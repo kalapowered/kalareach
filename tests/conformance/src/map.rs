@@ -34,7 +34,7 @@ use serde::Serialize;
 
 use crate::id::{self, Identifier, Refusal};
 use crate::plan::{CaseTable, Lane, matches};
-use crate::rust_items::{self, Entry, Import, Module, Sources, Visibility};
+use crate::rust_items::{self, Entry, Import, Module, NO_CODE, Sources, Visibility};
 use crate::typescript::{self, FileFacts, Keys, TsBinding};
 use crate::workspace::{self, Package, TargetId, TargetKind};
 
@@ -253,6 +253,8 @@ struct Helper {
     file: String,
     module: Vec<String>,
     mentions: Vec<(Identifier, String)>,
+    /// Whether a `cfg` of its own may leave it out of a build.
+    conditional: bool,
 }
 
 /// A test and what its body names: the functions it calls, the names its own `use` declarations
@@ -281,6 +283,7 @@ fn rust_package(map: &mut Map, sources: &mut Sources, root: &Path, package: &Pac
             functions: BTreeMap::new(),
             imports: BTreeMap::new(),
             expanded: BTreeSet::new(),
+            names: BTreeMap::new(),
         };
         let first_use = uses.len();
         let test_target = matches!(target.id.kind, TargetKind::Test | TargetKind::Bench);
@@ -302,9 +305,39 @@ fn rust_package(map: &mut Map, sources: &mut Sources, root: &Path, package: &Pac
         for module in &modules {
             rust_module(map, target, module, &mut tables, &mut helpers, &mut uses);
             scope.modules.insert(module.path.clone());
+            if let Some((name, parent)) = module.path.split_last() {
+                *scope
+                    .names
+                    .entry((parent.to_vec(), name.clone()))
+                    .or_default() += 1;
+            }
             for entry in &module.entries {
+                let mut take = |name: &str| {
+                    *scope
+                        .names
+                        .entry((module.path.clone(), name.to_owned()))
+                        .or_default() += 1;
+                };
                 match entry {
                     Entry::Item(item) => {
+                        if matches!(
+                            item.kind.as_str(),
+                            "fn" | "const"
+                                | "static"
+                                | "struct"
+                                | "enum"
+                                | "union"
+                                | "trait"
+                                | "type"
+                        ) && let Some(name) = &item.name
+                        {
+                            take(name);
+                        }
+                        for import in &item.imports {
+                            if let Import::Name { name, .. } = import {
+                                take(name);
+                            }
+                        }
                         scope
                             .imports
                             .entry(module.path.clone())
@@ -327,6 +360,7 @@ fn rust_package(map: &mut Map, sources: &mut Sources, root: &Path, package: &Pac
                         }
                     }
                     Entry::Test(test) => {
+                        take(&test.name);
                         scope
                             .functions
                             .insert((module.path.clone(), test.name.clone()), test.visibility);
@@ -337,37 +371,43 @@ fn rust_package(map: &mut Map, sources: &mut Sources, root: &Path, package: &Pac
         }
         // A keyed function of test code keys the tests of this target that call it: a case a
         // family of thin tests shares, one per shell or per platform, is keyed where it is written.
-        // A module that defines a function twice, under `cfg`s that keep one of them on each
-        // platform, compiles only one of them in a build: no call can be proved to reach the
-        // commented one.
-        let mut definitions: BTreeMap<(Vec<String>, String), usize> = BTreeMap::new();
+        // A helper keys only where every build has it and nothing else of its name: not under a
+        // `cfg` of its own (another item, or a glob's, may take its place), not where its module
+        // takes its name twice, and not in a module declared twice, one for each platform.
+        let mut declared: BTreeMap<&[String], usize> = BTreeMap::new();
         for module in &modules {
-            for entry in &module.entries {
-                if let Entry::Item(item) = entry
-                    && item.kind == "fn"
-                    && let Some(name) = &item.name
-                {
-                    *definitions
-                        .entry((module.path.clone(), name.clone()))
-                        .or_default() += 1;
-                }
-            }
+            *declared.entry(module.path.as_slice()).or_default() += 1;
         }
-        let (twice, helpers): (Vec<Helper>, Vec<Helper>) =
-            helpers.into_iter().partition(|helper| {
-                definitions
-                    .get(&(helper.module.clone(), helper.name.clone()))
-                    .is_some_and(|count| *count > 1)
+        let mut kept = Vec::new();
+        for helper in helpers {
+            let twin = (0..=helper.module.len()).any(|depth| {
+                declared
+                    .get(&helper.module[..depth])
+                    .is_some_and(|n| *n > 1)
             });
-        for helper in twice {
+            let taken = scope
+                .names
+                .get(&(helper.module.clone(), helper.name.clone()))
+                .is_some_and(|n| *n > 1);
+            let reason = if helper.conditional {
+                "which a cfg may leave out of a build"
+            } else if taken {
+                "which its module defines or brings in more than once"
+            } else if twin {
+                "whose module is declared more than once"
+            } else {
+                kept.push(helper);
+                continue;
+            };
             let context = format!(
-                "a comment on fn {} in {}, which its module defines more than once",
+                "a comment on fn {} in {}, {reason}",
                 helper.name, helper.file
             );
             for (identifier, source) in helper.mentions {
                 map.reference(identifier, source, &context);
             }
         }
+        let helpers = kept;
         // A test's calls prove nothing where the target may give a macro or attribute its reading
         // took on trust another meaning.
         let (claimed, unlisted) = claimed_names(&modules, &scope);
@@ -460,6 +500,10 @@ struct Scope {
     /// The modules with a macro invoked among their items, which can make items this reading does
     /// not see.
     expanded: BTreeSet<Vec<String>>,
+    /// How many times each module takes each name: by an item of any kind, a test, a child module
+    /// or a named `use`. A name taken twice (in two namespaces, or under two `cfg`s) cannot be
+    /// said to mean the function.
+    names: BTreeMap<(Vec<String>, String), usize>,
 }
 
 /// What a name comes to, as far as the target's own source proves it.
@@ -582,6 +626,16 @@ impl Scope {
         if depth > DEPTH {
             return Found::Unproved;
         }
+        // A name the module takes twice may mean either; one it takes once is the function or
+        // the named `use` below, or else an item that is no function this reading can follow.
+        let taken = self
+            .names
+            .get(&(module.to_vec(), name.to_owned()))
+            .copied()
+            .unwrap_or(0);
+        if taken > 1 {
+            return Found::Unproved;
+        }
         let reachable = |visibility: Visibility| match (
             visible(visibility, module, importer),
             visible(visibility, module, caller),
@@ -624,7 +678,7 @@ impl Scope {
                 }
             };
         }
-        if self.expanded.contains(module) {
+        if taken == 1 || self.expanded.contains(module) {
             return Found::Unproved;
         }
         let mut found = BTreeSet::new();
@@ -705,18 +759,28 @@ fn claimed_names(modules: &[Module], scope: &Scope) -> (BTreeSet<String>, bool) 
             }
         }
     }
+    // A definition written in `stringify!(...)` is text, unless the target gives that macro's
+    // name another meaning, when its arguments may be code after all.
+    if NO_CODE.iter().any(|name| claimed.contains(*name)) {
+        for module in modules {
+            claimed.extend(module.macros_in_text.iter().cloned());
+        }
+    }
     (claimed, unlisted)
 }
 
-/// Whether every crate a trusted name starts at (`tokio::` for `#[tokio::test]`) is the registry
-/// crate of that name the package depends on; the tool roots `rustfmt::` and `clippy::` are
-/// tools, not crates.
+/// Whether every root a trusted name starts at is what the reading took it for: the tool roots
+/// `rustfmt::` and `clippy::` are the tools only where no dependency of the package takes their
+/// names, and a crate root (`tokio::` for `#[tokio::test]`) must be the registry crate of that
+/// name the package depends on, as its lockfile resolves it.
 fn crates_named(assumes: &BTreeSet<String>, package: &Package) -> bool {
     assumes
         .iter()
         .filter_map(|name| name.strip_suffix("::"))
-        .filter(|root| !matches!(*root, "rustfmt" | "clippy"))
-        .all(|root| package.registry_crates.contains(root))
+        .all(|root| match root {
+            "rustfmt" | "clippy" => !package.dependency_names.contains(root),
+            _ => package.registry_crates.contains(root),
+        })
 }
 
 /// Whether a call written in the module `from` by `path` reaches `helper`.
@@ -928,6 +992,7 @@ fn rust_module(
                             file: module.file.clone(),
                             module: module.path.clone(),
                             mentions: found,
+                            conditional: item.conditional,
                         });
                     }
                 } else {
@@ -1191,4 +1256,42 @@ pub fn walk(root: &Path, directory: &str, keep: &dyn Fn(&str) -> bool) -> Vec<St
     }
     found.sort();
     found
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::crates_named;
+    use crate::workspace::Package;
+
+    fn package(registry: &[&str], dependencies: &[&str]) -> Package {
+        Package {
+            name: "p".to_owned(),
+            version: "0.1.0".to_owned(),
+            targets: Vec::new(),
+            manifest: "/p/Cargo.toml".into(),
+            registry_crates: registry.iter().map(|name| (*name).to_owned()).collect(),
+            dependency_names: dependencies.iter().map(|name| (*name).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_root_is_trusted_only_as_what_the_package_makes_it() {
+        let names = |names: &[&str]| -> BTreeSet<String> {
+            names.iter().map(|name| (*name).to_owned()).collect()
+        };
+        let plain = package(&["tokio"], &["tokio"]);
+        assert!(crates_named(
+            &names(&["tokio::", "clippy::", "rustfmt::", "test"]),
+            &plain
+        ));
+        // A dependency renamed to a tool's name makes the root the dependency's.
+        let renamed = package(&["tokio"], &["tokio", "clippy"]);
+        assert!(!crates_named(&names(&["clippy::"]), &renamed));
+        assert!(crates_named(&names(&["rustfmt::"]), &renamed));
+        // A crate the package does not take from crates.io under that name is not the one meant.
+        let elsewhere = package(&[], &["tokio"]);
+        assert!(!crates_named(&names(&["tokio::"]), &elsewhere));
+    }
 }

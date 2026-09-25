@@ -84,9 +84,45 @@ pub struct Package {
     pub targets: Vec<Target>,
     /// Its manifest.
     pub manifest: PathBuf,
-    /// The crates it depends on from the registry under their own names, with no other dependency
-    /// renamed to any of them: a path such as `tokio::test` names the crate it says only then.
+    /// The crates it depends on from crates.io under their own names, with no other dependency
+    /// renamed to any of them and the workspace's lockfile resolving each to crates.io: a path
+    /// such as `tokio::test` names the crate it says only then.
     pub registry_crates: BTreeSet<String>,
+    /// The names its dependencies are known by in its source: a rename where the manifest gives
+    /// one, the package's name otherwise.
+    pub dependency_names: BTreeSet<String>,
+}
+
+/// The sources Cargo names crates.io by.
+const CRATES_IO: &[&str] = &[
+    "registry+https://github.com/rust-lang/crates.io-index",
+    "sparse+https://index.crates.io/",
+];
+
+/// Whether the lockfile `lock` resolves the package `name` to crates.io, every time it lists it.
+fn locked_from_crates_io(lock: &str, name: &str) -> bool {
+    let mut found = false;
+    for block in lock.split("[[package]]").skip(1) {
+        let field = |key: &str| {
+            block.lines().find_map(|line| {
+                line.trim()
+                    .strip_prefix(key)?
+                    .trim()
+                    .strip_prefix('=')?
+                    .trim()
+                    .strip_prefix('"')?
+                    .strip_suffix('"')
+            })
+        };
+        if field("name") != Some(name) {
+            continue;
+        }
+        if !field("source").is_some_and(|source| CRATES_IO.contains(&source)) {
+            return false;
+        }
+        found = true;
+    }
+    found
 }
 
 /// Reads the workspace whose manifest is at `root`, through `cargo metadata`.
@@ -115,6 +151,13 @@ pub fn read(root: &Path) -> Result<Vec<Package>, String> {
     let value: Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("cargo metadata wrote something that is not JSON: {error}"))?;
     let mut packages = parse(&value)?;
+    // What a manifest asks for is not always what the build gets: a `[patch]` can replace it.
+    let lock = std::fs::read_to_string(root.join("Cargo.lock")).unwrap_or_default();
+    for package in &mut packages {
+        package
+            .registry_crates
+            .retain(|name| locked_from_crates_io(&lock, name));
+    }
     // Cargo's description leaves the harness out, so each manifest says it.
     for package in &mut packages {
         let manifest = std::fs::read_to_string(&package.manifest).map_err(|error| {
@@ -259,10 +302,19 @@ pub fn parse(value: &Value) -> Result<Vec<Package>, String> {
                 dependency["rename"].is_null()
                     && dependency["source"]
                         .as_str()
-                        .is_some_and(|source| source.starts_with("registry+"))
+                        .is_some_and(|source| CRATES_IO.contains(&source))
             })
             .filter_map(|dependency| dependency["name"].as_str())
             .filter(|name| !renamed.contains(name))
+            .map(str::to_owned)
+            .collect();
+        let dependency_names = dependencies
+            .iter()
+            .filter_map(|dependency| {
+                dependency["rename"]
+                    .as_str()
+                    .or_else(|| dependency["name"].as_str())
+            })
             .map(str::to_owned)
             .collect();
         packages.push(Package {
@@ -271,6 +323,7 @@ pub fn parse(value: &Value) -> Result<Vec<Package>, String> {
             targets,
             manifest,
             registry_crates,
+            dependency_names,
         });
     }
     packages.sort_by(|a, b| a.name.cmp(&b.name));
@@ -303,6 +356,25 @@ mod tests {
         assert_eq!(
             packages[0].registry_crates,
             BTreeSet::from(["tokio".to_owned()])
+        );
+        assert_eq!(
+            packages[0].dependency_names,
+            ["local", "serde", "tokio"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>()
+        );
+    }
+
+    #[test]
+    fn a_crate_the_lockfile_takes_from_elsewhere_is_not_the_registrys() {
+        let lock = "version = 4\n\n[[package]]\nname = \"tokio\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n[[package]]\nname = \"patched\"\nversion = \"1.0.0\"\n\n[[package]]\nname = \"mirrored\"\nversion = \"1.0.0\"\nsource = \"registry+https://example.test/index\"\n";
+        assert!(locked_from_crates_io(lock, "tokio"));
+        assert!(!locked_from_crates_io(lock, "patched"), "a path package");
+        assert!(!locked_from_crates_io(lock, "mirrored"), "another registry");
+        assert!(
+            !locked_from_crates_io(lock, "absent"),
+            "not in the lockfile"
         );
     }
 

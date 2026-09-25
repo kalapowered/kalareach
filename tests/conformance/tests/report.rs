@@ -201,8 +201,16 @@ fn a_call_a_macro_or_attribute_may_rewrite_move_or_rename_keys_nothing() {
         ("KR-REQ-03.27", "which an attribute may rewrite"),
         ("KR-REQ-03.28", "which no test calls"),
         ("KR-REQ-03.29", "which no test calls"),
-        ("KR-REQ-03.30", "which its module defines more than once"),
+        ("KR-REQ-03.30", "which a cfg may leave out of a build"),
         ("KR-REQ-03.32", "which no test calls"),
+        ("KR-REQ-03.33", "which a cfg may leave out of a build"),
+        ("KR-REQ-03.34", "which a cfg may leave out of a build"),
+        (
+            "KR-REQ-03.35",
+            "which its module defines or brings in more than once",
+        ),
+        ("KR-REQ-03.36", "whose module is declared more than once"),
+        ("KR-REQ-03.37", "which no test calls"),
     ] {
         let row = identifier(row);
         assert!(
@@ -226,13 +234,20 @@ fn a_call_a_macro_or_attribute_may_rewrite_move_or_rename_keys_nothing() {
             Binding::CalledFunction
         )])
     );
-    // A `use` written as text imports nothing, so it leaves the rest of its target proved.
+    // A `use` or a macro definition written as text defines and imports nothing, so it leaves
+    // the rest of its target proved.
     assert_eq!(
         keyed.get("KR-REQ-03.31"),
-        Some(&vec![(
-            "strings calls_the_case_beside_text".to_owned(),
-            Binding::CalledFunction
-        )])
+        Some(&vec![
+            (
+                "strings calls_the_case_beside_text".to_owned(),
+                Binding::CalledFunction
+            ),
+            (
+                "strings prints_and_calls_the_case".to_owned(),
+                Binding::CalledFunction
+            ),
+        ])
     );
 }
 
