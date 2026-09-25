@@ -296,6 +296,14 @@ fn a_source_outside_the_conventions_is_a_problem_and_keys_no_helper() {
                 "a `use` of `shared`, a keyed helper's name, that the reading does not follow",
             ),
             (
+                "tests/braced.rs:16",
+                "the header of this `fn`, from its keyword to its body or `;`, holds where a macro's repetition opens or ends",
+            ),
+            (
+                "tests/braced.rs:22",
+                "the header of this `fn`, from its keyword to its body or `;`, holds where a macro's repetition opens or ends",
+            ),
+            (
                 "tests/carrier/mod.rs:1",
                 "a `path` attribute inside a module's own file",
             ),
@@ -532,6 +540,7 @@ fn a_source_outside_the_conventions_is_a_problem_and_keys_no_helper() {
         "KR-REQ-03.71",
         "KR-REQ-03.72",
         "KR-REQ-03.73",
+        "KR-REQ-03.74",
     ] {
         let row = identifier(row);
         assert!(

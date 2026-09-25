@@ -187,13 +187,17 @@ metavariable or a repetition (`$name`, `$( ... )*`), its tokens do not show the 
 metavariable stands for whatever the macro is handed, a keyword or a `.` included, and a repetition
 for any number of copies of what it holds, none included. So inside such a macro a keyed helper's
 name is a problem however it is written, and so is a name the report trusts, unless it names a
-metavariable (`$core`) or no expansion can make it a declaration: invoked (`assert!`), before `::`
-and a name (`std::mem`), after a `.`, or inside an attribute (`#[derive(Debug)]`). A repetition
-that opens or ends inside an item's header, from its keyword (`fn`, `struct`, `enum`, `union`,
-`trait`, `type`, `impl` or `mod`) to its body or `;` and outside the groups the header holds, is a
-problem wherever it is, because the report could not tell where the item's name, generic
-parameters or body are; one that holds whole items (`$( #[test] fn $name() { ... } )*`) or stands
-inside a function's parameters is not.
+metavariable (`$core`) or is written where the macro cannot make a declaration of it: invoked
+(`assert!`), before `::` and a name (`std::mem`), after a `.`, or inside an attribute
+(`#[derive(Debug)]`). What another macro makes of the tokens it is handed falls under the rules on
+where that macro is invoked, below.
+
+A repetition that opens or ends inside an item's header is a problem, because the report could not
+tell where the item's name, generic parameters or body are. A header runs from a keyword written in
+the tokens (`fn`, but for a function's type `fn(...)`; `struct`; `enum`; `union`; `trait`; `type`;
+`impl`, in a type as well as an item; or `mod`) to its body, its `;` or the end of the group it
+stands in, and the groups it holds, a macro's braces (`ty!{}`) among them, are no part of it. A
+repetition that holds whole items (`$( #[test] fn $name() { ... } )*`) splits no header.
 
 What a macro makes, the macros it invokes included, counts as made where it is invoked, and a name
 the macro is handed there (`make!(core)`) is only an argument, which cannot earn a key: a macro
