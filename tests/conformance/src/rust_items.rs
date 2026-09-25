@@ -470,6 +470,11 @@ impl Attribute {
         self.path.last().is_some_and(|last| last == "test")
     }
 
+    /// Whether it is a `cfg_attr` that may set a `path`.
+    fn may_set_a_path(&self) -> bool {
+        self.path == ["cfg_attr"] && self.arguments.iter().any(|t| t.ident() == Some("path"))
+    }
+
     fn is_cfg_test(&self) -> bool {
         self.path == ["cfg"]
             && self.arguments.iter().any(|t| t.ident() == Some("test"))
@@ -562,6 +567,17 @@ fn parse_module(
                     }
                     module.rewritable |= !attribute.inert();
                     module.conditional |= attribute.is_conditional() && !path.is_empty();
+                    // Inside a module's own file, a `path` attribute makes the compiler look for the
+                    // module's own modules elsewhere; an inline module's is read where it is declared.
+                    if path.len() == context.depth
+                        && (attribute.path == ["path"] || attribute.may_set_a_path())
+                    {
+                        children.push(Parsed::Warning(Warning {
+                            file: context.relative.clone(),
+                            line: token.line,
+                            what: "a `path` attribute inside a module's own file, or a `cfg_attr` that may set one, which moves where the compiler looks for the module's own modules and which the reading does not follow".to_owned(),
+                        }));
+                    }
                 } else {
                     attributes.push(attribute);
                 }
@@ -619,12 +635,23 @@ fn parse_module(
                 } else {
                     directory
                 };
-                let explicit = attributes.iter().find_map(|a| a.value("path"));
-                let chosen = attributes.iter().any(|a| {
-                    a.path == ["cfg_attr"] && a.arguments.iter().any(|t| t.ident() == Some("path"))
-                });
                 let entry = classify(item, &attributes, attached, token.line);
-                if chosen
+                // An inline module's attributes are those before it and those its body opens with,
+                // in that order, as the compiler reads them.
+                let inner = match &entry {
+                    Classified::InlineModule { body, .. } => {
+                        inner_attributes(&item[body.0..body.1])
+                    }
+                    _ => Vec::new(),
+                };
+                let explicit = attributes
+                    .iter()
+                    .chain(&inner)
+                    .find_map(|a| a.value("path"));
+                if attributes
+                    .iter()
+                    .chain(&inner)
+                    .any(Attribute::may_set_a_path)
                     && matches!(
                         entry,
                         Classified::InlineModule { .. } | Classified::ModuleFile { .. }
@@ -1097,7 +1124,8 @@ fn inner_attributes(body: &[Token]) -> Vec<Attribute> {
 }
 
 /// Reads one use tree from `at`: a path, then `*`, a group in braces, or a last name with an
-/// optional `as`. Returns where it stopped.
+/// optional `as`. A path from the root of the paths (`use ::name`) starts with the segment `::`.
+/// Returns where it stopped.
 fn use_tree(tokens: &[Token], mut at: usize, prefix: &[String], found: &mut Vec<Import>) -> usize {
     let mut path = prefix.to_vec();
     loop {
@@ -1105,8 +1133,14 @@ fn use_tree(tokens: &[Token], mut at: usize, prefix: &[String], found: &mut Vec<
             return at;
         };
         if token.is_punct(':') {
-            // The `::` of a path that starts at the crate roots.
-            at += 1;
+            // A path that starts at the root of the paths (`::name`) names another crate, and keeps
+            // `::` as its first segment to say so.
+            if path.is_empty() && tokens.get(at + 1).is_some_and(|next| next.is_punct(':')) {
+                path.push("::".to_owned());
+                at += 2;
+            } else {
+                at += 1;
+            }
         } else if token.is_punct('*') {
             found.push(Import::Glob { path });
             return at + 1;
@@ -1547,8 +1581,8 @@ pub fn breaches(
 /// The breaches in one file's tokens, each as its line and what it is; see [`breaches`].
 fn conventions(tokens: &[Token], helpers: &BTreeSet<String>) -> Vec<(usize, String)> {
     let tokens = significant(tokens);
-    let level = module_levels(&tokens);
-    let uses = use_declarations(&tokens, &level);
+    let levels = levels(&tokens);
+    let uses = use_declarations(&tokens, &levels.module);
     let mut found = Vec::new();
     for (index, token) in tokens.iter().enumerate() {
         let name = match &token.tok {
@@ -1576,14 +1610,14 @@ fn conventions(tokens: &[Token], helpers: &BTreeSet<String>) -> Vec<(usize, Stri
         let declaration = uses
             .iter()
             .find(|declaration| declaration.from <= index && index < declaration.to);
-        if name == "mod" && !level[index] && around.declares_a_module_file() {
+        if name == "mod" && !levels.module[index] && around.declares_a_module_file() {
             found.push((
                 token.line,
                 "a module file declared inside a function, a block, an implementation or a macro, which the reading does not read".to_owned(),
             ));
         }
         if helpers.contains(name)
-            && let Some(what) = helper_occurrence(&around, &level, declaration)
+            && let Some(what) = helper_occurrence(&around, &levels, declaration)
         {
             found.push((
                 token.line,
@@ -1602,19 +1636,39 @@ fn conventions(tokens: &[Token], helpers: &BTreeSet<String>) -> Vec<(usize, Stri
     found
 }
 
-/// For each token, whether it stands among a module's items: every group around it is the body of
-/// a `mod`.
-fn module_levels(tokens: &[Token]) -> Vec<bool> {
-    let mut groups: Vec<bool> = Vec::new();
-    let mut level = Vec::with_capacity(tokens.len());
+/// Where each token of a file stands: among a module's items (every group around it is the body of
+/// a `mod`), and directly inside an `enum`'s body.
+struct Levels {
+    module: Vec<bool>,
+    enum_body: Vec<bool>,
+}
+
+fn levels(tokens: &[Token]) -> Levels {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Group {
+        Module,
+        Enum,
+        Other,
+    }
+    let mut groups: Vec<Group> = Vec::new();
+    let mut module = Vec::with_capacity(tokens.len());
+    let mut enum_body = Vec::with_capacity(tokens.len());
     for (index, token) in tokens.iter().enumerate() {
-        level.push(groups.iter().all(|module| *module));
+        module.push(groups.iter().all(|group| *group == Group::Module));
+        enum_body.push(groups.last() == Some(&Group::Enum));
         match token.tok {
-            Tok::Punct('(' | '[') => groups.push(false),
+            Tok::Punct('(' | '[') => groups.push(Group::Other),
             Tok::Punct('{') => groups.push(
-                index >= 2
+                if index >= 2
                     && tokens[index - 1].ident().is_some()
-                    && tokens[index - 2].ident() == Some("mod"),
+                    && tokens[index - 2].ident() == Some("mod")
+                {
+                    Group::Module
+                } else if opens_an_enum(tokens, index) {
+                    Group::Enum
+                } else {
+                    Group::Other
+                },
             ),
             Tok::Punct(')' | ']' | '}') => {
                 groups.pop();
@@ -1622,7 +1676,19 @@ fn module_levels(tokens: &[Token]) -> Vec<bool> {
             _ => {}
         }
     }
-    level
+    Levels { module, enum_body }
+}
+
+/// Whether the brace at `open` opens an `enum`'s body: what comes before it, back to the end of the
+/// statement or item before, names an `enum`.
+fn opens_an_enum(tokens: &[Token], open: usize) -> bool {
+    let start = tokens[..open]
+        .iter()
+        .rposition(|token| token.is_punct(';') || token.is_punct('{') || token.is_punct('}'))
+        .map_or(0, |at| at + 1);
+    tokens[start..open]
+        .windows(2)
+        .any(|pair| pair[0].ident() == Some("enum") && pair[1].ident().is_some())
 }
 
 /// A `use` declaration: the tokens of its tree, what it brings in, and whether it stands among a
@@ -1782,7 +1848,7 @@ impl Around<'_> {
 /// among a module's items (which the map then follows to a function).
 fn helper_occurrence(
     around: &Around<'_>,
-    level: &[bool],
+    levels: &Levels,
     declaration: Option<&UseDeclaration>,
 ) -> Option<&'static str> {
     if let Some(declaration) = declaration {
@@ -1798,8 +1864,11 @@ fn helper_occurrence(
             None
         };
     }
+    if levels.enum_body[around.index] {
+        return Some("an enum's variant, or a value in the enum's declaration");
+    }
     if around.word_before(1) == Some("fn") {
-        return (!level[around.index]).then_some(
+        return (!levels.module[around.index]).then_some(
             "a function inside a function, a block, an implementation, a trait or a macro",
         );
     }
@@ -1878,6 +1947,8 @@ fn trusted_declaration(
 /// crate root by itself, one of serde's derives from `serde`, and anything else from the standard
 /// library.
 fn trusted_import(name: &str, path: &[String]) -> bool {
+    // From the root of the paths, a crate's name names that crate.
+    let path = path.strip_prefix(&["::".to_owned()]).unwrap_or(path);
     if STANDARD_ROOTS.contains(&name) || TRUSTED_ROOTS.contains(&name) {
         path.len() == 1
     } else if SERDE_DERIVES.contains(&name) {
@@ -1998,7 +2069,7 @@ mod tests {
                 Import::Glob {
                     path: vec!["a".to_owned(), "b".to_owned(), "f".to_owned()]
                 },
-                name("g", &["g"]),
+                name("g", &["::", "g"]),
                 name("h", &["super", "h"]),
             ]
         );
@@ -2262,6 +2333,10 @@ mod tests {
             "fn t() { let _: &dyn shared() = x; }",
             "fn t(run: impl shared()) {}",
             "fn t<T: ?shared>() {}",
+            // An enum's variant of the name, or a value in its declaration.
+            "enum E { shared() }",
+            "pub enum E<T> where T: Copy { Other(T), shared(u8) }",
+            "enum E { A = shared() }",
         ] {
             let found = breached(text);
             assert!(!found.is_empty(), "{text}");
@@ -2282,6 +2357,7 @@ mod tests {
             "fn t() { assert!(!shared()); }",
             "fn t() { assert_eq!(shared(), 3); }",
             "fn t() { let _ = <T>::shared(); }",
+            "fn t() { let _ = E::A(shared()); }",
             "use a::shared;",
             "pub use a::{b, shared};",
             "mod m { use super::shared; }",
@@ -2549,9 +2625,17 @@ mod tests {
         };
         write(
             "root.rs",
-            "mod plain;\n#[path = \"sub/loaded.rs\"]\nmod loaded;\nmod inline {\n    #[path = \"named.rs\"]\n    mod named;\n}\n#[path = \"moved\"]\nmod shifted {\n    mod deep;\n}\n#[cfg_attr(unix, path = \"other.rs\")]\nmod chosen;\n",
+            "mod plain;\n#[path = \"sub/loaded.rs\"]\nmod loaded;\nmod inline {\n    #[path = \"named.rs\"]\n    mod named;\n}\n#[path = \"moved\"]\nmod shifted {\n    mod deep;\n}\n#[cfg_attr(unix, path = \"other.rs\")]\nmod chosen;\nmod inward {\n    #![path = \"turned\"]\n    mod bent;\n}\nmod unsure {\n    #![cfg_attr(unix, path = \"other\")]\n    mod kept;\n}\nmod carrier;\n",
         );
-        write("plain.rs", "mod child;\n");
+        write(
+            "plain.rs",
+            "mod child;\nmod layer {\n    #![path = \"far\"]\n    mod end;\n}\n",
+        );
+        write("far/end.rs", "");
+        write("turned/bent.rs", "");
+        write("unsure/kept.rs", "");
+        write("carrier.rs", "#![path = \"elsewhere\"]\nmod kid;\n");
+        write("carrier/kid.rs", "");
         write("plain/child.rs", "");
         write("sub/loaded.rs", "mod neighbour;\n");
         write("sub/neighbour.rs", "");
@@ -2587,14 +2671,32 @@ mod tests {
         );
         // On an inline module, it names the directory of the modules inside.
         assert_eq!(file(&["shifted", "deep"]).as_deref(), Some("moved/deep.rs"));
-        // A file a `cfg_attr` may choose is read as the default, and said to be in doubt.
-        assert_eq!(file(&["chosen"]).as_deref(), Some("chosen.rs"));
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        // So does one written inside the inline module, whose own directory it is read from in a
+        // `mod.rs` file and in any other.
+        assert_eq!(file(&["inward", "bent"]).as_deref(), Some("turned/bent.rs"));
         assert_eq!(
-            (warnings[0].file.as_str(), warnings[0].line),
-            ("root.rs", 13)
+            file(&["plain", "layer", "end"]).as_deref(),
+            Some("far/end.rs")
+        );
+        // A file a `cfg_attr` may choose is read as the default and said to be in doubt, as is a
+        // `path` attribute inside a module's own file, which moves where its own modules are.
+        assert_eq!(file(&["chosen"]).as_deref(), Some("chosen.rs"));
+        assert_eq!(file(&["unsure", "kept"]).as_deref(), Some("unsure/kept.rs"));
+        let doubts: Vec<(&str, usize)> = warnings
+            .iter()
+            .map(|warning| (warning.file.as_str(), warning.line))
+            .collect();
+        assert_eq!(
+            doubts,
+            [("root.rs", 13), ("root.rs", 18), ("carrier.rs", 1)],
+            "{warnings:?}"
         );
         assert!(warnings[0].what.contains("cfg_attr"), "{warnings:?}");
+        assert!(warnings[1].what.contains("cfg_attr"), "{warnings:?}");
+        assert!(
+            warnings[2].what.contains("`path` attribute inside"),
+            "{warnings:?}"
+        );
     }
 
     #[test]
