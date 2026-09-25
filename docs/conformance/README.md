@@ -164,7 +164,8 @@ compiles:
 - Everything outside comments, literals and lifetimes is ASCII, identifiers included: the compiler
   compares identifiers once it has normalised them, and the report compares them as written.
 - The report reads every file the target compiles: no module file is declared anywhere but among a
-  module's items, such as inside a function, where the report does not follow it.
+  module's items (inside a function, say, where the report does not follow it), no module's files
+  are chosen by a `cfg_attr`, and every declared module has its file.
 - The target is of the 2018 edition or later.
 
 The report checks these on tokens and nothing else, so it errs towards a problem: text inside
@@ -204,7 +205,12 @@ identifiers stay references that the result lists with the reason. That happens 
   work out, starts at the root (`::name`), or comes after a qualifier (`<T>::name`).
 
 The report reads each target's crate root as Cargo describes it and follows every `mod`
-declaration, `#[path]` included, so a test is named exactly as the test harness names it.
+declaration among a module's items as the compiler does, so a test is named exactly as the test
+harness names it. A `path` attribute is read from the directory of the file it is in at the file's
+top level, and from the inline module's directory inside one; on an inline module it names the
+directory of the modules inside; and the file it names keeps its own modules beside it, as a
+`mod.rs` does. A module whose file is not there, or whose files a `cfg_attr` chooses, is a warning,
+and in a target with a helper a problem.
 
 ### Case tables kept as data
 

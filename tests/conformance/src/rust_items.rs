@@ -183,12 +183,15 @@ pub struct ScanError {
     pub what: String,
 }
 
-/// A problem that does not stop the scan, such as a module file that is not there.
+/// A module whose file the scan could not read as the compiler would: a module file that is not
+/// there, or one a `cfg_attr` may choose. The scan carries on past it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Warning {
     /// The file that declared it, relative to the scan's root.
     pub file: String,
-    /// What was not found.
+    /// The line of the declaration.
+    pub line: usize,
+    /// What was not read.
     pub what: String,
 }
 
@@ -279,6 +282,7 @@ fn scan_file(
     let context = Context {
         file: file.to_owned(),
         relative: relative(root, file),
+        depth: module.path.len(),
     };
     let mut parsed = Vec::new();
     parse_module(
@@ -292,6 +296,7 @@ fn scan_file(
     for entry in parsed {
         match entry {
             Parsed::Module(scanned) => modules.push(scanned),
+            Parsed::Warning(warning) => warnings.push(warning),
             Parsed::Declaration(declaration) => {
                 let Some(child) = declaration
                     .candidates
@@ -301,6 +306,7 @@ fn scan_file(
                 else {
                     warnings.push(Warning {
                         file: relative(root, file),
+                        line: declaration.line,
                         what: format!(
                             "module {} has no file at {}",
                             declaration.path.join("::"),
@@ -314,7 +320,9 @@ fn scan_file(
                     });
                     continue;
                 };
-                let directory = if is_mod_rs(&child) {
+                // A file a `path` attribute names holds its own modules' files beside it, as a
+                // `mod.rs` does; any other file holds them in a directory of its own name.
+                let directory = if declaration.pathed || is_mod_rs(&child) {
                     child.parent().unwrap_or(root).to_owned()
                 } else {
                     child.with_extension("")
@@ -346,12 +354,17 @@ fn is_mod_rs(path: &Path) -> bool {
 struct Context {
     file: PathBuf,
     relative: String,
+    /// The length of the module path of the file's own module: a module deeper than that is inline.
+    depth: usize,
 }
 
 /// A `mod name;` to follow.
 struct Declaration {
     path: Vec<String>,
+    line: usize,
     candidates: Vec<PathBuf>,
+    /// Whether a `path` attribute names its file.
+    pathed: bool,
     test_code: bool,
     rewritable: bool,
     conditional: bool,
@@ -360,6 +373,7 @@ struct Declaration {
 enum Parsed {
     Module(Module),
     Declaration(Declaration),
+    Warning(Warning),
 }
 
 /// One attribute: its path and the tokens of its arguments.
@@ -596,14 +610,42 @@ fn parse_module(
                 }
                 let rewrites = module.rewritable || attributes.iter().any(|a| !a.inert());
                 let absent = module.conditional || attributes.iter().any(Attribute::is_conditional);
+                // A `path` attribute is read from the directory of the file's own module at the
+                // file's top level, and from the inline module's directory inside one, as the
+                // compiler reads it; one a `cfg_attr` may set is not worked out.
+                let base = if path.len() == context.depth {
+                    context.file.parent().unwrap_or(directory)
+                } else {
+                    directory
+                };
+                let explicit = attributes.iter().find_map(|a| a.value("path"));
+                let chosen = attributes.iter().any(|a| {
+                    a.path == ["cfg_attr"] && a.arguments.iter().any(|t| t.ident() == Some("path"))
+                });
                 let entry = classify(item, &attributes, attached, token.line);
+                if chosen
+                    && matches!(
+                        entry,
+                        Classified::InlineModule { .. } | Classified::ModuleFile { .. }
+                    )
+                {
+                    children.push(Parsed::Warning(Warning {
+                        file: context.relative.clone(),
+                        line: token.line,
+                        what: "a module whose files a `cfg_attr` chooses, where the reading does not work out which".to_owned(),
+                    }));
+                }
                 match entry {
                     Classified::Test(test) => module.entries.push(Entry::Test(test)),
                     Classified::Item(item) => module.entries.push(Entry::Item(item)),
                     Classified::InlineModule { name, body } => {
                         let mut child_path = path.to_vec();
                         child_path.push(name.clone());
-                        let child_directory = directory.join(&name);
+                        // A `path` attribute on an inline module names the directory of the
+                        // modules inside it.
+                        let child_directory = explicit
+                            .as_ref()
+                            .map_or_else(|| directory.join(&name), |explicit| base.join(explicit));
                         parse_module(
                             &item[body.0..body.1],
                             context,
@@ -616,10 +658,8 @@ fn parse_module(
                     Classified::ModuleFile { name } => {
                         let mut child_path = path.to_vec();
                         child_path.push(name.clone());
-                        let candidates = if let Some(explicit) =
-                            attributes.iter().find_map(|a| a.value("path"))
-                        {
-                            vec![context.file.parent().unwrap_or(directory).join(explicit)]
+                        let candidates = if let Some(explicit) = &explicit {
+                            vec![base.join(explicit)]
                         } else {
                             vec![
                                 directory.join(format!("{name}.rs")),
@@ -628,7 +668,9 @@ fn parse_module(
                         };
                         children.push(Parsed::Declaration(Declaration {
                             path: child_path,
+                            line: token.line,
                             candidates,
+                            pathed: explicit.is_some(),
                             test_code: test_code || cfg_test,
                             rewritable: rewrites,
                             conditional: absent,
@@ -2488,6 +2530,64 @@ mod tests {
         assert!(item("inside").rewritable);
         assert!(!item("plain").rewritable);
         assert!(item("formatted").rewritable);
+    }
+
+    #[test]
+    fn a_module_file_is_read_where_the_compiler_reads_it() {
+        let tree = tempfile::tempdir().expect("a directory");
+        let write = |relative: &str, text: &str| {
+            let file = tree.path().join(relative);
+            std::fs::create_dir_all(file.parent().expect("a parent")).expect("a directory");
+            std::fs::write(file, text).expect("writes");
+        };
+        write(
+            "root.rs",
+            "mod plain;\n#[path = \"sub/loaded.rs\"]\nmod loaded;\nmod inline {\n    #[path = \"named.rs\"]\n    mod named;\n}\n#[path = \"moved\"]\nmod shifted {\n    mod deep;\n}\n#[cfg_attr(unix, path = \"other.rs\")]\nmod chosen;\n",
+        );
+        write("plain.rs", "mod child;\n");
+        write("plain/child.rs", "");
+        write("sub/loaded.rs", "mod neighbour;\n");
+        write("sub/neighbour.rs", "");
+        write("inline/named.rs", "");
+        write("moved/deep.rs", "");
+        write("chosen.rs", "");
+        let (modules, warnings) = scan_target(
+            &mut Sources::default(),
+            tree.path(),
+            &tree.path().join("root.rs"),
+            true,
+        )
+        .expect("scans");
+        let file = |path: &[&str]| {
+            modules
+                .iter()
+                .find(|module| module.path == path)
+                .map(|module| module.file.clone())
+        };
+        // A plain module's file, and its own module's in a directory of its name.
+        assert_eq!(file(&["plain"]).as_deref(), Some("plain.rs"));
+        assert_eq!(file(&["plain", "child"]).as_deref(), Some("plain/child.rs"));
+        // A file a `path` attribute names keeps its own modules beside it.
+        assert_eq!(file(&["loaded"]).as_deref(), Some("sub/loaded.rs"));
+        assert_eq!(
+            file(&["loaded", "neighbour"]).as_deref(),
+            Some("sub/neighbour.rs")
+        );
+        // Inside an inline module, a `path` attribute is read from the inline module's directory.
+        assert_eq!(
+            file(&["inline", "named"]).as_deref(),
+            Some("inline/named.rs")
+        );
+        // On an inline module, it names the directory of the modules inside.
+        assert_eq!(file(&["shifted", "deep"]).as_deref(), Some("moved/deep.rs"));
+        // A file a `cfg_attr` may choose is read as the default, and said to be in doubt.
+        assert_eq!(file(&["chosen"]).as_deref(), Some("chosen.rs"));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(
+            (warnings[0].file.as_str(), warnings[0].line),
+            ("root.rs", 13)
+        );
+        assert!(warnings[0].what.contains("cfg_attr"), "{warnings:?}");
     }
 
     #[test]
