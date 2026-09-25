@@ -1,0 +1,238 @@
+{
+  "fixture_version": 1,
+  "visibility": [
+    {
+      "name": "an idle bound thread has no turn to stop",
+      "context": {
+        "rights": [
+          "session.view",
+          "agent.cancel"
+        ],
+        "binding_state": "bound",
+        "flags": [],
+        "capabilities": [
+          [
+            "upstream.action",
+            "qualified_available"
+          ]
+        ],
+        "present_nodes": [
+          "overview",
+          "activity",
+          "controls"
+        ]
+      },
+      "visible_controls": [
+        "cancel",
+        "refresh"
+      ],
+      "enabled_controls": [
+        "refresh"
+      ]
+    },
+    {
+      "name": "a running turn can be stopped",
+      "context": {
+        "rights": [
+          "session.view",
+          "agent.cancel"
+        ],
+        "binding_state": "upstream_busy",
+        "flags": [],
+        "capabilities": [
+          [
+            "upstream.action",
+            "qualified_available"
+          ]
+        ],
+        "present_nodes": [
+          "overview",
+          "activity",
+          "controls"
+        ]
+      },
+      "visible_controls": [
+        "cancel",
+        "refresh"
+      ],
+      "enabled_controls": [
+        "cancel",
+        "refresh"
+      ]
+    },
+    {
+      "name": "a turn waiting on a person can still be stopped",
+      "context": {
+        "rights": [
+          "session.view",
+          "agent.cancel",
+          "agent.approval.respond"
+        ],
+        "binding_state": "awaiting_person",
+        "flags": [
+          "pending_approval"
+        ],
+        "capabilities": [
+          [
+            "upstream.action",
+            "qualified_available"
+          ]
+        ],
+        "present_nodes": [
+          "overview",
+          "activity",
+          "controls"
+        ]
+      },
+      "visible_controls": [
+        "cancel",
+        "refresh"
+      ],
+      "enabled_controls": [
+        "cancel",
+        "refresh"
+      ]
+    },
+    {
+      "name": "an actor who can only view sees no turn control",
+      "context": {
+        "rights": [
+          "session.view"
+        ],
+        "binding_state": "bound",
+        "flags": [],
+        "capabilities": [
+          [
+            "upstream.action",
+            "qualified_available"
+          ]
+        ],
+        "present_nodes": [
+          "overview",
+          "activity",
+          "controls"
+        ]
+      },
+      "visible_controls": [
+        "refresh"
+      ],
+      "enabled_controls": [
+        "refresh"
+      ]
+    },
+    {
+      "name": "volatile-native operation leaves no usable turn control",
+      "context": {
+        "rights": [
+          "session.view",
+          "agent.cancel"
+        ],
+        "binding_state": "native_only_volatile",
+        "flags": [],
+        "capabilities": [
+          [
+            "upstream.action",
+            "qualified_available"
+          ]
+        ],
+        "present_nodes": [
+          "overview",
+          "activity",
+          "controls"
+        ]
+      },
+      "visible_controls": [
+        "cancel",
+        "refresh"
+      ],
+      "enabled_controls": [
+        "refresh"
+      ]
+    },
+    {
+      "name": "an upload in progress does not block stopping a turn",
+      "context": {
+        "rights": [
+          "session.view",
+          "agent.cancel"
+        ],
+        "binding_state": "upstream_busy",
+        "flags": [
+          "transfer_in_progress"
+        ],
+        "capabilities": [
+          [
+            "upstream.action",
+            "qualified_available"
+          ]
+        ],
+        "present_nodes": [
+          "overview",
+          "activity",
+          "controls"
+        ]
+      },
+      "visible_controls": [
+        "cancel",
+        "refresh"
+      ],
+      "enabled_controls": [
+        "cancel"
+      ]
+    },
+    {
+      "name": "no qualified evidence for acting upstream leaves the control unusable",
+      "context": {
+        "rights": [
+          "session.view",
+          "agent.cancel"
+        ],
+        "binding_state": "upstream_busy",
+        "flags": [],
+        "capabilities": [
+          [
+            "upstream.action",
+            "temporarily_unavailable"
+          ]
+        ],
+        "present_nodes": [
+          "overview",
+          "activity",
+          "controls"
+        ]
+      },
+      "visible_controls": [
+        "cancel",
+        "refresh"
+      ],
+      "enabled_controls": [
+        "refresh"
+      ]
+    },
+    {
+      "name": "repeated faults hide every control",
+      "context": {
+        "rights": [
+          "session.view",
+          "agent.cancel",
+          "agent.approval.respond"
+        ],
+        "binding_state": "disabled",
+        "flags": [],
+        "capabilities": [
+          [
+            "upstream.action",
+            "qualified_available"
+          ]
+        ],
+        "present_nodes": [
+          "overview",
+          "activity",
+          "controls"
+        ]
+      },
+      "visible_controls": [],
+      "enabled_controls": []
+    }
+  ]
+}

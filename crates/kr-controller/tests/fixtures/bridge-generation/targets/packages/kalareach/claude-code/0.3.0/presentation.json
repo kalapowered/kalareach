@@ -1,0 +1,280 @@
+{
+  "manifest_version": 1,
+  "base_revision": "2",
+  "nodes": [
+    {
+      "id": "overview",
+      "revision": "2",
+      "body": {
+        "kind": "markdown",
+        "source": "Claude Code keeps its own terminal. Lifecycle and tool hooks report what it is doing, and the Channels surface carries messages into the session and relays the tool approvals it waits on. Allow and Deny answer a relayed approval when this host can carry the answer, and the terminal always can; Claude Code takes whichever answer comes first. Project trust and MCP consent stay in the terminal."
+      }
+    },
+    {
+      "id": "activity",
+      "revision": "1",
+      "body": {
+        "kind": "progress",
+        "label": "Waiting for Claude Code",
+        "state": {
+          "kind": "indeterminate"
+        }
+      }
+    },
+    {
+      "id": "approval",
+      "revision": "1",
+      "body": {
+        "kind": "action_group",
+        "label": "Tool approval",
+        "controls": [
+          {
+            "id": "allow",
+            "revision": "1",
+            "label": "Allow",
+            "icon": "check",
+            "accessible_description": "Allow the tool call Claude Code is waiting on",
+            "action_id": "approval.answer",
+            "parameters": {
+              "parameters": [
+                {
+                  "name": "decision",
+                  "kind": {
+                    "type": "choice",
+                    "choices": [
+                      {
+                        "id": "allow",
+                        "label": "Allow"
+                      }
+                    ]
+                  },
+                  "label": "Decision",
+                  "required": true
+                }
+              ]
+            },
+            "priority": "primary",
+            "visible_when": {
+              "op": "all",
+              "terms": [
+                {
+                  "op": "grant",
+                  "right": "agent.approval.respond"
+                },
+                {
+                  "op": "flag",
+                  "flag": "pending_approval"
+                }
+              ]
+            },
+            "enabled_when": {
+              "op": "all",
+              "terms": [
+                {
+                  "op": "not",
+                  "term": {
+                    "op": "binding",
+                    "state": "native_only_volatile"
+                  }
+                },
+                {
+                  "op": "capability",
+                  "capability": "approval.respond",
+                  "state": "qualified_available"
+                }
+              ]
+            },
+            "disabled_reason": "This host cannot answer Claude Code's approvals on this channel; answer in the terminal"
+          },
+          {
+            "id": "deny",
+            "revision": "1",
+            "label": "Deny",
+            "icon": "cross",
+            "accessible_description": "Deny the tool call Claude Code is waiting on",
+            "action_id": "approval.answer",
+            "parameters": {
+              "parameters": [
+                {
+                  "name": "decision",
+                  "kind": {
+                    "type": "choice",
+                    "choices": [
+                      {
+                        "id": "deny",
+                        "label": "Deny"
+                      }
+                    ]
+                  },
+                  "label": "Decision",
+                  "required": true
+                }
+              ]
+            },
+            "priority": "secondary",
+            "visible_when": {
+              "op": "all",
+              "terms": [
+                {
+                  "op": "grant",
+                  "right": "agent.approval.respond"
+                },
+                {
+                  "op": "flag",
+                  "flag": "pending_approval"
+                }
+              ]
+            },
+            "enabled_when": {
+              "op": "all",
+              "terms": [
+                {
+                  "op": "not",
+                  "term": {
+                    "op": "binding",
+                    "state": "native_only_volatile"
+                  }
+                },
+                {
+                  "op": "capability",
+                  "capability": "approval.respond",
+                  "state": "qualified_available"
+                }
+              ]
+            },
+            "disabled_reason": "This host cannot answer Claude Code's approvals on this channel; answer in the terminal"
+          }
+        ]
+      }
+    },
+    {
+      "id": "compose",
+      "revision": "1",
+      "body": {
+        "kind": "form",
+        "title": "Message",
+        "fields": {
+          "parameters": [
+            {
+              "name": "text",
+              "kind": {
+                "type": "text",
+                "max_length": 8000,
+                "multiline": true
+              },
+              "label": "Message",
+              "required": true
+            }
+          ]
+        },
+        "submit": {
+          "id": "send",
+          "revision": "1",
+          "label": "Send",
+          "icon": "send",
+          "accessible_description": "Deliver this message into the Claude Code session",
+          "action_id": "prompt.send",
+          "parameters": {
+            "parameters": [
+              {
+                "name": "text",
+                "kind": {
+                  "type": "text",
+                  "max_length": 8000,
+                  "multiline": true
+                },
+                "label": "Message",
+                "required": true
+              }
+            ]
+          },
+          "priority": "primary",
+          "visible_when": {
+            "op": "all",
+            "terms": [
+              {
+                "op": "grant",
+                "right": "agent.prompt"
+              },
+              {
+                "op": "not",
+                "term": {
+                  "op": "binding",
+                  "state": "disabled"
+                }
+              }
+            ]
+          },
+          "enabled_when": {
+            "op": "all",
+            "terms": [
+              {
+                "op": "not",
+                "term": {
+                  "op": "binding",
+                  "state": "native_only_volatile"
+                }
+              },
+              {
+                "op": "capability",
+                "capability": "upstream.action",
+                "state": "qualified_available"
+              }
+            ]
+          },
+          "disabled_reason": "The channel is not carrying messages to this session"
+        }
+      }
+    },
+    {
+      "id": "controls",
+      "revision": "1",
+      "body": {
+        "kind": "action_group",
+        "label": "Session",
+        "controls": [
+          {
+            "id": "refresh",
+            "revision": "1",
+            "label": "Refresh",
+            "icon": "retry",
+            "accessible_description": "Draw the session's current state again from what this host already holds",
+            "action_id": "status.refresh",
+            "parameters": {
+              "parameters": []
+            },
+            "priority": "secondary",
+            "visible_when": {
+              "op": "not",
+              "term": {
+                "op": "binding",
+                "state": "disabled"
+              }
+            },
+            "enabled_when": {
+              "op": "not",
+              "term": {
+                "op": "flag",
+                "flag": "transfer_in_progress"
+              }
+            },
+            "disabled_reason": "An upload is in progress"
+          }
+        ]
+      }
+    }
+  ],
+  "voice": {
+    "status_nodes": [
+      "activity"
+    ],
+    "choice_controls": [
+      "send",
+      "allow",
+      "deny"
+    ],
+    "detail_nodes": [
+      "overview"
+    ]
+  }
+}

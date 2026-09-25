@@ -166,6 +166,7 @@ impl Site {
             }],
             search_path: vec![self.root.join("bin")],
             forwarder: Some(self.forwarder()),
+            signed_records: Vec::new(),
         }
     }
 

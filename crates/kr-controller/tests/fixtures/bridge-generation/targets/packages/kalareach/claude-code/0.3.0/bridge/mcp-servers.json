@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "kalareach": {
+      "type": "stdio",
+      "command": "kr-hook",
+      "args": [
+        "claude-code",
+        "channel"
+      ]
+    }
+  }
+}

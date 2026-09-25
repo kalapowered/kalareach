@@ -200,6 +200,8 @@ pub fn repository_transport(proxy: Option<&kr_transport::config::ProxyUrl>) -> R
 pub struct CatalogueModule {
     catalogue: Arc<Mutex<Catalogue>>,
     environment_id: EnvironmentId,
+    /// The native bridges installed packages put in their applications' own directories.
+    bridges: Arc<native_bridge::NativeBridges>,
 }
 
 impl CatalogueModule {
@@ -221,6 +223,27 @@ impl CatalogueModule {
         paths: &kr_ipc::paths::EnvironmentPaths,
         proxy: Option<&kr_transport::config::ProxyUrl>,
     ) -> crate::Result<Self> {
+        Self::open_with(
+            paths,
+            proxy,
+            native_bridge::BridgeHost::discover(paths.state_dir()),
+        )
+    }
+
+    /// Opens the environment's catalogue, applying native bridges where `bridges` says.
+    ///
+    /// Before this daemon serves anything, every package's bridge is brought to what its
+    /// installation wants: a recipe an earlier daemon left part way is finished or undone, and one
+    /// whose package is no longer installed is taken out.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::open`] returns.
+    pub fn open_with(
+        paths: &kr_ipc::paths::EnvironmentPaths,
+        proxy: Option<&kr_transport::config::ProxyUrl>,
+        bridges: native_bridge::BridgeHost,
+    ) -> crate::Result<Self> {
         let root = paths.state_dir().join("catalogue");
         let unavailable = |error: CatalogueError| crate::ControllerError::RegistryUnavailable {
             detail: error.to_string(),
@@ -230,10 +253,20 @@ impl CatalogueModule {
         catalogue
             .recover_interrupted(kr_ipc::now_ms().get())
             .map_err(unavailable)?;
+        let bridges = Arc::new(native_bridge::NativeBridges::new(bridges));
+        let environment_id = paths.environment_id();
         Ok(Self {
             catalogue: Arc::new(Mutex::new(catalogue)),
-            environment_id: paths.environment_id(),
+            environment_id,
+            bridges,
         })
+    }
+
+    /// Returns the native bridges installed packages put in place, which say what each applied
+    /// release yields.
+    #[must_use]
+    pub fn native_bridges(&self) -> &native_bridge::NativeBridges {
+        &self.bridges
     }
 
     /// Returns true when this daemon serves the method.

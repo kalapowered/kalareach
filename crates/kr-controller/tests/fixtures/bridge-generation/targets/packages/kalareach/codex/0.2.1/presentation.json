@@ -1,0 +1,125 @@
+{
+  "manifest_version": 1,
+  "base_revision": "1",
+  "nodes": [
+    {
+      "id": "overview",
+      "revision": "1",
+      "body": {
+        "kind": "markdown",
+        "source": "Codex CLI runs in its own terminal, and KalaReach keeps it there. The App Server behind it is read through a declarative table, so the session shows the thread, the running turn and the items it produces. Approvals are answered where Codex asks for them."
+      }
+    },
+    {
+      "id": "activity",
+      "revision": "1",
+      "body": {
+        "kind": "progress",
+        "label": "Waiting for Codex",
+        "state": {
+          "kind": "indeterminate"
+        }
+      }
+    },
+    {
+      "id": "controls",
+      "revision": "1",
+      "body": {
+        "kind": "action_group",
+        "label": "Turn",
+        "controls": [
+          {
+            "id": "cancel",
+            "revision": "1",
+            "label": "Stop the turn",
+            "icon": "stop",
+            "accessible_description": "Ask Codex to cancel the turn it is running",
+            "action_id": "turn.cancel",
+            "parameters": {
+              "parameters": []
+            },
+            "priority": "destructive",
+            "visible_when": {
+              "op": "all",
+              "terms": [
+                {
+                  "op": "grant",
+                  "right": "agent.cancel"
+                },
+                {
+                  "op": "not",
+                  "term": {
+                    "op": "binding",
+                    "state": "disabled"
+                  }
+                }
+              ]
+            },
+            "enabled_when": {
+              "op": "all",
+              "terms": [
+                {
+                  "op": "any",
+                  "terms": [
+                    {
+                      "op": "binding",
+                      "state": "upstream_busy"
+                    },
+                    {
+                      "op": "binding",
+                      "state": "awaiting_person"
+                    }
+                  ]
+                },
+                {
+                  "op": "capability",
+                  "capability": "upstream.action",
+                  "state": "qualified_available"
+                }
+              ]
+            },
+            "disabled_reason": "Codex has no turn in flight that this host can stop"
+          },
+          {
+            "id": "refresh",
+            "revision": "1",
+            "label": "Refresh",
+            "icon": "retry",
+            "accessible_description": "Draw the thread's current state again from what this host already holds",
+            "action_id": "thread.refresh",
+            "parameters": {
+              "parameters": []
+            },
+            "priority": "secondary",
+            "visible_when": {
+              "op": "not",
+              "term": {
+                "op": "binding",
+                "state": "disabled"
+              }
+            },
+            "enabled_when": {
+              "op": "not",
+              "term": {
+                "op": "flag",
+                "flag": "transfer_in_progress"
+              }
+            },
+            "disabled_reason": "An upload is in progress"
+          }
+        ]
+      }
+    }
+  ],
+  "voice": {
+    "status_nodes": [
+      "activity"
+    ],
+    "choice_controls": [
+      "cancel"
+    ],
+    "detail_nodes": [
+      "overview"
+    ]
+  }
+}

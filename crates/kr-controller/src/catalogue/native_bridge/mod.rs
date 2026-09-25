@@ -93,6 +93,10 @@ pub struct BridgeHost {
     pub search_path: Vec<PathBuf>,
     /// The forwarder this installation's registrations are expected to start.
     pub forwarder: Option<PathBuf>,
+    /// Signed qualification records this host's own tests stand in for, read beside the ones a
+    /// release carries. No shipped build has the field.
+    #[cfg(feature = "testing")]
+    pub signed_records: Vec<QualifiedExecutable>,
 }
 
 impl BridgeHost {
@@ -113,6 +117,8 @@ impl BridgeHost {
                 .ok()
                 .and_then(|path| path.parent().map(|directory| directory.join(FORWARDER)))
                 .filter(|path| path.is_file()),
+            #[cfg(feature = "testing")]
+            signed_records: Vec::new(),
         }
     }
 }
@@ -593,7 +599,11 @@ impl NativeBridges {
     ) -> std::result::Result<Vec<(PathBuf, String)>, String> {
         let range = &target.recipe.application_range;
         let application = target.recipe.application.as_str();
-        if target.qualified.is_empty() {
+        #[cfg_attr(not(feature = "testing"), expect(unused_mut))]
+        let mut qualified = target.qualified.clone();
+        #[cfg(feature = "testing")]
+        qualified.extend(self.host.signed_records.iter().cloned());
+        if qualified.is_empty() {
             return Err(format!(
                 "no signed qualification record names an executable of {application}, so the \
                  recipe's requirement {range} cannot be shown to hold"
@@ -632,8 +642,7 @@ impl NativeBridges {
         let mut versions = Vec::new();
         for path in found {
             let digest = read_executable(&path)?;
-            let record = target
-                .qualified
+            let record = qualified
                 .iter()
                 .find(|record| record.digest == digest)
                 .ok_or_else(|| {

@@ -1,0 +1,125 @@
+{
+  "corpus_version": 1,
+  "protocol": "claude-code-channels",
+  "tested_version": "2.1.278",
+  "source": "Frames written from the published Channels reference's own examples and the field names present in the installed 2.1.278 executable. They are not a capture of a live session.",
+  "frames": [
+    {
+      "situation": "a message delivered into the session",
+      "note": "A channel event carries no correlation identifier, because nothing answers it",
+      "frame": {
+        "method": "notifications/claude/channel",
+        "params": {
+          "content": "build failed on main",
+          "meta": {
+            "chat_id": "1"
+          }
+        }
+      },
+      "expect": {
+        "wire_name": "notifications/claude/channel",
+        "method": "channel.event",
+        "direction": "host_to_upstream",
+        "class": "mutation",
+        "request_id": null,
+        "members": {
+          "params.content": "build failed on main"
+        }
+      }
+    },
+    {
+      "situation": "a relayed tool approval",
+      "note": "The correlation identifier is params.request_id; this surface carries no JSON-RPC id",
+      "frame": {
+        "method": "notifications/claude/channel/permission_request",
+        "params": {
+          "request_id": "abcde",
+          "tool_name": "Bash",
+          "description": "Run shell command",
+          "input_preview": "{\"command\":\"rm -rf build\"}"
+        }
+      },
+      "expect": {
+        "wire_name": "notifications/claude/channel/permission_request",
+        "method": "channel.permission-request",
+        "direction": "upstream_to_host",
+        "class": "mutation",
+        "request_id": "abcde",
+        "members": {
+          "params.tool_name": "Bash",
+          "params.request_id": "abcde"
+        }
+      }
+    },
+    {
+      "situation": "the answer to that approval",
+      "note": "The answer repeats the identifier the request carried",
+      "frame": {
+        "method": "notifications/claude/channel/permission",
+        "params": {
+          "request_id": "abcde",
+          "behavior": "allow"
+        }
+      },
+      "expect": {
+        "wire_name": "notifications/claude/channel/permission",
+        "method": "channel.permission",
+        "direction": "host_to_upstream",
+        "class": "mutation",
+        "request_id": "abcde",
+        "members": {
+          "params.behavior": "allow",
+          "params.request_id": "abcde"
+        }
+      }
+    },
+    {
+      "situation": "an answer naming a request nobody issued",
+      "note": "The identifier is read verbatim, which is what lets the host refuse it rather than dispatch it",
+      "frame": {
+        "method": "notifications/claude/channel/permission",
+        "params": {
+          "request_id": "zzzzz",
+          "behavior": "allow"
+        }
+      },
+      "expect": {
+        "wire_name": "notifications/claude/channel/permission",
+        "method": "channel.permission",
+        "direction": "host_to_upstream",
+        "class": "mutation",
+        "request_id": "zzzzz",
+        "members": {
+          "params.behavior": "allow",
+          "params.request_id": "zzzzz"
+        }
+      }
+    },
+    {
+      "situation": "a method the table does not list",
+      "note": "An ordinary MCP tool call is not on this surface, so it is a mutation by default",
+      "frame": {
+        "method": "tools/call",
+        "id": 7,
+        "params": {
+          "name": "reply"
+        }
+      },
+      "expect": {
+        "wire_name": "tools/call",
+        "method": null,
+        "direction": null,
+        "class": "mutation",
+        "request_id": null
+      }
+    }
+  ],
+  "evidence": {
+    "executable": {
+      "path": "~/.local/share/claude/versions/2.1.278",
+      "platform": "macos-aarch64",
+      "sha256": "bd245662fb8a0e321b3bf133e930371d6563c387527885f30b2613aef3ba14d6"
+    },
+    "read_on": "2026-09-20"
+  }
+}
