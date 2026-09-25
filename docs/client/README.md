@@ -618,22 +618,22 @@ finds its record and confirms that instead.
 While it waits for the owner, the device asks `pair.status` every three seconds. A host answers an
 unpaired connection four times in any ten seconds and sixteen times in all, and ends it a minute
 after it answered the connection's handshake. So the device counts its questions the way the host
-does, counts that minute from before its offer went, which is never later than the host, waits
-when the window is full, and asks nothing on a connection after its last call, ten seconds before
-the host ends it. From four questions before the end, by count or by time, it opens a fresh
-connection before each question, asks there, and changes to it once it has answered. A host that
-commits the device serves it nothing on a new unpaired connection, so the old connection is then
-the only place to learn what the device became. The device keeps its last question there while
-fresh connections fail, and does the same with a question the host's window would hold back past
-the last call; it asks that question at the last call, as soon as the window has room. Ten seconds
-before the attempt's own deadline every answer is final, and from then on the device asks the
-connection it holds at its usual pace and looks for no other. A commit made after the last question
-on the last connection opened before it, while no new connection opens, is one the device cannot
-learn of by itself, and the attempt ends as `approval_unknown`. A change of connection is not a
-lost connection, and the device does not show it as one. A host that turns a question away as too soon keeps the
-connection. It counts the questions it refuses as well, so the device waits twice as long after each
-refusal in a row, however long that grows, up to the attempt's own deadline and the connection's
-last call.
+does, counts that minute from before its offer went, which is never later than the host, waits when
+the window is full, and asks nothing on a connection after its last call, ten seconds before the
+host ends it. From four questions before the end, by count or by time, it opens a fresh connection
+before each question, asks there, and changes to it once it has answered. A host that commits the
+device serves it nothing on a new unpaired connection, so the old connection is then the only place
+to learn what the device became. The device keeps its last question there while fresh connections
+fail, and asks it at the last call. A question that would leave the host's window no room at the
+call is kept for the call instead, so the window always has room for the last question when the call
+comes. Ten seconds before the attempt's own deadline every answer is final, and from then on the
+device asks the connection it holds at its usual pace and looks for no other. A commit made after
+the last question on the last connection opened before it, while no new connection opens, is one the
+device cannot learn of by itself, and the attempt ends as `approval_unknown`. A change of connection
+is not a lost connection, and the device does not show it as one. A host that turns a question away
+as too soon keeps the connection. It counts the questions it refuses as well, so the device waits
+twice as long after each refusal in a row, however long that grows, up to the attempt's own deadline
+and the connection's last call.
 
 `owner` is the owner device's half. It reads `owner.confirmation.pending` over the device's
 authorised session, checks each challenge against what it would authorise, and describes it in one
