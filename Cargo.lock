@@ -4407,9 +4407,14 @@ dependencies = [
 name = "kr-conformance"
 version = "0.1.0"
 dependencies = [
+ "kr-crypto",
+ "kr-ipc",
+ "kr-protocol",
+ "kr-worker",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
