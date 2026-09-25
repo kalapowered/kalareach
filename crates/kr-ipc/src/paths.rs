@@ -1187,27 +1187,29 @@ mod windows {
     /// A file is replaced by writing a new file in its directory and renaming it over the old one,
     /// and the new file carries what Windows gives a file created there, not what the old one
     /// carried. Two readings are equal when everything that decides access is equal, as the file
-    /// system stores it: the owner; the discretionary list (absent, or with its protection, whether
-    /// it records inheritance, and its entries in order, each an allow or a deny with its flags,
-    /// its account and its rights, generic rights read as the file rights they stand for); and the
-    /// system list's protection, whether it records inheritance, and its mandatory label entries in
-    /// order, each label's mask read as the policy it is. Nothing else is compared, because nothing
-    /// else is read: a file carrying any other control that decides access is refused instead (see
-    /// [`FileAccess::read`]).
+    /// system stores it: the owner; the discretionary list's protection, whether it records
+    /// inheritance, and its entries in order, each an allow or a deny with its flags, its account
+    /// and its rights, generic rights read as the file rights they stand for, or that there is no
+    /// list at all; and the system list's protection, whether it records inheritance, and its
+    /// mandatory label entries in order, each label's mask read as the policy it is. Nothing else is
+    /// compared, because nothing else is read: a file carrying any other control that decides access
+    /// is refused instead (see [`FileAccess::read`]).
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct FileAccess {
         owner: Account,
-        discretionary: Option<AccessList>,
+        discretionary: AccessList,
         system: SystemList,
     }
 
-    /// A discretionary list: whether it is protected from what its directory passes down, whether
-    /// it records which entries it inherited, and its entries in the order access is decided by.
+    /// The discretionary list: whether it is protected from what its directory passes down and
+    /// whether it records which entries it inherited, both of which the descriptor states even
+    /// where there is no list, and its entries in the order access is decided by, or `None` for no
+    /// list at all, which grants every account everything.
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct AccessList {
         protected: bool,
         records_inheritance: bool,
-        entries: Vec<AccessEntry>,
+        entries: Option<Vec<AccessEntry>>,
     }
 
     /// The part of the system list that decides access: its protection, whether it records which
@@ -1349,16 +1351,17 @@ mod windows {
         /// list changed since the file inherited from it and for a file moved in from elsewhere.
         #[must_use]
         pub fn records_nothing_set_here(&self) -> bool {
-            let Some(list) = &self.discretionary else {
+            let list = &self.discretionary;
+            let Some(entries) = &list.entries else {
                 return false;
             };
             let set_here = |recorded: bool, entries: &[AccessEntry]| {
                 recorded && entries.iter().any(|entry| !entry.is_inherited())
             };
             !list.protected
-                && !list.entries.is_empty()
+                && !entries.is_empty()
                 && !self.system.protected
-                && !set_here(list.records_inheritance, &list.entries)
+                && !set_here(list.records_inheritance, entries)
                 && !set_here(self.system.records_inheritance, &self.system.labels)
         }
 
@@ -1456,14 +1459,14 @@ mod windows {
         }
         // No list at all grants every account full access, which is not the same as a list with no
         // entries, which grants nothing.
-        let discretionary = if present == 0 || list.is_null() {
-            None
-        } else {
-            Some(AccessList {
-                protected: control & SE_DACL_PROTECTED != 0,
-                records_inheritance: control & SE_DACL_AUTO_INHERITED != 0,
-                entries: entries(list, descriptor, false)?,
-            })
+        let discretionary = AccessList {
+            protected: control & SE_DACL_PROTECTED != 0,
+            records_inheritance: control & SE_DACL_AUTO_INHERITED != 0,
+            entries: if present == 0 || list.is_null() {
+                None
+            } else {
+                Some(entries(list, descriptor, false)?)
+            },
         };
 
         let mut system: *mut ACL = std::ptr::null_mut();
@@ -1974,13 +1977,25 @@ mod windows {
         /// entry in it that is not marked inherited says nothing either way.
         #[test]
         fn only_a_list_that_records_inheritance_shows_an_entry_set_here() {
+            fn entries(access: &mut FileAccess) -> &mut Vec<AccessEntry> {
+                access
+                    .discretionary
+                    .entries
+                    .as_mut()
+                    .expect("the control has a list")
+            }
+
             let control = FileAccess {
                 owner: system(),
-                discretionary: Some(AccessList {
+                discretionary: AccessList {
                     protected: false,
                     records_inheritance: true,
-                    entries: vec![entry(EntryKind::Allow, INHERITED_ACE, FILE_ALL_ACCESS)],
-                }),
+                    entries: Some(vec![entry(
+                        EntryKind::Allow,
+                        INHERITED_ACE,
+                        FILE_ALL_ACCESS,
+                    )]),
+                },
                 system: SystemList {
                     protected: false,
                     records_inheritance: true,
@@ -1994,30 +2009,22 @@ mod windows {
                 change(&mut access);
                 access
             };
-            fn list(access: &mut FileAccess) -> &mut AccessList {
-                access
-                    .discretionary
-                    .as_mut()
-                    .expect("the control has a list")
-            }
             for (what, access) in [
                 (
                     "a protected list of inherited entries",
-                    changed(&|access| list(access).protected = true),
+                    changed(&|access| access.discretionary.protected = true),
                 ),
                 (
                     "an entry set here",
                     changed(&|access| {
-                        list(access)
-                            .entries
-                            .push(entry(EntryKind::Deny, 0, FILE_GENERIC_WRITE));
+                        entries(access).push(entry(EntryKind::Deny, 0, FILE_GENERIC_WRITE));
                     }),
                 ),
+                ("an empty list", changed(&|access| entries(access).clear())),
                 (
-                    "an empty list",
-                    changed(&|access| list(access).entries.clear()),
+                    "no list",
+                    changed(&|access| access.discretionary.entries = None),
                 ),
-                ("no list", changed(&|access| access.discretionary = None)),
                 (
                     "a protected system list",
                     changed(&|access| access.system.protected = true),
@@ -2030,17 +2037,31 @@ mod windows {
                 assert!(!access.records_nothing_set_here(), "{what}");
                 assert_ne!(access, control, "{what}");
             }
+            let absent = changed(&|access| access.discretionary.entries = None);
             assert_ne!(
-                changed(&|access| access.discretionary = None),
-                changed(&|access| list(access).entries.clear()),
+                absent,
+                changed(&|access| entries(access).clear()),
                 "no list is not an empty one"
+            );
+
+            // Where there is no list, the descriptor still says whether it is protected and
+            // whether it records inheritance, and each is compared: the control reads equal.
+            let reread = absent.clone();
+            assert_eq!(reread, absent);
+            let mut protected = absent.clone();
+            protected.discretionary.protected = true;
+            assert_ne!(protected, absent, "a protected absent list");
+            let mut unrecorded = absent.clone();
+            unrecorded.discretionary.records_inheritance = false;
+            assert_ne!(
+                unrecorded, absent,
+                "an absent list that records no inheritance"
             );
 
             // Written the older way, neither list says which of its entries it inherited.
             let older = changed(&|access| {
-                let list = list(access);
-                list.records_inheritance = false;
-                list.entries = vec![entry(EntryKind::Allow, 0, FILE_ALL_ACCESS)];
+                access.discretionary.records_inheritance = false;
+                *entries(access) = vec![entry(EntryKind::Allow, 0, FILE_ALL_ACCESS)];
                 access.system.records_inheritance = false;
                 access.system.labels = vec![entry(EntryKind::Label, 0, 1)];
             });
@@ -3164,6 +3185,16 @@ mod tests {
             "no list is not read as one that grants everything"
         );
         assert!(!absent.records_nothing_set_here());
+        assert_eq!(
+            access(&directory.described("no-list-again", "D:NO_ACCESS_CONTROL")),
+            absent,
+            "the same absent list reads the same"
+        );
+        assert_ne!(
+            access(&directory.described("no-list-protected", "D:PNO_ACCESS_CONTROL")),
+            absent,
+            "an absent list protected from its directory"
+        );
         // An empty list grants nothing, not even the synchronisation every open of a file asks
         // for, so its owner cannot open it to read its descriptor: a read that failed, never a
         // file read as having no list.
