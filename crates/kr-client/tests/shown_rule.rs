@@ -589,11 +589,10 @@ struct Source {
     module: Vec<String>,
     /// Its production tokens: everything that can compile without `test`.
     tokens: Vec<Located>,
-    /// The scope each production token is in, as an index into `scopes`.
+    /// The innermost scope each production token is in, as an index into `scopes`.
     token_scopes: Vec<usize>,
-    /// Each module scope's path below the file's own module: the file itself first, then every
-    /// module it declares inline.
-    scopes: Vec<Vec<String>>,
+    /// Every scope of the file: the file itself first, then each inline module and block.
+    scopes: Vec<Scope>,
     /// The modules it declares in files of their own, and whether each is test code.
     children: Vec<(String, bool)>,
     /// The names each scope imports.
@@ -604,6 +603,17 @@ struct Source {
     definitions: BTreeSet<(usize, String)>,
     /// What this reading cannot follow in it.
     problems: Vec<Finding>,
+}
+
+/// One scope of a file: a module, the file's own or one written inline, or a block inside one.
+struct Scope {
+    /// The scope it is written in; none for the file itself.
+    parent: Option<usize>,
+    /// Its module's path below the file's own module.
+    module: Vec<String>,
+    /// Whether it is a block, whose inner scopes see its names, rather than a module, whose names
+    /// stay its own.
+    block: bool,
 }
 
 /// The primitive types, which every file names without importing them.
@@ -638,13 +648,14 @@ const DERIVES: [&str; 20] = [
 ];
 
 /// Attributes whose presence under a `cfg_attr` would change what this reading reads.
-const READ_ATTRIBUTES: [&str; 7] = [
+const READ_ATTRIBUTES: [&str; 8] = [
     "path",
     "error",
     "derive",
     "source",
     "from",
     "cfg",
+    "cfg_attr",
     "macro_use",
 ];
 
@@ -667,20 +678,36 @@ impl Source {
     fn module_of(&self, scope: usize) -> Vec<String> {
         self.module
             .iter()
-            .chain(&self.scopes[scope])
+            .chain(&self.scopes[scope].module)
             .cloned()
             .collect()
     }
 
-    /// Whether `name` is a module declared in `scope`: a file of its own at the file's top, or an
-    /// inline one written there.
+    /// The scopes whose names a path written in `scope` can use without a prefix: the scope itself
+    /// and each block around it, up to and including the module they are in.
+    fn visible(&self, scope: usize) -> Vec<usize> {
+        let mut visible = vec![scope];
+        let mut current = scope;
+        while self.scopes[current].block {
+            let Some(parent) = self.scopes[current].parent else {
+                break;
+            };
+            visible.push(parent);
+            current = parent;
+        }
+        visible
+    }
+
+    /// Whether `name` is a module declared where `scope` is: a file of its own at the file's top,
+    /// or an inline one written in the same module.
     fn declares_module(&self, scope: usize, name: &str) -> bool {
-        let parent = &self.scopes[scope];
-        (scope == 0 && self.children.iter().any(|(child, _)| child == name))
-            || self.scopes.iter().any(|path| {
-                path.len() == parent.len() + 1
-                    && path.starts_with(parent)
-                    && path.last().is_some_and(|last| last == name)
+        let module = &self.scopes[scope].module;
+        (module.is_empty() && self.children.iter().any(|(child, _)| child == name))
+            || self.scopes.iter().any(|other| {
+                !other.block
+                    && other.module.len() == module.len() + 1
+                    && other.module.starts_with(module)
+                    && other.module.last().is_some_and(|last| last == name)
             })
     }
 
@@ -734,28 +761,42 @@ impl Source {
         } else if rest.is_empty() && PRIMITIVES.contains(&first.as_str()) {
             vec!["prim".to_owned(), first.clone()]
         } else {
-            let imported: BTreeSet<&Vec<String>> = self
-                .imports
-                .iter()
-                .filter(|import| import.scope == scope && import.local == *first)
-                .map(|import| &import.path)
-                .collect();
-            if imported.len() > 1 {
-                return None;
+            // The innermost scope that imports or defines the name decides it, as it does for the
+            // compiler; one that names it twice, or both ways, is not placed.
+            let mut placed = None;
+            for visible in self.visible(scope) {
+                let imported: BTreeSet<&Vec<String>> = self
+                    .imports
+                    .iter()
+                    .filter(|import| import.scope == visible && import.local == *first)
+                    .map(|import| &import.path)
+                    .collect();
+                let defined =
+                    rest.is_empty() && self.definitions.contains(&(visible, first.clone()));
+                match (imported.len(), defined) {
+                    (0, false) => continue,
+                    (1, false) => {
+                        let path = imported.into_iter().next()?;
+                        placed = Some(path.iter().chain(rest).cloned().collect::<Vec<_>>());
+                    }
+                    (0, true) => {
+                        placed = Some(
+                            self.module_of(visible)
+                                .into_iter()
+                                .chain(segments.iter().cloned())
+                                .collect(),
+                        );
+                    }
+                    _ => return None,
+                }
+                break;
             }
-            if let Some(path) = imported.into_iter().next() {
-                path.iter().chain(rest).cloned().collect()
-            } else if rest.is_empty() && self.definitions.contains(&(scope, first.clone())) {
-                self.module_of(scope)
-                    .into_iter()
-                    .chain(segments.iter().cloned())
-                    .collect()
-            } else if rest.is_empty() {
-                // A bare name neither imported nor defined in its scope: a glob's or the
-                // prelude's, which this reading does not place.
-                return None;
-            } else {
-                segments.to_vec()
+            match placed {
+                Some(path) => path,
+                // A bare name no visible scope imports or defines: a glob's or the prelude's,
+                // which this reading does not place.
+                None if rest.is_empty() => return None,
+                None => segments.to_vec(),
             }
         };
         let joined = path.join("::");
@@ -843,7 +884,11 @@ fn read_source(
         module,
         tokens: Vec::new(),
         token_scopes: Vec::new(),
-        scopes: vec![Vec::new()],
+        scopes: vec![Scope {
+            parent: None,
+            module: Vec::new(),
+            block: false,
+        }],
         children: Vec::new(),
         imports: Vec::new(),
         globs: BTreeSet::new(),
@@ -935,32 +980,36 @@ fn read_source(
     if !file_test {
         source.tokens.append(&mut attributes);
     }
-    // The module scope of every production token: the file's own, or an inline module's.
+    // The innermost scope of every production token: the file's own, an inline module's, or a
+    // block's. Every brace opens a scope, and a module's opens a module's.
     let tokens = std::mem::take(&mut source.tokens);
-    let mut stack: Vec<(usize, i64)> = Vec::new();
-    let mut depth = 0_i64;
+    let mut stack: Vec<usize> = Vec::new();
     let mut opening: Option<String> = None;
     for (at, located) in tokens.iter().enumerate() {
-        let current = stack.last().map_or(0, |(scope, _)| *scope);
+        let current = stack.last().copied().unwrap_or(0);
         source.token_scopes.push(current);
         match &located.token {
             Token::Ident(word) if word == "mod" && punct(tokens.get(at + 2), '{') => {
                 opening = ident(tokens.get(at + 1)).map(ToOwned::to_owned);
             }
             Token::Punct('{') => {
-                depth += 1;
-                if let Some(name) = opening.take() {
-                    let mut path = source.scopes[current].clone();
-                    path.push(name);
-                    source.scopes.push(path);
-                    stack.push((source.scopes.len() - 1, depth));
-                }
+                let mut module = source.scopes[current].module.clone();
+                let block = match opening.take() {
+                    Some(name) => {
+                        module.push(name);
+                        false
+                    }
+                    None => true,
+                };
+                source.scopes.push(Scope {
+                    parent: Some(current),
+                    module,
+                    block,
+                });
+                stack.push(source.scopes.len() - 1);
             }
             Token::Punct('}') => {
-                if stack.last().is_some_and(|(_, opened)| *opened == depth) {
-                    stack.pop();
-                }
-                depth -= 1;
+                stack.pop();
             }
             _ => {}
         }
@@ -1539,7 +1588,7 @@ fn check_source(
                     "a protocol error built from text outside kr_client::error::refusal",
                 );
             }
-            "eprint" | "eprintln" if next_is_bang && source.name != REPORTER_FILE => {
+            "eprint" | "eprintln" | "dbg" if next_is_bang && source.name != REPORTER_FILE => {
                 find(line, word, "standard error written outside the reporter");
             }
             // A call of `stderr()`, not a method of that name such as a command's.
@@ -1580,14 +1629,13 @@ fn check_source(
                     find(line, word, "an assertion that formats a value");
                 }
             }
-            // A method call, and a path call such as `Result::expect(value, "...")`; not a lint
-            // attribute of the same name.
+            // A method call, and any reference to one by its path, called at once, called
+            // through parentheses or passed on; not a field or a lint attribute of the same name.
             "unwrap" | "expect" | "unwrap_err" | "expect_err"
-                if punct(tokens.get(index + 1), '(')
-                    && (after_dot
-                        || index >= 2
-                            && punct(tokens.get(index - 1), ':')
-                            && punct(tokens.get(index - 2), ':')) =>
+                if after_dot && punct(tokens.get(index + 1), '(')
+                    || index >= 2
+                        && punct(tokens.get(index - 1), ':')
+                        && punct(tokens.get(index - 2), ':') =>
             {
                 find(
                     line,
@@ -2347,6 +2395,36 @@ fn each_break_of_the_rule_is_named_with_its_class_and_place() {
             "error field of type kr_cli::control::second::Uuid",
         ),
         (
+            "a cfg_attr inside a cfg_attr",
+            "#[derive(thiserror::Error)]\npub enum Failure {\n    #[cfg_attr(all(), cfg_attr(all(), error(\"{0}\")))]\n    Failed(String),\n}\nkr_client::debug_as_display!(Failure);\n",
+            3,
+            "an attribute under cfg_attr",
+        ),
+        (
+            "a name placed in another function's block",
+            "fn first() {\n    use kr_protocol::scalars::Uuid;\n}\nfn second() {\n    type Uuid = String;\n    #[derive(thiserror::Error)]\n    enum Failure {\n        #[error(\"failed: {0}\")]\n        Failed(Uuid),\n    }\n    kr_client::debug_as_display!(Failure);\n}\n",
+            9,
+            "error field of type kr_cli::control::Uuid",
+        ),
+        (
+            "an expect called through parentheses",
+            "fn f(input: String) {\n    (Result::expect)(Err::<(), _>(std::io::Error::other(input)), \"read\");\n}\n",
+            2,
+            "an unwrap or expect",
+        ),
+        (
+            "an unwrap passed on",
+            "fn f(values: Vec<Option<u8>>) -> Vec<u8> {\n    values.into_iter().map(Option::unwrap).collect()\n}\n",
+            2,
+            "an unwrap or expect",
+        ),
+        (
+            "a value printed by dbg",
+            "fn f(input: &str) {\n    dbg!(input);\n}\n",
+            2,
+            "standard error written outside",
+        ),
+        (
             "an error whose Debug is not its Display",
             "#[derive(thiserror::Error)]\npub enum Failure {\n    #[error(\"failed\")]\n    Failed,\n}\n",
             0,
@@ -2399,6 +2477,8 @@ fn what_the_rule_allows_is_not_named() {
                     Unsettled { sent: [u8; 32], text: String },\n\
                 }\n\
                 kr_client::debug_as_display!(Failure);\n\
+                pub struct Arguments { pub expect: Vec<String> }\n\
+                fn e(arguments: &Arguments) -> usize { arguments.expect.len() }\n\
                 fn f(ok: bool) {\n    \
                     assert!(ok, \"it holds\");\n    \
                     let Some(one) = Some(1) else { unreachable!(\"there is one\") };\n    \
