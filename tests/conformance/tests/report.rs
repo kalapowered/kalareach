@@ -385,6 +385,10 @@ fn a_source_outside_the_conventions_is_a_problem_and_keys_no_helper() {
                 "`println` is declared here as a macro",
             ),
             (
+                "tests/pages/mod.rs:1",
+                "a `path` attribute inside a module's own file",
+            ),
+            (
                 "tests/localcore.rs:3",
                 "`core` is declared here as a module",
             ),
@@ -479,6 +483,7 @@ fn a_source_outside_the_conventions_is_a_problem_and_keys_no_helper() {
         "KR-REQ-03.65",
         "KR-REQ-03.66",
         "KR-REQ-03.67",
+        "KR-REQ-03.69",
     ] {
         let row = identifier(row);
         assert!(
