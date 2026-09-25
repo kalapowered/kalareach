@@ -65,7 +65,21 @@ pub(super) enum Child {
     NotADirectory,
 }
 
+/// What reading one name found.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+pub(super) enum Fetched {
+    /// Nothing is there.
+    Absent,
+    /// A regular file, read whole.
+    File(Read),
+    /// Something that is not a regular file is there, or a link.
+    NotRegular,
+    /// A regular file larger than the reader takes.
+    TooLarge,
+}
+
 /// A file read through the directory's handle.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 pub(super) struct Read {
     /// Its bytes.
     pub(super) bytes: Vec<u8>,
@@ -86,7 +100,7 @@ mod platform {
     use rustix::fs::{AtFlags, FileType, Mode, OFlags, RenameFlags};
     use rustix::io::Errno;
 
-    use super::{Child, Entry, Identity, Read};
+    use super::{Child, Entry, Fetched, Identity, Read};
 
     /// An open directory, and the path it was reached by, for messages and for the checks that
     /// only take a path.
@@ -181,47 +195,39 @@ mod platform {
             }
         }
 
-        /// Reads a regular file of at most `limit` bytes; `None` when nothing is there.
-        pub(in crate::catalogue::native_bridge) fn read(
+        /// Reads a regular file of at most `limit` bytes, without following a link.
+        pub(in crate::catalogue::native_bridge) fn fetch(
             &self,
             name: &str,
             limit: u64,
-        ) -> std::io::Result<Option<Read>> {
+        ) -> std::io::Result<Fetched> {
             let file = match self.open_regular(name) {
                 Ok(Some(file)) => file,
-                Ok(None) => {
-                    return Err(std::io::Error::other(format!(
-                        "{} is not a regular file",
-                        self.join(name).display()
-                    )));
+                Ok(None) => return Ok(Fetched::NotRegular),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(Fetched::Absent);
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(error) => return Err(error),
             };
             let metadata = file.metadata()?;
             if metadata.len() > limit {
-                return Err(std::io::Error::other(format!(
-                    "{} is larger than the {limit} bytes this host reads of it",
-                    self.join(name).display()
-                )));
+                return Ok(Fetched::TooLarge);
             }
             let mut bytes = Vec::new();
             (&file).take(limit + 1).read_to_end(&mut bytes)?;
             if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limit {
-                return Err(std::io::Error::other(format!(
-                    "{} grew past the {limit} bytes this host reads of it",
-                    self.join(name).display()
-                )));
+                return Ok(Fetched::TooLarge);
             }
             use std::os::unix::fs::PermissionsExt as _;
-            Ok(Some(Read {
+            Ok(Fetched::File(Read {
                 bytes,
                 identity: identity(&metadata),
                 mode: metadata.permissions().mode() & 0o777,
             }))
         }
 
-        /// Writes `bytes` to a new file at `name`, flushes it, and returns its identity.
+        /// Writes `bytes` to a new file at `name` with exactly the permission bits of `mode`,
+        /// flushes it, and returns its identity.
         pub(in crate::catalogue::native_bridge) fn stage(
             &self,
             name: &str,
@@ -234,10 +240,25 @@ mod platform {
                 OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 permissions(mode),
             )?;
+            // The creation mask narrows what the file is created with. The bits are set again,
+            // before anything is written, so a replacement has the protection of the file it
+            // replaces, no more and no less.
+            let exact = rustix::fs::fchmod(&handle, permissions(mode)).map_err(Into::into);
             let mut file = std::fs::File::from(handle);
-            file.write_all(bytes)?;
-            file.sync_all()?;
-            Ok(identity(&file.metadata()?))
+            let staged = exact
+                .and_then(|()| file.write_all(bytes))
+                .and_then(|()| file.sync_all())
+                .and_then(|()| file.metadata());
+            match staged {
+                Ok(metadata) => Ok(identity(&metadata)),
+                Err(error) => {
+                    // This call made the file and nothing else knows its name yet, so a copy it
+                    // could not finish is its own to remove.
+                    drop(file);
+                    let _ = rustix::fs::unlinkat(self.handle.as_fd(), name, AtFlags::empty());
+                    Err(error)
+                }
+            }
         }
 
         /// Renames `from` to `to` only where nothing is at `to`.
@@ -341,7 +362,7 @@ mod platform {
 mod platform {
     use std::path::{Path, PathBuf};
 
-    use super::{Child, Entry, Identity, Read};
+    use super::{Child, Entry, Fetched, Identity};
 
     fn unsupported() -> std::io::Error {
         std::io::Error::new(
@@ -394,11 +415,11 @@ mod platform {
             Err(unsupported())
         }
 
-        pub(in crate::catalogue::native_bridge) fn read(
+        pub(in crate::catalogue::native_bridge) fn fetch(
             &self,
             _name: &str,
             _limit: u64,
-        ) -> std::io::Result<Option<Read>> {
+        ) -> std::io::Result<Fetched> {
             Err(unsupported())
         }
 
@@ -472,7 +493,7 @@ pub(super) fn parent_of<'p>(root: &Dir, path: &'p str) -> std::io::Result<Walk<'
         walked.push_str(part);
         let next = match current.as_ref().unwrap_or(root).child(part)? {
             Child::Directory(directory) => directory,
-            Child::Absent => return Ok(Walk::Missing),
+            Child::Absent => return Ok(Walk::Missing { reached: current }),
             Child::NotADirectory => return Ok(Walk::Substituted(walked)),
         };
         current = Some(next);
@@ -492,8 +513,12 @@ pub(super) enum Walk<'p> {
         /// The last component.
         name: &'p str,
     },
-    /// A directory on the way is not there.
-    Missing,
+    /// A directory on the way is not there. `reached` is the deepest one that is, `None` when that
+    /// is the application's directory.
+    Missing {
+        /// The deepest directory on the way that is there.
+        reached: Option<Dir>,
+    },
     /// A directory on the way is a link, or not a directory.
     Substituted(String),
 }

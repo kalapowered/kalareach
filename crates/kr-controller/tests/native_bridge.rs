@@ -410,6 +410,38 @@ fn an_applied_release_is_read_back_and_left_as_it_is() {
     );
 }
 
+/// A release applied in one directory, and wanted again once this host keeps the application's
+/// plugins in another, is taken out of the first and applied in the second.
+#[test]
+fn a_release_follows_the_application_directory_to_another_place() {
+    let site = Site::new();
+    let before = site.tree();
+    site.bridges()
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("applies");
+    let other = site.root.join("other/.claude");
+    std::fs::create_dir_all(&other).expect("another directory");
+    std::fs::write(other.join("settings.json"), SETTINGS).expect("settings");
+    let other_before = snapshot(&other);
+    let moved = NativeBridges::new(BridgeHost {
+        applications: vec![ApplicationDirectory {
+            application: "Claude Code".to_owned(),
+            directory: other.clone(),
+        }],
+        ..site.host()
+    });
+
+    let settled = moved
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("reconciles");
+
+    assert_eq!(settled, Settled::Applied);
+    assert_eq!(site.tree(), before, "taken out of the first directory");
+    let mut expected = applied_tree(&other_before);
+    expected.insert("skills".to_owned(), Node::Directory);
+    assert_eq!(snapshot(&other), expected, "and applied in the second");
+}
+
 /// KR-REQ-11.42: a file somebody changed after it was installed is kept by removal and reported;
 /// the rest goes.
 #[test]
@@ -892,40 +924,103 @@ fn a_document_that_keeps_changing_refuses_the_recipe_and_leaves_nothing_of_it() 
 // Stopped at each boundary
 // ---------------------------------------------------------------------------------------------
 
-/// Runs `first` on a fresh site stopped before step `step`, and returns the site when the run
+/// A run stopped before one of its steps: the site it ran in, and the steps it took.
+struct Stopped {
+    site: Site,
+    steps: Vec<String>,
+}
+
+impl Stopped {
+    /// True when the run stopped after making something under a temporary name and before
+    /// recording what it made: the one boundary that leaves an object the next run cannot show is
+    /// the host's.
+    fn left_unrecorded(&self) -> bool {
+        self.steps
+            .last()
+            .is_some_and(|step| step.starts_with("stage ") || step.starts_with("make "))
+    }
+}
+
+/// Runs `first` on a fresh site stopped before step `step`, and returns what it left when the run
 /// stopped, or `None` when it finished before reaching that step.
 fn stopped_at(
     step: usize,
     prepare: &dyn Fn(&Site),
     first: &dyn Fn(&Site, &NativeBridges) -> kr_controller::Result<Settled>,
-) -> Option<Site> {
+) -> Option<Stopped> {
     let site = Site::new();
     prepare(&site);
     let bridges = site.bridges();
     bridges.stop_before(step);
     match first(&site, &bridges) {
-        Err(_) => Some(site),
+        Err(_) => Some(Stopped {
+            steps: bridges.steps(),
+            site,
+        }),
         Ok(_) => None,
+    }
+}
+
+/// Every name under the application's directory that is a temporary one.
+fn temporaries(site: &Site) -> Vec<String> {
+    site.tree()
+        .into_keys()
+        .filter(|name| name.contains(".kalareach"))
+        .collect()
+}
+
+/// Checks that a reconciliation after a run stopped between making something and recording it
+/// left that one thing in place, named it, and reported the bridge as unsettled; then removes it,
+/// as its owner would.
+fn left_and_named(site: &Site, settled: &Settled, step: usize) {
+    let Settled::Unsettled(reason) = settled else {
+        panic!("step {step}: {settled:?}");
+    };
+    let left = temporaries(site);
+    assert_eq!(left.len(), 1, "step {step}: {left:?}");
+    let name = Path::new(&left[0])
+        .file_name()
+        .expect("a name")
+        .to_string_lossy()
+        .into_owned();
+    assert!(reason.contains(&name), "step {step}: {reason}");
+    let reports = site.bridges().reports().expect("reads");
+    assert_eq!(reports[0].state, "unsettled", "step {step}: {reports:?}");
+    assert!(
+        reports[0]
+            .notes
+            .iter()
+            .any(|note| note.starts_with("not settled") && note.contains(&name)),
+        "step {step}: {reports:?}"
+    );
+    let path = site.application().join(&left[0]);
+    if path.is_dir() {
+        std::fs::remove_dir(&path).expect("the owner removes it");
+    } else {
+        std::fs::remove_file(&path).expect("the owner removes it");
     }
 }
 
 /// KR-REQ-11.42: an installation stopped before any of its steps is never reported as applied, and
 /// the next reconciliation finishes it when the release is still wanted and takes it out when it is
-/// not, leaving no temporary file behind.
+/// not. Something made and not yet recorded is neither taken nor claimed: it is named, and the
+/// bridge is not reported as applied until its owner removes it.
 #[test]
 fn kr_req_11_42_an_installation_stopped_at_each_boundary_is_finished_or_undone() {
     let reference = Site::new();
     let before = reference.tree();
     let applied = applied_tree(&before);
     let mut boundaries = 0;
+    let mut unrecorded = 0;
     for step in 1.. {
         let apply = |site: &Site, bridges: &NativeBridges| {
             bridges.reconcile(&plugin(), Some(&site.release()))
         };
-        let Some(site) = stopped_at(step, &|_| {}, &apply) else {
+        let Some(stopped) = stopped_at(step, &|_| {}, &apply) else {
             break;
         };
         boundaries += 1;
+        let site = &stopped.site;
         assert!(
             site.bridges()
                 .facts(&plugin(), site.release().package_digest)
@@ -933,19 +1028,51 @@ fn kr_req_11_42_an_installation_stopped_at_each_boundary_is_finished_or_undone()
                 .is_none(),
             "step {step}: never reported as applied while unfinished"
         );
-        assert_eq!(
+        let settled = site
+            .bridges()
+            .reconcile(&plugin(), Some(&site.release()))
+            .expect("finishes");
+        if stopped.left_unrecorded() {
+            unrecorded += 1;
+            left_and_named(site, &settled, step);
+            assert_eq!(
+                site.bridges()
+                    .reconcile(&plugin(), Some(&site.release()))
+                    .expect("finishes"),
+                Settled::Unchanged,
+                "step {step}"
+            );
+        } else {
+            assert_eq!(settled, Settled::Applied, "step {step}");
+        }
+        assert_eq!(site.tree(), applied, "step {step}: finished exactly");
+        assert!(
             site.bridges()
-                .reconcile(&plugin(), Some(&site.release()))
-                .expect("finishes"),
-            Settled::Applied,
+                .facts(&plugin(), site.release().package_digest)
+                .expect("reads")
+                .is_some(),
             "step {step}"
         );
-        assert_eq!(site.tree(), applied, "step {step}: finished exactly");
 
-        let site = stopped_at(step, &|_| {}, &apply).expect("stops again");
-        site.bridges()
+        let stopped = stopped_at(step, &|_| {}, &apply).expect("stops again");
+        let site = &stopped.site;
+        let settled = site
+            .bridges()
             .reconcile(&plugin(), None)
             .expect("takes it out");
+        if stopped.left_unrecorded() {
+            left_and_named(site, &settled, step);
+            assert_eq!(
+                site.bridges().reconcile(&plugin(), None).expect("finishes"),
+                Settled::Removed,
+                "step {step}"
+            );
+        } else if step == 1 {
+            // Stopped before its first record: nothing was begun, so nothing needs undoing.
+            assert_eq!(settled, Settled::Unchanged, "step {step}");
+        } else {
+            assert_eq!(settled, Settled::Removed, "step {step}");
+        }
         assert_eq!(site.tree(), before, "step {step}: undone exactly");
         assert!(
             site.bridges().reports().expect("reads").is_empty(),
@@ -953,6 +1080,10 @@ fn kr_req_11_42_an_installation_stopped_at_each_boundary_is_finished_or_undone()
         );
     }
     assert!(boundaries > 20, "every step was a boundary: {boundaries}");
+    assert_eq!(
+        unrecorded, 7,
+        "three directories, three files and the settings document were each made unrecorded once"
+    );
 }
 
 /// KR-REQ-11.42: a removal stopped before any of its steps is finished by the next
@@ -962,6 +1093,7 @@ fn kr_req_11_42_a_removal_stopped_at_each_boundary_is_finished() {
     let reference = Site::new();
     let before = reference.tree();
     let mut boundaries = 0;
+    let mut unrecorded = 0;
     for step in 1.. {
         let install = |site: &Site| {
             site.bridges()
@@ -969,10 +1101,11 @@ fn kr_req_11_42_a_removal_stopped_at_each_boundary_is_finished() {
                 .expect("applies");
         };
         let remove = |_: &Site, bridges: &NativeBridges| bridges.reconcile(&plugin(), None);
-        let Some(site) = stopped_at(step, &install, &remove) else {
+        let Some(stopped) = stopped_at(step, &install, &remove) else {
             break;
         };
         boundaries += 1;
+        let site = &stopped.site;
         // Before its first step the removal has not begun, and the release is applied.
         assert!(
             step == 1
@@ -983,10 +1116,26 @@ fn kr_req_11_42_a_removal_stopped_at_each_boundary_is_finished() {
                     .is_none(),
             "step {step}: a release being removed is not reported as applied"
         );
-        site.bridges().reconcile(&plugin(), None).expect("finishes");
+        let settled = site.bridges().reconcile(&plugin(), None).expect("finishes");
+        if stopped.left_unrecorded() {
+            unrecorded += 1;
+            left_and_named(site, &settled, step);
+            assert_eq!(
+                site.bridges().reconcile(&plugin(), None).expect("finishes"),
+                Settled::Removed,
+                "step {step}"
+            );
+        } else {
+            assert_eq!(settled, Settled::Removed, "step {step}");
+        }
         assert_eq!(site.tree(), before, "step {step}: removed exactly");
+        assert!(
+            site.bridges().reports().expect("reads").is_empty(),
+            "step {step}"
+        );
     }
     assert!(boundaries > 10, "every step was a boundary: {boundaries}");
+    assert_eq!(unrecorded, 1, "the edit taking the key out");
 }
 
 /// An upgrade stopped before any of its steps ends with the new release applied and nothing of the
@@ -1003,18 +1152,28 @@ fn an_upgrade_stopped_at_each_boundary_ends_with_the_new_release() {
         let upgrade = |site: &Site, bridges: &NativeBridges| {
             bridges.reconcile(&plugin(), Some(&site.next_release()))
         };
-        let Some(site) = stopped_at(step, &install, &upgrade) else {
+        let Some(stopped) = stopped_at(step, &install, &upgrade) else {
             break;
         };
         boundaries += 1;
+        let site = &stopped.site;
         let next = site.next_release();
-        assert_eq!(
-            site.bridges()
-                .reconcile(&plugin(), Some(&next))
-                .expect("finishes"),
-            Settled::Applied,
-            "step {step}"
-        );
+        let settled = site
+            .bridges()
+            .reconcile(&plugin(), Some(&next))
+            .expect("finishes");
+        if stopped.left_unrecorded() {
+            left_and_named(site, &settled, step);
+            assert_eq!(
+                site.bridges()
+                    .reconcile(&plugin(), Some(&next))
+                    .expect("finishes"),
+                Settled::Unchanged,
+                "step {step}"
+            );
+        } else {
+            assert_eq!(settled, Settled::Applied, "step {step}");
+        }
         assert_eq!(
             std::fs::read(site.application().join(HOOKS_PATH)).expect("the new file"),
             std::fs::read(site.package("b").join("bridge/hooks.json")).expect("reads"),
@@ -1034,10 +1193,9 @@ fn an_upgrade_stopped_at_each_boundary_ends_with_the_new_release() {
                 .is_none(),
             "step {step}: the old release is not the one applied"
         );
-        let names: Vec<String> = site.tree().into_keys().collect();
         assert!(
-            names.iter().all(|name| !name.contains(".kalareach")),
-            "step {step}: no temporary file is left: {names:?}"
+            temporaries(site).is_empty(),
+            "step {step}: no temporary file is left"
         );
     }
     assert!(boundaries > 20, "every step was a boundary: {boundaries}");
@@ -1052,9 +1210,10 @@ fn a_change_noted_and_not_made_does_not_claim_what_somebody_put_there() {
         let apply = |site: &Site, bridges: &NativeBridges| {
             bridges.reconcile(&plugin(), Some(&site.release()))
         };
-        let Some(site) = stopped_at(step, &|_| {}, &apply) else {
+        let Some(stopped) = stopped_at(step, &|_| {}, &apply) else {
             break;
         };
+        let site = &stopped.site;
         let theirs = site.application().join(MANIFEST_PATH);
         if theirs.exists() || !theirs.parent().is_some_and(Path::is_dir) {
             continue;
@@ -1063,7 +1222,8 @@ fn a_change_noted_and_not_made_does_not_claim_what_somebody_put_there() {
         // recipe would have written, where it would have.
         std::fs::write(&theirs, pinned("plugin-manifest.json")).expect("the owner's copy");
 
-        site.bridges()
+        let settled = site
+            .bridges()
             .reconcile(&plugin(), None)
             .expect("reconciles");
 
@@ -1072,16 +1232,18 @@ fn a_change_noted_and_not_made_does_not_claim_what_somebody_put_there() {
             pinned("plugin-manifest.json"),
             "step {step}: the owner's file is left"
         );
-        let names: Vec<String> = site.tree().into_keys().collect();
+        if stopped.left_unrecorded() {
+            left_and_named(site, &settled, step);
+        }
         assert!(
-            names.iter().all(|name| !name.contains(".kalareach")),
-            "step {step}: no temporary file is left: {names:?}"
+            temporaries(site).is_empty(),
+            "step {step}: no temporary file is left"
         );
         checked += 1;
     }
     assert!(
-        checked >= 2,
-        "the noted and the staged boundaries were both reached: {checked}"
+        checked >= 3,
+        "the noted, the unrecorded and the staged boundaries were each reached: {checked}"
     );
 }
 
@@ -1093,9 +1255,10 @@ fn a_key_noted_and_not_written_is_not_taken_when_the_owner_sets_it() {
         let apply = |site: &Site, bridges: &NativeBridges| {
             bridges.reconcile(&plugin(), Some(&site.release()))
         };
-        let Some(site) = stopped_at(step, &|_| {}, &apply) else {
+        let Some(stopped) = stopped_at(step, &|_| {}, &apply) else {
             break;
         };
+        let site = &stopped.site;
         let document = site.application().join("settings.json");
         let text = std::fs::read_to_string(&document).expect("reads");
         if text != SETTINGS || !site.application().join(HOOKS_PATH).exists() {
@@ -1119,8 +1282,8 @@ fn a_key_noted_and_not_written_is_not_taken_when_the_owner_sets_it() {
 }
 
 /// A key published and then carried through a rewrite of the document by somebody else cannot be
-/// shown to be this host's: it is neither taken nor claimed, and the bridge is not reported as
-/// applied. A key recorded as published before the rewrite is this host's.
+/// shown to be this host's: it is neither taken nor claimed, and the bridge is reported as
+/// unsettled rather than applied. A key recorded as published before the rewrite is this host's.
 #[test]
 fn a_key_whose_document_was_rewritten_meanwhile_stays_unsettled() {
     let mut unsettled = 0;
@@ -1128,13 +1291,13 @@ fn a_key_whose_document_was_rewritten_meanwhile_stays_unsettled() {
         let apply = |site: &Site, bridges: &NativeBridges| {
             bridges.reconcile(&plugin(), Some(&site.release()))
         };
-        let Some(site) = stopped_at(step, &|_| {}, &apply) else {
+        let Some(stopped) = stopped_at(step, &|_| {}, &apply) else {
             break;
         };
+        let site = &stopped.site;
         let document = site.application().join("settings.json");
         let text = std::fs::read_to_string(&document).expect("reads");
-        let names: Vec<String> = site.tree().into_keys().collect();
-        if text != SETTINGS_WITH_KEY || names.iter().any(|name| name.contains(".kalareach")) {
+        if text != SETTINGS_WITH_KEY || !temporaries(site).is_empty() {
             continue;
         }
         // The key is in place. Another program rewrites the document as a new file, keeping it.
@@ -1157,6 +1320,8 @@ fn a_key_whose_document_was_rewritten_meanwhile_stays_unsettled() {
                         .is_none(),
                     "step {step}"
                 );
+                let reports = site.bridges().reports().expect("reads");
+                assert_eq!(reports[0].state, "unsettled", "step {step}: {reports:?}");
                 site.bridges()
                     .reconcile(&plugin(), None)
                     .expect("reconciles");
@@ -1175,4 +1340,579 @@ fn a_key_whose_document_was_rewritten_meanwhile_stays_unsettled() {
         unsettled >= 1,
         "a boundary after the key's publication and before its record was reached"
     );
+}
+
+/// Something staged and recorded, then replaced at its temporary name while the run was stopped,
+/// is not the object the host staged: it is left and named, not removed.
+#[test]
+fn a_staged_file_replaced_while_the_run_was_stopped_is_left() {
+    let mut checked = 0;
+    for step in 1.. {
+        let apply = |site: &Site, bridges: &NativeBridges| {
+            bridges.reconcile(&plugin(), Some(&site.release()))
+        };
+        let Some(stopped) = stopped_at(step, &|_| {}, &apply) else {
+            break;
+        };
+        // Stopped with a staged file recorded, before its rename.
+        let [.., staged, last] = stopped.steps.as_slice() else {
+            continue;
+        };
+        let Some(temporary) = staged.strip_prefix("stage ") else {
+            continue;
+        };
+        if !last.starts_with("save ") {
+            continue;
+        }
+        // Another file with the same bytes takes its place. It is written first and renamed over
+        // the staged one, so it is a new file rather than one reusing the staged file's inode.
+        let temporary = PathBuf::from(temporary);
+        let bytes = std::fs::read(&temporary).expect("staged");
+        let another = temporary.with_extension("another");
+        std::fs::write(&another, &bytes).expect("another file");
+        std::fs::rename(&another, &temporary).expect("put in its place");
+        let site = &stopped.site;
+
+        let settled = site
+            .bridges()
+            .reconcile(&plugin(), None)
+            .expect("reconciles");
+
+        assert_eq!(
+            std::fs::read(&temporary).expect("left"),
+            bytes,
+            "step {step}: the file that is not the one staged is left"
+        );
+        left_and_named(site, &settled, step);
+        checked += 1;
+    }
+    assert_eq!(checked, 4, "three files and the settings document");
+}
+
+/// A publication the next run finds renamed into place is recorded only after its directory is
+/// flushed, and so is a removal it finds already done.
+#[test]
+fn what_a_stopped_run_did_is_recorded_only_after_its_directory_is_flushed() {
+    // The run that installs, stopped between renaming the settings document into place and
+    // flushing the application's directory.
+    let traced = Site::new();
+    let bridges = traced.bridges();
+    bridges
+        .reconcile(&plugin(), Some(&traced.release()))
+        .expect("applies");
+    let settings = format!(
+        "rename {}",
+        traced.application().join("settings.json").display()
+    );
+    let renamed = bridges
+        .steps()
+        .iter()
+        .position(|step| *step == settings)
+        .expect("the settings document is renamed");
+    assert!(
+        bridges.steps()[renamed + 1].starts_with("flush "),
+        "a flush follows the rename"
+    );
+    let stopped = stopped_at(renamed + 2, &|_| {}, &|site, bridges| {
+        bridges.reconcile(&plugin(), Some(&site.release()))
+    })
+    .expect("stops before the flush");
+    let site = &stopped.site;
+    let next = site.bridges();
+    assert_eq!(
+        next.reconcile(&plugin(), Some(&site.release()))
+            .expect("finishes"),
+        Settled::Applied
+    );
+    let steps = next.steps();
+    let flush = format!("flush {}", site.application().display());
+    let flushed = steps
+        .iter()
+        .position(|step| *step == flush)
+        .expect("the application's directory is flushed");
+    let recorded = steps
+        .iter()
+        .position(|step| step.starts_with("save "))
+        .expect("the publication is recorded");
+    assert!(flushed < recorded, "{steps:?}");
+
+    // The run that removes, stopped between unlinking the hooks file and flushing its directory.
+    let traced = Site::new();
+    traced
+        .bridges()
+        .reconcile(&plugin(), Some(&traced.release()))
+        .expect("applies");
+    let bridges = traced.bridges();
+    bridges.reconcile(&plugin(), None).expect("removes");
+    let hooks = format!("unlink {}", traced.application().join(HOOKS_PATH).display());
+    let unlinked = bridges
+        .steps()
+        .iter()
+        .position(|step| *step == hooks)
+        .expect("the hooks file is unlinked");
+    let install = |site: &Site| {
+        site.bridges()
+            .reconcile(&plugin(), Some(&site.release()))
+            .expect("applies");
+    };
+    let stopped = stopped_at(unlinked + 2, &install, &|_, bridges| {
+        bridges.reconcile(&plugin(), None)
+    })
+    .expect("stops before the flush");
+    let site = &stopped.site;
+    let next = site.bridges();
+    assert_eq!(
+        next.reconcile(&plugin(), None).expect("finishes"),
+        Settled::Removed
+    );
+    let steps = next.steps();
+    let flush = format!(
+        "flush {}",
+        site.application()
+            .join("skills/kalareach-channels/hooks")
+            .display()
+    );
+    let flushed = steps
+        .iter()
+        .position(|step| *step == flush)
+        .expect("the hooks directory is flushed");
+    // One save marks the removal as begun; the next records what it took out.
+    assert_eq!(
+        steps[..flushed]
+            .iter()
+            .filter(|step| step.starts_with("save "))
+            .count(),
+        1,
+        "{steps:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Protection, substitution and failures
+// ---------------------------------------------------------------------------------------------
+
+/// A replacement of the settings document has exactly the permission bits of the document it
+/// replaces, whatever the creation mask, and so does the one the removal leaves.
+#[cfg(unix)]
+#[test]
+fn a_replaced_document_keeps_exactly_its_permission_bits() {
+    use std::os::unix::fs::PermissionsExt as _;
+    for mode in [0o600, 0o640, 0o666] {
+        let site = Site::new();
+        let document = site.application().join("settings.json");
+        std::fs::set_permissions(&document, std::fs::Permissions::from_mode(mode))
+            .expect("the document's mode");
+        let bridges = site.bridges();
+        assert_eq!(
+            bridges
+                .reconcile(&plugin(), Some(&site.release()))
+                .expect("applies"),
+            Settled::Applied
+        );
+        let applied = std::fs::metadata(&document).expect("reads").permissions();
+        assert_eq!(applied.mode() & 0o777, mode, "{mode:o}: applied");
+        bridges.reconcile(&plugin(), None).expect("removes");
+        let removed = std::fs::metadata(&document).expect("reads").permissions();
+        assert_eq!(removed.mode() & 0o777, mode, "{mode:o}: removed");
+    }
+}
+
+/// A document whose permission bits change between the read and the replacement is read again, and
+/// the replacement keeps the new bits.
+#[cfg(unix)]
+#[test]
+fn a_document_whose_permissions_change_meanwhile_is_read_again() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let site = Site::new();
+    let document = site.application().join("settings.json");
+    std::fs::set_permissions(&document, std::fs::Permissions::from_mode(0o644))
+        .expect("the document's mode");
+    let bridges = site.bridges();
+    let narrowed = Arc::new(AtomicBool::new(false));
+    {
+        let narrowed = Arc::clone(&narrowed);
+        let document = document.clone();
+        bridges.before_publishing(move |destination: &Path| {
+            if destination.ends_with("settings.json") && !narrowed.swap(true, Ordering::SeqCst) {
+                std::fs::set_permissions(&document, std::fs::Permissions::from_mode(0o600))
+                    .expect("somebody narrows it meanwhile");
+            }
+        });
+    }
+
+    let settled = bridges
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("reconciles");
+
+    assert_eq!(settled, Settled::Applied);
+    assert!(narrowed.load(Ordering::SeqCst));
+    let mode = std::fs::metadata(&document)
+        .expect("reads")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600, "the narrower bits are kept");
+    assert_eq!(
+        std::fs::read_to_string(&document).expect("reads"),
+        SETTINGS_WITH_KEY
+    );
+}
+
+/// An access-control list put on the settings document between the read and the replacement stops
+/// the replacement, and what the recipe had placed is taken out again.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_access_control_list_added_meanwhile_stops_the_replacement() {
+    let site = Site::new();
+    let document = site.application().join("settings.json");
+    let _restriction = Restriction(document.clone());
+    let before = site.tree();
+    let bridges = site.bridges();
+    {
+        let document = document.clone();
+        bridges.before_publishing(move |destination: &Path| {
+            if destination.ends_with("settings.json") {
+                exacl::setfacl(
+                    &[&document],
+                    &[exacl::AclEntry::deny_group(
+                        "everyone",
+                        exacl::Perm::DELETE,
+                        None,
+                    )],
+                    None,
+                )
+                .expect("somebody restricts it meanwhile");
+            }
+        });
+    }
+
+    let settled = bridges
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("reconciles");
+
+    assert!(
+        refused(&settled).contains("access-control list"),
+        "{settled:?}"
+    );
+    assert_eq!(site.tree(), before, "nothing of the recipe is left");
+    assert!(
+        !exacl::getfacl(&document, None)
+            .expect("reads the list")
+            .is_empty(),
+        "the document keeps its list"
+    );
+}
+
+/// An application directory replaced, after the installation, by a link to another directory that
+/// holds the same files is never changed by the removal: what was placed is named as left.
+#[cfg(unix)]
+#[test]
+fn a_directory_put_in_the_place_of_the_application_directory_is_never_changed() {
+    let site = Site::new();
+    let bridges = site.bridges();
+    bridges
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("applies");
+    let elsewhere = site.root.join("elsewhere");
+    copy_tree(&site.application(), &elsewhere);
+    let copied = snapshot(&elsewhere);
+    std::fs::rename(site.application(), site.root.join("home/.claude-original"))
+        .expect("somebody moves it");
+    std::os::unix::fs::symlink(&elsewhere, site.application()).expect("and links another there");
+
+    bridges.reconcile(&plugin(), None).expect("reconciles");
+
+    assert_eq!(snapshot(&elsewhere), copied, "nothing in it was touched");
+    let reports = bridges.reports().expect("reads");
+    assert!(
+        reports[0]
+            .notes
+            .iter()
+            .any(|note| note.starts_with("left in place") && note.contains("another directory")),
+        "{reports:?}"
+    );
+}
+
+/// A run stopped part way is not settled in a directory put in the application directory's place:
+/// what it had in flight is named as not settled, and nothing there is removed.
+#[cfg(unix)]
+#[test]
+fn a_run_stopped_part_way_is_not_settled_in_a_directory_put_in_its_place() {
+    let mut checked = 0;
+    for step in 1.. {
+        let apply = |site: &Site, bridges: &NativeBridges| {
+            bridges.reconcile(&plugin(), Some(&site.release()))
+        };
+        let Some(stopped) = stopped_at(step, &|_| {}, &apply) else {
+            break;
+        };
+        let site = &stopped.site;
+        if temporaries(site).is_empty() {
+            continue;
+        }
+        // A staged file is at its temporary name. The directory is replaced by a link to a copy.
+        let elsewhere = site.root.join("elsewhere");
+        copy_tree(&site.application(), &elsewhere);
+        let copied = snapshot(&elsewhere);
+        std::fs::rename(site.application(), site.root.join("home/.claude-original"))
+            .expect("somebody moves it");
+        std::os::unix::fs::symlink(&elsewhere, site.application())
+            .expect("and links another there");
+
+        let settled = site
+            .bridges()
+            .reconcile(&plugin(), None)
+            .expect("reconciles");
+
+        assert!(
+            matches!(settled, Settled::Unsettled(_)),
+            "step {step}: {settled:?}"
+        );
+        assert_eq!(
+            snapshot(&elsewhere),
+            copied,
+            "step {step}: nothing in it was touched"
+        );
+        // What was in flight is named as not settled because the directory is another one, not
+        // because of what the other directory happens to hold.
+        let reports = site.bridges().reports().expect("reads");
+        assert!(
+            reports[0].notes.iter().any(|note| {
+                note.starts_with("not settled") && note.contains("another directory")
+            }),
+            "step {step}: {reports:?}"
+        );
+        checked += 1;
+    }
+    assert!(checked >= 7, "each staged object was reached: {checked}");
+}
+
+/// A copy of an installed file with the same bytes is not the file this host installed: a removal
+/// leaves it and names it.
+#[test]
+fn a_copy_of_an_installed_file_is_not_taken_for_it() {
+    let site = Site::new();
+    let bridges = site.bridges();
+    bridges
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("applies");
+    // Somebody writes the same bytes to a new file and puts it in the installed file's place.
+    let hooks = site.application().join(HOOKS_PATH);
+    let copy = site.root.join("hooks-copy.json");
+    std::fs::write(&copy, pinned("hooks.json")).expect("a copy");
+    std::fs::rename(&copy, &hooks).expect("put in its place");
+
+    bridges.reconcile(&plugin(), None).expect("reconciles");
+
+    assert_eq!(std::fs::read(&hooks).expect("left"), pinned("hooks.json"));
+    assert!(
+        !site.application().join(SERVERS_PATH).exists(),
+        "the rest goes"
+    );
+    let reports = bridges.reports().expect("reads");
+    assert!(
+        reports[0]
+            .notes
+            .iter()
+            .any(|note| note.contains(HOOKS_PATH) && note.contains("not the file")),
+        "{reports:?}"
+    );
+}
+
+/// A settings document the key would take past the size this host reads back is refused before
+/// anything is written.
+#[test]
+fn a_settings_document_the_key_would_take_past_the_limit_is_refused() {
+    let padding = "x".repeat((1 << 20) - 64);
+    let settings = format!("{{\"padding\": \"{padding}\", \"enabledPlugins\": {{}}}}\n");
+    assert!(
+        settings.len() < 1 << 20,
+        "the document itself is within the limit"
+    );
+    let site = Site::with_settings(Some(&settings));
+    let before = site.tree();
+
+    let settled = site
+        .bridges()
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("reconciles");
+
+    assert!(refused(&settled).contains("larger than"), "{settled:?}");
+    assert_eq!(site.tree(), before, "nothing was written");
+}
+
+/// A file the undo of a refused recipe cannot take out keeps the bridge unsettled and named, not
+/// refused as if nothing were left; once it can be taken out, the next reconciliation does.
+#[cfg(unix)]
+#[test]
+fn a_file_the_undo_cannot_take_out_keeps_the_refusal_unsettled() {
+    let site = Site::new();
+    let before = site.tree();
+    let bridges = site.bridges();
+    let hooks = site.application().join("skills/kalareach-channels/hooks");
+    let _writable = Writable(hooks.clone());
+    {
+        let document = site.application().join("settings.json");
+        let hooks = hooks.clone();
+        let edits = std::sync::atomic::AtomicUsize::new(0);
+        bridges.before_publishing(move |destination: &Path| {
+            if destination.ends_with("settings.json") {
+                set_writable(&hooks, false);
+                let edit = edits.fetch_add(1, Ordering::SeqCst);
+                let text = std::fs::read_to_string(&document).expect("reads");
+                std::fs::write(
+                    &document,
+                    text.replacen('{', &format!("{{\"edit{edit}\": 1, "), 1),
+                )
+                .expect("somebody edits it again");
+            }
+        });
+    }
+
+    let settled = bridges
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("reconciles");
+
+    let Settled::Unsettled(reason) = &settled else {
+        panic!("reported as clean: {settled:?}");
+    };
+    assert!(
+        reason.contains("kept changing") && reason.contains("hooks.json"),
+        "{reason}"
+    );
+    assert!(site.application().join(HOOKS_PATH).exists());
+    let reports = bridges.reports().expect("reads");
+    assert_eq!(reports[0].state, "removing", "{reports:?}");
+    assert!(
+        reports[0]
+            .notes
+            .iter()
+            .any(|note| note.starts_with("could not be taken out") && note.contains(HOOKS_PATH)),
+        "{reports:?}"
+    );
+
+    set_writable(&hooks, true);
+    assert_eq!(
+        bridges.reconcile(&plugin(), None).expect("reconciles"),
+        Settled::Removed
+    );
+    let mut after = site.tree();
+    after.remove("settings.json");
+    let mut expected = before;
+    expected.remove("settings.json");
+    assert_eq!(after, expected, "everything the recipe placed is gone");
+}
+
+/// A removal that cannot write its edit of the settings document leaves the key recorded and says
+/// so, and leaves nothing beside it; once it can, the next reconciliation takes the key out.
+#[cfg(unix)]
+#[test]
+fn a_removal_that_cannot_write_its_edit_keeps_the_key_recorded() {
+    let site = Site::new();
+    let before = site.tree();
+    let bridges = site.bridges();
+    bridges
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("applies");
+    let _writable = Writable(site.application());
+    set_writable(&site.application(), false);
+
+    let settled = bridges.reconcile(&plugin(), None).expect("reconciles");
+
+    assert!(matches!(settled, Settled::Unsettled(_)), "{settled:?}");
+    assert_eq!(
+        std::fs::read_to_string(site.application().join("settings.json")).expect("reads"),
+        SETTINGS_WITH_KEY
+    );
+    assert!(temporaries(&site).is_empty(), "nothing is left beside it");
+    let reports = bridges.reports().expect("reads");
+    assert!(
+        reports[0].notes.iter().any(|note| {
+            note.starts_with("could not be taken out")
+                && note.contains("enabledPlugins.kalareach-channels@skills-dir")
+        }),
+        "{reports:?}"
+    );
+
+    set_writable(&site.application(), true);
+    assert_eq!(
+        bridges.reconcile(&plugin(), None).expect("reconciles"),
+        Settled::Removed
+    );
+    assert_eq!(site.tree(), before);
+}
+
+/// A directory that cannot be read says nothing about what is in it: what is named as not settled
+/// stays named while the application's directory cannot be opened, and is still named after.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_directory_does_not_erase_what_is_not_settled() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let apply =
+        |site: &Site, bridges: &NativeBridges| bridges.reconcile(&plugin(), Some(&site.release()));
+    let stopped = (1..)
+        .map_while(|step| stopped_at(step, &|_| {}, &apply))
+        .find(Stopped::left_unrecorded)
+        .expect("a run stopped between making something and recording it");
+    let site = &stopped.site;
+    let settled = site
+        .bridges()
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("reconciles");
+    assert!(matches!(settled, Settled::Unsettled(_)), "{settled:?}");
+    let left = temporaries(site);
+    assert_eq!(left.len(), 1, "{left:?}");
+    let _restored = Writable(site.application());
+    std::fs::set_permissions(site.application(), std::fs::Permissions::from_mode(0o000))
+        .expect("the directory cannot be read");
+
+    let failed = site.bridges().reconcile(&plugin(), None);
+
+    assert!(failed.is_err(), "{failed:?}");
+    std::fs::set_permissions(site.application(), std::fs::Permissions::from_mode(0o755))
+        .expect("readable again");
+    let reports = site.bridges().reports().expect("reads");
+    assert!(
+        reports[0]
+            .notes
+            .iter()
+            .any(|note| note.starts_with("not settled") && note.contains(&left[0])),
+        "{reports:?}"
+    );
+}
+
+/// Lets a directory's entries be changed, or stops that.
+#[cfg(unix)]
+fn set_writable(directory: &Path, writable: bool) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = if writable { 0o755 } else { 0o555 };
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(mode))
+        .expect("the directory's mode");
+}
+
+/// A directory a test made read-only, made writable again when this is dropped.
+#[cfg(unix)]
+struct Writable(PathBuf);
+
+#[cfg(unix)]
+impl Drop for Writable {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// Copies a directory tree, without following a link.
+#[cfg(unix)]
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("a directory");
+    for entry in std::fs::read_dir(from).expect("readable") {
+        let entry = entry.expect("an entry");
+        let target = to.join(entry.file_name());
+        let kind = entry.file_type().expect("a type");
+        if kind.is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else if kind.is_file() {
+            std::fs::copy(entry.path(), &target).expect("a copy");
+        }
+    }
 }

@@ -40,6 +40,8 @@ pub(super) struct Journal {
     pub(super) unresolved: Vec<Kept>,
     /// What removals left in place, and why.
     pub(super) leftovers: Vec<Kept>,
+    /// What the last removal could not finish, and why. Each reconciliation tries again.
+    pub(super) blocked: Vec<Kept>,
     /// Why the last application was refused, when it was.
     pub(super) refusal: Option<String>,
 }
@@ -70,6 +72,9 @@ pub(super) struct Release {
     pub(super) application: String,
     /// The application's directory every path is under.
     pub(super) directory: PathBuf,
+    /// That directory's identity when the release was applied. A directory at that path with
+    /// another identity is not the one this host changed, and nothing in it is taken as its own.
+    pub(super) directory_identity: Identity,
     /// What the registration says, once the release is applied.
     pub(super) facts: Option<RecordedFacts>,
     /// The recipe's removal operations, in the order they are applied.
@@ -162,9 +167,19 @@ pub(super) enum Change {
         temporary: String,
         /// How far its publication got.
         publication: Publication,
-        /// The temporary name of an edit that takes the key out, while one is being made.
-        removing: Option<String>,
+        /// The edit that takes the key out, while one is being made.
+        removing: Option<Staging>,
     },
+}
+
+/// An edit staged beside a document, before it takes the document's place.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Staging {
+    /// The temporary name it is staged under.
+    pub(super) temporary: String,
+    /// The staged file's identity, once recorded.
+    pub(super) identity: Option<Identity>,
 }
 
 /// How far a staged change got.
@@ -234,6 +249,7 @@ impl Journal {
             changes: Vec::new(),
             unresolved: Vec::new(),
             leftovers: Vec::new(),
+            blocked: Vec::new(),
             refusal: None,
         }
     }
