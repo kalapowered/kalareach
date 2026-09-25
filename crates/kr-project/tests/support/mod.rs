@@ -697,10 +697,37 @@ pub fn plant_marker(parent: &Path, name: &str, sentinels: &Path) -> PathBuf {
         "{name}-marker{}",
         if cfg!(windows) { ".cmd" } else { ".sh" }
     ));
-    std::fs::write(&marker, body).expect("the marker program is written");
-    make_executable(&marker);
+    place_script(&marker, &body);
     prove_the_marker_records(&marker, sentinels);
     marker
+}
+
+/// Puts a program whose text is `text` at `destination`, runnable, without this process ever
+/// holding it open for writing.
+///
+/// This binary's tests run on threads of one process, and a child another test starts is handed a
+/// copy of every descriptor open at that moment, a descriptor this process is writing a program
+/// through included. The child holds its copy until it starts its own program, and until then
+/// Linux refuses to start the program that is still open for writing. The programs these tests
+/// plant are started by Git, or by a program Git started, so no retry of this process's own can
+/// cover them, and a refused start is exactly what an assertion that nothing ran would miss. So
+/// the text goes to a file nothing starts, and a separate process copies it into place: no
+/// descriptor of this process is ever open on the program for writing, and no child can inherit
+/// one.
+///
+/// # Panics
+///
+/// Panics when the text cannot be written or the program cannot be placed.
+pub fn place_script(destination: &Path, text: &str) {
+    let mut name = destination
+        .file_name()
+        .expect("a program has a name")
+        .to_owned();
+    name.push(".text");
+    let text_file = destination.with_file_name(name);
+    std::fs::write(&text_file, text).expect("the program's text is written");
+    kr_ipc::testing::place_program(&text_file, destination);
+    std::fs::remove_file(&text_file).expect("the program's text goes once it is in place");
 }
 
 /// Runs the planted marker once and requires it to leave its evidence.
@@ -720,41 +747,15 @@ fn prove_the_marker_records(marker: &Path, sentinels: &Path) {
     const CONTROL: &str = "the-recorder-itself";
 
     std::fs::create_dir_all(sentinels).expect("the sentinel directory");
-    // A bounded retry, for one race and nothing else. This binary's tests run in threads of one
-    // process, and another test's child can be forked while the descriptor this helper wrote the
-    // marker through is still open: the child inherits a copy and holds it until its own exec
-    // closes it, and Linux refuses to exec a file any process still holds open for writing with
-    // ETXTBSY. Nothing about the marker or the product is wrong when that happens, and the window
-    // closes as soon as that child execs, so the control run is attempted again for about a second
-    // before the error stands. Keeping the retry is what keeps these tests parallel: the
-    // alternative is coordinating every write against every child launch in the binary, which
-    // costs far more than waiting out a window that closes in milliseconds.
-    const ATTEMPTS: usize = 100;
-    const BETWEEN: std::time::Duration = std::time::Duration::from_millis(10);
-
     // With nothing in its environment, which is at least as bare as the one the restricted profile
-    // gives a Git child: a marker that records under this records under that.
-    let mut attempted = 0;
-    let status = loop {
-        attempted += 1;
-        match Command::new(marker)
-            .arg(CONTROL)
-            .env_clear()
-            .stdin(std::process::Stdio::null())
-            .status()
-        {
-            Ok(status) => break status,
-            Err(error)
-                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
-                    && attempted < ATTEMPTS =>
-            {
-                std::thread::sleep(BETWEEN);
-            }
-            Err(error) => {
-                panic!("the planted marker runs, after {attempted} attempts: {error:?}");
-            }
-        }
-    };
+    // gives a Git child: a marker that records under this records under that. It was placed by
+    // `place_script`, so nothing holds it open for writing and it starts the first time.
+    let status = Command::new(marker)
+        .arg(CONTROL)
+        .env_clear()
+        .stdin(std::process::Stdio::null())
+        .status()
+        .unwrap_or_else(|error| panic!("the planted marker runs: {error:?}"));
     assert!(status.success(), "the planted marker exits zero: {status}");
     let recorded = sentinels.join(CONTROL);
     assert!(
@@ -786,23 +787,8 @@ fn copy_marker(marker: &Path, destination: &Path, sentinel: &str) {
     } else {
         format!("#!/bin/sh\nexec \"{}\" {sentinel}\n", marker.display())
     };
-    std::fs::write(destination, body).expect("the hook is written");
-    make_executable(destination);
+    place_script(destination, &body);
 }
-
-#[cfg(unix)]
-fn make_executable(path: &Path) {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let mut permissions = std::fs::metadata(path)
-        .expect("the program's metadata")
-        .permissions();
-    permissions.set_mode(0o700);
-    std::fs::set_permissions(path, permissions).expect("the program is executable");
-}
-
-#[cfg(not(unix))]
-fn make_executable(_path: &Path) {}
 
 /// A destination request for one name inside a directory.
 #[must_use]
