@@ -11,7 +11,7 @@
 //! The Gemini CLI connector package installs an extension, three files, into the user's own Gemini
 //! CLI directory: its manifest, its hooks and its install record. Their copies under
 //! `fixtures/bridges/gemini-cli/` are the bytes the package publishes (the plugins repository at
-//! `c3a3104d93740cef7302db471723646bb1e16803`, `plugins/kalareach/gemini-cli/bridge/`), pinned the
+//! `158b20ce7b748554e6eedcf09803239b2ee5d6c2`, `plugins/kalareach/gemini-cli/bridge/`), pinned the
 //! same way.
 //!
 //! Qoder CLI reads its hooks from the settings its launch is given, so nothing is installed for it:
