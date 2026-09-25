@@ -1059,9 +1059,13 @@ daemon when none answers, and the manager is the daemon's parent. It starts one 
 many commands ask at once. `kr new` itself installs nothing: a definition that has gone, that kr did
 not write, or that was changed after kr wrote it stops the command with `HOST_NOT_CONFIGURED`, names
 the file, and says to run `kr host startup --set service`. The command never writes it again. The
-same goes for a manager holding anything else under the definition's label, such as an earlier form
-of the job or a drop-in of the unit's own, and for a definition in the domain the environment's
-default execution profile no longer implies: the setup, run again, puts either right.
+same goes for a definition in the domain the environment's default execution profile no longer
+implies, which the setup, run again, rewrites; and for a manager holding anything under the
+definition's label but that definition, such as an earlier form of the job, or a drop-in for the
+unit other than the ones every service reads. kr leaves what a manager holds to the person: it
+names the remedy, `launchctl bootout <domain>/<label>` or deleting the drop-in, and the setup takes
+the definition once it has been applied. kr ends no daemon, so it never runs `launchctl bootout`
+itself.
 
 | Platform | The definition | Where it is loaded |
 | --- | --- | --- |
@@ -1079,8 +1083,10 @@ changed since kr wrote it, and leaves it exactly as it is.
 
 `--clear` and `--set standalone` remove exactly what `--set service` wrote, the definition and its
 record, and end nothing. Setup, removal and `kr new` take turns: each holds the environment's
-`controller-service.lock` while it looks at or changes the definition or the manager's job. A daemon the manager is running keeps serving, and the manager keeps its
-job until that daemon has ended. A definition changed after kr wrote it is no longer kr's to remove,
+`controller-service.lock` while it looks at or changes the definition or the manager's job, and
+`kr host startup` holds it until the configuration document is written too. A daemon the manager is
+running keeps serving; launchd keeps its job, which nothing starts again, until you log out, and the
+user manager forgets the unit once the daemon stops. A definition changed after kr wrote it is no longer kr's to remove,
 so it stays where it is and the command says so. `kr doctor` reports whether the definition matches
 what kr wrote.
 
