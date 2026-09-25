@@ -18,7 +18,15 @@ scripts/run-conformance.sh --all-terminals    # every group, and then section 27
 ```
 
 The script fetches what the applications group needs, installs the TypeScript packages when that
-group runs, builds the `kr-conformance` binary in `tests/conformance` and runs it. The result is
+group runs, builds the `kr-conformance` binary in `tests/conformance` and runs it. On Windows the
+report is started from PowerShell or cmd instead, because a POSIX shell's runtime enables privileges
+in the token of everything it starts and changes how the console's interrupt reaches it:
+
+```powershell
+pnpm install --frozen-lockfile
+cargo run --locked -p kr-conformance --bin kr-conformance -- run --root . --evidence <a directory under %TEMP%>
+```
+ The result is
 `<evidence>/conformance/result.json`, and each step's log is under `<evidence>/conformance/logs/`.
 
 The evidence directory is `KR_TEST_ARTIFACTS_DIR`, or a new directory under the platform's temporary
