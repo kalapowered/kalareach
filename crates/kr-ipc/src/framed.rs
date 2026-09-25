@@ -683,32 +683,62 @@ mod tests {
             );
         }
 
-        // On a named pipe: a fresh pipe answers the first offer as pending while it registers
-        // writability, so the frame is one larger than the pipe's buffer and is driven with a wait
-        // between attempts until the pipe is genuinely full - bytes have gone and the attempt is
-        // blocked - rather than stopping at that first readiness before anything is sent.
+        // On a named pipe: this platform's write takes whatever slice it is offered and reports it
+        // sent, completing it in the background, so a whole frame can be reported complete before the
+        // peer reads a byte and there is no "full" a single write reveals. What backpressure there is
+        // shows on the *next* write once a transport write is outstanding: it reports the pipe would
+        // take no more. So this offers a frame far larger than the pipe carries as checked writes of
+        // one piece each, drives them with a wait between blocks, and shows the bytes sent stop
+        // advancing while the peer does not read, and never reach the whole frame - the backpressure
+        // is real - and that the waiter polls rather than parking each time.
         #[cfg(windows)]
         {
-            let frame = vec![7_u8; 2 * 1024 * 1024];
+            let frame = vec![7_u8; 8 * 1024 * 1024];
             let started = std::time::Instant::now();
-            let mut outcome = writer.begin_frame(&frame).expect("the peer is there");
-            while !(writer.has_sent_any() && outcome == Wrote::Blocked) {
+            let mut outcome = writer
+                .begin_frame_checked(&frame, || true)
+                .expect("the peer is there");
+            let mut last = writer.sent;
+            let mut stalls = 0_u32;
+            loop {
                 assert_ne!(
                     outcome,
-                    Wrote::Complete,
-                    "a peer that never reads cannot take the whole frame"
+                    CheckedWrite::Complete,
+                    "a peer that never reads took the whole frame"
                 );
+                // The bytes sent stop advancing once a transport write is outstanding and the peer
+                // does not read; five polls without progress is the backpressure holding.
+                if writer.sent == last {
+                    stalls += 1;
+                } else {
+                    stalls = 0;
+                    last = writer.sent;
+                }
+                if stalls >= 5 && writer.has_sent_any() {
+                    break;
+                }
                 assert!(
                     started.elapsed() < std::time::Duration::from_secs(30),
-                    "the pipe fills while the peer does not read"
+                    "the pipe stops taking bytes while the peer does not read"
                 );
-                writer.writable().ready().await.expect("the wait returns");
-                outcome = writer.resume_frame().expect("the peer is there");
+                // A named pipe has no writability of its own the writer can hold while the reader
+                // holds the other half, so the wait is a bounded poll rather than a park: it returns
+                // promptly. The cost of that poll and the rule that every caller bounds it are on
+                // `Readiness::ready`.
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(250),
+                    writer.writable().ready(),
+                )
+                .await
+                .expect("a pipe waiter polls rather than parking")
+                .expect("the wait returns");
+                outcome = writer
+                    .resume_frame_checked(|| true)
+                    .expect("the peer is there");
             }
-            assert_eq!(
-                outcome,
-                Wrote::Blocked,
-                "a full pipe reports it would take no more rather than waiting for it"
+            assert!(
+                writer.sent < frame.len(),
+                "the peer that stopped reading did not take the whole frame"
             );
             assert!(
                 writer.is_mid_frame(),
@@ -717,24 +747,6 @@ mod tests {
             assert!(
                 writer.begin_frame(&frame).is_err(),
                 "a new frame is refused while one is part way to the peer"
-            );
-            // A named pipe has no writability of its own the writer can hold while the reader holds
-            // the other half, so the wait is a bounded poll rather than a park: it returns promptly,
-            // and the pipe stays full across several polls because the peer never reads. The cost of
-            // that poll and the rule that every caller bounds it are recorded on `Readiness::ready`.
-            for _ in 0..5 {
-                tokio::time::timeout(
-                    std::time::Duration::from_millis(250),
-                    writer.writable().ready(),
-                )
-                .await
-                .expect("a pipe waiter polls rather than parking")
-                .expect("the wait returns");
-            }
-            assert_eq!(
-                writer.resume_frame().expect("the peer is there"),
-                Wrote::Blocked,
-                "the pipe the peer stopped reading is still full"
             );
         }
         server.abort();
