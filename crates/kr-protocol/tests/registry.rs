@@ -476,6 +476,39 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         );
     }
 
+    // Section 11 ¶3 has the approval ledger retain the decoder and package hash, the original
+    // source, the native request identifier, the offered decisions, the deadline and the resolution
+    // state, and asks for the publisher and the original request details to be open to inspection.
+    // Section 23's agent-state row names no read that answers that, so this build adds one. It reads
+    // the session under `session.view` like the rest of the row, meets the history filter as a
+    // named current resource, and is served on the local socket only: this host applies no grant's
+    // history scope to its answer.
+    let inspection = [("agent.approval.inspect", EffectClass::Read)];
+    for (name, effect) in inspection {
+        let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));
+        assert_eq!(entry.effect, effect, "{name} carries its own effect class");
+        assert_eq!(
+            entry.group,
+            MethodGroup::AgentState,
+            "{name} is an agent-state read"
+        );
+        assert_eq!(
+            entry.required_rights,
+            &[RequiredRight::right(ActionRight::SessionView)],
+            "{name} asks for session.view and nothing else"
+        );
+        assert_eq!(
+            entry.history_filter,
+            HistoryFilter::NamedCurrentResources,
+            "{name} meets the history filter as a named current resource"
+        );
+        assert_eq!(
+            entry.ingress,
+            &[ActorIngress::LocalIpc],
+            "{name} is served on the local socket only"
+        );
+    }
+
     assert_eq!(
         REGISTRY.len(),
         required.len()
@@ -485,7 +518,8 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
             + delivery.len()
             + policy.len()
             + voice.len()
-            + owner.len(),
+            + owner.len()
+            + inspection.len(),
         "the registry holds the required methods and the named additions"
     );
 }

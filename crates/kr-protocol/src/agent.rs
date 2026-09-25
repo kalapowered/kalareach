@@ -19,7 +19,10 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::broker::{ActionName, ActionProvenance, CapabilityMap, IntegrationMode};
+use crate::broker::{
+    ActionName, ActionProvenance, CapabilityMap, DecoderLedgerEntry, IntegrationMode,
+};
+use crate::gateway::PendingState;
 use crate::ids::{
     AgentBindingRevision, AgentThreadId, AgentTurnId, ApplicationInstanceId, DraftId,
     LaunchProfileId, PendingResourceId, PluginId, SessionId, UpstreamRequestId,
@@ -243,6 +246,47 @@ pub struct AgentCommandsResult {
     pub binding: AgentBindingState,
     /// The commands, in the order the upstream advertises them.
     pub commands: Vec<AgentCommand>,
+}
+
+/// Parameters of `agent.approval.inspect`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentApprovalInspectParams {
+    /// The session and the exact instance the request came from.
+    pub subject: AgentSubject,
+    /// The pending resource whose record is read.
+    pub resource_id: PendingResourceId,
+}
+
+/// The result of `agent.approval.inspect`: what an installed decoder read and what it offered.
+///
+/// Section 11 makes an installed decoder part of the trust boundary. Authenticated wire provenance
+/// proves which connection supplied the bytes; nothing proves that the decoder read them
+/// correctly. Before the request became an approval a person can answer, the broker checked that
+/// the decoder's binding held the approval-interpreter grant and a trust covering the request's
+/// method, that the source frame was the request's own, recorded by that package's connection at
+/// the instance's current generation and never interpreted before, and that the projection kept to
+/// the trust's schema policy. None of that shows the projection says what the request says, so
+/// this answer carries the request itself, whole, beside what the decoder made of it and whose
+/// decoder that was.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentApprovalInspectResult {
+    /// The resource this record is about.
+    pub resource_id: PendingResourceId,
+    /// Where the request stands now: pending, claimed, or the one terminal state it reached.
+    pub state: PendingState,
+    /// When this host recorded the upstream's request, which is when its source frame arrived.
+    ///
+    /// The record belongs to this moment rather than to `decoding.decoded_at`: what the decoder
+    /// produced is derived from these bytes, and interpreting them later does not make the request
+    /// any newer.
+    pub recorded_at: TimestampMs,
+    /// What the decoder read and what it offered, exactly as the ledger retains it: the package
+    /// and publisher whose decoder it was, the upstream method and native request identifier, the
+    /// original source bytes and their digest, the decisions offered in the upstream's order, and
+    /// the upstream's deadline.
+    pub decoding: DecoderLedgerEntry,
 }
 
 /// What a mutation acts on: the subject and the revision it was prepared against.
@@ -536,5 +580,108 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("7")
         );
+    }
+
+    /// The record of one decoded request with every part at its bound: the whole original source
+    /// the ledger keeps, the longest summary, the most decisions at their longest, and every
+    /// identifier at its limit.
+    fn widest_record() -> AgentApprovalInspectResult {
+        use crate::broker::{
+            DecodedProjection, MAX_DECISION_TEXT_LEN, MAX_OFFERED_DECISIONS,
+            MAX_PROJECTION_SUMMARY_LEN, MAX_RETAINED_SOURCE_BYTES, OfferedDecision,
+        };
+        use crate::ids::{
+            BrokerBindingId, MAX_OPAQUE_ID_LEN, MAX_UPSTREAM_REQUEST_ID_LEN, PublisherId,
+            SourceGeneration, UpstreamMethod,
+        };
+        use crate::scalars::{Bytes, Digest256};
+
+        let text = |length: usize| "a".repeat(length);
+        AgentApprovalInspectResult {
+            resource_id: PendingResourceId::new(Uuid::from_bytes([0xff; 16])),
+            state: PendingState::Uncertain,
+            recorded_at: TimestampMs::new(u64::MAX),
+            decoding: DecoderLedgerEntry {
+                binding_id: BrokerBindingId::new(Uuid::from_bytes([0xff; 16])),
+                plugin_id: PluginId::new(text(MAX_OPAQUE_ID_LEN)).expect("a plugin"),
+                publisher_id: PublisherId::new(text(MAX_OPAQUE_ID_LEN)).expect("a publisher"),
+                package_digest: Digest256::from_bytes([0xff; 32]),
+                method: UpstreamMethod::new(text(MAX_OPAQUE_ID_LEN)).expect("a method"),
+                upstream_request_id: UpstreamRequestId::new(text(MAX_UPSTREAM_REQUEST_ID_LEN))
+                    .expect("a request identifier"),
+                source_generation: SourceGeneration::new(u64::MAX),
+                source_digest: Digest256::from_bytes([0xff; 32]),
+                source_bytes: Bytes::from(vec![0xff; MAX_RETAINED_SOURCE_BYTES]),
+                projection: DecodedProjection {
+                    schema_version: text(MAX_DECISION_TEXT_LEN),
+                    summary: text(MAX_PROJECTION_SUMMARY_LEN),
+                    decisions: (0..MAX_OFFERED_DECISIONS)
+                        .map(|index| OfferedDecision {
+                            option_id: format!("{index:0>width$}", width = MAX_DECISION_TEXT_LEN),
+                            label: text(MAX_DECISION_TEXT_LEN),
+                        })
+                        .collect(),
+                },
+                deadline_ms: Nullable::some(TimestampMs::new(u64::MAX)),
+                decoded_at: TimestampMs::new(u64::MAX),
+            },
+        }
+    }
+
+    /// KR-REQ-11.26: the record a person inspects is the one the ledger retains, and it survives
+    /// the wire exactly: the source bytes, the decisions in their order and the state.
+    #[test]
+    fn an_approval_record_survives_the_wire_exactly() {
+        let record = widest_record();
+        let value = crate::envelope::ParamsValue::from_typed(&record).expect("the record encodes");
+        let decoded: AgentApprovalInspectResult = value.to_typed().expect("the record decodes");
+        assert_eq!(decoded, record);
+
+        let params = AgentApprovalInspectParams {
+            subject: AgentSubject {
+                session_id: SessionId::new(Uuid::from_bytes([1; 16])),
+                application_instance_id: ApplicationInstanceId::new(Uuid::from_bytes([2; 16])),
+            },
+            resource_id: PendingResourceId::new(Uuid::from_bytes([3; 16])),
+        };
+        let mut encoded = serde_json::to_value(params).expect("the parameters encode");
+        assert_eq!(
+            serde_json::from_value::<AgentApprovalInspectParams>(encoded.clone())
+                .expect("the parameters decode"),
+            params
+        );
+        encoded
+            .as_object_mut()
+            .expect("an object")
+            .insert("option_id".to_owned(), serde_json::json!("allow"));
+        assert!(
+            serde_json::from_value::<AgentApprovalInspectParams>(encoded).is_err(),
+            "a read carries no decision, and a member it does not define is refused"
+        );
+    }
+
+    /// The widest record the ledger can hold is answered in one control frame, with room left for
+    /// the stream header the worker keeps back, and a control stream's decoder accepts it.
+    #[test]
+    fn the_widest_approval_record_fits_one_control_frame() {
+        use crate::envelope::{ControlFrame, Outcome, ParamsValue, Response};
+        use crate::frame::StreamKind;
+
+        let frame = ControlFrame::Response(Response {
+            request_id: crate::ids::RequestId::new(u64::MAX),
+            outcome: Outcome::Ok(
+                ParamsValue::from_typed(&widest_record()).expect("the record encodes"),
+            ),
+        });
+        let encoded = kr_cbor::to_canonical_vec(&frame).expect("the frame encodes");
+        let room = StreamKind::Control.max_payload_len() - crate::limits::MAX_STREAM_HEADER_LEN;
+        assert!(
+            encoded.len() <= room,
+            "the widest record is {} bytes and a control frame carries {room}",
+            encoded.len()
+        );
+        let read: ControlFrame = crate::wire::decode(&encoded, &StreamKind::Control.cbor_limits())
+            .expect("a control stream reads it");
+        assert_eq!(read, frame);
     }
 }

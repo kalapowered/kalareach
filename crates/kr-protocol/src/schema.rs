@@ -18,10 +18,11 @@ use crate::action::{
 };
 use crate::actor::ActorEnvelope;
 use crate::agent::{
-    AgentApprovalRespondParams, AgentApprovalRespondResult, AgentBindingState, AgentCancelParams,
-    AgentCapabilitiesParams, AgentCapabilitiesResult, AgentCommandsParams, AgentCommandsResult,
-    AgentMutationResult, AgentPromptParams, AgentSnapshotParams, AgentSnapshotResult,
-    AgentSteerParams, PluginActionInvokeParams, PluginActionInvokeResult,
+    AgentApprovalInspectParams, AgentApprovalInspectResult, AgentApprovalRespondParams,
+    AgentApprovalRespondResult, AgentBindingState, AgentCancelParams, AgentCapabilitiesParams,
+    AgentCapabilitiesResult, AgentCommandsParams, AgentCommandsResult, AgentMutationResult,
+    AgentPromptParams, AgentSnapshotParams, AgentSnapshotResult, AgentSteerParams,
+    PluginActionInvokeParams, PluginActionInvokeResult,
 };
 use crate::archive::{
     ArchiveDescriptor, BackupGenerationPublication, BackupWriterRecord, RecoveryBundle,
@@ -260,6 +261,8 @@ pub fn protocol_schema() -> Value {
         "action_token" => ActionToken,
         "action_token_claim" => ActionTokenClaim,
         "actor_envelope" => ActorEnvelope,
+        "agent_approval_inspect_params" => AgentApprovalInspectParams,
+        "agent_approval_inspect_result" => AgentApprovalInspectResult,
         "agent_approval_respond_params" => AgentApprovalRespondParams,
         "agent_approval_respond_result" => AgentApprovalRespondResult,
         "agent_binding_state" => AgentBindingState,

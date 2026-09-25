@@ -741,6 +741,54 @@
       ],
       "type": "object"
     },
+    "AgentApprovalInspectParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `agent.approval.inspect`.",
+      "properties": {
+        "resource_id": {
+          "$ref": "#/$defs/PendingResourceId",
+          "description": "The pending resource whose record is read."
+        },
+        "subject": {
+          "$ref": "#/$defs/AgentSubject",
+          "description": "The session and the exact instance the request came from."
+        }
+      },
+      "required": [
+        "subject",
+        "resource_id"
+      ],
+      "type": "object"
+    },
+    "AgentApprovalInspectResult": {
+      "additionalProperties": false,
+      "description": "The result of `agent.approval.inspect`: what an installed decoder read and what it offered.\n\nSection 11 makes an installed decoder part of the trust boundary. Authenticated wire provenance\nproves which connection supplied the bytes; nothing proves that the decoder read them\ncorrectly. Before the request became an approval a person can answer, the broker checked that\nthe decoder's binding held the approval-interpreter grant and a trust covering the request's\nmethod, that the source frame was the request's own, recorded by that package's connection at\nthe instance's current generation and never interpreted before, and that the projection kept to\nthe trust's schema policy. None of that shows the projection says what the request says, so\nthis answer carries the request itself, whole, beside what the decoder made of it and whose\ndecoder that was.",
+      "properties": {
+        "decoding": {
+          "$ref": "#/$defs/DecoderLedgerEntry",
+          "description": "What the decoder read and what it offered, exactly as the ledger retains it: the package\nand publisher whose decoder it was, the upstream method and native request identifier, the\noriginal source bytes and their digest, the decisions offered in the upstream's order, and\nthe upstream's deadline."
+        },
+        "recorded_at": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When this host recorded the upstream's request, which is when its source frame arrived.\n\nThe record belongs to this moment rather than to `decoding.decoded_at`: what the decoder\nproduced is derived from these bytes, and interpreting them later does not make the request\nany newer."
+        },
+        "resource_id": {
+          "$ref": "#/$defs/PendingResourceId",
+          "description": "The resource this record is about."
+        },
+        "state": {
+          "$ref": "#/$defs/PendingState",
+          "description": "Where the request stands now: pending, claimed, or the one terminal state it reached."
+        }
+      },
+      "required": [
+        "resource_id",
+        "state",
+        "recorded_at",
+        "decoding"
+      ],
+      "type": "object"
+    },
     "AgentApprovalRespondParams": {
       "additionalProperties": false,
       "description": "Parameters of `agent.approval.respond`.",
@@ -16850,6 +16898,11 @@
         {
           "const": "agent.commands",
           "description": "The commands the bound agent advertises.",
+          "type": "string"
+        },
+        {
+          "const": "agent.approval.inspect",
+          "description": "What an installed decoder read of one approval request and the decisions it offered, with the request's original bytes and where it stands now. It records what the decoder said, not that the decoder read the request correctly.",
           "type": "string"
         },
         {
@@ -34518,6 +34571,12 @@
     },
     "actor_envelope": {
       "$ref": "#/$defs/ActorEnvelope"
+    },
+    "agent_approval_inspect_params": {
+      "$ref": "#/$defs/AgentApprovalInspectParams"
+    },
+    "agent_approval_inspect_result": {
+      "$ref": "#/$defs/AgentApprovalInspectResult"
     },
     "agent_approval_respond_params": {
       "$ref": "#/$defs/AgentApprovalRespondParams"

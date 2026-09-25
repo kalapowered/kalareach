@@ -837,6 +837,20 @@ methods! {
     freshness: CurrentAuthority, confirmation: None, idempotency: READ,
     doc: "The commands the bound agent advertises.";
 
+    // Section 11 asks for the publisher and the original request of an interpreted approval to be
+    // open to inspection. The answer is the retained record of what the decoder read and offered,
+    // so it meets the history filter as a named current resource does. It is served on the local
+    // socket alone: a paired device's history scope does not travel with a forwarded read, and
+    // nothing narrower than the whole record could be answered without it.
+    AgentApprovalInspect = "agent.approval.inspect", AgentState,
+    effect: Read, ingress: [LocalIpc], rights: [req(SessionView)],
+    selectors: [Session, ApplicationInstance],
+    history: NamedCurrentResources, capability: NO_CAPABILITY, freshness: CurrentAuthority,
+    confirmation: None, idempotency: READ,
+    doc: "What an installed decoder read of one approval request and the decisions it offered, \
+          with the request's original bytes and where it stands now. It records what the decoder \
+          said, not that the decoder read the request correctly.";
+
     // ----- Agent mutations ------------------------------------------------------------------
     AgentPromptSubmit = "agent.prompt.submit", AgentMutations,
     effect: Write, ingress: [LocalIpc, PairedDevice, Workflow], rights: [req(AgentPrompt)],
@@ -1607,6 +1621,7 @@ mod tests {
         ("events.snapshot", &[ActionRight::SessionView]),
         ("history.page", &[ActionRight::SessionView]),
         ("agent.snapshot", &[ActionRight::SessionView]),
+        ("agent.approval.inspect", &[ActionRight::SessionView]),
     ];
 
     /// KR-REQ-23.32: `question.read` needs `session.view`, and answering or cancelling needs
@@ -1660,6 +1675,36 @@ mod tests {
                     AuthorityDecision::Denied(_)
                 ),
                 "{invented} resolved to a method"
+            );
+        }
+    }
+
+    /// KR-REQ-11.26: the record of what a decoder read is a read of the session under
+    /// `session.view` and the named-resource history rule, served on the local socket, and no
+    /// other ingress reaches it: this host applies no grant's history scope to the answer.
+    #[test]
+    fn an_approval_record_is_read_on_the_local_socket_under_the_named_resource_rule() {
+        let entry = entry("agent.approval.inspect");
+        assert_eq!(entry.group, MethodGroup::AgentState);
+        assert_eq!(entry.effect, EffectClass::Read);
+        assert_eq!(entry.history_filter, HistoryFilter::NamedCurrentResources);
+        assert!(matches!(
+            decide(
+                "agent.approval.inspect",
+                MethodVersion::V1,
+                ActorIngress::LocalIpc
+            ),
+            AuthorityDecision::Listed(_)
+        ));
+        for ingress in ActorIngress::ALL
+            .iter()
+            .copied()
+            .filter(|ingress| *ingress != ActorIngress::LocalIpc)
+        {
+            assert_eq!(
+                decide("agent.approval.inspect", MethodVersion::V1, ingress),
+                AuthorityDecision::Denied(DenialReason::ForbiddenIngress { ingress }),
+                "{ingress:?}"
             );
         }
     }

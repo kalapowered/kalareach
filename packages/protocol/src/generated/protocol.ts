@@ -1789,6 +1789,8 @@ export interface KalaReachProtocol {
   action_token_claim?: ActionTokenClaim
   action_window?: ActionWindow
   actor_envelope?: ActorEnvelope
+  agent_approval_inspect_params?: AgentApprovalInspectParams
+  agent_approval_inspect_result?: AgentApprovalInspectResult
   agent_approval_respond_params?: AgentApprovalRespondParams
   agent_approval_respond_result?: AgentApprovalRespondResult
   agent_binding_state?: AgentBindingState
@@ -1897,7 +1899,7 @@ export interface KalaReachProtocol {
   controller_connection_role?: ControllerConnectionRole
   controller_generation_token?: ControllerGenerationToken
   declarative_table?: DeclarativeTable
-  decoder_ledger_entry?: DecoderLedgerEntry
+  decoder_ledger_entry?: DecoderLedgerEntry1
   decoding_trust?: DecodingTrust
   delivery_destination_secret_set_params?: DeliveryDestinationSecretSetParams
   delivery_destination_secret_set_result?: DeliveryDestinationSecretSetResult
@@ -2800,6 +2802,144 @@ export interface ActorEnvelope {
     'local_ipc' | 'paired_device' | 'unpaired_peer' | 'workflow' | 'plugin' | 'service_client'
 }
 /**
+ * Parameters of `agent.approval.inspect`.
+ */
+export interface AgentApprovalInspectParams {
+  /**
+   * The pending resource whose record is read.
+   */
+  resource_id: string
+  subject: AgentSubject
+}
+/**
+ * The session and the exact instance the request came from.
+ */
+export interface AgentSubject {
+  /**
+   * One foreground application within a terminal session.
+   */
+  application_instance_id: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * The result of `agent.approval.inspect`: what an installed decoder read and what it offered.
+ *
+ * Section 11 makes an installed decoder part of the trust boundary. Authenticated wire provenance
+ * proves which connection supplied the bytes; nothing proves that the decoder read them
+ * correctly. Before the request became an approval a person can answer, the broker checked that
+ * the decoder's binding held the approval-interpreter grant and a trust covering the request's
+ * method, that the source frame was the request's own, recorded by that package's connection at
+ * the instance's current generation and never interpreted before, and that the projection kept to
+ * the trust's schema policy. None of that shows the projection says what the request says, so
+ * this answer carries the request itself, whole, beside what the decoder made of it and whose
+ * decoder that was.
+ */
+export interface AgentApprovalInspectResult {
+  decoding: DecoderLedgerEntry
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  recorded_at: string
+  /**
+   * The resource this record is about.
+   */
+  resource_id: string
+  /**
+   * Where the request stands now: pending, claimed, or the one terminal state it reached.
+   */
+  state: 'pending' | 'claimed' | 'resolved' | 'cancelled' | 'expired' | 'uncertain'
+}
+/**
+ * What the decoder read and what it offered, exactly as the ledger retains it: the package
+ * and publisher whose decoder it was, the upstream method and native request identifier, the
+ * original source bytes and their digest, the decisions offered in the upstream's order, and
+ * the upstream's deadline.
+ */
+export interface DecoderLedgerEntry {
+  /**
+   * The binding whose component decoded the request.
+   */
+  binding_id: string
+  /**
+   * The deadline the upstream put on its request, where it stated one.
+   */
+  deadline_ms: TimestampMs | null
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  decoded_at: string
+  /**
+   * The upstream method the original request named.
+   */
+  method: string
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  package_digest: string
+  /**
+   * The package that binding runs.
+   */
+  plugin_id: string
+  projection: DecodedProjection
+  /**
+   * The publisher of that package, for a person reading the pending resource.
+   */
+  publisher_id: string
+  /**
+   * The original source bytes, whole.
+   *
+   * A digest proves which bytes these are; it cannot reproduce them, and section 11 requires
+   * the original source to be retained rather than merely identified. A request too large to
+   * retain whole never becomes an approval, so this is never a partial copy.
+   */
+  source_bytes: string
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  source_digest: string
+  /**
+   * The generation of the source frame the decoder read.
+   */
+  source_generation: string
+  /**
+   * The native request identifier, exactly as the upstream wrote it.
+   */
+  upstream_request_id: string
+}
+/**
+ * The projection the decoder produced, with the exact decisions it offered.
+ */
+export interface DecodedProjection {
+  /**
+   * The decisions offered, in the order the upstream offered them.
+   */
+  decisions: OfferedDecision[]
+  /**
+   * The projection schema the decoder wrote this against.
+   */
+  schema_version: string
+  /**
+   * What the request is asking, for a person.
+   */
+  summary: string
+}
+/**
+ * One decision a decoder offers a person.
+ */
+export interface OfferedDecision {
+  /**
+   * What the decision says, for a person.
+   */
+  label: string
+  /**
+   * The identifier the upstream expects back. Answering is choosing one of these.
+   */
+  option_id: string
+}
+/**
  * Parameters of `agent.approval.respond`.
  */
 export interface AgentApprovalRespondParams {
@@ -2824,12 +2964,12 @@ export interface AgentMutationTarget {
    * Changes when the active upstream execution owner or selected thread changes.
    */
   binding_revision: string
-  subject: AgentSubject
+  subject: AgentSubject1
 }
 /**
  * The session and instance.
  */
-export interface AgentSubject {
+export interface AgentSubject1 {
   /**
    * One foreground application within a terminal session.
    */
@@ -2931,18 +3071,18 @@ export interface AgentMutationTarget1 {
    * Changes when the active upstream execution owner or selected thread changes.
    */
   binding_revision: string
-  subject: AgentSubject
+  subject: AgentSubject1
 }
 /**
  * Parameters of `agent.capabilities`.
  */
 export interface AgentCapabilitiesParams {
-  subject: AgentSubject1
+  subject: AgentSubject2
 }
 /**
  * The session and instance.
  */
-export interface AgentSubject1 {
+export interface AgentSubject2 {
   /**
    * One foreground application within a terminal session.
    */
@@ -3112,12 +3252,12 @@ export interface InstanceCapabilityIdentity {
  * Parameters of `agent.commands`.
  */
 export interface AgentCommandsParams {
-  subject: AgentSubject2
+  subject: AgentSubject3
 }
 /**
  * The session and instance.
  */
-export interface AgentSubject2 {
+export interface AgentSubject3 {
   /**
    * One foreground application within a terminal session.
    */
@@ -3656,7 +3796,7 @@ export interface AgentMutationTarget2 {
    * Changes when the active upstream execution owner or selected thread changes.
    */
   binding_revision: string
-  subject: AgentSubject
+  subject: AgentSubject1
 }
 /**
  * One committed broker transition, as an attached view is told about it.
@@ -3899,12 +4039,12 @@ export interface AgentSnapshotParams {
    * The node the reader wants the next part from, when continuing a bounded snapshot.
    */
   from_node: U64 | null
-  subject: AgentSubject3
+  subject: AgentSubject4
 }
 /**
  * The session and instance.
  */
-export interface AgentSubject3 {
+export interface AgentSubject4 {
   /**
    * One foreground application within a terminal session.
    */
@@ -4047,7 +4187,7 @@ export interface AgentMutationTarget3 {
    * Changes when the active upstream execution owner or selected thread changes.
    */
   binding_revision: string
-  subject: AgentSubject
+  subject: AgentSubject1
 }
 /**
  * The result of `agent_tools.install`.
@@ -9385,9 +9525,9 @@ export interface DeclarativeEntry {
  * outlives the plugin process, because a plugin-process failure cannot destroy the approval
  * ledger.
  */
-export interface DecoderLedgerEntry {
+export interface DecoderLedgerEntry1 {
   /**
-   * One component bound to one application instance inside the broker.
+   * The binding whose component decoded the request.
    */
   binding_id: string
   /**
@@ -9407,12 +9547,12 @@ export interface DecoderLedgerEntry {
    */
   package_digest: string
   /**
-   * A plugin identifier from its manifest.
+   * The package that binding runs.
    */
   plugin_id: string
   projection: DecodedProjection
   /**
-   * A package publisher identity from its manifest. Decoding trust is recorded against it.
+   * The publisher of that package, for a person reading the pending resource.
    */
   publisher_id: string
   /**
@@ -9432,39 +9572,9 @@ export interface DecoderLedgerEntry {
    */
   source_generation: string
   /**
-   * An upstream JSON-RPC request identifier, in its JSON form: a string identifier keeps its quotes, so a string and a number never collide. Correlation data, not authority.
+   * The native request identifier, exactly as the upstream wrote it.
    */
   upstream_request_id: string
-}
-/**
- * The projection the decoder produced, with the exact decisions it offered.
- */
-export interface DecodedProjection {
-  /**
-   * The decisions offered, in the order the upstream offered them.
-   */
-  decisions: OfferedDecision[]
-  /**
-   * The projection schema the decoder wrote this against.
-   */
-  schema_version: string
-  /**
-   * What the request is asking, for a person.
-   */
-  summary: string
-}
-/**
- * One decision a decoder offers a person.
- */
-export interface OfferedDecision {
-  /**
-   * What the decision says, for a person.
-   */
-  label: string
-  /**
-   * The identifier the upstream expects back. Answering is choosing one of these.
-   */
-  option_id: string
 }
 /**
  * What a component is trusted to interpret, and whose interpretation it is.
@@ -13990,6 +14100,7 @@ export interface MethodEntry {
     | 'agent.capabilities'
     | 'agent.snapshot'
     | 'agent.commands'
+    | 'agent.approval.inspect'
     | 'agent.prompt.submit'
     | 'agent.prompt.queue'
     | 'agent.turn.steer'
@@ -15668,7 +15779,7 @@ export interface AgentMutationTarget4 {
    * Changes when the active upstream execution owner or selected thread changes.
    */
   binding_revision: string
-  subject: AgentSubject
+  subject: AgentSubject1
 }
 /**
  * The result of `plugin.action.invoke`.
@@ -22115,6 +22226,7 @@ export interface ServiceRequestPayload {
     | 'agent.capabilities'
     | 'agent.snapshot'
     | 'agent.commands'
+    | 'agent.approval.inspect'
     | 'agent.prompt.submit'
     | 'agent.prompt.queue'
     | 'agent.turn.steer'
