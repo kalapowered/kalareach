@@ -19,7 +19,10 @@ use kr_client::recovery::{
 };
 use kr_client::services::account::{AccountToken, AccountTokenSource};
 use kr_client::services::backup::{BACKUP_MANIFEST_PATH, ManagedBackupManifestService};
-use kr_client::services::storage::ManagedStorageService;
+use kr_client::services::storage::{
+    ManagedStorageService, STORAGE_UPLOAD_ABORT_PATH, STORAGE_UPLOAD_COMPLETE_PATH,
+    STORAGE_UPLOAD_CREATE_PATH, STORAGE_UPLOAD_PART_PATH,
+};
 use kr_client::services::{
     ArchiveAnswer, BackupManifestService, NewUpload, ObjectDeleted, ObjectRange, PartStored,
     PartTable, RetentionChange, RetentionSet, ServiceFuture, ServiceSigner, StorageService,
@@ -271,6 +274,7 @@ struct Owner {
     bundles: Arc<Bundles>,
     device: Arc<Device>,
     seed: RecoverySeed,
+    producer: StoredEnvelopeKeyPair,
     store: SyncStore,
     settings: SyncObject,
     bundle_disk: tempfile::TempDir,
@@ -303,6 +307,7 @@ impl Owner {
             web,
             device: Device::generate(),
             seed: RecoverySeed::generate().expect("a seed"),
+            producer: StoredEnvelopeKeyPair::generate().expect("a producer key"),
             store,
             settings,
             bundle_disk: tempfile::tempdir().expect("a directory on the internal disk"),
@@ -333,7 +338,7 @@ impl Owner {
             owner_device_id: DeviceId::new(Uuid::from_bytes([0x7c; 16])),
             writer: self.device.0.clone(),
             writer_revision: BackupWriterRevision::new(1),
-            producer: StoredEnvelopeKeyPair::generate().expect("a producer key"),
+            producer: self.producer.clone(),
             recovery: *self
                 .seed
                 .recipient()
@@ -588,25 +593,85 @@ async fn privacy_mode_on_refuses_the_settings_archive_before_anything_is_sent() 
     assert_eq!(owner.web.arrived().len(), before, "nothing was sent");
 }
 
-/// Managed storage as the device reaches it, with the privacy generation moved on once a
-/// generation's objects are all stored.
-struct MovesOn {
-    storage: ManagedStorageService,
-    store: SyncStore,
-    completions: Mutex<u32>,
-    after: u32,
+/// The request of one kind after whose answer privacy mode changes, counted from one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum After {
+    Creation(u32),
+    Part(u32),
+    Completion(u32),
 }
 
-impl std::fmt::Debug for MovesOn {
+/// What privacy mode does then.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Change {
+    /// It is turned on, at the next generation.
+    Fence,
+    /// Its generation moves on, and it stays off.
+    MoveOn,
+}
+
+/// Managed storage as the device reaches it, with privacy mode changed once one request of the
+/// upload has been answered: a change that lands while the device is in the middle of an upload.
+struct Meddling {
+    storage: ManagedStorageService,
+    store: SyncStore,
+    after: After,
+    change: Change,
+    seen: Mutex<(u32, u32, u32)>,
+}
+
+impl Meddling {
+    fn new(owner: &Owner, after: After, change: Change) -> Self {
+        Self {
+            storage: storage(&owner.web, &owner.device),
+            store: SyncStore::open(owner.store.directory()).expect("the same sync store"),
+            after,
+            change,
+            seen: Mutex::new((0, 0, 0)),
+        }
+    }
+
+    /// Counts one answered request and changes privacy mode when it is the one chosen.
+    fn answered(&self, count: impl FnOnce(&mut (u32, u32, u32)) -> After) {
+        let reached = count(&mut self.seen.lock().expect("the count"));
+        if reached != self.after {
+            return;
+        }
+        let current = self
+            .store
+            .privacy()
+            .expect("the privacy state")
+            .generation
+            .get();
+        match self.change {
+            Change::Fence => {
+                self.store
+                    .record_privacy(PrivacyRecord {
+                        generation: U64::new(current + 1),
+                        fenced: true,
+                    })
+                    .expect("privacy mode on");
+            }
+            Change::MoveOn => {
+                self.store
+                    .advance_privacy(current + 1)
+                    .expect("privacy mode moves on");
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for Meddling {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("MovesOn")
+            .debug_struct("Meddling")
             .field("after", &self.after)
+            .field("change", &self.change)
             .finish_non_exhaustive()
     }
 }
 
-impl StorageService for MovesOn {
+impl StorageService for Meddling {
     fn status(&self) -> ServiceFuture<'_, StorageStatus> {
         StorageService::status(&self.storage)
     }
@@ -619,7 +684,14 @@ impl StorageService for MovesOn {
         &'a self,
         upload: &'a NewUpload,
     ) -> ServiceFuture<'a, ArchiveAnswer<UploadCreated>> {
-        StorageService::create_upload(&self.storage, upload)
+        Box::pin(async move {
+            let created = StorageService::create_upload(&self.storage, upload).await;
+            self.answered(|seen| {
+                seen.0 += 1;
+                After::Creation(seen.0)
+            });
+            created
+        })
     }
 
     fn upload_part<'a>(
@@ -627,7 +699,14 @@ impl StorageService for MovesOn {
         upload_id: &'a UploadId,
         part: UploadPart<'a>,
     ) -> ServiceFuture<'a, ArchiveAnswer<PartStored>> {
-        StorageService::upload_part(&self.storage, upload_id, part)
+        Box::pin(async move {
+            let stored = StorageService::upload_part(&self.storage, upload_id, part).await;
+            self.answered(|seen| {
+                seen.1 += 1;
+                After::Part(seen.1)
+            });
+            stored
+        })
     }
 
     fn complete_upload<'a>(
@@ -637,14 +716,10 @@ impl StorageService for MovesOn {
     ) -> ServiceFuture<'a, ArchiveAnswer<UploadCompleted>> {
         Box::pin(async move {
             let completed = StorageService::complete_upload(&self.storage, upload_id, table).await;
-            let mut completions = self.completions.lock().expect("the count");
-            *completions += 1;
-            if *completions == self.after {
-                let current = self.store.privacy().expect("the privacy state");
-                self.store
-                    .advance_privacy(current.generation.get() + 1)
-                    .expect("privacy mode moves on");
-            }
+            self.answered(|seen| {
+                seen.2 += 1;
+                After::Completion(seen.2)
+            });
             completed
         })
     }
@@ -684,12 +759,7 @@ async fn a_privacy_generation_that_moved_refuses_the_publication() {
         .enable()
         .await
         .expect("the settings writer is enabled");
-    let moving = MovesOn {
-        storage: storage(&owner.web, &owner.device),
-        store: SyncStore::open(owner.store.directory()).expect("the same sync store"),
-        completions: Mutex::new(0),
-        after: 2,
-    };
+    let moving = Meddling::new(&owner, After::Completion(2), Change::MoveOn);
     let refused = owner.back_up_through(&archive, 1, &moving).await;
     assert!(
         matches!(
@@ -706,6 +776,94 @@ async fn a_privacy_generation_that_moved_refuses_the_publication() {
         "no publication was sent"
     );
     assert_eq!(owner.web.stored_objects(), 2);
+}
+
+/// Section 24: privacy mode turned on while an upload is under way stops it before its next
+/// request, whichever request was on its way, and the upload is abandoned at the service.
+#[tokio::test]
+async fn privacy_mode_turned_on_during_an_upload_stops_it_and_abandons_it() {
+    for (after, parts) in [(After::Creation(1), 0), (After::Part(1), 1)] {
+        let owner = Owner::new();
+        let archive = owner
+            .enable()
+            .await
+            .expect("the settings writer is enabled");
+        let fencing = Meddling::new(&owner, after, Change::Fence);
+        let refused = owner.back_up_through(&archive, 1, &fencing).await;
+        assert!(
+            matches!(
+                refused,
+                Err(RecoveryError::Sync(SyncError::Fenced { generation: 1 }))
+            ),
+            "{after:?}: {refused:?}"
+        );
+        assert_eq!(
+            owner.web.requests_to(STORAGE_UPLOAD_CREATE_PATH),
+            1,
+            "{after:?}"
+        );
+        assert_eq!(
+            owner.web.requests_to(STORAGE_UPLOAD_PART_PATH),
+            parts,
+            "{after:?}"
+        );
+        assert_eq!(
+            owner.web.requests_to(STORAGE_UPLOAD_COMPLETE_PATH),
+            0,
+            "{after:?}: nothing is completed"
+        );
+        assert_eq!(
+            owner.web.requests_to(STORAGE_UPLOAD_ABORT_PATH),
+            1,
+            "{after:?}: the upload is abandoned"
+        );
+        assert_eq!(owner.web.stored_objects(), 0, "{after:?}");
+        assert!(owner.web.generations(&archive_id().to_string()).is_empty());
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Taking the archive up again                                                 */
+/* -------------------------------------------------------------------------- */
+
+/// A device that enabled its writer earlier takes the archive up again only for the collection,
+/// the producer and the writer the authenticated bundle names, since a restore with only the kit
+/// finds and opens nothing else.
+#[tokio::test]
+async fn an_archive_taken_up_again_is_held_to_what_the_bundle_names() {
+    let owner = Owner::new();
+    owner
+        .enable()
+        .await
+        .expect("the settings writer is enabled");
+    let mut bundles = owner.bundle_store();
+    let bundle = bundles.fetch(&owner.seed).await.expect("the bundle");
+
+    let resumed = SettingsArchive::resume(owner.collection(), &bundles, &bundle)
+        .expect("the bundle names the collection, the producer and the writer");
+    owner
+        .back_up(&resumed, 1)
+        .await
+        .expect("the settings are backed up");
+
+    let mut elsewhere = owner.collection();
+    elsewhere.archive_id = ArchiveId::new(Uuid::from_bytes([0x6f; 16]));
+    assert!(
+        SettingsArchive::resume(elsewhere, &bundles, &bundle).is_none(),
+        "a collection the bundle does not name"
+    );
+    let mut another_producer = owner.collection();
+    another_producer.producer = StoredEnvelopeKeyPair::generate().expect("a producer key");
+    assert!(
+        SettingsArchive::resume(another_producer, &bundles, &bundle).is_none(),
+        "a producer the bundle does not name"
+    );
+    let mut another_writer = owner.collection();
+    another_writer.writer = AuthorisationKeyPair::generate().expect("a writer key");
+    assert!(
+        SettingsArchive::resume(another_writer, &bundles, &bundle).is_none(),
+        "a writer the bundle does not name"
+    );
 }
 
 /* -------------------------------------------------------------------------- */

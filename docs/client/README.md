@@ -1415,15 +1415,19 @@ the producer whose wraps a restore opens and the writer a restore verifies again
 is enrolled at the manifest service only after that write has landed; a write that does not land
 enrols nothing. A `SettingsArchive` holds the `WriterEnabled` evidence, so no generation is published
 by a writer a restore with only the kit could not verify. A device that enabled its writer before
-takes the archive up again with `SettingsArchive::resume` and the evidence a read of the bundle
-gives.
+takes the archive up again with `SettingsArchive::resume`, which holds it to the collection, the
+producer and the writer the bundle it last authenticated names, since a restore finds and opens
+nothing else.
 
 The export refuses while privacy mode is on, before anything is sent. The device then reads its
-privacy state again before each object leaves and before the publication, and a fence, or a privacy
-generation that has moved on, refuses whatever has not been sent. An object stored before that stays
-at the service unpublished, where no restore looks for it. A collection deleted from the account
-console refuses the upload or the publication with a message that says to enrol a new collection.
-A generation that fails part-way is made again as the next generation, under new keys.
+privacy state again before each object's upload is created, once it exists, before each further
+part and before the completion, and before the publication. A fence, or a privacy generation that
+has moved on, refuses whatever has not been sent, and an upload it stops is abandoned at the
+service. An object already stored by then stays at the service unpublished, where no restore looks
+for it, and this device keeps no record of it: showing it among the archives privacy mode retains,
+or deleting it, is not built here. A collection deleted from the account console refuses the upload
+or the publication with a message that says to enrol a new collection. A generation that fails
+part-way is made again as the next generation, under new keys.
 
 ## Requirement rows
 

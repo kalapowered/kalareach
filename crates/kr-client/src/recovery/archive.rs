@@ -19,9 +19,13 @@
 //!
 //! The export refuses while privacy mode is on, before anything is sent, and names the privacy
 //! generation it read the settings under. The device reads its privacy state again before each
-//! object leaves and before the publication: a fence, or a generation that has moved on, refuses
-//! everything not yet sent. An object already stored stays at the service unpublished, where no
-//! restore looks for it.
+//! object's upload is created, once it is, before each further part and before the completion, and
+//! before the publication: a fence, or a generation that has moved on, refuses everything not yet
+//! sent, and an upload it stops is abandoned at the service.
+//!
+//! An object already stored when that happens stays at the service, unpublished, where no restore
+//! looks for it. This device keeps no record of it, so showing it among the archives privacy mode
+//! retains, or deleting it, is not built here.
 //!
 //! # What leaves this device
 //!
@@ -53,7 +57,9 @@ use kr_protocol::ids::{
 use kr_protocol::scalars::{Digest256, StoredEnvelopeKey, TimestampMs};
 
 use crate::error::ClientError;
-use crate::recovery::{BundleStore, Result, SETTINGS_FILENAME, WriterEnabled, export_settings};
+use crate::recovery::{
+    BundleStore, RecoveryError, Result, SETTINGS_FILENAME, WriterEnabled, export_settings,
+};
 use crate::services::storage::collection_deleted;
 use crate::services::{
     ArchiveAnswer, BackupManifestService, Dispatched, NewUpload, Published, StorageService,
@@ -187,11 +193,32 @@ impl SettingsArchive {
     /// The settings archive of a writer whose bundle has already landed, as a device that enabled
     /// it earlier takes it up again.
     ///
-    /// `enabled` comes from [`BundleStore::writer_enabled`] after the bundle is read. Answers none
-    /// when the evidence is for another writer.
+    /// `bundle` is the bundle `bundles` last authenticated, as [`BundleStore::fetch`] gave it back.
+    /// The archive is taken up only when that bundle names this collection at its origin, this
+    /// producer's key and this writer's key, as [`Self::enable`] committed them: a writer a restore
+    /// can verify is not enough when the restore could not find the collection or open its wraps.
+    /// Answers none otherwise.
     #[must_use]
-    pub fn resume(collection: SettingsCollection, enabled: WriterEnabled) -> Option<Self> {
-        (enabled.writer_key_id() == collection.writer.key_id()).then_some(Self {
+    pub fn resume(
+        collection: SettingsCollection,
+        bundles: &BundleStore,
+        bundle: &RecoveryBundle,
+    ) -> Option<Self> {
+        let enabled = bundles.writer_enabled(collection.writer.key_id())?;
+        let carried = enabled.bundle_revision() == bundle.revision.get()
+            && bundle.collections.iter().any(|held| {
+                held.archive_id == collection.archive_id
+                    && held.service_origin == collection.service_origin
+            })
+            && bundle.trusted_producers.iter().any(|held| {
+                held.sender_key_id == collection.producer.key_id()
+                    && held.stored_envelope_key == *collection.producer.public()
+            })
+            && bundle.trusted_writers.iter().any(|held| {
+                held.writer_key_id == collection.writer.key_id()
+                    && held.signing_key == *collection.writer.public()
+            });
+        carried.then_some(Self {
             collection,
             enabled,
         })
@@ -254,20 +281,20 @@ impl SettingsArchive {
         drop(exported);
 
         let encrypted_manifest = &sealed.descriptor.encrypted_manifest;
-        for (object_id, bytes, hash) in [
-            (
-                member.object_id(),
-                member.bytes(),
-                member.reference().encrypted_object_hash,
-            ),
-            (
-                encrypted_manifest.object_id,
-                sealed.encrypted_manifest.as_slice(),
-                encrypted_manifest.encrypted_object_hash,
-            ),
+        for leaving in [
+            Leaving {
+                object_id: member.object_id(),
+                bytes: member.bytes(),
+                hash: member.reference().encrypted_object_hash,
+            },
+            Leaving {
+                object_id: encrypted_manifest.object_id,
+                bytes: sealed.encrypted_manifest.as_slice(),
+                hash: encrypted_manifest.encrypted_object_hash,
+            },
         ] {
             still_in_force(store, produced_under)?;
-            self.upload(storage, generation, object_id, bytes, hash)
+            self.upload(storage, store, produced_under, generation, leaving)
                 .await?;
         }
 
@@ -289,14 +316,24 @@ impl SettingsArchive {
     }
 
     /// Uploads one object of a generation whole, in the parts its table cuts.
+    ///
+    /// Privacy mode can change while a request is on its way, so the device's privacy state is read
+    /// again once the upload exists, before each further part and before the completion. An upload
+    /// that meets a fence, or a generation that has moved on, is abandoned at the service and goes
+    /// no further.
     async fn upload(
         &self,
         storage: &dyn StorageService,
+        store: &SyncStore,
+        produced_under: u64,
         generation: BackupGeneration,
-        object_id: BackupObjectId,
-        bytes: &[u8],
-        hash: Digest256,
+        leaving: Leaving<'_>,
     ) -> Result<()> {
+        let Leaving {
+            object_id,
+            bytes,
+            hash,
+        } = leaving;
         let total = bytes.len() as u64;
         let upload = NewUpload {
             archive_id: self.collection.archive_id,
@@ -313,13 +350,31 @@ impl SettingsArchive {
                 return Err(contrary("a creation as an upload it holds none of").into());
             }
         };
-        let mut nothing_kept = |_: &UploadProgress| -> crate::Result<()> { Ok(()) };
-        match upload_parts(storage, &mut progress, bytes, &mut nothing_kept).await? {
+        if let Err(stopped) = still_in_force(store, produced_under) {
+            return Err(abandon(storage, &progress, stopped).await);
+        }
+        let mut stopped: Option<RecoveryError> = None;
+        let sent = {
+            let mut before_the_next_part = |_: &UploadProgress| -> crate::Result<()> {
+                still_in_force(store, produced_under).map_err(|refusal| {
+                    stopped = Some(refusal);
+                    held_back()
+                })
+            };
+            upload_parts(storage, &mut progress, bytes, &mut before_the_next_part).await
+        };
+        if let Some(stopped) = stopped {
+            return Err(abandon(storage, &progress, stopped).await);
+        }
+        match sent? {
             ArchiveAnswer::Done(()) => {}
             ArchiveAnswer::CollectionDeleted => return Err(collection_deleted().into()),
             ArchiveAnswer::UploadGone => {
                 return Err(contrary("a part as an upload it holds none of").into());
             }
+        }
+        if let Err(stopped) = still_in_force(store, produced_under) {
+            return Err(abandon(storage, &progress, stopped).await);
         }
         match storage
             .complete_upload(&progress.upload_id, &progress.table)
@@ -360,6 +415,36 @@ impl SettingsArchive {
             payload,
         })
     }
+}
+
+/// One object of a generation on its way to the service: its identity, its ciphertext and the
+/// ciphertext's hash.
+struct Leaving<'a> {
+    object_id: BackupObjectId,
+    bytes: &'a [u8],
+    hash: Digest256,
+}
+
+/// Abandons an upload privacy mode stopped, and gives back what stopped it.
+///
+/// The abandonment is asked for once. An upload it does not end was never completed, so it ends
+/// when its lifetime runs out.
+async fn abandon(
+    storage: &dyn StorageService,
+    progress: &UploadProgress,
+    stopped: RecoveryError,
+) -> RecoveryError {
+    let _ = storage.abort_upload(&progress.upload_id).await;
+    stopped
+}
+
+/// What stops an upload part-way once privacy mode has stopped it. Nothing reads it: the upload
+/// knows why it stopped.
+fn held_back() -> ClientError {
+    ClientError::Host(ProtocolError::new(
+        ErrorCode::PermissionDenied,
+        "privacy mode stopped the upload before its next part".to_owned(),
+    ))
 }
 
 /// The owner's record enrolling `writer` for the collection.
