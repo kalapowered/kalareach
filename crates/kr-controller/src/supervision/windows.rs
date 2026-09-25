@@ -755,9 +755,154 @@ mod launching {
             launch: &ServiceLaunch,
             variables: &[(String, String)],
         ) -> LaunchOutcome {
-            let _ = (launch, variables);
-            LaunchOutcome::NotStarted {
-                detail: "not built yet".to_owned(),
+            let not_started = |detail: String| LaunchOutcome::NotStarted { detail };
+            match standing(&self.expected) {
+                Ok(Standing::Owned(differences)) if differences.is_empty() => {}
+                Ok(Standing::Owned(differences)) => {
+                    return not_started(format!(
+                        "the environment's task {} is not the one this installation registers ({}): \
+                         {SETUP_ACTION} to repair it",
+                        self.expected.name,
+                        differences.join("; ")
+                    ));
+                }
+                Ok(Standing::Absent) => {
+                    return not_started(format!(
+                        "the environment has no task to start workers: {SETUP_ACTION}"
+                    ));
+                }
+                Ok(Standing::Foreign(detail)) => {
+                    return not_started(format!("{detail}: {SETUP_ACTION} for this environment"));
+                }
+                Err(detail) => return not_started(detail),
+            }
+            let (Some(program), Some(working_directory)) =
+                (launch.program.to_str(), launch.working_directory.to_str())
+            else {
+                return not_started(format!(
+                    "{} or the directory it runs in is not a path this host can hand over",
+                    launch.program.display()
+                ));
+            };
+            let session = match starter::current_session() {
+                Ok(session) => session,
+                Err(error) => {
+                    return not_started(format!("this daemon's login session: {error}"));
+                }
+            };
+            let recorded = kr_ipc::identity::boot_identity()
+                .map_err(|error| error.to_string())
+                .and_then(|boot| {
+                    starter::record_session(
+                        &self.environment,
+                        &starter::RecordedSession { session, boot },
+                    )
+                    .map_err(|error| error.to_string())
+                });
+            if let Err(detail) = recorded {
+                return not_started(format!(
+                    "the environment's login session could not be recorded: {detail}"
+                ));
+            }
+            let listener = match self
+                .environment
+                .starter_endpoint()
+                .map_err(|error| error.to_string())
+                .and_then(|endpoint| {
+                    LaunchListener::create(&endpoint).map_err(|error| error.to_string())
+                }) {
+                Ok(listener) => listener,
+                Err(detail) => {
+                    return not_started(format!("the launch pipe could not be opened: {detail}"));
+                }
+            };
+            // The launch reaches a starter only through this instance, so a run that failed, or a
+            // starter that never came, leaves nothing that could still start it once the instance
+            // is dropped.
+            if let Err(failure) = run(&self.expected) {
+                let detail = match failure {
+                    RunFailure::NotRun(detail) | RunFailure::Failed(detail) => detail,
+                };
+                return not_started(detail);
+            }
+            let mut stream = match listener.accept(Instant::now() + self.reach_bound) {
+                Ok(Some(stream)) => stream,
+                Ok(None) => {
+                    return not_started(format!(
+                        "the environment's task {} was run and no starter reached the launch within \
+                         {:?}",
+                        self.expected.name, self.reach_bound
+                    ));
+                }
+                Err(error) => {
+                    return not_started(format!("waiting for the starter failed: {error}"));
+                }
+            };
+            if let Err(reason) = self.accept_starter(&mut stream, session) {
+                // Best effort: a starter that is told why logs nothing and starts nothing either way.
+                if let Ok(declined) = encode(&Answer::Declined {
+                    reason: reason.clone(),
+                }) {
+                    let _ = stream.send(&declined, Instant::now() + EXCHANGE_BOUND);
+                }
+                return not_started(reason);
+            }
+            let handed = Launch {
+                program: program.to_owned(),
+                arguments: launch.arguments.clone(),
+                working_directory: working_directory.to_owned(),
+                environment: variables
+                    .iter()
+                    .map(|(name, value)| Variable {
+                        name: name.clone(),
+                        value: value.clone(),
+                    })
+                    .collect(),
+                session,
+            };
+            let bytes = match encode(&Answer::Launch(handed)) {
+                Ok(bytes) => bytes,
+                Err(detail) => return not_started(detail),
+            };
+            // From here the starter may have the launch, so a failure is uncertain, never nothing.
+            let uncertain = |detail: String| LaunchOutcome::Uncertain { detail, pid: None };
+            if let Err(error) = stream.send(&bytes, Instant::now() + EXCHANGE_BOUND) {
+                return uncertain(format!(
+                    "the launch was handed to the starter and may not have arrived: {error}"
+                ));
+            }
+            let report = match stream
+                .receive(Instant::now() + REPORT_BOUND)
+                .map_err(|error| error.to_string())
+                .and_then(|bytes| decode::<Report>(&bytes))
+            {
+                Ok(report) => report,
+                Err(detail) => {
+                    return uncertain(format!(
+                        "the starter took the launch and its answer was lost: {detail}"
+                    ));
+                }
+            };
+            match report {
+                Report::Started {
+                    identity,
+                    session: started_in,
+                    ..
+                } if started_in == session => LaunchOutcome::Started(identity),
+                Report::Started {
+                    session: started_in,
+                    ..
+                } => uncertain(format!(
+                    "the starter reports a process in login session {started_in}, not {session}"
+                )),
+                Report::Refused {
+                    detail,
+                    remaining: false,
+                } => not_started(detail),
+                Report::Refused {
+                    detail,
+                    remaining: true,
+                } => uncertain(detail),
             }
         }
 
@@ -849,8 +994,22 @@ mod launching {
     /// lets run only once [`kr_ipc::starter::start_child`] has checked it.
     #[must_use]
     pub fn run_starter(runtime_root: &Path, state_root: &Path) -> StarterExit {
-        let _ = (runtime_root, state_root);
-        StarterExit::Unusable
+        let Ok(paths) = HostPaths::new(runtime_root, state_root) else {
+            return StarterExit::Unusable;
+        };
+        let Ok(Some(environment_id)) = paths.recorded_environment_id() else {
+            return StarterExit::Unusable;
+        };
+        let environment = paths.environment(environment_id);
+        let Ok(endpoint) = environment.starter_endpoint() else {
+            return StarterExit::Unusable;
+        };
+        match starter::connect(&endpoint, Instant::now() + LOOK_BOUND) {
+            Ok(Reached::Connected(stream)) => serve_launch(stream, environment_id),
+            Ok(Reached::NoInstance | Reached::Busy) | Err(_) => {
+                start_claimed_daemon(&environment, runtime_root, state_root)
+            }
+        }
     }
 
     /// Serves the one launch this starter reached.
