@@ -810,6 +810,27 @@ fn kr_req_12_07_a_launch_whose_session_closed_before_it_went_runs_as_typed() {
     );
 }
 
+/// KR-REQ-12.07: the session closed after the launch was committed and before the launcher was told:
+/// the launcher, which execs with the integration's flags only when it is told, runs what was typed.
+#[test]
+fn kr_req_12_07_a_launch_whose_session_closed_before_it_was_confirmed_runs_as_typed() {
+    let shell = Shell::new();
+    let (arrived, _release) = shell.backends.pause_before_confirming();
+    let answer = shell.establish();
+    let child = shell.launch(&answer, "unconfirmed", &[]);
+    shell
+        .runtime
+        .block_on(async { tokio::time::timeout(LIVENESS, arrived).await })
+        .expect("the launch is committed")
+        .expect("and paused before the launcher is told");
+    shell.backends.close();
+    let _ = finish(child);
+    assert_typed(
+        &shell.report("unconfirmed"),
+        "a launch whose session closed before it was confirmed",
+    );
+}
+
 /// KR-REQ-12.07: a backend being launched when its line ends, or when a later line is resolved, is
 /// retired by its rollback rather than handed back unbound, so a retry of the old answer runs as
 /// typed.
