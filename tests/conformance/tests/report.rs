@@ -224,6 +224,21 @@ fn a_call_a_macro_or_attribute_may_rewrite_move_or_rename_keys_nothing() {
             Binding::CalledFunction
         )])
     );
+    // One name in two modules names two tests, each keyed by its own comment.
+    assert_eq!(
+        keyed.get("KR-REQ-03.57"),
+        Some(&vec![(
+            "samename first::example".to_owned(),
+            Binding::AttachedComment
+        )])
+    );
+    assert_eq!(
+        keyed.get("KR-REQ-03.58"),
+        Some(&vec![(
+            "samename second::example".to_owned(),
+            Binding::AttachedComment
+        )])
+    );
     // A `use` written as text imports nothing, so it leaves the rest of its target proved.
     assert_eq!(
         keyed.get("KR-REQ-03.31"),
@@ -380,7 +395,15 @@ fn a_source_outside_the_conventions_is_a_problem_and_keys_no_helper() {
                 "`clippy` is declared here as the name `as` gives",
             ),
             ("tests/traits.rs:10", "a type or a trait"),
+            (
+                "tests/twice.rs:6",
+                "defines the test `example` more than once (tests/twice.rs:6, tests/twice.rs:11)",
+            ),
             ("tests/unicode.rs:12", "is an identifier outside ASCII"),
+            (
+                "tests/variants.rs:8",
+                "defines the test `example` more than once (tests/variants.rs:8, tests/variants.rs:14)",
+            ),
             ("vintage/tests/old.rs:1", "the 2015 edition"),
         ],
     );
@@ -414,6 +437,7 @@ fn a_source_outside_the_conventions_is_a_problem_and_keys_no_helper() {
         "KR-REQ-03.47",
         "KR-REQ-03.48",
         "KR-REQ-03.49",
+        "KR-REQ-03.50",
         "KR-REQ-03.51",
         "KR-REQ-03.52",
         "KR-REQ-03.53",

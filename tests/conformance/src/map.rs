@@ -268,6 +268,9 @@ struct Helper {
 struct Use {
     target: TargetId,
     name: String,
+    /// The file and line it is defined at.
+    file: String,
+    line: usize,
     module: Vec<String>,
     uses: BTreeSet<String>,
     calls: BTreeSet<Vec<String>>,
@@ -397,28 +400,33 @@ fn rust_package(map: &mut Map, sources: &mut Sources, root: &Path, package: &Pac
                 }
             }
         }
+        // A target that defines one test name twice has at most one of them in a build: a `cfg`
+        // chooses, and the report does not evaluate `cfg`, so it cannot say which one ran.
+        let mut found = defined_twice(&uses[first_use..], &target.id);
         // A helper key relies on conventions the target's source keeps to; a target that breaks
         // one keys no test through a helper, and the report stops.
         if !helpers.is_empty() {
-            let found = breaches(sources, root, package, target, &modules, &scope, &helpers);
-            if !found.is_empty() {
-                for breach in found {
-                    let text = breach.to_string();
-                    if !map.problems.contains(&text) {
-                        map.problems.push(text);
-                    }
-                }
-                for helper in helpers {
-                    let context = format!(
-                        "a comment on fn {} in {}, in a target whose source steps outside the conventions a helper key relies on",
-                        helper.name, helper.file
-                    );
-                    for (identifier, source) in helper.mentions {
-                        map.reference(identifier, source, &context);
-                    }
-                }
-                continue;
+            found.extend(breaches(
+                sources, root, package, target, &modules, &scope, &helpers,
+            ));
+        }
+        for breach in &found {
+            let text = breach.to_string();
+            if !map.problems.contains(&text) {
+                map.problems.push(text);
             }
+        }
+        if !found.is_empty() && !helpers.is_empty() {
+            for helper in helpers {
+                let context = format!(
+                    "a comment on fn {} in {}, in a target whose source steps outside the conventions a helper key relies on",
+                    helper.name, helper.file
+                );
+                for (identifier, source) in helper.mentions {
+                    map.reference(identifier, source, &context);
+                }
+            }
+            continue;
         }
         // A keyed function of test code keys the tests of this target that call it: a case a
         // family of thin tests shares, one per shell or per platform, is keyed where it is written.
@@ -819,6 +827,33 @@ fn unlisted_names(modules: &[Module], scope: &Scope) -> bool {
     })
 }
 
+/// The test names a target defines more than once, each as a breach at its first definition that
+/// names every one.
+fn defined_twice(tests: &[Use], target: &TargetId) -> Vec<Breach> {
+    let mut defined: BTreeMap<&str, Vec<&Use>> = BTreeMap::new();
+    for test in tests {
+        defined.entry(test.name.as_str()).or_default().push(test);
+    }
+    defined
+        .into_iter()
+        .filter(|(_, definitions)| definitions.len() > 1)
+        .map(|(name, definitions)| {
+            let places: Vec<String> = definitions
+                .iter()
+                .map(|test| format!("{}:{}", test.file, test.line))
+                .collect();
+            Breach {
+                file: definitions[0].file.clone(),
+                line: definitions[0].line,
+                what: format!(
+                    "{target} defines the test `{name}` more than once ({}): a `cfg` chooses which one a build has, and the report does not evaluate `cfg`",
+                    places.join(", ")
+                ),
+            }
+        })
+        .collect()
+}
+
 /// Where a target with keyed helpers steps outside the conventions a helper key relies on: its
 /// files as [`rust_items::breaches`] reads them; a helper named like a keyword or like a trait a type
 /// writes like a call; a plain `use` of a helper's name among a module's items that the reading
@@ -1108,6 +1143,8 @@ fn rust_module(
                 uses.push(Use {
                     target: target.clone(),
                     name,
+                    file: module.file.clone(),
+                    line: test.line,
                     module: module.path.clone(),
                     uses: test.uses.clone(),
                     // An attribute macro on its module may rewrite any call in it.

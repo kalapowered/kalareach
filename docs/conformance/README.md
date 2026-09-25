@@ -122,6 +122,11 @@ Test code is a test or bench target, or a module compiled under `cfg(test)`. A c
 code (a module's documentation, a function, a constant) is a reference: it is listed with the
 identifier and it is never a test.
 
+A test is keyed by its name, so a target defines each test name once. Two definitions of one name,
+each under its own `cfg`, are a problem that names both: a build has at most one of them, and the
+report does not work out `cfg`, so it cannot say which one ran. The report stops before it runs
+anything.
+
 #### Helper keys and their boundary
 
 A function of test code whose comment names identifiers is a helper: the tests that call it are
