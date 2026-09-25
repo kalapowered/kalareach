@@ -535,11 +535,13 @@ Questions belong to the session, so these reach the session's worker directly, t
 does; they keep working while the control daemon is restarting.
 
 An answer the worker could not take is kept rather than lost. When the connection to the worker
-ends before the answer is sent, or after it is sent and before the worker says what became of it,
-`kr question answer` keeps the answer in this user's state directory, readable only by its owner,
-with the question and the revision it answered. It says so and exits with 3, and its `--json`
-document carries `"kept": true` beside the failure: `RESOURCE_UNAVAILABLE` when the answer did not
-go, `OUTCOME_UNKNOWN` when it went and its fate is not known.
+fails before the answer is sent, or ends while it is being sent so that nobody can say whether it
+arrived, or the worker refuses it for the moment, `kr question answer` keeps the answer in this
+user's state directory, readable only by its owner, with the question and the revision it answered.
+It says so and exits with 3, and its `--json` document carries `"kept": true` beside the failure:
+`RESOURCE_UNAVAILABLE` when the answer did not go, `OUTCOME_UNKNOWN` when whether it arrived is not
+known, which the command never calls unsent. A reply that is not a message is the worker's own
+answer rather than a lost connection, so it is shown as a refusal and nothing is kept.
 
 `kr question drafts` reads each kept answer's question again. An answer whose question is still
 pending at the revision it answered is offered, and stays kept. Any other is retired: its question
@@ -547,7 +549,12 @@ was answered, cancelled or expired, moved to another revision, or its session is
 answer is not sent and no longer kept. The command sends nothing, however often it runs. `kr
 question send` is the one way a kept answer is sent: it reads the question once more and sends the
 answer only while that question is still what the person answered. An answer whose outcome was not
-known is retired by the next `kr question drafts` if it did arrive, so it is never sent twice.
+known is retired by the next `kr question drafts` if it did arrive, so it is never sent twice. When
+`kr question send` cannot send it, the failure keeps its own code and says the answer is still kept.
+
+Only a session with no descriptor at all is gone. When a session's descriptor is there and cannot
+be read, or is readable by anyone but its owner, `kr question drafts` fails and retires nothing,
+because such a descriptor says nothing about whether the session is still running.
 
 ## `kr skill`
 

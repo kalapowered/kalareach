@@ -41,14 +41,20 @@ use serde_json::Value;
 
 mod support;
 
-/// What the scripted worker does after it answers a read.
+/// How the scripted worker behaves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Behaviour {
     /// Goes on serving the connection, and takes an answer to a pending question at the revision
     /// it names.
     Serves,
-    /// Ends the connection as soon as the read is answered.
+    /// Ends the connection as soon as a read is answered.
     EndsAfterTheRead,
+    /// Takes an answer, then ends the connection without replying.
+    TakesAnswersAndDropsTheReply,
+    /// Refuses every read with `PERMISSION_DENIED`.
+    RefusesReads,
+    /// Replies to an answer with a frame that is not a message, and takes nothing.
+    RepliesWithGarbage,
 }
 
 /// What the scripted worker holds.
@@ -66,6 +72,8 @@ struct Host {
     state: Arc<Mutex<State>>,
     serving: tokio::task::JoinHandle<()>,
     question_id: QuestionId,
+    /// Where the session's descriptor is published.
+    descriptor: PathBuf,
 }
 
 impl Drop for Host {
@@ -125,12 +133,17 @@ impl Host {
             Arc::clone(&state),
         ));
         Self {
+            descriptor: environment.descriptor_file(session_id),
             temp,
             home,
             state,
             serving,
             question_id,
         }
+    }
+
+    fn behave(&self, behaviour: Behaviour) {
+        self.state().behaviour = behaviour;
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -299,18 +312,47 @@ async fn serve_one(
                 continue;
             }
             ControlFrame::Request(request) => {
+                let behaviour = state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .behaviour;
                 let outcome = match request.method.as_str() {
+                    "question.read" if behaviour == Behaviour::RefusesReads => {
+                        Err(ProtocolError::new(
+                            ErrorCode::PermissionDenied,
+                            "this worker will not show its questions",
+                        ))
+                    }
                     "question.read" => read(&state, &request.params),
                     other => Err(refusal(&format!("this worker answers no {other}"))),
                 };
-                let end = state
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .behaviour
-                    == Behaviour::EndsAfterTheRead;
-                ((request.request_id, outcome), end)
+                (
+                    (request.request_id, outcome),
+                    behaviour == Behaviour::EndsAfterTheRead,
+                )
             }
             ControlFrame::Mutation(mutation) => {
+                let behaviour = state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .behaviour;
+                if mutation.method.as_str() == "question.answer" {
+                    match behaviour {
+                        Behaviour::TakesAnswersAndDropsTheReply => {
+                            let _ = take(&state, &mutation.params);
+                            return;
+                        }
+                        Behaviour::RepliesWithGarbage => {
+                            state
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .answers_received += 1;
+                            let _ = writer.write_frame(&garbage()).await;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
                 let outcome = match mutation.method.as_str() {
                     "question.answer" => take(&state, &mutation.params),
                     other => Err(refusal(&format!("this worker answers no {other}"))),
@@ -331,6 +373,17 @@ async fn serve_one(
             return;
         }
     }
+}
+
+/// A whole frame whose payload is not a message.
+fn garbage() -> Vec<u8> {
+    let payload = [0xff_u8, 0x00, 0xff, 0x00];
+    let mut frame = u32::try_from(payload.len())
+        .expect("a short payload")
+        .to_be_bytes()
+        .to_vec();
+    frame.extend_from_slice(&payload);
+    frame
 }
 
 fn refusal(message: &str) -> ProtocolError {
@@ -414,6 +467,18 @@ async fn an_answer_the_worker_could_not_take_is_kept_and_nothing_is_sent() {
     assert_eq!(document["ok"], Value::Bool(false), "{document}");
     assert_eq!(document["kept"], Value::Bool(true), "{document}");
     assert_eq!(document["question_id"], Value::String(question.clone()));
+    // The worker ended the connection after the read, which the command sees either before it
+    // writes the answer or while it waits for the reply. Either way it keeps the answer, and it
+    // says only what it knows.
+    let message = document["message"].as_str().expect("a message");
+    match document["code"].as_str() {
+        Some("RESOURCE_UNAVAILABLE") => assert!(message.contains("was not sent"), "{message}"),
+        Some("OUTCOME_UNKNOWN") => {
+            assert!(message.contains("is not known"), "{message}");
+            assert!(!message.contains("was not sent"), "{message}");
+        }
+        other => panic!("a kept answer carries {other:?}: {document}"),
+    }
     assert_eq!(host.answers_received(), 0, "nothing was sent");
     assert_eq!(host.state().question.state, QuestionState::Pending);
 
@@ -495,4 +560,130 @@ async fn a_kept_answer_whose_question_moved_is_retired_unsent() {
     assert_ne!(status, Some(0), "{document}");
     assert_eq!(host.answers_received(), 0, "and nothing sends it");
     assert_eq!(host.state().question.state, QuestionState::Pending);
+}
+
+/// KR-REQ-11.63: an answer the worker took and whose reply was lost is kept as an answer whose
+/// outcome is not known, and is never called unsent. The next `kr question drafts` finds the
+/// question answered and retires it, so it is never sent twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_whose_reply_was_lost_is_kept_as_unknown_and_never_sent_twice() {
+    let host = Host::start(Behaviour::TakesAnswersAndDropsTheReply).await;
+    let question = host.question();
+    let (status, document) = host.json(&["question", "answer", &question, "--choice", "left"]);
+    assert_eq!(status, Some(3), "{document}");
+    assert_eq!(document["code"], "OUTCOME_UNKNOWN", "{document}");
+    assert_eq!(document["kept"], Value::Bool(true), "{document}");
+    let message = document["message"].as_str().expect("a message");
+    assert!(message.contains("is not known"), "{message}");
+    assert!(!message.contains("was not sent"), "{message}");
+    assert!(host.kept().is_file());
+    assert_eq!(host.answers_received(), 1, "the worker took it");
+
+    host.behave(Behaviour::Serves);
+    let (status, document) = host.json(&["question", "drafts"]);
+    assert_eq!(status, Some(0), "{document}");
+    assert_eq!(document["drafts"][0]["state"], "retired", "{document}");
+    assert_eq!(document["drafts"][0]["reason_code"], "QUESTION_RESOLVED");
+    assert!(!host.kept().exists(), "a retired answer is no longer kept");
+    assert_eq!(host.answers_received(), 1, "and it was not sent again");
+}
+
+/// KR-REQ-11.63: only a session with no descriptor at all is gone. A descriptor that cannot be read
+/// or is not the owner's alone says nothing about the session, so `kr question drafts` fails and
+/// retires nothing. The controls: the same descriptor put right is offered again, and one that is
+/// not there retires the answer as gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_descriptor_that_cannot_be_read_retires_nothing() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let host = Host::start(Behaviour::EndsAfterTheRead).await;
+    let question = host.question();
+    let (status, _) = host.json(&["question", "answer", &question, "--choice", "left"]);
+    assert_eq!(status, Some(3));
+    host.behave(Behaviour::Serves);
+    let published = std::fs::read(&host.descriptor).expect("the descriptor");
+
+    // Not a descriptor at all.
+    std::fs::write(&host.descriptor, b"not a descriptor").expect("overwritten");
+    let (status, document) = host.json(&["question", "drafts"]);
+    assert_ne!(status, Some(0), "{document}");
+    assert!(
+        host.kept().is_file(),
+        "an unreadable descriptor retires nothing"
+    );
+
+    // A descriptor, readable by others.
+    std::fs::write(&host.descriptor, &published).expect("put back");
+    std::fs::set_permissions(&host.descriptor, std::fs::Permissions::from_mode(0o644))
+        .expect("widened");
+    let (status, document) = host.json(&["question", "drafts"]);
+    assert_ne!(status, Some(0), "{document}");
+    assert!(
+        host.kept().is_file(),
+        "an untrusted descriptor retires nothing"
+    );
+
+    // Put right, it is offered again.
+    std::fs::set_permissions(&host.descriptor, std::fs::Permissions::from_mode(0o600))
+        .expect("narrowed");
+    let (status, document) = host.json(&["question", "drafts"]);
+    assert_eq!(status, Some(0), "{document}");
+    assert_eq!(document["drafts"][0]["state"], "offered", "{document}");
+
+    // Not there at all, the session is gone.
+    std::fs::remove_file(&host.descriptor).expect("removed");
+    let (status, document) = host.json(&["question", "drafts"]);
+    assert_eq!(status, Some(0), "{document}");
+    assert_eq!(document["drafts"][0]["state"], "retired", "{document}");
+    assert_eq!(document["drafts"][0]["reason_code"], "UNKNOWN_SESSION");
+    assert!(!host.kept().exists());
+    assert_eq!(host.answers_received(), 0, "nothing was ever sent");
+}
+
+/// KR-REQ-11.63: a worker that refuses the read `kr question send` makes first is reported with its
+/// own code, and the answer is still kept, which the refusal says; `kr question drafts` retires
+/// nothing either. The control is the same worker serving again, which takes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_read_keeps_its_code_and_the_answer() {
+    let host = Host::start(Behaviour::EndsAfterTheRead).await;
+    let question = host.question();
+    let (status, _) = host.json(&["question", "answer", &question, "--choice", "left"]);
+    assert_eq!(status, Some(3));
+
+    host.behave(Behaviour::RefusesReads);
+    let (status, document) = host.json(&["question", "send", &question]);
+    assert_eq!(status, Some(8), "{document}");
+    assert_eq!(document["code"], "PERMISSION_DENIED", "{document}");
+    assert!(
+        document["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("still kept")),
+        "{document}"
+    );
+    assert!(host.kept().is_file());
+    let (status, document) = host.json(&["question", "drafts"]);
+    assert_eq!(status, Some(8), "{document}");
+    assert_eq!(document["code"], "PERMISSION_DENIED", "{document}");
+    assert!(host.kept().is_file(), "and drafts retires nothing");
+    assert_eq!(host.answers_received(), 0);
+
+    host.behave(Behaviour::Serves);
+    let (status, document) = host.json(&["question", "send", &question]);
+    assert_eq!(status, Some(0), "{document}");
+    assert_eq!(host.answers_received(), 1);
+}
+
+/// KR-REQ-11.63: a reply that is not a message is the worker's own answer, not a lost connection,
+/// so the answer is shown as refused and not kept, as the drafts library rules.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_malformed_reply_is_shown_and_not_kept() {
+    let host = Host::start(Behaviour::RepliesWithGarbage).await;
+    let question = host.question();
+    let (status, document) = host.json(&["question", "answer", &question, "--choice", "left"]);
+    assert_eq!(status, Some(8), "{document}");
+    assert_eq!(document["ok"], Value::Bool(false), "{document}");
+    assert!(document.get("kept").is_none(), "{document}");
+    assert_ne!(document["code"], "OUTCOME_UNKNOWN", "{document}");
+    assert!(!host.kept().exists(), "a malformed reply keeps nothing");
+    assert_eq!(host.answers_received(), 1);
 }

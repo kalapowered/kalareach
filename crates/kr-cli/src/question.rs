@@ -192,13 +192,43 @@ pub async fn send(
     match answers::send(&workers, &drafts, &draft).await {
         Ok(question) => Ok(question),
         // The library keeps a draft it could not send for any reason but its question's end, so
-        // what is still in the store says which this was.
-        Err(error) => match kept_draft(&drafts, question_id) {
-            Ok(Some(_)) if !matches!(error, AnswerError::Retired(_)) => {
-                Err(kept(&workers, question_id, "is still kept"))
+        // what is still in the store says whether it stayed kept. The failure is reported as
+        // itself, with that beside it.
+        Err(error) => {
+            let still_kept = !matches!(error, AnswerError::Retired(_))
+                && kept_draft(&drafts, question_id)?.is_some();
+            if still_kept {
+                Err(still_kept_failure(&workers, question_id, error))
+            } else {
+                Err(answer_failure(error))
             }
-            _ => Err(answer_failure(error)),
-        },
+        }
+    }
+}
+
+/// The failure a kept answer `kr question send` could not send is reported as.
+///
+/// A refusal keeps its own code and says the answer is still kept. A connection that failed is a
+/// kept answer again, with the reason the worker connection recorded.
+fn still_kept_failure(workers: &Workers, question_id: QuestionId, error: AnswerError) -> CliError {
+    let retention = format!("the answer to question {question_id} is still kept on this device");
+    match error {
+        AnswerError::Host(
+            ClientError::Host(refusal) | ClientError::Refused { error: refusal, .. },
+        ) => CliError::Refused(ProtocolError::new(
+            refusal.code,
+            format!("{}; {retention} and was not sent", refusal.message),
+        )),
+        other => {
+            let code = other.code();
+            let why = workers
+                .failure()
+                .map_or_else(|| other.to_string(), |(_, why)| why);
+            CliError::AnswerKept {
+                code,
+                message: kept_message(question_id, code, &why, &retention),
+            }
+        }
     }
 }
 
@@ -221,19 +251,35 @@ fn kept_draft(drafts: &AnswerDrafts, question_id: QuestionId) -> Result<Option<A
         .find(|draft| draft.question_id == question_id))
 }
 
-/// The failure an answer that was not sent is reported as, with why and what to do about it.
+/// The failure an answer kept rather than delivered is reported as, with why and what to do next.
 fn kept(workers: &Workers, question_id: QuestionId, which: &str) -> CliError {
     let (code, why) = workers.failure().unwrap_or((
         ErrorCode::ResourceUnavailable,
         "its session's worker could not take it".to_owned(),
     ));
+    let retention = format!("the answer to question {question_id} {which} on this device");
     CliError::AnswerKept {
         code,
-        message: format!(
-            "the answer to question {question_id} {which} on this device and not sent: {why}. \
-             `kr question drafts` says whether it can still be sent, and \
-             `kr question send {question_id}` sends it"
-        ),
+        message: kept_message(question_id, code, &why, &retention),
+    }
+}
+
+/// Says what became of a kept answer in words that claim no more than is known.
+///
+/// An answer whose outcome is not known may have reached its worker, so it is never said to be
+/// unsent; the next `kr question drafts` retires it when it did arrive.
+fn kept_message(question_id: QuestionId, code: ErrorCode, why: &str, retention: &str) -> String {
+    if code == ErrorCode::OutcomeUnknown {
+        format!(
+            "{retention}, and whether its session's worker took it is not known: {why}. \
+             `kr question drafts` retires it if it arrived, and `kr question send {question_id}` \
+             sends it if it did not"
+        )
+    } else {
+        format!(
+            "{retention} and was not sent: {why}. `kr question drafts` says whether it can \
+             still be sent, and `kr question send {question_id}` sends it"
+        )
     }
 }
 
@@ -252,6 +298,9 @@ fn answer_failure(error: AnswerError) -> CliError {
         AnswerError::Host(
             ClientError::Host(refusal) | ClientError::Refused { error: refusal, .. },
         ) => CliError::Refused(refusal),
+        AnswerError::Host(ClientError::Ipc(failure)) => {
+            CliError::Refused(failure.to_protocol_error())
+        }
         AnswerError::Host(other) => CliError::HostUnavailable(other.to_string()),
         AnswerError::Store { .. } | AnswerError::Unreadable { .. } => {
             CliError::Other(error.to_string())
@@ -396,25 +445,13 @@ impl Workers {
 
     /// Opens and proves a connection to the worker of `session_id`.
     ///
-    /// A session no descriptor names is gone as far as this host is concerned, which is the
-    /// host's own `UNKNOWN_SESSION`. A worker that cannot be reached has not answered, and that is
-    /// a connection that ended.
+    /// Only a session that has no descriptor at all is gone as far as this host is concerned, which
+    /// is the host's own `UNKNOWN_SESSION` and retires its kept answers. A descriptor that is there
+    /// and cannot be read or trusted, and a directory that cannot be listed, say nothing about the
+    /// session, so they are failures that retire nothing. A worker that cannot be reached has not
+    /// answered, and that is a connection that ended.
     async fn open(&self, session_id: SessionId) -> std::result::Result<LocalClient, ClientError> {
-        let descriptor = match find(&self.paths, &SessionSelector::Identifier(session_id), None) {
-            Ok((_, descriptor)) => descriptor,
-            Err(CliError::UnknownSession(_)) => {
-                return Err(ClientError::Host(ProtocolError::new(
-                    ErrorCode::UnknownSession,
-                    format!("no session {session_id} is on this host"),
-                )));
-            }
-            Err(error) => {
-                return Err(ClientError::Host(ProtocolError::new(
-                    ErrorCode::ResourceUnavailable,
-                    error.to_string(),
-                )));
-            }
-        };
+        let descriptor = self.descriptor(session_id)?;
         open_worker(&descriptor, self.build_id.clone())
             .await
             .map_err(|error| {
@@ -425,6 +462,59 @@ impl Workers {
                 ClientError::ConnectionEnded
             })
     }
+
+    /// The descriptor `session_id` was published under, in whichever environment holds it.
+    fn descriptor(
+        &self,
+        session_id: SessionId,
+    ) -> std::result::Result<WorkerDescriptor, ClientError> {
+        let unknown = |detail: String| {
+            ClientError::Host(ProtocolError::new(ErrorCode::ResourceUnavailable, detail))
+        };
+        let known = environments(&self.paths).map_err(|error| unknown(error.to_string()))?;
+        for environment in known {
+            let entries = kr_ipc::descriptor::read_all(&environment.paths).map_err(|error| {
+                unknown(format!(
+                    "whether session {session_id} is still on this host cannot be read: {error}"
+                ))
+            })?;
+            let published = environment.paths.descriptor_file(session_id);
+            for entry in entries {
+                match entry.descriptor {
+                    Ok(descriptor) if descriptor.session_id == session_id => return Ok(descriptor),
+                    Ok(_) => {}
+                    // The file this session's descriptor is published at is there and cannot be
+                    // trusted. That is no evidence the session is gone.
+                    Err(why) if entry.path == published => {
+                        return Err(unknown(format!(
+                            "session {session_id}'s descriptor at {} cannot be used: {why}",
+                            entry.path.display()
+                        )));
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+        Err(ClientError::Host(ProtocolError::new(
+            ErrorCode::UnknownSession,
+            format!("no session {session_id} is on this host"),
+        )))
+    }
+}
+
+/// Whether a failure of the connection to a worker is the connection going, rather than something
+/// the worker sent or said.
+///
+/// The drafts library keeps an answer on exactly these and on a transient refusal, and shows every
+/// other failure: a malformed message is the worker's own answer, not a lost connection.
+fn connection_went(failure: &kr_ipc::IpcError) -> bool {
+    matches!(
+        failure,
+        kr_ipc::IpcError::PeerClosed
+            | kr_ipc::IpcError::Socket { .. }
+            | kr_ipc::IpcError::TruncatedFrame { .. }
+            | kr_ipc::IpcError::Frame(kr_protocol::frame::FrameError::Incomplete { .. })
+    )
 }
 
 impl QuestionHost for Workers {
@@ -465,23 +555,23 @@ impl QuestionHost for Workers {
         let mut connections = self.connections.lock().await;
         let client = self.connection(&mut connections, session_id).await?;
         let action_id = ActionId::new(kr_ipc::new_uuid());
-        // Composing reads whatever the worker already sent, before anything is written. A
-        // connection that fails here has sent nothing.
+        // Composing reads whatever the worker already sent and writes nothing, so a failure here
+        // sent nothing.
         let mutation = match client
             .compose(Method::QuestionAnswer, action_id, target, &params)
             .await
         {
             Ok(mutation) => mutation,
-            Err(error) => {
+            Err(failure) => {
                 connections.remove(&session_id);
                 self.failed(
                     ErrorCode::ResourceUnavailable,
                     format!(
-                        "the connection to session {session_id}'s worker ended before the answer \
-                         was sent ({error})"
+                        "the connection to session {session_id}'s worker failed before the answer \
+                         was sent ({failure})"
                     ),
                 );
-                return Err(ClientError::ConnectionEnded);
+                return Err(ClientError::Ipc(failure));
             }
         };
         match client.repeat(&mutation).await {
@@ -496,17 +586,22 @@ impl QuestionHost for Workers {
                 );
                 Err(ClientError::from(refusal))
             }
-            // Once the answer is written, a connection that ends leaves what became of it unknown.
-            Err(error) => {
+            // Sending reads what is pending, writes the answer and waits for the reply, and a
+            // connection that goes at any of those points may have carried the answer or not.
+            Err(failure) if connection_went(&failure) => {
                 connections.remove(&session_id);
                 self.failed(
                     ErrorCode::OutcomeUnknown,
                     format!(
-                        "the connection to session {session_id}'s worker ended after the answer \
-                         was sent, so whether it arrived is not known ({error})"
+                        "the connection to session {session_id}'s worker ended while the answer \
+                         was being sent ({failure})"
                     ),
                 );
                 Err(ClientError::SubmissionUncertain { action_id })
+            }
+            Err(failure) => {
+                connections.remove(&session_id);
+                Err(ClientError::Ipc(failure))
             }
         }
     }
