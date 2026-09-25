@@ -570,6 +570,176 @@ impl RemoteOutput {
     }
 }
 
+/// How this host answers one read a paired device may make: which service answers it, or the
+/// reason it is refused.
+///
+/// [`DeviceRead::of`] is the whole of the decision, one arm per method, and
+/// [`RemoteConnection::read`] does what it says after the grant has decided the request. A read
+/// the method table admits for a paired device is either served or refused by name here, and a
+/// test walks the table to hold it so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeviceRead {
+    /// The daemon's own answer, out of the call the owner's own client reaches.
+    ///
+    /// The four host-and-environment reads leave in their export form: the daemon decides the
+    /// form by who asked, in the one function every such answer leaves through, so a device is
+    /// told which environments these are, what they run on and what they can do, and never an
+    /// account name, a local path or what the platform said. `device.list` is the devices this
+    /// host paired and the keys their pairing bound, which an owner's other device reads to learn
+    /// a device's keys from the pairing the owner approved rather than from anything the device
+    /// says of itself; the registry requires `host.manage` for it.
+    Daemon,
+    /// The daemon's own answer, narrowed to what the grant admits ([`RemoteConnection::narrow`]).
+    ///
+    /// A listing is every session, repository or working copy this actor may observe, not every
+    /// one this host has. A read of one repository or working copy names its subject, so it is
+    /// refused rather than narrowed when the grant does not reach that subject's environment, and
+    /// the session content it carries is narrowed as the listing's is. A session read and a
+    /// change-set read carry content the grant's lower bound decides.
+    Narrowed,
+    /// `diff.read`, which a device is refused for one of two reasons.
+    ///
+    /// A diff of a **captured version** is retained content whose answer carries the moment of the
+    /// read rather than the moment of the capture, so nothing on this path can apply the grant's
+    /// lower bound to it, and a host that cannot narrow content to a grant refuses it rather than
+    /// serve more than the grant allows; a change-set read does carry the capture, and is
+    /// narrowed. A diff of a **working copy** opens the repository and runs the Git program, and
+    /// this host cannot bound what that program reaches, which is why the five repository
+    /// operations are refused too.
+    Diff,
+    /// A receipt. One of an action this host performed itself is kept by the service that
+    /// performed it, and the catalogue's are answered here; any other goes to the session whose
+    /// journal holds it.
+    Receipt,
+    /// Forwarded to the worker of the session the read names, under this device's envelope, and
+    /// answered there by the rules the worker holds a paired device's envelope to: the state
+    /// recovery reads, raw input, and the two agent reads that carry no retained history.
+    Worker,
+    /// `question.read`: forwarded like [`Self::Worker`], and the answer narrowed to the grant's
+    /// history scope ([`RemoteConnection::narrow_questions`]).
+    Questions,
+    /// The automation group's read. A device is shown the workflows that act under the grant it
+    /// holds, their runs and receipts, and the budgets and alerts of the chains those runs belong
+    /// to; a workflow under another grant is not this device's to see.
+    Workflow,
+    /// The voice coordinator's own reads. A selection is built from what this daemon holds about
+    /// the session, filtered under this device's own grant, a preparation reads this device's
+    /// grants and the managed service's published terms, and what comes back goes to this device
+    /// and nowhere else.
+    Voice,
+    /// The catalogue and plugin reads. A catalogue belongs to the environment rather than to a
+    /// session, so there is no worker to forward them to and no session content to narrow: the
+    /// grant's environment selector and `host.manage` are the whole of what admits them, and the
+    /// module decides each at this connection's ingress.
+    Catalogue,
+    /// The review and attention reads, from this host's own store: the sessions the grant's
+    /// selector admits with `session.view`, the automation of its own grant with
+    /// `automation.manage`, the host's own items with `host.manage`, and no session text.
+    Attention,
+    /// The pairing and owner-confirmation reads. A device is the issuing owner of nothing, because
+    /// invitations are issued over local IPC, so its `pair.status` is refused by the pairing
+    /// service; an owner device reads the confirmations it can approve.
+    Pairing,
+    /// `grant.list`: the grants this device issued and everything delegated from them, which is
+    /// the set its own delegation authority reaches. The registry requires `session.share`; the
+    /// issuer this host lists for is the device itself.
+    Grants,
+    /// Refused by name, for the reason [`Unserved::refusal`] gives.
+    Refused(Unserved),
+}
+
+impl DeviceRead {
+    /// Decides one method as a request from a paired device.
+    ///
+    /// `None` is a method the method table does not admit as one: not a read, or not one a paired
+    /// device may make. Raw input is the one write that travels as a request, because section 9
+    /// makes it an ordered stream with no action identity.
+    fn of(method: Method) -> Option<Self> {
+        let entry = method.entry();
+        let request = entry.effect == EffectClass::Read || method == Method::InputWrite;
+        if !request || !entry.ingress.contains(&ActorIngress::PairedDevice) {
+            return None;
+        }
+        Some(match method {
+            Method::HostInfo
+            | Method::EnvironmentList
+            | Method::EnvironmentCapabilities
+            | Method::HostDoctor
+            | Method::DeviceList => Self::Daemon,
+            Method::ProjectList
+            | Method::ProjectRead
+            | Method::WorkspaceList
+            | Method::WorkspaceRead
+            | Method::ChangesetRead
+            | Method::SessionList
+            | Method::SessionRead => Self::Narrowed,
+            Method::DiffRead => Self::Diff,
+            Method::ActionRead => Self::Receipt,
+            Method::EventsSubscribe
+            | Method::EventsSnapshot
+            | Method::HistoryPage
+            | Method::InputWrite
+            | Method::AgentCapabilities
+            | Method::AgentCommands => Self::Worker,
+            Method::QuestionRead => Self::Questions,
+            Method::WorkflowRead => Self::Workflow,
+            Method::VoiceContext | Method::VoicePrepare => Self::Voice,
+            Method::PairStatus | Method::OwnerConfirmationPending => Self::Pairing,
+            Method::GrantList => Self::Grants,
+            Method::SessionDescribe => Self::Refused(Unserved::Description),
+            Method::AgentSnapshot => Self::Refused(Unserved::AgentHistory),
+            Method::UploadStatus | Method::DownloadBegin | Method::DownloadChunk => {
+                Self::Refused(Unserved::Transfer)
+            }
+            _ if crate::catalogue::CatalogueModule::serves(method) => Self::Catalogue,
+            _ if crate::attention::AttentionModule::serves(method) => Self::Attention,
+            _ => return None,
+        })
+    }
+}
+
+/// Why this host refuses a paired device a read the method table admits for one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unserved {
+    /// `session.describe`. This host runs no description service, so it has no description to
+    /// give anybody; the name, metadata and verified state of a session are `session.read`'s.
+    Description,
+    /// `agent.snapshot`. Section 10 narrows a grant's history in one place, the shared host-side
+    /// history filter, and an agent's retained history is not one of the surfaces that filter
+    /// narrows, so answering would give a device more than its grant covers. The session's worker
+    /// refuses a forwarded snapshot for the same reason.
+    AgentHistory,
+    /// `upload.status`, `download.begin` and `download.chunk`. A transfer's chunks travel on an
+    /// attachment-chunk stream, a stream kind of its own with its own frame bound, and this host
+    /// opens no such stream on a network connection, so no transfer with a device can complete: a
+    /// download begun for one would stage a copy nothing can read.
+    Transfer,
+}
+
+impl Unserved {
+    /// The refusal a device is given, naming the read and saying why.
+    fn refusal(self, entry: &MethodEntry) -> ProtocolError {
+        let why = match self {
+            Self::Description => {
+                "this host runs no description service, and session.read and session.list carry \
+                 each session's metadata and verified state"
+            }
+            Self::AgentHistory => {
+                "the shared history filter that holds an answer to a grant's lower bound does not \
+                 reach an agent's retained history"
+            }
+            Self::Transfer => {
+                "a transfer's chunks travel on an attachment-chunk stream, and this host opens \
+                 none on a network connection"
+            }
+        };
+        ProtocolError::new(
+            ErrorCode::UnsupportedCapability,
+            format!("{} is not served to a paired device: {why}", entry.name),
+        )
+    }
+}
+
 /// What one authorised remote connection is serving.
 pub struct RemoteConnection {
     controller: Arc<Controller>,
@@ -831,45 +1001,26 @@ impl RemoteConnection {
         // its own subjects decides them against the actor that asked, and a read served under the
         // host's own principal would be answered about the host's own objects.
         let actor_id = self.device.principal();
-        let answer = match entry.method {
-            // The four host-and-environment reads are the daemon's own answers, and what a device
-            // reads of them is their export form: the daemon decides the form by who asked, in the
-            // one function every such answer leaves through, so a device is told which
-            // environments these are, what they run on and what they can do, and never an account
-            // name, a local path or what the platform said.
-            Method::HostInfo
-            | Method::EnvironmentList
-            | Method::EnvironmentCapabilities
-            | Method::HostDoctor => self.controller.read_method(&actor_id, request).await,
-            // The project and workspace metadata reads. They name no session, so the grant's
-            // environment selector and the rights the registry lists are the whole of what
-            // narrows them, and the service answers a device exactly as it answers this user's
-            // own client.
-            Method::ProjectList | Method::WorkspaceList => {
+        // One decision per method, and it is [`DeviceRead::of`]'s: every read the method table
+        // admits for a paired device is served below or refused by name, and a test walks the table
+        // to hold it so. Only a method the table does not admit for a device has no decision, and
+        // the registry and the effect check above have refused every such method already.
+        let Some(route) = DeviceRead::of(entry.method) else {
+            return failure(
+                request.request_id,
+                ProtocolError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("{} is not a read this host serves", entry.name),
+                ),
+            );
+        };
+        let answer = match route {
+            DeviceRead::Daemon => self.controller.read_method(&actor_id, request).await,
+            DeviceRead::Narrowed => {
                 let answer = self.controller.read_method(&actor_id, request).await;
                 self.narrow(answer)
             }
-            // A read of one repository or one working copy. It names its subject, so it is
-            // refused rather than narrowed when the grant does not reach that subject's
-            // environment: a list this grant narrowed must not be a way to find an identifier the
-            // read then answers for. What the read does narrow is the same session content the
-            // list narrows, so neither door shows more than the other.
-            Method::ProjectRead | Method::WorkspaceRead => {
-                let answer = self.controller.read_method(&actor_id, request).await;
-                self.narrow(answer)
-            }
-            // A diff of a **captured version** is retained content, and its answer carries the
-            // moment of the read rather than the moment of the capture, so nothing on this path
-            // can apply the grant's lower bound to it: a host that cannot narrow content to a
-            // grant refuses it rather than serving more than the grant allows. A change-set read
-            // does carry the capture, and its answer is narrowed below.
-            //
-            // A diff of a **working copy** is refused for the other reason, the same one the five
-            // repository operations are refused for: reading one opens the repository and runs
-            // the Git program, and this host cannot bound what that program reaches. The rule is
-            // about starting Git for a device, so it reaches every method that starts Git and not
-            // only the ones that write.
-            Method::DiffRead => {
+            DeviceRead::Diff => {
                 if let Ok(params) = request
                     .params
                     .to_typed::<kr_protocol::changeset::DiffReadParams>()
@@ -886,46 +1037,22 @@ impl RemoteConnection {
                 }
                 return failure(request.request_id, refuses_to_run_git());
             }
-            Method::ChangesetRead => {
-                let answer = self.controller.read_method(&actor_id, request).await;
-                self.narrow(answer)
-            }
-            // The devices this host paired and the keys their pairing bound. An owner's other
-            // device reads it to learn a device's keys from the pairing the owner approved rather
-            // than from anything the device says of itself; the registry requires `host.manage`,
-            // and the grant check above has applied it.
-            Method::DeviceList => self.controller.read_method(&actor_id, request).await,
-            // The daemon answers these itself, and what it answers with is narrowed to the grant:
-            // a list is every session this actor may observe, not every session this host runs.
-            Method::SessionList | Method::SessionRead => {
-                let answer = self.controller.read_method(&actor_id, request).await;
-                self.narrow(answer)
-            }
-            // A receipt of an action this host performed itself, rather than a session's, is kept
-            // by the service that performed it. The catalogue's are answered here; anything else
-            // goes to the session whose journal holds it.
-            Method::ActionRead => match self.host_receipt(request).await {
+            DeviceRead::Receipt => match self.host_receipt(request).await {
                 Some(answer) => answer,
                 None => self.proxied_read(request, entry, validated).await,
             },
-            Method::EventsSubscribe
-            | Method::EventsSnapshot
-            | Method::HistoryPage
-            | Method::InputWrite => self.proxied_read(request, entry, validated).await,
-            // The automation group's read. A device is shown the workflows that act under the
-            // grant it holds, their runs and receipts, and the budgets and alerts of the chains
-            // those runs belong to; a workflow under another grant is not this device's to see.
-            Method::WorkflowRead => {
+            DeviceRead::Worker => self.proxied_read(request, entry, validated).await,
+            DeviceRead::Questions => {
+                let answer = self.proxied_read(request, entry, validated).await;
+                self.narrow_questions(request, answer)
+            }
+            DeviceRead::Workflow => {
                 self.controller
                     .automation()
                     .read_frame(request, Some(self.device.grant.grant_id))
                     .await
             }
-            // The voice coordinator's own reads. They run on this host rather than on a worker:
-            // a selection is built from what this daemon holds about the session, filtered under
-            // this device's own grant, a preparation reads this device's grants and the managed
-            // service's published terms, and what comes back goes to this device and nowhere else.
-            Method::VoiceContext | Method::VoicePrepare => {
+            DeviceRead::Voice => {
                 self.controller
                     .voice()
                     .read_frame(
@@ -935,22 +1062,13 @@ impl RemoteConnection {
                     )
                     .await
             }
-            // The catalogue and plugin reads. A catalogue belongs to the environment rather than to
-            // a session, so there is no worker to forward them to and no session content to narrow:
-            // the grant's environment selector and `host.manage` are the whole of what admits them,
-            // and the module answers a device exactly as it answers this user's own client. The
-            // ingress travels with the read so the module decides it at the connection's own.
-            _ if crate::catalogue::CatalogueModule::serves(entry.method) => {
+            DeviceRead::Catalogue => {
                 self.controller
                     .catalogue
                     .read_frame(kr_protocol::actor::ActorIngress::PairedDevice, request)
                     .await
             }
-            // The review and attention group is this host's own store, and a device reads it under
-            // its grant: the sessions its selector admits with `session.view`, the automation of
-            // its own grant with `automation.manage`, the host's own items with `host.manage`, and
-            // no session text.
-            _ if crate::attention::AttentionModule::serves(entry.method) => {
+            DeviceRead::Attention => {
                 let caller = crate::attention::Caller::device(&self.device.grant);
                 let reach = self.controller.attention_reach();
                 self.controller
@@ -958,10 +1076,7 @@ impl RemoteConnection {
                     .read_frame(reach.as_ref(), &caller, &actor_id, request)
                     .await
             }
-            // The pairing and owner-confirmation reads. A device is the issuing owner of nothing,
-            // because invitations are issued over local IPC, so its `pair.status` is refused by the
-            // pairing service; an owner device reads the confirmations it can approve.
-            Method::PairStatus | Method::OwnerConfirmationPending => {
+            DeviceRead::Pairing => {
                 let caller = super::owner::Caller::device(self.device.clone());
                 match self
                     .controller
@@ -975,13 +1090,21 @@ impl RemoteConnection {
                     Err(error) => failure(request.request_id, error.to_protocol_error()),
                 }
             }
-            _ => failure(
-                request.request_id,
-                ProtocolError::new(
-                    ErrorCode::InvalidArgument,
-                    format!("{} is not a read this host serves", entry.name),
-                ),
-            ),
+            DeviceRead::Grants => {
+                match self
+                    .controller
+                    .grant_list(self.device.device_id, &request.params)
+                {
+                    Ok(value) => ControlFrame::Response(Response {
+                        request_id: request.request_id,
+                        outcome: Outcome::Ok(value),
+                    }),
+                    Err(error) => failure(request.request_id, error.to_protocol_error()),
+                }
+            }
+            DeviceRead::Refused(unserved) => {
+                return failure(request.request_id, unserved.refusal(entry));
+            }
         };
         // Checked again now the read has finished. A read that passed its check and then waited
         // for a worker can complete after the authority behind it was withdrawn, and what the
@@ -1828,6 +1951,63 @@ impl RemoteConnection {
                 ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()),
             ),
         }
+    }
+
+    /// Narrows a session worker's answer to `question.read` to what this device's grant admits.
+    ///
+    /// A question is session content: what an application asked, the context it gave and the
+    /// answer once there is one. The method table puts it under the grant's history scope for
+    /// current resources: a question the grant names is admitted however early it was asked, and
+    /// any other only when it was asked at or after the moment the grant reaches back to, so a
+    /// grant that retains no history and names no question admits none. A read that named one
+    /// question the scope does not reach is refused, as a change-set version captured before the
+    /// lower bound is, rather than answered as if the question did not exist. An answer that is not
+    /// a question read is refused too: nothing here passes on what it could not narrow.
+    fn narrow_questions(&self, request: &Request, answer: ControlFrame) -> ControlFrame {
+        let ControlFrame::Response(Response {
+            request_id,
+            outcome: Outcome::Ok(value),
+        }) = answer
+        else {
+            return answer;
+        };
+        let Ok(read) = value.to_typed::<kr_protocol::question::QuestionReadResult>() else {
+            return failure(
+                request_id,
+                ProtocolError::new(
+                    ErrorCode::ResourceUnavailable,
+                    "the session's worker answered this question read with something else",
+                ),
+            );
+        };
+        let scope = &self.device.grant.history;
+        let admitted = |question: &kr_protocol::question::Question| {
+            scope.named_questions.contains(&question.question_id)
+                || scope
+                    .lower_bound_ms
+                    .0
+                    .is_some_and(|bound| question.created_at_ms.get() >= bound.get())
+        };
+        let named = request
+            .params
+            .to_typed::<kr_protocol::question::QuestionReadParams>()
+            .is_ok_and(|params| params.question_id.is_present());
+        if named && !read.questions.iter().all(admitted) {
+            return failure(
+                request_id,
+                ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "this question was asked before the moment this device's grant reaches back \
+                     to, and the grant does not name it",
+                ),
+            );
+        }
+        encoded(
+            request_id,
+            &kr_protocol::question::QuestionReadResult {
+                questions: read.questions.into_iter().filter(admitted).collect(),
+            },
+        )
     }
 
     /// Answers `action.read` for a catalogue action this device performed, where there is one.
@@ -2850,6 +3030,11 @@ fn claims_geometry(mutation: &MutationRequest) -> bool {
 /// the typed shape belongs to the subject: the daemon needs one field to decide which worker a
 /// request goes to and which session its grant is checked against, and parsing the whole thing
 /// here would mean two places that have to agree on every parameter of every method.
+///
+/// A request names its session at the top of its parameters, except the three agent reads, which
+/// name the exact instance they are about as a subject that carries its session. That session is
+/// the one the worker answers for, so it is the one the grant is checked against and the request
+/// routed by; a read whose session was looked for anywhere else would be decided without one.
 fn session_of(
     params: &ParamsValue,
     entry: &'static MethodEntry,
@@ -2863,7 +3048,16 @@ fn session_of(
     let kr_cbor::CanonicalValue::Map(map) = params.as_value() else {
         return Err(named());
     };
-    let Some(kr_cbor::CanonicalValue::Bytes(bytes)) = map.get("session_id") else {
+    let carried = match entry.method {
+        Method::AgentCapabilities | Method::AgentSnapshot | Method::AgentCommands => {
+            match map.get("subject") {
+                Some(kr_cbor::CanonicalValue::Map(subject)) => subject.get("session_id"),
+                _ => None,
+            }
+        }
+        _ => map.get("session_id"),
+    };
+    let Some(kr_cbor::CanonicalValue::Bytes(bytes)) = carried else {
         return Err(named());
     };
     let bytes = <[u8; 16]>::try_from(bytes.as_slice()).map_err(|_| named())?;
@@ -3537,11 +3731,12 @@ mod tests {
     /// reason the device can act on. None reaches the refusal the routing keeps for a method the
     /// table does not admit for a device, which names no reason.
     ///
-    /// Each read is sent through a paired device's own connection, naming the session this host's
-    /// worker serves, by a device whose grant admits every one of them, so what answers is the
-    /// routing rather than the grant. A read the routing forwards reaches the worker, which records
-    /// it and refuses it; a read the daemon answers itself is answered or refused by its own
-    /// service.
+    /// The routing's decision is walked over the whole table: every read a paired device may make
+    /// has one, raw input has one, and no other method does. Then each read is sent through a
+    /// paired device's own connection, naming the session this host's worker serves, by a device
+    /// whose grant admits every one of them, so what answers is the routing rather than the grant.
+    /// A read the routing forwards reaches the worker, which records it and refuses it; a read the
+    /// daemon answers itself is answered or refused by its own service.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn every_read_the_method_table_admits_for_a_device_is_served_or_refused_by_name() {
         use std::sync::Arc;
@@ -3552,6 +3747,21 @@ mod tests {
         use kr_protocol::error::ErrorCode;
 
         use crate::service::a_close_a_worker_never_answers as fake;
+
+        let mut undecided = Vec::new();
+        for method in Method::ALL {
+            let entry = method.entry();
+            let request = entry.effect == EffectClass::Read || *method == Method::InputWrite;
+            let admitted = request && entry.ingress.contains(&ActorIngress::PairedDevice);
+            if super::DeviceRead::of(*method).is_some() != admitted {
+                undecided.push((entry.name, admitted));
+            }
+        }
+        assert!(
+            undecided.is_empty(),
+            "methods whose routing decision does not match whether the method table admits them \
+             as a paired device's request, with that admission: {undecided:?}"
+        );
 
         let recorded: fake::Recorded = Arc::default();
         let world = fake::fake_worker(Some(Arc::clone(&recorded))).await;

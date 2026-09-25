@@ -5334,7 +5334,7 @@ impl Controller {
                 self.archive_action_read(actor_id, &request.params).await
             }
             Method::AgentToolsStatus => self.agent_tools_status(&request.params),
-            Method::GrantList => self.grant_list(&request.params),
+            Method::GrantList => self.grant_list(self.host_device_id(), &request.params),
             Method::DeviceList => self.device_list(&request.params).await,
             _ => Err(ControllerError::InvalidArgument(format!(
                 "{} is not a read this daemon serves",
@@ -6027,14 +6027,19 @@ impl Controller {
         }
     }
 
-    /// Lists the grants this host's owner may see.
+    /// Lists the grants `issuer` may see: the grants it issued, and everything delegated from them.
     ///
     /// A local caller is the operating-system owner of this environment, so the issuer it lists
-    /// grants for is this host itself: the grants it issued, and everything delegated from them.
-    fn grant_list(&self, params: &ParamsValue) -> Result<ParamsValue> {
+    /// grants for is this host itself, which sees every grant here. A paired device lists as
+    /// itself, and sees what its own delegation authority reaches.
+    pub(crate) fn grant_list(
+        &self,
+        issuer: kr_protocol::ids::DeviceId,
+        params: &ParamsValue,
+    ) -> Result<ParamsValue> {
         let params: kr_protocol::sharing::GrantListParams = parse(params)?;
         let result = self.sharing.list_for_issuer(
-            self.host_device_id(),
+            issuer,
             params.session_id.as_ref().copied(),
             params.include_resolved,
             self.settled_now_ms(),
