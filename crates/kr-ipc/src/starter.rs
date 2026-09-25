@@ -344,7 +344,8 @@ pub fn clear_recorded_session(environment: &EnvironmentPaths) -> Result<()> {
 #[cfg(windows)]
 pub use self::windows::{
     ChildCommand, ChildRefusal, LaunchListener, LaunchStream, MAX_LAUNCH_FRAME, PeerProcess,
-    Reached, StartedChild, connect, current_session, process_facts, start_child,
+    Reached, StartedChild, account_sid, connect, current_session, current_user_sid, process_facts,
+    start_child,
 };
 
 #[cfg(all(windows, any(test, feature = "testing")))]
@@ -781,6 +782,92 @@ mod windows {
     /// Returns the operating system's error when this process's token cannot be read.
     pub fn current_session() -> io::Result<u32> {
         Token::of(current_process())?.session()
+    }
+
+    /// Returns the account this process runs as, as its security identifier's text, `S-1-5-...`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating system's error when this process's token cannot be read.
+    pub fn current_user_sid() -> io::Result<String> {
+        let user = Token::of(current_process())?.user()?;
+        // SAFETY: the buffer holds a `TOKEN_USER` the kernel wrote, aligned for it, and the
+        // identifier it points at lies inside the buffer, which outlives the conversion.
+        let sid = unsafe { std::ptr::read(user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        sid_text(sid)
+    }
+
+    /// Resolves an account's name, `name` or `DOMAIN\name`, to its security identifier's text.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating system's error when no account has that name.
+    pub fn account_sid(name: &str) -> io::Result<String> {
+        use windows_sys::Win32::Security::{LookupAccountNameW, SID_NAME_USE};
+
+        let account: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut sid_size = 0_u32;
+        let mut domain_size = 0_u32;
+        let mut kind: SID_NAME_USE = 0;
+        // SAFETY: a null buffer with a zero size asks for the sizes, which is all this call is
+        // for; its expected failure is ignored.
+        let _ = unsafe {
+            LookupAccountNameW(
+                std::ptr::null(),
+                account.as_ptr(),
+                std::ptr::null_mut(),
+                &raw mut sid_size,
+                std::ptr::null_mut(),
+                &raw mut domain_size,
+                &raw mut kind,
+            )
+        };
+        if sid_size == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut sid = vec![0_u64; usize::try_from(sid_size).unwrap_or(0).div_ceil(8)];
+        let mut domain = vec![0_u16; usize::try_from(domain_size).unwrap_or(0).max(1)];
+        // SAFETY: both buffers hold at least the sizes the call above reported, which this call is
+        // told, and `kind` is a live out parameter.
+        let found = unsafe {
+            LookupAccountNameW(
+                std::ptr::null(),
+                account.as_ptr(),
+                sid.as_mut_ptr().cast(),
+                &raw mut sid_size,
+                domain.as_mut_ptr(),
+                &raw mut domain_size,
+                &raw mut kind,
+            )
+        };
+        if found == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        sid_text(sid.as_mut_ptr().cast())
+    }
+
+    /// Writes a security identifier in its text form.
+    fn sid_text(sid: windows_sys::Win32::Security::PSID) -> io::Result<String> {
+        use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+
+        let mut text: *mut u16 = std::ptr::null_mut();
+        // SAFETY: `sid` points at a live identifier and `text` is a live out parameter.
+        let converted = unsafe { ConvertSidToStringSidW(sid, &raw mut text) };
+        if converted == 0 || text.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let mut length = 0_usize;
+        // SAFETY: the buffer the conversion allocated is terminated, so the scan stops inside it.
+        while unsafe { *text.add(length) } != 0 {
+            length += 1;
+        }
+        // SAFETY: the buffer holds `length` code units before its terminator.
+        let written = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, length) });
+        // SAFETY: the buffer came from the conversion above and is freed exactly once.
+        unsafe {
+            LocalFree(text.cast());
+        }
+        Ok(written)
     }
 
     /// What a starter is asked to run.
@@ -1789,6 +1876,28 @@ mod tests {
             let refused = stream.receive(soon()).expect_err("the frame is refused");
             assert_eq!(refused.kind(), std::io::ErrorKind::InvalidData);
             reaching.join().expect("the starter's end finishes");
+        }
+
+        /// This process's account is named by its identifier, and its name resolves to the same
+        /// identifier, whether it is given bare or with its domain.
+        #[test]
+        fn this_account_is_found_by_its_name_and_its_identifier() {
+            let own = current_user_sid().expect("this process's account");
+            assert!(
+                own.starts_with("S-1-"),
+                "an identifier in its text form: {own}"
+            );
+            let user = std::env::var("USERNAME").expect("this account's name");
+            let domain = std::env::var("USERDOMAIN").expect("this account's domain");
+            assert_eq!(
+                account_sid(&format!("{domain}\\{user}")).expect("the qualified name"),
+                own
+            );
+            assert_eq!(account_sid(&user).expect("the bare name"), own);
+            assert!(
+                account_sid("kalareach-no-such-account-4f1c").is_err(),
+                "an unknown name names no account"
+            );
         }
 
         /// What a started process is given to run: long enough to be looked at, and it ends by
