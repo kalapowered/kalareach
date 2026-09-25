@@ -164,7 +164,21 @@ pub async fn drafts(paths: &HostPaths, build_id: BuildId) -> Result<Vec<Reconcil
     let workers = Workers::new(paths, build_id).knowing(&drafts.drafts().map_err(answer_failure)?);
     answers::reconcile(&workers, &drafts)
         .await
-        .map_err(answer_failure)
+        .map_err(|error| unreconciled(&workers, error))
+}
+
+/// The failure `kr question drafts` reports when a session holding a kept answer could not be
+/// read, which retires nothing.
+///
+/// A worker that could not be reached is named, with what its daemon said of the session, rather
+/// than reported as a connection that ended.
+fn unreconciled(workers: &Workers, error: AnswerError) -> CliError {
+    match (error, workers.failure()) {
+        (AnswerError::Host(ClientError::ConnectionEnded), Some(failure)) => {
+            CliError::HostUnavailable(format!("{}; no kept answer was retired", failure.why))
+        }
+        (error, _) => answer_failure(error),
+    }
 }
 
 /// Sends one kept answer, which is the one way a kept answer is ever sent.
@@ -514,11 +528,14 @@ impl Workers {
             // its daemon keeps says so.
             Err(error) => match self.ended(session_id, false).await {
                 Ok(gone) => Err(gone),
-                Err(_) => {
+                Err(why) => {
                     self.failed(
                         ErrorCode::ResourceUnavailable,
                         Delivery::NotSent,
-                        format!("session {session_id}'s worker could not be reached ({error})"),
+                        format!(
+                            "session {session_id}'s worker could not be reached ({error}), and \
+                             {why}"
+                        ),
                     );
                     Err(ClientError::ConnectionEnded)
                 }
@@ -569,8 +586,9 @@ impl Workers {
     ///
     /// A closure its registry keeps does, and so, when the session has published no descriptor,
     /// does a registry that never held the session at all: nothing on this host can reach such a
-    /// session again. Everything else, a daemon that is not running, a session it reports live,
-    /// an environment this host does not have, establishes nothing, and the reason is returned.
+    /// session again. Everything else, a daemon that is not running, a session it reports live, a
+    /// registry with no record of a session whose descriptor is still published, an environment
+    /// this host does not have, establishes nothing, and what the daemon said is returned.
     async fn ended(
         &self,
         session_id: SessionId,
@@ -580,9 +598,7 @@ impl Workers {
             ClientError::Host(ProtocolError::new(ErrorCode::UnknownSession, detail))
         };
         let Some(environment) = self.environments.get(&session_id) else {
-            return Err(format!(
-                "which environment session {session_id} ran in is not known"
-            ));
+            return Err("which environment it ran in is not known".to_owned());
         };
         let environment = environment.to_string();
         match crate::resolve::registered(
@@ -598,9 +614,9 @@ impl Workers {
             Err(CliError::UnknownSession(_)) if unpublished => Ok(gone(format!(
                 "this host has no record of session {session_id}"
             ))),
-            Err(CliError::UnknownSession(_)) => Err(format!(
-                "this host has no record of session {session_id}, whose worker could not be reached"
-            )),
+            Err(CliError::UnknownSession(_)) => {
+                Err("its environment's daemon has no record of it".to_owned())
+            }
             Ok(crate::resolve::Registered::Unpublished { state, .. }) => {
                 Err(format!("its environment's daemon reports it {state}"))
             }

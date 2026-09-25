@@ -557,7 +557,9 @@ in: a closure its registry keeps, or, for a session with no descriptor, no recor
 all. Nothing on disk, or missing from it, retires one. When the descriptor is missing and there is
 no daemon to ask, when the daemon reports the session still live, and when a descriptor is there
 and cannot be read or is readable by anyone but its owner, `kr question drafts` fails and retires
-nothing.
+nothing. A worker that cannot be reached retires its answer only on a closure its daemon keeps; the
+descriptor it left behind says nothing either way. Otherwise `kr question drafts` exits with 3,
+names the worker it could not reach and what its daemon said of the session, and retires nothing.
 
 ## `kr skill`
 

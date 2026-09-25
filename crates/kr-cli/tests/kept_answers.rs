@@ -66,6 +66,8 @@ enum Registry {
     Closed,
     /// The session is live.
     Live,
+    /// The registry never held the session.
+    NeverHeld,
 }
 
 /// What the scripted worker holds.
@@ -155,6 +157,12 @@ impl Host {
 
     fn behave(&self, behaviour: Behaviour) {
         self.state().behaviour = behaviour;
+    }
+
+    /// Stops the worker, as a worker that ended would, and leaves its descriptor where it was.
+    async fn stop_worker(&mut self) {
+        self.serving.abort();
+        let _ = (&mut self.serving).await;
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -288,6 +296,10 @@ async fn serve_daemon(
                 ParamsValue::from_typed(&live_session(environment_id, session_id))
                     .expect("a session"),
             ),
+            ("session.read", Registry::NeverHeld) => Outcome::Error(ProtocolError::new(
+                ErrorCode::UnknownSession,
+                "this daemon has no such session",
+            )),
             (other, _) => Outcome::Error(refusal(&format!("this daemon answers no {other}"))),
         };
         let response = ControlFrame::Response(Response {
@@ -773,63 +785,114 @@ async fn a_descriptor_that_cannot_be_read_retires_nothing() {
     assert_eq!(host.answers_received(), 0, "nothing was ever sent");
 }
 
+/// A fresh scripted session whose worker could not take an answer, which is kept, and which then
+/// serves again.
+async fn kept_answer() -> Host {
+    let host = Host::start(Behaviour::EndsAfterTheRead).await;
+    let (status, document) =
+        host.json(&["question", "answer", &host.question(), "--choice", "left"]);
+    assert_eq!(status, Some(3), "{document}");
+    assert!(host.kept().is_file(), "the answer is kept");
+    host.behave(Behaviour::Serves);
+    host
+}
+
 /// KR-REQ-11.63: a session is gone only when its environment's daemon says so. With its descriptor
-/// missing, a kept answer is retired unsent when the daemon's registry records the session closed,
-/// and nothing is retired while there is no daemon to ask or the daemon reports the session live,
-/// even though its worker cannot be found.
+/// missing, a kept answer is retired unsent when the daemon's registry records the session closed
+/// or never held it, and nothing is retired while there is no daemon to ask or the daemon reports
+/// the session live, even though its worker cannot be found.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_missing_descriptor_retires_a_kept_answer_only_on_the_daemons_word() {
-    let host = Host::start(Behaviour::EndsAfterTheRead).await;
-    let question = host.question();
-    let (status, _) = host.json(&["question", "answer", &question, "--choice", "left"]);
-    assert_eq!(status, Some(3));
-    host.behave(Behaviour::Serves);
-    std::fs::remove_file(&host.descriptor).expect("the descriptor goes");
+    for (registry, retired) in [
+        (None, false),
+        (Some(Registry::Live), false),
+        (Some(Registry::NeverHeld), true),
+        (Some(Registry::Closed), true),
+    ] {
+        let host = kept_answer().await;
+        std::fs::remove_file(&host.descriptor).expect("the descriptor goes");
+        let daemon = registry.map(|registry| host.daemon(registry));
+        let (status, document) = host.json(&["question", "drafts"]);
+        if retired {
+            assert_eq!(status, Some(0), "{registry:?}: {document}");
+            assert_eq!(
+                document["drafts"][0]["state"], "retired",
+                "{registry:?}: {document}"
+            );
+            assert_eq!(
+                document["drafts"][0]["reason_code"], "UNKNOWN_SESSION",
+                "{registry:?}: {document}"
+            );
+            assert!(
+                !host.kept().exists(),
+                "{registry:?}: a retired answer is not kept"
+            );
+        } else {
+            assert_ne!(status, Some(0), "{registry:?}: {document}");
+            let message = document["message"].as_str().expect("a message");
+            assert!(message.contains("published no descriptor"), "{message}");
+            if registry == Some(Registry::Live) {
+                assert!(message.contains("reports it live"), "{message}");
+            }
+            assert!(host.kept().is_file(), "{registry:?}: nothing is retired");
+        }
+        assert_eq!(host.answers_received(), 0, "{registry:?}: nothing was sent");
+        if let Some(daemon) = daemon {
+            daemon.abort();
+        }
+    }
+}
 
-    // No daemon to ask.
-    let (status, document) = host.json(&["question", "drafts"]);
-    assert_ne!(status, Some(0), "{document}");
-    assert!(
-        host.kept().is_file(),
-        "with nobody to ask, nothing is retired"
-    );
-
-    // A daemon that reports the session live.
-    let daemon = host.daemon(Registry::Live);
-    let (status, document) = host.json(&["question", "drafts"]);
-    assert_ne!(status, Some(0), "{document}");
-    assert!(
-        document["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("live")),
-        "{document}"
-    );
-    assert!(
-        host.kept().is_file(),
-        "a live session's answer is not retired"
-    );
-    daemon.abort();
-    let _ = daemon.await;
-    let _ = std::fs::remove_file(
-        host.temp
-            .environment()
-            .controller_endpoint()
-            .expect("an endpoint")
-            .as_path(),
-    );
-
-    // A daemon whose registry records the session closed.
-    let daemon = host.daemon(Registry::Closed);
-    let (status, document) = host.json(&["question", "drafts"]);
-    assert_eq!(status, Some(0), "{document}");
-    assert_eq!(document["drafts"][0]["state"], "retired", "{document}");
-    assert_eq!(document["drafts"][0]["reason_code"], "UNKNOWN_SESSION");
-    assert!(
-        !host.kept().exists(),
-        "a closed session's answer is retired"
-    );
-    assert_eq!(host.answers_received(), 0, "and it was never sent");
-    daemon.abort();
+/// KR-REQ-11.63: a worker that cannot be reached retires its kept answer only on a closure its
+/// daemon keeps. Its descriptor left behind says nothing either way, so with no daemon to ask, a
+/// daemon that reports the session live, or one with no record of it, nothing is retired, and
+/// `kr question drafts` names the worker it could not reach and what its daemon said.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unreachable_worker_retires_a_kept_answer_only_on_a_recorded_closure() {
+    for (registry, retired) in [
+        (None, false),
+        (Some(Registry::Live), false),
+        (Some(Registry::NeverHeld), false),
+        (Some(Registry::Closed), true),
+    ] {
+        let mut host = kept_answer().await;
+        host.stop_worker().await;
+        assert!(host.descriptor.is_file(), "the descriptor is left behind");
+        let daemon = registry.map(|registry| host.daemon(registry));
+        let (status, document) = host.json(&["question", "drafts"]);
+        if retired {
+            assert_eq!(status, Some(0), "{registry:?}: {document}");
+            assert_eq!(
+                document["drafts"][0]["state"], "retired",
+                "{registry:?}: {document}"
+            );
+            assert_eq!(
+                document["drafts"][0]["reason_code"], "UNKNOWN_SESSION",
+                "{registry:?}: {document}"
+            );
+            assert!(
+                !host.kept().exists(),
+                "{registry:?}: a retired answer is not kept"
+            );
+        } else {
+            assert_eq!(status, Some(3), "{registry:?}: {document}");
+            let message = document["message"].as_str().expect("a message");
+            assert!(message.contains("worker could not be reached"), "{message}");
+            assert!(message.contains("no kept answer was retired"), "{message}");
+            match registry {
+                Some(Registry::Live) => assert!(message.contains("reports it live"), "{message}"),
+                Some(Registry::NeverHeld) => {
+                    assert!(message.contains("has no record of it"), "{message}");
+                }
+                _ => assert!(message.contains("cannot be established"), "{message}"),
+            }
+            assert!(host.kept().is_file(), "{registry:?}: nothing is retired");
+        }
+        assert_eq!(host.answers_received(), 0, "{registry:?}: nothing was sent");
+        if let Some(daemon) = daemon {
+            daemon.abort();
+        }
+    }
 }
 
 /// KR-REQ-11.63: a worker that cannot say what became of an answer leaves its fate unknown, so the
