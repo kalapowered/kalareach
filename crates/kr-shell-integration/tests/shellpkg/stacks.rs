@@ -1030,7 +1030,7 @@ impl Session {
         let endpoint_path = setup.runtime.join("shell-bridge");
         // A session that starts twice over one home binds a fresh endpoint each time.
         let _ = std::fs::remove_file(&endpoint_path);
-        let endpoint = BridgeEndpoint::unix(endpoint_path.to_string_lossy().into_owned());
+        let endpoint = BridgeEndpoint::unix(told(&endpoint_path));
         endpoint
             .validate()
             .expect("the endpoint path fits a socket address");
@@ -1055,16 +1055,11 @@ impl Session {
             })
             .expect("a pseudo-terminal");
 
-        let mut command = CommandBuilder::new(package.executable.to_string_lossy().into_owned());
+        let mut command = CommandBuilder::new(&package.executable);
         match package.kind {
             ShellKind::PowerShell => {
                 command.arg("-NoLogo");
-                let mut module_path = package.module_directory.to_string_lossy().into_owned();
-                if let Some(existing) = std::env::var_os("PSModulePath") {
-                    module_path.push(':');
-                    module_path.push_str(&existing.to_string_lossy());
-                }
-                command.env("PSModulePath", module_path);
+                command.env("PSModulePath", module_search_path(package));
                 // The host's own image needs its runtime's location, which the qualification
                 // recorded from the launcher that started the host it qualified.
                 if let Some(environment) = package.record["launch"]["environment"].as_object() {
