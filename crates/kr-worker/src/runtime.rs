@@ -588,6 +588,13 @@ impl SessionRuntime {
         // Set when the writer ends. A terminal that will take nothing more is one this session
         // cannot accept input for, and saying so is better than acknowledging bytes nothing writes.
         let terminal_gone = session.terminal_gone_latch();
+        // Input this session accepted and output it produced are what ask the supervision to look
+        // at the boundary, and the adoption watch at the terminal's foreground; neither is proof
+        // that a process started, and [`crate::lifecycle`] says what a session whose application
+        // works in silence leaves out. Nothing here is on a clock that an idle session pays for.
+        // The mark is the session's own, because a command its shell's integration reports
+        // starting is marked there.
+        let activity = session.activity();
         let session = Arc::new(Mutex::new(session));
         let (input_sender, mut input_receiver) = mpsc::unbounded_channel::<InputBatch>();
         // Bounded on purpose. Section 9 says a slow *client* must never hold the read loop, and it
@@ -606,11 +613,6 @@ impl SessionRuntime {
         let counter = progress.counter();
         let wake = Arc::new(Notify::new());
         let closed = Arc::new(Notify::new());
-        // Input this session accepted and output it produced are what ask the supervision to look
-        // at the boundary; neither is proof that a process started, and [`crate::lifecycle`] says
-        // what a session whose application works in silence leaves out. Nothing here is on a clock
-        // that an idle session pays for.
-        let activity = crate::lifecycle::Activity::new();
 
         // The read loop runs on its own thread. The terminal answers a read with nothing to read
         // rather than waiting inside it, so this waits on the descriptor and then reads what is

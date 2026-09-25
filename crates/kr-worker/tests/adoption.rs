@@ -1,14 +1,17 @@
 //! Adoption, and the session's announcement of its agent instances.
 //!
-//! This test process plays the root shell. The program adoption finds is this test binary, placed
-//! as `claude` and started with the one case below that only sleeps, as this process's own child
-//! in a process group of its own, as a shell with job control starts a foreground job. It is a
-//! copy of this binary rather than of a system program, because macOS stops a copy of a system
-//! program from running, and a link to one would run under the system program's own name.
+//! In most cases this test process plays the root shell. The program adoption finds is this test
+//! binary, placed as `claude` and started with the one case below that only sleeps, as this
+//! process's own child in a process group of its own, as a shell with job control starts a
+//! foreground job. It is a copy of this binary rather than of a system program, because macOS stops
+//! a copy of a system program from running, and a link to one would run under the system program's
+//! own name. The watch's own cases run a session whose root shell is a POSIX shell with job
+//! control, which starts the same program as a foreground job when a line is typed into it.
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-12.07 | a program the root shell ran that the integration did not launch is adopted as a native terminal instance with no process record, with the bypass its line was answered with, its bridges refused, and ended when it exits; a program the integration launched is not adopted; a view that installs the session's list and applies the announcements after it holds each instance once |
+//! | KR-REQ-12.07 | a program the root shell ran that the integration did not launch is adopted as a native terminal instance with no process record, with the bypass its line was answered with, its bridges refused, and ended when it exits; a program the integration launched is not adopted; a view that installs the session's list and applies the announcements after it holds each instance once; the watch finds a program the root shell starts from a typed line within two seconds of it running and its end within two seconds of its exit, and looks when the integration asks about an invocation or reports a command starting |
+//! | KR-PERF-003 | a session nothing is happening in reads its terminal's foreground on no interval, before and after its own traffic, and after an adopted program has ended |
 
 #![cfg(unix)]
 
@@ -34,6 +37,10 @@ use kr_worker::persistence::JournalHealth;
 /// many seconds as it names.
 const STAND_IN: &str = "KR_ADOPTION_STAND_IN";
 
+/// The variable that names a file the stand-in writes its process identifier to once it is
+/// running, for a test that needs to know when the program itself has started.
+const STAND_IN_RUNNING: &str = "KR_ADOPTION_STAND_IN_RUNNING";
+
 /// How long a test waits for something that should happen promptly, before it calls it a failure.
 const LIVENESS: Duration = Duration::from_secs(60);
 
@@ -41,6 +48,9 @@ const LIVENESS: Duration = Duration::from_secs(60);
 #[test]
 fn the_stand_in_program() {
     if let Ok(seconds) = std::env::var(STAND_IN) {
+        if let Some(running) = std::env::var_os(STAND_IN_RUNNING) {
+            std::fs::write(running, std::process::id().to_string()).expect("says it is running");
+        }
         std::thread::sleep(Duration::from_secs(seconds.parse().unwrap_or(60)));
     }
 }
@@ -305,14 +315,37 @@ fn session_and_view(
     Arc<kr_worker::runtime::SessionRuntime>,
     kr_worker::output::OutputStream,
 ) {
+    open_session(
+        host,
+        kr_worker::testing::posix_script("exec cat"),
+        &[kr_protocol::attachment::AttachmentCapability::ObserveTerminal],
+    )
+}
+
+/// The view every session in these tests is attached to.
+const VIEW: kr_protocol::ids::AttachmentId =
+    kr_protocol::ids::AttachmentId::new(Uuid::from_bytes([5; 16]));
+
+/// A session whose root shell runs `shell`, with one view attached with `capabilities`, and that
+/// view's own delivery stream.
+fn open_session(
+    host: &kr_ipc::testing::TempHost,
+    shell: kr_worker::pty::ShellCommand,
+    capabilities: &[kr_protocol::attachment::AttachmentCapability],
+) -> (
+    Arc<kr_worker::runtime::SessionRuntime>,
+    kr_worker::output::OutputStream,
+) {
     let mut requested = kr_protocol::scalars::CanonicalSet::new();
-    requested.insert(kr_protocol::attachment::AttachmentCapability::ObserveTerminal);
+    for capability in capabilities {
+        requested.insert(*capability);
+    }
     let config = kr_worker::session::SessionConfig {
         session_id: session(),
         session_epoch: kr_protocol::ids::SessionEpoch::V1,
         environment_id: host.environment_id(),
         display_number: kr_protocol::session::DisplayNumber::new(1),
-        shell: kr_worker::testing::posix_script("exec cat"),
+        shell,
         shell_mode: kr_protocol::session::ShellMode::NativeCompat,
         worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
         desktop: kr_protocol::identity::DesktopBinding::none(),
@@ -327,7 +360,6 @@ fn session_and_view(
     };
     let mut opened = kr_worker::session::Session::open(config).expect("opens");
     opened.launch().expect("launches");
-    let attachment_id = kr_protocol::ids::AttachmentId::new(Uuid::from_bytes([5; 16]));
     let params = kr_protocol::attachment::SessionAttachParams {
         session_id: session(),
         mode: kr_protocol::attachment::AttachMode::Terminal,
@@ -336,10 +368,8 @@ fn session_and_view(
         terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
         requested: requested.clone(),
     };
-    opened
-        .attach(&params, requested, attachment_id)
-        .expect("attaches");
-    let stream = opened.subscribe(attachment_id).expect("subscribes");
+    opened.attach(&params, requested, VIEW).expect("attaches");
+    let stream = opened.subscribe(VIEW).expect("subscribes");
     let runtime = Arc::new(
         kr_worker::runtime::SessionRuntime::start(
             opened,
@@ -471,8 +501,11 @@ async fn kr_req_12_07_a_slow_identification_holds_no_end_and_adopts_nothing_afte
     let (arrived, release) = setup.adoptions.pause_before_reading();
     let adoptions = Arc::new(setup.adoptions);
     let foreground = Setup::foreground(&second, Vec::new());
+    let group = foreground.group;
     let watching = tokio::spawn(kr_worker::broker::adoption::watch_foreground(
         Arc::clone(&adoptions),
+        kr_worker::lifecycle::Activity::new(),
+        move || Some(Some(group)),
         move || Some(Some(foreground.clone())),
     ));
     tokio::task::spawn_blocking(move || arrived.recv_timeout(LIVENESS))
@@ -509,4 +542,317 @@ async fn kr_req_12_07_a_slow_identification_holds_no_end_and_adopts_nothing_afte
         "an identification that finished after the close records nothing"
     );
     second.end();
+}
+
+/// Longer than the watch goes on looking after it was last asked to, with room for a loaded
+/// machine's timers: a session this long after its latest traffic is one nothing is happening in.
+const QUIET_AFTER: Duration = Duration::from_secs(4);
+
+/// How many intervals a quiet session is watched for, on none of which it may read its foreground.
+const QUIET_INTERVALS: u32 = 8;
+
+/// A session whose one view holds the input lease, and the view's own delivery stream.
+struct Typing {
+    runtime: Arc<kr_worker::runtime::SessionRuntime>,
+    epoch: u64,
+    sequence: u64,
+    _view: kr_worker::output::OutputStream,
+}
+
+impl Typing {
+    /// Starts a session whose root shell runs `shell`, with a view that can type into it.
+    fn start(host: &kr_ipc::testing::TempHost, shell: kr_worker::pty::ShellCommand) -> Self {
+        let (runtime, view) = open_session(
+            host,
+            shell,
+            &[
+                kr_protocol::attachment::AttachmentCapability::ObserveTerminal,
+                kr_protocol::attachment::AttachmentCapability::Input,
+            ],
+        );
+        let epoch = {
+            let mut session = runtime.session();
+            session
+                .acquire_input(
+                    VIEW,
+                    kr_protocol::ids::ConnectionId::new(kr_ipc::new_uuid()),
+                    None,
+                )
+                .expect("takes the lease");
+            session.lease().epoch.get()
+        };
+        Self {
+            runtime,
+            epoch,
+            sequence: 0,
+            _view: view,
+        }
+    }
+
+    /// Types `bytes` into the terminal, as the view holding the lease does.
+    fn type_in(&mut self, bytes: &[u8]) {
+        self.runtime
+            .session()
+            .write_input(
+                VIEW,
+                self.epoch,
+                self.sequence,
+                bytes,
+                None,
+                std::time::Instant::now(),
+            )
+            .expect("the input is accepted");
+        self.sequence += 1;
+        self.runtime.flush_input();
+    }
+
+    /// How many times the terminal's foreground has been read.
+    fn reads(&self) -> usize {
+        self.runtime.session().foreground_reads()
+    }
+
+    /// Asserts that the session reads its foreground on none of [`QUIET_INTERVALS`] intervals.
+    async fn quiet(&self, what: &str) {
+        let before = self.reads();
+        tokio::time::sleep(kr_worker::broker::adoption::WATCH_INTERVAL * QUIET_INTERVALS).await;
+        let read = self.reads() - before;
+        assert_eq!(
+            read, 0,
+            "{what} reads its foreground on no interval: {read} reads in {QUIET_INTERVALS} intervals"
+        );
+    }
+
+    /// Closes the session and waits for it to have closed.
+    async fn close(self) {
+        let (_, gate) = self
+            .runtime
+            .close(kr_protocol::session::ClosureReason::CloseRequested);
+        gate.release();
+        tokio::time::timeout(LIVENESS, self.runtime.wait_closed())
+            .await
+            .expect("the session closes");
+    }
+}
+
+/// Waits up to `limit` for `condition` to hold, and says whether it did.
+async fn within(limit: Duration, mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        if condition() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// KR-PERF-003 and KR-REQ-12.07: a session nothing is happening in reads its terminal's foreground
+/// on no interval. The watch looks while the root shell starts and after the session's own input
+/// and output, and between them it waits for that traffic rather than for a clock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_perf_003_an_idle_session_reads_its_foreground_on_no_interval() {
+    let setup = Setup::new();
+    let mut typing = Typing::start(&setup.host, kr_worker::testing::posix_script("exec cat"));
+    let adoptions = Arc::new(setup.adoptions);
+    let watching = tokio::spawn(kr_worker::broker::adoption::watch(
+        Arc::clone(&adoptions),
+        Arc::downgrade(&typing.runtime),
+    ));
+
+    tokio::time::sleep(QUIET_AFTER).await;
+    typing
+        .quiet("a session nothing has happened in since its shell started")
+        .await;
+
+    // Its own input, and the output that comes of it, ask the watch to look again.
+    let before = typing.reads();
+    typing.type_in(b"kr-adoption-marker\n");
+    assert!(
+        within(Duration::from_secs(2), || typing.reads() > before).await,
+        "the session's traffic asks the watch to look"
+    );
+    tokio::time::sleep(QUIET_AFTER).await;
+    typing
+        .quiet("the same session once its traffic has settled")
+        .await;
+
+    let _ = adoptions.close();
+    tokio::time::timeout(LIVENESS, watching)
+        .await
+        .expect("the watch ends with the session's adoptions")
+        .expect("joined");
+    typing.close().await;
+}
+
+/// KR-REQ-12.07: a program the root shell starts from a line typed into the session, which the
+/// integration did not launch, is found by the watch within two seconds of running and adopted,
+/// its end is found once it exits, and the watch is quiet again after that. The shell asks
+/// nothing, as a shell without the integration does, and runs the program as a job of its own in
+/// the foreground, which then neither reads nor writes the terminal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_12_07_the_watch_adopts_a_program_the_root_shell_starts_from_a_typed_line() {
+    let setup = Setup::new();
+    let running = setup.host.root().join("running");
+    let mut shell = kr_worker::testing::posix_script(
+        "set -m; read line; \"$KR_ADOPTION_PROGRAM\" --exact the_stand_in_program \
+         --test-threads 1 </dev/null >/dev/null 2>&1; read line",
+    );
+    shell.environment.extend([
+        (
+            "KR_ADOPTION_PROGRAM".to_owned(),
+            setup.program.display().to_string(),
+        ),
+        (STAND_IN.to_owned(), "60".to_owned()),
+        (STAND_IN_RUNNING.to_owned(), running.display().to_string()),
+    ]);
+    let mut typing = Typing::start(&setup.host, shell);
+    let (arrived, release) = setup.adoptions.pause_before_reading();
+    let adoptions = Arc::new(setup.adoptions);
+    let watching = tokio::spawn(kr_worker::broker::adoption::watch(
+        Arc::clone(&adoptions),
+        Arc::downgrade(&typing.runtime),
+    ));
+    tokio::time::sleep(QUIET_AFTER).await;
+
+    typing.type_in(b"\n");
+    let mut program = None;
+    assert!(
+        within(LIVENESS, || {
+            program = std::fs::read_to_string(&running)
+                .ok()
+                .and_then(|pid| pid.trim().parse::<u32>().ok());
+            program.is_some()
+        })
+        .await,
+        "the root shell starts the program"
+    );
+    let pid = program.expect("the program's identifier");
+    let reached = tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(2)))
+        .await
+        .expect("joined");
+    assert!(
+        reached.is_ok(),
+        "the watch reaches the program within two seconds of it running"
+    );
+    // Let go, unless it has already gone on by itself.
+    let _ = release.send(());
+    let process = kr_ipc::identity::process_start_identity(pid).expect("the program is identified");
+    assert!(
+        within(LIVENESS, || adoptions.adopted(&process).is_some()).await,
+        "the program is adopted"
+    );
+    let instance = adoptions.adopted(&process).expect("adopted");
+    assert!(
+        !setup.broker.holds_process(&process),
+        "with no process record behind it"
+    );
+
+    let _ = rustix::process::kill_process(
+        rustix::process::Pid::from_raw(i32::try_from(pid).expect("an identifier"))
+            .expect("a process"),
+        rustix::process::Signal::TERM,
+    );
+    assert!(
+        within(Duration::from_secs(2), || setup
+            .broker
+            .binding_state(instance)
+            .is_err())
+        .await,
+        "its end is found within two seconds of its exit"
+    );
+    assert_eq!(adoptions.adopted(&process), None);
+
+    // The root shell has the terminal back and waits for its next line.
+    tokio::time::sleep(QUIET_AFTER).await;
+    typing
+        .quiet("a session whose adopted program has ended")
+        .await;
+
+    let _ = adoptions.close();
+    tokio::time::timeout(LIVENESS, watching)
+        .await
+        .expect("the watch ends with the session's adoptions")
+        .expect("joined");
+    typing.close().await;
+}
+
+/// KR-REQ-12.07: the invocation the shell's integration asks about and a command it reports
+/// starting each ask the watch to look, without any input or output, and a command's end does not.
+/// A program a line runs is looked for as the line starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_12_07_a_command_the_integration_reports_starting_asks_the_watch_to_look() {
+    use kr_protocol::root::{CwdRevision, PromptGeneration, RootCommandBlockParams};
+    use kr_worker::fence::{CommandHook, Effects, Step};
+
+    let setup = Setup::new();
+    let typing = Typing::start(&setup.host, kr_worker::testing::posix_script("exec cat"));
+    let hook = |hook: CommandHook| {
+        let _ = typing.runtime.session().apply_fence_effects(Effects {
+            steps: vec![Step::CommandHook(
+                kr_protocol::ids::RequestId::new(1),
+                Box::new(hook),
+            )],
+            ..Effects::default()
+        });
+    };
+    let block = |exit_status: Option<u64>| RootCommandBlockParams {
+        session_id: session(),
+        prompt_generation: PromptGeneration::new(1),
+        command: "claude".to_owned(),
+        started_at_ms: TimestampMs::new(1),
+        duration_ms: Nullable(exit_status.map(|_| kr_protocol::scalars::DurationMs::new(1))),
+        exit_status: Nullable(exit_status.map(U64::new)),
+        cwd: "/".to_owned(),
+        cwd_revision: CwdRevision::new(0),
+    };
+
+    // The marks themselves, read before any watch runs to take them: the root program neither
+    // reads nor writes, so nothing else marks this session meanwhile.
+    let activity = typing.runtime.session().activity();
+    let _ = activity.take_foreground();
+    hook(CommandHook::Resolve(
+        kr_protocol::root::RootCommandResolveParams {
+            session_id: session(),
+            prompt_generation: PromptGeneration::new(1),
+            argv: vec!["claude".to_owned()],
+            executable: "/usr/local/bin/claude".to_owned(),
+            interactive: true,
+            cwd: "/".to_owned(),
+            cwd_revision: CwdRevision::new(0),
+        },
+    ));
+    assert!(activity.take_foreground(), "the invocation asked about");
+    hook(CommandHook::Block(Box::new(block(None))));
+    assert!(activity.take_foreground(), "a command starting");
+    hook(CommandHook::Block(Box::new(block(Some(0)))));
+    assert!(
+        !activity.take_foreground(),
+        "a command's end asks for nothing"
+    );
+
+    // And the watch they wake.
+    let adoptions = Arc::new(setup.adoptions);
+    let watching = tokio::spawn(kr_worker::broker::adoption::watch(
+        Arc::clone(&adoptions),
+        Arc::downgrade(&typing.runtime),
+    ));
+    tokio::time::sleep(QUIET_AFTER).await;
+    typing.quiet("a session nothing has happened in").await;
+    let before = typing.reads();
+    hook(CommandHook::Block(Box::new(block(None))));
+    assert!(
+        within(Duration::from_secs(1), || typing.reads() > before).await,
+        "a command starting asks the watch to look"
+    );
+    tokio::time::sleep(QUIET_AFTER).await;
+    typing.quiet("the session after that command").await;
+
+    let _ = adoptions.close();
+    tokio::time::timeout(LIVENESS, watching)
+        .await
+        .expect("the watch ends with the session's adoptions")
+        .expect("joined");
+    typing.close().await;
 }

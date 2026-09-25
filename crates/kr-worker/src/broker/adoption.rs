@@ -3,12 +3,26 @@
 //! Section 12 keeps manual launches valid: they trigger the same detection and capability process,
 //! and detection never creates a gateway after the fact. A Claude Code started by absolute path,
 //! with its integration disabled, after a refused or retired launch, in a form the shell does not
-//! ask about, or from a shell that does not ask, is found here. Every [`WATCH_INTERVAL`], while the
-//! terminal's foreground group is not the root shell's, each process in that group that the root
-//! shell started itself, that no instance of this broker holds, and whose executable an installed
-//! connector recognises is recorded as a native terminal instance with the profile it was observed
-//! running. It gets no registration, no endpoint and no credential, so none of its bridges is
-//! admitted, and its announcement says so. It is watched by its identity and ended when it exits.
+//! ask about, or from a shell that does not ask, is found here. While the terminal's foreground
+//! group is not the root shell's, each process in that group that the root shell started itself,
+//! that no instance of this broker holds, and whose executable an installed connector recognises is
+//! recorded as a native terminal instance with the profile it was observed running. It gets no
+//! registration, no endpoint and no credential, so none of its bridges is admitted, and its
+//! announcement says so. It is watched by its identity and ended when it exits.
+//!
+//! A program takes the terminal when the root shell starts a command, and the session knows when
+//! that can happen: the input it accepts, the output it produces and a command the shell's
+//! integration reports starting all mark its [`crate::lifecycle::Activity`]. The watch looks when
+//! it is marked and on each [`WATCH_INTERVAL`] for [`SETTLE`] after that. It also looks on each
+//! interval while a command has the terminal and while a program it adopted is still to be ended.
+//! Otherwise it waits for the next mark, on no clock, because a session sitting idle has to cost
+//! nothing (KR-PERF-003). While the root shell has the terminal a look is one read of the
+//! foreground group and nothing else: no process is asked about, no executable is read and nothing
+//! is allocated.
+//!
+//! What that leaves out is a program the root shell starts more than [`SETTLE`] after the latest
+//! mark, with nothing reported in between, which then neither reads nor writes the terminal. It is
+//! found at the session's next input or output, whichever comes first.
 //!
 //! A program the integration launched is not adopted: the launch registered the process that
 //! presented itself, and that process keeps its identity when it execs the program, so the broker
@@ -31,8 +45,16 @@ use crate::broker::Broker;
 use crate::broker::connectors::ConnectorSources;
 use crate::broker::image::HashedFiles;
 
-/// How often the foreground is looked at.
+/// How often the foreground is looked at while the watch is looking.
 pub const WATCH_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How long the watch goes on looking after a mark while the root shell has the terminal.
+///
+/// Input is marked as it is queued for the terminal, before the shell has read it, and the shell
+/// gives the terminal to the command a line names only once it has read the line, run its own
+/// hooks and started the command. A look the mark asks for can therefore come before the command
+/// has the terminal, and this is how long the ones after it go on.
+pub const SETTLE: Duration = Duration::from_secs(2);
 
 /// Why an adopted instance's bridges are refused, as its announcement says.
 pub const ADOPTED_REFUSAL: &str = "it was not launched through the integration, so no \
@@ -74,6 +96,8 @@ pub struct Adoptions {
     hashed: HashedFiles,
     /// Set when the session closes: a reading in progress stops, and nothing is adopted after.
     stopped: AtomicBool,
+    /// Wakes a watch that is waiting for the session to do something, because it has closed.
+    closing: tokio::sync::Notify,
     adopted: Mutex<BTreeMap<ApplicationInstanceId, Adopted>>,
     /// The session whose views are told, where there is one.
     views: Option<Weak<crate::runtime::SessionRuntime>>,
@@ -109,6 +133,7 @@ impl Adoptions {
             environment_id,
             hashed: HashedFiles::default(),
             stopped: AtomicBool::new(false),
+            closing: tokio::sync::Notify::new(),
             adopted: Mutex::new(BTreeMap::new()),
             views: None,
             #[cfg(feature = "testing")]
@@ -149,7 +174,7 @@ impl Adoptions {
     /// prompt.
     #[must_use]
     pub fn look(&self, foreground: &Foreground) -> Vec<AgentInstanceSummary> {
-        if self.sources.is_empty() || self.is_stopped() {
+        if !self.can_adopt() {
             return Vec::new();
         }
         let root_group = group_of(&foreground.root_shell);
@@ -172,6 +197,10 @@ impl Adoptions {
     /// session's views are told as it ends.
     #[must_use]
     pub fn sweep(&self) -> Vec<AgentInstanceSummary> {
+        // Nothing adopted is nothing to end, and the session is not locked to find that out.
+        if !self.holds_any() {
+            return Vec::new();
+        }
         self.told(|adopted| {
             let ended: Vec<ApplicationInstanceId> = adopted
                 .iter()
@@ -200,6 +229,7 @@ impl Adoptions {
     #[must_use]
     pub fn close(&self) -> Vec<AgentInstanceSummary> {
         self.stopped.store(true, Ordering::SeqCst);
+        self.closing.notify_one();
         let mut adopted = self
             .adopted
             .lock()
@@ -214,6 +244,28 @@ impl Adoptions {
     #[must_use]
     pub fn is_stopped(&self) -> bool {
         self.stopped.load(Ordering::SeqCst)
+    }
+
+    /// Returns whether a look could adopt anything: a connector is installed to recognise a
+    /// program, and the session is still open.
+    fn can_adopt(&self) -> bool {
+        !self.sources.is_empty() && !self.is_stopped()
+    }
+
+    /// Returns whether this session holds an adoption, whose program's end is still to be found.
+    fn holds_any(&self) -> bool {
+        !self
+            .adopted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    }
+
+    /// Waits until the session closes, which is when a watch waiting for anything else ends.
+    async fn closed(&self) {
+        if !self.is_stopped() {
+            self.closing.notified().await;
+        }
     }
 
     /// Returns the instance this session adopted for `process`, where it adopted one.
@@ -372,33 +424,84 @@ const READING_PAUSE_LIMIT: Duration = Duration::from_secs(5);
 /// The session is read under its lock only for what a look needs, and the processes are read with
 /// that lock given back, so a foreground with many processes holds nobody's keystrokes.
 pub async fn watch(adoptions: Arc<Adoptions>, runtime: Weak<crate::runtime::SessionRuntime>) {
-    watch_foreground(adoptions, move || {
-        runtime
-            .upgrade()
-            .map(|runtime| runtime.session().foreground())
-    })
+    let Some(activity) = runtime
+        .upgrade()
+        .map(|runtime| runtime.session().activity())
+    else {
+        return;
+    };
+    let grouping = Weak::clone(&runtime);
+    watch_foreground(
+        adoptions,
+        activity,
+        move || {
+            grouping
+                .upgrade()
+                .map(|runtime| runtime.session().foreground_group())
+        },
+        move || {
+            runtime
+                .upgrade()
+                .map(|runtime| runtime.session().foreground())
+        },
+    )
     .await;
 }
 
-/// Watches what `read` says the foreground is, until it says the session has gone (`None`) or the
-/// adoptions are closed.
+/// Watches the foreground `group` and `read` describe, when `activity` asks it to, until they say
+/// the session has gone (`None`) or the adoptions are closed.
 ///
-/// Each tick ends what exited, whatever else is under way: an identification, which reads an
-/// image and can take as long as that takes, runs on a thread of its own, one at a time, and a
-/// tick that finds one still running starts no other and waits for none.
+/// The watch looks for [`SETTLE`] from its start, because a shell that has just started can run a
+/// program from its startup files before anything is typed. It looks again whenever `activity` is
+/// marked and on each [`WATCH_INTERVAL`] for [`SETTLE`] after that, and on each interval while a
+/// command has the terminal, while a program it adopted is still to be ended and while an
+/// identification is under way. Otherwise it waits for the next mark, on no clock.
+///
+/// A look reads `group` alone while the root shell has the terminal. When a command has it, `read`
+/// gives the look the rest, and each process in the command's group is identified on a thread of its
+/// own, one identification at a time: identifying reads an image and can take as long as that
+/// takes, so a tick that finds one still running starts no other and waits for none, and every
+/// tick ends what exited, whatever else is under way.
 pub async fn watch_foreground(
     adoptions: Arc<Adoptions>,
+    activity: Arc<crate::lifecycle::Activity>,
+    mut group: impl FnMut() -> Option<Option<i32>>,
     mut read: impl FnMut() -> Option<Option<Foreground>>,
 ) {
     let mut identifying: Option<tokio::task::JoinHandle<Vec<AgentInstanceSummary>>> = None;
+    // Read once: a root shell leads its own process group for as long as it runs.
+    let mut root_group: Option<i32> = None;
+    // Whether a command had the terminal at the last look.
+    let mut command = false;
+    let mut settle_until = tokio::time::Instant::now() + SETTLE;
     loop {
-        tokio::time::sleep(WATCH_INTERVAL).await;
+        let looking = command
+            || identifying.is_some()
+            || adoptions.holds_any()
+            || tokio::time::Instant::now() < settle_until;
+        if looking {
+            tokio::select! {
+                () = tokio::time::sleep(WATCH_INTERVAL) => {}
+                () = adoptions.closed() => return,
+            }
+            if activity.take_foreground() {
+                settle_until = tokio::time::Instant::now() + SETTLE;
+            }
+        } else {
+            tokio::select! {
+                () = activity.foreground_marked() => {}
+                () = adoptions.closed() => return,
+            }
+            // A mark an earlier look already took leaves its wake behind, with nothing new to look
+            // at.
+            if !activity.take_foreground() {
+                continue;
+            }
+            settle_until = tokio::time::Instant::now() + SETTLE;
+        }
         if adoptions.is_stopped() {
             return;
         }
-        let Some(foreground) = read() else {
-            return;
-        };
         let _ = adoptions.sweep();
         if identifying
             .as_ref()
@@ -406,9 +509,26 @@ pub async fn watch_foreground(
         {
             identifying = None;
         }
-        if identifying.is_none()
-            && let Some(foreground) = foreground
-        {
+        let Some(now) = group() else {
+            return;
+        };
+        // No foreground to read, or the root shell at its prompt: the group was the whole look.
+        if now.is_none() || (root_group.is_some() && now == root_group) {
+            command = false;
+            continue;
+        }
+        let Some(foreground) = read() else {
+            return;
+        };
+        let Some(foreground) = foreground else {
+            command = false;
+            continue;
+        };
+        if root_group.is_none() {
+            root_group = group_of(&foreground.root_shell);
+        }
+        command = root_group != Some(foreground.group);
+        if command && identifying.is_none() && adoptions.can_adopt() {
             let looking = Arc::clone(&adoptions);
             identifying = Some(tokio::task::spawn_blocking(move || {
                 looking.look(&foreground)
