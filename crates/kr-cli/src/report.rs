@@ -475,8 +475,10 @@ mod tests {
             )),
             session_epoch: kr_protocol::ids::SessionEpoch::V1,
             reason: kr_protocol::session::ClosureReason::CloseRequested,
-            root_exit_code: kr_protocol::scalars::Nullable::null(),
-            root_signal: kr_protocol::scalars::Nullable::null(),
+            root_exit_code: kr_protocol::scalars::Nullable::some(kr_protocol::scalars::U64::new(
+                143,
+            )),
+            root_signal: kr_protocol::scalars::Nullable::some("SIGTERM".to_owned()),
             terminated: vec![kr_protocol::session::TerminatedProcess {
                 identity: kr_protocol::identity::ProcessStartIdentity::new(
                     42,
@@ -490,8 +492,8 @@ mod tests {
                 kind: "desktop_resource".to_owned(),
                 detail: "a window the broker opened".to_owned(),
             }],
-            ownership_coverage: kr_protocol::session::OwnershipCoverage::Complete,
-            durability: kr_protocol::session::Durability::Durable,
+            ownership_coverage: kr_protocol::session::OwnershipCoverage::Incomplete,
+            durability: kr_protocol::session::Durability::Volatile,
             closed_at_ms: kr_protocol::scalars::TimestampMs::new(9),
         };
         let rendered = closure(&record);
@@ -510,8 +512,34 @@ mod tests {
             json!([{ "kind": "desktop_resource", "detail": "a window the broker opened" }])
         );
         assert_eq!(rendered["reason"], json!("close_requested"));
-        assert_eq!(rendered["ownership_coverage"], json!("complete"));
+        assert_eq!(rendered["exit_code"], json!(143));
+        assert_eq!(rendered["signal"], json!("SIGTERM"));
+        assert_eq!(rendered["ownership_coverage"], json!("incomplete"));
+        assert_eq!(rendered["durability"], json!("volatile"));
         assert_eq!(rendered["closed_at_ms"], json!(9));
+        let mut fields: Vec<&str> = rendered
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            [
+                "closed_at_ms",
+                "durability",
+                "exit_code",
+                "ownership_coverage",
+                "reason",
+                "session_epoch",
+                "session_id",
+                "signal",
+                "surviving",
+                "terminated",
+            ],
+            "every field is checked above"
+        );
     }
 
     #[test]
