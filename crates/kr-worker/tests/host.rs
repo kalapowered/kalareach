@@ -1335,6 +1335,10 @@ fn worker_dirs(host: &Host) -> Vec<String> {
 /// anything is spawned: the daemon's only request of its supervisor is the first session's worker.
 /// The session already running is not evicted to make room.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "cargo's own job kills on close and forbids breakaway, so a worker cannot be started under `cargo test`; run this from the built test executable directly, outside cargo"
+)]
 async fn the_environment_limit_refuses_before_anything_is_spawned() {
     let host = Host::create().recording_launches();
     {
