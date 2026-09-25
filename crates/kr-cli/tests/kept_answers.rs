@@ -1360,6 +1360,41 @@ async fn what_an_attempt_established_is_reported_when_the_store_cannot_be_read_a
     assert!(host.kept().is_file(), "the copy is still there");
 }
 
+/// KR-REQ-11.63: an answer to a question that ended before it reached the worker is not sent, and
+/// an answer kept earlier for the same question is reported as still kept, never as removed. The
+/// control is the same answer with nothing kept before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_to_a_question_that_ended_says_an_earlier_answer_is_still_kept() {
+    let host = Host::start(Behaviour::TakesAnswersAndDropsTheReply).await;
+    let question = host.question();
+    let (status, document) = host.json(&["question", "answer", &question, "--choice", "left"]);
+    assert_eq!(status, Some(3), "{document}");
+    assert!(host.kept().is_file());
+    host.behave(Behaviour::Serves);
+
+    let (status, document) = host.json(&["question", "answer", &question, "--choice", "left"]);
+    assert_eq!(status, Some(8), "{document}");
+    assert_eq!(document["code"], "QUESTION_RESOLVED", "{document}");
+    let message = document["message"].as_str().expect("a message");
+    assert!(message.contains("did not send this answer"), "{message}");
+    assert!(message.contains("still kept"), "{message}");
+    assert!(!message.contains("no longer kept"), "{message}");
+    assert!(host.kept().is_file(), "the earlier answer is still kept");
+    assert_eq!(host.answers_received(), 1, "the second answer went nowhere");
+
+    // With nothing kept before it, nothing is said of an earlier answer.
+    let host = Host::start(Behaviour::Serves).await;
+    let question = host.question();
+    let (status, _) = host.json(&["question", "answer", &question, "--choice", "left"]);
+    assert_eq!(status, Some(0));
+    let (status, document) = host.json(&["question", "answer", &question, "--choice", "left"]);
+    assert_eq!(status, Some(8), "{document}");
+    let message = document["message"].as_str().expect("a message");
+    assert!(message.contains("did not send this answer"), "{message}");
+    assert!(!message.contains("kept"), "{message}");
+    assert_eq!(host.answers_received(), 1);
+}
+
 /// KR-REQ-11.63: an answer `kr question send` sent and its worker took is never called unsent, even
 /// when the copy kept on this device cannot be removed afterwards. The command says the worker took
 /// it and that the copy is still kept, and the next `kr question drafts` retires the copy without

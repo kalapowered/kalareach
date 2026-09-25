@@ -156,6 +156,11 @@ pub async fn answer(
                 error,
                 &kept_copy(&drafts, question_id),
             ),
+            // The question ended or moved before this answer was sent. Nothing was removed, so an
+            // answer kept for it earlier is reported as the store has it.
+            (_, AnswerError::Retired(reason)) => {
+                ended_first(question_id, reason, &kept_copy(&drafts, question_id))
+            }
             // Keeping it was the fallback, and it failed too.
             (_, error @ (AnswerError::Store { .. } | AnswerError::Unreadable { .. })) => {
                 lost(&workers, question_id, &error)
@@ -379,6 +384,32 @@ fn unknown_copy(
         code: error.code(),
         message: format!("{}: {reason}", retained(workers.delivery(), &retention)),
     }
+}
+
+/// The failure `kr question answer` reports for a question that ended or moved before this answer
+/// reached it: this answer was not sent, and an answer kept for the question earlier is reported
+/// as the store has it, because nothing removed it.
+fn ended_first(question_id: QuestionId, reason: Retired, copy: &KeptCopy) -> CliError {
+    let what = match reason {
+        Retired::Ended(state) => format!("question {question_id} was already {state}"),
+        Retired::Moved { revision } => {
+            format!("question {question_id} is now at revision {revision}")
+        }
+        Retired::Gone => format!("question {question_id} is not on this host any more"),
+    };
+    let earlier = match copy {
+        KeptCopy::Kept => "; an earlier answer to it is still kept on this device, and \
+                           `kr question drafts` retires it"
+            .to_owned(),
+        KeptCopy::None => String::new(),
+        KeptCopy::Unreadable(why) => format!(
+            "; whether an earlier answer to it is still kept on this device cannot be read ({why})"
+        ),
+    };
+    CliError::Refused(ProtocolError::new(
+        AnswerError::Retired(reason).code(),
+        format!("{what}, so this command did not send this answer{earlier}"),
+    ))
 }
 
 /// The failure reported for an answer that went out, whose fate is not known, and that the rules

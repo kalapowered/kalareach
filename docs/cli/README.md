@@ -559,6 +559,8 @@ question send` is the one way a kept answer is sent: it reads the question once 
 answer only while that question is still what the person answered. An answer whose outcome was not
 known is retired by the next `kr question drafts` if it did arrive, so it is never sent twice. When
 `kr question send` cannot send it, the failure keeps its own code and says the answer is still kept.
+An answer `kr question answer` gives to a question that ended or moved before the answer reached it
+is not sent, and the command says whether an answer kept for that question earlier is still kept.
 
 A kept answer is retired as gone only on the word of the daemon of the environment its session ran
 in: a closure its registry keeps, or, for a session with no descriptor, no record of the session at
