@@ -146,15 +146,40 @@ function Invoke-Nest([string]$Case, [string]$Outer, [string]$Inner, [int]$Borrow
   $null = Invoke-Probe "nest `"$out`" $Case $Outer $Inner $task $Borrow - $Hold" 400
 }
 
+# After a task's starter has completed (so the child faced the task ending, not just the daemon):
+# whether the starter's plain and breakaway children survived, and where each landed.
+function Test-Survival([string]$Tag, [int]$Seconds = 90) {
+  if (-not (Wait-Line "$Tag.self " $Seconds)) { Say ('' + $Tag + ': no starter within ' + $Seconds + ' s'); return }
+  $self = Get-Record "$Tag.self"
+  $selfPid = if ($self -match ' pid=(\d+)') { [int]$Matches[1] } else { 0 }
+  # Wait for the starter to exit, i.e. the task to complete on its own.
+  $deadline = (Get-Date).AddSeconds(60)
+  while ($selfPid -gt 0 -and (Get-Process -Id $selfPid -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
+  Start-Sleep -Seconds 3
+  $flags = if ($self -match ' flags=(\S+)') { $Matches[1] } else { '?' }
+  $session = if ($self -match ' session=(\S+)') { $Matches[1] } else { '?' }
+  Say "$Tag.self task_job_flags=$flags session=$session starter_gone=$($selfPid -gt 0 -and -not (Get-Process -Id $selfPid -ErrorAction SilentlyContinue))"
+  foreach ($kind in 'plain', 'brk') {
+    $record = Get-Record "$Tag.$kind"
+    if ($record) {
+      $injob = if ($record -match ' injob=(\S+)') { $Matches[1] } else { '?' }
+      $suspended = if ($record -match ' injob_suspended=(\S+)') { $Matches[1] } else { '?' }
+      $child = if ($record -match ' child=(\d+)') { $Matches[1] } else { '0' }
+      $childError = if ($record -match ' error=(\S+)') { $Matches[1] } else { '' }
+      Say "$Tag.$kind child=$child injob_suspended=$suspended injob=$injob error=$childError survived_task_end=$(Test-Alive $record)"
+    }
+  }
+}
+
 function Invoke-Main {
   Show-Context
   $signedIn = @(Get-Lines | Where-Object { $_ -match '^session ' -and $_ -match ' state=(0|4) ' -and $_ -match ('user=' + [regex]::Escape($env:USERNAME) + '$') }).Count -gt 0
 
-  Say "E1 a task's process and its checked child; priority 5, and the default 7"
-  Start-Probe (Register-Probe 's4u' 'S4U' 5 "starter `"$out`" s4u $Hold nohold KalaReachProbe-$run-credential-s4u")
-  $null = Wait-Line 's4u.child ' 60
-  Start-Probe (Register-Probe 'p7' 'S4U' 7 "starter `"$out`" p7 $Hold")
-  $null = Wait-Line 'p7.child ' 60
+  Say "E1 the task's job, its plain and breakaway children, whether each survives the task's end; priority 5 and 7"
+  Start-Probe (Register-Probe 's4u' 'S4U' 5 "starter `"$out`" s4u $Hold both nohold KalaReachProbe-$run-credential-s4u")
+  Test-Survival 's4u'
+  Start-Probe (Register-Probe 'p7' 'S4U' 7 "starter `"$out`" p7 $Hold both")
+  Test-Survival 'p7'
 
   Say 'E4 three runs start three starters'
   $parallel = Register-Probe 'par' 'S4U' 5 "starter `"$out`" par $Hold"
@@ -184,14 +209,13 @@ function Invoke-Main {
   $argvLine = if (Test-Path -LiteralPath $argvOut) { Get-Content -LiteralPath $argvOut | Select-Object -First 1 } else { 'argv none' }
   Say ('argv ' + $argvLine + ' whole=' + $argvLine.EndsWith('|C:\a b\c\]'))
 
-  Say 'E6 an InteractiveToken run'
+  Say 'E6 an InteractiveToken run: its job, its children and their survival'
   if ($signedIn) {
     Say "skipped: this account already has a signed-in session here, which is not this run's to use; the signed-in case runs in -Mode SignOut as a temporary account"
   } else {
-    $interactive = Register-Probe 'it' 'InteractiveToken' 5 "starter `"$out`" it $Hold nohold KalaReachProbe-$run-credential-it"
+    $interactive = Register-Probe 'it' 'InteractiveToken' 5 "starter `"$out`" it $Hold both nohold KalaReachProbe-$run-credential-it"
     Start-Probe $interactive
-    Say ('interactive starter within 30 s: ' + (Wait-Line 'it.self ' 30))
-    Show-Query $interactive
+    if (Wait-Line 'it.self ' 30) { Test-Survival 'it' } else { Say 'it: no InteractiveToken run within 30 s (no session for it)'; Show-Query $interactive }
   }
 
   Say 'E2, E3 a requester in each set of jobs, ended by closing them'
@@ -206,14 +230,12 @@ function Invoke-Main {
 
 function Invoke-Runner {
   Show-Context
-  Say "E8 the runner: an S4U task's process and its child, an InteractiveToken run, and the forbidding-ancestor nesting"
-  Start-Probe (Register-Probe 's4u' 'S4U' 5 "starter `"$out`" s4u $Hold nohold KalaReachProbe-$run-credential-s4u")
-  Say ('runner starter within 60 s: ' + (Wait-Line 's4u.child ' 60))
-  Show-Query "KalaReachProbe-$run-s4u"
-  $interactive = Register-Probe 'it' 'InteractiveToken' 5 "starter `"$out`" it $Hold nohold KalaReachProbe-$run-credential-it"
+  Say "E8 the runner: an S4U and an InteractiveToken task, each task's job, its children and their survival, and the forbidding-ancestor nesting"
+  Start-Probe (Register-Probe 's4u' 'S4U' 5 "starter `"$out`" s4u $Hold both nohold KalaReachProbe-$run-credential-s4u")
+  Test-Survival 's4u'
+  $interactive = Register-Probe 'it' 'InteractiveToken' 5 "starter `"$out`" it $Hold both nohold KalaReachProbe-$run-credential-it"
   Start-Probe $interactive
-  Say ('runner interactive starter within 30 s: ' + (Wait-Line 'it.self ' 30))
-  Show-Query $interactive
+  if (Wait-Line 'it.self ' 30) { Test-Survival 'it' } else { Say 'it: no InteractiveToken run within 30 s'; Show-Query $interactive }
   Invoke-Nest 'n1' '0x2000' '0x800' 0
 }
 
@@ -791,15 +813,15 @@ public static class KrProbe
         }
     }
 
-    // Starts `sleep <hold>` and records it. `mode` is plain, breakaway, suspended (created
-    // suspended, checked, then resumed: the starter's create) or parent:<pid> (the borrowed-parent
-    // attribute).
+    // Starts `sleep <hold>` and records it. `mode` is plain, breakaway, suspended and
+    // suspended-breakaway (created suspended, checked, then resumed: the starter's create, without
+    // or with a request to leave the task's job) or parent:<pid> (the borrowed-parent attribute).
     static void Spawn(string tag, string mode, string hold)
     {
         uint flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT;
         IntPtr parent = IntPtr.Zero;
-        bool suspended = mode == "suspended";
-        if (mode == "breakaway")
+        bool suspended = mode == "suspended" || mode == "suspended-breakaway";
+        if (mode == "breakaway" || mode == "suspended-breakaway")
         {
             flags |= CREATE_BREAKAWAY_FROM_JOB;
         }
@@ -828,19 +850,14 @@ public static class KrProbe
             Write(tag + " child=0 error=" + error);
             return;
         }
+        // The evidence observes where the child landed; it does not judge it. So a suspended child
+        // is checked from its handle, then resumed and left to be watched, in every job state. The
+        // product's own decision (terminate a child a kill-on-close job would take) is a matter for
+        // the supervisor's code, not for what the measurements are allowed to see.
         string before = "";
         if (suspended)
         {
-            string held = InJob(information.hProcess);
-            before = " injob_suspended=" + held;
-            if (held != "no")
-            {
-                TerminateProcess(information.hProcess, 1);
-                Write(tag + " child=0 error=in-job-before-resume" + before);
-                CloseHandle(information.hThread);
-                CloseHandle(information.hProcess);
-                return;
-            }
+            before = " injob_suspended=" + InJob(information.hProcess);
             ResumeThread(information.hThread);
         }
         Write(tag + " child=" + information.dwProcessId + " created=" + Created(information.hProcess) + before +
@@ -1154,11 +1171,23 @@ public static class KrProbe
                     Report(args[2], args.Length > 3 ? args[3] : null);
                     return 0;
                 case "starter":
-                    // What the product's starter does: a report of itself, one child created
-                    // suspended, checked and resumed, and, with "hold", staying to be ended.
-                    Report(args[2] + ".self", args.Length > 5 ? args[5] : null);
-                    Spawn(args[2] + ".child", "suspended", args[3]);
-                    if (args.Length > 4 && args[4] == "hold")
+                    // What the product's starter does, and the evidence its behaviour needs: a
+                    // report of itself (its own job, the one the Task Scheduler put it in), then a
+                    // child created suspended and checked each way. "plain" takes no breakaway;
+                    // "breakaway" asks to leave the task's job; "both" does each; "hold" keeps the
+                    // starter alive to be ended rather than letting it complete.
+                    string childMode = args.Length > 4 ? args[4] : "both";
+                    bool holdStarter = childMode == "hold" || (args.Length > 5 && args[5] == "hold");
+                    Report(args[2] + ".self", args.Length > 6 ? args[6] : null);
+                    if (childMode == "plain" || childMode == "both" || childMode == "hold")
+                    {
+                        Spawn(args[2] + ".plain", "suspended", args[3]);
+                    }
+                    if (childMode == "breakaway" || childMode == "both")
+                    {
+                        Spawn(args[2] + ".brk", "suspended-breakaway", args[3]);
+                    }
+                    if (holdStarter)
                     {
                         Thread.Sleep(int.Parse(args[3]) * 1000);
                     }
