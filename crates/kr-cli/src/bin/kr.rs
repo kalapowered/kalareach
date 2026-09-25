@@ -150,10 +150,8 @@ async fn run(cli: Cli) -> Result<Completion> {
                 && !cli.json
             {
                 report::say(&shown!(
-                    "kr: started the control daemon for environment {} (process {}) under the \
-                     standalone start",
-                    environment.environment_id,
-                    started.pid
+                    "kr: {}",
+                    started.describe(environment.environment_id)
                 ));
             }
             // The execution context is this host's own unless the command chose one. The
@@ -670,6 +668,7 @@ async fn run(cli: Cli) -> Result<Completion> {
             // number the change has already replaced.
             let checks: HostDoctorResult =
                 host_read(&mut client, &environment.paths, Method::HostDoctor, &()).await?;
+            let checks = kr_cli::doctor::with_startup(checks, &environment.paths);
             let info: HostInfoResult =
                 host_read(&mut client, &environment.paths, Method::HostInfo, &()).await?;
             // What this environment can currently do, which is where the desktop, what a logout

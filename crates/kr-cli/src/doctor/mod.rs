@@ -21,11 +21,123 @@ pub mod configuration;
 use kr_client::shown;
 use kr_client::shown::Shown;
 use kr_protocol::hostinfo::{
-    DoctorStatus, EffectiveConfiguration, HostDoctorResult, HostInfoResult,
+    DoctorCheck, DoctorStatus, EffectiveConfiguration, HostDoctorResult, HostInfoResult,
 };
 use serde_json::{Value, json};
 
 use crate::error::{CliError, Result};
+
+/// Adds the service start's own check to the daemon's diagnostics, where there is anything of it
+/// to report: whether the definition kr wrote is the one `kr new` would have the service manager
+/// start the daemon from.
+///
+/// The daemon does not know how it was started, so this command, which wrote the definition,
+/// looks at it. An environment that neither chooses the service start nor has a definition of it
+/// installed gets no check.
+#[must_use]
+pub fn with_startup(
+    mut result: HostDoctorResult,
+    environment: &kr_ipc::paths::EnvironmentPaths,
+) -> HostDoctorResult {
+    if let Some(check) = startup_check(environment) {
+        result.healthy &= !check.status.is_failure();
+        result.checks.push(check);
+    }
+    result
+}
+
+/// The identifier the service start's check is published under.
+pub const STARTUP_CHECK: &str = "startup-definition";
+
+/// What the check examines.
+const STARTUP_TITLE: &str =
+    "The service definition kr new has the service manager start the daemon from";
+
+/// The service start's check, when there is anything of it to report.
+fn startup_check(environment: &kr_ipc::paths::EnvironmentPaths) -> Option<DoctorCheck> {
+    use kr_protocol::hostinfo::configuration::ControllerStartup;
+    use kr_protocol::hostinfo::export::Sentence;
+
+    use crate::service_manager::State;
+
+    let chosen = crate::startup::Chosen::read(environment);
+    let selected = chosen.controller == Some(ControllerStartup::Service);
+    let inspection = match crate::service_manager::inspect(environment, selected) {
+        Ok(inspection) => inspection?,
+        Err(_) => {
+            return Some(DoctorCheck::new(
+                STARTUP_CHECK,
+                STARTUP_TITLE,
+                DoctorStatus::Failed,
+                Sentence::new().stated(
+                    "the record of the service definition kr wrote for this environment cannot be \
+                     read",
+                ),
+                Some(
+                    "run kr host startup to see why, then kr host startup --set service or --clear",
+                ),
+            ));
+        }
+    };
+    let started = Sentence::new()
+        .stated(inspection.manager.as_str())
+        .stated(" starts the daemon of environment ")
+        .identifier(&environment.environment_id());
+    if !selected {
+        return Some(DoctorCheck::new(
+            STARTUP_CHECK,
+            STARTUP_TITLE,
+            DoctorStatus::Warning,
+            started.stated(
+                " from a definition kr wrote for the service start, which startup.controller no \
+                 longer chooses; nothing uses it",
+            ),
+            Some(
+                "run kr host startup --clear to remove it, or kr host startup --set service to use it",
+            ),
+        ));
+    }
+    let (status, found, remedy) = match inspection.state {
+        State::Matches => (
+            DoctorStatus::Ok,
+            " from the definition kr wrote, which matches what kr wrote",
+            None,
+        ),
+        State::Missing => (
+            DoctorStatus::Failed,
+            ", and the definition kr wrote for it is missing",
+            Some("run kr host startup --set service to write it again"),
+        ),
+        State::Changed => (
+            DoctorStatus::Failed,
+            ", and the definition kr wrote for it was changed after kr wrote it",
+            Some("restore the definition or remove it, then run kr host startup --set service"),
+        ),
+        State::Foreign => (
+            DoctorStatus::Failed,
+            ", and a definition kr did not write is where its definition belongs",
+            Some("remove that definition, then run kr host startup --set service"),
+        ),
+        State::Outdated => (
+            DoctorStatus::Failed,
+            ", from a definition that names another program, other directories or another domain \
+             than this installation's",
+            Some("run kr host startup --set service to write this installation's"),
+        ),
+    };
+    Some(DoctorCheck::new(
+        STARTUP_CHECK,
+        STARTUP_TITLE,
+        status,
+        Sentence::new()
+            .stated("startup.controller is ")
+            .term("service")
+            .stated(": ")
+            .sentence(&started)
+            .stated(found),
+        remedy,
+    ))
+}
 
 /// Renders diagnostics.
 #[must_use]

@@ -19,7 +19,8 @@
 //! | [`device`] | `kr device`: the paired devices, and revoking one |
 //! | [`plugin`] | `kr plugin`: plugin packages and the repositories they come from |
 //! | [`resolve`] | Finding a session by number or identifier, and reaching its worker |
-//! | [`startup`] | `kr host startup`, and `kr new` starting the control daemon under the standalone start |
+//! | [`startup`] | `kr host startup`, and `kr new` starting the control daemon when none is running |
+//! | [`service_manager`] | The per-user service definition the service start has the user's service manager start the daemon from |
 //! | [`contact`] | The contact tools an agent reaches its person through, over the Model Context Protocol |
 //! | [`create`] | The palette a new session starts with |
 //! | [`question`] | Reading and answering an agent's questions from the terminal |
@@ -55,6 +56,7 @@ pub mod question;
 pub mod render;
 pub mod report;
 pub mod resolve;
+pub mod service_manager;
 pub mod session;
 pub mod shell;
 pub mod shown;

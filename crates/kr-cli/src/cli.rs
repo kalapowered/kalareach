@@ -859,11 +859,14 @@ pub enum HostCommand {
 /// `kr host startup`.
 #[derive(Debug, Args)]
 pub struct StartupArguments {
-    /// The way to choose: `standalone`, which has `kr new` start the daemon itself, detached from
-    /// the command. Without it, what is chosen is shown and nothing changes.
+    /// The way to choose: `service`, which writes this user's service manager a definition of the
+    /// daemon that `kr new` then asks it to start, or `standalone`, which has `kr new` start the
+    /// daemon itself, detached from the command. Without it, what is chosen is shown and nothing
+    /// changes.
     #[arg(long)]
     pub set: Option<String>,
-    /// Choose none, so that `kr new` finds no daemon and says what to set up.
+    /// Choose none, so that `kr new` finds no daemon and says what to set up. A service definition
+    /// kr wrote is removed, and a daemon that is running keeps running.
     #[arg(long, conflicts_with = "set")]
     pub clear: bool,
 }
