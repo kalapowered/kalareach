@@ -4532,6 +4532,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "kr-e2e-agents"
+version = "0.1.0"
+dependencies = [
+ "kr-cbor",
+ "kr-client",
+ "kr-controller",
+ "kr-e2e-m1b",
+ "kr-ipc",
+ "kr-protocol",
+ "kr-worker",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "kr-e2e-m1b"
 version = "0.1.0"
 dependencies = [
