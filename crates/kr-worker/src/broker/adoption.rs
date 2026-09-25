@@ -11,18 +11,24 @@
 //! announcement says so. It is watched by its identity and ended when it exits.
 //!
 //! A program takes the terminal when the root shell starts a command, and the session knows when
-//! that can happen: the input it accepts, the output it produces and a command the shell's
-//! integration reports starting all mark its [`crate::lifecycle::Activity`]. The watch looks when
-//! it is marked and on each [`WATCH_INTERVAL`] for [`SETTLE`] after that. It also looks on each
-//! interval while a command has the terminal and while a program it adopted is still to be ended.
-//! Otherwise it waits for the next mark, on no clock, because a session sitting idle has to cost
-//! nothing (KR-PERF-003). While the root shell has the terminal a look is one read of the
-//! foreground group and nothing else: no process is asked about, no executable is read and nothing
-//! is allocated.
+//! that is likely: the input it accepts, the output it produces, and an invocation the shell's
+//! integration asks about or a command it reports starting all mark its
+//! [`crate::lifecycle::Activity`]. A shell with the integration asks about each command of a typed
+//! line just before it runs it, so there the mark comes with the launch itself. The watch looks at
+//! once when it is marked, and on each [`WATCH_INTERVAL`] while a command has the terminal and while
+//! a program it adopted is still to be ended.
 //!
-//! What that leaves out is a program the root shell starts more than [`SETTLE`] after the latest
-//! mark, with nothing reported in between, which then neither reads nor writes the terminal. It is
-//! found at the session's next input or output, whichever comes first.
+//! No mark comes when the shell asks nothing, or runs the program from a function, a trap or a
+//! subshell, which do not ask either, and neither it nor the program uses the terminal first. So
+//! the watch goes on looking without one, less often the longer nothing happens: each wait is a
+//! quarter of the time since the watch last had a reason to look, from [`WATCH_INTERVAL`] up to
+//! [`IDLE_LOOK`]. A program the shell gives the terminal to some time after the session's latest
+//! traffic is looked at within a quarter of that time, and within [`IDLE_LOOK`] at the most. One
+//! that exits sooner can be missed, as one shorter than [`WATCH_INTERVAL`] always could.
+//!
+//! A session sitting idle costs one look every [`IDLE_LOOK`] (KR-PERF-003). While the root shell
+//! has the terminal a look is one read of the foreground group and nothing else: no process is
+//! asked about, no executable is read and nothing is allocated.
 //!
 //! A program the integration launched is not adopted: the launch registered the process that
 //! presented itself, and that process keeps its identity when it execs the program, so the broker
@@ -45,16 +51,18 @@ use crate::broker::Broker;
 use crate::broker::connectors::ConnectorSources;
 use crate::broker::image::HashedFiles;
 
-/// How often the foreground is looked at while the watch is looking.
+/// How often the foreground is looked at while a look is likely to find something: while a command
+/// has the terminal, while a program the watch adopted is still to be ended, and just after the
+/// session's traffic.
 pub const WATCH_INTERVAL: Duration = Duration::from_millis(250);
 
-/// How long the watch goes on looking after a mark while the root shell has the terminal.
-///
-/// Input is marked as it is queued for the terminal, before the shell has read it, and the shell
-/// gives the terminal to the command a line names only once it has read the line, run its own
-/// hooks and started the command. A look the mark asks for can therefore come before the command
-/// has the terminal, and this is how long the ones after it go on.
-pub const SETTLE: Duration = Duration::from_secs(2);
+/// The longest the watch waits between two looks: the slow cadence the supervision keeps for what
+/// no event reports.
+pub const IDLE_LOOK: Duration = crate::lifecycle::IDLE_SWEEP_INTERVAL;
+
+/// How the wait between two looks grows while nothing happens: it is this fraction of the time since
+/// the watch last had a reason to look.
+const QUIET_SHARE: u32 = 4;
 
 /// Why an adopted instance's bridges are refused, as its announcement says.
 pub const ADOPTED_REFUSAL: &str = "it was not launched through the integration, so no \
@@ -448,20 +456,20 @@ pub async fn watch(adoptions: Arc<Adoptions>, runtime: Weak<crate::runtime::Sess
     .await;
 }
 
-/// Watches the foreground `group` and `read` describe, when `activity` asks it to, until they say
+/// Watches the foreground `group` and `read` describe, at the pace `activity` sets, until they say
 /// the session has gone (`None`) or the adoptions are closed.
 ///
-/// The watch looks for [`SETTLE`] from its start, because a shell that has just started can run a
-/// program from its startup files before anything is typed. It looks again whenever `activity` is
-/// marked and on each [`WATCH_INTERVAL`] for [`SETTLE`] after that, and on each interval while a
-/// command has the terminal, while a program it adopted is still to be ended and while an
-/// identification is under way. Otherwise it waits for the next mark, on no clock.
+/// The watch starts as if it had just been marked, because a shell that has just started can run a
+/// program from its startup files before anything is typed. It looks at once when `activity` is
+/// marked, on each [`WATCH_INTERVAL`] while a command has the terminal, while a program it adopted
+/// is still to be ended and while an identification is under way, and otherwise at the pace
+/// [`Pace`] keeps.
 ///
 /// A look reads `group` alone while the root shell has the terminal. When a command has it, `read`
-/// gives the look the rest, and each process in the command's group is identified on a thread of its
-/// own, one identification at a time: identifying reads an image and can take as long as that
-/// takes, so a tick that finds one still running starts no other and waits for none, and every
-/// tick ends what exited, whatever else is under way.
+/// gives the look the rest, and each process in the command's group is identified on a thread of
+/// its own, one identification at a time: identifying reads an image and can take as long as that
+/// takes, so a look that finds one still running starts no other and waits for none, and every look
+/// ends what exited, whatever else is under way.
 pub async fn watch_foreground(
     adoptions: Arc<Adoptions>,
     activity: Arc<crate::lifecycle::Activity>,
@@ -473,32 +481,38 @@ pub async fn watch_foreground(
     let mut root_group: Option<i32> = None;
     // Whether a command had the terminal at the last look.
     let mut command = false;
-    let mut settle_until = tokio::time::Instant::now() + SETTLE;
+    let mut pace = Pace::new(tokio::time::Instant::now());
     loop {
-        let looking = command
-            || identifying.is_some()
-            || adoptions.holds_any()
-            || tokio::time::Instant::now() < settle_until;
-        if looking {
+        if command || identifying.is_some() || adoptions.holds_any() {
+            pace.reason_at_look();
+        }
+        let due = pace.due();
+        if pace.wait() <= WATCH_INTERVAL {
+            // A mark made meanwhile is taken at the look rather than waking the watch early, so a
+            // session that prints steadily is looked at once an interval and no more.
             tokio::select! {
-                () = tokio::time::sleep(WATCH_INTERVAL) => {}
+                () = tokio::time::sleep_until(due) => {}
                 () = adoptions.closed() => return,
-            }
-            if activity.take_foreground() {
-                settle_until = tokio::time::Instant::now() + SETTLE;
             }
         } else {
             tokio::select! {
-                () = activity.foreground_marked() => {}
+                () = tokio::time::sleep_until(due) => {}
+                () = activity.foreground_marked() => {
+                    // A mark an earlier look already took leaves its wake behind, with nothing new
+                    // to look at.
+                    if !activity.take_foreground() {
+                        continue;
+                    }
+                    pace.reason(tokio::time::Instant::now());
+                }
                 () = adoptions.closed() => return,
             }
-            // A mark an earlier look already took leaves its wake behind, with nothing new to look
-            // at.
-            if !activity.take_foreground() {
-                continue;
-            }
-            settle_until = tokio::time::Instant::now() + SETTLE;
         }
+        let now = tokio::time::Instant::now();
+        if activity.take_foreground() {
+            pace.reason(now);
+        }
+        pace.looked(now);
         if adoptions.is_stopped() {
             return;
         }
@@ -509,11 +523,11 @@ pub async fn watch_foreground(
         {
             identifying = None;
         }
-        let Some(now) = group() else {
+        let Some(holding) = group() else {
             return;
         };
         // No foreground to read, or the root shell at its prompt: the group was the whole look.
-        if now.is_none() || (root_group.is_some() && now == root_group) {
+        if holding.is_none() || (root_group.is_some() && holding == root_group) {
             command = false;
             continue;
         }
@@ -534,6 +548,57 @@ pub async fn watch_foreground(
                 looking.look(&foreground)
             }));
         }
+    }
+}
+
+/// When the watch looks next.
+///
+/// Each wait is a quarter of the time from the watch's latest reason to look to its latest look,
+/// from [`WATCH_INTERVAL`] up to [`IDLE_LOOK`]. A reason is a mark, and a look that found a command
+/// with the terminal, a program still to be ended or an identification under way. A program that
+/// takes the terminal some time after the latest reason is looked at within a quarter of that time,
+/// and within [`WATCH_INTERVAL`] at the least.
+#[derive(Debug)]
+struct Pace {
+    /// When the watch last had a reason to look.
+    reason: tokio::time::Instant,
+    /// When it last looked.
+    looked: tokio::time::Instant,
+}
+
+impl Pace {
+    /// A pace whose reason to look is `now`, as a mark would be.
+    const fn new(now: tokio::time::Instant) -> Self {
+        Self {
+            reason: now,
+            looked: now,
+        }
+    }
+
+    /// Records a reason to look at `now`.
+    fn reason(&mut self, now: tokio::time::Instant) {
+        self.reason = now;
+    }
+
+    /// Records that the latest look found something to go on looking at.
+    fn reason_at_look(&mut self) {
+        self.reason = self.looked;
+    }
+
+    /// Records a look at `now`.
+    fn looked(&mut self, now: tokio::time::Instant) {
+        self.looked = now;
+    }
+
+    /// Returns the wait from the latest look to the next.
+    fn wait(&self) -> Duration {
+        (self.looked.saturating_duration_since(self.reason) / QUIET_SHARE)
+            .clamp(WATCH_INTERVAL, IDLE_LOOK)
+    }
+
+    /// Returns when the next look is due.
+    fn due(&self) -> tokio::time::Instant {
+        self.looked + self.wait()
     }
 }
 
@@ -612,4 +677,62 @@ fn bypass_for(
             std::fs::canonicalize(Path::new(named)).is_ok_and(|named| named == running)
         })
         .and_then(|(_, bypass)| *bypass)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{IDLE_LOOK, Pace, WATCH_INTERVAL};
+
+    #[test]
+    fn a_quiet_watch_waits_a_quarter_of_the_quiet_time_between_the_interval_and_the_idle_look() {
+        let marked = tokio::time::Instant::now();
+        let mut pace = Pace::new(marked);
+        assert_eq!(pace.wait(), WATCH_INTERVAL, "just after a reason to look");
+
+        pace.looked(marked + Duration::from_secs(4));
+        assert_eq!(
+            pace.wait(),
+            Duration::from_secs(1),
+            "a quarter of the quiet time"
+        );
+        assert_eq!(pace.due(), marked + Duration::from_secs(5));
+
+        pace.looked(marked + Duration::from_secs(600));
+        assert_eq!(pace.wait(), IDLE_LOOK, "and no more than the idle look");
+
+        pace.reason_at_look();
+        assert_eq!(
+            pace.wait(),
+            WATCH_INTERVAL,
+            "a look that found something to go on looking at is a reason of its own"
+        );
+
+        pace.reason(marked + Duration::from_secs(601));
+        assert_eq!(pace.wait(), WATCH_INTERVAL, "and so is a mark");
+    }
+
+    #[test]
+    fn each_wait_is_at_most_a_quarter_of_the_quiet_time_before_it() {
+        // Whenever a program takes the terminal, the look that finds it is no further away than a
+        // quarter of the time since the latest reason, or one interval.
+        let marked = tokio::time::Instant::now();
+        let mut pace = Pace::new(marked);
+        for _ in 0..200 {
+            let due = pace.due();
+            let quiet = pace.looked.saturating_duration_since(marked);
+            assert!(
+                due.saturating_duration_since(pace.looked) <= (quiet / 4).max(WATCH_INTERVAL),
+                "a wait of {:?} after {quiet:?} of quiet",
+                pace.wait()
+            );
+            pace.looked(due);
+        }
+        assert_eq!(
+            pace.wait(),
+            IDLE_LOOK,
+            "a watch left alone settles on the idle look"
+        );
+    }
 }

@@ -10,8 +10,8 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-12.07 | a program the root shell ran that the integration did not launch is adopted as a native terminal instance with no process record, with the bypass its line was answered with, its bridges refused, and ended when it exits; a program the integration launched is not adopted; a view that installs the session's list and applies the announcements after it holds each instance once; the watch finds a program the root shell starts from a typed line within two seconds of it running and its end within two seconds of its exit, and looks when the integration asks about an invocation or reports a command starting |
-//! | KR-PERF-003 | a session nothing is happening in reads its terminal's foreground on no interval, before and after its own traffic, and after an adopted program has ended |
+//! | KR-REQ-12.07 | a program the root shell ran that the integration did not launch is adopted as a native terminal instance with no process record, with the bypass its line was answered with, its bridges refused, and ended when it exits; a program the integration launched is not adopted; a view that installs the session's list and applies the announcements after it holds each instance once; the watch finds a program the root shell starts from a typed line within two seconds of it running, at once or after four silent seconds, and its end within two seconds of its exit, and looks when the integration asks about an invocation or reports a command starting |
+//! | KR-PERF-003 | a session nothing is happening in reads its terminal's foreground on no more than one interval in four, less often the longer it stays quiet, before and after its own traffic, and after an adopted program has ended |
 
 #![cfg(unix)]
 
@@ -37,8 +37,8 @@ use kr_worker::persistence::JournalHealth;
 /// many seconds as it names.
 const STAND_IN: &str = "KR_ADOPTION_STAND_IN";
 
-/// The variable that names a file the stand-in writes its process identifier to once it is
-/// running, for a test that needs to know when the program itself has started.
+/// The variable that names a file the stand-in writes to once it is running: its process
+/// identifier, and when it started on [`monotonic`], for a test that measures from that moment.
 const STAND_IN_RUNNING: &str = "KR_ADOPTION_STAND_IN_RUNNING";
 
 /// How long a test waits for something that should happen promptly, before it calls it a failure.
@@ -49,7 +49,9 @@ const LIVENESS: Duration = Duration::from_secs(60);
 fn the_stand_in_program() {
     if let Ok(seconds) = std::env::var(STAND_IN) {
         if let Some(running) = std::env::var_os(STAND_IN_RUNNING) {
-            std::fs::write(running, std::process::id().to_string()).expect("says it is running");
+            let started = monotonic().as_nanos();
+            std::fs::write(running, format!("{} {started}", std::process::id()))
+                .expect("says it is running");
         }
         std::thread::sleep(Duration::from_secs(seconds.parse().unwrap_or(60)));
     }
@@ -544,12 +546,17 @@ async fn kr_req_12_07_a_slow_identification_holds_no_end_and_adopts_nothing_afte
     second.end();
 }
 
-/// Longer than the watch goes on looking after it was last asked to, with room for a loaded
-/// machine's timers: a session this long after its latest traffic is one nothing is happening in.
+/// How long after its latest traffic a session counts as one nothing is happening in.
 const QUIET_AFTER: Duration = Duration::from_secs(4);
 
-/// How many intervals a quiet session is watched for, on none of which it may read its foreground.
-const QUIET_INTERVALS: u32 = 8;
+/// How many intervals a quiet session is watched for.
+const QUIET_INTERVALS: u32 = 16;
+
+/// The most foreground reads a quiet session may make in [`QUIET_INTERVALS`]: one read in four
+/// intervals. From [`QUIET_AFTER`] on, the watch waits a second and more between looks, a quarter of
+/// the time since the traffic, so it reads at most four times in these four seconds; a watch on a
+/// clock reads on every interval.
+const QUIET_READS: usize = 4;
 
 /// A session whose one view holds the input lease, and the view's own delivery stream.
 struct Typing {
@@ -611,14 +618,16 @@ impl Typing {
         self.runtime.session().foreground_reads()
     }
 
-    /// Asserts that the session reads its foreground on none of [`QUIET_INTERVALS`] intervals.
+    /// Asserts that the session reads its foreground on no more than one interval in four, over
+    /// [`QUIET_INTERVALS`] intervals.
     async fn quiet(&self, what: &str) {
         let before = self.reads();
         tokio::time::sleep(kr_worker::broker::adoption::WATCH_INTERVAL * QUIET_INTERVALS).await;
         let read = self.reads() - before;
-        assert_eq!(
-            read, 0,
-            "{what} reads its foreground on no interval: {read} reads in {QUIET_INTERVALS} intervals"
+        assert!(
+            read <= QUIET_READS,
+            "{what} reads its foreground on no more than one interval in four: {read} reads in \
+             {QUIET_INTERVALS} intervals"
         );
     }
 
@@ -634,12 +643,15 @@ impl Typing {
     }
 }
 
-/// Waits up to `limit` for `condition` to hold, and says whether it did.
+/// Waits up to `limit` for `condition` to hold, and says whether it held by then.
+///
+/// A condition first seen to hold after the deadline counts as not holding by it, however late
+/// this task was woken to look: a bound is a bound on when it held, not on when it was checked.
 async fn within(limit: Duration, mut condition: impl FnMut() -> bool) -> bool {
     let deadline = tokio::time::Instant::now() + limit;
     loop {
         if condition() {
-            return true;
+            return tokio::time::Instant::now() <= deadline;
         }
         if tokio::time::Instant::now() >= deadline {
             return false;
@@ -648,11 +660,21 @@ async fn within(limit: Duration, mut condition: impl FnMut() -> bool) -> bool {
     }
 }
 
-/// KR-PERF-003 and KR-REQ-12.07: a session nothing is happening in reads its terminal's foreground
-/// on no interval. The watch looks while the root shell starts and after the session's own input
-/// and output, and between them it waits for that traffic rather than for a clock.
+/// The system's monotonic clock, read the same way here and in the stand-in, so that a time one
+/// process records can be compared with a time the other does.
+fn monotonic() -> Duration {
+    let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    Duration::new(
+        u64::try_from(now.tv_sec).expect("a time after the clock's start"),
+        u32::try_from(now.tv_nsec).expect("a fraction of a second"),
+    )
+}
+
+/// KR-PERF-003 and KR-REQ-12.07: a session nothing is happening in does not read its terminal's
+/// foreground on every interval. The watch looks often while the root shell starts and after the
+/// session's own input and output, and less and less often the longer nothing happens.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kr_perf_003_an_idle_session_reads_its_foreground_on_no_interval() {
+async fn kr_perf_003_an_idle_session_does_not_read_its_foreground_on_every_interval() {
     let setup = Setup::new();
     let mut typing = Typing::start(&setup.host, kr_worker::testing::posix_script("exec cat"));
     let adoptions = Arc::new(setup.adoptions);
@@ -688,17 +710,31 @@ async fn kr_perf_003_an_idle_session_reads_its_foreground_on_no_interval() {
 
 /// KR-REQ-12.07: a program the root shell starts from a line typed into the session, which the
 /// integration did not launch, is found by the watch within two seconds of running and adopted,
-/// its end is found once it exits, and the watch is quiet again after that. The shell asks
-/// nothing, as a shell without the integration does, and runs the program as a job of its own in
-/// the foreground, which then neither reads nor writes the terminal.
+/// its end is found within two seconds of its exit, and the session is quiet again after that. The
+/// shell asks nothing, as a shell without the integration does, and runs the program as a job of
+/// its own in the foreground, which neither reads nor writes the terminal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_12_07_the_watch_adopts_a_program_the_root_shell_starts_from_a_typed_line() {
+    adopts_from_a_typed_line("").await;
+}
+
+/// KR-REQ-12.07: the same when the line keeps the root shell busy for four seconds before it
+/// starts the program, with the root shell's own group holding the terminal and nothing written:
+/// the watch looks less often by then, and still finds the program within two seconds of running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_12_07_the_watch_adopts_a_program_a_typed_line_starts_after_a_silent_delay() {
+    adopts_from_a_typed_line("delay=$(sleep 4); ").await;
+}
+
+/// Types a line into a POSIX shell with job control that runs `before` and then the stand-in, and
+/// holds the watch to its bounds.
+async fn adopts_from_a_typed_line(before: &str) {
     let setup = Setup::new();
     let running = setup.host.root().join("running");
-    let mut shell = kr_worker::testing::posix_script(
-        "set -m; read line; \"$KR_ADOPTION_PROGRAM\" --exact the_stand_in_program \
-         --test-threads 1 </dev/null >/dev/null 2>&1; read line",
-    );
+    let mut shell = kr_worker::testing::posix_script(&format!(
+        "set -m; read line; {before}\"$KR_ADOPTION_PROGRAM\" --exact the_stand_in_program \
+         --test-threads 1 </dev/null >/dev/null 2>&1; read line"
+    ));
     shell.environment.extend([
         (
             "KR_ADOPTION_PROGRAM".to_owned(),
@@ -709,6 +745,11 @@ async fn kr_req_12_07_the_watch_adopts_a_program_the_root_shell_starts_from_a_ty
     ]);
     let mut typing = Typing::start(&setup.host, shell);
     let (arrived, release) = setup.adoptions.pause_before_reading();
+    // Waiting before the program can start, so the moment the watch reaches it is taken as it
+    // happens rather than whenever this test next looks.
+    let reached = tokio::task::spawn_blocking(move || {
+        arrived.recv_timeout(LIVENESS).ok().map(|()| monotonic())
+    });
     let adoptions = Arc::new(setup.adoptions);
     let watching = tokio::spawn(kr_worker::broker::adoption::watch(
         Arc::clone(&adoptions),
@@ -717,24 +758,29 @@ async fn kr_req_12_07_the_watch_adopts_a_program_the_root_shell_starts_from_a_ty
     tokio::time::sleep(QUIET_AFTER).await;
 
     typing.type_in(b"\n");
-    let mut program = None;
+    let mut said = None;
     assert!(
         within(LIVENESS, || {
-            program = std::fs::read_to_string(&running)
-                .ok()
-                .and_then(|pid| pid.trim().parse::<u32>().ok());
-            program.is_some()
+            said = std::fs::read_to_string(&running).ok().and_then(|text| {
+                let (pid, started) = text.trim().split_once(' ')?;
+                Some((pid.parse::<u32>().ok()?, started.parse::<u64>().ok()?))
+            });
+            said.is_some()
         })
         .await,
         "the root shell starts the program"
     );
-    let pid = program.expect("the program's identifier");
-    let reached = tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(2)))
+    let (pid, started) = said.expect("the program says it is running");
+    let started = Duration::from_nanos(started);
+    let reached = reached
         .await
-        .expect("joined");
+        .expect("joined")
+        .expect("the watch reaches the program");
+    let took = reached.saturating_sub(started);
+    println!("the watch reached the program {took:?} after it started running");
     assert!(
-        reached.is_ok(),
-        "the watch reaches the program within two seconds of it running"
+        took <= Duration::from_secs(2),
+        "the watch reaches the program within two seconds of it running: {took:?}"
     );
     // Let go, unless it has already gone on by itself.
     let _ = release.send(());
