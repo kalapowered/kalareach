@@ -1420,18 +1420,46 @@ pub fn read_owner_only_file(path: &Path, limit: u64) -> Result<Option<Vec<u8>>> 
     Ok(Some(bytes))
 }
 
-/// Reads a small file this user owns.
+/// Reads a small file this user owns, checking its access-control list from the handle it opened.
+///
+/// Windows has no mode bits, so the question the Unix reader asks of an owner and a mode is asked of
+/// the file's list, read from the handle rather than from the name: it belongs to this user and
+/// grants no account the machine does not already trust. A symbolic link or a junction under the
+/// file's name is opened as the link itself and refused by its attributes, never followed. This is
+/// what the descriptor reader does for a worker's descriptor; the environment identity is read here.
 ///
 /// # Errors
 ///
 /// Returns an error when the file exists but is not one this host wrote.
 #[cfg(not(unix))]
 pub fn read_owner_only_file(path: &Path, limit: u64) -> Result<Option<Vec<u8>>> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(IpcError::io("inspect", path, error)),
+    use std::io::Read as _;
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use std::os::windows::io::AsHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
     };
+
+    // Opened without following a reparse point, so a link planted under this name opens as the link
+    // and is refused below rather than sending this read wherever it points.
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(IpcError::io("open", path, error)),
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|error| IpcError::io("inspect", path, error))?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(IpcError::UntrustedFile {
+            path: path.to_path_buf(),
+            reason: "this file must not be a symbolic link or a junction",
+        });
+    }
     if !metadata.is_file() {
         return Err(IpcError::UntrustedFile {
             path: path.to_path_buf(),
@@ -1444,9 +1472,31 @@ pub fn read_owner_only_file(path: &Path, limit: u64) -> Result<Option<Vec<u8>>> 
             reason: "this file is larger than anything this host writes here",
         });
     }
-    std::fs::read(path)
-        .map(Some)
-        .map_err(|error| IpcError::io("read", path, error))
+    match check_access_list(file.as_handle(), &path.display().to_string(), false) {
+        Ok(()) => {}
+        Err(AccessListRefusal::Policy(_)) => {
+            return Err(IpcError::UntrustedFile {
+                path: path.to_path_buf(),
+                reason: "this file's access-control list grants an account this host does not trust",
+            });
+        }
+        Err(AccessListRefusal::Unreadable(detail)) => {
+            return Err(IpcError::io("inspect", path, std::io::Error::other(detail)));
+        }
+    }
+    // Bounded by one byte more than the limit, so a file that grew between the check and the read is
+    // refused rather than read.
+    let mut bytes = Vec::new();
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| IpcError::io("read", path, error))?;
+    if bytes.len() as u64 > limit {
+        return Err(IpcError::UntrustedFile {
+            path: path.to_path_buf(),
+            reason: "this file is larger than anything this host writes here",
+        });
+    }
+    Ok(Some(bytes))
 }
 
 /// Writes a file owner-only, replacing any previous contents atomically.
@@ -2178,6 +2228,35 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         printed
+    }
+
+    /// KR-REQ-03.08: the owner-only reader, which reads the environment identity, checks the file's
+    /// access-control list, so a file whose list has been widened is refused rather than read. As
+    /// written the file is owner-only and reads; granting Everyone makes the next read refuse it.
+    #[cfg(windows)]
+    #[test]
+    fn a_widened_owner_only_file_is_refused_by_the_reader() {
+        let root = temporary_root("owner-only-read");
+        let path = root.join("run").join("environment");
+        create_private_tree(&root, path.parent().expect("a directory")).expect("the tree");
+        write_owner_only_file(&path, b"an environment identity").expect("writes");
+        assert_eq!(
+            read_owner_only_file(&path, 128)
+                .expect("reads")
+                .expect("present"),
+            b"an environment identity",
+            "as written it is owner-only and reads"
+        );
+        run(
+            "icacls.exe",
+            &[path.as_os_str(), "/grant".as_ref(), "*S-1-1-0:F".as_ref()],
+        );
+        let error = read_owner_only_file(&path, 128).expect_err("a widened file is refused");
+        assert_eq!(
+            error.code(),
+            kr_protocol::error::ErrorCode::PermissionDenied
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// A directory is flushed through a handle of its own for either kind of name. A flush that
