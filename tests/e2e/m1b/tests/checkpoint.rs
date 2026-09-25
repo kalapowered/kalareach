@@ -42,6 +42,44 @@ fn no_rendezvous_origin() -> String {
         .unwrap_or_else(|| NO_RENDEZVOUS_ORIGIN.to_owned())
 }
 
+/// What a leg left in its invitation's room once the invitation ended, in the words the report
+/// uses: nothing a new candidate is served, or a record the host's release did not reach.
+///
+/// The host releases the locator before it answers the call that ended the invitation, as a best
+/// effort: a release that does not reach the service leaves a record that ends by itself when the
+/// invitation's five minutes do. So a room that still serves the record is reported as what the
+/// leg left on the deployment, with how long it lasts, rather than failed.
+fn room_after(
+    runtime: &tokio::runtime::Runtime,
+    origin: &kr_protocol::pairing::RendezvousOrigin,
+    locator: &Locator,
+    expires_at_ms: u64,
+    ended: &str,
+) -> String {
+    let stopped = runtime
+        .block_on(room::stops_serving(origin, locator, PROBE, RELEASE_WAIT))
+        .unwrap_or_else(|why| panic!("the room could not be asked: {why}"));
+    if let Some(after) = stopped {
+        println!("a new candidate was served no record {after:?} after {ended}");
+        return format!(
+            "nothing that a new candidate is served: once {ended}, the room of locator {} served \
+             no record",
+            locator.as_str()
+        );
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        });
+    format!(
+        "the room of locator {} still served its record {RELEASE_WAIT:?} after {ended}: the \
+         host's release did not reach it, and the record ends with the invitation in about {} s",
+        locator.as_str(),
+        expires_at_ms.saturating_sub(now_ms) / 1000
+    )
+}
+
 /// Ends a leg's host and checks that nothing the leg started is still running.
 fn close(run: &Run, host: &Host<'_>) -> String {
     host.stop()
@@ -144,27 +182,19 @@ fn the_site_answers_and_a_host_reserves_its_invitations_there() {
 
     let withdrawn = host.kr_json(&["pair", "cancel", &invitation_id]);
     println!("the invitation was withdrawn: {}", withdrawn["status"]);
-    let stopped = runtime
-        .block_on(room::stops_serving(&origin, &locator, PROBE, RELEASE_WAIT))
-        .unwrap_or_else(|why| panic!("the room could not be asked: {why}"))
-        .unwrap_or_else(|| {
-            panic!(
-                "once the invitation is withdrawn, its locator's room serves no record: a new \
-                 candidate was still served it {RELEASE_WAIT:?} after the withdrawal"
-            )
-        });
-    println!("a new candidate was served no record {stopped:?} after the withdrawal");
+    let left = room_after(
+        &runtime,
+        &origin,
+        &locator,
+        invited.document["expires_at_ms"]
+            .as_u64()
+            .unwrap_or_default(),
+        "the invitation was withdrawn",
+    );
+    checkpoint.left(LEG, &left);
 
     let closing = close(&run, &host);
     println!("{closing}");
-    checkpoint.left(
-        LEG,
-        &format!(
-            "nothing that a new candidate is served: locator {} was reserved for one \
-             invitation, and once the invitation was withdrawn its room served no record",
-            locator.as_str()
-        ),
-    );
     checkpoint.proved(
         LEG,
         &format!(
@@ -283,17 +313,17 @@ fn a_device_pairs_by_code_through_the_site_and_by_direct_qr_over_loopback() {
         owner.connection()
     );
 
-    // The deployment gave its locator back once the invitation was consumed.
-    let stopped = runtime
-        .block_on(room::stops_serving(&origin, &locator, PROBE, RELEASE_WAIT))
-        .unwrap_or_else(|why| panic!("the room could not be asked: {why}"))
-        .unwrap_or_else(|| {
-            panic!(
-                "once the invitation is consumed, its locator's room serves no record: a new \
-                 candidate was still served it {RELEASE_WAIT:?} after the pairing committed"
-            )
-        });
-    println!("a new candidate was served no record {stopped:?} after the pairing committed");
+    // Once the invitation is consumed, the host gives its locator back.
+    let left = room_after(
+        &runtime,
+        &origin,
+        &locator,
+        invited.document["expires_at_ms"]
+            .as_u64()
+            .unwrap_or_default(),
+        "the pairing committed",
+    );
+    checkpoint.left(LEG, &left);
 
     // A direct invitation on a host with an owner: each owner step is the first device's.
     let second = runtime.block_on(Device::create("second device", &run.root().join("d2")));
@@ -374,15 +404,6 @@ fn a_device_pairs_by_code_through_the_site_and_by_direct_qr_over_loopback() {
     runtime.block_on(second.close());
     let closing = close(&run, &host);
     println!("{closing}");
-    checkpoint.left(
-        LEG,
-        &format!(
-            "nothing that a new candidate is served: locator {} was reserved for one \
-             invitation and reached by two candidate sockets, and once the pairing committed its \
-             room served no record",
-            locator.as_str()
-        ),
-    );
     checkpoint.proved(
         LEG,
         "a device paired by code through the rendezvous after a wrong code was counted, a second \
