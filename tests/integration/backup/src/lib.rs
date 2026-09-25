@@ -115,6 +115,7 @@ pub struct Watched {
     fences: Mutex<Vec<FenceAnswer>>,
     wrong: Mutex<Vec<String>>,
     named: AtomicUsize,
+    calls: AtomicUsize,
     lose_the_next_answer: AtomicBool,
     lost: Mutex<Option<ServiceHttpAnswer>>,
 }
@@ -144,6 +145,7 @@ impl Watched {
             fences: Mutex::new(Vec::new()),
             wrong: Mutex::new(Vec::new()),
             named: AtomicUsize::new(0),
+            calls: AtomicUsize::new(0),
             lose_the_next_answer: AtomicBool::new(false),
             lost: Mutex::new(None),
         })
@@ -193,6 +195,23 @@ impl Watched {
     #[must_use]
     pub fn named(&self) -> usize {
         self.named.load(Ordering::SeqCst)
+    }
+
+    /// How many calls went through, counted before anything in them is read, so a request this
+    /// transport cannot read is counted all the same.
+    #[must_use]
+    pub fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    /// What this transport found wrong so far.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the record is poisoned.
+    #[must_use]
+    pub fn findings(&self) -> Vec<String> {
+        self.wrong.lock().expect("the findings").clone()
     }
 
     /// Says that every answer so far named the history this transport expects, and that some did.
@@ -300,6 +319,7 @@ impl ServiceHttp for Watched {
         headers: &'a [(&'a str, &'a str)],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             let member = self.note(body);
             if member.is_none() {
                 self.wrong(
@@ -628,6 +648,8 @@ mod tests {
             .post_json("http://127.0.0.1:1/api/sync", b"not json", &[])
             .await
             .expect("answered");
-        assert_eq!(watched.wrong.lock().expect("the findings").len(), 1);
+        assert_eq!(watched.findings().len(), 1);
+        // Counted as a call although nothing in it could be read.
+        assert_eq!((watched.calls(), watched.sent().len()), (1, 0));
     }
 }

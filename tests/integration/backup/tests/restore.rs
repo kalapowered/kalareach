@@ -812,8 +812,8 @@ async fn the_device_meets_the_deployment_restored_from_the_export() {
         .expect("reconciled");
     assert_eq!((again.settled, again.fenced, again.unsettled), (0, 0, 0));
     assert_eq!(
-        device.transport.sent(),
-        Vec::new(),
+        (device.transport.calls(), device.transport.findings()),
+        (0, Vec::<String>::new()),
         "a reconciliation with nothing outstanding asks the service nothing"
     );
     // Before the reopening the ended identity went out once more after the restore, as the fence
