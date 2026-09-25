@@ -141,6 +141,8 @@ pub struct Item {
     pub visibility: Visibility,
     /// Whether an attribute of its own may be a macro that rewrites it.
     pub rewritable: bool,
+    /// Whether a `cfg` or `cfg_attr` of its own may leave it out of a build.
+    pub conditional: bool,
 }
 
 /// One module: a file, or an inline `mod` block.
@@ -160,6 +162,10 @@ pub struct Module {
     /// The macros a `macro_rules!` anywhere in its file defines, by name, those inside functions
     /// included: a file's top module holds them all.
     pub macros: Vec<String>,
+    /// The macros a `macro_rules!` written in the arguments of a standard macro whose arguments
+    /// are no code (`stringify!(macro_rules! ...)`) would define: text, unless the target gives
+    /// that macro's name another meaning.
+    pub macros_in_text: Vec<String>,
     /// Whether it brings in names its source does not list: an item under `#[macro_use]`, an
     /// `extern crate`, or a macro invoked among its items, whose expansion may define anything.
     pub unlisted_names: bool,
@@ -282,7 +288,7 @@ fn scan_file(
         &mut parsed,
     );
     if let Some(Parsed::Module(top)) = parsed.first_mut() {
-        top.macros = macro_definitions(&tokens);
+        (top.macros, top.macros_in_text) = macro_definitions(&tokens);
     }
     for entry in parsed {
         match entry {
@@ -437,6 +443,11 @@ impl Attribute {
         self.trusted().is_some_and(|names| names.is_empty())
     }
 
+    /// Whether it is a `cfg` or a `cfg_attr`, which may leave what it is on out of a build.
+    fn is_conditional(&self) -> bool {
+        matches!(self.path.as_slice(), [name] if name == "cfg" || name == "cfg_attr")
+    }
+
     fn is_test(&self) -> bool {
         self.path.last().is_some_and(|last| last == "test")
     }
@@ -482,6 +493,7 @@ fn parse_module(
         docs: Vec::new(),
         entries: Vec::new(),
         macros: Vec::new(),
+        macros_in_text: Vec::new(),
         unlisted_names: false,
         rewritable,
     };
@@ -718,14 +730,7 @@ fn attribute(tokens: &[Token], line: usize) -> Attribute {
 
 /// Where the item that starts at `start` ends (exclusive).
 fn item_end(tokens: &[Token], start: usize) -> usize {
-    // The keyword follows a visibility and a few qualifiers, well within the item's first tokens.
-    let structure: Vec<Token> = tokens[start..]
-        .iter()
-        .filter(|token| !token.is_comment())
-        .take(64)
-        .cloned()
-        .collect();
-    let keyword = structure.get(head(&structure)).and_then(Token::ident);
+    let keyword = item_keyword(tokens, start);
     let extern_crate = keyword == Some("extern");
     let ends_at_semicolon =
         extern_crate || matches!(keyword, Some("const" | "static" | "type" | "use"));
@@ -761,6 +766,38 @@ fn item_end(tokens: &[Token], start: usize) -> usize {
 
 /// The index of an item's keyword: past its visibility and its qualifiers. `extern crate` stops at
 /// `extern`, which is its keyword.
+/// The keyword of the item that starts at `start`: the first name after its visibility (however
+/// long a `pub(in ...)` path it gives) and its qualifiers, with comments passed over.
+fn item_keyword(tokens: &[Token], start: usize) -> Option<&str> {
+    let next = |from: usize| next_significant(tokens, from);
+    let mut at = next(start)?;
+    loop {
+        let following = next(at + 1);
+        let following_name = following.and_then(|index| tokens[index].ident());
+        match tokens[at].ident() {
+            Some("pub") => {
+                at = following?;
+                if tokens[at].is_punct('(') {
+                    at = next(matching(tokens, at)? + 1)?;
+                }
+            }
+            Some("default" | "async" | "unsafe" | "safe") => at = following?,
+            Some("const")
+                if matches!(following_name, Some("fn" | "unsafe" | "async" | "extern")) =>
+            {
+                at = following?;
+            }
+            Some("extern") if following_name != Some("crate") => {
+                at = following?;
+                if matches!(tokens[at].tok, Tok::Str(_)) {
+                    at = next(at + 1)?;
+                }
+            }
+            keyword => return keyword,
+        }
+    }
+}
+
 fn head(tokens: &[Token]) -> usize {
     let mut at = 0;
     while let Some(token) = tokens.get(at) {
@@ -877,17 +914,18 @@ fn classify(
                 imports: Vec::new(),
                 visibility: visibility(&structure[..at]),
                 rewritable: attributes.iter().any(|a| !a.inert()),
+                conditional: attributes.iter().any(Attribute::is_conditional),
             })
         }
         _ => {
             let is_macro = structure.get(at + 1).is_some_and(|t| t.is_punct('!'));
             // A function's inner attributes, at the start of its body, are its own.
-            let inner = keyword == "fn"
-                && body.is_some_and(|(from, to)| {
-                    inner_attributes(&tokens[from..to])
-                        .iter()
-                        .any(|a| !a.inert())
-                });
+            let own_inner = if keyword == "fn" {
+                body.map_or_else(Vec::new, |(from, to)| inner_attributes(&tokens[from..to]))
+            } else {
+                Vec::new()
+            };
+            let inner = own_inner.iter().any(|a| !a.inert());
             Classified::Item(Item {
                 kind: if is_macro {
                     "macro".to_owned()
@@ -912,6 +950,10 @@ fn classify(
                 },
                 visibility: visibility(&structure[..at]),
                 rewritable: inner || attributes.iter().any(|a| !a.inert()),
+                conditional: attributes
+                    .iter()
+                    .chain(&own_inner)
+                    .any(Attribute::is_conditional),
             })
         }
     }
@@ -981,23 +1023,36 @@ fn next_significant(tokens: &[Token], from: usize) -> Option<usize> {
     (from..tokens.len()).find(|&at| !tokens[at].is_comment())
 }
 
-/// Every macro a `macro_rules!` in `tokens` defines, by name, wherever it stands.
-fn macro_definitions(tokens: &[Token]) -> Vec<String> {
+/// Every macro a `macro_rules!` in `tokens` defines, by name, wherever it stands; and apart, those
+/// written in the arguments of a standard macro whose arguments are no code ([`NO_CODE`]).
+fn macro_definitions(tokens: &[Token]) -> (Vec<String>, Vec<String>) {
     let tokens = significant(tokens);
-    let mut names = Vec::new();
+    let mut code = Vec::new();
+    let mut text = Vec::new();
+    let mut text_to = 0;
     for index in 0..tokens.len() {
+        let in_text = index < text_to;
+        if !in_text
+            && tokens[index].ident() != Some("macro_rules")
+            && let Some(end) = passed_over(&tokens, index)
+        {
+            text_to = end;
+            continue;
+        }
         if tokens[index].ident() == Some("macro_rules")
             && tokens.get(index + 1).is_some_and(|t| t.is_punct('!'))
             && let Some(name) = tokens.get(index + 2).and_then(Token::ident)
             && tokens
                 .get(index + 3)
                 .is_some_and(|t| t.is_punct('(') || t.is_punct('[') || t.is_punct('{'))
-            && !names.iter().any(|known| known == name)
         {
-            names.push(name.to_owned());
+            let names = if in_text { &mut text } else { &mut code };
+            if !names.iter().any(|known| known == name) {
+                names.push(name.to_owned());
+            }
         }
     }
-    names
+    (code, text)
 }
 
 /// The inner attributes (`#![...]`) a body opens with.
@@ -1114,7 +1169,7 @@ const RUN_AS_WRITTEN: &[&str] = &[
 
 /// The standard library's macros whose arguments are no code that runs: configuration, literals,
 /// and `stringify!`, whose tokens become text.
-const NO_CODE: &[&str] = &[
+pub const NO_CODE: &[&str] = &[
     "cfg",
     "column",
     "compile_error",
@@ -1244,7 +1299,12 @@ fn calls(body: &[Token], attributes: &[Attribute]) -> Read {
             before(1).and_then(|at| tokens[at].ident()),
             Some("fn" | "struct")
         );
-        if !defined && called_after(&tokens, index + 1) {
+        // After `dyn`, `impl` or `?`, `name(...)` is a trait's sugar in a type, not a call.
+        let in_type = matches!(
+            before(1).and_then(|at| tokens[at].ident()),
+            Some("dyn" | "impl")
+        ) || punct(before(1), '?');
+        if !defined && !in_type && called_after(&tokens, index + 1) {
             let (path, start) = path_to(&tokens, index);
             let led = start.checked_sub(1);
             if punct(led, ':') || (punct(led, '.') && !punct(start.checked_sub(2), '.')) {
@@ -1538,6 +1598,9 @@ mod tests {
             "r#macro_rules!(); shared();",
             // A `cfg` may compile the call out of the build.
             "#[cfg(any())] shared();",
+            // After `dyn` or `impl`, the name is a trait's in a type, and the body names it.
+            "let _: Option<&dyn shared()> = None; shared();",
+            "fn inner(run: impl shared()) {} shared();",
         ] {
             assert!(!read(body).contains(&shared), "{body}: {:?}", read(body));
         }
@@ -1680,6 +1743,52 @@ mod tests {
                 path: vec!["std".to_owned(), "stringify".to_owned()],
             }]
         );
+    }
+
+    #[test]
+    fn a_macro_definition_written_as_text_is_kept_apart() {
+        let (code, text) = macro_definitions(
+            &lex("let _ = stringify!(macro_rules! println { () => {} }); macro_rules! real { () => {} } std::stringify!(macro_rules! pathed { () => {} });")
+                .expect("lexes"),
+        );
+        assert_eq!(code, ["real", "pathed"]);
+        assert_eq!(text, ["println"]);
+    }
+
+    #[test]
+    fn an_item_ends_where_it_ends_however_long_its_visibility() {
+        let path: Vec<String> = (0..30).map(|depth| format!("m{depth}")).collect();
+        let text = format!(
+            "pub(in crate::{}) const N: i32 = if true {{ 1 }} else {{ 2 }};\nfn next() {{}}\n",
+            path.join("::")
+        );
+        let tokens = lex(&text).expect("lexes");
+        let end = item_end(&tokens, 0);
+        assert!(tokens[end - 1].is_punct(';'), "{:?}", tokens[end - 1]);
+        assert_eq!(tokens[end].ident(), Some("fn"));
+    }
+
+    #[test]
+    fn an_item_under_a_cfg_of_its_own_is_conditional() {
+        let modules = scan_text(
+            "#[cfg(unix)]\nfn outer() {}\nfn inner() {\n    #![cfg_attr(unix, allow(unused))]\n}\n#[allow(dead_code)]\nfn plain() {}\n",
+            true,
+        );
+        let conditional = |name: &str| {
+            modules[0]
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    Entry::Item(item) if item.name.as_deref() == Some(name) => {
+                        Some(item.conditional)
+                    }
+                    _ => None,
+                })
+                .expect("the item")
+        };
+        assert!(conditional("outer"));
+        assert!(conditional("inner"));
+        assert!(!conditional("plain"));
     }
 
     #[test]

@@ -14,3 +14,14 @@ fn writes_a_glob_as_text() {
 fn calls_the_case_beside_text() {
     assert_eq!(case(), 3);
 }
+
+#[test]
+fn writes_a_macro_definition_as_text() {
+    let _ = stringify!(macro_rules! println { () => {} });
+}
+
+#[test]
+fn prints_and_calls_the_case() {
+    println!("ok");
+    assert_eq!(case(), 3);
+}
