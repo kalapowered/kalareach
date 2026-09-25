@@ -70,6 +70,9 @@ impl Pairing {
                 "the connection reached another endpoint than the invitation pins",
             ));
         }
+        // The host counts the connection's time from when it answers the handshake, which is
+        // after the device's offer arrives: a time read before the offer goes is never later.
+        let opened = tokio::time::Instant::now();
         let mut preauth = within(
             WAIT_STEP,
             self.link
@@ -77,7 +80,6 @@ impl Pairing {
         )
         .await
         .map_err(|error| reached(&error))?;
-        let opened = tokio::time::Instant::now();
         let selection = preauth.selection().clone();
         if selection.endpoint_id != payload.endpoint_id {
             return Err(PairingFailure::new(

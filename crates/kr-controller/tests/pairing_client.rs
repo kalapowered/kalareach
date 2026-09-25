@@ -502,8 +502,16 @@ struct WatchedLink {
     /// While set, every dial after the first fails at once, as a network that drops new
     /// connections would.
     fresh_dials_fail: Arc<AtomicBool>,
+    /// The first connection's pre-authorisation surface reaches the device this much later than
+    /// the host answered its handshake, as a slow network would deliver that answer.
+    first_open_delay: Option<Duration>,
+    /// Every status question reaches the host this much later than the device sent it.
+    status_transit: Option<Duration>,
     severed: Arc<AtomicBool>,
     statuses: Arc<AtomicUsize>,
+    /// Status questions that got no answer from the host: the connection had ended, or the answer
+    /// was a refusal.
+    failed_statuses: Arc<AtomicUsize>,
     dials: AtomicUsize,
     opened: AtomicUsize,
     paired_connects: AtomicUsize,
@@ -524,8 +532,11 @@ impl WatchedLink {
             paired_gate: None,
             sever_paired: false,
             fresh_dials_fail: Arc::new(AtomicBool::new(false)),
+            first_open_delay: None,
+            status_transit: None,
             severed: Arc::new(AtomicBool::new(false)),
             statuses: Arc::new(AtomicUsize::new(0)),
+            failed_statuses: Arc::new(AtomicUsize::new(0)),
             dials: AtomicUsize::new(0),
             opened: AtomicUsize::new(0),
             paired_connects: AtomicUsize::new(0),
@@ -583,9 +594,13 @@ impl HostLink for WatchedLink {
         connection: &'a Connection,
         identity: &'a LocalIdentity,
     ) -> BoxFuture<'a, Result<Box<dyn Preauth>, LinkError>> {
-        self.opened.fetch_add(1, Ordering::SeqCst);
+        let earlier = self.opened.fetch_add(1, Ordering::SeqCst);
+        let delay = self.first_open_delay.filter(|_| earlier == 0);
         Box::pin(async move {
             let inner = self.inner.open_unpaired(connection, identity).await?;
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
             Ok(Box::new(Watched {
                 inner,
                 alter_value: self.alter_value,
@@ -594,8 +609,10 @@ impl HostLink for WatchedLink {
                 answers_before_silence: self.answers_before_silence,
                 withhold_submission_answer: self.withhold_submission_answer,
                 status_gate: self.status_gate.clone(),
+                status_transit: self.status_transit,
                 severed: Arc::clone(&self.severed),
                 statuses: Arc::clone(&self.statuses),
+                failed_statuses: Arc::clone(&self.failed_statuses),
             }) as Box<dyn Preauth>)
         })
     }
@@ -637,8 +654,10 @@ struct Watched {
     answers_before_silence: Option<usize>,
     withhold_submission_answer: bool,
     status_gate: Option<Arc<Gate>>,
+    status_transit: Option<Duration>,
     severed: Arc<AtomicBool>,
     statuses: Arc<AtomicUsize>,
+    failed_statuses: Arc<AtomicUsize>,
 }
 
 fn altered(value: &str) -> String {
@@ -718,7 +737,14 @@ impl Preauth for Watched {
             {
                 std::future::pending::<()>().await;
             }
-            self.inner.status(params).await
+            if let Some(transit) = self.status_transit {
+                tokio::time::sleep(transit).await;
+            }
+            let answer = self.inner.status(params).await;
+            if answer.is_err() {
+                self.failed_statuses.fetch_add(1, Ordering::SeqCst);
+            }
+            answer
         })
     }
 }
@@ -1640,6 +1666,97 @@ async fn the_last_question_waits_for_the_connections_last_call() {
     made(&link).fresh_dials_fail.store(false, Ordering::SeqCst);
     let paired = outcome(attempt).await.expect("paired");
     assert_eq!(paired.host_endpoint_id, host.network().endpoint_id());
+}
+
+/// KR-REQ-10.36, KR-REQ-10.23: the owner approves with seconds left in the attempt, while new
+/// connections fail. Those seconds belong to the connection the device holds: it goes on asking
+/// there at its usual pace, each answer now final, and finds itself committed, rather than
+/// spending them on fresh connections that cannot open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_attempts_last_seconds_go_to_the_connection_the_device_holds() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let invited = issue_direct(environment, &mut client, &owner).await;
+    let expires_at_ms = calls::direct_payload(&invited).expires_at_ms.get();
+
+    let (link, making) = watching(|link| {
+        link.fresh_dials_fail.store(true, Ordering::SeqCst);
+    });
+    let device = ProductDevice::new(Arc::new(host.room.clone()), making);
+    let (attempt, mut shown) = device.redeem(&direct_text(&invited));
+    awaiting_value(&mut shown).await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while made(&link).statuses.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the device asks where its attempt stands");
+    // The answer is in, and the device waits its interval before the next question.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
+        .await
+        .expect("the owner approves");
+    // The device's clock comes to eight seconds before the attempt's deadline, a minute past the
+    // invitation's expiry.
+    let late = expires_at_ms + 52_000;
+    device.clock.advance(Duration::from_millis(
+        late.saturating_sub(device.clock.wall_clock_ms()),
+    ));
+    let paired = outcome(attempt).await.expect("paired");
+    assert_eq!(paired.host_endpoint_id, host.network().endpoint_id());
+}
+
+/// KR-REQ-10.23: a slow network. The host's answer to the first connection's handshake reaches the
+/// device eight seconds late, every status question takes three seconds to reach the host, and new
+/// connections fail. The host ends an unpaired connection a minute after it answered that
+/// handshake, so the device counts the connection's time from before it asked, and no question it
+/// sends there meets a connection the host has ended: it asks its last one at the connection's last
+/// call and then lets the connection go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_question_goes_to_a_connection_the_host_has_ended() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let invited = issue_direct(environment, &mut client, &owner).await;
+
+    let (link, making) = watching(|link| {
+        link.first_open_delay = Some(Duration::from_secs(8));
+        link.status_transit = Some(Duration::from_secs(3));
+        link.fresh_dials_fail.store(true, Ordering::SeqCst);
+    });
+    let device = ProductDevice::new(Arc::new(host.room.clone()), making);
+    let (attempt, mut shown) = device.redeem(&direct_text(&invited));
+    let seen = record(shown.clone());
+    awaiting_value(&mut shown).await;
+    tokio::time::timeout(Duration::from_secs(120), async {
+        while !seen
+            .lock()
+            .expect("the record")
+            .iter()
+            .any(|state| matches!(state, AttemptState::Reconnecting { .. }))
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the device lets the connection go, and no new one opens");
+    attempt.abort();
+    let watched = made(&link);
+    assert!(
+        watched.statuses.load(Ordering::SeqCst) >= 6,
+        "the device asked where its attempt stood on the connection"
+    );
+    assert_eq!(
+        watched.failed_statuses.load(Ordering::SeqCst),
+        0,
+        "a question met a connection the host had ended"
+    );
 }
 
 /// KR-REQ-10.23: a host may serve an unpaired connection by other limits than the ones a device
