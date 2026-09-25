@@ -15,7 +15,9 @@
 //! counts do not add up to the summary it printed is reported as unreadable rather than guessed at.
 //!
 //! A test that returns early because what it needs is absent passes, and says so on a line of its
-//! own that starts with one of [`EARLY_RETURN`]. The reading finds that line in what the test
+//! own that starts with one of [`EARLY_RETURN`], or names itself first and then says
+//! [`EARLY_RETURN_NAMED`]: `container: skipped, because podman is not installed`. The reading
+//! finds that line in what the test
 //! wrote: in its `---- <name> stdout ----` block, which `--show-output` prints for every test
 //! that passed; between its name and its verdict, when the tests run one at a time with their
 //! output shown as it is written; or anywhere in the run of a binary that ran that one test alone.
@@ -27,6 +29,10 @@ use std::collections::BTreeMap;
 /// How the suites begin the line a test prints when it returns early, for want of something it
 /// needs: `skipped: <why>`, `skipping: <why>`, `not exercised: <why>`.
 pub const EARLY_RETURN: &[&str] = &["skipped:", "skipping:", "not exercised"];
+
+/// How a suite that names itself first says a test of it returned early: `<suite>: skipped, because
+/// <why>`.
+pub const EARLY_RETURN_NAMED: &str = ": skipped, because ";
 
 /// What one test came to.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,7 +86,7 @@ struct Reading {
 /// Whether `line` is a test saying it returned early.
 fn says_early_return(line: &str) -> bool {
     let line = line.trim_start();
-    EARLY_RETURN.iter().any(|marker| line.starts_with(marker))
+    EARLY_RETURN.iter().any(|marker| line.starts_with(marker)) || line.contains(EARLY_RETURN_NAMED)
 }
 
 /// Whether a line's text after a test's name is its verdict rather than something it wrote.
@@ -430,9 +436,10 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
         let shown = "\
      Running tests/shells.rs (target/debug/deps/shells-5)
 
-running 3 tests
+running 4 tests
 test drives_fish ... ok
 test drives_zsh ... ok
+test in_a_container ... ok
 test fails ... FAILED
 
 successes:
@@ -445,10 +452,14 @@ skipped: fish is on neither this test's PATH nor any of its locations
 zsh: /bin/zsh
 a line that says nothing about returning
 
+---- in_a_container stdout ----
+container: skipped, because podman is not installed on this machine
+
 
 successes:
     drives_fish
     drives_zsh
+    in_a_container
 
 failures:
 
@@ -458,7 +469,7 @@ skipped: this is a failure's output, and it failed
 failures:
     fails
 
-test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
 ";
         let binaries = read(shown);
         assert_eq!(
@@ -468,6 +479,12 @@ test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             )
         );
         assert_eq!(binaries[0].tests["drives_zsh"], Outcome::Passed);
+        assert_eq!(
+            binaries[0].tests["in_a_container"],
+            Outcome::Skipped(
+                "container: skipped, because podman is not installed on this machine".to_owned()
+            )
+        );
         assert_eq!(binaries[0].tests["fails"], Outcome::Failed);
         assert!(binaries[0].readable, "{:?}", binaries[0]);
 
