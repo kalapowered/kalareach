@@ -95,6 +95,11 @@ struct State {
     answers_received: usize,
     /// The directory `kr` keeps answers in.
     store: PathBuf,
+    /// Whether an answer reaching the worker also leaves a file in the store that no kept answer
+    /// reads as, as a store damaged part way through would hold.
+    spoils_store: bool,
+    /// The file it left there.
+    spoiled: Option<PathBuf>,
 }
 
 /// A host tree with one scripted session in it, holding one question.
@@ -175,6 +180,8 @@ impl Host {
             behaviour,
             answers_received: 0,
             store: temp.paths().state_root().join("kept-answers"),
+            spoils_store: false,
+            spoiled: None,
         }));
         let serving = tokio::spawn(serve(
             listener,
@@ -195,6 +202,20 @@ impl Host {
 
     fn behave(&self, behaviour: Behaviour) {
         self.state().behaviour = behaviour;
+    }
+
+    /// Has the next answer that reaches the worker leave a file in the store that cannot be read.
+    fn spoil_store_on_answer(&self) {
+        self.state().spoils_store = true;
+    }
+
+    /// Takes away the file the worker left in the store.
+    fn mend_store(&self) {
+        let mut state = self.state();
+        state.spoils_store = false;
+        if let Some(spoiled) = state.spoiled.take() {
+            std::fs::remove_file(spoiled).expect("the spoiled file goes");
+        }
     }
 
     /// Makes the store of kept answers read-only, creating it first when `kr` has not.
@@ -551,6 +572,7 @@ async fn serve_one(
                     .unwrap_or_else(PoisonError::into_inner)
                     .behaviour;
                 if mutation.method.as_str() == "question.answer" {
+                    spoil(&state);
                     match behaviour {
                         Behaviour::TakesAnswersAndDropsTheReply => {
                             let _ = take(&state, &mutation.params);
@@ -618,6 +640,18 @@ async fn serve_one(
             return;
         }
     }
+}
+
+/// Leaves a file in the store that no kept answer reads as, when the worker is set to.
+fn spoil(state: &Mutex<State>) {
+    let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+    if !state.spoils_store || state.spoiled.is_some() {
+        return;
+    }
+    let spoiled = state.store.join(format!("{}.answer", kr_ipc::new_uuid()));
+    std::fs::write(&spoiled, b"not an answer").expect("a spoiled file");
+    std::fs::set_permissions(&spoiled, std::fs::Permissions::from_mode(0o600)).expect("owner-only");
+    state.spoiled = Some(spoiled);
 }
 
 /// A whole frame whose payload is not a message.
@@ -1268,6 +1302,62 @@ async fn an_answer_a_worker_took_is_never_called_unsent_when_its_reply_cannot_be
     assert_eq!(document["drafts"][0]["reason_code"], "QUESTION_RESOLVED");
     assert!(!host.kept().exists(), "the copy is retired");
     assert_eq!(host.answers_received(), 1, "and it was not sent again");
+}
+
+/// KR-REQ-11.63: what an attempt established about an answer is reported whatever the store says
+/// afterwards. A worker that took the answer, where the store can no longer be read, is still
+/// reported as having taken it, by `kr question answer` and by `kr question send`, and an answer
+/// whose fate is unknown is still reported as unknown; the store's state is said beside it. The
+/// control is the same store mended, where the copy is retired as answered and never sent again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn what_an_attempt_established_is_reported_when_the_store_cannot_be_read_afterwards() {
+    let host = Host::start(Behaviour::TakesAnswersAndRepliesUnreadably).await;
+    let question = host.question();
+    host.spoil_store_on_answer();
+    let (status, document) = host.json(&["question", "answer", &question, "--choice", "left"]);
+    host.mend_store();
+    assert_eq!(status, Some(1), "{document}");
+    assert_eq!(document["code"], "INVALID_ARGUMENT", "{document}");
+    let message = document["message"].as_str().expect("a message");
+    assert!(message.contains("worker took the answer"), "{message}");
+    assert!(message.contains("cannot be read"), "{message}");
+    assert!(!message.contains("did not send"), "{message}");
+    assert!(!host.kept().exists(), "nothing is kept");
+    assert_eq!(host.answers_received(), 1);
+
+    let host = kept_answer().await;
+    let question = host.question();
+    host.behave(Behaviour::TakesAnswersAndRepliesUnreadably);
+    host.spoil_store_on_answer();
+    let (status, document) = host.json(&["question", "send", &question]);
+    host.mend_store();
+    assert_eq!(status, Some(1), "{document}");
+    assert_eq!(document["code"], "INVALID_ARGUMENT", "{document}");
+    let message = document["message"].as_str().expect("a message");
+    assert!(message.contains("worker took the answer"), "{message}");
+    assert!(message.contains("cannot be read"), "{message}");
+    assert!(!message.contains("did not send"), "{message}");
+    host.behave(Behaviour::Serves);
+    let (status, document) = host.json(&["question", "drafts"]);
+    assert_eq!(status, Some(0), "{document}");
+    assert_eq!(document["drafts"][0]["state"], "retired", "{document}");
+    assert_eq!(document["drafts"][0]["reason_code"], "QUESTION_RESOLVED");
+    assert_eq!(host.answers_received(), 1, "and it was not sent again");
+
+    let host = kept_answer().await;
+    let question = host.question();
+    host.behave(Behaviour::TakesAnswersAndDropsTheReply);
+    host.spoil_store_on_answer();
+    let (status, document) = host.json(&["question", "send", &question]);
+    host.mend_store();
+    assert_eq!(status, Some(1), "{document}");
+    assert_eq!(document["code"], "OUTCOME_UNKNOWN", "{document}");
+    assert!(document.get("kept").is_none(), "{document}");
+    let message = document["message"].as_str().expect("a message");
+    assert!(message.contains("is not known"), "{message}");
+    assert!(message.contains("cannot be read"), "{message}");
+    assert!(!message.contains("did not send"), "{message}");
+    assert!(host.kept().is_file(), "the copy is still there");
 }
 
 /// KR-REQ-11.63: an answer `kr question send` sent and its worker took is never called unsent, even

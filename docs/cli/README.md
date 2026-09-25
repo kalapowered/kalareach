@@ -547,7 +547,9 @@ connection, so it is shown as a refusal that says the answer's fate is not known
 kept. An answer that can be neither taken nor kept is reported as both, with exit status 1. A worker
 that replied that it took the answer took it: when that reply cannot be read, or the copy kept on
 this device cannot be removed afterwards, the command says the worker took the answer and exits with
-1, and the next `kr question drafts` retires any copy still kept.
+1, and the next `kr question drafts` retires any copy still kept. When the store on this device
+cannot be read after an attempt, the command says so beside what the attempt established, never in
+place of it, and exits with 1.
 
 `kr question drafts` reads each kept answer's question again. An answer whose question is still
 pending at the revision it answered is offered, and stays kept. Any other is retired: its question

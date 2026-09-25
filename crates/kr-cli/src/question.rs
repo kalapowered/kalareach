@@ -149,16 +149,13 @@ pub async fn answer(
         // What the failure says of the answer is what the attempt established, not what the
         // failure's kind suggests.
         Err(error) => Err(match (workers.delivery(), error) {
-            (Delivery::Taken, error) => {
-                let still_kept = kept_draft(&drafts, question_id)?.is_some();
-                taken(
-                    &workers,
-                    descriptor.session_id,
-                    question_id,
-                    error,
-                    still_kept,
-                )
-            }
+            (Delivery::Taken, error) => taken(
+                &workers,
+                descriptor.session_id,
+                question_id,
+                error,
+                &kept_copy(&drafts, question_id),
+            ),
             // Keeping it was the fallback, and it failed too.
             (_, error @ (AnswerError::Store { .. } | AnswerError::Unreadable { .. })) => {
                 lost(&workers, question_id, &error)
@@ -227,16 +224,22 @@ pub async fn send(
         Ok(question) => Ok(question),
         // The library keeps a draft it could not send for any reason but its question's end, so
         // what is still in the store says whether it stayed kept. The failure is reported as
-        // itself, with that beside it.
+        // itself, with what the store says beside it, and a store that cannot be read replaces
+        // nothing the attempt established.
         Err(error) => {
-            let still_kept = !matches!(error, AnswerError::Retired(_))
-                && kept_draft(&drafts, question_id)?.is_some();
-            Err(if workers.delivery() == Delivery::Taken {
-                taken(&workers, draft.session_id, question_id, error, still_kept)
-            } else if still_kept {
-                still_kept_failure(&workers, question_id, error)
+            let copy = if matches!(error, AnswerError::Retired(_)) {
+                KeptCopy::None
             } else {
-                answer_failure(error)
+                kept_copy(&drafts, question_id)
+            };
+            Err(if workers.delivery() == Delivery::Taken {
+                taken(&workers, draft.session_id, question_id, error, &copy)
+            } else {
+                match copy {
+                    KeptCopy::Kept => still_kept_failure(&workers, question_id, error),
+                    KeptCopy::None => answer_failure(error),
+                    KeptCopy::Unreadable(why) => unknown_copy(&workers, question_id, error, &why),
+                }
             })
         }
     }
@@ -278,6 +281,28 @@ pub fn kept_answers(paths: &HostPaths) -> Result<AnswerDrafts> {
     AnswerDrafts::open(paths.state_root().join(KEPT_ANSWERS)).map_err(answer_failure)
 }
 
+/// What the store on this device says of the answer kept for one question.
+#[derive(Debug)]
+enum KeptCopy {
+    /// An answer to the question is kept.
+    Kept,
+    /// None is kept.
+    None,
+    /// The store cannot be read, so whether one is kept is not known.
+    Unreadable(String),
+}
+
+/// Whether an answer to `question_id` is kept on this device, read without failing, so that once
+/// an answer went out a store that cannot be read is reported beside what the attempt established
+/// and never in place of it.
+fn kept_copy(drafts: &AnswerDrafts, question_id: QuestionId) -> KeptCopy {
+    match drafts.drafts() {
+        Ok(kept) if kept.iter().any(|draft| draft.question_id == question_id) => KeptCopy::Kept,
+        Ok(_) => KeptCopy::None,
+        Err(error) => KeptCopy::Unreadable(error.to_string()),
+    }
+}
+
 /// The answer kept for one question, when there is one.
 fn kept_draft(drafts: &AnswerDrafts, question_id: QuestionId) -> Result<Option<AnswerDraft>> {
     Ok(drafts
@@ -310,18 +335,21 @@ fn taken(
     session_id: SessionId,
     question_id: QuestionId,
     error: AnswerError,
-    still_kept: bool,
+    copy: &KeptCopy,
 ) -> CliError {
     let after = workers
         .failure()
         .map_or_else(|| error.to_string(), |failure| failure.why);
-    let copy = if still_kept {
-        format!(
+    let copy = match copy {
+        KeptCopy::Kept => format!(
             "an answer to question {question_id} is still kept on this device, and \
              `kr question drafts` retires it once its question reads as answered"
-        )
-    } else {
-        "nothing is kept for it".to_owned()
+        ),
+        KeptCopy::None => "nothing is kept for it".to_owned(),
+        KeptCopy::Unreadable(why) => format!(
+            "whether an answer to question {question_id} is still kept on this device cannot be \
+             read ({why})"
+        ),
     };
     CliError::Unfinished {
         code: error.code(),
@@ -329,6 +357,27 @@ fn taken(
             "session {session_id}'s worker took the answer to question {question_id}, but \
              {after}; {copy}"
         ),
+    }
+}
+
+/// The failure `kr question send` reports for a kept answer it did not deliver when the store
+/// cannot say whether the answer is still kept: what the attempt established, and that.
+fn unknown_copy(
+    workers: &Workers,
+    question_id: QuestionId,
+    error: AnswerError,
+    why: &str,
+) -> CliError {
+    let retention = format!(
+        "whether the answer to question {question_id} is still kept on this device cannot be \
+         read ({why})"
+    );
+    let reason = workers
+        .failure()
+        .map_or_else(|| error.to_string(), |failure| failure.why);
+    CliError::Unfinished {
+        code: error.code(),
+        message: format!("{}: {reason}", retained(workers.delivery(), &retention)),
     }
 }
 
