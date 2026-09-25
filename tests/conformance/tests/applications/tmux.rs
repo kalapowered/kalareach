@@ -225,10 +225,11 @@ async fn a_click_in_the_other_pane_makes_it_the_active_one() {
 async fn a_focus_report_reaches_the_program_in_the_pane_that_asked_for_it() {
     let directory = tempfile::tempdir().expect("a directory");
     let tmux = Tmux::new(directory.path());
-    // The pane's program asks for focus reports and shows what it reads.
+    // The pane's program asks for focus reports and shows what it reads, a line at a time, with an
+    // escape written as `^[`.
     let mut session = Session::start(tmux.launch(
         directory.path(),
-        "printf '\\033[?1004hkr-focus\\n'; stty -icanon -echo; exec od -c",
+        "printf '\\033[?1004hkr-focus\\n'; stty -icanon -echo; exec cat -v",
     ))
     .await;
     let screen = session
@@ -236,14 +237,14 @@ async fn a_focus_report_reaches_the_program_in_the_pane_that_asked_for_it() {
         .await;
     assert!(screen.mode(1004), "focus events: {}", screen.modes);
     session.type_bytes(b"\x1b[O\x1b[I");
-    // `od -c` writes what it read in blocks of sixteen bytes; the two reports and ten more fill one.
-    session.type_bytes(b"0123456789");
+    // Enter ends the line, which is when the program writes it.
+    session.type_bytes(b"\r");
     let screen = session
         .wait_for("the focus reports in the pane", |screen| {
-            screen.shows("033   [   O 033   [   I")
+            screen.shows("^[[O^[[I")
         })
         .await;
-    assert!(screen.shows("033   [   O 033   [   I"), "{screen}");
+    assert!(screen.shows("^[[O^[[I"), "{screen}");
     no_query_reached_the_terminal(&session).await;
 }
 
@@ -261,10 +262,11 @@ async fn a_key_in_the_modify_other_keys_protocol_reaches_the_pane_that_asked_for
          set -g extended-keys-format xterm\n\
          set -as terminal-features 'xterm*:extkeys'\n",
     );
-    // The pane's program asks for modifyOtherKeys at level 2 and shows what it reads.
+    // The pane's program asks for modifyOtherKeys at level 2 and shows what it reads, a line at a
+    // time, with an escape written as `^[`.
     let mut session = Session::start(tmux.launch(
         directory.path(),
-        "printf '\\033[>4;2mkr-keys\\n'; stty -icanon -echo; exec od -c",
+        "printf '\\033[>4;2mkr-keys\\n'; stty -icanon -echo; exec cat -v",
     ))
     .await;
     let screen = session
@@ -277,9 +279,9 @@ async fn a_key_in_the_modify_other_keys_protocol_reaches_the_pane_that_asked_for
     );
     // Control-Enter, as xterm writes it at that level: `CSI 27 ; 5 ; 13 ~`.
     session.type_bytes(b"\x1b[27;5;13~");
-    // `od -c` writes what it read in blocks of sixteen bytes; the key's ten and six more fill one.
-    session.type_bytes(b"012345");
-    let key = "033   [   2   7   ;   5   ;   1   3   ~";
+    // Enter ends the line, which is when the program writes it.
+    session.type_bytes(b"\r");
+    let key = "^[[27;5;13~";
     let screen = session
         .wait_for("control-Enter in the pane", |screen| screen.shows(key))
         .await;
