@@ -285,21 +285,26 @@ impl WorkerService {
         config: crate::broker::commands::CommandBackendsConfig,
     ) -> Arc<crate::broker::commands::CommandBackends> {
         // A program the integrated route did not launch is adopted from the same connectors, by
-        // a watch of the terminal's foreground that ends with the session.
+        // a watch of the terminal's foreground, and its adoption ends with the backends when the
+        // session closes.
         #[cfg(unix)]
-        let adoptions = Arc::new(crate::broker::adoption::Adoptions::new(
-            Arc::clone(&self.broker),
-            Arc::clone(&config.sources),
-            config.environment_id,
-        ));
-        let backends = Arc::new(
-            crate::broker::commands::CommandBackends::new(
+        let adoptions = Arc::new(
+            crate::broker::adoption::Adoptions::new(
                 Arc::clone(&self.broker),
-                config,
-                tokio::runtime::Handle::current(),
+                Arc::clone(&config.sources),
+                config.environment_id,
             )
             .with_views(Arc::downgrade(&self.runtime)),
         );
+        let backends = crate::broker::commands::CommandBackends::new(
+            Arc::clone(&self.broker),
+            config,
+            tokio::runtime::Handle::current(),
+        )
+        .with_views(Arc::downgrade(&self.runtime));
+        #[cfg(unix)]
+        let backends = backends.with_adoptions(Arc::clone(&adoptions));
+        let backends = Arc::new(backends);
         self.runtime
             .session()
             .set_command_backends(Arc::clone(&backends));

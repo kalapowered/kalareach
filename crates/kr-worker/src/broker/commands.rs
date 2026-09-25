@@ -209,21 +209,68 @@ struct Backend {
     views: Option<(SessionId, Weak<crate::runtime::SessionRuntime>)>,
     /// What the session's views were last told this backend's instance is.
     ///
-    /// Every announcement about the instance is made while this is held, so the views hear its
-    /// start, a refusal of its bridges and its end in the order they happened, whichever task
-    /// found each.
+    /// Every announcement about the instance is decided while this is held, and made while it is
+    /// still held, so the views hear its start, a refusal of its bridges and its end in the order
+    /// they were decided, whichever task found each. The session's lock is taken first.
     announced: Mutex<Announced>,
     #[cfg(feature = "testing")]
     confirm_pause: Arc<Mutex<Option<ConfirmPause>>>,
 }
 
-/// What a backend's instance was last announced as.
+/// What a backend's instance was last announced as, and what may still be announced about it.
 #[derive(Debug, Default)]
 struct Announced {
     /// The instance as the views were told, once its program was announced as started.
     summary: Option<kr_protocol::projection::AgentInstanceSummary>,
     /// Why the instance's bridges are refused, where one was, whether or not it was announced yet.
     refusal: Option<String>,
+    /// Set once the instance's end is decided, by its program's exit or by its session closing.
+    /// Nothing about it is announced afterwards.
+    ended: bool,
+}
+
+impl Announced {
+    /// The program's start, unless its start was announced already or its end came first. A
+    /// refusal found before the start goes out with it.
+    fn start(
+        &mut self,
+        mut summary: kr_protocol::projection::AgentInstanceSummary,
+    ) -> Option<kr_protocol::projection::AgentInstanceSummary> {
+        if self.ended || self.summary.is_some() {
+            return None;
+        }
+        summary.refusal = kr_protocol::scalars::Nullable(self.refusal.clone());
+        self.summary = Some(summary.clone());
+        Some(summary)
+    }
+
+    /// A refusal of the instance's bridges: kept for the start where the start is still to come,
+    /// announced once for each new reason where it went, and never after the end.
+    fn refuse(&mut self, why: &str) -> Option<kr_protocol::projection::AgentInstanceSummary> {
+        let why = bounded_refusal(why);
+        if self.ended || self.refusal.as_deref() == Some(why) {
+            return None;
+        }
+        self.refusal = Some(why.to_owned());
+        let summary = self.summary.as_mut()?;
+        summary.refusal = kr_protocol::scalars::Nullable::some(why.to_owned());
+        Some(summary.clone())
+    }
+
+    /// The instance's end, once, with the refusal that stood: announced where the start was.
+    fn end(
+        &mut self,
+        at: kr_protocol::scalars::TimestampMs,
+    ) -> Option<kr_protocol::projection::AgentInstanceSummary> {
+        if self.ended {
+            return None;
+        }
+        self.ended = true;
+        let summary = self.summary.as_mut()?;
+        summary.ended_at = kr_protocol::scalars::Nullable::some(at);
+        summary.refusal = kr_protocol::scalars::Nullable(self.refusal.clone());
+        Some(summary.clone())
+    }
 }
 
 impl std::fmt::Debug for Backend {
@@ -279,6 +326,9 @@ pub struct CommandBackends {
     ///
     /// Held weakly: the session holds these backends, so a strong hold would keep both alive.
     views: Option<Weak<crate::runtime::SessionRuntime>>,
+    /// The session's adoptions, which end with its backends when the session closes.
+    #[cfg(unix)]
+    adoptions: Option<Arc<crate::broker::adoption::Adoptions>>,
     /// Where the next committed launch stops before the launcher is told, for this host's own tests.
     #[cfg(feature = "testing")]
     confirm_pause: Arc<Mutex<Option<ConfirmPause>>>,
@@ -355,6 +405,8 @@ impl CommandBackends {
             backends: Mutex::new(Vec::new()),
             hashed: Arc::new(HashedFiles::default()),
             views: None,
+            #[cfg(unix)]
+            adoptions: None,
             #[cfg(feature = "testing")]
             confirm_pause: Arc::new(Mutex::new(None)),
             #[cfg(feature = "testing")]
@@ -367,6 +419,14 @@ impl CommandBackends {
     #[must_use]
     pub fn with_views(mut self, runtime: Weak<crate::runtime::SessionRuntime>) -> Self {
         self.views = Some(runtime);
+        self
+    }
+
+    /// Ends the session's adoptions with its backends when the session closes.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn with_adoptions(mut self, adoptions: Arc<crate::broker::adoption::Adoptions>) -> Self {
+        self.adoptions = Some(adoptions);
         self
     }
 
@@ -515,19 +575,34 @@ impl CommandBackends {
         end_lines(&mut backends, |generation| generation <= prompt_generation);
     }
 
-    /// Retires every backend, because the session is closing, and removes the session's root.
+    /// Retires every backend, because the session is closing, removes the session's root, and
+    /// returns the ends the session is to announce.
     ///
-    /// Nothing a launch is running is ended here: the session's own closure owns the program. A
-    /// launcher that looks now finds nothing to present to, and runs what was typed.
-    pub fn close(&self) {
+    /// No program is stopped here: the session's own closure owns the programs. What ends here is
+    /// each committed launch's instance, with its grant, since the session is ending its program,
+    /// and every instance the session adopted. It is called with the session's lock held, so
+    /// nothing here takes it: the session announces what this returns. A launcher that looks now
+    /// finds nothing to present to, and runs what was typed.
+    #[must_use]
+    pub fn close(&self) -> Vec<kr_protocol::projection::AgentInstanceSummary> {
         let backends = std::mem::take(
             &mut *self
                 .backends
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
+        let mut ended = Vec::new();
         for backend in backends {
+            let committed = matches!(
+                *backend.lifecycle.state.borrow(),
+                BackendState::Committed(_)
+            );
             backend.retire();
+            ended.extend(backend.end_at_close(&self.broker, committed));
+        }
+        #[cfg(unix)]
+        if let Some(adoptions) = self.adoptions.as_ref() {
+            ended.extend(adoptions.close());
         }
         let root = self
             .root
@@ -537,6 +612,7 @@ impl CommandBackends {
         if let Some(root) = root {
             let _ = std::fs::remove_dir_all(root);
         }
+        ended
     }
 
     /// Returns the session's root, once the first establish has made it.
@@ -761,10 +837,6 @@ impl Backend {
     /// Announces the committed program to the session's views: launched through the integration,
     /// with the refusal of its bridges where one came first.
     fn announce_started(&self) {
-        let mut announced = self
-            .announced
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let summary = kr_protocol::projection::AgentInstanceSummary {
             application_instance_id: self.application_instance_id,
             plugin_id: kr_protocol::scalars::Nullable::some(self.connector.plugin_id()),
@@ -773,59 +845,81 @@ impl Backend {
             bypass: kr_protocol::scalars::Nullable::null(),
             started_at: kr_ipc::now_ms(),
             ended_at: kr_protocol::scalars::Nullable::null(),
-            refusal: kr_protocol::scalars::Nullable(announced.refusal.clone()),
+            refusal: kr_protocol::scalars::Nullable::null(),
         };
-        announced.summary = Some(summary.clone());
-        self.publish(summary);
+        self.announce(|announced| announced.start(summary));
     }
 
     /// Records why the instance's bridges are refused, and announces it once the program has been.
     ///
     /// A refusal stands for every later bridge and is found again by each, so only a new reason is
-    /// announced.
+    /// announced, and none after the end.
     fn announce_refusal(&self, why: &str) {
-        let mut announced = self
-            .announced
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let why = bounded_refusal(why);
-        if announced.refusal.as_deref() == Some(why) {
-            return;
-        }
-        announced.refusal = Some(why.to_owned());
-        if let Some(summary) = announced.summary.as_mut() {
-            summary.refusal = kr_protocol::scalars::Nullable::some(why.to_owned());
-            let summary = summary.clone();
-            self.publish(summary);
-        }
+        self.announce(|announced| announced.refuse(why));
     }
 
-    /// Announces the end of the program that was announced as started.
+    /// Announces the end of the program that was announced as started, unless its session's
+    /// closing announced it first.
     fn announce_ended(&self) {
-        let mut announced = self
-            .announced
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(summary) = announced.summary.as_mut() {
-            summary.ended_at = kr_protocol::scalars::Nullable::some(kr_ipc::now_ms());
-            let summary = summary.clone();
-            self.publish(summary);
-        }
+        self.announce(|announced| announced.end(kr_ipc::now_ms()));
     }
 
-    /// Hands one announcement to the session's views, where this backend was given them.
+    /// Decides one announcement and makes it to the session's views, where this backend was given
+    /// them.
     ///
-    /// Called with the announced state held, which is what orders the announcements; the session
-    /// never takes that state, so holding it while the session's lock is taken orders nothing
-    /// against the session.
-    fn publish(&self, summary: kr_protocol::projection::AgentInstanceSummary) {
-        if let Some(runtime) = self
+    /// The session's lock is taken first and the announced state second, here and when the
+    /// session's closing ends the instance, so the views hear each instance's announcements in the
+    /// order they were decided and no two locks are ever taken the other way round.
+    fn announce(
+        &self,
+        decide: impl FnOnce(&mut Announced) -> Option<kr_protocol::projection::AgentInstanceSummary>,
+    ) {
+        let runtime = self
             .views
             .as_ref()
-            .and_then(|(_, runtime)| runtime.upgrade())
-        {
-            runtime.session().announce_instance(summary);
+            .and_then(|(_, runtime)| runtime.upgrade());
+        let Some(runtime) = runtime else {
+            let _ = decide(
+                &mut self
+                    .announced
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            return;
+        };
+        let mut session = runtime.session();
+        let decided = decide(
+            &mut self
+                .announced
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        if let Some(summary) = decided {
+            session.announce_instance(summary);
         }
+    }
+
+    /// Ends the instance of a launch this backend committed, because its session is closing, and
+    /// returns what the session is to announce.
+    ///
+    /// Called with the session's lock held. Nothing here stops the program, which the session's
+    /// own closure ends; what ends here is the instance, its grant and what the views were told,
+    /// so no list the session keeps names a program it is ending.
+    fn end_at_close(
+        &self,
+        broker: &Broker,
+        committed: bool,
+    ) -> Option<kr_protocol::projection::AgentInstanceSummary> {
+        if committed {
+            let _ = broker.end(
+                self.application_instance_id,
+                crate::broker::InstanceEnding::NativeExit,
+            );
+        }
+        self.announced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .end(kr_ipc::now_ms())
     }
 
     fn is_unbound(&self) -> bool {
@@ -1652,6 +1746,84 @@ const fn forward_now() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn summary() -> kr_protocol::projection::AgentInstanceSummary {
+        kr_protocol::projection::AgentInstanceSummary {
+            application_instance_id: ApplicationInstanceId::new(Uuid::from_bytes([3; 16])),
+            plugin_id: kr_protocol::scalars::Nullable::null(),
+            profile_id: kr_protocol::scalars::Nullable::null(),
+            mode: IntegrationMode::NativeBridge,
+            bypass: kr_protocol::scalars::Nullable::null(),
+            started_at: kr_protocol::scalars::TimestampMs::new(1),
+            ended_at: kr_protocol::scalars::Nullable::null(),
+            refusal: kr_protocol::scalars::Nullable::null(),
+        }
+    }
+
+    /// KR-REQ-12.07: an instance's end is final and carries the refusal that stood; a refusal found
+    /// before the start goes out with the start, a reason goes out once, and nothing goes out after
+    /// the end, whichever task finds it.
+    #[test]
+    fn kr_req_12_07_an_instance_s_end_is_final_and_carries_the_refusal_that_stood() {
+        let mut announced = Announced::default();
+        assert!(
+            announced.refuse("first").is_none(),
+            "nothing is announced before the start"
+        );
+        let started = announced.start(summary()).expect("the start");
+        assert_eq!(started.refusal.as_ref().map(String::as_str), Some("first"));
+        assert!(
+            announced.start(summary()).is_none(),
+            "the start goes out once"
+        );
+        let refused = announced.refuse("second").expect("a new reason");
+        assert_eq!(refused.refusal.as_ref().map(String::as_str), Some("second"));
+        assert!(
+            announced.refuse("second").is_none(),
+            "a reason goes out once"
+        );
+        let ended = announced
+            .end(kr_protocol::scalars::TimestampMs::new(9))
+            .expect("the end");
+        assert!(ended.ended_at.is_present());
+        assert_eq!(ended.refusal.as_ref().map(String::as_str), Some("second"));
+        assert!(
+            announced.refuse("third").is_none(),
+            "a refusal found after the end is not announced"
+        );
+        assert!(
+            announced
+                .end(kr_protocol::scalars::TimestampMs::new(10))
+                .is_none(),
+            "the end goes out once"
+        );
+    }
+
+    /// KR-REQ-12.07: an instance whose end was decided before its start was announced, as a session
+    /// that closes before the supervision first runs decides it, is never announced as started.
+    #[test]
+    fn kr_req_12_07_an_end_before_the_start_announces_nothing() {
+        let mut announced = Announced::default();
+        assert!(
+            announced
+                .end(kr_protocol::scalars::TimestampMs::new(9))
+                .is_none()
+        );
+        assert!(
+            announced.start(summary()).is_none(),
+            "a start after the end is not announced"
+        );
+    }
+
+    /// A refusal's reason is cut at a character boundary within its bound.
+    #[test]
+    fn a_long_refusal_is_cut_at_a_character_boundary() {
+        let long = "é".repeat(MAX_REFUSAL_BYTES);
+        let cut = bounded_refusal(&long);
+        assert!(cut.len() <= MAX_REFUSAL_BYTES);
+        assert!(cut.len() >= MAX_REFUSAL_BYTES - 1);
+        assert_eq!(bounded_refusal("short"), "short");
+    }
 
     fn registration() -> Arc<Registration> {
         Arc::new(Registration::new(

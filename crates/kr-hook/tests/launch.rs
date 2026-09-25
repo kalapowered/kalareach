@@ -146,7 +146,7 @@ struct Shell {
     runtime: tokio::runtime::Runtime,
     broker: Arc<Broker>,
     sources: Arc<ConnectorSources>,
-    backends: CommandBackends,
+    backends: Arc<CommandBackends>,
     executable: PathBuf,
     other: PathBuf,
     reports: PathBuf,
@@ -225,6 +225,14 @@ impl Shell {
         });
         if let Some(view) = view.as_ref() {
             backends = backends.with_views(Arc::downgrade(&view.runtime));
+        }
+        let backends = Arc::new(backends);
+        // The viewed session holds its backends, as a worker's session does, so its closing ends
+        // them.
+        if let Some(view) = view.as_ref() {
+            view.runtime
+                .session()
+                .set_command_backends(Arc::clone(&backends));
         }
         let reports = placed.host.root().join("reports");
         std::fs::create_dir_all(&reports).expect("a directory for reports");
@@ -436,7 +444,7 @@ impl Shell {
 
 impl Drop for Shell {
     fn drop(&mut self) {
-        self.backends.close();
+        let _ = self.backends.close();
     }
 }
 
@@ -989,7 +997,7 @@ fn kr_req_12_07_a_launch_whose_session_closed_before_it_went_runs_as_typed() {
     eventually("the launch is admitted", || registration.exists());
     let admitted_at = Instant::now();
     let instance = Shell::registered_instance(&answer);
-    shell.backends.close();
+    let _ = shell.backends.close();
     eventually("the admission ends with its backend", || {
         shell.broker.binding_state(instance).is_err()
     });
@@ -1019,7 +1027,7 @@ fn kr_req_12_07_a_launch_whose_session_closed_before_it_was_confirmed_runs_as_ty
         .block_on(async { tokio::time::timeout(LIVENESS, arrived).await })
         .expect("the launch is committed")
         .expect("and paused before the launcher is told");
-    shell.backends.close();
+    let _ = shell.backends.close();
     let _ = finish(child);
     assert_typed(
         &shell.report("unconfirmed"),
@@ -1195,7 +1203,7 @@ fn kr_req_12_07_a_launcher_resumed_after_its_session_closed_runs_as_typed() {
         .env("VALUE", fixture::FLAGS[1]);
     let child = stopped.spawn().expect("the shell starts");
     wait_stopped(child.id());
-    shell.backends.close();
+    let _ = shell.backends.close();
     assert!(
         !Shell::directory(&answer).exists(),
         "the session's backends are gone"
@@ -1863,20 +1871,16 @@ fn kr_req_12_07_a_launch_an_adoption_and_their_ends_reach_a_view_in_order() {
         Arc::clone(&shell.broker),
         Arc::clone(&shell.sources),
         EnvironmentId::new(Uuid::from_bytes([4; 16])),
-    );
+    )
+    .with_views(Arc::downgrade(&view.runtime));
     let foreground = kr_worker::broker::adoption::Foreground {
         group: i32::try_from(other.id()).expect("a process identifier"),
         root_shell: kr_ipc::identity::current_process_start_identity().expect("this process"),
         answered: Vec::new(),
     };
-    let mut told = Vec::new();
     eventually("the program is adopted", || {
-        told = adoptions.look(&foreground);
-        !told.is_empty()
+        !adoptions.look(&foreground).is_empty()
     });
-    for summary in told {
-        view.runtime.session().announce_instance(summary);
-    }
     let adopted = shell.announcement();
     assert_eq!(
         adopted.instance.mode,
@@ -1905,9 +1909,8 @@ fn kr_req_12_07_a_launch_an_adoption_and_their_ends_reach_a_view_in_order() {
 
     let _ = other.kill();
     let _ = other.wait();
-    for summary in adoptions.sweep() {
-        view.runtime.session().announce_instance(summary);
-    }
+    let swept = adoptions.sweep();
+    assert_eq!(swept.len(), 1, "the adopted program's end: {swept:?}");
     let adopted_ended = shell.announcement();
     assert_eq!(
         adopted_ended.instance.application_instance_id,
@@ -2006,4 +2009,55 @@ fn kr_req_12_16_a_directory_replaced_before_it_is_opened_is_not_granted() {
         "the directory opened is not the one the program runs in, so none is granted"
     );
     let _ = finish(child);
+}
+
+/// KR-REQ-12.07, KR-REQ-12.16: a session that closes ends the instances of the programs it is
+/// ending and tells its views so while they are attached: the launch's instance and its grant end,
+/// and the session lists nothing. Its program's own exit, later, announces nothing more.
+#[test]
+fn kr_req_12_07_a_session_that_closes_ends_its_launches_and_tells_its_views() {
+    let shell = Shell::with_source(fixture::reading, true);
+    let view = shell.view.as_ref().expect("a view");
+    let project = shell.placed.host.root().join("closing");
+    std::fs::create_dir_all(&project).expect("a project directory");
+    let answer = shell.establish_in(&project);
+    let child = shell.launch_from(&answer, "closing", &[("LINGER", "3")], &project);
+    let instance = instance_of(&shell.report("closing"));
+    let started = shell.announcement();
+    assert_eq!(started.instance.application_instance_id, instance);
+    assert!(shell.broker.host_files(instance).is_some(), "granted");
+
+    let _ = view
+        .runtime
+        .session()
+        .begin_close(kr_protocol::session::ClosureReason::CloseRequested);
+    let ended = shell.announcement();
+    assert_eq!(ended.instance.application_instance_id, instance);
+    assert!(ended.instance.ended_at.is_present(), "the end is announced");
+    assert!(ended.sequence.get() > started.sequence.get());
+    assert!(
+        shell.broker.binding_state(instance).is_err(),
+        "the instance ended with its session"
+    );
+    assert!(
+        shell.broker.host_files(instance).is_none(),
+        "and its grant with it"
+    );
+    assert!(
+        view.runtime
+            .session()
+            .agent_instances()
+            .instances
+            .is_empty(),
+        "the session lists nothing it is ending"
+    );
+
+    let (status, said) = finish(child);
+    assert!(status.success(), "{said}");
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        view.runtime.session().agent_instances().sequence.get(),
+        ended.sequence.get(),
+        "the program's own exit announces nothing more"
+    );
 }

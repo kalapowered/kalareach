@@ -453,3 +453,60 @@ async fn kr_req_12_07_a_list_and_the_announcements_after_it_hold_each_instance_o
     assert_eq!(apply(&resynchronised, &events), vec![summary(2)]);
     assert_eq!(apply(&now, &events), vec![summary(2)]);
 }
+
+/// KR-REQ-12.07: the watch ends an adopted program that exited at its next tick while another
+/// program's image is still being read, since an identification runs on a thread of its own and
+/// no tick waits for it; and a session that closes meanwhile ends every adoption, after which that
+/// identification records nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_12_07_a_slow_identification_holds_no_end_and_adopts_nothing_after_the_close() {
+    let setup = Setup::new();
+    let first = setup.start();
+    let told = setup.adopt(&Setup::foreground(&first, Vec::new()));
+    assert_eq!(told.len(), 1, "the first program is adopted");
+    let first_instance = told[0].application_instance_id;
+
+    let second = setup.start();
+    let second_process = second.process.clone();
+    let (arrived, release) = setup.adoptions.pause_before_reading();
+    let adoptions = Arc::new(setup.adoptions);
+    let foreground = Setup::foreground(&second, Vec::new());
+    let watching = tokio::spawn(kr_worker::broker::adoption::watch_foreground(
+        Arc::clone(&adoptions),
+        move || Some(Some(foreground.clone())),
+    ));
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(LIVENESS))
+        .await
+        .expect("joined")
+        .expect("the second program's image read is reached");
+
+    first.end();
+    let ended = tokio::time::timeout(Duration::from_secs(2), async {
+        while setup.broker.binding_state(first_instance).is_ok() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        ended.is_ok(),
+        "the first program's end is found while the second's image is being read"
+    );
+
+    let closed = adoptions.close();
+    assert!(
+        closed.is_empty(),
+        "nothing else was adopted when the session closed: {closed:?}"
+    );
+    release.send(()).expect("the reading is let go");
+    tokio::time::timeout(LIVENESS, watching)
+        .await
+        .expect("the watch ends with the session")
+        .expect("joined");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        adoptions.adopted(&second_process),
+        None,
+        "an identification that finished after the close records nothing"
+    );
+    second.end();
+}

@@ -3743,8 +3743,15 @@ impl Session {
                 self.state = SessionState::Closing;
                 self.closing_reason = Some(reason);
                 // Nothing new is started inside a closing session, so no backend waits for one.
-                if let Some(backends) = self.command_backends.as_ref() {
-                    backends.close();
+                // The instances it is ending are announced as ended now, while every view is still
+                // attached, so no list this session keeps names a program it is ending.
+                let ended = self
+                    .command_backends
+                    .as_ref()
+                    .map(|backends| backends.close())
+                    .unwrap_or_default();
+                for instance in ended {
+                    self.announce_instance(instance);
                 }
                 // Input is rejected from here, and that has to reach bytes already handed to the
                 // writer as well as the ones not yet accepted. Releasing the lease moves the fence,
