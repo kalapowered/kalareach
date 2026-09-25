@@ -1659,7 +1659,7 @@ async fn kr_req_11_35_a_faulted_journal_refuses_reverse_writes_and_keeps_reads()
     let _ = std::fs::remove_dir_all(&directory);
 }
 
-/// KR-REQ-11.27, KR-REQ-12.16 and KR-REQ-24: a process that ends after the marker and before the
+/// KR-REQ-11.27, KR-REQ-12.16 and section 24: a process that ends after the marker and before the
 /// operation leaves the request uncertain, and nothing after the restart runs it.
 ///
 /// What a restart reads is the journal's committed state, and this test takes that state as a copy
@@ -3612,7 +3612,7 @@ fn duplex_over_sized_pipes(
     (owner, upstream_there, client_there, writes)
 }
 
-/// KR-REQ-11.32 and KR-REQ-09: a full byte queue refuses in place, and the connection says so.
+/// KR-REQ-11.32 and section 9: a full byte queue refuses in place, and the connection says so.
 ///
 /// The bound on what one end holds is in bytes, and the frame that meets it is the frame this host
 /// has already taken off the socket. Three things follow and all three are tested here. What was
@@ -3821,7 +3821,7 @@ async fn next_line_from<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> S
     line
 }
 
-/// KR-REQ-12.13 and KR-REQ-09: the client's own requests are bounded, given up on a deadline, and
+/// KR-REQ-12.13 and section 9: the client's own requests are bounded, given up on a deadline, and
 /// cleared when the connection ends.
 ///
 /// The upstream reads everything the terminal asks and answers none of it. What this host holds
@@ -4251,7 +4251,7 @@ async fn kr_req_12_11_a_position_from_an_earlier_run_replays_the_stream_again() 
     let _ = std::fs::remove_dir_all(&directory);
 }
 
-/// KR-REQ-11.32 and KR-REQ-09: a write that does not finish reports every frame behind it.
+/// KR-REQ-11.32 and section 9: a write that does not finish reports every frame behind it.
 ///
 /// The frames behind a failure are the ones a connection would lose quietly. This runs over the
 /// connection the host actually serves: the endpoint is bound by the host, the bridge is admitted
@@ -4457,7 +4457,7 @@ async fn kr_req_11_32_owner_drop_with_retained_dispatch_closes_upstream() {
     drop(client);
 }
 
-/// KR-REQ-11.32 and KR-REQ-09: a write that does not finish ends the connection, and every frame
+/// KR-REQ-11.32 and section 9: a write that does not finish ends the connection, and every frame
 /// behind it is reported as the unsent frame it is.
 ///
 /// The terminal stops reading part way through a frame. What that costs is the connection: nothing
@@ -4633,7 +4633,7 @@ async fn read_available(stream: &mut tokio::io::DuplexStream) -> String {
     String::from_utf8_lossy(&held).into_owned()
 }
 
-/// KR-REQ-11.32 and KR-REQ-09: a reader goes on correlating while the other end is not draining.
+/// KR-REQ-11.32 and section 9: a reader goes on correlating while the other end is not draining.
 ///
 /// The terminal has stopped reading, so a frame bound for it fills the pipe and sits there for the
 /// whole write deadline. Meanwhile this host's own operation is acknowledged by the upstream. The
@@ -4951,7 +4951,7 @@ async fn kr_req_11_30_a_classified_client_request_is_recorded_and_suspends_nothi
     served.drained.abort();
 }
 
-/// KR-REQ-09 and KR-REQ-11.33: a write that blocks, one that goes in part and a reply that never
+/// Section 9 and KR-REQ-11.33: a write that blocks, one that goes in part and a reply that never
 /// comes are never a success, and nothing is sent again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_33_a_blocked_partial_or_unanswered_write_is_never_a_success() {
