@@ -175,7 +175,10 @@ pub fn scope_words(known: &[&'static str], unknown: usize) -> Shown {
 /// Every scope an application sign-in asks for, in the order the request states them.
 ///
 /// The [`IDENTITY_SCOPES`], then the member's lease fetch, the call this device holds and the
-/// answers it asks for, and usage. Not [`BACKUP_WRITE_SCOPE`]: the application writes no archives.
+/// answers it asks for, and usage. Not [`BACKUP_WRITE_SCOPE`]: nothing writes an account's backup
+/// storage until the person turns recovery-enabled backup on, and that is a second authorisation
+/// of its own, [`AuthorisationRequest::with_recovery_backup`], so no sign-in carries a capability
+/// it has no use for.
 pub const REQUESTED_SCOPES: [&str; 8] = [
     "openid",
     "profile",
@@ -185,6 +188,23 @@ pub const REQUESTED_SCOPES: [&str; 8] = [
     super::voice::VOICE_SCOPE,
     "reasoning",
     USAGE_SCOPE,
+];
+
+/// Every scope the application's sign-in asks for once the person has turned recovery-enabled
+/// backup on: the [`REQUESTED_SCOPES`], in their order, and [`BACKUP_WRITE_SCOPE`] after them.
+///
+/// It asks for the application's own scopes as well because the grant it leads to replaces the one
+/// the device holds, and the application goes on using what that one carried.
+pub const RECOVERY_BACKUP_SCOPES: [&str; 9] = [
+    "openid",
+    "profile",
+    "email",
+    "offline_access",
+    LEASE_SCOPE,
+    super::voice::VOICE_SCOPE,
+    "reasoning",
+    USAGE_SCOPE,
+    BACKUP_WRITE_SCOPE,
 ];
 
 /// How long before its stated end an access token is replaced rather than presented.
@@ -476,9 +496,10 @@ impl fmt::Debug for AttemptId {
 /// succeeds, because a refresh's ID token is checked against it.
 ///
 /// It asks for the scopes its caller names and no others. The application's own sign-in asks for
-/// [`REQUESTED_SCOPES`]; an authorisation made for one purpose asks for the [`IDENTITY_SCOPES`] and
-/// that purpose's resources, so the token that comes of it reaches what it was asked for and
-/// nothing else.
+/// [`REQUESTED_SCOPES`], and once the person has turned recovery-enabled backup on for
+/// [`RECOVERY_BACKUP_SCOPES`]; an authorisation made for one purpose asks for the
+/// [`IDENTITY_SCOPES`] and that purpose's resources, so the token that comes of it reaches what it
+/// was asked for and nothing else.
 pub struct AuthorisationRequest {
     client: Client,
     redirect: Redirect,
@@ -510,6 +531,26 @@ impl AuthorisationRequest {
     /// not produce random bytes.
     pub fn new(client: Client, redirect: Redirect) -> Result<Self> {
         Self::asking(client, redirect, &REQUESTED_SCOPES[IDENTITY_SCOPES.len()..])
+    }
+
+    /// The application's sign-in once the person has turned recovery-enabled backup on, for
+    /// `client`, answered on `redirect`, asking for [`RECOVERY_BACKUP_SCOPES`].
+    ///
+    /// It is the second authorisation that turning backup on takes, and the sign-in the
+    /// application makes again while backup stays on. Until then no sign-in asks for
+    /// `backup.write`, because nothing on the device writes an account's backup storage: the
+    /// storage and manifest clients present that scope's token, and a source whose grant does not
+    /// carry it refuses the token, so they send nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::new`].
+    pub fn with_recovery_backup(client: Client, redirect: Redirect) -> Result<Self> {
+        Self::asking(
+            client,
+            redirect,
+            &RECOVERY_BACKUP_SCOPES[IDENTITY_SCOPES.len()..],
+        )
     }
 
     /// A request for `client`, answered on `redirect`, asking for the [`IDENTITY_SCOPES`] and the
@@ -2449,7 +2490,8 @@ mod tests {
 
     /// An authorisation asks for the identity scopes and exactly the resources its caller names,
     /// and the application's own sign-in asks for what it always has: the identity scopes first,
-    /// then its resources, and not `backup.write`.
+    /// then its resources, and not `backup.write`, which only turning recovery-enabled backup on
+    /// asks for.
     #[test]
     fn an_authorisation_asks_for_the_identity_scopes_and_the_resources_its_caller_names() {
         let restore = AuthorisationRequest::asking(
@@ -2735,5 +2777,101 @@ mod tests {
             .expect("a scope a request carries");
         assert_eq!(request.scopes().last().map(String::as_str), Some(MARKER));
         assert_unmarked("an authorisation request", &debug_renderings(&request));
+    }
+
+    /// Commits the grant an exchange of `request`'s answer issues, with the scopes `granted` names.
+    async fn signed_in_through(request: AuthorisationRequest, granted: &str) -> SignedInAccount {
+        let state = request.state.clone();
+        let client = request.client();
+        let redirect = request.redirect();
+        let mut pending = PendingAuthorisation::new(request);
+        let mut answer = Url::parse(redirect.uri()).expect("the redirect");
+        answer
+            .query_pairs_mut()
+            .append_pair("code", "a-code")
+            .append_pair("state", &state)
+            .append_pair("iss", ISSUER);
+        let Answer::Granted(grant) = pending.answer(answer.as_str(), Carrier::Terminal) else {
+            panic!("the answer grants a code");
+        };
+        let now = system_seconds();
+        let endpoint = Arc::new(TokenEndpoint(serde_json::json!({
+            "access_token": "an-access-token",
+            "token_type": "Bearer",
+            "expires_in": 600,
+            "refresh_token": "a-refresh-token",
+            "scope": granted,
+            "id_token": id_token(&serde_json::json!({
+                "iss": ISSUER,
+                "sub": "an-account",
+                "aud": client.id(),
+                "nonce": grant.nonce(),
+                "iat": now - 5,
+                "exp": now + 3600,
+            })),
+        })));
+        let service = Arc::new(ManagedAccountService::new(
+            endpoint as Arc<dyn AccountHttp>,
+            client,
+        ));
+        let Exchanged::Issued(issued) = service.exchange(&grant).await.expect("an answer") else {
+            panic!("the exchange is issued");
+        };
+        let account = SignedInAccount::new(
+            service,
+            Arc::new(kr_crypto::store::MemoryStore::new()),
+            client,
+        );
+        account
+            .commit(issued, grant.nonce())
+            .await
+            .expect("the grant is kept");
+        account
+    }
+
+    /// No sign-in carries `backup.write` until the person turns recovery-enabled backup on: the
+    /// application's own sign-in asks for everything it uses and not that, so its token is refused
+    /// for backup storage. Turning backup on is a second authorisation, which asks for what the
+    /// application's sign-in asks for and `backup.write` after it, because the grant it leads to
+    /// replaces the one the device holds; its token is handed out for backup storage and for every
+    /// resource the application uses.
+    #[tokio::test]
+    async fn backup_write_is_asked_for_only_once_recovery_enabled_backup_is_turned_on() {
+        let application =
+            AuthorisationRequest::new(Client::Desktop, Redirect::Loopback).expect("a request");
+        assert!(
+            !application
+                .scopes()
+                .iter()
+                .any(|scope| scope == BACKUP_WRITE_SCOPE)
+        );
+
+        let backup =
+            AuthorisationRequest::with_recovery_backup(Client::Desktop, Redirect::Loopback)
+                .expect("a request");
+        assert_eq!(backup.scopes(), RECOVERY_BACKUP_SCOPES);
+        assert_eq!(
+            RECOVERY_BACKUP_SCOPES[..REQUESTED_SCOPES.len()],
+            REQUESTED_SCOPES,
+            "everything the application's sign-in asks for, first"
+        );
+        assert_eq!(RECOVERY_BACKUP_SCOPES.last(), Some(&BACKUP_WRITE_SCOPE));
+        assert_eq!(asked(&backup), [RECOVERY_BACKUP_SCOPES.join(" ")]);
+        assert!(
+            AuthorisationRequest::with_recovery_backup(Client::Mobile, Redirect::Loopback).is_err(),
+            "a redirect the client did not register"
+        );
+
+        let before = signed_in_through(application, &REQUESTED_SCOPES.join(" ")).await;
+        let refused = before
+            .token(BACKUP_WRITE_SCOPE)
+            .await
+            .expect_err("the application's own sign-in");
+        assert_eq!(refused.code(), ErrorCode::PermissionDenied);
+
+        let after = signed_in_through(backup, &RECOVERY_BACKUP_SCOPES.join(" ")).await;
+        for scope in RECOVERY_BACKUP_SCOPES {
+            after.token(scope).await.expect(scope);
+        }
     }
 }

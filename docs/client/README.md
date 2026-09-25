@@ -796,7 +796,11 @@ a request larger than the method admits), and `Unanswered::Sent` for everything 
 cannot read included. An authorisation made for one purpose asks for that purpose alone:
 `AuthorisationRequest::asking` asks the identity and refresh scopes and the resources its caller
 names, so a device restoring from a recovery kit asks for `backup.restore` and nothing else, while
-`AuthorisationRequest::new` is the application's own sign-in and asks for what it always has.
+`AuthorisationRequest::new` is the application's own sign-in and asks for what it always has. That
+sign-in never asks for `backup.write`. `AuthorisationRequest::with_recovery_backup` does, with every
+scope the application's sign-in asks for before it, because the grant it leads to replaces the one
+the device holds: it is the second authorisation the person makes when they turn recovery-enabled
+backup on, and the sign-in the application makes again while backup stays on.
 
 A relay lease request whose answer went missing is `OUTCOME_UNKNOWN`: a success `services::relay`
 cannot read, and a 502 or 504 with no envelope of the service's, because the service may have
