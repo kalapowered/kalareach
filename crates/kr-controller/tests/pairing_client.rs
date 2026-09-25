@@ -499,14 +499,18 @@ struct WatchedLink {
     paired_gate: Option<Arc<Gate>>,
     /// Every connection as a paired device fails.
     sever_paired: bool,
-    /// While set, every dial after the first fails at once, as a network that drops new
-    /// connections would.
+    /// While set, every dial after the first fails, as a network that drops new connections
+    /// would: at once, or after `fresh_dial_stall`.
     fresh_dials_fail: Arc<AtomicBool>,
+    /// How long a dial that fails takes to fail.
+    fresh_dial_stall: Option<Duration>,
     /// The first connection's pre-authorisation surface reaches the device this much later than
     /// the host answered its handshake, as a slow network would deliver that answer.
     first_open_delay: Option<Duration>,
-    /// Every status question reaches the host this much later than the device sent it.
-    status_transit: Option<Duration>,
+    /// When the device began to open its first connection's pre-authorisation surface.
+    first_opened: Mutex<Option<tokio::time::Instant>>,
+    /// How long each status question and its answer take on the way.
+    transit: Arc<Transit>,
     severed: Arc<AtomicBool>,
     statuses: Arc<AtomicUsize>,
     /// Status questions that got no answer from the host: the connection had ended, or the answer
@@ -532,8 +536,10 @@ impl WatchedLink {
             paired_gate: None,
             sever_paired: false,
             fresh_dials_fail: Arc::new(AtomicBool::new(false)),
+            fresh_dial_stall: None,
             first_open_delay: None,
-            status_transit: None,
+            first_opened: Mutex::new(None),
+            transit: Arc::new(Transit::default()),
             severed: Arc::new(AtomicBool::new(false)),
             statuses: Arc::new(AtomicUsize::new(0)),
             failed_statuses: Arc::new(AtomicUsize::new(0)),
@@ -541,6 +547,36 @@ impl WatchedLink {
             opened: AtomicUsize::new(0),
             paired_connects: AtomicUsize::new(0),
         }
+    }
+
+    /// When the device began to open its first connection's pre-authorisation surface: the
+    /// moment it counts that connection's time from.
+    fn first_opened(&self) -> Option<tokio::time::Instant> {
+        *self.first_opened.lock().expect("the record")
+    }
+}
+
+/// How long a status question takes to reach the host, and its answer to reach the device. A test
+/// can change both while the device waits; a question keeps what they were when it was sent.
+#[derive(Default)]
+struct Transit {
+    question_ms: AtomicU64,
+    answer_ms: AtomicU64,
+}
+
+impl Transit {
+    fn set(&self, question: Duration, answer: Duration) {
+        let millis = |delay: Duration| u64::try_from(delay.as_millis()).expect("a short delay");
+        self.question_ms.store(millis(question), Ordering::SeqCst);
+        self.answer_ms.store(millis(answer), Ordering::SeqCst);
+    }
+
+    /// The two delays for a question sent now.
+    fn now(&self) -> (Duration, Duration) {
+        (
+            Duration::from_millis(self.question_ms.load(Ordering::SeqCst)),
+            Duration::from_millis(self.answer_ms.load(Ordering::SeqCst)),
+        )
     }
 }
 
@@ -572,10 +608,17 @@ impl HostLink for WatchedLink {
         endpoint: &'a EndpointKey,
     ) -> BoxFuture<'a, Result<Connection, LinkError>> {
         let earlier = self.dials.fetch_add(1, Ordering::SeqCst);
-        if self.severed.load(Ordering::SeqCst)
-            || (earlier > 0 && self.fresh_dials_fail.load(Ordering::SeqCst))
-        {
+        if self.severed.load(Ordering::SeqCst) {
             return Box::pin(async { Err(severed()) });
+        }
+        if earlier > 0 && self.fresh_dials_fail.load(Ordering::SeqCst) {
+            let stall = self.fresh_dial_stall;
+            return Box::pin(async move {
+                if let Some(stall) = stall {
+                    tokio::time::sleep(stall).await;
+                }
+                Err(severed())
+            });
         }
         let gate = self.reconnect_gate.as_ref().filter(|_| earlier > 0);
         Box::pin(async move {
@@ -595,6 +638,9 @@ impl HostLink for WatchedLink {
         identity: &'a LocalIdentity,
     ) -> BoxFuture<'a, Result<Box<dyn Preauth>, LinkError>> {
         let earlier = self.opened.fetch_add(1, Ordering::SeqCst);
+        if earlier == 0 {
+            *self.first_opened.lock().expect("the record") = Some(tokio::time::Instant::now());
+        }
         let delay = self.first_open_delay.filter(|_| earlier == 0);
         Box::pin(async move {
             let inner = self.inner.open_unpaired(connection, identity).await?;
@@ -609,7 +655,7 @@ impl HostLink for WatchedLink {
                 answers_before_silence: self.answers_before_silence,
                 withhold_submission_answer: self.withhold_submission_answer,
                 status_gate: self.status_gate.clone(),
-                status_transit: self.status_transit,
+                transit: Arc::clone(&self.transit),
                 severed: Arc::clone(&self.severed),
                 statuses: Arc::clone(&self.statuses),
                 failed_statuses: Arc::clone(&self.failed_statuses),
@@ -654,7 +700,7 @@ struct Watched {
     answers_before_silence: Option<usize>,
     withhold_submission_answer: bool,
     status_gate: Option<Arc<Gate>>,
-    status_transit: Option<Duration>,
+    transit: Arc<Transit>,
     severed: Arc<AtomicBool>,
     statuses: Arc<AtomicUsize>,
     failed_statuses: Arc<AtomicUsize>,
@@ -737,13 +783,13 @@ impl Preauth for Watched {
             {
                 std::future::pending::<()>().await;
             }
-            if let Some(transit) = self.status_transit {
-                tokio::time::sleep(transit).await;
-            }
+            let (question, back) = self.transit.now();
+            tokio::time::sleep(question).await;
             let answer = self.inner.status(params).await;
             if answer.is_err() {
                 self.failed_statuses.fetch_add(1, Ordering::SeqCst);
             }
+            tokio::time::sleep(back).await;
             answer
         })
     }
@@ -1644,22 +1690,27 @@ async fn the_last_question_waits_for_the_connections_last_call() {
     let device = ProductDevice::new(Arc::new(host.room.clone()), making);
     let (attempt, mut shown) = device.redeem(&direct_text(&invited));
     awaiting_value(&mut shown).await;
-    // Thirteen status questions after the challenge and the proof leave one on the connection.
+    // The device keeps its last question: three fresh connections fail in a row, and nothing is
+    // asked on the connection it holds between them.
+    let watched = made(&link);
     tokio::time::timeout(Duration::from_secs(90), async {
-        while made(&link).statuses.load(Ordering::SeqCst) < 13 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("the device comes to its last question");
-    let dials = made(&link).dials.load(Ordering::SeqCst);
-    tokio::time::timeout(Duration::from_secs(30), async {
-        while made(&link).dials.load(Ordering::SeqCst) < dials + 3 {
+        let mut since = (
+            watched.statuses.load(Ordering::SeqCst),
+            watched.dials.load(Ordering::SeqCst),
+        );
+        loop {
             tokio::time::sleep(Duration::from_millis(20)).await;
+            let statuses = watched.statuses.load(Ordering::SeqCst);
+            let dials = watched.dials.load(Ordering::SeqCst);
+            if statuses != since.0 {
+                since = (statuses, dials);
+            } else if dials >= since.1 + 3 {
+                return;
+            }
         }
     })
     .await
-    .expect("three fresh connections fail in a row");
+    .expect("the device keeps its last question while three fresh connections fail");
     calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
         .await
         .expect("the owner approves");
@@ -1727,7 +1778,7 @@ async fn no_question_goes_to_a_connection_the_host_has_ended() {
 
     let (link, making) = watching(|link| {
         link.first_open_delay = Some(Duration::from_secs(8));
-        link.status_transit = Some(Duration::from_secs(3));
+        link.transit.set(Duration::from_secs(3), Duration::ZERO);
         link.fresh_dials_fail.store(true, Ordering::SeqCst);
     });
     let device = ProductDevice::new(Arc::new(host.room.clone()), making);
@@ -1757,6 +1808,93 @@ async fn no_question_goes_to_a_connection_the_host_has_ended() {
         0,
         "a question met a connection the host had ended"
     );
+}
+
+/// A direct pairing over a slow network, whose owner approves three seconds before the device's
+/// first connection comes to its last call. Until then every answer to a status question reaches
+/// the device eight seconds after the host gave it; from then on each question takes seven seconds
+/// to reach the host. New connections fail, after `dial_stall` when it is set. The first
+/// connection's surface reaches the device `open_delay` after the host answered its handshake.
+///
+/// A device that is not free when the call comes would ask its next question only after the call,
+/// too late for a host that ends the connection a minute after its handshake, and the approval
+/// would be lost with the connection. The device must pair, with no question meeting a connection
+/// the host has ended and no connection shown as lost.
+async fn approved_just_before_the_last_call_on_a_slow_network(
+    open_delay: Option<Duration>,
+    dial_stall: Option<Duration>,
+) {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let invited = issue_direct(environment, &mut client, &owner).await;
+
+    let (link, making) = watching(|link| {
+        link.first_open_delay = open_delay;
+        link.fresh_dial_stall = dial_stall;
+        link.transit.set(Duration::ZERO, Duration::from_secs(8));
+        link.fresh_dials_fail.store(true, Ordering::SeqCst);
+    });
+    let device = ProductDevice::new(Arc::new(host.room.clone()), making);
+    let (attempt, mut shown) = device.redeem(&direct_text(&invited));
+    let seen = record(shown.clone());
+    awaiting_value(&mut shown).await;
+    let watched = made(&link);
+    let opened = watched
+        .first_opened()
+        .expect("the device opened a connection");
+    tokio::time::sleep_until(opened + Duration::from_secs(47)).await;
+    watched.transit.set(Duration::from_secs(7), Duration::ZERO);
+    calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
+        .await
+        .expect("the owner approves");
+    tokio::time::timeout(WATCHDOG, async {
+        while !attempt.is_finished() {
+            assert_eq!(
+                watched.failed_statuses.load(Ordering::SeqCst),
+                0,
+                "a question met a connection the host had ended"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the attempt ends");
+    let paired = outcome(attempt).await.expect("paired");
+    assert_eq!(paired.host_endpoint_id, host.network().endpoint_id());
+    assert_eq!(watched.failed_statuses.load(Ordering::SeqCst), 0);
+    let shown: Vec<AttemptState> = seen.lock().expect("the record").clone();
+    assert!(
+        !shown
+            .iter()
+            .any(|state| matches!(state, AttemptState::Reconnecting { .. })),
+        "the device waited without losing its connection: {shown:?}"
+    );
+}
+
+/// KR-REQ-10.23: status questions go at 0, 11, 22 and 33 seconds, each answered eight seconds
+/// later, and fresh connections fail at once. A question at 44 seconds could be answered as late
+/// as 54, past the last call at 50, so the device keeps it for the call, asks it on time, and
+/// learns of the approval.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_answer_never_carries_the_last_question_past_the_last_call() {
+    approved_just_before_the_last_call_on_a_slow_network(None, None).await;
+}
+
+/// KR-REQ-10.23: the first connection opens six seconds late, so status questions go at about 6,
+/// 17 and 28 seconds, and each fresh connection takes five seconds to fail. The look for a fresh
+/// connection at 39 seconds leaves time for a question and its answer before the last call, but it
+/// fails at 44, when that time has gone: the device plans again from then, keeps the question for
+/// the call, and learns of the approval.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_look_that_took_its_time_is_followed_by_a_new_plan() {
+    approved_just_before_the_last_call_on_a_slow_network(
+        Some(Duration::from_secs(6)),
+        Some(Duration::from_secs(5)),
+    )
+    .await;
 }
 
 /// KR-REQ-10.23: a host may serve an unpaired connection by other limits than the ones a device
