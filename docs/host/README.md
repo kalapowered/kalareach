@@ -3814,10 +3814,13 @@ request, which a decision destination cannot name: its requests are recorded, fo
 answered by the native client alone.
 
 A request belongs to the package whose table recorded it, and that package is kept with the
-request's source, so a connection that closes, or whose identifier is restored under another
-package's tables, changes nothing about whose request it is. Only a binding of that package, at the
-same bytes, interprets it, and a rich answer to it goes out only on a connection that reads that
-package's table.
+request's source. A connection identifier keeps the package it recorded requests under for good,
+across a restart too, which reads it back from the ledger: the identifier is never restored under
+another package's tables, so any answer to its requests, the native client's included, goes out on
+a connection that reads that package's table. Only a binding of that package, at the same bytes,
+interprets a request, and a rich answer to it needs the binding that interpreted it to run that
+package still: a binding identifier names one package for as long as it is bound, and one bound
+again after a restart to another package answers nothing the first interpreted.
 
 Narrowing an installation's grants narrows the record where it is written. `approval.respond`
 leaving takes the answer away and leaves the decoding; `approval.decode` leaving withdraws the
