@@ -41,6 +41,7 @@ use kr_worker::session::{Session, SessionConfig};
 
 mod common;
 
+#[cfg(unix)]
 use common::{carries, produced, retained};
 
 // ---------------------------------------------------------------------------------------------
@@ -49,6 +50,7 @@ use common::{carries, produced, retained};
 
 struct Host {
     _temp: kr_ipc::testing::TempHost,
+    #[cfg_attr(not(unix), allow(dead_code))]
     service: Arc<WorkerService>,
     runtime: Arc<SessionRuntime>,
     session_id: SessionId,
@@ -137,6 +139,7 @@ async fn host() -> Host {
 }
 
 /// Starts a worker whose root program is `script`, for a test that watches what reaches it.
+#[cfg(unix)]
 async fn host_running(script: &str) -> Host {
     host_prepared(|_| {}, script).await
 }
@@ -151,12 +154,7 @@ fn session_config(
         session_epoch: SessionEpoch::V1,
         environment_id: environment.environment_id(),
         display_number: DisplayNumber::new(1),
-        shell: ShellCommand {
-            program: "/bin/sh".to_owned(),
-            arguments: vec!["-c".to_owned(), script.to_owned()],
-            cwd: "/".to_owned(),
-            environment: vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())],
-        },
+        shell: root_shell(script),
         shell_mode: ShellMode::NativeCompat,
         worker_profile: WorkerProfile::HeadlessUser,
         launch_profile: kr_protocol::session::LaunchProfile::default(),
@@ -168,6 +166,23 @@ fn session_config(
         send_queue_bytes: 1024 * 1024,
         resident_bytes: 64 * 1024,
     }
+}
+
+/// Builds the command that runs one script as a session's root shell on this platform.
+///
+/// The scripts here are POSIX, so on Unix this is `/bin/sh`. On Windows it is PowerShell 7, the
+/// shell this product launches there, with the platform's own working directory and search path
+/// rather than a `/bin/sh` the platform has not got; a test whose script is POSIX-only says so and
+/// runs on Unix alone.
+#[cfg(unix)]
+fn root_shell(script: &str) -> ShellCommand {
+    kr_worker::testing::posix_script(script)
+}
+
+/// Builds the command that runs one script as a session's root shell on this platform.
+#[cfg(windows)]
+fn root_shell(script: &str) -> ShellCommand {
+    kr_worker::testing::powershell_command(script)
 }
 
 async fn cli(host: &Host) -> LocalClient {
@@ -1572,6 +1587,15 @@ struct EarlierHistoryGap {
 /// KR-REQ-07.57: with the journal full, raw input and the interrupt under the live lease keep
 /// working, while a typed mutation and an approval are refused with `STORAGE_UNAVAILABLE` before
 /// anything is dispatched, leaving nothing behind to be retried.
+///
+/// Unix only: its root program is a POSIX script that turns off echo, traps the interrupt signal and
+/// reads a line at a time, none of which PowerShell expresses the same way, and the interrupt it
+/// drives is a POSIX signal to a process group. The store-side halves of this contract - a full
+/// store refusing a rich mutation and still taking the interrupt and the close - are covered on
+/// Windows by [`a_full_durable_store_refuses_a_new_mutation_before_anything_is_dispatched`] and
+/// [`a_store_that_cannot_be_read_still_takes_the_interrupt_and_the_close`], whose root shell is only
+/// a keep-alive; the worker's own `tests/windows.rs` drives a real console and PowerShell.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_full_journal_fences_a_rich_mutation_while_raw_input_keeps_flowing() {
     // KR-ACC-028, for the parts this suite can drive: the journal is filled while the input lease
@@ -2091,7 +2115,67 @@ fn assert_owner_only(path: &std::path::Path) {
     assert_eq!(mode, 0o700, "{} is {mode:o}", path.display());
 }
 
-#[cfg(not(unix))]
+/// Reads a directory's access-control list, and returns why it is not owner-only, or `None`.
+///
+/// Windows has no mode bits, so the question the Unix check asks of `0700` is asked of the list,
+/// read from a handle on the directory: it belongs to this account and grants no account the machine
+/// does not already trust.
+#[cfg(windows)]
+fn not_owner_only(path: &std::path::Path) -> Option<String> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsHandle as _;
+
+    // The flag that lets a program open a directory at all.
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+    let handle = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+    {
+        Ok(handle) => handle,
+        Err(error) => return Some(format!("{} could not be opened: {error}", path.display())),
+    };
+    match kr_ipc::paths::check_access_list(handle.as_handle(), &path.display().to_string(), false) {
+        Ok(()) => None,
+        Err(refusal) => Some(format!("{refusal:?}")),
+    }
+}
+
+#[cfg(windows)]
 fn assert_owner_only(path: &std::path::Path) {
-    assert!(std::fs::metadata(path).is_ok(), "{}", path.display());
+    if let Some(reason) = not_owner_only(path) {
+        panic!("{} is not owner-only: {reason}", path.display());
+    }
+}
+
+/// KR-REQ-24.26: the owner-only check reads the access-control list, so a directory whose list has
+/// been widened is refused. Today's check, that the directory merely exists, passes a widened one;
+/// this is the case that fails against it.
+#[cfg(windows)]
+#[test]
+fn a_widened_state_directory_is_not_owner_only() {
+    let root = tempfile::tempdir().expect("a directory");
+    let owned = root.path().join("owned");
+    kr_ipc::paths::create_private_directory(&owned).expect("an owner-only directory");
+    // The negative control: as created, it is owner-only.
+    assert!(
+        not_owner_only(&owned).is_none(),
+        "a directory this host created is owner-only"
+    );
+
+    // Widened to grant Everyone, which the check must refuse.
+    let output = std::process::Command::new("icacls.exe")
+        .args([owned.as_os_str(), "/grant".as_ref(), "*S-1-1-0:F".as_ref()])
+        .output()
+        .expect("icacls runs");
+    assert!(
+        output.status.success(),
+        "icacls: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        not_owner_only(&owned).is_some(),
+        "a directory that grants Everyone is not owner-only"
+    );
 }
