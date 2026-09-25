@@ -332,6 +332,12 @@ plugin change, and each time the daemon starts, each package's bridge is brought
 installation wants. The method's answer and receipt say what the catalogue did and are never changed
 by the recipe.
 
+No recipe is applied yet. The version check below needs a signed qualification record that names
+the application's executable by its digest, and no release carries one: the catalogue's signed
+results name a capability, a subject and a profile instead. So every recipe is refused and nothing
+is written, the package's journal records why, and the check runs again after every plugin change
+and each time the daemon starts.
+
 Before anything is written, everything the recipe needs is checked, and a failed check is a refusal
 that writes nothing:
 
@@ -344,9 +350,7 @@ that writes nothing:
   bytes its recipe names;
 - every executable the package's match rules name on the daemon's search path is read, never run,
   and each must be one a signed qualification record of the package names by its SHA-256 digest, at
-  a version inside the recipe's range. A version nothing establishes refuses the recipe. A catalogue
-  qualification result names a capability, a subject and its profile rather than an executable's
-  digest, so it establishes no version here;
+  a version inside the recipe's range. A version nothing establishes refuses the recipe;
 - every path is walked from one handle on the application's directory, each directory opened without
   following a link, and a link or a non-directory on the way, or a destination that is not a regular
   file, is refused;
@@ -354,31 +358,47 @@ that writes nothing:
   when it holds the same bytes, and so is a configuration key already set that this host did not
   set, whatever its value;
 - a configuration document is edited only when it is strict JSON with no member name repeated in any
-  object, and only when a replacement keeps its protection: one with an access-control list, or in a
-  directory that would give its replacement one, is refused.
+  object, when the key leaves it within the 1 MiB the host reads back, and when a replacement keeps
+  its protection: one with an access-control list, or in a directory that would give its replacement
+  one, is refused.
 
 A configuration key is spliced into the document's own text and every other byte is kept, so the
 document's layout, its members' order and its numbers are as they were, and removing the key
-restores the document exactly. A document that changes between the host's reading and its
-replacement is read again, so what somebody wrote meanwhile is kept. Each file is written under a
-temporary name, flushed and renamed into place only where nothing is; directories are made the same
-way.
+restores the document exactly. The replacement has exactly the permission bits of the document it
+replaces. A document whose bytes or permission bits change between the host's reading and its
+replacement is read again, so what somebody changed meanwhile is kept, and one that gains an
+access-control list meanwhile is not replaced. Each file is written under a temporary name, flushed
+and renamed into place only where nothing is; directories are made the same way.
 
-Each change is noted in the package's journal before it is made and recorded after it, with the
-identity of the file it staged. A daemon that stops part way leaves notes the next run settles from
-what is on disk: a temporary file still there was never put in place, a destination holding the
-staged identity is the host's, and anything else is somebody else's and is left alone. An
-application either finishes or is taken out and recorded as refused with its reason, and a release
-is reported as applied only once every change is in place. A key that may be the host's and cannot
-be shown to be, because its document was replaced after the host wrote it and before it recorded
-doing so, is neither taken out nor claimed, and while it stays the bridge is not reported as
-applied.
+Each change is noted in the package's journal before it is made: a file or a directory with the
+temporary name it is about to be made under, then with the identity of what was made there, then as
+in place once its directory has been flushed. A daemon that stops part way leaves notes the next run
+settles from what is on disk. What is still at its temporary name with the recorded identity was
+never put in place, and is removed. A destination holding that identity is the host's, and is
+recorded as in place only after its directory is flushed. Anything else is left alone.
 
-A removal takes each file out only while it still holds the bytes installed, and the key only while
-it holds the value written, then the directories the host made once they are empty. Whatever has
-changed since is left in place and named in the journal. The journal also says what an applied
-release yields for the sessions that launch its application: the application name its registration
-invokes the forwarder for, the registrations it makes and the forwarder it is expected to start.
+Two things can be the host's without the host being able to show it: something at a temporary name
+when the run stopped before recording what it made there, and a key whose document was replaced
+after the host wrote the key and before it recorded doing so. Neither is taken out or claimed. Each
+is named in the journal, and the bridge is reported as unsettled, never as applied, until it is
+gone.
+The application's directory is recorded by its identity as well as its path, so a directory put in
+its place is never changed: what the release placed is named as left in the original.
+
+An application either finishes, or is taken out and recorded as refused with its reason. When
+something cannot be taken out, such as a file in a directory that is no longer writable, the bridge
+stays recorded as being removed, names what is left, and the next reconciliation tries again; it is
+reported as refused only once nothing of it is left. A release is reported as applied only once
+every change is in place and nothing is unsettled.
+
+A removal takes out each file only while it is the file the host installed and still holds the
+bytes installed: a copy with the same bytes put in its place is somebody's own, and is left. The key
+goes only while it holds the value written, then the directories the host made once they hold
+nothing else. Whatever changed since is left in place and named in the journal. A release applied
+in a directory the host no longer keeps the application's plugins in is taken out of it before the
+release is applied in the new one. The journal also says what an applied release yields for the
+sessions that launch its application: the application name its registration invokes the forwarder
+for, the registrations it makes and the forwarder it is expected to start.
 
 ## The transport, and the broker
 

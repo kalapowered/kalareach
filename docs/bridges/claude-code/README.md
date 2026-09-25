@@ -38,7 +38,9 @@ together.
 The host applies the recipe in `.claude` in the account's home, the directory Claude Code reads when
 `CLAUDE_CONFIG_DIR` is not set, once the owner's confirmed installation of the release has
 committed, and removes it when the package is removed; `docs/plugins/catalogue.md` says what it
-checks before writing anything and what a removal leaves. The settings key is spliced into the
+checks before writing anything and what a removal leaves. One of those checks is Claude Code's
+version, which only a signed record naming its executable by digest establishes; no release carries
+one yet, so the recipe is refused and nothing is written. The settings key is spliced into the
 person's own `settings.json`, so every other byte of it stays as it was. The registration names the
 forwarder as `kr-hook`, a bare command Claude Code finds on its own search path. The installation
 expects the `kr-hook` beside the daemon, and a connection running another copy is refused at

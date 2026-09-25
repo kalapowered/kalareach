@@ -751,8 +751,10 @@ time the daemon starts, the package's bridge is brought to what its installation
 a stopped daemon left part way is finished or taken out before anything else is served. The recipe
 keeps a journal of its own for each package under `native-bridges/` in the environment's state
 directory, apart from the catalogue's records, and never changes a method's answer or receipt: an
-installation's answer says what the catalogue did, and the journal says what the recipe did.
-`docs/plugins/catalogue.md` has what is checked before anything is written and what a removal
+installation's answer says what the catalogue did, and the journal says what the recipe did. No
+recipe is applied yet: its version check needs a signed record that names the application's
+executable by digest, which no release carries, so every recipe is refused and the journal says
+why. `docs/plugins/catalogue.md` has what is checked before anything is written and what a removal
 leaves.
 
 The registry admits a paired device to all thirteen of these methods, and the daemon serves them
