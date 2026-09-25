@@ -1999,13 +1999,18 @@ async fn asks_the_real_worker_before_each_command(
         assert!(!environment.contains_key("KR_REGISTRATION"));
 
         // A sourced script and a script of its own ask nothing for what they run.
-        keys.type_line(&shell, &format!(". {}", shell_quoted(&probes.script())));
+        let sourced = format!(". {}", shell_quoted(&probes.script()));
+        keys.type_line(&shell, &sourced);
         printed += 1;
         shell.produced(b"probe-ran", printed).await;
         assert_eq!(probes.asked().len(), 1, "{}", probes.trace());
 
         // The line's capability reaches the command, and the worker resolves it to the
-        // attachment that typed the line while the line runs.
+        // attachment that typed the line while the line runs. A capability is minted only for a
+        // line whose keys went through the reader's fence, so the line is typed at the prompt:
+        // keys typed while the sourced script's line is still finishing are typeahead, which the
+        // worker cannot attribute to anyone.
+        back_at_the_prompt(&shell, &probes, &sourced).await;
         keys.type_line(&shell, "kr-probe hold");
         let token = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
@@ -2061,6 +2066,39 @@ async fn asks_the_real_worker_before_each_command(
 
         shell.close().await;
     }
+}
+
+/// Waits until the line `command` has finished and the reader is back at its prompt behind a valid
+/// fence, which is when a line typed next is typed at that prompt rather than ahead of it.
+///
+/// The bridge reports a line's block finished when the next reader starts, and the fence that
+/// reader answers is valid only after that, so the two together say the prompt is the next one.
+#[cfg(unix)]
+async fn back_at_the_prompt(shell: &RealShell, probes: &RealProbes, command: &str) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            {
+                let session = shell.runtime.session();
+                let finished = session
+                    .last_command_block()
+                    .is_some_and(|block| block.command == command && block.finished());
+                let fenced = session
+                    .fence()
+                    .is_some_and(|driver| driver.state() == FenceState::Fenced);
+                if finished && fenced {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the shell did not come back to its prompt after {command:?}: {}",
+            probes.trace()
+        )
+    });
 }
 
 /// Returns the root of the built packages this run named.
