@@ -185,12 +185,12 @@ report stops before it runs anything.
 A macro's body is read like any other code, so a name written in it is held to the conventions
 however the macro writes the item around it (`fn $name<core>`, `enum $($name)* { helper() }`). A
 name the macro is handed when it is invoked (`make!(core)`) is only an argument there, and cannot
-earn a key: a helper's name handed to a macro is itself a problem; a macro invoked among a module's
-items declines every helper key of its target, and one invoked in a test's body declines that
-test's calls; what a macro invoked in a function, an implementation or a trait makes stays inside
-it, and a foreign block's items are functions and statics, which no path starts at; and the
-compiler reports a standard macro's name as ambiguous wherever a macro that another macro makes
-and exports would take it.
+earn a key: a macro invoked among a module's items declines every helper key of its target, and one
+invoked in a test's body declines that test's calls; what a macro invoked in a function, an
+implementation or a trait makes stays inside it; a macro invoked in a foreign block
+(`extern "C" { ... }`), whose items are its module's own, is a problem; and the compiler reports a
+standard macro's name as ambiguous wherever a macro that another macro makes and exports would
+take it.
 
 The report does not model build scripts, `include!`, procedural macros other than the trusted
 derives and `tokio::test`, the expansion of any macro, or `cfg`. None of them earns a key: the
