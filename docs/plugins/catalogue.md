@@ -358,38 +358,47 @@ that writes nothing:
   when it holds the same bytes, and so is a configuration key already set that this host did not
   set, whatever its value;
 - a configuration document is edited only when it is strict JSON with no member name repeated in any
-  object, when the key leaves it within the 1 MiB the host reads back, and when a replacement keeps
-  its protection: one with an access-control list, or in a directory that would give its replacement
-  one, is refused.
+  object, when the key leaves it, or the document the key creates, within the 1 MiB the host reads
+  back, and when a replacement keeps its protection: one with an access-control list, or in a
+  directory that would give its replacement one, is refused.
 
 A configuration key is spliced into the document's own text and every other byte is kept, so the
 document's layout, its members' order and its numbers are as they were, and removing the key
 restores the document exactly. The replacement has exactly the permission bits of the document it
 replaces. A document whose bytes or permission bits change between the host's reading and its
 replacement is read again, so what somebody changed meanwhile is kept, and one that gains an
-access-control list meanwhile is not replaced. Each file is written under a temporary name, flushed
-and renamed into place only where nothing is; directories are made the same way.
+access-control list meanwhile is not replaced. Access-control lists are read through paths, so they
+are read only while the paths still lead to the directory the host holds and the document it read,
+and the replacement is refused otherwise. Each file is written under a temporary name, flushed and
+renamed into place only where nothing is; directories are made the same way.
 
 Each change is noted in the package's journal before it is made: a file or a directory with the
 temporary name it is about to be made under, then with the identity of what was made there, then as
 in place once its directory has been flushed. A daemon that stops part way leaves notes the next run
 settles from what is on disk. What is still at its temporary name with the recorded identity was
-never put in place, and is removed. A destination holding that identity is the host's, and is
-recorded as in place only after its directory is flushed. Anything else is left alone.
+never put in place, and is removed. A destination holding that identity is the host's, whatever is
+at the temporary name now, and is recorded as in place only after its directory is flushed. An
+absence is flushed before its record goes too, so a removal a stopped run made is durable before it
+is forgotten. Anything else is left alone.
 
 Two things can be the host's without the host being able to show it: something at a temporary name
 when the run stopped before recording what it made there, and a key whose document was replaced
 after the host wrote the key and before it recorded doing so. Neither is taken out or claimed. Each
 is named in the journal, and the bridge is reported as unsettled, never as applied, until it is
 gone.
-The application's directory is recorded by its identity as well as its path, so a directory put in
-its place is never changed: what the release placed is named as left in the original.
+
+The application's directory is recorded by its identity as well as its path. A directory put in its
+place is never changed, and nothing it holds or lacks is taken as saying anything about the
+original: what the release placed stays recorded, the removal is reported as unfinished, and it is
+taken out if the original comes back to its path. When nothing at all is at the path, the directory
+is taken as deleted, with everything in it.
 
 An application either finishes, or is taken out and recorded as refused with its reason. When
 something cannot be taken out, such as a file in a directory that is no longer writable, the bridge
-stays recorded as being removed, names what is left, and the next reconciliation tries again; it is
-reported as refused only once nothing of it is left. A release is reported as applied only once
-every change is in place and nothing is unsettled.
+stays recorded as being removed, names what is left, and the next reconciliation tries again. A
+refusal is reported as clean only when nothing of it is left: what it had to leave because somebody
+changed it is named. A release is reported as applied only once every change is in place and
+nothing is unsettled.
 
 A removal takes out each file only while it is the file the host installed and still holds the
 bytes installed: a copy with the same bytes put in its place is somebody's own, and is left. The key
