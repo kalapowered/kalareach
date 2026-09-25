@@ -905,7 +905,7 @@ fn remove_one(destination: &AuthorisedDirectory, name: &RelativeName) -> bool {
     let Ok(leaf) = RelativeName::parse(leaf) else {
         return false;
     };
-    target.remove(&leaf).is_ok() && target.sync().is_ok()
+    target.remove(&leaf).is_ok() && target.sync(kr_ipc::paths::NameKind::File).is_ok()
 }
 
 fn copy_one(
@@ -1039,7 +1039,7 @@ fn copy_one(
         }
         return Ok(false);
     }
-    target.sync()?;
+    target.sync(kr_ipc::paths::NameKind::File)?;
     Ok(true)
 }
 
