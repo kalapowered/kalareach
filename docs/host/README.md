@@ -4036,11 +4036,13 @@ is opened, and a read returns text. A write replaces the file's content; a file 
 is created, readable and writable by its owner only and never executable.
 
 A launch from the shell is granted the directory the shell reported for its command, for reading
-only, when its connector's installation holds `filesystem.read`. The worker opens that directory
-when it establishes the launch's backend, so what is granted is the directory the command was typed
-in, whatever its path names later, and a read that would cross into another mount is refused. The
-grant ends with the instance. No other launch is granted a directory, and no launch is granted
-writing.
+only, when its connector's installation holds `filesystem.read`. The worker opens the directory off
+the session's lock once it has established the launch's backend, and grants it only when it is the
+directory the launched process works in, as the kernel keeps it: a directory moved away and
+replaced at its path before the open is not granted. What is granted is then that directory,
+whatever its path names later, and a read that would cross into another mount is refused. The grant
+ends with the instance, or with the session. No other launch is granted a directory, and no launch
+is granted writing.
 
 The request is recorded, what to do about it is decided, and the one admission to answer it is taken
 with the dispatch marker committed, all under the broker's one lock and all before the operation
@@ -4220,15 +4222,19 @@ it was observed running: the kernel's executable and argument vector, its digest
 the shell's question was answered with, where there was one. It has no process record and no
 credential, so none of its bridges is admitted, and it ends when its process exits. A launched
 program is never adopted as well: its launch registered the process that presented itself, which
-keeps its identity when it execs the program. Until the worker receives the installed connectors,
-nothing is recognised and nothing is adopted.
+keeps its identity when it execs the program. Reading a program's image runs on its own, so a slow
+reading delays only the next identification, and a program's exit is found at the next look
+whatever is being read. Until the worker receives the installed connectors, nothing is recognised
+and nothing is adopted.
 
 The session announces each of its agent instances to its attached views: when a launch is committed
 or a program adopted, when an instance's bridges are refused and why, and when it ends. It counts
 the announcements, keeps the list of live instances and publishes each announcement under its own
 lock, and a subscription or a snapshot carries that list with the count of the last announcement it
 includes, read under the same lock. A view installs the list and applies the announcements counted
-after it, so it holds every live instance once.
+after it, so it holds every live instance once. A session that closes ends the instances of the
+programs it is ending, launched or adopted, and announces those ends while its views are still
+attached. Nothing about an instance is announced after its end.
 
 An admitted hook sends one observation and waits for this host to apply it and close the connection.
 When that exchange completes, the host has the report before the hook answers the application. It
@@ -4332,10 +4338,12 @@ permit that carried its answer.
 An answer's transport is the one that speaks for the connection whose resource it resolves, chosen
 when the answer is admitted; a connection that has gone is `UPSTREAM_UNAVAILABLE` before anything
 is claimed. The transport work happens after the session boundary ends, because terminal ingestion
-needs that boundary and an upstream that is slow to answer must not stop a person typing. It runs
-on a thread of its own under this worker's ten-second bound, so a transport that blocks cannot hold
-the caller past it: at the bound the caller is told `UPSTREAM_UNAVAILABLE`, and the receipt records
-an outcome nobody can establish.
+needs that boundary and an upstream that is slow to answer must not stop a person typing. The
+transport's own call that takes the operation runs on a thread of its own, and the worker waits for
+it and for the upstream's answer for ten seconds at most, so a transport that blocks cannot hold the
+caller past them. At that bound an answer's resource is settled as uncertain first, the receipt then
+records an outcome nobody can establish, and only then is the caller told `UPSTREAM_UNAVAILABLE`.
+What the transport does afterwards settles nothing.
 
 `plugin.action.invoke` validates the registered action, the grant that action declares, its effect
 class and whether a draft the action needs was named, and then issues the action token that

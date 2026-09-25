@@ -149,8 +149,8 @@ ask about, or from a shell that does not ask. Four times a second, while a comma
 the worker looks at the terminal's foreground process group. It adopts a process there that the
 root shell started itself, that no launch holds, and whose executable the connector recognises, and
 records it as a native terminal instance. The record holds the executable and argument vector the
-kernel reports, the executable's digest, and the reason the shell's question was answered with a
-bypass, where it was.
+kernel reports, the executable's digest, and the reason the shell's question about it was answered
+with a bypass, where the line running it asked one.
 
 An adopted Claude Code gets no registration, endpoint or credential. Its environment names no
 registration either, since a bypassed invocation is given no variable, so its hooks answer `{}` with
@@ -161,7 +161,8 @@ worker does not yet receive, so today nothing is adopted.
 Every instance, launched or adopted, is announced to the session's attached views when it starts,
 when its bridges are refused and when it ends, with its mode, its plugin and profile, and the reason
 its bridges are refused where they are. An adopted instance's announcement says that none of its
-bridges is admitted.
+bridges is admitted. When the session closes, its instances end with it and the views are told
+before they detach.
 
 ## Admission
 
