@@ -1279,10 +1279,10 @@ mod tests {
         ]
     }
 
-    /// Section 10: a direct invitation's text carries its secret, so a failure to decode it names
-    /// the rule and the offset and never a symbol it refused. Two different symbols planted at one
-    /// offset inside the secret are reported in the same words, and neither the marker nor any run
-    /// of the text is in them.
+    /// KR-REQ-04.19 and section 10: a direct invitation's text carries its secret, so a failure to
+    /// decode it names the rule and the offset and never a symbol it refused. Two different
+    /// symbols planted at one offset inside the secret are reported in the same words, and neither
+    /// the marker nor any run of the text is in them.
     #[test]
     fn a_decoding_failure_of_a_secret_bearing_payload_prints_no_symbol_of_it() {
         let text = direct_invitation();
@@ -1306,8 +1306,9 @@ mod tests {
         }
     }
 
-    /// Section 10: a secret whose last symbol sets bits past its last byte is refused, in words
-    /// that name the offset and not the symbol, which is a symbol of the secret itself.
+    /// KR-REQ-04.19 and section 10: a secret whose last symbol sets bits past its last byte is
+    /// refused, in words that name the offset and not the symbol, which is a symbol of the secret
+    /// itself.
     #[test]
     fn a_secret_whose_last_symbol_sets_bits_past_its_last_byte_is_refused_without_that_symbol() {
         let secret = to_base64url(&[0x7b; 32]);
@@ -1346,6 +1347,7 @@ mod tests {
         );
     }
 
+    /// KR-REQ-04.19: each way base64url text can fail is named, with where it failed.
     #[test]
     fn a_decoding_failure_names_its_rule() {
         for (text, rule) in [

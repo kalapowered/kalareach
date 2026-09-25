@@ -302,7 +302,8 @@ mod tests {
         sources
     }
 
-    /// Every service module reads an answer through [`read`], and this is what keeps that true.
+    /// KR-REQ-04.19: every service module reads an answer through [`read`], and this is what keeps
+    /// that true.
     ///
     /// Decoding JSON text takes one of `serde_json`'s decoders, and each is reached by a name in
     /// [`DECODERS`]. So every file under `services/` but this one is read for those names, and one
@@ -371,6 +372,7 @@ mod tests {
         );
     }
 
+    /// KR-REQ-04.19: the control for the walk above.
     #[test]
     fn the_walk_finds_a_decode_however_it_is_written() {
         // The control for the test above: each way of decoding text is seen, and a name that only
@@ -407,6 +409,8 @@ mod tests {
         read::<serde_json::Value>(text.as_bytes()).expect_err(text)
     }
 
+    /// KR-REQ-04.19: a text that names one member twice, in any object at any depth, is refused,
+    /// and two spellings of one name are one name.
     #[test]
     fn a_text_that_names_a_member_twice_is_refused_at_any_depth() {
         for text in [
@@ -427,6 +431,7 @@ mod tests {
         }
     }
 
+    /// KR-REQ-04.19: the controls for the test above.
     #[test]
     fn names_that_are_not_one_name_or_are_in_two_objects_are_read() {
         // The controls: a name is one only within one object, and only as the string it decodes to.
@@ -445,6 +450,8 @@ mod tests {
         }
     }
 
+    /// KR-REQ-04.19: the text is refused whole, whether or not the shape it is read as names the
+    /// member it repeats.
     #[test]
     fn a_repeat_in_a_member_the_shape_never_reads_still_refuses_the_text() {
         #[derive(Debug, serde::Deserialize)]
@@ -465,6 +472,7 @@ mod tests {
         );
     }
 
+    /// KR-REQ-04.19: what a failure says is the rule and the place, and nothing of the text.
     #[test]
     fn a_failure_names_the_rule_and_the_place_and_nothing_of_the_text() {
         let text =
