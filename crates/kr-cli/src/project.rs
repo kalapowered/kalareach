@@ -204,6 +204,10 @@ fn clone_source(arguments: &ProjectCloneArguments) -> Result<CloneSource> {
 ///
 /// The three forms this host clones from, and no fourth: a `git://` URL, a `file://` URL and a
 /// remote helper's `transport::address` are refused here, as the service refuses them.
+///
+/// The refusal does not repeat what was typed. A remote that is not one of the three is exactly
+/// the text this command has not read, so it is not known to hold no credential, and the project
+/// service's own refusals redact a remote for the same reason.
 fn transport_of(text: &str) -> Result<RemoteTransport> {
     if text.starts_with("https://") {
         return Ok(RemoteTransport::Https);
@@ -226,11 +230,12 @@ fn transport_of(text: &str) -> Result<RemoteTransport> {
             return Ok(RemoteTransport::Ssh);
         }
     }
-    Err(CliError::Usage(format!(
-        "{text} is not a source this host clones from: name an https:// URL, an ssh remote \
+    Err(CliError::Usage(
+        "that source is not one this host clones from: name an https:// URL, an ssh remote \
          (ssh://host/path or user@host:path), the absolute path of a repository on this machine, \
          or a registered repository's identifier"
-    )))
+            .to_owned(),
+    ))
 }
 
 /// Prints what a creation made.
@@ -350,5 +355,13 @@ mod tests {
         ] {
             assert!(transport_of(text).is_err(), "{text} is refused");
         }
+    }
+
+    #[test]
+    fn a_refused_source_is_not_repeated() {
+        let refused = transport_of("http://someone:hunter2@example.invalid/work.git")
+            .expect_err("an http remote is refused");
+        assert!(!refused.to_string().contains("hunter2"), "{refused}");
+        assert!(!refused.to_string().contains("someone"), "{refused}");
     }
 }

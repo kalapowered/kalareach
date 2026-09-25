@@ -481,6 +481,22 @@ async fn each_family_is_refused_what_the_daemon_does_not_have() {
         );
     }
     assert!(!Path::new(&nowhere).exists(), "nothing was made");
+    // A source that is not one this host clones from is refused without being repeated, because
+    // it can carry a credential.
+    let source = "http://someone:hunter2@example.invalid/work.git";
+    let output = host.kr(&["project", "clone", source, &nowhere]);
+    assert_eq!(output.status.code(), Some(2));
+    let refused = host.refused(&["project", "clone", source, &nowhere]);
+    for said in [
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+        refused.to_string(),
+    ] {
+        assert!(
+            !said.contains("hunter2"),
+            "the credential is not repeated: {said}"
+        );
+    }
     // A workspace that is not an identifier is the person's mistake, and never reaches the daemon.
     let mistaken = host.refused(&["workspace", "remove", "review"]);
     assert_eq!(mistaken["exit_code"], 2, "{mistaken}");
