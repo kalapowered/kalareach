@@ -2890,4 +2890,41 @@ mod tests {
             .expect_err("a deadline of nothing");
         assert_eq!(code(&error), ErrorCode::InvalidArgument);
     }
+
+    /// A transport whose certificate verification cannot be set up says so in this client's words,
+    /// and nothing of the verifier's words or of the certificates it was given.
+    ///
+    /// The setup fails here because the verifier reads the root it is given, and Android's takes no
+    /// root beside the platform's, so the case does not arise there and the test is left out.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn a_verification_that_cannot_be_set_up_says_nothing_of_what_it_was_given() {
+        use crate::shown::marker::{MARKER, assert_unmarked, failure_renderings};
+
+        let root = MARKER.as_bytes();
+        // The negative control: the verifier refuses the certificate in words of its own.
+        let own = platform_tls(&[CertificateDer::from(root.to_vec())])
+            .map(|_| ())
+            .expect_err("that is no certificate")
+            .to_string();
+        let refused = HttpService::trusting(
+            GatewayOrigin::new("https://gateway.example").expect("an origin"),
+            out_of_reach(),
+            ResponseLimits::default(),
+            root,
+        )
+        .map(|_| ())
+        .expect_err("that is no certificate");
+        // The neutral control: what could not be set up, in this client's words.
+        let said = refused.to_string();
+        assert_eq!(
+            said,
+            "INVALID_ARGUMENT: this client could not set up the platform's certificate verification"
+        );
+        assert!(!said.contains(&own), "{said}");
+        assert_unmarked(
+            "a verification that cannot be set up",
+            &failure_renderings(refused),
+        );
+    }
 }

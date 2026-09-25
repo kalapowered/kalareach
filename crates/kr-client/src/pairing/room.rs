@@ -1165,4 +1165,101 @@ mod tests {
              verifier cannot be set up\")"
         );
     }
+
+    /// A proxy that does not open the tunnel is said by the proxy's part in this client's words, and
+    /// by the status when it refused: nothing the proxy wrote, not its reason phrase, a header or an
+    /// answer that is not one, and not the proxy's address. A refusal's status in any shape but
+    /// three digits is a reason this client does not give.
+    #[tokio::test]
+    async fn a_proxy_that_does_not_open_the_tunnel_is_said_in_this_clients_words() {
+        use crate::shown::marker::{MARKER, NEUTRAL, assert_unmarked, failure_renderings};
+        use tokio::net::TcpListener;
+
+        /// A proxy that reads one tunnel request, writes `answer` and closes.
+        async fn answering(answer: Vec<u8>) -> ProxyUrl {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+            let port = listener.local_addr().expect("its address").port();
+            tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("the tunnel request");
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    let Ok(byte) = stream.read_u8().await else {
+                        return;
+                    };
+                    head.push(byte);
+                }
+                let _ = stream.write_all(&answer).await;
+                let _ = stream.shutdown().await;
+            });
+            format!("http://127.0.0.1:{port}")
+                .parse()
+                .expect("a proxy address")
+        }
+
+        let tls = ClientConfig::builder_with_provider(Arc::new(
+            tokio_rustls::rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("the protocol versions")
+        .with_root_certificates(tokio_rustls::rustls::RootCertStore::empty())
+        .with_no_client_auth();
+        let origin = RendezvousOrigin::new("https://rendezvous.example").expect("an origin");
+        let locator = Locator::new("abcd").expect("a locator");
+        let marked = MARKER.as_bytes();
+
+        for (answer, said) in [
+            (
+                format!("HTTP/1.1 407 {MARKER}\r\nProxy-Authenticate: {MARKER}\r\n\r\n")
+                    .into_bytes(),
+                "the proxy refused the tunnel with status 407",
+            ),
+            (
+                format!("{MARKER}\r\n\r\n").into_bytes(),
+                PROXY_NO_STATUS_LINE,
+            ),
+            (
+                marked
+                    .iter()
+                    .copied()
+                    .cycle()
+                    .take(MAX_TUNNEL_ANSWER_BYTES + 1)
+                    .collect(),
+                PROXY_ANSWER_TOO_LONG,
+            ),
+            (marked.to_vec(), PROXY_ENDED),
+        ] {
+            // The negative control: what the proxy writes holds the marker.
+            assert!(answer.windows(marked.len()).any(|window| window == marked));
+            let failed = RoomConnector::with_tls(tls.clone())
+                .through(Some(answering(answer).await))
+                .open(&origin, &locator, RoomRole::Candidate)
+                .await
+                .map(|_| ())
+                .expect_err("the tunnel does not open");
+            // The neutral control: the stage, the room's origin and the proxy's part.
+            assert_eq!(
+                failed.to_string(),
+                format!("the room at https://rendezvous.example could not be reached: {said}")
+            );
+            assert_unmarked(said, &failure_renderings(failed));
+        }
+
+        for reason in [
+            format!("{PROXY_REFUSED} {MARKER}"),
+            format!("{PROXY_REFUSED} 4031"),
+            format!("{PROXY_REFUSED}  407"),
+            format!("{PROXY_REFUSED} {NEUTRAL}"),
+        ] {
+            let failed = RoomError::Unreachable {
+                origin: "https://rendezvous.example".to_owned(),
+                reason,
+            };
+            assert_eq!(
+                failed.to_string(),
+                "the room at https://rendezvous.example could not be reached: [a reason this client \
+                 does not give]"
+            );
+            assert_unmarked("a status in another shape", &failure_renderings(failed));
+        }
+    }
 }
