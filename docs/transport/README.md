@@ -644,6 +644,27 @@ is small. The transfer is drained rather than left unread, because a receiver th
 fills the connection's flow-control window, which no stream priority reaches past, and that is the
 case named at the end of the streams section rather than this one.
 
+## Local frame writer backpressure
+
+The typed-frame writer over a local connection (`crates/kr-ipc/src/framed.rs`) waits for the peer to
+make room between attempts. An attempt never blocks: it writes what the transport takes now and
+reports what it could not, and the waiting happens separately, so the decision to send and the
+sending are one step that never waits.
+
+The wait differs by transport. On the Unix family the writer parks on the socket's own writability
+and wakes when the peer reads. A Windows named pipe has no writability of its own the writer can hold
+while the reader holds the other half, so the wait is a bounded poll: it sleeps a millisecond and
+attempts again. Measured on Windows Server 2025, a writer waiting on a full pipe for thirty seconds
+woke about seventy-four times a second and spent roughly 730 ms of processor time over that span,
+about 2.4% of one core.
+
+Because that poll makes progress only when the peer reads, every caller bounds its own wait rather
+than relying on the pipe to end it: the worker's delivery ends on a withdrawal or a send deadline,
+the controller's attention delivery on its release ticket's own expiry. `FrameWriter::write_frame`,
+which waits with no bound of its own, is used only where the peer reads what it is sent — a control
+reply, a handshake, a request whose answer the peer awaits — and a path whose peer may stop reading
+uses the checked writes under a deadline instead.
+
 ## Wiring a host
 
 ### What the host owes
