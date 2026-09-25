@@ -17,11 +17,12 @@
 //!   the draft and request preconditions before an action token is issued.
 
 use kr_protocol::agent::{
-    AgentApprovalRespondParams, AgentApprovalRespondResult, AgentCancelParams,
-    AgentCapabilitiesParams, AgentCapabilitiesResult, AgentCommand, AgentCommandsParams,
-    AgentCommandsResult, AgentMutationResult, AgentMutationTarget, AgentPromptParams,
-    AgentSnapshotParams, AgentSnapshotResult, AgentSteerParams, AgentSubject,
-    PluginActionInvokeParams, PluginActionInvokeResult,
+    AgentApprovalInspectParams, AgentApprovalInspectResult, AgentApprovalRespondParams,
+    AgentApprovalRespondResult, AgentCancelParams, AgentCapabilitiesParams,
+    AgentCapabilitiesResult, AgentCommand, AgentCommandsParams, AgentCommandsResult,
+    AgentMutationResult, AgentMutationTarget, AgentPromptParams, AgentSnapshotParams,
+    AgentSnapshotResult, AgentSteerParams, AgentSubject, PluginActionInvokeParams,
+    PluginActionInvokeResult,
 };
 use kr_protocol::authority::EffectClass;
 use kr_protocol::broker::{ActionName, ActionProvenance, ActionToken, BrokerGrant};
@@ -941,6 +942,59 @@ impl Broker {
         Ok(AgentCommandsResult {
             binding: self.binding_state(params.subject.application_instance_id)?,
             commands: self.commands(params.subject.application_instance_id),
+        })
+    }
+
+    /// Answers `agent.approval.inspect`: what the decoder read and offered for one pending
+    /// resource of the instance the call names, and where that resource stands now.
+    ///
+    /// Section 11 asks for the publisher and the original request details to be open to
+    /// inspection, and does not let sandboxing stand in for the decoder being truthful. So what
+    /// comes back is the ledger's own record of the decoder's reading beside the request's
+    /// original bytes, and nothing here vouches for the reading. The resource's state and the
+    /// record are read under one lock, so the answer is of one moment: the live arbitration's
+    /// state while it holds the resource, and the ledger's once it has gone.
+    ///
+    /// A resource of another instance, one no decoder interpreted and one this broker does not
+    /// hold are refused with one text, so a caller that names a resource wrongly learns nothing
+    /// about which of the three it named.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnknownSubject`] for a session this worker does not serve and for a
+    /// resource the instance has no interpreted record of, and [`BrokerError::LedgerUnavailable`]
+    /// when the ledger cannot be read.
+    pub fn inspect_approval(
+        &self,
+        params: &AgentApprovalInspectParams,
+    ) -> Result<AgentApprovalInspectResult> {
+        self.check_subject(&params.subject)?;
+        let unknown = || {
+            BrokerError::unknown(format!(
+                "application instance {} has no interpreted approval {}",
+                params.subject.application_instance_id, params.resource_id
+            ))
+        };
+        let state = self.state();
+        let resource = match state.arbitration.get(params.resource_id) {
+            Some(held) => held.resource.clone(),
+            None => state
+                .ledger
+                .pending(params.resource_id)?
+                .ok_or_else(unknown)?,
+        };
+        if resource.application_instance_id != params.subject.application_instance_id {
+            return Err(unknown());
+        }
+        let decoding = state
+            .ledger
+            .decoding(params.resource_id)?
+            .ok_or_else(unknown)?;
+        Ok(AgentApprovalInspectResult {
+            resource_id: params.resource_id,
+            state: resource.state,
+            recorded_at: resource.recorded_at,
+            decoding,
         })
     }
 

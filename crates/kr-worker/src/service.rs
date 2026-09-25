@@ -2655,6 +2655,7 @@ impl WorkerService {
             Method::AgentCapabilities => self.agent_capabilities(&request.params),
             Method::AgentSnapshot => self.agent_snapshot(&request.params, caller),
             Method::AgentCommands => self.agent_commands(&request.params),
+            Method::AgentApprovalInspect => self.agent_approval_inspect(state, &request.params),
             _ => Err(WorkerError::InvalidArgument(format!(
                 "{} is not a read this worker serves",
                 method.as_str()
@@ -4813,6 +4814,34 @@ impl WorkerService {
     fn agent_commands(&self, params: &ParamsValue) -> Result<ParamsValue> {
         let params: kr_protocol::agent::AgentCommandsParams = parse(params)?;
         encode(&self.broker.agent_commands(&params)?)
+    }
+
+    /// Answers `agent.approval.inspect`: what an approval's decoder read and what it offered.
+    ///
+    /// A local caller reads the whole record, as it reads the whole retained agent history: its
+    /// authority is the operating-system identity the listener authenticated, and section 10's
+    /// history rule narrows a grant, of which there is none. The method table serves this read on
+    /// the local socket only, so no caller acting under a grant reaches it.
+    ///
+    /// The original source travels whole with the answer, so the answer is held to what this
+    /// connection said it can receive: a peer that declared a smaller control frame is refused
+    /// with both sizes rather than sent a frame it would have to discard.
+    fn agent_approval_inspect(
+        &self,
+        state: &ConnectionState,
+        params: &ParamsValue,
+    ) -> Result<ParamsValue> {
+        let params: kr_protocol::agent::AgentApprovalInspectParams = parse(params)?;
+        let record = self.broker.inspect_approval(&params)?;
+        let measured = Self::answer_bytes(&record);
+        if measured > Self::frame_bytes(state) {
+            return Err(WorkerError::InvalidArgument(format!(
+                "this approval's record is {measured} bytes with its original source, and this \
+                 connection said it receives control frames of at most {} bytes",
+                state.peer_limits.max_control_frame_len.get()
+            )));
+        }
+        encode(&record)
     }
 
     /// Returns the application instance one of the agent or plugin methods acts on.
