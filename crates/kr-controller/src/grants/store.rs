@@ -598,6 +598,14 @@ impl GrantDirectory {
         }
     }
 
+    /// Makes every write wait up to `bound` for another writer to let the store go, in place of
+    /// the five seconds it waits otherwise, for this host's own tests that hold the store for
+    /// longer than a write would wait.
+    #[cfg(test)]
+    pub(crate) fn wait_for_storage_up_to(&self, bound: std::time::Duration) -> Result<()> {
+        self.with(|connection| connection.busy_timeout(bound))
+    }
+
     fn with<T>(&self, body: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T> {
         let connection = self
             .connection

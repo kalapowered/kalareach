@@ -4758,6 +4758,10 @@ mod write_boundary {
     /// refused at a reading past it, and the lock is then held while that refusal's write waits for
     /// storage. The batch is not written, whether it waited for the writer or had started and
     /// waited for the peer.
+    ///
+    /// The store is held until the batch's write has returned, and the decision's write waits for
+    /// it that long, so the lock is held throughout: a write that took the lock could not return
+    /// within its bound, and the lock is still held when it has.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_batch_is_not_written_once_a_floor_raised_under_the_lock_passes_its_decision() {
         use kr_automation::authority::AuthoritySource as _;
@@ -4768,6 +4772,11 @@ mod write_boundary {
             // decision below is given, however long the runner takes between two steps.
             let (_continuous, wall, clocks) = super::super::tests::manual_clocks();
             let controller = super::super::tests::daemon_on(&temp, clocks).await;
+            controller
+                .sharing()
+                .grants()
+                .wait_for_storage_up_to(WAIT_BOUND * 4)
+                .expect("the store waits as long as the test holds it");
             let stream = HeldStream::new(peer_stops_reading);
             let output = output(&controller, &stream);
             let frame = batch();
@@ -4808,7 +4817,19 @@ mod write_boundary {
                 redecide: &redecide,
             };
             let mut deciding = None;
-            let (written, ()) = tokio::join!(output.write(&frame, Some(relaying)), async {
+            // Longer than the helper below may take to let the batch go, and far shorter than the
+            // decision's write waits for the store.
+            let written = async {
+                tokio::time::timeout(WAIT_BOUND * 2, output.write(&frame, Some(relaying)))
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "the batch's write did not return while the decision held the \
+                             policy's lock"
+                        )
+                    })
+            };
+            let (written, ()) = tokio::join!(written, async {
                 stream.waited(if peer_stops_reading { 2 } else { 1 }).await;
                 deciding = Some(std::thread::spawn(move || {
                     grants.grant(grant_id, lapses_at_ms + 1)
@@ -4836,8 +4857,19 @@ mod write_boundary {
                     stream.writer.add_permits(1);
                 }
             });
+            // The write has returned, and the decision still holds the lock it held before the
+            // batch was let go: the write never took it.
+            assert!(
+                controller.policy.try_lock().is_err(),
+                "the decision still holds the policy's lock"
+            );
+            let deciding = deciding.expect("the workflow's grant was decided");
+            assert!(
+                !deciding.is_finished(),
+                "the decision is still waiting for the store"
+            );
             storage.execute_batch("ROLLBACK;").expect("storage is free");
-            let _ = deciding.expect("the workflow's grant was decided").join();
+            let _ = deciding.join();
             if peer_stops_reading {
                 assert_eq!(written, Written::Withdrawn);
                 assert_eq!(stream.reached(), vec![Reached::Part]);
