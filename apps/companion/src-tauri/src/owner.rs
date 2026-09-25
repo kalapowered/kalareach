@@ -214,6 +214,10 @@ impl Owner {
         }
         let owns = |host: &DeviceId| owned.iter().any(|owned| owned.host_device_id == *host);
         lock(&self.sessions).retain(|host, _| owns(host));
+        // A challenge's reference outlives its host's visits until the challenge expires, and no
+        // longer, whether or not any host is left to visit.
+        let now = self.device.pairing().clock.wall_clock_ms();
+        lock(&self.references).retain(|_, (_, expires_at_ms)| *expires_at_ms > now);
         let before = lock(&self.entries).len();
         lock(&self.entries).retain(|entry| owns(&entry.host));
         if lock(&self.entries).len() != before {
