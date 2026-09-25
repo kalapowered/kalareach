@@ -1001,6 +1001,68 @@ fn a_refusal_that_has_to_leave_a_changed_file_is_not_reported_as_clean() {
     );
 }
 
+/// A refusal stopped at any of its steps, and settled by a host started again, is never reported
+/// as clean while a file it placed, and somebody changed, is still there.
+#[test]
+fn a_refusal_stopped_at_each_boundary_is_never_clean_while_a_changed_file_remains() {
+    let mut reached = 0;
+    for step in 1.. {
+        let site = Site::new();
+        let bridges = site.bridges();
+        let hooks = site.application().join(HOOKS_PATH);
+        {
+            let document = site.application().join("settings.json");
+            let hooks = hooks.clone();
+            let edits = std::sync::atomic::AtomicUsize::new(0);
+            bridges.before_publishing(move |destination: &Path| {
+                if destination == document {
+                    let edit = edits.fetch_add(1, Ordering::SeqCst);
+                    if edit == 0 {
+                        std::fs::write(&hooks, b"{\"hooks\": {}}").expect("somebody edits it");
+                    }
+                    let text = std::fs::read_to_string(&document).expect("reads");
+                    std::fs::write(
+                        &document,
+                        text.replacen('{', &format!("{{\"edit{edit}\": 1, "), 1),
+                    )
+                    .expect("somebody edits it again");
+                }
+            });
+        }
+        bridges.stop_before(step);
+        if bridges.reconcile(&plugin(), Some(&site.release())).is_ok() {
+            break;
+        }
+
+        let restarted = site.bridges();
+        let settled = restarted
+            .reconcile(&plugin(), Some(&site.release()))
+            .expect("reconciles");
+
+        let changed_left = std::fs::read(&hooks).is_ok_and(|bytes| bytes == b"{\"hooks\": {}}");
+        if changed_left {
+            reached += 1;
+            assert!(
+                !matches!(settled, Settled::Refused(_) | Settled::Applied),
+                "step {step}: {settled:?}"
+            );
+            let reports = restarted.reports().expect("reads");
+            assert_ne!(reports[0].state, "refused", "step {step}: {reports:?}");
+            assert!(
+                reports[0]
+                    .notes
+                    .iter()
+                    .any(|note| note.contains(HOOKS_PATH)),
+                "step {step}: {reports:?}"
+            );
+        }
+    }
+    assert!(
+        reached > 5,
+        "the changed file was left at several boundaries: {reached}"
+    );
+}
+
 /// A refusal names the file its undo had to leave even when, in the same run, something an earlier
 /// removal left is found gone.
 #[test]
@@ -2681,7 +2743,8 @@ fn a_missing_application_directory_keeps_what_was_placed_recorded() {
 
 /// A second link to the published file at its former temporary name does not hide the
 /// publication: taking the link back still leaves the destination to be settled, and the removal
-/// takes out what was published.
+/// takes out what was published. Where the destination has since been replaced by a copy that holds
+/// the key, the key is not the host's to take or to forget: it is named as not settled.
 #[cfg(unix)]
 #[test]
 fn a_second_link_at_a_temporary_name_does_not_hide_what_was_published() {
@@ -2694,28 +2757,92 @@ fn a_second_link_at_a_temporary_name_does_not_hide_what_was_published() {
             site.application().join("settings.json").display()
         )
     };
-    let stopped = (1..)
-        .map_while(|step| stopped_at(step, &|_| {}, &apply))
-        .find(|stopped| stopped.steps.last() == Some(&rename(&stopped.site)))
-        .expect("the settings document's rename was reached");
-    let site = &stopped.site;
-    let staged = stopped
-        .steps
-        .iter()
-        .rev()
-        .find_map(|step| step.strip_prefix("stage "))
-        .map(PathBuf::from)
-        .expect("the staged copy");
-    std::fs::hard_link(site.application().join("settings.json"), &staged)
-        .expect("somebody links the document at its former temporary name");
+    for copied in [false, true] {
+        let stopped = (1..)
+            .map_while(|step| stopped_at(step, &|_| {}, &apply))
+            .find(|stopped| stopped.steps.last() == Some(&rename(&stopped.site)))
+            .expect("the settings document's rename was reached");
+        let site = &stopped.site;
+        let document = site.application().join("settings.json");
+        let staged = stopped
+            .steps
+            .iter()
+            .rev()
+            .find_map(|step| step.strip_prefix("stage "))
+            .map(PathBuf::from)
+            .expect("the staged copy");
+        std::fs::hard_link(&document, &staged)
+            .expect("somebody links the document at its former temporary name");
+        if copied {
+            let copy = site.root.join("settings-copy.json");
+            std::fs::copy(&document, &copy).expect("a copy");
+            std::fs::rename(&copy, &document).expect("put in its place");
+        }
+
+        let settled = site
+            .bridges()
+            .reconcile(&plugin(), None)
+            .expect("reconciles");
+
+        if copied {
+            assert!(matches!(settled, Settled::Unsettled(_)), "{settled:?}");
+            assert_eq!(
+                std::fs::read_to_string(&document).expect("reads"),
+                SETTINGS_WITH_KEY,
+                "the key in the copy is not taken"
+            );
+            let reports = site.bridges().reports().expect("reads");
+            assert!(
+                reports[0].notes.iter().any(|note| {
+                    note.starts_with("not settled")
+                        && note.contains("enabledPlugins.kalareach-channels@skills-dir")
+                }),
+                "{reports:?}"
+            );
+        } else {
+            assert_eq!(settled, Settled::Removed);
+            assert_eq!(site.tree(), before, "the key is taken out, and the link");
+        }
+    }
+}
+
+/// A key somebody else took out of the document is recorded as gone only once the document as it
+/// is now, and its directory, are durable.
+#[test]
+fn a_key_found_gone_is_recorded_only_after_its_document_is_synced() {
+    let site = Site::new();
+    site.bridges()
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("applies");
+    let document = site.application().join("settings.json");
+    std::fs::write(&document, SETTINGS).expect("somebody takes the key out in place");
+    let bridges = site.bridges();
 
     assert_eq!(
-        site.bridges()
-            .reconcile(&plugin(), None)
-            .expect("reconciles"),
+        bridges.reconcile(&plugin(), None).expect("removes"),
         Settled::Removed
     );
-    assert_eq!(site.tree(), before, "the key is taken out, and the link");
+
+    let steps = bridges.steps();
+    let synced = steps
+        .iter()
+        .position(|step| *step == format!("sync {}", document.display()))
+        .expect("the document is synced");
+    let flushed = steps
+        .iter()
+        .position(|step| *step == format!("flush {}", site.application().display()))
+        .expect("its directory is flushed");
+    // One save marks the removal as begun; the next records the key gone.
+    let saves: Vec<usize> = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| step.starts_with("save "))
+        .map(|(index, _)| index)
+        .collect();
+    assert!(
+        saves.len() >= 2 && saves[0] < synced && synced < flushed && flushed < saves[1],
+        "{steps:?}"
+    );
 }
 
 /// A settings document somebody put in the place of the one this host created, with the same

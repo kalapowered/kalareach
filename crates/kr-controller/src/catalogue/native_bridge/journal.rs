@@ -42,19 +42,8 @@ pub(super) struct Journal {
     pub(super) leftovers: Vec<Kept>,
     /// What the last removal could not finish, and why. Each reconciliation tries again.
     pub(super) blocked: Vec<Kept>,
-    /// Why the last application was refused, when it was, and what its undo had to leave.
-    pub(super) refusal: Option<Refusal>,
-}
-
-/// Why an application was refused, and what its undo had to leave in place because somebody
-/// changed it after this host placed it. While any of that is there, the refusal is not clean.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct Refusal {
-    /// Why.
-    pub(super) reason: String,
-    /// What its undo had to leave, each also among the journal's leftovers.
-    pub(super) left: Vec<Kept>,
+    /// Why the last application was refused, when it was.
+    pub(super) refusal: Option<String>,
 }
 
 /// Where a package's bridge stands.
@@ -275,16 +264,15 @@ impl Journal {
             .map(|release| release.package_digest.as_str())
     }
 
-    /// Returns true when the release was refused and nothing of it is left: no change recorded,
-    /// nothing that may be this host's, and nothing the refusal's undo had to leave.
+    /// Returns true when the release was refused and nothing this host placed is left: no change
+    /// recorded, nothing that may be this host's, and nothing any removal or refusal had to leave
+    /// because somebody changed it. Whichever run left it, and whether or not a run stopped while
+    /// leaving it, it is in the journal until it is gone.
     pub(super) fn is_clean_refusal(&self) -> bool {
         self.state == State::Refused
             && self.changes.is_empty()
             && self.unresolved.is_empty()
-            && self
-                .refusal
-                .as_ref()
-                .is_none_or(|refusal| refusal.left.is_empty())
+            && self.leftovers.is_empty()
     }
 
     /// Returns true when the release is applied, every change is published and nothing is left

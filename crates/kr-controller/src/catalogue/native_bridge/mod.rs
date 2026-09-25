@@ -60,8 +60,7 @@ pub use kr_worker::broker::bridge::BridgeSurface;
 pub use kr_worker::broker::connectors::{BridgeFacts, QualifiedExecutable};
 
 use self::journal::{
-    Change, Journal, Journals, Kept, Publication, RecordedFacts, Refusal, Release, Removal,
-    Staging, State,
+    Change, Journal, Journals, Kept, Publication, RecordedFacts, Release, Removal, Staging, State,
 };
 use self::tree::{Child, Dir, Entry, Fetched, Identity, Unstaged, Walk};
 use crate::catalogue::files;
@@ -532,8 +531,8 @@ impl NativeBridges {
                     notes.push(format!("not settled: {}", named.describe()));
                 }
             }
-            if let Some(refusal) = &journal.refusal {
-                notes.push(format!("refused: {}", refusal.reason));
+            if let Some(reason) = &journal.refusal {
+                notes.push(format!("refused: {reason}"));
             }
             let unsettled = !journal.unresolved.is_empty()
                 || journal.changes.iter().any(in_flight)
@@ -678,30 +677,13 @@ impl NativeBridges {
     /// is reported as clean only when nothing of the release is left and nothing is unsettled.
     fn refuse(&self, journal: &mut Journal, reason: String) -> Run<Settled> {
         self.settle(journal)?;
-        let earlier = journal.leftovers.len();
+        // The refusal is on record before anything is taken out, so a run that stops part way
+        // leaves it said. Whether it is clean is read from the journal, never from what one run
+        // saw: what any undo had to leave stays among the leftovers until it is gone.
+        journal.refusal = Some(reason.clone());
         if !journal.changes.is_empty() {
             self.undo(journal)?;
         }
-        // What this refusal's undo had to leave in place because it changed since it was placed,
-        // with what an earlier refusal had to leave. Both are kept with the refusal, so it is not
-        // reported as clean, by this run or any later one, while any of it is there.
-        let mut left = journal
-            .refusal
-            .take()
-            .map(|refusal| refusal.left)
-            .unwrap_or_default();
-        left.extend(
-            journal
-                .leftovers
-                .get(earlier..)
-                .unwrap_or_default()
-                .iter()
-                .cloned(),
-        );
-        journal.refusal = Some(Refusal {
-            reason: reason.clone(),
-            left,
-        });
         journal.state = if journal.changes.is_empty() {
             State::Refused
         } else {
@@ -1456,7 +1438,8 @@ impl NativeBridges {
                 // may be this host's, carried across by whoever replaced the document, or
                 // somebody's own.
                 if let Change::Key { key, value, .. } = &change
-                    && key_holds(directory, name, key, value) != Some(false)
+                    && (key_holds(directory, name, key, value) != Some(false)
+                        || !self.durably_absent(directory, name))
                 {
                     found.unresolved.push(kept(
                         root,
@@ -1488,12 +1471,11 @@ impl NativeBridges {
             Publication::Staged { identity } => Some(identity),
             Publication::Noted => None,
         };
-        // What is at the temporary name is settled first. The staged object still there means it
-        // was never renamed into place, unless the destination holds it too, as a second link.
-        let (taken_back, beside) = match self.clear_staged(directory, temporary, kind, staged)? {
-            Cleared::Removed => (true, None),
-            Cleared::Left(reason) => (false, Some(reason)),
-            Cleared::Absent => (false, None),
+        // What is at the temporary name is settled first, and says nothing about the destination:
+        // the staged object may be there as a second link to what was renamed into place.
+        let beside = match self.clear_staged(directory, temporary, kind, staged)? {
+            Cleared::Left(reason) => Some(reason),
+            Cleared::Removed | Cleared::Absent => None,
         };
         // Only a staged object is ever renamed into place.
         let Some(staged) = staged else {
@@ -1505,7 +1487,6 @@ impl NativeBridges {
                 self.flush(directory).map_err(halted)?;
                 Ok((Settlement::Placed(staged), beside))
             }
-            _ if taken_back => Ok((Settlement::Absent, beside)),
             _ => Ok((Settlement::NotOurs, beside)),
         }
     }
@@ -1726,9 +1707,14 @@ impl NativeBridges {
                     Ok(Some(planned)) => planned,
                     Ok(None) => {
                         // The key or its document is gone, by an earlier run of this host's that
-                        // stopped before recording it, or by somebody. Either way what is gone is
-                        // flushed before it is recorded as gone.
-                        self.flush(directory).map_err(halted)?;
+                        // stopped before recording it, or by somebody. Either way the document as
+                        // it is now, and its directory, are made durable before it is recorded as
+                        // gone.
+                        if !self.durably_absent(directory, name) {
+                            return Ok(Outcome::Unfinished(
+                                "the document without the key could not be made durable".to_owned(),
+                            ));
+                        }
                         return Ok(Outcome::Done);
                     }
                     Err(outcome) => return Ok(outcome),
@@ -1948,15 +1934,20 @@ impl NativeBridges {
         })
     }
 
-    /// Drops what removals and refusals left, and what could not be settled, once it is shown to be
-    /// gone and that is durable; returns whether anything was dropped.
+    /// Makes a document's absence, or its bytes as they are now, durable, and its directory's
+    /// entries with them; false when either cannot be.
+    fn durably_absent(&self, directory: &Dir, name: &str) -> bool {
+        self.step("sync", &directory.join(name)).is_ok()
+            && directory.sync_file(name).is_ok()
+            && self.flush(directory).is_ok()
+    }
+
+    /// Drops what removals left, and what could not be settled, once it is shown to be gone and that
+    /// is durable; returns whether anything was dropped.
     fn recheck(&self, journal: &mut Journal) -> bool {
         let before = journal.leftovers.len() + journal.unresolved.len();
         journal.leftovers.retain(|kept| !self.confirmed_gone(kept));
         journal.unresolved.retain(|kept| !self.confirmed_gone(kept));
-        if let Some(refusal) = journal.refusal.as_mut() {
-            refusal.left.retain(|kept| journal.leftovers.contains(kept));
-        }
         journal.leftovers.len() + journal.unresolved.len() != before
     }
 
@@ -1978,12 +1969,9 @@ impl NativeBridges {
                 let gone = match &kept.key {
                     None => matches!(directory.entry(name), Ok(Entry::Absent)),
                     // The document without the key is made durable too, as it is now.
-                    Some(key) => {
-                        key_holds_anything(directory, name, key) == Some(false)
-                            && directory.sync_file(name).is_ok()
-                    }
+                    Some(key) => key_holds_anything(directory, name, key) == Some(false),
                 };
-                gone && self.flush(directory).is_ok()
+                gone && self.durably_absent(directory, name)
             }
             _ => false,
         }
@@ -2853,10 +2841,8 @@ fn outstanding(journal: &Journal) -> String {
         let unresolved: Vec<String> = journal.unresolved.iter().map(Kept::describe).collect();
         parts.push(format!("not settled: {}", unresolved.join("; ")));
     }
-    if let Some(refusal) = journal.refusal.as_ref()
-        && !refusal.left.is_empty()
-    {
-        let left: Vec<String> = refusal.left.iter().map(Kept::describe).collect();
+    if !journal.leftovers.is_empty() {
+        let left: Vec<String> = journal.leftovers.iter().map(Kept::describe).collect();
         parts.push(format!("left in place: {}", left.join("; ")));
     }
     parts.join("; and ")
