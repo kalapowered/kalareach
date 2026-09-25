@@ -100,7 +100,7 @@ row that does not exist.
 | A test function whose name spells an identifier in snake case: `kr_req_11_07_...`, `kr_acc_004_...` | That test. A name that spells no accepted form is only a name |
 | A module comment (`//!`) of test code | Every test in that module and the modules inside it |
 | In test code, a comment block with a blank line after it | Every test from there to the next such block, or the end of the module |
-| In test code, a comment on a function | Every test of the same target whose body calls that function by a path that reaches it. A local of the same name, a method, and a function of the same name in another module are not that function |
+| In test code, a comment on a function | Every test of the same target whose body calls that function, the call resolved as the compiler resolves it: through the body's own `use` declarations, the module's functions, its `use` declarations and its globs. A local of the same name, a method, and a function of the same name elsewhere are not that function, and a call the report cannot follow to one function keys nothing |
 | A `covers` field of a `const` or `static` case table | Every test of the same package whose body names the table |
 
 Test code is a test or bench target, or a module compiled under `cfg(test)`. A comment on product
