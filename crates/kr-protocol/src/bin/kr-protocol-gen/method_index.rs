@@ -276,10 +276,7 @@ fn link(section: &Section) -> String {
 pub(crate) fn has_heading(text: &str, heading: &str) -> bool {
     text.lines().any(|line| {
         let level = line.bytes().take_while(|byte| *byte == b'#').count();
-        (1..=6).contains(&level)
-            && line[level..]
-                .strip_prefix(' ')
-                .is_some_and(|rest| rest.trim_end() == heading)
+        (1..=6).contains(&level) && line[level..].strip_prefix(' ') == Some(heading)
     })
 }
 
@@ -535,11 +532,12 @@ mod tests {
 
     #[test]
     fn a_heading_line_is_one_to_six_hashes_a_space_and_exactly_the_text() {
-        let text =
-            "# Title\n## The exchange\n### Budgets  \n####### Seven\n#Tight\nThe exchange, again\n";
+        let text = "# Title\n## The exchange\n### Budgets\n### Spaced  \n####### Seven\n#Tight\n\
+                    The exchange, again\n";
         assert!(has_heading(text, "Title"));
         assert!(has_heading(text, "The exchange"));
         assert!(has_heading(text, "Budgets"));
+        assert!(!has_heading(text, "Spaced"));
         assert!(!has_heading(text, "Seven"));
         assert!(!has_heading(text, "Tight"));
         assert!(!has_heading(text, "The exchange, again"));
