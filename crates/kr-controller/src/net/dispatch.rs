@@ -3459,6 +3459,135 @@ mod tests {
         );
         world.serving.abort();
     }
+
+    /// A device committed to `controller`'s records whose grant admits every read the method table
+    /// lets a paired device make: every right, every environment and session, the whole retained
+    /// history and the live screen, and a live voice grant beside it. What such a device is answered
+    /// is the routing's decision rather than its grant's.
+    fn paired_with_every_right(
+        controller: &crate::service::Controller,
+        byte: u8,
+    ) -> crate::service::net::devices::DeviceRecord {
+        use kr_protocol::rights::ActionRight;
+
+        let revision = controller.policy().authority_revision();
+        let (mut paired, _) =
+            crate::service::net::tests::granted(kr_protocol::grant::GrantExpiry::Never, revision);
+        paired.actions = ActionRight::ALL.iter().copied().collect();
+        paired.history.lower_bound_ms = Nullable::some(kr_protocol::scalars::TimestampMs::new(0));
+        paired.history.include_live_screen = true;
+        let device = crate::service::net::devices::DeviceRecord {
+            device_id: paired.recipient_device_id,
+            endpoint_id: kr_protocol::scalars::EndpointKey::from_bytes([byte; 32]),
+            device_key_revision: kr_protocol::ids::DeviceKeyRevision::new(1),
+            authorisation: kr_protocol::scalars::AuthorisationKey::from_bytes([byte; 32]),
+            stored_envelope: None,
+            notification_preview: None,
+            device_name: kr_protocol::pairing::DeviceName::new("A phone").expect("a name"),
+            platform: kr_protocol::pairing::DevicePlatform::Ios,
+            grant: paired.clone(),
+            paired_at_ms: kr_protocol::scalars::TimestampMs::new(1),
+            revoked_at_ms: None,
+            committed_invitation_id: None,
+            expired_at_ms: None,
+        };
+        controller.devices().commit(&device).expect("paired");
+        let voice_grant = kr_protocol::grant::Grant {
+            grant_id: kr_protocol::ids::GrantId::new(kr_ipc::new_uuid()),
+            issuer_device_id: controller.sharing().host_device_id(),
+            actions: [ActionRight::VoiceUse, ActionRight::SessionView]
+                .into_iter()
+                .collect(),
+            ..paired
+        };
+        controller
+            .sharing()
+            .grants()
+            .issue(
+                &crate::grants::GrantRecord {
+                    grant: voice_grant,
+                    session_id: None,
+                    issued_at_ms: 1,
+                    activated_at_ms: Some(1),
+                    revoked_at_ms: None,
+                    revoked_by_parent: None,
+                },
+                || Ok(()),
+            )
+            .expect("a live voice grant");
+        device
+    }
+
+    /// Every read the method table admits for a paired device is served, or refused by name for a
+    /// reason the device can act on. None reaches the refusal the routing keeps for a method the
+    /// table does not admit for a device, which names no reason.
+    ///
+    /// Each read is sent through a paired device's own connection, naming the session this host's
+    /// worker serves, by a device whose grant admits every one of them, so what answers is the
+    /// routing rather than the grant. A read the routing forwards reaches the worker, which records
+    /// it and refuses it; a read the daemon answers itself is answered or refused by its own
+    /// service.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn every_read_the_method_table_admits_for_a_device_is_served_or_refused_by_name() {
+        use std::sync::Arc;
+
+        use kr_protocol::actor::ActorIngress;
+        use kr_protocol::authority::EffectClass;
+        use kr_protocol::envelope::{ControlFrame, Outcome, Request, Response};
+        use kr_protocol::error::ErrorCode;
+
+        use crate::service::a_close_a_worker_never_answers as fake;
+
+        let recorded: fake::Recorded = Arc::default();
+        let world = fake::fake_worker(Some(Arc::clone(&recorded))).await;
+        let controller = &world.controller;
+        fake::acknowledged(controller, world.session_id);
+        let device = paired_with_every_right(controller, 9);
+        let connection = super::RemoteConnection::for_test(controller, device);
+        let params = ParamsValue::from_typed(&kr_protocol::session::SessionReadParams {
+            session_id: world.session_id,
+        })
+        .expect("encodes");
+
+        let mut reads = 0_u64;
+        let mut unrouted = Vec::new();
+        for method in Method::ALL {
+            let entry = method.entry();
+            if entry.effect != EffectClass::Read
+                || !entry.ingress.contains(&ActorIngress::PairedDevice)
+            {
+                continue;
+            }
+            reads += 1;
+            let answer = connection
+                .read(&Request {
+                    request_id: RequestId::new(reads),
+                    method: (*method).into(),
+                    method_version: MethodVersion::V1,
+                    params: params.clone(),
+                })
+                .await;
+            if let ControlFrame::Response(Response {
+                outcome: Outcome::Error(error),
+                ..
+            }) = &answer
+                && error.code == ErrorCode::InvalidArgument
+                && error.message == format!("{} is not a read this host serves", entry.name)
+            {
+                unrouted.push(entry.name);
+            }
+        }
+        assert!(
+            reads > 0,
+            "the method table admits reads for a paired device"
+        );
+        assert!(
+            unrouted.is_empty(),
+            "reads the method table admits for a paired device that reach the refusal kept for \
+             methods it does not admit: {unrouted:?}"
+        );
+        world.serving.abort();
+    }
 }
 
 #[cfg(test)]
