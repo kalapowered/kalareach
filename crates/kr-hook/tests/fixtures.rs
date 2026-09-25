@@ -1,4 +1,4 @@
-//! The Claude Code bridge files the forwarder is registered by, pinned.
+//! The registrations that start the forwarder, pinned.
 //!
 //! The Claude Code connector package installs three files into the user's own Claude Code
 //! directory, and those files are what start this forwarder. Their copies under
@@ -8,23 +8,44 @@
 //! the digests together, and this suite then checks that the forwarder still answers what the new
 //! files invoke.
 //!
+//! Qoder CLI reads its hooks from the settings its launch is given, so nothing is installed for it:
+//! its registration is the two elements a launch adds to Qoder CLI's argument vector, `--settings`
+//! and the inline JSON that follows it, in `fixtures/bridges/qoder-cli/flags.json`, pinned the same
+//! way.
+//!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-11.42 | every test below: the installed registration and the forwarder agree |
+//! | KR-REQ-11.42 | every test below: the registration and the forwarder agree |
 //! | KR-REQ-12.18 | `the_hooks_file_registers_the_five_observing_events_within_the_deadline` |
+//! | KR-REQ-12.22 | `the_qoder_cli_flags_pass_its_hooks_in_exec_form_and_nothing_else` |
+//! | KR-REQ-12.27 | `the_qoder_cli_flags_pass_its_hooks_in_exec_form_and_nothing_else`: every timeout the forwarder's deadline fits inside |
 
-use kr_hook::cli::{ClaudeCode, Cli, Command};
+use kr_hook::cli::{ClaudeCode, Cli, Command, Hooks};
 
-/// The copies, beside the other fixtures at the top of the repository.
-fn fixture(name: &str) -> Vec<u8> {
+/// A copy, beside the other fixtures at the top of the repository, in the application's own
+/// directory.
+fn fixture(application: &str, name: &str) -> Vec<u8> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../fixtures/bridges/claude-code")
+        .join("../../fixtures/bridges")
+        .join(application)
         .join(name);
     std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
 }
 
-fn json(name: &str) -> serde_json::Value {
-    serde_json::from_slice(&fixture(name)).expect("the fixture is JSON")
+fn json(application: &str, name: &str) -> serde_json::Value {
+    serde_json::from_slice(&fixture(application, name)).expect("the fixture is JSON")
+}
+
+/// The members of a JSON object, sorted.
+fn members(value: &serde_json::Value) -> Vec<&str> {
+    let mut members: Vec<&str> = value
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    members.sort_unstable();
+    members
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -68,7 +89,7 @@ fn the_bridge_files_are_the_bytes_the_package_publishes() {
             "1cb6238953bafc5e2872e8af3a430d94ca8452c11e51dc43946889f7268b126c",
         ),
     ] {
-        assert_eq!(sha256(&fixture(name)), digest, "{name}");
+        assert_eq!(sha256(&fixture("claude-code", name)), digest, "{name}");
     }
 }
 
@@ -79,7 +100,7 @@ fn the_bridge_files_are_the_bytes_the_package_publishes() {
 /// lets the worker order the hooks by when Claude Code started each one.
 #[test]
 fn the_hooks_file_registers_the_five_observing_events_within_the_deadline() {
-    let hooks = json("hooks.json");
+    let hooks = json("claude-code", "hooks.json");
     let events = hooks["hooks"].as_object().expect("events");
     let mut names: Vec<&str> = events.keys().map(String::as_str).collect();
     names.sort_unstable();
@@ -142,7 +163,7 @@ fn the_hooks_file_registers_the_five_observing_events_within_the_deadline() {
 /// adds is what turns it on.
 #[test]
 fn the_channel_registration_starts_the_forwarders_channel_under_its_name() {
-    let servers = json("mcp-servers.json");
+    let servers = json("claude-code", "mcp-servers.json");
     let servers = servers["mcpServers"].as_object().expect("servers");
     assert_eq!(servers.len(), 1);
     let (name, server) = servers.iter().next().expect("one server");
@@ -155,7 +176,7 @@ fn the_channel_registration_starts_the_forwarders_channel_under_its_name() {
     );
     assert_eq!(name, kr_hook::claude_code::channel::SERVER_NAME);
 
-    let manifest = json("plugin-manifest.json");
+    let manifest = json("claude-code", "plugin-manifest.json");
     assert_eq!(
         manifest["channels"],
         serde_json::json!([{"server": name}]),
@@ -163,4 +184,78 @@ fn the_channel_registration_starts_the_forwarders_channel_under_its_name() {
     );
     assert_eq!(manifest["defaultEnabled"], false);
     assert_eq!(manifest["name"], "kalareach-channels");
+}
+
+/// The digest of the two elements a Qoder CLI launch adds, so a change to them is a deliberate one.
+#[test]
+fn the_qoder_cli_flags_are_the_pinned_bytes() {
+    assert_eq!(
+        sha256(&fixture("qoder-cli", "flags.json")),
+        "d867f03b41f63a11688ee1c6e0a79455ffbaca09d2c38150b6f8d4b4c269261f"
+    );
+}
+
+/// KR-REQ-12.22, KR-REQ-12.27: a Qoder CLI launch adds exactly two elements, `--settings` and the
+/// inline JSON after it, and that JSON holds hooks and nothing else: the forwarder's `qoder-cli
+/// hook` invocation, in exec form, for exactly the events the forwarder reports for Qoder CLI, for
+/// every tool, notification and source (no matcher), in the foreground, each with a timeout in
+/// seconds that the forwarder's deadline fits inside.
+#[test]
+fn the_qoder_cli_flags_pass_its_hooks_in_exec_form_and_nothing_else() {
+    let flags: Vec<String> =
+        serde_json::from_slice(&fixture("qoder-cli", "flags.json")).expect("the two elements");
+    assert_eq!(flags.len(), 2, "{flags:?}");
+    assert_eq!(flags[0], "--settings");
+    let settings: serde_json::Value =
+        serde_json::from_str(&flags[1]).expect("the settings are inline JSON");
+    assert_eq!(members(&settings), ["hooks"], "hooks and nothing else");
+
+    let events = &settings["hooks"];
+    let mut registered = members(events);
+    let mut reported: Vec<&str> = kr_hook::qoder_cli::HOOKS
+        .events
+        .iter()
+        .map(|(event, _)| *event)
+        .collect();
+    registered.sort_unstable();
+    reported.sort_unstable();
+    assert_eq!(
+        registered, reported,
+        "the launch registers exactly the events the forwarder reports for Qoder CLI"
+    );
+    for (event, groups) in events.as_object().expect("events") {
+        let groups = groups.as_array().expect("matcher groups");
+        assert_eq!(groups.len(), 1, "{event}");
+        assert_eq!(
+            members(&groups[0]),
+            ["hooks"],
+            "{event}: no matcher, not in the background"
+        );
+        let handlers = groups[0]["hooks"].as_array().expect("handlers");
+        assert_eq!(handlers.len(), 1, "{event}");
+        let handler = &handlers[0];
+        assert_eq!(
+            members(handler),
+            ["args", "command", "timeout", "type"],
+            "{event}: exec form, no shell, no environment, not in the background"
+        );
+        assert_eq!(handler["type"], "command", "{event}");
+        assert_eq!(
+            parsed(&handler["command"], &handler["args"]),
+            Command::QoderCli {
+                surface: Hooks::Hook
+            },
+            "{event}"
+        );
+        let timeout = handler["timeout"].as_u64().expect("a timeout in seconds");
+        assert_eq!(
+            timeout,
+            if event == "SessionEnd" { 1 } else { 5 },
+            "{event}"
+        );
+        assert!(
+            kr_hook::hook::HOOK_DEADLINE < std::time::Duration::from_secs(timeout),
+            "{event}: the forwarder answers before Qoder CLI would stop it"
+        );
+    }
 }
