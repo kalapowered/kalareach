@@ -257,6 +257,11 @@ pub struct GrantDirectory {
     /// This host's clocks and every grant's anchor, once the daemon has bound them
     /// ([`Self::bind_host_clock`]).
     host_clock: std::sync::OnceLock<HostClock>,
+    /// Where this host's own tests stop a delegation, a redemption or a transfer once it has
+    /// anchored its grant and before it takes the store's transaction. Compiled away in every
+    /// shipped build.
+    #[cfg(feature = "testing")]
+    before_effect: crate::attention::Pause,
 }
 
 /// This host's clocks as the daemon binds them to the store ([`GrantDirectory::bind_host_clock`]).
@@ -375,6 +380,8 @@ impl GrantDirectory {
             connection: std::sync::Mutex::new(connection),
             live: Arc::new(LiveClaims::default()),
             host_clock: std::sync::OnceLock::new(),
+            #[cfg(feature = "testing")]
+            before_effect: crate::attention::Pause::default(),
         })
     }
 
@@ -542,6 +549,19 @@ impl GrantDirectory {
             return Err(unrecorded());
         }
         outcome
+    }
+
+    /// Arms the pause a delegation, a redemption or a transfer stops at once it has anchored its
+    /// grant, before it takes the store's transaction. Returns the end that says the effect has
+    /// arrived, and the end that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_effect(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        self.before_effect.arm()
     }
 
     /// Binds this host's clocks and every grant's anchor, so a grant's time bound is decided at
@@ -1013,6 +1033,8 @@ impl GrantDirectory {
         let recipient = record.grant.recipient_device_id;
         let parent_anchor = self.parent_anchor_before_effect(record)?;
         let ran_out = std::cell::Cell::new(None);
+        #[cfg(feature = "testing")]
+        self.before_effect.wait();
         let issued = self.in_transaction(|connection| {
             check_parent(connection, record, |parent, expiry, at| {
                 self.passed_at_effect(parent, expiry, at, parent_anchor, &ran_out)
@@ -1101,6 +1123,8 @@ impl GrantDirectory {
         // the things it writes is that the invitation expired: rolling that back would let a
         // later call with an earlier clock reading redeem an invitation this host has already
         // refused as expired.
+        #[cfg(feature = "testing")]
+        self.before_effect.wait();
         let redeemed = self.in_transaction(|connection| {
             let Some(invitation) = read_invitation_within(connection, invitation_id)? else {
                 return Ok(Err(ControllerError::InvalidArgument(
@@ -1268,6 +1292,8 @@ impl GrantDirectory {
                 })?;
         let source_anchor = self.anchor_before_effect(&source)?;
         let ran_out = std::cell::Cell::new(None);
+        #[cfg(feature = "testing")]
+        self.before_effect.wait();
         let transferred = self.in_transaction(|connection| {
             let source = read_one(connection, source_grant_id)?.ok_or_else(|| {
                 ControllerError::PermissionDenied {

@@ -2340,11 +2340,11 @@ enum Effect {
 }
 
 /// Rule C at the grant store's effects: a delegation, a redemption and a transfer, each under a
-/// stored grant with an expiry anchored in this boot. Another writer holds the registry; the
-/// operation passes its early check and waits for the store's transaction; only the continuous
-/// clock moves past the grant's anchor, with the wall clock, and so UTC under the floor, still
-/// before its expiry; the registry is released. The effect is refused inside its transaction, and
-/// nothing it would have written is there. Controls: the same sequence with no clock movement
+/// stored grant with an expiry anchored in this boot. The operation passes its early check and is
+/// stopped before the store's transaction; only the continuous clock moves past the grant's
+/// anchor, with the wall clock, and so UTC under the floor, still before its expiry; the operation
+/// goes on. The effect is refused inside its transaction, and nothing it would have written is
+/// there. Controls: the same sequence with no clock movement
 /// commits the effect; and with the clock distrusted, an expiring grant this boot never anchored is
 /// refused while a grant that does not expire is transferred.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2423,12 +2423,9 @@ async fn an_effect_waiting_for_the_store(effect: Effect, advanced: bool) {
         "the grant stands before either deadline"
     );
 
-    // Another writer holds the registry, so the effect waits for its transaction.
-    let registry = rusqlite::Connection::open(temp.environment().registry_database())
-        .expect("opens the registry");
-    registry
-        .execute_batch("BEGIN IMMEDIATE;")
-        .expect("the registry is held");
+    // The effect stops once it has passed its early check and anchored its grant, before it takes
+    // the store's transaction, so the clock below moves while it waits.
+    let (arrived, go) = controller.sharing().grants().pause_before_effect();
     let operation = {
         let controller = Arc::clone(&controller);
         let grant = grant.clone();
@@ -2443,15 +2440,16 @@ async fn an_effect_waiting_for_the_store(effect: Effect, advanced: bool) {
             }
         })
     };
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::task::spawn_blocking(move || arrived.recv())
+        .await
+        .expect("the wait ends")
+        .expect("the effect reaches the store");
     if advanced {
         // Well past the grant's anchor on the continuous clock, an hour after its issue; UTC stays
         // where it was, before its expiry.
         continuous.advance(Duration::from_secs(2 * 60 * 60));
     }
-    registry
-        .execute_batch("ROLLBACK;")
-        .expect("the registry is released");
+    go.send(()).expect("the effect waits");
     let outcome = operation.await.expect("the operation ends");
 
     let grants = controller.sharing().grants();

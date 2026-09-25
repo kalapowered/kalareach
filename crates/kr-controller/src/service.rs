@@ -466,7 +466,10 @@ pub struct Controller {
     /// restriction whose barrier has not run stops every admission and forward rather than being
     /// reported and passed over ([`Self::check_fence`]).
     debts: Arc<std::sync::Mutex<Debts>>,
-
+    /// Where this host's own tests stop a lease presentation that has read the clock, before it
+    /// waits for the policy's lock. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    before_presentation_lock: crate::attention::Pause,
     /// The environment's transfer service, whose methods this daemon admits and dispatches.
     transfer: Arc<crate::transfer::TransferModule>,
     /// The environment's project service, whose methods this daemon admits and dispatches.
@@ -989,7 +992,8 @@ impl Controller {
             started,
             rights_ceiling: std::sync::Mutex::new(rights_ceiling),
             debts: Arc::new(std::sync::Mutex::new(Debts::default())),
-
+            #[cfg(feature = "testing")]
+            before_presentation_lock: crate::attention::Pause::default(),
             boot_identity: setup.boot_identity,
             boot_epoch,
             windows: ActionWindowIssuer::with_default_validity(Arc::clone(&clock) as Arc<_>),
@@ -2367,6 +2371,19 @@ impl Controller {
         Ok(value)
     }
 
+    /// Arms the pause a lease presentation stops at once it has read the clock, before it waits
+    /// for the policy's lock. Returns the end that says the presentation has arrived, and the end
+    /// that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_presentation_before_lock(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        self.before_presentation_lock.arm()
+    }
+
     /// Decides a membership lease a device presents to this host, and installs it when it is new.
     ///
     /// A paired device presents on its pairing's standing: paired, and its grant in force on both
@@ -2410,6 +2427,8 @@ impl Controller {
 
         let organisation_id = lease.payload.organisation_id;
         let reading = self.lifetimes.clock_trust().sample(&self.devices)?;
+        #[cfg(feature = "testing")]
+        self.before_presentation_lock.wait();
         let mut held = self
             .policy
             .lock()

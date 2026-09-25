@@ -3551,7 +3551,12 @@ mod write_boundary {
                 deciding = Some(std::thread::spawn(move || {
                     grants.grant(grant_id, lapses_at_ms + 1)
                 }));
-                while controller.policy.try_lock().is_ok() {
+                // What the write decides from is the floor that decision raises, and the decision
+                // holds the policy's lock while its write waits for storage. The batch is released
+                // once both hold; the lock alone can be taken before the floor moves.
+                while controller.utc_floor().get() <= lapses_at_ms
+                    || controller.policy.try_lock().is_ok()
+                {
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 }
                 if peer_stops_reading {
@@ -3559,8 +3564,6 @@ mod write_boundary {
                 } else {
                     stream.writer.add_permits(1);
                 }
-                // Long enough for the write to decide, and well inside what storage waits.
-                tokio::time::sleep(Duration::from_millis(300)).await;
             });
             storage.execute_batch("ROLLBACK;").expect("storage is free");
             let _ = deciding.expect("the workflow's grant was decided").join();
