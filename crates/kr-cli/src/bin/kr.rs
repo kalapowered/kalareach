@@ -32,7 +32,9 @@ fn main() -> ExitCode {
     // Whether the caller asked for machine-readable output has to be known before the arguments
     // parse, because a usage mistake is one of the things a script has to be able to read. A
     // literal `--` ends the options, so a `--json` after it is an argument and asks for nothing.
-    let json = std::env::args()
+    // Read as the operating system gave them: an argument that is not UTF-8 is compared, never
+    // decoded, so it cannot end the program with a panic that repeats it.
+    let json = std::env::args_os()
         .take_while(|argument| argument != "--")
         .any(|argument| argument == "--json");
     let cli = match Cli::try_parse() {
