@@ -224,30 +224,65 @@ mod tests {
         ),
     ];
 
-    /// The names a decode of JSON text is reached by: `serde_json`'s three decoders, the
-    /// deserializers they are built on, and a value parsed out of text.
-    const DECODERS: [&str; 6] = [
+    /// The names `serde_json`'s deserializer is reached by: its three decoders and the constructors
+    /// they are built on. `from_str` is also how `FromStr` is reached, which `serde_json::Value`
+    /// implements, and the other way to it, `parse`, is held by [`PARSED_INTO`].
+    const DECODERS: [&str; 5] = [
         "from_slice",
         "from_str",
         "from_reader",
         "Deserializer::new",
         "StreamDeserializer",
-        "parse::<serde_json::Value>",
     ];
 
-    /// Every name in [`DECODERS`] that `code` uses, where it starts a name rather than ends one.
-    fn decoders_named_in(code: &str) -> Vec<&'static str> {
-        DECODERS
-            .into_iter()
-            .filter(|name| {
-                code.match_indices(name).any(|(at, _)| {
-                    !code[..at]
-                        .chars()
-                        .next_back()
-                        .is_some_and(|before| before.is_alphanumeric() || before == '_')
-                })
+    /// The types a service module parses text into. None of them is JSON. A `parse` into any other
+    /// type, or into one the compiler infers, fails the walk: `Value` implements `FromStr`, and an
+    /// inferred type or another name for it could be it.
+    const PARSED_INTO: [&str; 5] = [
+        "u32",
+        "u64",
+        "Uuid",
+        "std::net::Ipv4Addr",
+        "std::net::Ipv6Addr",
+    ];
+
+    /// Where `name` is a whole word in `code`: nothing that could be part of a name before it, and,
+    /// when it ends in a character a name can hold, nothing that could continue it after.
+    fn words<'a>(code: &'a str, name: &'a str) -> impl Iterator<Item = usize> + 'a {
+        let part = |character: char| character.is_alphanumeric() || character == '_';
+        code.match_indices(name)
+            .map(|(at, _)| at)
+            .filter(move |&at| {
+                let joined_before = code[..at].chars().next_back().is_some_and(part);
+                let joined_after = name.chars().next_back().is_some_and(part)
+                    && code[at + name.len()..].chars().next().is_some_and(part);
+                !joined_before && !joined_after
             })
-            .collect()
+    }
+
+    /// Every way `code` decodes JSON text round [`read`]: a name in [`DECODERS`], and a call of
+    /// `parse`, as a method or by its path, that does not name a type in [`PARSED_INTO`]. The word
+    /// in a message is not a call, and `Url::parse` reads an address, not JSON.
+    fn decodes_in(code: &str) -> Vec<String> {
+        let mut found: Vec<String> = DECODERS
+            .into_iter()
+            .filter(|name| words(code, name).next().is_some())
+            .map(str::to_owned)
+            .collect();
+        for at in words(code, "parse") {
+            let called = code[..at].ends_with('.') || code[..at].ends_with("::");
+            if !called || code[..at].ends_with("Url::") {
+                continue;
+            }
+            let target = code[at + "parse".len()..]
+                .strip_prefix("::<")
+                .and_then(|rest| rest.split_once('>'))
+                .map(|(target, _)| target);
+            if !target.is_some_and(|target| PARSED_INTO.contains(&target)) {
+                found.push(code[at..].chars().take(48).collect());
+            }
+        }
+        found
     }
 
     /// What a source holds outside its tests, without its comments and with its layout taken out.
@@ -305,8 +340,10 @@ mod tests {
     /// KR-REQ-04.19: every service module reads an answer through [`read`], and this is what keeps
     /// that true.
     ///
-    /// Decoding JSON text takes one of `serde_json`'s decoders, and each is reached by a name in
-    /// [`DECODERS`]. So every file under `services/` but this one is read for those names, and one
+    /// JSON text becomes a value in one of two ways: through `serde_json`'s deserializer, reached
+    /// by a name in [`DECODERS`], or through `FromStr`, which `serde_json::Value` implements and
+    /// `from_str` or `parse` reaches. So every file under `services/` but this one is read for those
+    /// names, and for a `parse` that does not name one of the types in [`PARSED_INTO`], and one
     /// found there fails this test whatever it decodes. The exceptions read this device's own
     /// stored files, or no JSON at all, and each is named by its code in [`NOT_AN_ANSWER`].
     ///
@@ -358,10 +395,10 @@ mod tests {
                     excused[index] += 1;
                 }
             }
-            let named = decoders_named_in(&code);
+            let found = decodes_in(&code);
             assert!(
-                named.is_empty(),
-                "{} decodes JSON text round the one reader of an answer: {named:?}",
+                found.is_empty(),
+                "{} decodes JSON text round the one reader of an answer: {found:?}",
                 relative.display()
             );
         }
@@ -372,11 +409,11 @@ mod tests {
         );
     }
 
-    /// KR-REQ-04.19: the control for the walk above.
+    /// KR-REQ-04.19: the control for the walk above. Each way of decoding text is seen, and a name
+    /// that only ends in one of them, a comment that mentions one, and a parse into a scalar or an
+    /// address are not.
     #[test]
     fn the_walk_finds_a_decode_however_it_is_written() {
-        // The control for the test above: each way of decoding text is seen, and a name that only
-        // ends in one of them, or a comment that mentions one, is not.
         for written in [
             "let envelope: Envelope = serde_json::from_slice(&answer.body)?;",
             "let envelope = serde_json::from_str::<Envelope>(\n    text,\n)?;",
@@ -384,12 +421,16 @@ mod tests {
             "serde_json::from_reader(std::io::Cursor::new(bytes))",
             "let mut walk = serde_json::Deserializer::new(serde_json::de::SliceRead::new(bytes));",
             "let pages = serde_json::StreamDeserializer::<_, Page>::new(read);",
-            "let value = text.parse::<serde_json::Value>()?;",
+            "let value: serde_json::Value = text.parse()?;",
+            "let value = text.parse::<Value>()?;",
+            "let value = str::parse::<serde_json::Value>(text)?;",
+            "let values = texts.iter().map(|text| text.parse::<Json>());",
+            "let values: Vec<Value> = texts.iter().filter_map(|text| str::parse(text).ok()).collect();",
+            "let value = texts\n    .first()\n    .and_then(|text| text\n        .parse()\n        .ok());",
+            "let value = Value::from_str(text)?;",
+            "let value = <Value as FromStr>::from_str(text)?;",
         ] {
-            assert!(
-                !decoders_named_in(&product_code(written)).is_empty(),
-                "{written}"
-            );
+            assert!(!decodes_in(&product_code(written)).is_empty(), "{written}");
         }
         for innocent in [
             "buffer.extend_from_slice(&chunk);",
@@ -397,11 +438,14 @@ mod tests {
             "    // serde_json::from_str would quote the text",
             "let value = serde_json::from_value(data)?;",
             "fn product() {}\n#[cfg(test)]\nmod tests {\n    let _ = serde_json::from_slice(b\"{}\");\n}",
+            "let seconds = text.parse::<u64>()?;",
+            "let address = host.parse::<std::net::Ipv6Addr>()?;",
+            "let origin = url::Url::parse(origin)?;",
+            "let parsed = parsed_before + 1;",
+            "let origin = Url::parse(ORIGIN).expect(\"the pinned origin and path parse\");",
+            "let figure = u64::from_str_radix(text, 16)?;",
         ] {
-            assert!(
-                decoders_named_in(&product_code(innocent)).is_empty(),
-                "{innocent}"
-            );
+            assert!(decodes_in(&product_code(innocent)).is_empty(), "{innocent}");
         }
     }
 

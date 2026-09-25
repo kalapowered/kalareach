@@ -276,7 +276,7 @@ impl VoiceRateQuote {
         if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
             return None;
         }
-        digits.parse().ok()
+        digits.parse::<u64>().ok()
     }
 
     /// Returns true when every figure is one a person can be shown.

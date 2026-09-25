@@ -207,7 +207,7 @@ impl Collection {
             )
         };
         let (_, identity) = collection.split_once('/').ok_or_else(refused)?;
-        let identity: Uuid = identity.parse().map_err(|_| refused())?;
+        let identity = identity.parse::<Uuid>().map_err(|_| refused())?;
         let object_id = SyncObjectId::new(identity);
         let kind = if collection == crate::drafts::draft_collection(DraftId::new(identity)) {
             SyncObjectKind::Draft
@@ -2374,8 +2374,8 @@ fn copy_position(
             (write_sequence != 0).then(|| SyncPosition::removed_at(write_sequence, recovery))
         );
     }
-    let revision: Uuid = current_revision
-        .parse()
+    let revision = current_revision
+        .parse::<Uuid>()
         .map_err(|_| contrary("a copy whose object stood at a revision that is not one"))?;
     Ok(Some(SyncPosition::at(
         write_sequence,
