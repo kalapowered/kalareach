@@ -51,7 +51,11 @@ impl LogonType {
 
     /// Reads the Task Scheduler's name for a logon type this host registers.
     fn parse(text: &str) -> Option<Self> {
-        todo!("not built yet")
+        match text {
+            "InteractiveToken" => Some(Self::InteractiveToken),
+            "S4U" => Some(Self::S4U),
+            _ => None,
+        }
     }
 }
 
@@ -134,7 +138,32 @@ impl TaskDefinition {
     /// The definition in the Task Scheduler's XML.
     #[must_use]
     pub fn xml(&self) -> String {
-        todo!("not built yet")
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n\
+             <Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n\
+             <RegistrationInfo><Description>{description}</Description></RegistrationInfo>\r\n\
+             <Triggers />\r\n\
+             <Principals><Principal id=\"Author\"><UserId>{user}</UserId>\
+             <LogonType>{logon}</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\r\n\
+             <Settings><MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy>\
+             <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\
+             <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\
+             <AllowHardTerminate>true</AllowHardTerminate><StartWhenAvailable>false</StartWhenAvailable>\
+             <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\
+             <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>\
+             <AllowStartOnDemand>true</AllowStartOnDemand><Enabled>true</Enabled><Hidden>false</Hidden>\
+             <RunOnlyIfIdle>false</RunOnlyIfIdle><WakeToRun>false</WakeToRun>\
+             <ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Priority>5</Priority></Settings>\r\n\
+             <Actions Context=\"Author\"><Exec><Command>{command}</Command>\
+             <Arguments>{arguments}</Arguments><WorkingDirectory>{directory}</WorkingDirectory></Exec></Actions>\r\n\
+             </Task>\r\n",
+            description = escape(&self.description()),
+            user = escape(&self.user),
+            logon = self.logon.as_str(),
+            command = escape(&self.starter.display().to_string()),
+            arguments = escape(&self.arguments),
+            directory = escape(&self.working_directory.display().to_string()),
+        )
     }
 }
 
@@ -175,7 +204,23 @@ impl RegisteredTask {
     /// what this host writes and as a difference otherwise.
     #[must_use]
     pub fn parse(xml: &str) -> Self {
-        todo!("not built yet")
+        Self {
+            user: text(xml, "UserId"),
+            logon: element(xml, "LogonType").and_then(|value| LogonType::parse(value.trim())),
+            description: text(xml, "Description"),
+            command: text(xml, "Command"),
+            arguments: text(xml, "Arguments"),
+            working_directory: text(xml, "WorkingDirectory"),
+            multiple_instances: text(xml, "MultipleInstancesPolicy"),
+            execution_time_limit: text(xml, "ExecutionTimeLimit"),
+            priority: text(xml, "Priority"),
+            enabled: text(xml, "Enabled"),
+            actions: ["Exec", "ComHandler", "SendEmail", "ShowMessage"]
+                .into_iter()
+                .map(|action| count(xml, action))
+                .sum(),
+            triggered: element(xml, "Triggers").is_some_and(|triggers| triggers.contains('<')),
+        }
     }
 
     /// Whether this is `expected`'s environment's task: the account it runs as is `expected`'s,
@@ -189,7 +234,13 @@ impl RegisteredTask {
         expected: &TaskDefinition,
         sid_of: impl Fn(&str) -> Option<String>,
     ) -> bool {
-        todo!("not built yet")
+        let user = self.user.trim();
+        let same_user = if user.starts_with("S-1-") {
+            user.eq_ignore_ascii_case(&expected.user)
+        } else {
+            sid_of(user).is_some_and(|sid| sid.eq_ignore_ascii_case(&expected.user))
+        };
+        same_user && self.description.trim() == expected.description()
     }
 
     /// What makes this task something other than the one `expected` registers, if anything: its
@@ -197,7 +248,58 @@ impl RegisteredTask {
     /// a logon this host does not register. Empty when it is the task this build expects.
     #[must_use]
     pub fn differences(&self, expected: &TaskDefinition) -> Vec<String> {
-        todo!("not built yet")
+        let mut differences = Vec::new();
+        if !same_path(&self.command, &expected.starter) {
+            differences.push(format!(
+                "it runs {}, not {}",
+                self.command,
+                expected.starter.display()
+            ));
+        }
+        if self.arguments.trim() != expected.arguments {
+            differences.push(format!(
+                "it gives the starter {:?}, not {:?}",
+                self.arguments, expected.arguments
+            ));
+        }
+        if !same_path(&self.working_directory, &expected.working_directory) {
+            differences.push(format!(
+                "it runs in {}, not {}",
+                self.working_directory,
+                expected.working_directory.display()
+            ));
+        }
+        if self.actions != 1 {
+            differences.push(format!("it has {} actions, not one", self.actions));
+        }
+        if self.triggered {
+            differences.push("it has a trigger, so it runs without being asked".to_owned());
+        }
+        if self.logon.is_none() {
+            differences.push("it logs on in a way this host does not register".to_owned());
+        }
+        if self.multiple_instances.trim() != "Parallel" {
+            differences.push(format!(
+                "a second run while one is running is {:?}, not in parallel",
+                self.multiple_instances
+            ));
+        }
+        if self.execution_time_limit.trim() != "PT0S" {
+            differences.push(format!(
+                "its runs are limited to {:?}",
+                self.execution_time_limit
+            ));
+        }
+        if self.priority.trim() != "5" {
+            differences.push(format!(
+                "it runs at priority {:?}, not the normal 5",
+                self.priority
+            ));
+        }
+        if self.enabled.trim() == "false" {
+            differences.push("it is disabled".to_owned());
+        }
+        differences
     }
 }
 
@@ -315,7 +417,17 @@ fn unescape(text: &str) -> String {
 /// every character of an XML declaration has in its second half, anything else as UTF-8.
 #[must_use]
 pub fn decode_output(bytes: &[u8]) -> String {
-    todo!("not built yet")
+    let utf16 = bytes.starts_with(&[0xff, 0xfe]) || (bytes.len() >= 2 && bytes[1] == 0);
+    if utf16 {
+        let body = bytes.strip_prefix(&[0xff, 0xfe]).unwrap_or(bytes);
+        let units: Vec<u16> = body
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        return String::from_utf16_lossy(&units);
+    }
+    let body = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
+    String::from_utf8_lossy(body).into_owned()
 }
 
 /// Where an environment's task stands.
@@ -366,7 +478,33 @@ mod platform {
     /// Returns what went wrong when the Task Scheduler could not be asked, or answered with
     /// something other than a task or its absence.
     pub fn standing(definition: &TaskDefinition) -> Result<Standing, String> {
-        todo!("not built yet")
+        let output = schtasks_within(&["/Query", "/TN", &definition.name, "/XML"])
+            .map_err(|failure| failure.detail())?;
+        if !output.status.success() {
+            let said = decode_output(&output.stderr);
+            // The Task Scheduler's word for a name nothing holds.
+            if said.contains("cannot find") {
+                return Ok(Standing::Absent);
+            }
+            return Err(format!(
+                "the Task Scheduler could not say whether {} is registered: {}",
+                definition.name,
+                said.trim()
+            ));
+        }
+        let registered = RegisteredTask::parse(&decode_output(&output.stdout));
+        let sid_of = |name: &str| kr_ipc::starter::account_sid(name).ok();
+        if !registered.belongs_to(definition, sid_of) {
+            return Ok(Standing::Foreign(format!(
+                "a task named {} is registered for {} with the description {:?}, which is not \
+                 this user's task for environment {}",
+                definition.name,
+                registered.user.trim(),
+                registered.description.trim(),
+                definition.environment_id
+            )));
+        }
+        Ok(Standing::Owned(registered.differences(definition)))
     }
 
     /// Registers `definition`, or brings this environment's own task back to it.
@@ -381,7 +519,41 @@ mod platform {
     /// Returns what went wrong: a foreign task, a registration the Task Scheduler refused, or a
     /// task that did not read back as the one registered.
     pub fn register(definition: &TaskDefinition) -> Result<(), String> {
-        todo!("not built yet")
+        if let Standing::Foreign(detail) = standing(definition)? {
+            return Err(format!("{detail}, so it is left as it is"));
+        }
+        let file = definition
+            .working_directory
+            .join(format!("{}.xml", definition.name));
+        let mut bytes = vec![0xff, 0xfe];
+        bytes.extend(definition.xml().encode_utf16().flat_map(u16::to_le_bytes));
+        kr_ipc::paths::write_owner_only_file(&file, &bytes)
+            .map_err(|error| format!("write the definition of {}: {error}", definition.name))?;
+        let file_text = file.display().to_string();
+        let created =
+            schtasks_within(&["/Create", "/TN", &definition.name, "/XML", &file_text, "/F"]);
+        let _ = std::fs::remove_file(&file);
+        let output = created.map_err(|failure| failure.detail())?;
+        if !output.status.success() {
+            return Err(format!(
+                "the Task Scheduler did not register {}: {}",
+                definition.name,
+                decode_output(&output.stderr).trim()
+            ));
+        }
+        match standing(definition)? {
+            Standing::Owned(differences) if differences.is_empty() => Ok(()),
+            Standing::Owned(differences) => Err(format!(
+                "{} was registered and reads back differently: {}",
+                definition.name,
+                differences.join("; ")
+            )),
+            Standing::Absent => Err(format!(
+                "{} was registered and cannot be found",
+                definition.name
+            )),
+            Standing::Foreign(detail) => Err(detail),
+        }
     }
 
     /// Removes this environment's own task, and says whether there was one.
@@ -394,7 +566,21 @@ mod platform {
     ///
     /// Returns what went wrong: a foreign task, or a removal the Task Scheduler refused.
     pub fn remove(definition: &TaskDefinition) -> Result<bool, String> {
-        todo!("not built yet")
+        match standing(definition)? {
+            Standing::Absent => return Ok(false),
+            Standing::Foreign(detail) => return Err(format!("{detail}, so it is left as it is")),
+            Standing::Owned(_) => {}
+        }
+        let output = schtasks_within(&["/Delete", "/TN", &definition.name, "/F"])
+            .map_err(|failure| failure.detail())?;
+        if !output.status.success() {
+            return Err(format!(
+                "the Task Scheduler did not remove {}: {}",
+                definition.name,
+                decode_output(&output.stderr).trim()
+            ));
+        }
+        Ok(true)
     }
 
     /// Asks the Task Scheduler to run `definition`'s task once, now.
@@ -405,7 +591,15 @@ mod platform {
     /// [`RunFailure::Failed`] when it was asked and did not start the run, which it may have begun
     /// first.
     pub fn run(definition: &TaskDefinition) -> Result<(), RunFailure> {
-        todo!("not built yet")
+        let output = schtasks_within(&["/Run", "/I", "/TN", &definition.name])?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(RunFailure::Failed(format!(
+            "the Task Scheduler did not run {}: {}",
+            definition.name,
+            decode_output(&output.stderr).trim()
+        )))
     }
 }
 
