@@ -74,6 +74,36 @@ fn defines_a_function_of_the_same_name_in_its_body() {
     assert_eq!(shared(), 4);
 }
 
+#[test]
+fn annotates_the_same_name_with_a_type_from_the_root() {
+    let shared: ::std::boxed::Box<dyn Fn() -> u8> = ::std::boxed::Box::new(|| 4);
+    assert_eq!(shared(), 4);
+}
+
+macro_rules! a_case_of_the_same_name {
+    () => {
+        fn shared() -> u8 {
+            4
+        }
+    };
+}
+
+#[test]
+fn has_a_macro_define_a_function_of_the_same_name() {
+    a_case_of_the_same_name!();
+    assert_eq!(shared(), 4);
+}
+
+#[test]
+fn calls_through_a_module_of_its_own_by_the_same_path() {
+    mod cases {
+        pub fn brought_up() -> u8 {
+            4
+        }
+    }
+    assert_eq!(cases::brought_up(), 4);
+}
+
 mod other {
     /// A case of this module's own, which names no row.
     fn shared() -> u8 {
