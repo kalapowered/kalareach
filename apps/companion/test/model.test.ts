@@ -12,6 +12,7 @@ import {
   applyNode,
   applyNodes,
   emptyConversation,
+  installSnapshot,
   isNewer,
   nodesAbove,
   prependHistory,
@@ -119,6 +120,39 @@ describe('the conversation', () => {
     let state = applyNodes(emptyConversation(), [node('a', '1'), node('b', '1')])
     state = prependHistory(state, [node('a', '1')])
     expect(state.nodes).toHaveLength(2)
+  })
+})
+
+describe('a snapshot and the nodes held while it was read', () => {
+  const ids = (state: ReturnType<typeof emptyConversation>) => state.nodes.map((each) => each.id)
+  const texts = (state: ReturnType<typeof emptyConversation>) =>
+    state.nodes.map((each) => (each.body as { text: string }).text)
+  const snapshot = [node('a', '1'), node('b', '2'), node('c', '1')]
+
+  it('keeps the snapshot in its presentation order', () => {
+    expect(ids(installSnapshot(emptyConversation(), snapshot, []))).toEqual(['a', 'b', 'c'])
+  })
+
+  it('puts a held node the snapshot lacks after it, in the order the stream delivered it', () => {
+    const state = installSnapshot(emptyConversation(), snapshot, [node('e', '1'), node('d', '1')])
+    expect(ids(state)).toEqual(['a', 'b', 'c', 'e', 'd'])
+  })
+
+  it('takes a held node in place of the snapshot’s copy only when its revision is newer', () => {
+    const state = installSnapshot(emptyConversation(), snapshot, [
+      node('b', '3', 'newer b'),
+      node('a', '0', 'older a'),
+      node('c', '1', 'same c')
+    ])
+    expect(ids(state)).toEqual(['a', 'b', 'c'])
+    expect(texts(state)).toEqual(['a', 'newer b', 'c'])
+  })
+
+  it('leaves the nodes already held where they are, and adds the snapshot’s new ones after', () => {
+    const before = applyNodes(emptyConversation(), [node('a', '1'), node('b', '1')])
+    const state = installSnapshot(before, [node('a', '1'), node('b', '2', 'newer b'), node('c', '1')], [])
+    expect(ids(state)).toEqual(['a', 'b', 'c'])
+    expect(texts(state)).toEqual(['a', 'newer b', 'c'])
   })
 })
 
