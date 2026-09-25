@@ -108,6 +108,9 @@ them.
 | `json` | The kind of fault, with its line and column |
 | `io` | The kind of failure and the operating system's error number; a message a caller attached is dropped |
 | `frame`, `ipc`, `transport`, `crypto` | Their own fixed words, with CBOR and input or output failures said as above |
+| `pairing` | A pairing failure's own fixed words and numbers; what a rendezvous service, a store or a peer wrote is named by its kind, and a refusal by its code |
+| `qr_payload` | The rule an invitation's QR payload broke, a member that failed by its name, and its size or version, never a mode it named or why a member failed |
+| `task` | Whether a task panicked or was cancelled, never what a panic said |
 | `route` | Each segment of a request path that is a word of the service adapters' own paths or an identifier, and a placeholder for any other |
 | `collection` | A sync collection's kind, one of the protocol's, and its object's identifier |
 | `terminfo` | A terminal type that is one of the terminfo names this build lists |
@@ -137,7 +140,18 @@ command declares: the argument, the values it takes, a suggestion and the usage 
 the command `kr` however it was invoked. What was typed is never repeated, because an argument in
 the wrong place can be a secret pasted into it.
 `kr account token show` and `kr account token import` say a stored origin as an address, and the
-stored scopes as the names this build knows, with the others counted.
+stored scopes as the names this build knows, with the others counted. While an owner device
+confirms a pairing, the command says the verification value the new device should show, grouped in
+fours as both devices show it and only when it is eight hexadecimal digits, and names the device by
+its platform: the name a device gave itself is not repeated. When `kr new` starts a daemon that does
+not answer, the failure names the process and the daemon's log, and repeats the log's last line only
+when it is the daemon's own refusal of an environment another daemon holds.
+
+A pairing attempt's failure says its kind and a detail that is a `Shown`, so it carries nothing a
+host, a room or a store wrote and nothing an invitation carried. A room that could not be opened is
+said by its stage, its origin as an address, the status it answered with, and a reason when the
+reason is one this library gives; a failed link to a host is said by the host's own refusal, or by
+its kind.
 
 Two tests hold this. `crates/kr-client/tests/shown_rule.rs` reads both crates' sources as the
 compiler does, with each literal's escapes decoded, each type named by its full path through the
@@ -154,8 +168,8 @@ decimal and hexadecimal bytes, and in base64; beside each, the same planting of 
 held to naming the fault's class and its place. A service's answer that cannot be read is said
 through `json` or `cbor`, whose renderings carry none of the answer by their types.
 
-The rule does not reach standard output yet, nor the `--json` answers other than a failure document
-and the account token's, nor the derived `Debug` of a type that is not a failure.
+Standard output, the `--json` answers other than a failure document and the account token's, and
+the derived `Debug` of a type that is not a failure are outside this rule.
 
 ## Drafts
 
