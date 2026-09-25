@@ -10523,19 +10523,26 @@ mod a_create_that_launches_nothing {
         (connection_id, actor_id)
     }
 
-    /// Waits until the create under test has written its reservation.
+    /// Waits until the create under test has written its reservation, and fails the test when it
+    /// has not within thirty seconds: a create that stopped before its reservation would otherwise
+    /// hold the test, and the job running it, for ever.
     async fn reserved(controller: &Controller) {
-        loop {
-            let registry = controller.registry.lock().await;
-            let reserved = registry
-                .reservations_in(LaunchPhase::Reserved)
-                .expect("reads the reservations");
-            drop(registry);
-            if !reserved.is_empty() {
-                return;
+        const BOUND: Duration = Duration::from_secs(30);
+        tokio::time::timeout(BOUND, async {
+            loop {
+                let registry = controller.registry.lock().await;
+                let reserved = registry
+                    .reservations_in(LaunchPhase::Reserved)
+                    .expect("reads the reservations");
+                drop(registry);
+                if !reserved.is_empty() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the create wrote no reservation within {BOUND:?}"));
     }
 
     /// KR-REQ-08.44: an invisible session has no terminal, so probed colours are refused.
