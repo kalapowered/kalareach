@@ -50,6 +50,11 @@ const SCRIPT: &str = r#"report="$REPORT"
 } > "$report.part" && mv "$report.part" "$report"
 if [ -n "$HOOK" ]; then
   if [ -n "$WAIT_FOR" ]; then while [ ! -f "$WAIT_FOR" ]; do sleep 0.02; done; fi
+  if [ -n "$NESTED" ]; then
+    /bin/bash -c 'printf "%s" "$HOOK_EVENT" | "$HOOK" claude-code hook' > "$report.nested" 2>&1
+    echo done > "$report.nested.hooked"
+    if [ -n "$THEN_OWN" ]; then while [ ! -f "$THEN_OWN" ]; do sleep 0.02; done; fi
+  fi
   printf '%s' "$HOOK_EVENT" | "$HOOK" claude-code hook > "$report.hook" 2>&1
   echo done > "$report.hooked"
   if [ -n "$AGAIN_AFTER" ]; then
@@ -1690,6 +1695,120 @@ fn kr_req_12_16_a_directory_slow_to_open_does_not_hold_the_establish() {
         shell.broker.host_files(instance).is_some(),
         "the launch is granted the directory once it is open"
     );
+    let _ = finish(child);
+}
+
+/// Sets a directory's permission bits.
+fn set_mode(directory: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(mode))
+        .expect("the directory's mode is set");
+}
+
+/// How many observations one instance's history holds.
+fn observed(shell: &Shell, instance: ApplicationInstanceId) -> usize {
+    shell
+        .broker
+        .agent_snapshot(
+            &kr_protocol::agent::AgentSnapshotParams {
+                subject: kr_worker::broker::subject(session(), instance),
+                from_node: kr_protocol::scalars::Nullable::null(),
+            },
+            &kr_worker::broker::GrantLowerBound {
+                from: kr_protocol::ids::StreamCursor::new(0),
+            },
+        )
+        .map_or(0, |snapshot| snapshot.entries.len())
+}
+
+/// KR-REQ-12.07: a launch whose registration cannot be written after its instance was registered
+/// gives back what it took, and only that. The invocation runs as typed, an instance registered
+/// beside it stays, and a retry of the same invocation is launched, which it could not be if the
+/// failed launch still held its instance.
+#[test]
+fn kr_req_12_07_a_registration_that_cannot_be_written_gives_back_only_its_own() {
+    let shell = Shell::new();
+    let beside = ApplicationInstanceId::new(Uuid::from_bytes([8; 16]));
+    shell
+        .broker
+        .register_instance(
+            beside,
+            kr_protocol::broker::IntegrationMode::NativeTerminal,
+            None,
+            None,
+        )
+        .expect("an instance beside the launch");
+    let answer = shell.establish();
+    let directory = Shell::directory(&answer);
+    // Read-only: everything the launch reads is there, and its registration cannot be written.
+    set_mode(&directory, 0o500);
+    let child = shell.launch(&answer, "unwritten", &[]);
+    let report = shell.report("unwritten");
+    let (status, said) = finish(child);
+    set_mode(&directory, 0o700);
+    assert!(status.success(), "{said}");
+    assert_typed(&report, "a launch whose registration could not be written");
+    assert!(
+        !Shell::registration(&answer).exists(),
+        "nothing was published"
+    );
+    assert!(
+        shell.broker.binding_state(beside).is_ok(),
+        "an instance the launch did not take stays"
+    );
+
+    let child = shell.launch(&answer, "retried", &[("LINGER", "1")]);
+    let report = shell.report("retried");
+    assert_eq!(
+        report["registered"], "yes",
+        "the retry is launched: the failed launch gave its instance back"
+    );
+    assert!(
+        shell.broker.binding_state(instance_of(&report)).is_ok(),
+        "under the backend's own instance"
+    );
+    let _ = finish(child);
+    assert!(shell.broker.binding_state(beside).is_ok());
+}
+
+/// KR-REQ-11.34: only the launched program's own hook reports its selection. A process the program
+/// started, as a nested Claude Code inheriting its variables would be, has its hook admitted,
+/// since it descends from the program, and recorded, and its report moves nothing; the program's
+/// own report then selects the thread.
+#[test]
+fn kr_req_11_34_a_nested_process_s_session_start_is_recorded_and_moves_nothing() {
+    let shell = Shell::new();
+    let hook = shell.placed.forwarder.display().to_string();
+    let answer = shell.establish();
+    let own = shell.placed.host.root().join("own-hook");
+    let own_text = own.display().to_string();
+    let child = shell.launch(
+        &answer,
+        "nested",
+        &[
+            ("HOOK", hook.as_str()),
+            ("HOOK_EVENT", SESSION_START),
+            ("NESTED", "1"),
+            ("THEN_OWN", own_text.as_str()),
+            ("LINGER", "2"),
+        ],
+    );
+    let instance = instance_of(&shell.report("nested"));
+    eventually("the nested process's hook has run", || {
+        shell.reports.join("nested.nested.hooked").exists()
+    });
+    eventually("its report is recorded", || observed(&shell, instance) == 1);
+    assert_eq!(
+        selected(&shell, instance),
+        None,
+        "a nested process's report moves nothing"
+    );
+    std::fs::write(&own, "").expect("the program's own hook may run");
+    hooked(&shell, "nested");
+    eventually("the program's own report selects the thread", || {
+        selected(&shell, instance).as_deref() == Some(THREAD)
+    });
+    assert_eq!(observed(&shell, instance), 2);
     let _ = finish(child);
 }
 
