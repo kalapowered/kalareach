@@ -152,7 +152,8 @@ an older build read joins nothing because of them.
   "relay_trust_anchors": ["/etc/kalareach/relay-ca.der"],
   "relay_only": false,
   "local_discovery": false,
-  "mainline_dht": false
+  "mainline_dht": false,
+  "proxy_url": "http://proxy.example.com:3128"
 },
 "voice": { "broker_origin": "https://voice.example.com" }
 ```
@@ -169,6 +170,7 @@ an older build read joins nothing because of them.
 | `network.relay_only` | every packet through the relay, and no direct path | `true` or `false`; `true` needs at least one relay |
 | `network.local_discovery` | discovery of peers on the local network | `true` or `false` |
 | `network.mainline_dht` | the public Mainline DHT, which carries no KalaReach service guarantee | `true` or `false` |
+| `network.proxy_url` | the HTTP proxy the endpoint reaches its relays and discovery servers through; absent reaches them directly | an absolute `http` or `https` origin, with no user information, no path and no trailing slash |
 | `voice.broker_origin` | the managed broker a device's voice session talks to | an absolute `https` or `http` origin in lower case, with no path and no port its scheme already implies |
 
 A field the document does not write selects nothing, because there is no public relay or discovery
@@ -178,10 +180,16 @@ already implies, and no user information. A name in its `xn--` A-label form is r
 URL parser the endpoint uses decodes that punycode and this check cannot decode it the same way. A
 path is letters, digits and `- . _ ~ /`, with no `.` or `..` segment, and the whole URL fits the 253
 bytes of printable ASCII that an invitation carries it in, counting the `/` the parser adds to a URL
-with no path. Every address the document accepts is therefore one the endpoint accepts. A value
-outside these rules makes the whole document invalid, as it would in any other section: the host
-keeps its product defaults, `kr doctor` names the key and withholds the value, and an edit to
-another section is refused until the document is fixed.
+with no path. The proxy is an origin by the same rules, with nothing after its host and port, and a
+proxy address that names a user or a password, even an empty one, is refused as a proxy that needs
+credentials, which is not supported; it is never used with the credential dropped. Every address
+the document accepts is therefore one the endpoint accepts. A value outside these rules makes the
+whole document invalid, as it would in any other section: the host keeps its product defaults,
+`kr doctor` names the key and withholds the value, and an edit to another section is refused until
+the document is fixed. The proxy is this machine's own choice, and no invitation or host bundle
+carries it. Without one, the endpoint reaches its relays and discovery servers directly, apart from
+iroh's relay latency probe and captive-portal check, which then follow `HTTP_PROXY`, `HTTPS_PROXY`
+and `ALL_PROXY` when those are set.
 
 The daemon reads both sections once, when it starts, because that is when its endpoint and its
 voice service are built. `kr doctor` prints each field with its value, its source

@@ -56,6 +56,7 @@ used:
 | `relay_only` | Removes the IP transports, so every packet goes through the selected relay. |
 | `relay_ca_roots` | Extra trust anchors for a relay whose certificate comes from a private authority. |
 | `bind_addr` | The local socket. |
+| `proxy_url` | The HTTP proxy the endpoint's own web requests go through: the relay connection, the relay latency probe and captive-portal check, and the Pkarr publisher and resolver. A `ProxyUrl` is an `http` or `https` origin and never names a credential. |
 
 Publication rules, which are the defaults of `PublisherPolicy`:
 
@@ -76,6 +77,50 @@ pinned endpoint identity again rather than reusing an address that worked before
 The publication filter applies to the publisher, not to the endpoint. An endpoint-wide filter would
 also strip the direct addresses that local network discovery exists to advertise, so the public
 record stays relay-only while a selected mDNS service publishes what a local network needs.
+
+### Proxies, blocked upgrades and intercepted TLS
+
+`proxy_url` is the one way out for the endpoint's HTTP and HTTPS traffic. With it set, the relay
+client opens a `CONNECT` tunnel to each relay through the proxy, iroh's net report sends its relay
+latency probe and captive-portal check through it, and the Pkarr publisher and resolver send their
+requests through it. Nothing goes around it: when the proxy cannot be reached, neither can the
+relays. The endpoint's QUIC traffic is UDP and does not go through an HTTP proxy, so direct paths
+and iroh's QUIC address discovery reach their addresses as they would without one. A network that
+requires a proxy usually blocks them, which leaves the relay's HTTPS path; a relay-only endpoint
+has that path alone.
+
+The proxy is each machine's own choice. A pairing invitation and a host bundle carry the relays and
+discovery services a device dials with, never the proxy the inviting machine goes through. Nothing
+reads it from the environment: `bind` never calls iroh's `proxy_from_env`, and the Pkarr publisher
+and resolver are this crate's own, built on iroh's public `AddressLookup` trait, because iroh's own
+build their HTTP client with no way to name a proxy and follow `HTTP_PROXY`, `HTTPS_PROXY` and
+`ALL_PROXY` instead. They publish and read the same signed records, verified by iroh's record code,
+and a record longer than a signed record can be is refused before it is read whole. With no proxy
+selected, iroh still builds the client for its relay latency probe and captive-portal check with
+the environment's proxy settings, so those two requests follow `HTTP_PROXY`, `HTTPS_PROXY` and
+`ALL_PROXY` when they are set.
+
+A proxy that needs credentials is not supported. `ProxyUrl` refuses an address that names a user or
+a password, even an empty one, rather than using the proxy with the credential dropped.
+
+A network that blocks WebSocket upgrades lets the relay's HTTPS through and answers the relay
+connection's upgrade with something other than `101 Switching Protocols`, such as `403`. The relay
+itself never answered, so `endpoint::connect` reports that as `TransportError::Connect`, never as
+`RelayRefused`, with a message that names the relay and the status:
+
+```
+the network refused the WebSocket upgrade to the relay https://relay.example.com/ with HTTP status 403
+```
+
+It is decided as a relay's refusal is, below: it explains an attempt only through a relay on the
+connection's route, an endpoint with no IP transport stops at once when no relay on its route can
+be used, and one that can take a direct path lets its attempt run. A refused upgrade counts only
+while the relay status still shows it, because the network can let the next attempt through.
+
+A network that inspects TLS presents a certificate of its own for the relay. The endpoint refuses it
+(`invalid peer certificate: UnknownIssuer`) unless the network's authority is among
+`relay_ca_roots`, which an owner adds explicitly through `network.relay_trust_anchors` in the host
+configuration document; the public anchors stay in force beside it.
 
 ### Self-hosting
 
