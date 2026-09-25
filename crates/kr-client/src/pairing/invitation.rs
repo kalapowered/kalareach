@@ -17,6 +17,7 @@ use kr_protocol::rights::ActionRight;
 use serde::Serialize;
 
 use super::failure::{FailureKind, PairingFailure};
+use crate::shown::Shown;
 
 /// What a scanned or pasted payload turned out to be.
 pub enum Invitation {
@@ -137,7 +138,7 @@ pub fn read_invitation(
             }
             _ => FailureKind::NotAnInvitation,
         };
-        PairingFailure::new(kind, error.to_string())
+        PairingFailure::new(kind, Shown::qr_payload(&error))
     })?;
     match payload {
         QrPayload::Code(code) => {

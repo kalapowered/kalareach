@@ -19,6 +19,7 @@ use super::candidate::{
 use super::failure::{FailureKind, PairingFailure, refused_by_host};
 use super::link::{ConnectionPeer, LinkError};
 use super::paired::{AttemptMode, PairedHost, PendingAttempt};
+use crate::shown::{Said, Shown};
 
 impl Pairing {
     /// Redeems a direct invitation.
@@ -121,7 +122,7 @@ impl Pairing {
                 | kr_pairing::PairingError::ContextMismatch { .. } => FailureKind::HostMismatch,
                 _ => FailureKind::DidNotFinish,
             };
-            PairingFailure::new(kind, error.to_string())
+            PairingFailure::new(kind, Shown::pairing(&error))
         })?;
         let value = direct_verification_value(&transcript);
         let pending = PendingAttempt {
@@ -175,7 +176,7 @@ impl Pairing {
                 let _ = self.hosts.clear_attempt();
                 return Err(PairingFailure::new(
                     refused_by_host(refusal.code, true),
-                    refusal.message,
+                    Shown::protocol(&refusal),
                 ));
             }
             // Whether the host locked the invitation is unknown; asking is how to find out, on a
@@ -204,5 +205,5 @@ fn reached(error: &LinkError) -> PairingFailure {
         LinkError::Lost(_) => FailureKind::HostUnreachable,
         LinkError::Configuration(_) => FailureKind::NotAnInvitation,
     };
-    PairingFailure::new(kind, error.to_string())
+    PairingFailure::new(kind, error.said())
 }

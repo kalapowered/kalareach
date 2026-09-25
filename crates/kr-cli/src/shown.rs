@@ -8,7 +8,7 @@
 //! * [`Named`], a path the person named on this command line, returned to them;
 //! * [`Usage`], a usage failure as the command's own declarations and clap's classification say it,
 //!   with every value the person typed taken out;
-//! * [`tool_server`] and [`task`], a failure of the tool server by its kind;
+//! * [`tool_server`], a failure of the tool server by its kind;
 //! * [`VerificationValue`], a pairing's verification value as both devices show it.
 //!
 //! Each type here is made only by the function beside it, so a value of it is always what that
@@ -150,19 +150,6 @@ pub fn tool_server(error: &rmcp::service::ServerInitializeError) -> Shown {
     })
 }
 
-/// What a task that ended abnormally says: whether it panicked or was cancelled, never what a
-/// panic said.
-#[must_use]
-pub fn task(error: &tokio::task::JoinError) -> Shown {
-    if error.is_panic() {
-        Shown::said("a task panicked")
-    } else if error.is_cancelled() {
-        Shown::said("a task was cancelled")
-    } else {
-        Shown::said("a task ended abnormally")
-    }
-}
-
 /// A pairing's verification value, as both devices show it.
 pub struct VerificationValue(String);
 
@@ -282,77 +269,6 @@ pub fn term(error: &kr_term::TermError) -> Shown {
              does not offer",
         ),
         _ => Shown::said("the terminal library failed"),
-    }
-}
-
-/// What a pairing failure says: its fixed words and numbers; a rendezvous service's, a store's or
-/// a peer's own text is named by its kind, and a code a refusal carried by its code.
-#[must_use]
-pub fn pairing(error: &kr_pairing::PairingError) -> Shown {
-    use kr_pairing::PairingError as Failure;
-
-    match error {
-        Failure::MalformedCode => {
-            Shown::said("a pairing code is ten characters from the Bitcoin Base58 alphabet")
-        }
-        Failure::AuthenticationFailed => Shown::said("the pairing could not be authenticated"),
-        Failure::Expired => Shown::said("the invitation expired"),
-        Failure::Consumed { .. } => Shown::said("the invitation is no longer open"),
-        Failure::AlreadyCommitted => Shown::said("the invitation was already committed"),
-        Failure::EarlyData => Shown::said("a pairing mutation cannot arrive in early data"),
-        Failure::AttemptsExhausted => {
-            Shown::said("the invitation has no confirmation attempts left")
-        }
-        Failure::ClientAttemptsExhausted => {
-            Shown::said("this code has no attempts left on this device; ask for a new one")
-        }
-        Failure::CandidateLocked => {
-            Shown::said("another candidate is already awaiting owner approval")
-        }
-        Failure::WrongPhase { expected, actual } => shown!(
-            "a pairing message arrived in the {} phase, which expects {}",
-            *actual,
-            *expected
-        ),
-        Failure::ReplayedSequence { sequence } => shown!(
-            "a pairing message repeated or skipped sequence number {}",
-            *sequence
-        ),
-        Failure::TooLarge {
-            what,
-            limit,
-            actual,
-        } => shown!(
-            "{} is {} bytes, over the {}-byte limit",
-            *what,
-            *actual,
-            *limit
-        ),
-        Failure::ContextMismatch { what } => shown!("{} does not match", *what),
-        Failure::EndpointMismatch { side } => shown!(
-            "the live {} endpoint is not the one the pairing authenticated",
-            *side
-        ),
-        Failure::NotIssuingOwner => {
-            Shown::said("only the issuing owner can confirm or cancel this invitation")
-        }
-        Failure::OwnerConfirmationRequired => {
-            Shown::said("this action needs a fresh owner confirmation")
-        }
-        Failure::GrantNotPermitted { reason } => {
-            shown!("the proposed grant is not permitted: {}", *reason)
-        }
-        Failure::RendezvousUnavailable { .. } => {
-            Shown::said("the rendezvous service is unavailable")
-        }
-        Failure::RendezvousConfiguration { .. } => {
-            Shown::said("the rendezvous origin is not configured correctly")
-        }
-        Failure::Store { .. } => Shown::said("the pairing store failed"),
-        Failure::Refused { code, .. } => shown!("the pairing was refused: {}", *code),
-        Failure::Crypto(error) => Shown::crypto(error),
-        Failure::Encoding(error) => Shown::cbor(error),
-        _ => Shown::said("the pairing failed"),
     }
 }
 
@@ -681,10 +597,10 @@ mod tests {
         ] {
             assert!(error.to_string().contains(MARKER), "{error}");
             // The neutral control: the kind of failure, and a refusal's code, are said.
-            assert_eq!(pairing(&error).as_str(), expected);
+            assert_eq!(Shown::pairing(&error).as_str(), expected);
             assert_unmarked(
                 "a pairing failure",
-                &failure_renderings(CliError::Other(pairing(&error))),
+                &failure_renderings(CliError::Other(Shown::pairing(&error))),
             );
         }
     }
@@ -716,7 +632,7 @@ mod tests {
         assert!(panicked.to_string().contains(MARKER), "{panicked}");
         assert_unmarked(
             "a task that panicked",
-            &failure_renderings(CliError::Other(task(&panicked))),
+            &failure_renderings(CliError::Other(Shown::task(&panicked))),
         );
     }
 
@@ -727,5 +643,28 @@ mod tests {
     fn an_error_number_is_its_kind_and_number() {
         let said = errno(rustix::io::Errno::NOENT).to_string();
         assert!(said.contains("(os error 2)"), "{said}");
+    }
+
+    /// A verification value is said grouped in fours, as both devices show it, and only when it is
+    /// eight hexadecimal digits; anything else a host sent is replaced. A platform is said by the
+    /// protocol's own name for it.
+    #[test]
+    fn a_verification_value_is_said_only_as_eight_hexadecimal_digits() {
+        assert_eq!(verification_value("f3c146fd").to_string(), "f3c1 46fd");
+        for sent in [MARKER, "f3c146fd0", "f3c1 46fd", "", "g3c146fd"] {
+            let said = verification_value(sent).to_string();
+            assert_eq!(
+                said, "[a verification value this build does not read]",
+                "{sent}"
+            );
+        }
+        assert_unmarked(
+            "a verification value",
+            &failure_renderings(CliError::Other(shown!("{}", verification_value(MARKER)))),
+        );
+        assert_eq!(
+            platform(kr_protocol::pairing::DevicePlatform::Ios).as_str(),
+            "ios"
+        );
     }
 }

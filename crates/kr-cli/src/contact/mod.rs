@@ -897,10 +897,7 @@ pub async fn run_stdio(build_id: BuildId) -> crate::error::Result<()> {
         ))
     })?;
     let stopped = service.waiting().await.map_err(|error| {
-        CliError::Other(shown!(
-            "the tool server stopped: {}",
-            crate::shown::task(&error)
-        ))
+        CliError::Other(shown!("the tool server stopped: {}", Shown::task(&error)))
     });
     // A call the client cancelled just before the transport ended may still be cancelling its
     // question. It is given a bounded moment to finish, so the process does not exit under it.

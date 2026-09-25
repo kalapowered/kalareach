@@ -1119,6 +1119,71 @@ mod cases {
         }
     }
 
+    /// An invitation that cannot be read says which rule its payload broke and names a member by
+    /// its name, and says nothing the payload carried: not a mode it named, not a member's value and
+    /// not a decoder's words about one. A direct invitation's payload carries its pairing secret.
+    #[test]
+    fn an_invitation_that_cannot_be_read_says_nothing_it_carries() {
+        use kr_protocol::pairing::{QrPayload, RendezvousOrigin};
+
+        use crate::pairing::failure::FailureKind;
+        use crate::pairing::invitation::read_invitation;
+
+        let published: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/pairing/codes.json"),
+            )
+            .expect("the published vectors"),
+        )
+        .expect("JSON");
+        let configured = RendezvousOrigin::new("https://reach.kala.to").expect("an origin");
+        let payload = |pointer: &str| {
+            let text = published
+                .pointer(pointer)
+                .and_then(serde_json::Value::as_str)
+                .expect("a vector");
+            let bytes = kr_protocol::scalars::from_base64url(text).expect("base64url");
+            kr_cbor::decode(&bytes, &kr_cbor::Limits::DEFAULT).expect("a value")
+        };
+        let (mut refused, mut quoted) = (0, 0);
+        for pointer in ["/qr/code/text", "/qr/direct/text"] {
+            for planted in cbor_plantings(&payload(pointer), MARKER) {
+                let text = kr_protocol::scalars::to_base64url(&planted.input);
+                // The negative control: the payload reader's own failure quotes what it read.
+                if QrPayload::from_text(&text)
+                    .is_err_and(|error| error.to_string().contains(MARKER))
+                {
+                    quoted += 1;
+                }
+                if let Err(failure) = read_invitation(&text, &configured) {
+                    refused += 1;
+                    assert_unmarked(&planted.at, &failure_renderings(failure));
+                }
+            }
+        }
+        assert!(
+            refused > 0 && quoted > 0,
+            "{refused} refused, {quoted} quoting the marker"
+        );
+        // The neutral control: a payload naming a mode this build does not read says so, and says
+        // what kind of failure it is, with none of the mode.
+        let neutral = cbor_plantings(&payload("/qr/code/text"), NEUTRAL)
+            .into_iter()
+            .find(|planted| planted.at == "Text at /mode")
+            .expect("the mode is planted");
+        let failure = read_invitation(
+            &kr_protocol::scalars::to_base64url(&neutral.input),
+            &configured,
+        )
+        .map(|_| ())
+        .expect_err("no such mode");
+        assert_eq!(failure.kind, FailureKind::NotAnInvitation);
+        assert_eq!(
+            failure.to_string(),
+            "NotAnInvitation: the QR payload names a mode this build does not read"
+        );
+    }
+
     #[allow(dead_code, reason = "a path helper some cases share")]
     fn named(path: &Path) -> Shown {
         Shown::root(path)

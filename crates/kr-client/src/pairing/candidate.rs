@@ -69,6 +69,7 @@ use super::invitation::origin_host;
 use super::link::{ConnectionPeer, HostLink, LinkError, Preauth};
 use super::paired::{AttemptMode, PairedHost, PairedHosts, PendingAttempt};
 use super::room::{RoomConnector, RoomError, RoomRole, RoomSocket};
+use crate::shown::{Said, Shown};
 
 /// How long a candidate waits for the room's first frame once its socket is open.
 ///
@@ -660,7 +661,7 @@ impl Pairing {
                 let _ = self.hosts.clear_attempt();
                 return Err(PairingFailure::new(
                     refused_by_host(refusal.code, false),
-                    refusal.message,
+                    Shown::protocol(&refusal),
                 )
                 .with_tries(tries));
             }
@@ -708,12 +709,14 @@ impl Pairing {
                     "this code has no tries left on this device",
                 )
                 .with_tries(Some(0)),
-                (PairingError::Store { reason }, _) => {
-                    PairingFailure::new(FailureKind::StoreFailed, reason)
+                (error @ PairingError::Store { .. }, _) => {
+                    PairingFailure::new(FailureKind::StoreFailed, Shown::pairing(&error))
                 }
                 (_, Some(ending)) => ending.with_tries(tries),
-                (error, None) => PairingFailure::new(FailureKind::DidNotFinish, error.to_string())
-                    .with_tries(tries),
+                (error, None) => {
+                    PairingFailure::new(FailureKind::DidNotFinish, Shown::pairing(&error))
+                        .with_tries(tries)
+                }
             },
             StartRefused::Lost(detail) => {
                 PairingFailure::new(FailureKind::DidNotFinish, detail).with_tries(tries)
@@ -850,7 +853,7 @@ impl Pairing {
                         unpaired.asked.asked(now, self.attempt_call(&pending, now));
                         within(self.step(&pending), unpaired.preauth.status(&params)).await
                     }
-                    None => Err(LinkError::Lost("no connection".to_owned())),
+                    None => Err(LinkError::lost(Shown::said("no connection"))),
                 },
             };
             match asked {
@@ -882,7 +885,7 @@ impl Pairing {
                     let _ = self.hosts.clear_attempt();
                     return Err(PairingFailure::new(
                         refused_by_host(refusal.code, pending.mode == AttemptMode::Direct),
-                        refusal.message,
+                        Shown::protocol(&refusal),
                     ));
                 }
                 Err(LinkError::Lost(_) | LinkError::Configuration(_)) => {
@@ -1028,7 +1031,7 @@ impl Pairing {
         let mut fresh = self
             .reconnect(pending)
             .await
-            .ok_or_else(|| LinkError::Lost("no fresh connection opened".to_owned()))?;
+            .ok_or_else(|| LinkError::lost(Shown::said("no fresh connection opened")))?;
         let now = tokio::time::Instant::now();
         fresh.asked.asked(now, self.attempt_call(pending, now));
         let answer = within(self.step(pending), fresh.preauth.status(params)).await?;
@@ -1104,7 +1107,7 @@ impl Pairing {
         let params = PairStatusParams {
             invitation_id: pending.invitation_id,
         };
-        let mut last = String::new();
+        let mut last = Shown::said("no connection was tried");
         for (index, delay) in RECONNECT_DELAYS
             .iter()
             .take(PAIRED_CONNECT_TRIES)
@@ -1116,7 +1119,7 @@ impl Pairing {
             // The attempt's own deadline holds here too. Past it the device stops asking, and it
             // keeps its record of the host, which committed it.
             if self.left(pending).is_zero() {
-                last = "the attempt's time ran out".to_owned();
+                last = Shown::said("the attempt's time ran out");
                 break;
             }
             let session = match within(
@@ -1127,7 +1130,7 @@ impl Pairing {
             {
                 Ok(session) => session,
                 Err(error) => {
-                    last = error.to_string();
+                    last = error.said();
                     continue;
                 }
             };
@@ -1135,7 +1138,7 @@ impl Pairing {
                 session
                     .read(Method::PairStatus, &params)
                     .await
-                    .map_err(|error| LinkError::Lost(error.to_string()))
+                    .map_err(|error| LinkError::lost(error.said()))
             })
             .await;
             match status.map(|answer| answer.status) {
@@ -1153,7 +1156,7 @@ impl Pairing {
                 }
                 Err(error) => {
                     session.close();
-                    last = error.to_string();
+                    last = error.said();
                     continue;
                 }
             }
@@ -1162,7 +1165,7 @@ impl Pairing {
                     session
                         .read(Method::EnvironmentList, &EmptyParams {})
                         .await
-                        .map_err(|error| LinkError::Lost(error.to_string()))
+                        .map_err(|error| LinkError::lost(error.said()))
                 })
                 .await;
             session.close();
@@ -1187,7 +1190,10 @@ impl Pairing {
         }
         Err(PairingFailure::new(
             FailureKind::HostUnreachable,
-            format!("the host committed this device, which could not connect as it: {last}"),
+            crate::shown!(
+                "the host committed this device, which could not connect as it: {}",
+                last
+            ),
         ))
     }
 }
@@ -1199,9 +1205,9 @@ pub(crate) async fn within<T>(
     step: impl std::future::Future<Output = Result<T, LinkError>>,
 ) -> Result<T, LinkError> {
     tokio::time::timeout(bound, step).await.unwrap_or_else(|_| {
-        Err(LinkError::Lost(
-            "the host answered nothing in time".to_owned(),
-        ))
+        Err(LinkError::lost(Shown::said(
+            "the host answered nothing in time",
+        )))
     })
 }
 
@@ -1553,7 +1559,7 @@ fn answered_otherwise(message: &RendezvousMessage, tries: Option<u32>) -> Pairin
     match message {
         RendezvousMessage::Refused { code, .. } => PairingFailure::new(
             refused_by_host(*code, false),
-            format!("the host reported {}", code.as_str()),
+            crate::shown!("the host reported {}", *code),
         )
         .with_tries(tries),
         _ => PairingFailure::new(
@@ -1574,7 +1580,7 @@ fn step_failed(error: &PairingError, tries: Option<u32>) -> PairingFailure {
         | PairingError::ReplayedSequence { .. } => FailureKind::NotAuthenticated,
         _ => FailureKind::DidNotFinish,
     };
-    PairingFailure::new(kind, error.to_string()).with_tries(tries)
+    PairingFailure::new(kind, Shown::pairing(error)).with_tries(tries)
 }
 
 /// What a failure reaching the host means, once its bundle pinned it.
@@ -1584,7 +1590,7 @@ fn link_failed(error: &LinkError, tries: Option<u32>) -> PairingFailure {
         LinkError::Lost(_) => FailureKind::HostUnreachable,
         LinkError::Configuration(_) => FailureKind::DidNotFinish,
     };
-    PairingFailure::new(kind, error.to_string()).with_tries(tries)
+    PairingFailure::new(kind, error.said()).with_tries(tries)
 }
 
 /// How the room ended an exchange that was under way.
@@ -1611,9 +1617,37 @@ impl RoomStop {
             (Self::TimedOut, _) => FailureKind::TimedOut,
             (_, kind) => kind,
         };
-        PairingFailure::new(kind, format!("the room ended the exchange: {self:?}"))
-            .with_tries(tries)
+        PairingFailure::new(
+            kind,
+            crate::shown!("the room ended the exchange: {}", self.said()),
+        )
+        .with_tries(tries)
     }
+}
+
+impl Said for RoomStop {
+    fn said(&self) -> Shown {
+        match self {
+            Self::Closed(reason) => crate::shown!("the room closed it: {}", closed(*reason)),
+            Self::Ended => Shown::said("the socket ended without a last frame"),
+            Self::TimedOut => Shown::said("the attempt's own deadline passed"),
+            Self::Unreadable => Shown::said("the room sent something no attempt reads"),
+        }
+    }
+}
+
+/// Why the room said it closed a socket or an attempt.
+const fn closed(reason: CloseReason) -> Shown {
+    Shown::said(match reason {
+        CloseReason::Deadline => "a candidate socket reached its deadline",
+        CloseReason::Expired => "the record's advertised expiry passed",
+        CloseReason::Cancelled => "the host closed the attempt or released the record",
+        CloseReason::Superseded => "another socket took this role's place",
+        CloseReason::Invalid => "a frame was not one of the room's vocabulary",
+        CloseReason::Oversize => "a frame carried more than the room allows",
+        CloseReason::Exhausted => "the attempt relayed more than the room allows in total",
+        CloseReason::HostGone => "no host was attached to carry the frame",
+    })
 }
 
 /// One attempt's frames through the room.
@@ -1681,7 +1715,7 @@ pub(crate) enum StartRefused {
         room: Option<PairingFailure>,
     },
     /// The blocking thread did not finish.
-    Lost(String),
+    Lost(Shown),
 }
 
 /// Runs kr-pairing's start on a blocking thread with a lookup that opens the room.
@@ -1714,16 +1748,17 @@ where
     match joined {
         Ok(Ok(value)) => match socket {
             Some(socket) => Ok((value, socket)),
-            None => Err(StartRefused::Lost(
-                "the attempt started without opening its room".to_owned(),
-            )),
+            None => Err(StartRefused::Lost(Shown::said(
+                "the attempt started without opening its room",
+            ))),
         },
         Ok(Err(error)) => Err(StartRefused::Pairing {
             error,
             room: ending.lock().unwrap_or_else(PoisonError::into_inner).take(),
         }),
-        Err(error) => Err(StartRefused::Lost(format!(
-            "the attempt's start did not finish: {error}"
+        Err(error) => Err(StartRefused::Lost(crate::shown!(
+            "the attempt's start did not finish: {}",
+            Shown::task(&error)
         ))),
     }
 }
@@ -1769,11 +1804,11 @@ impl RendezvousClient for RoomLookup {
             Err(failure) => {
                 let error = if failure.kind == FailureKind::ServiceNotPairing {
                     PairingError::RendezvousConfiguration {
-                        reason: failure.detail.clone(),
+                        reason: failure.detail.as_str().to_owned(),
                     }
                 } else {
                     PairingError::RendezvousUnavailable {
-                        reason: failure.detail.clone(),
+                        reason: failure.detail.as_str().to_owned(),
                     }
                 };
                 *self.ending.lock().unwrap_or_else(PoisonError::into_inner) = Some(failure);
@@ -1792,8 +1827,8 @@ async fn first_record(
     let mut socket = room
         .open(origin, locator)
         .await
-        .map_err(|error| PairingFailure::new(room_failure(&error), error.to_string()))?;
-    let no_host = |detail: &str| PairingFailure::new(FailureKind::NoHostAnswered, detail);
+        .map_err(|error| PairingFailure::new(room_failure(&error), error.said()))?;
+    let no_host = |detail: Shown| PairingFailure::new(FailureKind::NoHostAnswered, detail);
     match tokio::time::timeout(RECORD_WAIT, socket.incoming.recv()).await {
         Ok(Some(ServiceFrame::Record {
             invitation_id,
@@ -1805,12 +1840,15 @@ async fn first_record(
             },
             socket,
         )),
-        Ok(Some(ServiceFrame::Closed { reason })) => {
-            Err(no_host(&format!("the room closed the socket: {reason:?}")))
-        }
-        Ok(Some(_)) => Err(no_host("the room sent something before a record")),
-        Ok(None) => Err(no_host("the room ended the socket")),
-        Err(_) => Err(no_host("the room served no record in time")),
+        Ok(Some(ServiceFrame::Closed { reason })) => Err(no_host(crate::shown!(
+            "the room closed the socket: {}",
+            closed(reason)
+        ))),
+        Ok(Some(_)) => Err(no_host(Shown::said(
+            "the room sent something before a record",
+        ))),
+        Ok(None) => Err(no_host(Shown::said("the room ended the socket"))),
+        Err(_) => Err(no_host(Shown::said("the room served no record in time"))),
     }
 }
 

@@ -15,8 +15,8 @@
 //!   is what [`shown!`](crate::shown!) writes;
 //! * a reducer, which turns one kind of input into what may be said of it: [`Shown::address`],
 //!   [`Shown::cbor`], [`Shown::json`], [`Shown::io`], [`Shown::frame`], [`Shown::ipc`],
-//!   [`Shown::transport`], [`Shown::crypto`], and for paths [`Shown::root`], [`Shown::within`] and
-//!   [`Shown::stored`];
+//!   [`Shown::transport`], [`Shown::crypto`], [`Shown::pairing`], [`Shown::qr_payload`],
+//!   [`Shown::task`], and for paths [`Shown::root`], [`Shown::within`] and [`Shown::stored`];
 //! * a door for text somebody wrote for a person and that is shown on purpose, each taking the one
 //!   value it is for: [`Shown::protocol`], [`Shown::service`] and [`Shown::package`].
 //!
@@ -466,6 +466,123 @@ impl Shown {
                 expected, actual, ..
             } => crate::shown!("a stored secret is {} bytes, not {}", *actual, *expected),
             _ => Self::said("a cryptographic operation failed"),
+        }
+    }
+
+    /// What a pairing failure says: its fixed words and numbers. What a rendezvous service, a
+    /// store or a peer wrote is named by its kind, and a refusal by the code it carried.
+    #[must_use]
+    pub fn pairing(error: &kr_pairing::PairingError) -> Self {
+        use kr_pairing::PairingError as Failure;
+
+        match error {
+            Failure::MalformedCode => {
+                Self::said("a pairing code is ten characters from the Bitcoin Base58 alphabet")
+            }
+            Failure::AuthenticationFailed => Self::said("the pairing could not be authenticated"),
+            Failure::Expired => Self::said("the invitation expired"),
+            Failure::Consumed { .. } => Self::said("the invitation is no longer open"),
+            Failure::AlreadyCommitted => Self::said("the invitation was already committed"),
+            Failure::EarlyData => Self::said("a pairing mutation cannot arrive in early data"),
+            Failure::AttemptsExhausted => {
+                Self::said("the invitation has no confirmation attempts left")
+            }
+            Failure::ClientAttemptsExhausted => {
+                Self::said("this code has no attempts left on this device; ask for a new one")
+            }
+            Failure::CandidateLocked => {
+                Self::said("another candidate is already awaiting owner approval")
+            }
+            Failure::WrongPhase { expected, actual } => crate::shown!(
+                "a pairing message arrived in the {} phase, which expects {}",
+                *actual,
+                *expected
+            ),
+            Failure::ReplayedSequence { sequence } => crate::shown!(
+                "a pairing message repeated or skipped sequence number {}",
+                *sequence
+            ),
+            Failure::TooLarge {
+                what,
+                limit,
+                actual,
+            } => crate::shown!(
+                "{} is {} bytes, over the {}-byte limit",
+                *what,
+                *actual,
+                *limit
+            ),
+            Failure::ContextMismatch { what } => crate::shown!("{} does not match", *what),
+            Failure::EndpointMismatch { side } => crate::shown!(
+                "the live {} endpoint is not the one the pairing authenticated",
+                *side
+            ),
+            Failure::NotIssuingOwner => {
+                Self::said("only the issuing owner can confirm or cancel this invitation")
+            }
+            Failure::OwnerConfirmationRequired => {
+                Self::said("this action needs a fresh owner confirmation")
+            }
+            Failure::GrantNotPermitted { reason } => {
+                crate::shown!("the proposed grant is not permitted: {}", *reason)
+            }
+            Failure::RendezvousUnavailable { .. } => {
+                Self::said("the rendezvous service is unavailable")
+            }
+            Failure::RendezvousConfiguration { .. } => {
+                Self::said("the rendezvous origin is not configured correctly")
+            }
+            Failure::Store { .. } => Self::said("the pairing store failed"),
+            Failure::Refused { code, .. } => crate::shown!("the pairing was refused: {}", *code),
+            Failure::Crypto(error) => Self::crypto(error),
+            Failure::Encoding(error) => Self::cbor(error),
+            _ => Self::said("the pairing failed"),
+        }
+    }
+
+    /// What an invitation's QR payload that could not be read says: the rule it broke, a member
+    /// that failed by its name, and its size or its version.
+    ///
+    /// The mode a payload named and why one of its members failed are not said. Both are the
+    /// payload's own text, and a direct invitation's payload carries its pairing secret.
+    #[must_use]
+    pub fn qr_payload(error: &kr_protocol::pairing::QrPayloadError) -> Self {
+        use kr_protocol::pairing::QrPayloadError as Fault;
+
+        match error {
+            Fault::Encoding(error) => crate::shown!(
+                "the QR payload is not canonical KR-CBOR-1: {}",
+                Self::cbor(error)
+            ),
+            Fault::Malformed(what) => crate::shown!("the QR payload is malformed: {}", *what),
+            Fault::UnsupportedMode { .. } => {
+                Self::said("the QR payload names a mode this build does not read")
+            }
+            Fault::UnsupportedVersion { version } => crate::shown!(
+                "unsupported QR payload version {}; this build reads version 1",
+                *version
+            ),
+            Fault::TooLarge { len, limit } => crate::shown!(
+                "the QR payload is {} bytes, over the {}-byte limit",
+                *len,
+                *limit
+            ),
+            Fault::InvalidMember { member, .. } => {
+                crate::shown!("the QR payload carries an invalid {}", *member)
+            }
+        }
+    }
+
+    /// What a task that ended abnormally says: whether it panicked or was cancelled, never what a
+    /// panic said.
+    #[must_use]
+    pub fn task(error: &tokio::task::JoinError) -> Self {
+        if error.is_panic() {
+            Self::said("a task panicked")
+        } else if error.is_cancelled() {
+            Self::said("a task was cancelled")
+        } else {
+            Self::said("a task ended abnormally")
         }
     }
 

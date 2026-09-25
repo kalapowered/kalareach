@@ -44,21 +44,51 @@ use tokio::sync::{Mutex, watch};
 use super::BoxFuture;
 use super::paired::PairedHost;
 use crate::session::Session;
+use crate::shown::{Said, Shown};
 use crate::transport::NetworkTransport;
 
 /// Why a call to a host did not answer.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+///
+/// What it says is the host's own refusal, through [`Shown::protocol`], or which of the other two
+/// it was. The text those two carry is not said: this library puts only what a reducer decided
+/// there, and anything else that builds one can put any text there.
+#[derive(Clone, PartialEq, Eq)]
 pub enum LinkError {
     /// The host answered with a refusal of its own.
-    #[error("the host refused: {}: {}", .0.code.as_str(), .0.message)]
     Refused(ProtocolError),
     /// The host could not be reached, or the connection to it ended.
-    #[error("the host could not be reached: {0}")]
     Lost(String),
     /// The network configuration a host gave could not be used.
-    #[error("the host's network configuration cannot be used: {0}")]
     Configuration(String),
 }
+
+impl LinkError {
+    /// The host could not be reached, for the reason `reason` says.
+    pub(crate) fn lost(reason: Shown) -> Self {
+        Self::Lost(reason.into_string())
+    }
+}
+
+impl Said for LinkError {
+    fn said(&self) -> Shown {
+        match self {
+            Self::Refused(error) => crate::shown!(
+                "the host refused: {}: {}",
+                error.code,
+                Shown::protocol(error)
+            ),
+            Self::Lost(_) => Shown::said("the host could not be reached"),
+            Self::Configuration(_) => {
+                Shown::said("the host's network configuration cannot be used")
+            }
+        }
+    }
+}
+
+crate::display_as_said!(LinkError);
+crate::debug_as_display!(LinkError);
+
+impl std::error::Error for LinkError {}
 
 impl From<kr_transport::TransportError> for LinkError {
     /// Says what a transport failure is for the pairing flows.
@@ -71,9 +101,9 @@ impl From<kr_transport::TransportError> for LinkError {
         match error {
             kr_transport::TransportError::Refused(refusal) => Self::Refused(refusal),
             kr_transport::TransportError::Configuration { .. } => {
-                Self::Configuration(error.to_string())
+                Self::Configuration(Shown::transport(&error).into_string())
             }
-            other => Self::Lost(other.to_string()),
+            other => Self::lost(Shown::transport(&other)),
         }
     }
 }
@@ -375,9 +405,9 @@ impl EndpointPool {
             .iter()
             .any(|open| open.held() && open.services.share_a_relay(&services))
         {
-            return Err(LinkError::Lost(
-                "the relay this host is reached through is in use for another host".to_owned(),
-            ));
+            return Err(LinkError::lost(Shown::said(
+                "the relay this host is reached through is in use for another host",
+            )));
         }
         endpoints.start_closing(|held| held.share_a_relay(&services));
         endpoints.closed(|held| held.share_a_relay(&services)).await;
@@ -389,7 +419,10 @@ impl EndpointPool {
             endpoint,
             holds: Arc::new(()),
         });
-        Ok(endpoints.open.last().expect("just bound"))
+        let Some(open) = endpoints.open.last() else {
+            unreachable!("an endpoint was just bound");
+        };
+        Ok(open)
     }
 
     /// How many endpoints are open.
@@ -459,10 +492,9 @@ impl HostLink for IrohLink {
         Box::pin(async move {
             let address = EndpointConfig::from_network_config(network)?.peer_addr(endpoint)?;
             let local = self.pool.endpoint(network).await?;
-            local
-                .connect(address, ALPN)
-                .await
-                .map_err(|error| LinkError::Lost(error.to_string()))
+            local.connect(address, ALPN).await.map_err(|_| {
+                LinkError::lost(Shown::said("the connection could not be established"))
+            })
         })
     }
 
@@ -496,9 +528,9 @@ impl HostLink for IrohLink {
             .await
             .map_err(|error| match error {
                 crate::ClientError::Transport(error) => LinkError::from(error),
-                other => LinkError::Lost(other.to_string()),
+                other => LinkError::lost(other.said()),
             })?;
-            Session::start(Arc::new(transport)).map_err(|error| LinkError::Lost(error.to_string()))
+            Session::start(Arc::new(transport)).map_err(|error| LinkError::lost(error.said()))
         })
     }
 
@@ -829,5 +861,33 @@ mod tests {
                 "{code:?}"
             );
         }
+    }
+
+    /// A link failure says the host's own refusal through its door, and otherwise only which kind
+    /// of failure it was: the text a lost connection or a configuration carries is not said.
+    #[test]
+    fn a_link_failure_says_the_hosts_refusal_and_otherwise_only_its_kind() {
+        use kr_protocol::error::ErrorCode;
+
+        use crate::shown::marker::{MARKER, assert_unmarked, failure_renderings};
+
+        for error in [
+            LinkError::Lost(MARKER.to_owned()),
+            LinkError::Configuration(MARKER.to_owned()),
+        ] {
+            assert_unmarked("a link failure", &failure_renderings(error));
+        }
+        assert_eq!(
+            LinkError::lost(Shown::said("no connection")).to_string(),
+            "the host could not be reached"
+        );
+        let refused = LinkError::Refused(crate::error::refusal(
+            ErrorCode::PairingExpired,
+            Shown::said("the invitation expired"),
+        ));
+        assert_eq!(
+            format!("{refused:?}"),
+            "LinkError(\"the host refused: PAIRING_EXPIRED: the invitation expired\")"
+        );
     }
 }

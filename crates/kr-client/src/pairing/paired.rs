@@ -22,6 +22,7 @@ use kr_protocol::scalars::EndpointKey;
 use serde::{Deserialize, Serialize};
 
 use super::failure::{FailureKind, PairingFailure};
+use crate::shown::Shown;
 
 /// The version of the records this store writes and reads.
 const FORMAT_VERSION: u32 = 1;
@@ -161,8 +162,13 @@ impl PairedHosts {
     /// user owns alone.
     pub fn open(directory: impl Into<PathBuf>) -> Result<Self, PairingFailure> {
         let directory = directory.into();
-        kr_ipc::paths::create_private_directory(&directory)
-            .map_err(|error| store_failed(format!("{}: {error}", directory.display())))?;
+        kr_ipc::paths::create_private_directory(&directory).map_err(|error| {
+            store_failed(crate::shown!(
+                "{}: {}",
+                Shown::root(&directory),
+                Shown::ipc(&error)
+            ))
+        })?;
         Ok(Self {
             directory,
             writing: Mutex::new(()),
@@ -186,12 +192,17 @@ impl PairedHosts {
         let Some(bytes) = self.read(HOSTS_FILE)? else {
             return Ok(Vec::new());
         };
-        let file: HostsFile = serde_json::from_slice(&bytes)
-            .map_err(|error| store_failed(format!("the paired hosts cannot be read: {error}")))?;
+        let file: HostsFile = serde_json::from_slice(&bytes).map_err(|error| {
+            store_failed(crate::shown!(
+                "the paired hosts cannot be read: {}",
+                Shown::json(&error)
+            ))
+        })?;
         if file.version != FORMAT_VERSION {
-            return Err(store_failed(format!(
-                "the paired hosts are version {}, and this release reads {FORMAT_VERSION}",
-                file.version
+            return Err(store_failed(crate::shown!(
+                "the paired hosts are version {}, and this release reads {}",
+                file.version,
+                FORMAT_VERSION
             )));
         }
         Ok(file.hosts)
@@ -266,7 +277,12 @@ impl PairedHosts {
             version: FORMAT_VERSION,
             attempt: attempt.clone(),
         })
-        .map_err(|error| store_failed(format!("the attempt cannot be written: {error}")))?;
+        .map_err(|error| {
+            store_failed(crate::shown!(
+                "the attempt cannot be written: {}",
+                Shown::json(&error)
+            ))
+        })?;
         self.write(ATTEMPT_FILE, &bytes)
     }
 
@@ -280,12 +296,16 @@ impl PairedHosts {
             return Ok(None);
         };
         let file: AttemptFile = serde_json::from_slice(&bytes).map_err(|error| {
-            store_failed(format!("the waiting attempt cannot be read: {error}"))
+            store_failed(crate::shown!(
+                "the waiting attempt cannot be read: {}",
+                Shown::json(&error)
+            ))
         })?;
         if file.version != FORMAT_VERSION {
-            return Err(store_failed(format!(
-                "the waiting attempt is version {}, and this release reads {FORMAT_VERSION}",
-                file.version
+            return Err(store_failed(crate::shown!(
+                "the waiting attempt is version {}, and this release reads {}",
+                file.version,
+                FORMAT_VERSION
             )));
         }
         Ok(Some(file.attempt))
@@ -302,7 +322,11 @@ impl PairedHosts {
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(store_failed(format!("{}: {error}", path.display()))),
+            Err(error) => Err(store_failed(crate::shown!(
+                "{}: {}",
+                Shown::within(&self.directory, ATTEMPT_FILE),
+                Shown::io(&error)
+            ))),
         }
     }
 
@@ -311,20 +335,34 @@ impl PairedHosts {
             version: FORMAT_VERSION,
             hosts,
         })
-        .map_err(|error| store_failed(format!("the paired hosts cannot be written: {error}")))?;
+        .map_err(|error| {
+            store_failed(crate::shown!(
+                "the paired hosts cannot be written: {}",
+                Shown::json(&error)
+            ))
+        })?;
         self.write(HOSTS_FILE, &bytes)
     }
 
-    fn read(&self, name: &str) -> Result<Option<Vec<u8>>, PairingFailure> {
+    fn read(&self, name: &'static str) -> Result<Option<Vec<u8>>, PairingFailure> {
         let path = self.directory.join(name);
         kr_ipc::paths::read_owner_only_file(&path, MAX_FILE_BYTES)
-            .map_err(|error| store_failed(format!("{}: {error}", path.display())))
+            .map_err(|error| self.file_failed(name, &error))
     }
 
-    fn write(&self, name: &str, bytes: &[u8]) -> Result<(), PairingFailure> {
+    fn write(&self, name: &'static str, bytes: &[u8]) -> Result<(), PairingFailure> {
         let path = self.directory.join(name);
         kr_ipc::paths::write_owner_only_file(&path, bytes)
-            .map_err(|error| store_failed(format!("{}: {error}", path.display())))
+            .map_err(|error| self.file_failed(name, &error))
+    }
+
+    /// Says which of the records' files could not be used, and why.
+    fn file_failed(&self, name: &'static str, error: &kr_ipc::IpcError) -> PairingFailure {
+        store_failed(crate::shown!(
+            "{}: {}",
+            Shown::within(&self.directory, name),
+            Shown::ipc(error)
+        ))
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -334,7 +372,7 @@ impl PairedHosts {
     }
 }
 
-fn store_failed(detail: String) -> PairingFailure {
+fn store_failed(detail: Shown) -> PairingFailure {
     PairingFailure::new(FailureKind::StoreFailed, detail)
 }
 

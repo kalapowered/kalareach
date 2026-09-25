@@ -47,6 +47,8 @@ use tokio_rustls::rustls::ClientConfig;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_websockets::{ClientBuilder, Limits, Message, WebSocketStream};
 
+use crate::shown::{Said, Shown};
+
 /// How long opening a room socket may take: the name, the connection, TLS and the upgrade.
 pub const OPEN_DEADLINE: Duration = Duration::from_secs(10);
 
@@ -113,10 +115,13 @@ impl std::fmt::Debug for RoomRole<'_> {
 }
 
 /// How far opening a room socket got.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+///
+/// What it says is its stage, the origin as a diagnostic names an address, the status a room
+/// answered with, and a reason when the reason is one this client gives. A reason is otherwise
+/// text somebody else wrote, and it is replaced.
+#[derive(Clone, PartialEq, Eq)]
 pub enum RoomError {
     /// The origin is not one this client can address, or a request to it cannot be written.
-    #[error("the room at {origin} cannot be addressed: {reason}")]
     Configuration {
         /// The origin.
         origin: String,
@@ -124,7 +129,6 @@ pub enum RoomError {
         reason: String,
     },
     /// The name, the connection, the proxy or TLS failed, or the socket did not open in time.
-    #[error("the room at {origin} could not be reached: {reason}")]
     Unreachable {
         /// The origin.
         origin: String,
@@ -132,7 +136,6 @@ pub enum RoomError {
         reason: String,
     },
     /// The upgrade was answered with a status other than switching protocols.
-    #[error("the room at {origin} answered the upgrade with status {status}")]
     Refused {
         /// The origin.
         origin: String,
@@ -140,13 +143,180 @@ pub enum RoomError {
         status: u16,
     },
     /// The answer was not a WebSocket upgrade, or not one this client accepts.
-    #[error("the room at {origin} did not answer with an upgrade: {reason}")]
     NotAnUpgrade {
         /// The origin.
         origin: String,
         /// What was wrong with the answer.
         reason: String,
     },
+}
+
+impl Said for RoomError {
+    fn said(&self) -> Shown {
+        match self {
+            Self::Configuration { origin, reason } => crate::shown!(
+                "the room at {} cannot be addressed: {}",
+                room_origin(origin),
+                room_reason(reason)
+            ),
+            Self::Unreachable { origin, reason } => crate::shown!(
+                "the room at {} could not be reached: {}",
+                room_origin(origin),
+                room_reason(reason)
+            ),
+            Self::Refused { origin, status } => crate::shown!(
+                "the room at {} answered the upgrade with status {}",
+                room_origin(origin),
+                *status
+            ),
+            Self::NotAnUpgrade { origin, reason } => crate::shown!(
+                "the room at {} did not answer with an upgrade: {}",
+                room_origin(origin),
+                room_reason(reason)
+            ),
+        }
+    }
+}
+
+crate::display_as_said!(RoomError);
+crate::debug_as_display!(RoomError);
+
+impl std::error::Error for RoomError {}
+
+/// What a failure that concerns no origin in particular names as its origin.
+const EVERY_ORIGIN: &str = "every origin";
+
+/// The platform's certificate verifier could not be set up.
+const NO_VERIFIER: &str = "the platform's certificate verifier cannot be set up";
+/// The origin is not an https origin.
+const NOT_HTTPS: &str = "a rendezvous origin is an https origin";
+/// An IPv6 origin's brackets do not close.
+const OPEN_BRACKETS: &str = "an IPv6 origin closes its brackets";
+/// The origin's port is not a number a port can be.
+const NOT_A_PORT: &str = "the origin's port is not a port number";
+/// The origin's host is not a name TLS can verify.
+const NOT_A_TLS_NAME: &str = "the origin's host is not a name TLS can verify";
+/// The room's address cannot be written as a request.
+const NOT_AN_ADDRESS: &str = "the room's address cannot be written as a request";
+/// The control token's header cannot be sent.
+const NO_TOKEN_HEADER: &str = "the control token header cannot be sent";
+/// The control token cannot be sent.
+const NO_TOKEN: &str = "the control token cannot be sent";
+/// The socket did not open within [`OPEN_DEADLINE`].
+const TOO_SLOW: &str = "the socket did not open within its deadline";
+/// The connection to the origin's host failed.
+const NO_CONNECTION: &str = "the connection failed";
+/// The TLS handshake failed.
+const NO_TLS: &str = "the TLS handshake failed";
+/// The upgrade did not finish.
+const UNFINISHED: &str = "the upgrade did not finish";
+/// The answer does not begin with a status line.
+const NO_STATUS_LINE: &str = "the room's answer to the upgrade does not begin with a status line";
+/// The answer is longer than [`MAX_UPGRADE_ANSWER_BYTES`].
+const TOO_LONG: &str = "the room's answer to the upgrade is longer than an answer may be";
+/// The answer carries an accept value that is not one SHA-1 digest.
+const NOT_A_DIGEST: &str =
+    "the room's answer to the upgrade carries an accept value that is no SHA-1 digest";
+/// The answer lacks a header an upgrade needs.
+const MISSING_HEADER: &str = "the answer lacks a header an upgrade needs";
+/// The answer's `Upgrade` header is not `websocket`.
+const NOT_WEBSOCKET: &str = "the answer upgrades to another protocol than WebSocket";
+/// The answer's `Connection` header does not upgrade.
+const NO_UPGRADE: &str = "the answer's connection header does not upgrade";
+/// The answer names a WebSocket version this client does not speak.
+const OTHER_VERSION: &str = "the answer names a WebSocket version this client does not speak";
+/// The answer is not a response that can be read.
+const UNPARSED: &str = "the answer is not a response this client can read";
+/// The answer's accept value is not the one the key this client sent asks for.
+const WRONG_ACCEPT: &str = "the answer's accept value does not match the key this client sent";
+/// Any other answer that is not an upgrade.
+const NOT_ACCEPTED: &str = "the answer is not an upgrade this client accepts";
+
+/// The proxy's address names no port.
+const PROXY_NO_PORT: &str = "the proxy's address names no port";
+/// The proxy's address names no host.
+const PROXY_NO_HOST: &str = "the proxy's address names no host";
+/// The connection to the proxy failed.
+const PROXY_UNREACHABLE: &str = "the proxy could not be reached";
+/// The proxy's host is not a name TLS can verify.
+const PROXY_NOT_A_TLS_NAME: &str = "the proxy's host is not a name TLS can verify";
+/// The TLS handshake with the proxy failed.
+const PROXY_NO_TLS: &str = "the TLS handshake with the proxy failed";
+/// The tunnel request could not be sent to the proxy.
+const PROXY_REQUEST_FAILED: &str = "the tunnel request to the proxy failed";
+/// The proxy's answer is longer than [`MAX_TUNNEL_ANSWER_BYTES`].
+const PROXY_ANSWER_TOO_LONG: &str =
+    "the proxy's answer to the tunnel request is longer than an answer may be";
+/// The proxy ended the connection before its answer's head was complete.
+const PROXY_ENDED: &str = "the proxy ended the connection before it answered";
+/// The proxy's answer does not begin with a status line.
+const PROXY_NO_STATUS_LINE: &str = "the proxy did not answer the tunnel request with a status line";
+/// The proxy answered the tunnel request with a status other than 2xx, which follows these words.
+const PROXY_REFUSED: &str = "the proxy refused the tunnel with status";
+
+/// The reasons this client gives a room failure, which are the only reasons a failure says.
+const ROOM_REASONS: [&str; 31] = [
+    NO_VERIFIER,
+    NOT_HTTPS,
+    OPEN_BRACKETS,
+    NOT_A_PORT,
+    NOT_A_TLS_NAME,
+    NOT_AN_ADDRESS,
+    NO_TOKEN_HEADER,
+    NO_TOKEN,
+    TOO_SLOW,
+    NO_CONNECTION,
+    NO_TLS,
+    UNFINISHED,
+    NO_STATUS_LINE,
+    TOO_LONG,
+    NOT_A_DIGEST,
+    MISSING_HEADER,
+    NOT_WEBSOCKET,
+    NO_UPGRADE,
+    OTHER_VERSION,
+    UNPARSED,
+    WRONG_ACCEPT,
+    NOT_ACCEPTED,
+    PROXY_NO_PORT,
+    PROXY_NO_HOST,
+    PROXY_UNREACHABLE,
+    PROXY_NOT_A_TLS_NAME,
+    PROXY_NO_TLS,
+    PROXY_REQUEST_FAILED,
+    PROXY_ANSWER_TOO_LONG,
+    PROXY_ENDED,
+    PROXY_NO_STATUS_LINE,
+];
+
+/// What a room failure says of its origin: the address as a diagnostic names one, or that it
+/// concerns every origin.
+fn room_origin(origin: &str) -> Shown {
+    if origin == EVERY_ORIGIN {
+        Shown::said(EVERY_ORIGIN)
+    } else {
+        Shown::address(origin)
+    }
+}
+
+/// What a room failure says of its reason: the reason when this client gives it, a proxy's refusal
+/// by its three-digit status, and a placeholder for any other.
+fn room_reason(reason: &str) -> Shown {
+    let refused = reason
+        .strip_prefix(PROXY_REFUSED)
+        .and_then(|rest| rest.strip_prefix(' '))
+        .filter(|status| status.len() == 3 && status.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|status| status.parse::<u16>().ok());
+    if let Some(status) = refused {
+        return crate::shown!("{} {}", PROXY_REFUSED, status);
+    }
+    ROOM_REASONS
+        .iter()
+        .find(|known| **known == reason)
+        .map_or_else(
+            || Shown::said("[a reason this client does not give]"),
+            |known| Shown::said(known),
+        )
 }
 
 /// Opens room sockets with one TLS configuration, directly or through one proxy.
@@ -165,9 +335,9 @@ impl RoomConnector {
     /// Returns [`RoomError::Configuration`] when the platform's verifier cannot be set up.
     pub fn platform() -> Result<Self, RoomError> {
         let tls =
-            crate::services::http::platform_tls(&[]).map_err(|error| RoomError::Configuration {
-                origin: "every origin".to_owned(),
-                reason: format!("the platform's certificate verifier cannot be set up: {error}"),
+            crate::services::http::platform_tls(&[]).map_err(|_| RoomError::Configuration {
+                origin: EVERY_ORIGIN.to_owned(),
+                reason: NO_VERIFIER.to_owned(),
             })?;
         Ok(Self::with_tls(tls))
     }
@@ -227,10 +397,7 @@ impl RoomConnector {
         .await
         .map_err(|_| RoomError::Unreachable {
             origin: origin.as_str().to_owned(),
-            reason: format!(
-                "the socket did not open within {} seconds",
-                OPEN_DEADLINE.as_secs()
-            ),
+            reason: TOO_SLOW.to_owned(),
         })??;
         Ok(pump(opened))
     }
@@ -246,58 +413,56 @@ async fn open_socket(
     role: &str,
     token: Option<&str>,
 ) -> Result<WebSocketStream<UpgradeGuard<tokio_rustls::client::TlsStream<Carrier>>>, RoomError> {
-    let configuration = |reason: String| RoomError::Configuration {
+    let configuration = |reason: &'static str| RoomError::Configuration {
         origin: origin.as_str().to_owned(),
-        reason,
+        reason: reason.to_owned(),
     };
-    let unreachable = |what: &str, error: &dyn std::fmt::Display| RoomError::Unreachable {
+    let unreachable = |reason: &'static str| RoomError::Unreachable {
         origin: origin.as_str().to_owned(),
-        reason: format!("{what}: {error}"),
+        reason: reason.to_owned(),
     };
     let authority = origin
         .as_str()
         .strip_prefix("https://")
-        .ok_or_else(|| configuration("a rendezvous origin is an https origin".to_owned()))?;
+        .ok_or_else(|| configuration(NOT_HTTPS))?;
     let (host, port) = host_and_port(authority).map_err(configuration)?;
-    let server_name = ServerName::try_from(host.to_owned())
-        .map_err(|_| configuration(format!("{host} is not a name TLS can verify")))?;
+    let server_name =
+        ServerName::try_from(host.to_owned()).map_err(|_| configuration(NOT_A_TLS_NAME))?;
     let connection = match proxy {
         None => Carrier::Plain(
             TcpStream::connect((host, port))
                 .await
-                .map_err(|error| unreachable("the connection failed", &error))?,
+                .map_err(|_| unreachable(NO_CONNECTION))?,
         ),
         Some(proxy) => {
             tunnel(proxy, host, port, &tls)
                 .await
-                .map_err(|reason| RoomError::Unreachable {
+                .map_err(|failure| RoomError::Unreachable {
                     origin: origin.as_str().to_owned(),
-                    reason,
+                    reason: failure.reason(),
                 })?
         }
     };
     let stream = TlsConnector::from(tls)
         .connect(server_name, connection)
         .await
-        .map_err(|error| unreachable("the TLS handshake failed", &error))?;
+        .map_err(|_| unreachable(NO_TLS))?;
     let address = format!(
         "wss://{authority}/api/pair/room/{}/{role}",
         locator.as_str()
     );
     let mut builder = ClientBuilder::new()
         .uri(&address)
-        .map_err(|error| configuration(format!("{address} is not an address: {error}")))?;
+        .map_err(|_| configuration(NOT_AN_ADDRESS))?;
     if let Some(token) = token {
         builder = builder
             .add_header(
-                CONTROL_TOKEN_HEADER.parse().map_err(|_| {
-                    configuration("the control token header cannot be sent".to_owned())
-                })?,
-                token
+                CONTROL_TOKEN_HEADER
                     .parse()
-                    .map_err(|_| configuration("the control token cannot be sent".to_owned()))?,
+                    .map_err(|_| configuration(NO_TOKEN_HEADER))?,
+                token.parse().map_err(|_| configuration(NO_TOKEN))?,
             )
-            .map_err(|_| configuration("the control token header cannot be sent".to_owned()))?;
+            .map_err(|_| configuration(NO_TOKEN_HEADER))?;
     }
     let (socket, _) = builder
         .limits(Limits::default().max_payload_len(Some(MAX_FRAME_BYTES)))
@@ -315,24 +480,39 @@ async fn open_socket(
 /// as input errors of the same kind the guard's do, so the guard's are told apart by their own
 /// type rather than by their kind.
 fn upgrade_failed(origin: &RendezvousOrigin, error: tokio_websockets::Error) -> RoomError {
+    use tokio_websockets::upgrade;
+
     let origin = origin.as_str().to_owned();
     match error {
-        tokio_websockets::Error::Upgrade(
-            tokio_websockets::upgrade::Error::DidNotSwitchProtocols(status),
-        ) => RoomError::Refused { origin, status },
+        tokio_websockets::Error::Upgrade(upgrade::Error::DidNotSwitchProtocols(status)) => {
+            RoomError::Refused { origin, status }
+        }
         tokio_websockets::Error::Upgrade(error) => RoomError::NotAnUpgrade {
             origin,
-            reason: error.to_string(),
-        },
-        tokio_websockets::Error::Io(error) if GuardRefusal::refused(&error) => {
-            RoomError::NotAnUpgrade {
-                origin,
-                reason: error.to_string(),
+            reason: match error {
+                upgrade::Error::MissingHeader(_) => MISSING_HEADER,
+                upgrade::Error::UpgradeNotWebSocket => NOT_WEBSOCKET,
+                upgrade::Error::ConnectionNotUpgrade => NO_UPGRADE,
+                upgrade::Error::UnsupportedWebSocketVersion => OTHER_VERSION,
+                upgrade::Error::Parsing(_) => UNPARSED,
+                upgrade::Error::WrongWebSocketAccept => WRONG_ACCEPT,
+                _ => NOT_ACCEPTED,
             }
-        }
-        error => RoomError::Unreachable {
+            .to_owned(),
+        },
+        tokio_websockets::Error::Io(error) => match GuardRefusal::of(&error) {
+            Some(refusal) => RoomError::NotAnUpgrade {
+                origin,
+                reason: refusal.to_owned(),
+            },
+            None => RoomError::Unreachable {
+                origin,
+                reason: UNFINISHED.to_owned(),
+            },
+        },
+        _ => RoomError::Unreachable {
             origin,
-            reason: format!("the upgrade did not finish: {error}"),
+            reason: UNFINISHED.to_owned(),
         },
     }
 }
@@ -358,7 +538,6 @@ struct UpgradeGuard<S> {
 /// It travels inside an input error, the only kind of error a stream can return, and is its own
 /// type so that a refusal of the answer is never confused with the stream failing underneath: TLS
 /// reports a corrupt record after the handshake with the same error kind.
-#[derive(Debug)]
 struct GuardRefusal(&'static str);
 
 impl GuardRefusal {
@@ -367,17 +546,23 @@ impl GuardRefusal {
         io::Error::new(io::ErrorKind::InvalidData, Self(reason))
     }
 
-    /// Returns true when `error` carries the guard's refusal.
-    fn refused(error: &io::Error) -> bool {
-        error.get_ref().is_some_and(|inner| inner.is::<Self>())
+    /// The reason the guard gave, when `error` carries the guard's refusal.
+    fn of(error: &io::Error) -> Option<&'static str> {
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<Self>())
+            .map(|refusal| refusal.0)
     }
 }
 
-impl std::fmt::Display for GuardRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.0)
+impl Said for GuardRefusal {
+    fn said(&self) -> Shown {
+        Shown::said(self.0)
     }
 }
+
+crate::display_as_said!(GuardRefusal);
+crate::debug_as_display!(GuardRefusal);
 
 impl std::error::Error for GuardRefusal {}
 
@@ -432,18 +617,14 @@ impl<S: AsyncRead + Unpin> AsyncRead for UpgradeGuard<S> {
                     head.extend_from_slice(into.filled());
                     let start = head.len().min(STATUS_LINE_START.len());
                     if head[..start] != STATUS_LINE_START[..start] {
-                        return Poll::Ready(Err(GuardRefusal::error(
-                            "the room's answer to the upgrade does not begin with a status line",
-                        )));
+                        return Poll::Ready(Err(GuardRefusal::error(NO_STATUS_LINE)));
                     }
                     if let Some(end) = head.windows(4).position(|window| window == b"\r\n\r\n") {
                         check_upgrade_head(&head[..end + 4])?;
                         let read = std::mem::take(head);
                         this.answer = Answered::Handing { read, at: 0 };
                     } else if head.len() >= MAX_UPGRADE_ANSWER_BYTES {
-                        return Poll::Ready(Err(GuardRefusal::error(
-                            "the room's answer to the upgrade is longer than an answer may be",
-                        )));
+                        return Poll::Ready(Err(GuardRefusal::error(TOO_LONG)));
                     }
                 }
             }
@@ -517,21 +698,17 @@ fn check_upgrade_head(head: &[u8]) -> io::Result<()> {
                 .iter()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'));
         if !digest {
-            return Err(GuardRefusal::error(
-                "the room's answer to the upgrade carries an accept value that is no SHA-1 digest",
-            ));
+            return Err(GuardRefusal::error(NOT_A_DIGEST));
         }
     }
     Ok(())
 }
 
 /// Splits an origin's authority into its host, without an IPv6 literal's brackets, and its port.
-fn host_and_port(authority: &str) -> Result<(&str, u16), String> {
+fn host_and_port(authority: &str) -> Result<(&str, u16), &'static str> {
     let (host, port) = match authority.strip_prefix('[') {
         Some(bracketed) => {
-            let (host, rest) = bracketed
-                .split_once(']')
-                .ok_or_else(|| "an IPv6 origin closes its brackets".to_owned())?;
+            let (host, rest) = bracketed.split_once(']').ok_or(OPEN_BRACKETS)?;
             (host, rest.strip_prefix(':'))
         }
         None => match authority.rsplit_once(':') {
@@ -540,7 +717,7 @@ fn host_and_port(authority: &str) -> Result<(&str, u16), String> {
         },
     };
     let port = match port {
-        Some(port) => port.parse().map_err(|_| format!("{port} is not a port"))?,
+        Some(port) => port.parse().map_err(|_| NOT_A_PORT)?,
         None => 443,
     };
     Ok((host, port))
@@ -593,6 +770,25 @@ impl AsyncWrite for Carrier {
     }
 }
 
+/// Why a tunnel through a proxy did not open: one of this client's reasons, or the proxy's refusal
+/// with the status it answered. Nothing the proxy wrote beside its status is kept, and neither is
+/// the proxy's address, which its owner configured and a failure does not repeat.
+enum TunnelFailure {
+    Reason(&'static str),
+    Refused(u16),
+}
+
+impl TunnelFailure {
+    /// The reason a room failure carries: this client's words, and for a refusal the status after
+    /// them, which [`room_reason`] says again.
+    fn reason(&self) -> String {
+        match self {
+            Self::Reason(reason) => (*reason).to_owned(),
+            Self::Refused(status) => format!("{PROXY_REFUSED} {status}"),
+        }
+    }
+}
+
 /// Opens a tunnel to `host:port` through `proxy` with HTTP `CONNECT`, and returns it once the
 /// proxy has agreed.
 ///
@@ -605,11 +801,11 @@ async fn tunnel(
     host: &str,
     port: u16,
     tls: &Arc<ClientConfig>,
-) -> Result<Carrier, String> {
+) -> Result<Carrier, TunnelFailure> {
     let address = proxy.as_url();
     let proxy_port = address
         .port_or_known_default()
-        .ok_or_else(|| format!("the proxy {proxy} names no port"))?;
+        .ok_or(TunnelFailure::Reason(PROXY_NO_PORT))?;
     let (connection, name) = match address.host() {
         Some(url::Host::Domain(name)) => (
             TcpStream::connect((name, proxy_port)).await,
@@ -623,16 +819,15 @@ async fn tunnel(
             TcpStream::connect((ip, proxy_port)).await,
             Some(ServerName::from(IpAddr::V6(ip))),
         ),
-        None => return Err(format!("the proxy {proxy} names no host")),
+        None => return Err(TunnelFailure::Reason(PROXY_NO_HOST)),
     };
-    let connection =
-        connection.map_err(|error| format!("the proxy {proxy} could not be reached: {error}"))?;
+    let connection = connection.map_err(|_| TunnelFailure::Reason(PROXY_UNREACHABLE))?;
     let mut carrier = if address.scheme() == "https" {
-        let name = name.ok_or_else(|| format!("the proxy {proxy} is not a name TLS can verify"))?;
+        let name = name.ok_or(TunnelFailure::Reason(PROXY_NOT_A_TLS_NAME))?;
         let stream = TlsConnector::from(Arc::clone(tls))
             .connect(name, connection)
             .await
-            .map_err(|error| format!("the TLS handshake with the proxy {proxy} failed: {error}"))?;
+            .map_err(|_| TunnelFailure::Reason(PROXY_NO_TLS))?;
         Carrier::Tls(Box::new(stream))
     } else {
         Carrier::Plain(connection)
@@ -647,32 +842,27 @@ async fn tunnel(
     carrier
         .write_all(request.as_bytes())
         .await
-        .map_err(|error| format!("the tunnel request to the proxy {proxy} failed: {error}"))?;
+        .map_err(|_| TunnelFailure::Reason(PROXY_REQUEST_FAILED))?;
     carrier
         .flush()
         .await
-        .map_err(|error| format!("the tunnel request to the proxy {proxy} failed: {error}"))?;
+        .map_err(|_| TunnelFailure::Reason(PROXY_REQUEST_FAILED))?;
 
     let mut head = Vec::new();
     while !head.ends_with(b"\r\n\r\n") {
         if head.len() >= MAX_TUNNEL_ANSWER_BYTES {
-            return Err(format!(
-                "the proxy {proxy}'s answer to the tunnel request is longer than an answer may be"
-            ));
+            return Err(TunnelFailure::Reason(PROXY_ANSWER_TOO_LONG));
         }
-        let byte = carrier.read_u8().await.map_err(|error| {
-            format!("the proxy {proxy} ended the connection before it answered: {error}")
-        })?;
+        let byte = carrier
+            .read_u8()
+            .await
+            .map_err(|_| TunnelFailure::Reason(PROXY_ENDED))?;
         head.push(byte);
     }
     match tunnel_status(&head) {
         Some(status) if (200..300).contains(&status) => Ok(carrier),
-        Some(status) => Err(format!(
-            "the proxy {proxy} refused the tunnel with status {status}"
-        )),
-        None => Err(format!(
-            "the proxy {proxy} did not answer the tunnel request with a status line"
-        )),
+        Some(status) => Err(TunnelFailure::Refused(status)),
+        None => Err(TunnelFailure::Reason(PROXY_NO_STATUS_LINE)),
     }
 }
 
@@ -905,5 +1095,74 @@ mod tests {
         let rendered = format!("{:?}", RoomRole::Host(&token));
         assert_eq!(rendered, "host");
         assert!(!rendered.contains(&to_base64url(token.expose())));
+    }
+
+    /// A room failure says its stage, the origin as a diagnostic names an address, the status and a
+    /// reason this client gives, and nothing else: not an origin's credentials, and not a reason
+    /// anything else wrote.
+    #[test]
+    fn a_room_failure_says_its_stage_its_origin_and_only_a_reason_of_its_own() {
+        use crate::shown::marker::{MARKER, NEUTRAL, assert_unmarked, failure_renderings};
+
+        let origin = format!("https://{MARKER}:{MARKER}@rendezvous.example");
+        for error in [
+            RoomError::Configuration {
+                origin: origin.clone(),
+                reason: MARKER.to_owned(),
+            },
+            RoomError::Unreachable {
+                origin: origin.clone(),
+                reason: MARKER.to_owned(),
+            },
+            RoomError::Refused {
+                origin: origin.clone(),
+                status: 404,
+            },
+            RoomError::NotAnUpgrade {
+                origin: origin.clone(),
+                reason: MARKER.to_owned(),
+            },
+        ] {
+            assert_unmarked("a room failure", &failure_renderings(error));
+        }
+        // The neutral controls: an origin without credentials, a status and a reason this client
+        // gives are said; a reason it does not give is replaced.
+        assert_eq!(
+            RoomError::Unreachable {
+                origin: "https://rendezvous.example:8443".to_owned(),
+                reason: NO_TLS.to_owned(),
+            }
+            .to_string(),
+            "the room at https://rendezvous.example:8443 could not be reached: the TLS handshake \
+             failed"
+        );
+        assert_eq!(
+            RoomError::Refused {
+                origin: "https://rendezvous.example".to_owned(),
+                status: 404,
+            }
+            .to_string(),
+            "the room at https://rendezvous.example answered the upgrade with status 404"
+        );
+        assert_eq!(
+            RoomError::NotAnUpgrade {
+                origin: "https://rendezvous.example".to_owned(),
+                reason: NEUTRAL.to_owned(),
+            }
+            .to_string(),
+            "the room at https://rendezvous.example did not answer with an upgrade: [a reason this \
+             client does not give]"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                RoomError::Configuration {
+                    origin: EVERY_ORIGIN.to_owned(),
+                    reason: NO_VERIFIER.to_owned(),
+                }
+            ),
+            "RoomError(\"the room at every origin cannot be addressed: the platform's certificate \
+             verifier cannot be set up\")"
+        );
     }
 }

@@ -371,7 +371,7 @@ async fn confirmed(
         .map_err(|error| {
             CliError::Other(shown!(
                 "the confirmation could not be signed: {}",
-                crate::shown::pairing(&error)
+                Shown::pairing(&error)
             ))
         })?;
         let _: OwnerConfirmationCompleteResult = bind::mutate(
@@ -544,11 +544,7 @@ fn proposal(
             };
             let grant = session_invitation_grant(now_ms, minutes.saturating_mul(60_000), history)
                 .map_err(|error| {
-                CliError::Usage(shown!(
-                    "--view {}: {}",
-                    minutes,
-                    crate::shown::pairing(&error)
-                ))
+                CliError::Usage(shown!("--view {}: {}", minutes, Shown::pairing(&error)))
             })?;
             Ok((InviteGrantKind::SessionInvitation, grant))
         }
@@ -1003,6 +999,12 @@ mod tests {
             owner_device_note(DevicePlatform::Android, "f3c146fd").as_str(),
             "The new device (android) should show f3c1 46fd. Confirm on an owner device only if \
              it does."
+        );
+        // A value the host sent in any other shape is not repeated.
+        let marked = owner_device_note(DevicePlatform::Android, crate::shown::marker::MARKER);
+        crate::shown::marker::assert_unmarked(
+            "the owner device note",
+            &[marked.as_str().to_owned()],
         );
     }
 

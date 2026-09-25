@@ -15,6 +15,8 @@ use kr_protocol::error::ErrorCode;
 use kr_protocol::pairing::PairingConsumedReason;
 use serde::Serialize;
 
+use crate::shown::{Said, Shown};
+
 /// Which of the outcomes a person is told apart an attempt ended with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -66,11 +68,41 @@ pub enum FailureKind {
     ApprovalUnknown,
 }
 
+impl Said for FailureKind {
+    fn said(&self) -> Shown {
+        Shown::said(match self {
+            Self::Malformed => "Malformed",
+            Self::DeviceTriesUsed => "DeviceTriesUsed",
+            Self::ServiceUnreachable => "ServiceUnreachable",
+            Self::ServiceNotPairing => "ServiceNotPairing",
+            Self::NoHostAnswered => "NoHostAnswered",
+            Self::NotAuthenticated => "NotAuthenticated",
+            Self::HostTriesUsed => "HostTriesUsed",
+            Self::Expired => "Expired",
+            Self::TimedOut => "TimedOut",
+            Self::DidNotFinish => "DidNotFinish",
+            Self::Declined => "Declined",
+            Self::Withdrawn => "Withdrawn",
+            Self::HostRestarted => "HostRestarted",
+            Self::AnotherDeviceWaiting => "AnotherDeviceWaiting",
+            Self::HostUnreachable => "HostUnreachable",
+            Self::HostMismatch => "HostMismatch",
+            Self::AlreadyPaired => "AlreadyPaired",
+            Self::NotAnInvitation => "NotAnInvitation",
+            Self::NewerInvitation => "NewerInvitation",
+            Self::NothingToPaste => "NothingToPaste",
+            Self::StoreFailed => "StoreFailed",
+            Self::ApprovalUnknown => "ApprovalUnknown",
+        })
+    }
+}
+
 /// How an attempt ended, with the tries this device has left when the attempt was charged.
 ///
-/// `detail` says what happened in terms a log can keep. It never holds a secret, and an interface
-/// shows the kind's own words rather than it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+/// `detail` says what happened in terms a log can keep. It is a [`Shown`], so it never holds a
+/// secret or anything a host, a service, a store or a payload wrote, and an interface shows the
+/// kind's own words rather than it.
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct PairingFailure {
     /// Which outcome it was.
     pub kind: FailureKind,
@@ -78,13 +110,13 @@ pub struct PairingFailure {
     pub tries_left: Option<u32>,
     /// What happened, for a log.
     #[serde(skip)]
-    pub detail: String,
+    pub detail: Shown,
 }
 
 impl PairingFailure {
     /// A failure of `kind`, with `detail` for a log.
     #[must_use]
-    pub fn new(kind: FailureKind, detail: impl Into<String>) -> Self {
+    pub fn new(kind: FailureKind, detail: impl Into<Shown>) -> Self {
         Self {
             kind,
             tries_left: None,
@@ -110,11 +142,14 @@ impl PairingFailure {
     }
 }
 
-impl std::fmt::Display for PairingFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{:?}: {}", self.kind, self.detail)
+impl Said for PairingFailure {
+    fn said(&self) -> Shown {
+        crate::shown!("{}: {}", self.kind.said(), self.detail)
     }
 }
+
+crate::display_as_said!(PairingFailure);
+crate::debug_as_display!(PairingFailure);
 
 impl std::error::Error for PairingFailure {}
 
@@ -196,6 +231,23 @@ mod tests {
         assert_eq!(
             sent,
             serde_json::json!({"kind": "host_mismatch", "tries_left": 3})
+        );
+    }
+
+    /// A failure says its kind and its detail, in its `Display` and in its `Debug` alike.
+    #[test]
+    fn a_failure_says_its_kind_and_its_detail() {
+        let failure = PairingFailure::new(
+            FailureKind::HostMismatch,
+            "the live peer was another endpoint",
+        );
+        assert_eq!(
+            failure.to_string(),
+            "HostMismatch: the live peer was another endpoint"
+        );
+        assert_eq!(
+            format!("{failure:?}"),
+            "PairingFailure(\"HostMismatch: the live peer was another endpoint\")"
         );
     }
 }
