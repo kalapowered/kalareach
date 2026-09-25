@@ -198,7 +198,9 @@ pub struct AdmittedMember {
 /// Returns [`CborError::UnknownField`] for an undeclared ordinary key in an object that refuses
 /// one, [`CborError::UnknownVariant`] for a tag naming no variant, and
 /// [`CborError::UnnegotiatedExtension`] for an extension member the policy refuses. The error
-/// names the object and where it is in the message.
+/// names the object and where it is in the message, in the schema's words: array indices, the
+/// members the schema or an admitted extension declares, and the entries of a map keyed by data by
+/// their position, never by a key the message carried.
 pub fn check<'a>(
     value: &'a CanonicalValue,
     shape: &Shape,
@@ -218,7 +220,13 @@ pub fn check<'a>(
 
 /// One step of the path to the value being checked.
 enum Step<'v> {
-    Key(&'v str),
+    /// A member the object's schema declares, or an extension member the policy admitted: a name
+    /// the schema gives, which the message spelled the same way.
+    Member(&'v str),
+    /// An entry of a map keyed by data: its key is the message's text, and its position in the
+    /// map is this program's own count.
+    Entry { key: &'v str, position: usize },
+    /// An item of an array.
     Index(usize),
 }
 
@@ -277,7 +285,10 @@ impl<'v> Walk<'_, 'v> {
     fn map(&mut self, map: &'v CanonicalMap, member: &Shape) -> Rewrite {
         let mut rewritten: Option<Vec<(String, CanonicalValue)>> = None;
         for (index, (key, entry)) in map.entries().iter().enumerate() {
-            self.path.push(Step::Key(key));
+            self.path.push(Step::Entry {
+                key,
+                position: index,
+            });
             let outcome = self.value(entry, member);
             self.path.pop();
             keep(&mut rewritten, map, index, key, entry, outcome?.map(Some));
@@ -289,14 +300,14 @@ impl<'v> Walk<'_, 'v> {
         let mut rewritten: Option<Vec<(String, CanonicalValue)>> = None;
         for (index, (key, entry)) in map.entries().iter().enumerate() {
             let change = if let Some(field) = object.fields.get(key) {
-                self.path.push(Step::Key(key));
+                self.path.push(Step::Member(key));
                 let outcome = self.value(entry, field);
                 self.path.pop();
                 outcome?.map(Some)
             } else {
                 match self.extensions.classify(object, key) {
                     Member::Admitted(member) => {
-                        self.path.push(Step::Key(key));
+                        self.path.push(Step::Member(key));
                         let outcome = self.value(entry, &member);
                         self.path.pop();
                         let value = outcome?.unwrap_or_else(|| entry.clone());
@@ -378,25 +389,47 @@ impl<'v> Walk<'_, 'v> {
         }
     }
 
+    /// Where the value being checked is, as a JSON Pointer, for an admitted member the caller reads.
     fn pointer(&self) -> String {
         let mut pointer = String::new();
         for step in &self.path {
             pointer.push('/');
             match step {
-                Step::Key(key) => pointer.push_str(&key.replace('~', "~0").replace('/', "~1")),
+                Step::Member(key) | Step::Entry { key, .. } => {
+                    pointer.push_str(&key.replace('~', "~0").replace('/', "~1"));
+                }
                 Step::Index(index) => pointer.push_str(&index.to_string()),
             }
         }
         pointer
     }
 
+    /// Where the value being checked is, for a failure to say: the pointer's path, with each entry
+    /// of a map keyed by data named by its position rather than by the message's key.
+    fn place(&self) -> String {
+        let mut place = String::new();
+        for step in &self.path {
+            place.push('/');
+            match step {
+                Step::Member(member) => {
+                    place.push_str(&member.replace('~', "~0").replace('/', "~1"));
+                }
+                Step::Entry { position, .. } => {
+                    place.push_str(&format!("[entry {position}]"));
+                }
+                Step::Index(index) => place.push_str(&index.to_string()),
+            }
+        }
+        place
+    }
+
     fn describe(&self, object: &ObjectShape) -> String {
-        let pointer = self.pointer();
-        match (&object.name, pointer.is_empty()) {
+        let place = self.place();
+        match (&object.name, place.is_empty()) {
             (Some(name), true) => name.clone(),
-            (Some(name), false) => format!("{name} at {pointer}"),
+            (Some(name), false) => format!("{name} at {place}"),
             (None, true) => "the message".to_owned(),
-            (None, false) => format!("the object at {pointer}"),
+            (None, false) => format!("the object at {place}"),
         }
     }
 }

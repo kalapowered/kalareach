@@ -117,7 +117,8 @@ fn an_undeclared_key_is_refused_where_it_is_found() {
         }
     );
 
-    // The keys of a map keyed by data are not fields; its values are still checked.
+    // The keys of a map keyed by data are not fields; its values are still checked, and a failure
+    // names an entry by its position, never by the key the message gave it.
     let in_map = map(&[(
         "labels",
         map(&[("a/b~c", map(&[("name", int(1)), ("zz", int(2))]))]),
@@ -126,7 +127,7 @@ fn an_undeclared_key_is_refused_where_it_is_found() {
     assert_eq!(error.rule(), "unknown_field");
     assert_eq!(
         error.to_string(),
-        "Item at /labels/a~1b~0c does not declare the field \"zz\""
+        "Item at /labels/[entry 0] carries a field it does not declare"
     );
 }
 

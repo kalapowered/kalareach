@@ -4,11 +4,20 @@
 //! before typed decoding applies. [`CborError::rule`] returns the stable rule identifier that the
 //! cross-language fixtures use, so the Rust and TypeScript implementations can assert the same
 //! error class for the same bytes.
+//!
+//! A failure says the rule it broke and where, and nothing it read. A message can carry anything
+//! its sender put in it, a secret included, and a failure is written to logs and shown to people.
+//! So `Display` says the rule and a place built from this program's own text: an offset, a count,
+//! the schema's name for an object, and a path of array indices, declared members and map entries
+//! by position. `Debug` says the same after the rule's identifier, the form the TypeScript
+//! decoder's messages take. Text a failure read from a message (a key, a variant, the name of an
+//! extension, serde's own message) stays in its fields for code that matches on them, and no
+//! rendering shows it.
 
 use core::fmt;
 
 /// A KR-CBOR-1 validation, encoding or decoding failure.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum CborError {
     /// The input was empty; a KR-CBOR-1 message is exactly one object.
@@ -115,18 +124,19 @@ pub enum CborError {
     },
 
     /// Two map keys were equal.
-    #[error("duplicate map key {key:?}")]
+    #[error("duplicate map key")]
     DuplicateKey {
-        /// The repeated key.
+        /// The repeated key, as the message spelled it. It is the message's text, so no rendering
+        /// of the failure shows it.
         key: String,
     },
 
     /// Map keys were not in ascending bytewise order of their complete encoded keys.
-    #[error("map keys {previous:?} and {current:?} are not in canonical order")]
+    #[error("map keys are not in canonical order")]
     UnsortedMapKeys {
-        /// The key that appeared first.
+        /// The key that appeared first, as the message spelled it. No rendering shows it.
         previous: String,
-        /// The key that appeared after it.
+        /// The key that appeared after it, as the message spelled it. No rendering shows it.
         current: String,
     },
 
@@ -186,35 +196,37 @@ pub enum CborError {
     /// A closed object carries a key its schema does not declare.
     ///
     /// Found by [`crate::check`] before typed decoding runs, never by the typed decoder.
-    #[error("{at} does not declare the field {field:?}")]
+    #[error("{at} carries a field it does not declare")]
     UnknownField {
-        /// The object, by schema name where it has one, and where it is in the message.
+        /// The object, by schema name where it has one, and where it is in the message: array
+        /// indices, declared members, and the entries of a map keyed by data by their position
+        /// rather than their keys.
         at: String,
-        /// The undeclared key.
+        /// The undeclared key, as the message spelled it. No rendering shows it.
         field: String,
     },
 
     /// An object's tag names a variant its schema does not have.
     ///
     /// Found by [`crate::check`] before typed decoding runs, never by the typed decoder.
-    #[error("{at} names the variant {variant:?} in {tag:?}, which its schema does not have")]
+    #[error("{at} names a variant in {tag:?} that its schema does not have")]
     UnknownVariant {
-        /// The object, by schema name where it has one, and where it is in the message.
+        /// The object, as [`Self::UnknownField`] places it.
         at: String,
-        /// The field whose text selects the variant.
+        /// The field whose text selects the variant, as the schema names it.
         tag: String,
-        /// The text it carried.
+        /// The text it carried, as the message spelled it. No rendering shows it.
         variant: String,
     },
 
     /// An object carries a member of an extension that is not admitted there.
     ///
     /// Found by [`crate::check`] before typed decoding runs, never by the typed decoder.
-    #[error("{at} carries a member of the extension {extension:?}, which is not negotiated there")]
+    #[error("{at} carries a member of an extension that is not negotiated there")]
     UnnegotiatedExtension {
-        /// The object, by schema name where it has one, and where it is in the message.
+        /// The object, as [`Self::UnknownField`] places it.
         at: String,
-        /// The key naming the extension.
+        /// The key naming the extension, as the message spelled it. No rendering shows it.
         extension: String,
     },
 
@@ -226,18 +238,27 @@ pub enum CborError {
     },
 
     /// The serde serializer failed before validation could run.
-    #[error("serialization failed: {message}")]
+    #[error("serialization failed: the value could not be written")]
     Serialize {
-        /// Message from the serde implementation.
+        /// Message from the serde implementation, which can quote the value. No rendering shows
+        /// it.
         message: String,
     },
 
     /// The serde deserializer rejected a validated value.
-    #[error("deserialization failed: {message}")]
+    #[error("deserialization failed: the value does not match the type it is read as")]
     Deserialize {
-        /// Message from the serde implementation.
+        /// Message from the serde implementation, which quotes what it refused. No rendering shows
+        /// it.
         message: String,
     },
+}
+
+/// The rule's identifier, then what `Display` says, and nothing a failure read from a message.
+impl fmt::Debug for CborError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {self}", self.rule())
+    }
 }
 
 impl CborError {
