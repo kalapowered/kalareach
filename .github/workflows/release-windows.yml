@@ -88,6 +88,12 @@ jobs:
           & "$env:GITHUB_WORKSPACE\scripts\check-windows-signature-gate.ps1"
           exit $LASTEXITCODE
 
+      # The check the release job holds its sums and signature record to is put through records
+      # made to fail in the same way: a carriage return that GNU sha256sum would pass is among them.
+      - name: Drive the sums check with records made to fail
+        shell: bash
+        run: bash scripts/check-release-sums.sh self-test
+
   release:
     name: build, sign and publish
     needs: gate
@@ -448,6 +454,19 @@ jobs:
 
           Write-Host "$signed signed artefacts and $($unsigned.Count) data files in $(Split-Path -Leaf $archive)"
           "directory=$release" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      # The two records people check a download with, held to what their checkers read before
+      # anything can upload them: SHA256SUMS beside the archive, and signatures.txt inside it. The
+      # copy read here is the one packed, whose digest the step above held the archive's copy to.
+      # Each line must end in a line feed alone, and sha256sum -c must pass over the archive.
+      - name: Hold the sums and the signature record to what checkers read
+        shell: bash
+        env:
+          KR_RELEASE_DIR: ${{ steps.pack.outputs.directory }}
+        run: |
+          set -euo pipefail
+          bash scripts/check-release-sums.sh "$(cygpath -u "$KR_RELEASE_DIR")" \
+            "$(cygpath -u "$RUNNER_TEMP")/payload/signatures.txt"
 
       # Every run keeps what it signed, whether or not a release follows.
       - name: Keep the signed archive
