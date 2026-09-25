@@ -1931,11 +1931,8 @@ struct UserManager {
 
 #[cfg(target_os = "linux")]
 impl UserManager {
-    /// Starts a manager whose home is `home`, or says why none can be started here. With `bus`,
-    /// a message bus of the manager's own runs in its scope first, at `bus` in its runtime
-    /// directory, where a user manager looks for one, so `systemctl` told to use a bus there
-    /// reaches this manager.
-    fn start(home: &Path, holder: teardown::Holder, bus: bool) -> Result<Self, String> {
+    /// Starts a manager whose home is `home`, or says why none can be started here.
+    fn start(home: &Path, holder: teardown::Holder) -> Result<Self, String> {
         use std::os::unix::fs::PermissionsExt as _;
 
         let program = ["/usr/lib/systemd/systemd", "/lib/systemd/systemd"]
@@ -1978,14 +1975,6 @@ impl UserManager {
                 .arg(format!("HOME={}", home.display()))
                 .arg(format!("XDG_RUNTIME_DIR={}", runtime.display()))
                 .arg("PATH=/usr/bin:/bin");
-            if bus {
-                command.args([
-                    "/bin/sh",
-                    "-c",
-                    "dbus-daemon --session --address=\"unix:path=$XDG_RUNTIME_DIR/bus\" --fork \
-                     --nopidfile >/dev/null && exec \"$0\" \"$@\"",
-                ]);
-            }
             command
                 .arg(&program)
                 .args([
@@ -2175,7 +2164,7 @@ impl ServiceHost {
         }
         #[cfg(target_os = "linux")]
         {
-            match UserManager::start(&home, tree.holder(), false) {
+            match UserManager::start(&home, tree.holder()) {
                 Ok(manager) => Some(Self {
                     manager,
                     tree,
@@ -2984,11 +2973,11 @@ fn no_drop_in_anywhere_changes_the_command_the_user_manager_runs() {
 /// checked is the manager it asks to start the daemon.
 ///
 /// Two managers are reachable. The test's own, named by the runtime directory, holds the
-/// definition kr wrote. A second one, reachable only over a message bus of its own, holds another
-/// unit under the same name whose command leaves a mark. With `SYSTEMCTL_FORCE_BUS=1` and that
-/// bus named, `systemctl` reaches the second manager for every call: kr checks what that manager
-/// holds, refuses it, and asks nothing to start, so the mark never appears. Without them, the test's
-/// own manager starts the daemon.
+/// definition kr wrote. A second one holds another unit under the same name whose command leaves a
+/// mark, and is reachable over the message bus its own `dbus.socket` starts. With
+/// `SYSTEMCTL_FORCE_BUS=1` and that bus named, `systemctl` reaches the second manager for every
+/// call: kr checks what that manager holds, refuses it, and asks nothing to start, so the mark never
+/// appears. Without them, the test's own manager starts the daemon.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_user_manager_kr_checks_is_the_one_it_asks() {
@@ -3009,7 +2998,18 @@ fn the_user_manager_kr_checks_is_the_one_it_asks() {
         ),
     )
     .expect("another unit under the same name");
-    let other = match UserManager::start(&other_home, host.tree.holder(), true) {
+    let other = UserManager::start(&other_home, host.tree.holder()).and_then(|other| {
+        let started = bounded(other.systemctl(&["start", "dbus.socket"]), STREAMS_DEADLINE)?;
+        if started.status.success() {
+            Ok(other)
+        } else {
+            Err(format!(
+                "its dbus.socket did not start: {}",
+                String::from_utf8_lossy(&started.stderr).trim()
+            ))
+        }
+    });
+    let other = match other {
         Ok(other) => other,
         Err(why) => {
             assert!(
