@@ -136,6 +136,15 @@ impl RecipientAuthority for GrantedRecipients {
         {
             return None;
         }
+        // Nothing that reads this host's clock is decided while this boot's clock continuity is
+        // lost: an organisation's lease and a bounded offline validity are bounds that can pass, as
+        // the grant's own expiry is, and nothing proves where any of them stands until the owner
+        // establishes the clock.
+        if policy.utc_floor().continuity_lost()
+            && policy.stands_on_the_clock(grant, ActorIngress::PairedDevice)
+        {
+            return None;
+        }
         // Content leaving this host for a recipient elsewhere is remote use of the grant, so it is
         // intersected the way a paired device's request is. An organisation grant answers to the
         // lease of the member its recipient device is bound to, on both clocks; a message carries
@@ -282,6 +291,56 @@ mod tests {
                 .sessions,
             named
         );
+    }
+
+    /// While this boot's clock continuity is lost, a rule whose grant stands on the clock admits
+    /// nothing, however it stands on it: a grant that never expires under a bounded offline
+    /// validity is one. A grant that reads no clock still admits its recipient.
+    #[test]
+    fn a_lost_clock_continuity_admits_nothing_that_reads_the_clock() {
+        let sharing = Arc::new(SharingService::in_memory(host()).expect("a store"));
+        issued(
+            &sharing,
+            grant(12, SessionSelector::Any, &[ActionRight::SessionView]),
+            true,
+        );
+        let policy = personal();
+        let recipients = GrantedRecipients::at(
+            Arc::clone(&sharing),
+            Arc::clone(&policy),
+            environment(),
+            Arc::new(kr_transport::clock::ManualClock::new()),
+            || NOW,
+        );
+        policy
+            .lock()
+            .expect("not poisoned")
+            .utc_floor()
+            .lose_continuity();
+        assert!(
+            recipients.scope_for(&rule(Some(12))).is_some(),
+            "a grant that reads no clock is untouched"
+        );
+        policy
+            .lock()
+            .expect("not poisoned")
+            .set_offline_validity(Some(kr_protocol::sharing::OfflineValidityPolicy {
+                maximum_offline_ms: kr_protocol::scalars::DurationMs::new(60 * 60 * 1000),
+                last_synchronised_at_ms: Nullable::some(kr_protocol::scalars::TimestampMs::new(
+                    NOW,
+                )),
+            }));
+        assert!(
+            recipients.scope_for(&rule(Some(12))).is_none(),
+            "a bounded offline validity reads the clock"
+        );
+        // The control: once the owner establishes the clock, the rule admits its recipient again.
+        policy
+            .lock()
+            .expect("not poisoned")
+            .utc_floor()
+            .establish_continuity();
+        assert!(recipients.scope_for(&rule(Some(12))).is_some());
     }
 
     #[test]

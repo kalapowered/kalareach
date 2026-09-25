@@ -537,7 +537,7 @@ mod platform {
     )]
 
     use std::os::windows::fs::OpenOptionsExt as _;
-    use std::os::windows::io::AsRawHandle as _;
+    use std::os::windows::io::{AsHandle as _, AsRawHandle as _};
     use std::path::Path;
     use std::sync::atomic::AtomicU64;
 
@@ -652,6 +652,18 @@ mod platform {
                 "the clock floor file is not the length this build writes",
             ));
         }
+        // Windows has no mode bits, so the owner-only question is asked of the file's own
+        // access-control list, read from the handle that was opened: a file another account owns,
+        // or one whose list lets another account write it, could have its floor lowered or its
+        // record raised by that account.
+        crate::paths::check_access_list(file.as_handle(), "the clock floor file", false).map_err(
+            |refusal| match refusal {
+                crate::paths::AccessListRefusal::Policy(detail) => Unusable::because(detail),
+                crate::paths::AccessListRefusal::Unreadable(detail) => Unusable::because(format!(
+                    "the clock floor file's access-control list cannot be read: {detail}"
+                )),
+            },
+        )?;
         let identity = information(&file)
             .ok_or_else(|| Unusable::because("the clock floor file's identity cannot be read"))?;
         // SAFETY: a mapping of a file this process holds open, of its whole length, with no name
@@ -765,6 +777,8 @@ mod tests {
         first.record(4_800);
         first.record(4_700);
         assert_eq!(second.recorded(), 4_800, "the record only rises");
+        // Every mapping ends before the file goes: on Windows a mapped file cannot be removed.
+        drop((first, second));
         std::fs::remove_dir_all(&root).expect("removed");
     }
 
@@ -785,7 +799,7 @@ mod tests {
         let root = directory("other");
         let path = root.join("utc-floor");
         let environment_id = environment();
-        let _floor =
+        let floor =
             SharedFloor::create(&path, environment_id, BootEpoch::new(1), 0).expect("created");
         let other_boot = SharedFloor::open(&path, environment_id, BootEpoch::new(2))
             .expect_err("another boot's floor");
@@ -798,6 +812,54 @@ mod tests {
         let absent = SharedFloor::open(&root.join("none"), environment_id, BootEpoch::new(1))
             .expect_err("nothing there");
         assert!(absent.absent);
+        drop(floor);
+        std::fs::remove_dir_all(&root).expect("removed");
+    }
+
+    /// On Windows a mapped floor's name cannot be removed or replaced while anything maps it,
+    /// because every mapping holds the file open without delete sharing. Once the last mapping
+    /// ends, the name can go.
+    #[cfg(windows)]
+    #[test]
+    fn a_mapped_floor_keeps_its_name_on_windows() {
+        let root = directory("held");
+        let path = root.join("utc-floor");
+        let environment_id = environment();
+        let boot = BootEpoch::new(12);
+        let floor = SharedFloor::create(&path, environment_id, boot, 0).expect("created");
+        std::fs::remove_file(&path).expect_err("a mapped floor's name cannot be removed");
+        let other = root.join("other");
+        std::fs::write(&other, [0_u8; FLOOR_FILE_LEN]).expect("another file");
+        std::fs::rename(&other, &path).expect_err("nor can another file be renamed over it");
+        assert!(floor.named());
+        // The control: with the mapping gone, the name goes.
+        drop(floor);
+        std::fs::remove_file(&path).expect("removed once nothing maps it");
+        std::fs::remove_dir_all(&root).expect("removed");
+    }
+
+    /// On Windows the owner-only question is asked of the file's access-control list: a floor file
+    /// that another account may write is no floor.
+    #[cfg(windows)]
+    #[test]
+    fn a_floor_file_another_account_may_write_is_no_floor_on_windows() {
+        let root = directory("acl");
+        let environment_id = environment();
+        let boot = BootEpoch::new(13);
+        // `WD` is the Everyone group; `OICI` makes every file created inside inherit the entry.
+        let wide = root.join("wide");
+        crate::paths::create_directory_with_list(&wide, "D:P(A;OICI;GA;;;OW)(A;OICI;GA;;;WD)")
+            .expect("a directory whose files everyone may write");
+        let refused = SharedFloor::create(&wide.join("utc-floor"), environment_id, boot, 0)
+            .expect_err("a floor everyone may write");
+        assert!(
+            refused.to_string().contains("grants access to"),
+            "{refused}"
+        );
+        // The control: the same file in an owner-only directory is a floor.
+        let floor = SharedFloor::create(&root.join("utc-floor"), environment_id, boot, 0)
+            .expect("an owner-only floor");
+        drop(floor);
         std::fs::remove_dir_all(&root).expect("removed");
     }
 

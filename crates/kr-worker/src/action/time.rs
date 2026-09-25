@@ -2517,16 +2517,31 @@ mod tests {
             contract.check_utc_deadline(WALL + 60_000),
             UtcDeadline::Ahead
         );
-        std::fs::remove_file(&path).expect("the name is removed");
-        assert_eq!(
-            contract.check_utc_deadline(WALL + 60_000),
-            UtcDeadline::FloorLost
-        );
+        // On Unix the name can go while the file is mapped, and the next check finds it gone. On
+        // Windows every mapping holds the file open without delete sharing, so the name cannot go
+        // while anything maps it.
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&path).expect("the name is removed");
+            assert_eq!(
+                contract.check_utc_deadline(WALL + 60_000),
+                UtcDeadline::FloorLost
+            );
+        }
+        #[cfg(windows)]
+        {
+            std::fs::remove_file(&path).expect_err("a mapped floor keeps its name");
+            assert_eq!(
+                contract.check_utc_deadline(WALL + 60_000),
+                UtcDeadline::Ahead
+            );
+        }
         assert_eq!(
             contract.floor_identity(),
             created.identity(),
             "a worker states the floor it maps, name or not"
         );
+        drop((contract, mapped, created));
         std::fs::remove_dir_all(&root).expect("removed");
     }
 }

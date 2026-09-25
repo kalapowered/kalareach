@@ -913,7 +913,7 @@ mod windows {
     /// # Errors
     ///
     /// Returns an error when the list cannot be built or the directory cannot be created.
-    pub(super) fn create_directory_with_list(path: &Path, descriptor: &str) -> Result<()> {
+    pub(crate) fn create_directory_with_list(path: &Path, descriptor: &str) -> Result<()> {
         let wide_path = wide(path.as_os_str());
         let wide_descriptor = wide_str(descriptor);
         let mut built: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
@@ -1295,6 +1295,9 @@ mod windows {
     }
 }
 
+/// For this crate's own tests of files a wider list would let another account reach.
+#[cfg(all(windows, test))]
+pub(crate) use self::windows::create_directory_with_list;
 #[cfg(windows)]
 pub use self::windows::{
     AccessListRefusal, check_access_list, current_job_limit_flags, open_child,

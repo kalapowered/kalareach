@@ -951,6 +951,8 @@ mod tests {
         assert!(floor.is_owed());
         floor.wrote(floor.get());
         assert!(!floor.is_owed());
+        // Every mapping ends before the file goes: on Windows a mapped file cannot be removed.
+        drop((floor, words, second));
         std::fs::remove_dir_all(&root).expect("removed");
     }
 
