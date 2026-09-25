@@ -1849,10 +1849,11 @@ async fn transfer_to_another(
 /// The host's store refuses every write of the floor. The wall clock reads an hour and a minute
 /// ahead, once, which raises the floor past a grant's expiry, and then comes back. A transfer of
 /// that grant is decided while the floor is owed its record, so it is refused as a failure to
-/// record rather than as an expiry: this host has decided nothing about the grant. The daemon stops
-/// before any write lands, the store recovers, and a daemon started again finds the older floor and
-/// the wall clock back where it was. The grant is valid by everything it can read, and it is
-/// admitted, which contradicts no answer this host gave.
+/// record rather than as an expiry: this host has not answered the lapse yet. The daemon stops
+/// before any write lands and the store recovers. The reading outlives the daemon in the boot's
+/// shared floor, so the daemon started again writes it down as it starts and refuses the grant as
+/// expired: the lapse is answered once it is on record, and a grant refused once is never admitted
+/// afterwards.
 #[tokio::test]
 async fn a_refusal_the_clock_decided_is_never_answered_on_a_floor_that_was_not_written() {
     let temp = kr_ipc::testing::TempHost::create();
@@ -1890,7 +1891,22 @@ async fn a_refusal_the_clock_decided_is_never_answered_on_a_floor_that_was_not_w
         kr_protocol::error::ErrorCode::StorageUnavailable,
         "refused as a floor this host could not write down, not decided"
     );
-    second.expect("nothing this host decided stands against the grant");
+    assert_eq!(
+        second
+            .expect_err("the reading past the expiry outlived the daemon")
+            .code(),
+        kr_protocol::error::ErrorCode::PermissionDenied,
+        "and once it is on record the lapse is answered"
+    );
+    let written = controller
+        .sharing()
+        .grants()
+        .stored_policy()
+        .expect("readable")
+        .expect("written")
+        .utc_floor_ms
+        .get();
+    assert!(written >= ahead, "the start wrote the floor it found down");
 }
 
 /// A delegation of one session under `parent`, from the device holding it to another, for half an
