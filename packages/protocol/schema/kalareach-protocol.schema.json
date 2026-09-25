@@ -8487,7 +8487,7 @@
     },
     "DecoderLedgerEntry": {
       "additionalProperties": false,
-      "description": "What a decoder offered, and every check the broker made before believing it.\n\nThis is the ledger row section 11 requires the broker to retain: \"the decoder/package hash,\noriginal source, native request ID, offered decisions, deadline and resolution state\". It\noutlives the plugin process, because a plugin-process failure cannot destroy the approval\nledger.",
+      "description": "What a decoder was given and what it offered, as the broker retains it.\n\nThis is the ledger row section 11 requires the broker to retain: \"the decoder/package hash,\noriginal source, native request ID, offered decisions, deadline and resolution state\", the\nresolution state being the pending resource's own. It outlives the plugin process, because a\nplugin-process failure cannot destroy the approval ledger.\n\nThe broker writes it only after its own checks: the decoder's grant and trust, the source\nframe's package, generation and first use, and the projection's schema policy. Those checks\nestablish whose decoder read which bytes. They do not establish that it read them correctly,\nwhich is why the original bytes are kept beside what the decoder made of them.",
       "properties": {
         "binding_id": {
           "$ref": "#/$defs/BrokerBindingId",
@@ -8514,7 +8514,7 @@
         },
         "package_digest": {
           "$ref": "#/$defs/Digest256",
-          "description": "The digest of the exact component bytes."
+          "description": "The hash that package was installed under, which names its exact contents, the decoder\nincluded."
         },
         "plugin_id": {
           "$ref": "#/$defs/PluginId",
@@ -8542,7 +8542,7 @@
         },
         "upstream_request_id": {
           "$ref": "#/$defs/UpstreamRequestId",
-          "description": "The native request identifier, exactly as the upstream wrote it."
+          "description": "The native request identifier, as this host's JSON form of its value.\n\nTwo spellings of one value are one identifier here. The upstream's own spelling of it is in\n`source_bytes`."
         }
       },
       "required": [

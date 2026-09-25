@@ -2905,7 +2905,10 @@ export interface DecoderLedgerEntry {
    */
   source_generation: string
   /**
-   * The native request identifier, exactly as the upstream wrote it.
+   * The native request identifier, as this host's JSON form of its value.
+   *
+   * Two spellings of one value are one identifier here. The upstream's own spelling of it is in
+   * `source_bytes`.
    */
   upstream_request_id: string
 }
@@ -9518,12 +9521,17 @@ export interface DeclarativeEntry {
   reverse: ReverseOperation | null
 }
 /**
- * What a decoder offered, and every check the broker made before believing it.
+ * What a decoder was given and what it offered, as the broker retains it.
  *
  * This is the ledger row section 11 requires the broker to retain: "the decoder/package hash,
- * original source, native request ID, offered decisions, deadline and resolution state". It
- * outlives the plugin process, because a plugin-process failure cannot destroy the approval
- * ledger.
+ * original source, native request ID, offered decisions, deadline and resolution state", the
+ * resolution state being the pending resource's own. It outlives the plugin process, because a
+ * plugin-process failure cannot destroy the approval ledger.
+ *
+ * The broker writes it only after its own checks: the decoder's grant and trust, the source
+ * frame's package, generation and first use, and the projection's schema policy. Those checks
+ * establish whose decoder read which bytes. They do not establish that it read them correctly,
+ * which is why the original bytes are kept beside what the decoder made of them.
  */
 export interface DecoderLedgerEntry1 {
   /**
@@ -9572,7 +9580,10 @@ export interface DecoderLedgerEntry1 {
    */
   source_generation: string
   /**
-   * The native request identifier, exactly as the upstream wrote it.
+   * The native request identifier, as this host's JSON form of its value.
+   *
+   * Two spellings of one value are one identifier here. The upstream's own spelling of it is in
+   * `source_bytes`.
    */
   upstream_request_id: string
 }

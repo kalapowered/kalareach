@@ -445,12 +445,17 @@ pub enum TrustError {
     },
 }
 
-/// What a decoder offered, and every check the broker made before believing it.
+/// What a decoder was given and what it offered, as the broker retains it.
 ///
 /// This is the ledger row section 11 requires the broker to retain: "the decoder/package hash,
-/// original source, native request ID, offered decisions, deadline and resolution state". It
-/// outlives the plugin process, because a plugin-process failure cannot destroy the approval
-/// ledger.
+/// original source, native request ID, offered decisions, deadline and resolution state", the
+/// resolution state being the pending resource's own. It outlives the plugin process, because a
+/// plugin-process failure cannot destroy the approval ledger.
+///
+/// The broker writes it only after its own checks: the decoder's grant and trust, the source
+/// frame's package, generation and first use, and the projection's schema policy. Those checks
+/// establish whose decoder read which bytes. They do not establish that it read them correctly,
+/// which is why the original bytes are kept beside what the decoder made of them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct DecoderLedgerEntry {
@@ -460,11 +465,15 @@ pub struct DecoderLedgerEntry {
     pub plugin_id: PluginId,
     /// The publisher of that package, for a person reading the pending resource.
     pub publisher_id: PublisherId,
-    /// The digest of the exact component bytes.
+    /// The hash that package was installed under, which names its exact contents, the decoder
+    /// included.
     pub package_digest: Digest256,
     /// The upstream method the original request named.
     pub method: UpstreamMethod,
-    /// The native request identifier, exactly as the upstream wrote it.
+    /// The native request identifier, as this host's JSON form of its value.
+    ///
+    /// Two spellings of one value are one identifier here. The upstream's own spelling of it is in
+    /// `source_bytes`.
     pub upstream_request_id: UpstreamRequestId,
     /// The generation of the source frame the decoder read.
     pub source_generation: SourceGeneration,
