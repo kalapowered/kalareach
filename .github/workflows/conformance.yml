@@ -1,0 +1,282 @@
+name: conformance
+
+# The conformance report on each hosted platform: every identifier of the specification the tests
+# name, what each of those tests came to on that platform, the commands that reproduce them, and
+# the application matrix in a real session. docs/conformance/README.md states the result. It is
+# started by hand and every night; the landing workflow is core-ci.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "37 2 * * *"
+
+permissions:
+  contents: read
+
+# A second run of the same ref waits for the first rather than cutting its evidence short.
+concurrency:
+  group: conformance-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  linux:
+    name: linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      # No debug information and no incremental artefacts: nothing here reads them, and the disk
+      # has to hold a debug build of every test target and a release build for the measurements.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+      # The plugin runtime's tests run real components, which the step below builds; a component
+      # that is not there is a failure here rather than a skip.
+      KR_REQUIRE_PLUGIN_FIXTURES: "1"
+      # The evidence directory: inside the platform's temporary directory, new for the run.
+      KR_TEST_ARTIFACTS_DIR: /tmp/kr-conformance-evidence
+    steps:
+      - name: Free the disk the build needs
+        timeout-minutes: 10
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
+
+      - name: Check out
+        timeout-minutes: 5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install the pinned toolchain
+        timeout-minutes: 5
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+          cargo --version
+
+      # The companion application's backend links the system WebView and the window toolkit. The
+      # curses headers are for the applications the matrix builds from their release's source.
+      - name: Install the build dependencies
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
+            libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libncurses-dev
+
+      - name: Install the component target
+        timeout-minutes: 5
+        run: rustup target add wasm32-wasip2
+
+      - name: Install pnpm
+        timeout-minutes: 5
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with:
+          version: 11.14.0
+
+      - name: Install Node
+        timeout-minutes: 5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22.23.1
+          cache: pnpm
+
+      - name: Restore the cargo registry
+        timeout-minutes: 10
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: conformance-${{ runner.os }}-registry-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build the test components
+        timeout-minutes: 15
+        run: bash scripts/build-plugin-fixtures.sh
+
+      # Every group this platform runs, the applications fetched and built from the pins in
+      # tests/conformance/applications.lock. The step fails when the run did.
+      - name: The conformance report
+        timeout-minutes: 240
+        run: bash scripts/run-conformance.sh
+
+      - name: Keep the result and the evidence
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: conformance-linux
+          path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
+          if-no-files-found: error
+
+  macos:
+    name: macos
+    runs-on: macos-15
+    timeout-minutes: 300
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+      KR_REQUIRE_PLUGIN_FIXTURES: "1"
+      KR_TEST_ARTIFACTS_DIR: /tmp/kr-conformance-evidence
+    steps:
+      - name: Check out
+        timeout-minutes: 5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: What this runner is
+        timeout-minutes: 2
+        run: |
+          sw_vers
+          uname -srm
+          echo "processors: $(sysctl -n hw.logicalcpu); memory: $(( $(sysctl -n hw.memsize) / 1073741824 )) GiB"
+          df -h /System/Volumes/Data
+          echo "CARGO_BUILD_JOBS=$(sysctl -n hw.logicalcpu)" >> "$GITHUB_ENV"
+
+      # The suites run Apple's own Git, as a Mac with Xcode has it, rather than Homebrew's, which is
+      # first on this runner's PATH: the newest Xcode's Git goes first, as a script that runs it by
+      # its own path, so it finds its helper directory where Xcode put it.
+      - name: Put Apple's Git first
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          newest=""
+          newest_version=""
+          for developer in /Applications/Xcode_*.app/Contents/Developer; do
+            application="${developer%/Contents/Developer}"
+            if [ -L "$application" ] || [ ! -x "$developer/usr/bin/git" ]; then
+              continue
+            fi
+            version="$("$developer/usr/bin/git" --version | awk '{ print $3 }')"
+            later="$(printf '%s\n%s\n' "${newest_version:-0}" "$version" | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1)"
+            if [ -z "$newest" ] || { [ "$later" = "$version" ] && [ "$version" != "$newest_version" ]; }; then
+              newest="$developer/usr/bin/git"
+              newest_version="$version"
+            fi
+          done
+          if [ -z "$newest" ]; then
+            echo "no Xcode on this runner has a Git in it" >&2
+            exit 1
+          fi
+          directory="$RUNNER_TEMP/apple-git"
+          mkdir -p "$directory"
+          printf '%s\n' '#!/bin/sh' "exec \"$newest\" \"\$@\"" > "$directory/git"
+          chmod +x "$directory/git"
+          echo "$directory" >> "$GITHUB_PATH"
+          "$directory/git" --version
+
+      - name: Install the pinned toolchain
+        timeout-minutes: 5
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - name: Install the component target
+        timeout-minutes: 5
+        run: rustup target add wasm32-wasip2
+
+      # The worker's pseudo-terminal suite drives each shell section 3 names; the runner has Bash
+      # and Zsh.
+      - name: Install Fish
+        timeout-minutes: 5
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          brew install fish
+          fish --version
+
+      - name: Install pnpm
+        timeout-minutes: 5
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with:
+          version: 11.14.0
+
+      - name: Install Node
+        timeout-minutes: 5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22.23.1
+          cache: pnpm
+
+      - name: Restore the cargo registry
+        timeout-minutes: 10
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: conformance-${{ runner.os }}-registry-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build the test components
+        timeout-minutes: 15
+        run: bash scripts/build-plugin-fixtures.sh
+
+      - name: The conformance report
+        timeout-minutes: 240
+        run: bash scripts/run-conformance.sh
+
+      - name: Keep the result and the evidence
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: conformance-macos
+          path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
+          if-no-files-found: error
+
+  windows:
+    name: windows
+    runs-on: windows-2025
+    timeout-minutes: 180
+    env:
+      CARGO_INCREMENTAL: "0"
+      # The one case that writes this runner's credential store, which is the runner's own and
+      # holds nobody's credentials; what it writes is named for the run and taken away again.
+      KR_TEST_PLATFORM_SECRET_STORE: "1"
+    steps:
+      - name: Check out
+        timeout-minutes: 5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install the pinned toolchain
+        timeout-minutes: 5
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - name: Restore the cargo registry
+        timeout-minutes: 10
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: conformance-${{ runner.os }}-registry-${{ hashFiles('Cargo.lock') }}
+
+      # The evidence directory is inside the user's temporary directory, by its long name.
+      - name: Name the evidence directory
+        timeout-minutes: 2
+        run: |
+          $temporary = (Get-Item $env:TEMP).FullName
+          "KR_TEST_ARTIFACTS_DIR=$temporary\kr-conformance-evidence" >> $env:GITHUB_ENV
+
+      # The suites qualified on Windows, as the landing workflow's Windows job runs them; the other
+      # groups and the applications are recorded as not run here, each with its reason.
+      - name: The conformance report
+        timeout-minutes: 150
+        shell: bash
+        run: bash scripts/run-conformance.sh
+
+      - name: Keep the result and the evidence
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: conformance-windows
+          path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
+          if-no-files-found: error
