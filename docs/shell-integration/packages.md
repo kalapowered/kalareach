@@ -333,10 +333,11 @@ operating system ask the person for permission first, so a built shell lives on 
 where a session can start it without a dialog.
 
 Beside the binary is `kr-shell-identity.json`, which is what the package declares in its handshake:
-the executable, the upstream version, the editor ABI, the integration version, every published
-patch with the upstream revision it was rebased onto, the module tree with each module's ABI, the
-five declared mechanisms, and the build's own inputs and compiler. The record also states what the
-shell's own test suite did.
+the executable, the upstream version, the editor ABI, the integration version, every published patch
+with the upstream revision it was rebased onto, the module tree with each module's ABI, the five
+declared mechanisms, and the build's own inputs and compiler. The record also states what the
+shell's own test suite did, and holds as `build.inputs` the exact text the identity is a digest of,
+so which of the inputs were the tree's and which the machine's can be read back line by line.
 
 The manifest's compilation flags are part of the package rather than a local preference. Zsh 5.9
 writes some of its configure probes in pre-C99 style, and a compiler that rejects implicit `int`

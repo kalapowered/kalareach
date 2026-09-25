@@ -233,13 +233,21 @@ PYTHON
 }
 
 write_identity_record() {
-    python3 - "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" <<'PYTHON'
+    python3 - "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" <<'PYTHON'
 import json
 import sys
 
-manifest_path, destination, identity, executable, module_directory, inputs, tests, toolchain = (
-    sys.argv[1:9]
-)
+(
+    manifest_path,
+    destination,
+    identity,
+    executable,
+    module_directory,
+    inputs,
+    tests,
+    toolchain,
+    inputs_text,
+) = sys.argv[1:10]
 with open(manifest_path, encoding="utf-8") as handle:
     manifest = json.load(handle)
 
@@ -284,6 +292,9 @@ record = {
         "configure": manifest["configure"],
         "cflags": manifest["cflags"],
         "inputs_sha256": inputs,
+        # The exact text the identity is a digest of, so a reader can tell which of the inputs
+        # were this tree's and which were the machine's, and name the one that differs.
+        "inputs": inputs_text,
         "toolchain": toolchain,
         "upstream_tests": tests,
     },
@@ -578,7 +589,7 @@ startup=$(digest "$package/$m_startup") $m_startup"
     cp "$package/$m_startup" "$destination/startup/$(basename "$m_startup")"
 
     write_identity_record "$package/manifest.json" "$record" "$identity" "$executable" \
-        "$module_directory" "$inputs_digest" "$tests_result" "${CC:-cc} $toolchain"
+        "$module_directory" "$inputs_digest" "$tests_result" "${CC:-cc} $toolchain" "$inputs"
     printf '%s\n' "$identity" > "$prefix/$shell_name/current"
 
     echo "build-shells: built $shell_name $m_upstream_version as $identity"

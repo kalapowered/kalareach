@@ -155,8 +155,8 @@ impl Package {
     /// Finds this tree's own built package, or says why it is not there.
     ///
     /// The installation's `current` names a build, and a build is named by a digest of what it was
-    /// built from, so the build it names is this tree's only when that is the identity this tree's
-    /// inputs give. A build of other inputs, left by a build of another tree, is not this tree's
+    /// built from, so the build it names is this tree's only when this tree's inputs are the ones it
+    /// was built from. A build of other inputs, left by a build of another tree, is not this tree's
     /// package, and a suite that drove it would be testing somebody else's patches.
     ///
     /// # Errors
@@ -191,16 +191,12 @@ impl Package {
                 format!("{} has no identity record ({error})", record_path.display())
             })?)
             .map_err(|error| format!("{} does not decode ({error})", record_path.display()))?;
-        let tree = identity::tree_identity(kind, &record).map_err(|error| {
-            format!("the identity this tree gives the {name} package cannot be worked out: {error}")
-        })?;
-        if tree != identity {
-            return Err(format!(
-                "{} names {name} {identity}, and this tree's inputs give {tree}, so the package \
-                 there was built from something other than this tree; {how}",
+        identity::this_trees(kind, &identity, &record).map_err(|reason| {
+            format!(
+                "{} names {name} {identity}, which is not this tree's package: {reason}; {how}",
                 pointer.display()
-            ));
-        }
+            )
+        })?;
         let executable = PathBuf::from(
             record["shell"]["executable"]
                 .as_str()
