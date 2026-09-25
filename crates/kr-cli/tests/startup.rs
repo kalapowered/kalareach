@@ -2115,6 +2115,44 @@ impl Drop for UserManager {
     }
 }
 
+/// A unit file's command line that creates `mark` and nothing else: each word quoted as systemd
+/// reads it, with its specifier character doubled, and environment expansion off.
+#[cfg(target_os = "linux")]
+fn touching(mark: &Path) -> String {
+    let word = |value: &str| {
+        format!(
+            "\"{}\"",
+            value
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('%', "%%")
+        )
+    };
+    format!(
+        "{} {} {}",
+        word(":/usr/bin/touch"),
+        word("--"),
+        word(&mark.display().to_string())
+    )
+}
+
+/// A D-Bus address for the socket at `path`: letters, digits and `-_/.` as they are, and every
+/// other byte as `%` and its two hex digits, which every D-Bus library reads back.
+#[cfg(target_os = "linux")]
+fn bus_address(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let mut address = "unix:path=".to_owned();
+    for byte in path.as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || b"-_/.".contains(byte) {
+            address.push(char::from(*byte));
+        } else {
+            address.push_str(&format!("%{byte:02x}"));
+        }
+    }
+    address
+}
+
 /// A host tree of a test's own where the service start is chosen: a home of the test's own that
 /// the definition is written in, and the user service manager that starts the daemon.
 ///
@@ -2924,10 +2962,7 @@ fn no_drop_in_anywhere_changes_the_command_the_user_manager_runs() {
         std::fs::create_dir_all(directory).expect("a drop-in directory");
         std::fs::write(
             &drop_in,
-            format!(
-                "[Service]\nExecStart=\nExecStart=/usr/bin/touch {}\n",
-                mark.display()
-            ),
+            format!("[Service]\nExecStart=\nExecStart={}\n", touching(&mark)),
         )
         .expect("a drop-in");
         if directory == linked {
@@ -2992,10 +3027,7 @@ fn the_user_manager_kr_checks_is_the_one_it_asks() {
     let other_unit = other_units.join(format!("{}.service", host.label()));
     std::fs::write(
         &other_unit,
-        format!(
-            "[Service]\nType=exec\nExecStart=/usr/bin/touch {}\n",
-            mark.display()
-        ),
+        format!("[Service]\nType=exec\nExecStart={}\n", touching(&mark)),
     )
     .expect("another unit under the same name");
     let other = UserManager::start(&other_home, host.tree.holder()).and_then(|other| {
@@ -3020,7 +3052,7 @@ fn the_user_manager_kr_checks_is_the_one_it_asks() {
             return;
         }
     };
-    let bus = format!("unix:path={}", other.runtime.join("bus").display());
+    let bus = bus_address(&other.runtime.join("bus"));
     let over_the_bus = |command: &mut Command| {
         command
             .env("SYSTEMCTL_FORCE_BUS", "1")
