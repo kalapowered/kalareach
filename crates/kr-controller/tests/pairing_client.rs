@@ -23,7 +23,9 @@ use kr_client::pairing::candidate::{AttemptState, Candidate, CandidateRoom, Pair
 use kr_client::pairing::clock::DeviceClock;
 use kr_client::pairing::failure::FailureKind;
 use kr_client::pairing::invitation::{Invitation, read_invitation};
-use kr_client::pairing::link::{EndpointPool, HostLink, IrohLink, LinkError, Preauth};
+use kr_client::pairing::link::{
+    EndpointHold, EndpointPool, HostLink, IrohLink, LinkError, Preauth,
+};
 use kr_client::pairing::owner::{
     CannotCheck, Ceremony, CeremonyKind, CeremonyOutcome, Listed, OwnerChannel, OwnerConfirmations,
     ReviewOutcome, SessionChannel, Subject,
@@ -608,6 +610,13 @@ impl HostLink for WatchedLink {
             }
             self.inner.connect_paired(host, identity).await
         })
+    }
+
+    fn hold<'a>(
+        &'a self,
+        network: &'a NetworkConfig,
+    ) -> BoxFuture<'a, Result<EndpointHold, LinkError>> {
+        self.inner.hold(network)
     }
 }
 

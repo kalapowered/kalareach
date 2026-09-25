@@ -57,6 +57,10 @@ impl Pairing {
                 "this device is already paired with the host the invitation pins",
             ));
         }
+        // Nothing this device does for another host may close the endpoint the attempt uses.
+        let _held = within(WAIT_STEP, self.link.hold(&payload.network_config))
+            .await
+            .map_err(|error| reached(&error))?;
         let connection = within(
             WAIT_STEP,
             self.link

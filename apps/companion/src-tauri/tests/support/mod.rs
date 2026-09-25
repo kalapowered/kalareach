@@ -110,14 +110,19 @@ pub async fn reached(device: &Device, until: impl Fn(&AttemptState) -> bool) -> 
 /// This computer as the host's owner device: the owner's keys in its store and its record of
 /// the host.
 pub fn owner_device(host: &Host, owner_keys: &DeviceKeys, data: &std::path::Path) -> Arc<Device> {
+    owner_device_with(host, owner_keys, data, &Arc::new(Capture::default()))
+}
+
+/// The host's owner device, whose every change the capture keeps.
+pub fn owner_device_with(
+    host: &Host,
+    owner_keys: &DeviceKeys,
+    data: &std::path::Path,
+    capture: &Arc<Capture>,
+) -> Arc<Device> {
     let secrets: Arc<dyn SecretStore> = Arc::new(MemoryStore::new());
     store_device_keys(&*secrets, "device", owner_keys).expect("the owner's keys are kept");
-    let device = device(
-        data,
-        secrets,
-        Arc::new(host.room.clone()),
-        &Arc::new(Capture::default()),
-    );
+    let device = device(data, secrets, Arc::new(host.room.clone()), capture);
     let record = host.owner.clone().expect("the owner device");
     let identity = host.network().pairing().identity();
     device
@@ -137,6 +142,27 @@ pub fn owner_device(host: &Host, owner_keys: &DeviceKeys, data: &std::path::Path
         })
         .expect("the host is recorded");
     device
+}
+
+/// Whether this computer is in contact with the host it owns, as the pairing screen shows it.
+pub fn owned_host_in_contact(device: &Device) -> Option<bool> {
+    device
+        .view()
+        .hosts
+        .iter()
+        .find(|host| host.owner)
+        .and_then(|host| host.in_contact)
+}
+
+/// Waits until the pairing screen shows the owned host `in_contact` or not.
+pub async fn owned_host_shown(device: &Device, in_contact: bool) {
+    tokio::time::timeout(WATCHDOG, async {
+        while owned_host_in_contact(device) != Some(in_contact) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the owned host is shown so");
 }
 
 /// Waits until `owner` lists a request `matching` accepts, and returns it.

@@ -13,6 +13,11 @@
 //! relay until its connections have drained, so the pool records it until its close has finished,
 //! and binds nothing on that relay before then.
 //!
+//! Whatever must not be cut off holds its endpoint ([`EndpointPool::hold`]): a pairing attempt for
+//! as long as it runs, and an owner's review of a confirmation while it runs. A held endpoint is
+//! closed for no other configuration: a request that would close it is refused until the last hold
+//! ends, so a device watching the hosts it owns waits for them rather than cutting the attempt off.
+//!
 //! [`HostLink`] is the whole of what the pairing flows ask of the network, so a test can put a
 //! dialler that reaches another host, or a layer that alters an answer, in its place. [`IrohLink`]
 //! is the product's.
@@ -125,6 +130,13 @@ pub trait HostLink: Send + Sync {
         host: &'a PairedHost,
         identity: &'a LocalIdentity,
     ) -> BoxFuture<'a, Result<Session, LinkError>>;
+
+    /// Holds the endpoint for `network`, so nothing this device does for another host closes it,
+    /// until the hold is dropped.
+    fn hold<'a>(
+        &'a self,
+        network: &'a NetworkConfig,
+    ) -> BoxFuture<'a, Result<EndpointHold, LinkError>>;
 }
 
 /// The live peer of a connection, as kr-pairing checks it.
@@ -189,6 +201,13 @@ impl Services {
     }
 }
 
+/// A hold on the endpoint of one set of services. While any hold on it lives, the pool closes that
+/// endpoint for no other configuration; dropping the last one lets it be closed again.
+#[derive(Debug)]
+pub struct EndpointHold {
+    _holds: Arc<()>,
+}
+
 /// This device's dialling endpoints, one per distinct set of services its hosts select.
 pub struct EndpointPool {
     transport: TransportIdentityKeyPair,
@@ -206,7 +225,7 @@ pub struct EndpointPool {
 /// waits for it, and it stays recorded until that task says it has.
 #[derive(Default)]
 struct Endpoints {
-    open: Vec<(Services, Endpoint)>,
+    open: Vec<Open>,
     closing: Vec<(Services, watch::Receiver<bool>)>,
     /// Holds every close the pool starts until a test opens it, so a test decides when a close
     /// finishes rather than guessing how long one takes.
@@ -214,14 +233,33 @@ struct Endpoints {
     close_gate: Option<watch::Receiver<bool>>,
 }
 
+/// One open endpoint, the services it was bound for, and the holds on it.
+struct Open {
+    services: Services,
+    endpoint: Endpoint,
+    /// One more reference than there are holds.
+    holds: Arc<()>,
+}
+
+impl Open {
+    fn held(&self) -> bool {
+        Arc::strong_count(&self.holds) > 1
+    }
+}
+
 impl Endpoints {
     /// Moves every open endpoint `selected` picks to the closing record, and starts its close.
     fn start_closing(&mut self, selected: impl Fn(&Services) -> bool) {
         let (closing, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.open)
             .into_iter()
-            .partition(|(held, _)| selected(held));
+            .partition(|open| selected(&open.services));
         self.open = kept;
-        for (held, endpoint) in closing {
+        for Open {
+            services: held,
+            endpoint,
+            ..
+        } in closing
+        {
             let (closed, watching) = watch::channel(false);
             #[cfg(test)]
             let gate = self.close_gate.clone();
@@ -294,21 +332,64 @@ impl EndpointPool {
     /// # Errors
     ///
     /// Returns [`LinkError::Configuration`] for a configuration that cannot be used, and
-    /// [`LinkError::Lost`] when the endpoint cannot be bound.
+    /// [`LinkError::Lost`] when the endpoint cannot be bound, or when binding it would close an
+    /// endpoint someone holds.
     pub async fn endpoint(&self, network: &NetworkConfig) -> Result<Endpoint, LinkError> {
         let config = self.config(network)?;
-        let services = Services::of(&config);
         let mut endpoints = self.endpoints.lock().await;
-        if let Some((_, endpoint)) = endpoints.open.iter().find(|(held, _)| *held == services) {
-            return Ok(endpoint.clone());
+        let open = self.open_for(&mut endpoints, config).await?;
+        Ok(open.endpoint.clone())
+    }
+
+    /// Holds the endpoint for `network`'s services, bound now if none is open, until the returned
+    /// hold is dropped.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::endpoint`].
+    pub async fn hold(&self, network: &NetworkConfig) -> Result<EndpointHold, LinkError> {
+        let config = self.config(network)?;
+        let mut endpoints = self.endpoints.lock().await;
+        let open = self.open_for(&mut endpoints, config).await?;
+        Ok(EndpointHold {
+            _holds: Arc::clone(&open.holds),
+        })
+    }
+
+    /// The open endpoint for `config`'s services, bound now if there is none.
+    async fn open_for<'a>(
+        &self,
+        endpoints: &'a mut Endpoints,
+        config: EndpointConfig,
+    ) -> Result<&'a Open, LinkError> {
+        let services = Services::of(&config);
+        if let Some(index) = endpoints
+            .open
+            .iter()
+            .position(|open| open.services == services)
+        {
+            return Ok(&endpoints.open[index]);
+        }
+        if endpoints
+            .open
+            .iter()
+            .any(|open| open.held() && open.services.share_a_relay(&services))
+        {
+            return Err(LinkError::Lost(
+                "the relay this host is reached through is in use for another host".to_owned(),
+            ));
         }
         endpoints.start_closing(|held| held.share_a_relay(&services));
         endpoints.closed(|held| held.share_a_relay(&services)).await;
         #[cfg(test)]
         self.binds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let endpoint = kr_transport::endpoint::bind_dialer(&config, &self.transport).await?;
-        endpoints.open.push((services, endpoint.clone()));
-        Ok(endpoint)
+        endpoints.open.push(Open {
+            services,
+            endpoint,
+            holds: Arc::new(()),
+        });
+        Ok(endpoints.open.last().expect("just bound"))
     }
 
     /// How many endpoints are open.
@@ -327,7 +408,7 @@ impl EndpointPool {
             .await
             .open
             .iter()
-            .any(|(held, _)| *held == services)
+            .any(|open| open.services == services)
     }
 
     /// Closes every endpoint, and waits until each has finished closing.
@@ -419,6 +500,13 @@ impl HostLink for IrohLink {
             })?;
             Session::start(Arc::new(transport)).map_err(|error| LinkError::Lost(error.to_string()))
         })
+    }
+
+    fn hold<'a>(
+        &'a self,
+        network: &'a NetworkConfig,
+    ) -> BoxFuture<'a, Result<EndpointHold, LinkError>> {
+        Box::pin(self.pool.hold(network))
     }
 }
 
@@ -655,6 +743,60 @@ mod tests {
             "the relay is used again only once the old endpoint has finished closing"
         );
         assert_eq!(binds(&pool), 2);
+        pool.close().await;
+    }
+
+    /// KR-REQ-10.27: an endpoint held for an attempt or a review is closed for no other
+    /// configuration. While it is held, a request for another configuration on its relay is
+    /// refused, for an endpoint and for a hold alike, and binds nothing; the held configuration
+    /// itself, and one on no shared relay, are served at once. Once the last hold ends, the same
+    /// request closes the endpoint and binds, as it does for an endpoint nobody holds.
+    #[tokio::test]
+    async fn a_held_endpoint_is_closed_for_no_other_configuration_on_its_relay() {
+        let pool = EndpointPool::new(TransportIdentityKeyPair::generate().expect("a key"))
+            .bound_to("127.0.0.1:0".parse().expect("loopback"));
+        let held_config = network(
+            &["https://relay.example.test"],
+            Some("http://127.0.0.1:16/pkarr"),
+            &[],
+        );
+        let other = network(
+            &["https://relay.example.test"],
+            Some("http://127.0.0.1:17/pkarr"),
+            &[],
+        );
+        let elsewhere = network(&[], Some("http://127.0.0.1:18/pkarr"), &[]);
+
+        let first = pool.hold(&held_config).await.expect("held");
+        let second = pool.hold(&held_config).await.expect("held twice");
+        let held = pool
+            .endpoint(&held_config)
+            .await
+            .expect("the held one itself");
+        assert!(matches!(
+            pool.endpoint(&other).await,
+            Err(LinkError::Lost(_))
+        ));
+        assert!(matches!(pool.hold(&other).await, Err(LinkError::Lost(_))));
+        assert!(!held.is_closed(), "the held endpoint stays open");
+        pool.endpoint(&elsewhere).await.expect("no shared relay");
+        assert_eq!(binds(&pool), 2, "nothing was bound on the held relay");
+
+        drop(first);
+        assert!(
+            matches!(pool.endpoint(&other).await, Err(LinkError::Lost(_))),
+            "one hold still lives"
+        );
+        drop(second);
+        pool.endpoint(&other)
+            .await
+            .expect("served once no hold lives");
+        assert!(
+            held.is_closed(),
+            "and the endpoint it held was closed first"
+        );
+        assert!(pool.holds(&other).await);
+        assert_eq!(binds(&pool), 3);
         pool.close().await;
     }
 
