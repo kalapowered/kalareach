@@ -1496,4 +1496,170 @@ mod tests {
             assert!(UploadId::new(refused.clone()).is_err(), "{refused:?}");
         }
     }
+
+    /// Reads `answer`, and every planting of the marker and of the neutral value in it, through
+    /// this module's reader as `T`.
+    ///
+    /// The answer as the service writes it is read. No rendering of a planting's refusal holds the
+    /// marker, and at least one planting is refused. A neutral planting that is refused says what
+    /// was being read and the class and place of the fault, as the reader of every answer says them,
+    /// and nothing it held.
+    fn held_to_the_rule<T: for<'de> Deserialize<'de>>(
+        what: &'static str,
+        answer: &serde_json::Value,
+    ) {
+        use crate::services::json::Unreadable;
+        use crate::shown::marker::{
+            MARKER, NEUTRAL, assert_unmarked, failure_renderings, json_plantings,
+        };
+
+        assert!(
+            read::<T>(answer.clone(), what).is_ok(),
+            "{what}: the answer as the service writes it"
+        );
+        let mut refused = 0;
+        for planted in json_plantings(answer, MARKER) {
+            if let Err(error) = read::<T>(planted.input, what) {
+                refused += 1;
+                assert_unmarked(
+                    &format!("{what}, {}", planted.at),
+                    &failure_renderings(error),
+                );
+            }
+        }
+        assert!(refused > 0, "{what}: the plantings are refused");
+        for planted in json_plantings(answer, NEUTRAL) {
+            let fault = serde_json::from_value::<T>(planted.input.clone()).err();
+            match (read::<T>(planted.input, what), fault) {
+                (Err(error), Some(fault)) => assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "{}: this client cannot read {what}: {}",
+                        ErrorCode::OutcomeUnknown,
+                        Unreadable::from(&fault)
+                    ),
+                    "{what}, {}",
+                    planted.at
+                ),
+                (Ok(_), None) => {}
+                (read, _) => panic!(
+                    "{what}, {}: the reader and the answer's shape disagree (read: {})",
+                    planted.at,
+                    read.is_ok()
+                ),
+            }
+        }
+    }
+
+    /// What managed storage answers is read without a word of it reaching a failure: the marker,
+    /// planted in each member, name and value of every answer in turn, is in no rendering of what
+    /// the reader refuses, and a neutral value planted the same way is refused in this client's
+    /// words.
+    #[test]
+    fn an_answer_this_client_cannot_read_says_nothing_it_carried() {
+        let archive =
+            serde_json::to_value(ArchiveId::new(Uuid::from_bytes([0x11; 16]))).expect("an archive");
+        let object = serde_json::to_value(BackupObjectId::new(Uuid::from_bytes([0x22; 16])))
+            .expect("an object");
+        let hash = serde_json::to_value(Digest256::from_bytes([0x5a; 32])).expect("a hash");
+        let generation = serde_json::to_value(BackupGeneration::new(3)).expect("a generation");
+        let principal = "account:0e1f9a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b";
+        let retention = serde_json::json!({
+            "daily_snapshots": 30,
+            "tombstone_days": 7,
+            "provider_recovery_days": 30,
+        });
+
+        held_to_the_rule::<StatusAnswer>(
+            "what a storage status read answered",
+            &serde_json::json!({
+                "principal": principal,
+                "backup": "on",
+                "retention_revision": "3",
+                "retention": retention,
+                "stored": { "objects": 2, "bytes": "4096" },
+                "tombstoned": {
+                    "objects": 1,
+                    "bytes": "512",
+                    "next_purge": "2026-10-02T17:00:00.000Z",
+                },
+                "uploading": { "objects": 1, "bytes": "0", "reserved_bytes": "8388608" },
+                "allowance_bytes": "10737418240",
+                "limits": {
+                    "part_size_bytes": "8388608",
+                    "max_object_bytes": "1073741824",
+                    "max_parts": 128,
+                    "max_read_bytes": "8388608",
+                    "upload_lifetime_seconds": 3600,
+                    "outstanding_uploads": 2,
+                },
+            }),
+        );
+        held_to_the_rule::<RetentionAnswer>(
+            "what a retention change answered",
+            &serde_json::json!({
+                "state": "set",
+                "backup": "on",
+                "retention": retention,
+                "revision": 4,
+            }),
+        );
+        held_to_the_rule::<CreateAnswer>(
+            "what an upload creation answered",
+            &serde_json::json!({
+                "state": "created",
+                "layout": {
+                    "total_bytes": "9000000",
+                    "part_size_bytes": "8388608",
+                    "part_count": 2,
+                    "final_part_bytes": "611392",
+                },
+                "upload_id": "upload-0001",
+                "principal": principal,
+                "reserved_bytes": "9000000",
+                "expires_at": "2026-09-25T18:00:00.000Z",
+            }),
+        );
+        held_to_the_rule::<PartAnswer>(
+            "what a part answered",
+            &serde_json::json!({
+                "state": "stored",
+                "part_number": 1,
+                "length_bytes": "8388608",
+                "parts_stored": 1,
+                "bytes_stored": "8388608",
+            }),
+        );
+        held_to_the_rule::<CompleteAnswer>(
+            "what an upload completion answered",
+            &serde_json::json!({
+                "state": "stored",
+                "archive_id": archive,
+                "backup_generation": generation,
+                "object": {
+                    "object_id": object,
+                    "encrypted_object_hash": hash,
+                    "encrypted_len": "9000000",
+                },
+                "size_bucket_bytes": "16777216",
+                "stored_at": "2026-09-25T17:00:00.000Z",
+                "committed_bytes": "9000000",
+                "principal": principal,
+            }),
+        );
+        held_to_the_rule::<AbortAnswer>(
+            "what an upload abandonment answered",
+            &serde_json::json!({ "state": "cleaned", "released_bytes": "9000000" }),
+        );
+        held_to_the_rule::<DeleteAnswer>(
+            "what an object deletion answered",
+            &serde_json::json!({
+                "state": "tombstoned",
+                "deleted_at": "2026-09-25T17:00:00.000Z",
+                "purge_after": "2026-10-02T17:00:00.000Z",
+                "retained_bytes": "9000000",
+                "retention": retention,
+            }),
+        );
+    }
 }

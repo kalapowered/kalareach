@@ -530,28 +530,33 @@ mod tests {
     use kr_protocol::ids::BackupObjectId;
     use kr_protocol::scalars::{Signature64, TimestampMs, Uuid};
 
+    /// A writer's publication of generation 3 of `archive_id`.
+    fn publication(archive_id: ArchiveId) -> BackupGenerationPublication {
+        BackupGenerationPublication {
+            payload: BackupGenerationPublicationPayload {
+                descriptor: ArchiveDescriptor {
+                    version: U64::new(1),
+                    archive_id,
+                    backup_generation: BackupGeneration::new(3),
+                    encrypted_manifest: EncryptedObjectRef {
+                        object_id: BackupObjectId::new(Uuid::from_bytes([0xf0; 16])),
+                        encrypted_object_hash: Digest256::from_bytes([0x5a; 32]),
+                        encrypted_len: U64::new(64),
+                    },
+                    manifest_key_wraps: Vec::new(),
+                },
+                writer_key_id: KeyId::from_bytes([0x22; 32]),
+                published_at_ms: TimestampMs::new(2_000),
+            },
+            signature: Signature64::from_bytes([0x33; 64]),
+        }
+    }
+
     #[test]
     fn a_rendering_of_a_fetched_generation_carries_neither_its_publication_nor_its_signature() {
         let archive_id = ArchiveId::new(Uuid::from_bytes([0x11; 16]));
         let fetched = FetchedGeneration {
-            publication: BackupGenerationPublication {
-                payload: BackupGenerationPublicationPayload {
-                    descriptor: ArchiveDescriptor {
-                        version: U64::new(1),
-                        archive_id,
-                        backup_generation: BackupGeneration::new(3),
-                        encrypted_manifest: EncryptedObjectRef {
-                            object_id: BackupObjectId::new(Uuid::from_bytes([0xf0; 16])),
-                            encrypted_object_hash: Digest256::from_bytes([0x5a; 32]),
-                            encrypted_len: U64::new(64),
-                        },
-                        manifest_key_wraps: Vec::new(),
-                    },
-                    writer_key_id: KeyId::from_bytes([0x22; 32]),
-                    published_at_ms: TimestampMs::new(2_000),
-                },
-                signature: Signature64::from_bytes([0x33; 64]),
-            },
+            publication: publication(archive_id),
             published_at: NEVER_RENDERED.to_owned(),
             collection: CollectionSummary {
                 archive_id,
@@ -572,6 +577,114 @@ mod tests {
                 "FetchedGeneration{{archive_id:{archive_id:?},backup_generation:{:?},..}}",
                 BackupGeneration::new(3)
             ),
+        );
+    }
+
+    /// Reads `answer`, and every planting of the marker and of the neutral value in it, through
+    /// this module's reader as `T`.
+    ///
+    /// The answer as the service writes it is read. No rendering of a planting's refusal holds the
+    /// marker, and at least one planting is refused. A neutral planting that is refused says what
+    /// was being read and the class and place of the fault, as the reader of every answer says them,
+    /// and nothing it held.
+    fn held_to_the_rule<T: for<'de> Deserialize<'de>>(
+        what: &'static str,
+        answer: &serde_json::Value,
+    ) {
+        use crate::services::json::Unreadable;
+        use crate::shown::marker::{
+            MARKER, NEUTRAL, assert_unmarked, failure_renderings, json_plantings,
+        };
+
+        assert!(
+            read::<T>(answer.clone(), what).is_ok(),
+            "{what}: the answer as the service writes it"
+        );
+        let mut refused = 0;
+        for planted in json_plantings(answer, MARKER) {
+            if let Err(error) = read::<T>(planted.input, what) {
+                refused += 1;
+                assert_unmarked(
+                    &format!("{what}, {}", planted.at),
+                    &failure_renderings(error),
+                );
+            }
+        }
+        assert!(refused > 0, "{what}: the plantings are refused");
+        for planted in json_plantings(answer, NEUTRAL) {
+            let fault = serde_json::from_value::<T>(planted.input.clone()).err();
+            match (read::<T>(planted.input, what), fault) {
+                (Err(error), Some(fault)) => assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "{}: this client cannot read {what}: {}",
+                        ErrorCode::OutcomeUnknown,
+                        Unreadable::from(&fault)
+                    ),
+                    "{what}, {}",
+                    planted.at
+                ),
+                (Ok(_), None) => {}
+                (read, _) => panic!(
+                    "{what}, {}: the reader and the answer's shape disagree (read: {})",
+                    planted.at,
+                    read.is_ok()
+                ),
+            }
+        }
+    }
+
+    /// What the backup manifest answers is read without a word of it reaching a failure: the
+    /// marker, planted in each member, name and value of every answer in turn, a publication's
+    /// included, is in no rendering of what the reader refuses, and a neutral value planted the
+    /// same way is refused in this client's words.
+    #[test]
+    fn an_answer_this_client_cannot_read_says_nothing_it_carried() {
+        let archive_id = ArchiveId::new(Uuid::from_bytes([0x11; 16]));
+        let writer = serde_json::json!({
+            "writer_key_id": KeyId::from_bytes([0x22; 32]),
+            "writer_revision": "1",
+            "enrolled_at": "2026-09-25T16:00:00.000Z",
+        });
+        let collection = serde_json::json!({
+            "archive_id": archive_id,
+            "checkpoint_generation": "3",
+            "generations": ["3", "2"],
+            "bytes": "512",
+            "allowance_bytes": "10737418240",
+        });
+
+        held_to_the_rule::<EnrolAnswer>(
+            "what an enrolment answered",
+            &serde_json::json!({
+                "state": "enrolled",
+                "writer": writer,
+                "collection": collection,
+            }),
+        );
+        held_to_the_rule::<PublishAnswer>(
+            "what a publication answered",
+            &serde_json::json!({
+                "state": "published",
+                "generation": {
+                    "backup_generation": BackupGeneration::new(3),
+                    "encrypted_manifest_hash": Digest256::from_bytes([0x5a; 32]),
+                    "descriptor_bytes": "512",
+                    "recipients": 1,
+                    "published_at": "2026-09-25T17:00:00.000Z",
+                },
+                "collection": collection,
+                "dropped": ["1"],
+            }),
+        );
+        held_to_the_rule::<FetchAnswer>(
+            "what a fetch answered",
+            &serde_json::json!({
+                "publication": publication(archive_id),
+                "published_at": "2026-09-25T17:00:00.000Z",
+                "collection": collection,
+                "current_writer": writer,
+            }),
         );
     }
 }

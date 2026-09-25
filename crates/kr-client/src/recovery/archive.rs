@@ -944,4 +944,60 @@ mod tests {
             .expect("room for one more");
         assert_eq!(journal.read().expect("readable").generations.len(), 4_096);
     }
+
+    /// The record of sent objects says nothing of what it holds: the marker, planted in each of
+    /// its leaves and keys in turn and in the bytes no encoder writes, is in no rendering of what
+    /// reading it returns. The neutral control, planted the same way, is refused with the rule its
+    /// bytes broke, as the record's own decoder reports it, and nothing it held.
+    #[test]
+    fn the_record_of_sent_objects_says_nothing_of_what_it_holds() {
+        use crate::shown::marker::{
+            MARKER, NEUTRAL, assert_unmarked, cbor_plantings, debug_renderings, failure_renderings,
+        };
+
+        let records = tempfile::tempdir().expect("a directory on the internal disk");
+        let journal = Journal::of(records.path(), archive());
+        for index in 0..2 {
+            journal
+                .note_leaving(BackupGeneration::new(7), object(7, index))
+                .expect("the record takes the object");
+        }
+        let value = kr_cbor::decode(
+            &std::fs::read(&journal.path).expect("the record"),
+            &RECORD_LIMITS,
+        )
+        .expect("a value");
+
+        let mut refused = 0;
+        for planted in cbor_plantings(&value, MARKER) {
+            std::fs::write(&journal.path, &planted.input).expect("written");
+            match journal.read() {
+                Ok(read) => assert_unmarked(&planted.at, &debug_renderings(&read)),
+                Err(error) => {
+                    refused += 1;
+                    assert_unmarked(&planted.at, &failure_renderings(error));
+                }
+            }
+        }
+        assert!(refused > 0, "the plantings are refused");
+
+        for planted in cbor_plantings(&value, NEUTRAL) {
+            std::fs::write(&journal.path, &planted.input).expect("written");
+            let broken =
+                kr_cbor::from_canonical_slice::<Sent>(&planted.input, &RECORD_LIMITS).err();
+            match (journal.read(), broken) {
+                (Err(error), Some(broken)) => assert_eq!(
+                    error.to_string(),
+                    Shown::cbor(&broken).into_string(),
+                    "{}",
+                    planted.at
+                ),
+                (Ok(_), None) => {}
+                (read, _) => panic!(
+                    "{}: the record and its decoder disagree: {read:?}",
+                    planted.at
+                ),
+            }
+        }
+    }
 }
