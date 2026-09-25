@@ -815,7 +815,8 @@ async fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_prec
                     effect: EffectClass::Write,
                     capability: Some(capability("agent.prompt")),
                     needs_draft: false,
-                    operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
+                    operation: Some(kr_protocol::broker::PreparedOperation::UpstreamSubmit),
+                    decision: None,
                 },
                 RegisteredAction {
                     name: ActionName::new("draft.attach").expect("valid"),
@@ -823,7 +824,8 @@ async fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_prec
                     effect: EffectClass::Write,
                     capability: Some(capability("agent.prompt")),
                     needs_draft: true,
-                    operation: kr_protocol::broker::PreparedOperation::UpstreamAttachment,
+                    operation: Some(kr_protocol::broker::PreparedOperation::UpstreamAttachment),
+                    decision: None,
                 },
                 RegisteredAction {
                     name: ActionName::new("conversation.read").expect("valid"),
@@ -831,7 +833,8 @@ async fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_prec
                     effect: EffectClass::Read,
                     capability: None,
                     needs_draft: false,
-                    operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
+                    operation: Some(kr_protocol::broker::PreparedOperation::UpstreamSubmit),
+                    decision: None,
                 },
             ],
         )
@@ -967,7 +970,8 @@ async fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_prec
                 effect: EffectClass::Write,
                 capability: Some(capability("agent.prompt")),
                 needs_draft: false,
-                operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
+                operation: Some(kr_protocol::broker::PreparedOperation::UpstreamSubmit),
+                decision: None,
             }],
         )
         .expect("the actions are registered");
@@ -1232,7 +1236,8 @@ fn kr_req_11_31_a_disabled_provider_refuses_its_own_dispatch_beside_a_working_on
                 effect: EffectClass::Write,
                 capability: Some(capability("agent.prompt")),
                 needs_draft: false,
-                operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
+                operation: Some(kr_protocol::broker::PreparedOperation::UpstreamSubmit),
+                decision: None,
             }],
         )
         .expect("the actions are registered");
@@ -1306,7 +1311,8 @@ fn kr_req_11_28_a_prepared_effect_may_use_only_what_its_invocation_permits() {
                 effect: EffectClass::Write,
                 capability: None,
                 needs_draft: true,
-                operation: kr_protocol::broker::PreparedOperation::UpstreamAttachment,
+                operation: Some(kr_protocol::broker::PreparedOperation::UpstreamAttachment),
+                decision: None,
             }],
         )
         .expect("the actions are registered");
@@ -1509,7 +1515,8 @@ fn kr_req_11_28_an_unvalidated_effect_transmits_on_neither_dispatch_route() {
                 effect: EffectClass::Write,
                 capability: Some(capability("agent.prompt")),
                 needs_draft: false,
-                operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
+                operation: Some(kr_protocol::broker::PreparedOperation::UpstreamSubmit),
+                decision: None,
             }],
         )
         .expect("the actions are registered");
@@ -1589,7 +1596,8 @@ fn kr_req_23_30_a_replaced_declaration_refuses_the_plan_of_the_invocation_it_rep
                 effect: EffectClass::Write,
                 capability: Some(capability("agent.prompt")),
                 needs_draft: false,
-                operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
+                operation: Some(kr_protocol::broker::PreparedOperation::UpstreamSubmit),
+                decision: None,
             }],
         )
         .expect("the actions are registered");
@@ -1616,7 +1624,8 @@ fn kr_req_23_30_a_replaced_declaration_refuses_the_plan_of_the_invocation_it_rep
                 effect: EffectClass::Read,
                 capability: Some(capability("agent.prompt")),
                 needs_draft: false,
-                operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
+                operation: Some(kr_protocol::broker::PreparedOperation::UpstreamSubmit),
+                decision: None,
             }],
         )
         .expect("the package registers its actions");
@@ -1849,7 +1858,8 @@ fn kr_req_11_28_a_plan_is_refused_when_the_invocations_authority_has_moved() {
                 effect: EffectClass::Write,
                 capability: Some(capability("agent.prompt")),
                 needs_draft: false,
-                operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
+                operation: Some(kr_protocol::broker::PreparedOperation::UpstreamSubmit),
+                decision: None,
             }],
         )
         .expect("the actions are registered");
@@ -1998,7 +2008,8 @@ fn a_fence_refuses_a_plan_that_arrives_after_it(recovered: bool) {
                 effect: EffectClass::Write,
                 capability: Some(capability("agent.prompt")),
                 needs_draft: false,
-                operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
+                operation: Some(kr_protocol::broker::PreparedOperation::UpstreamSubmit),
+                decision: None,
             }],
         )
         .expect("the actions are registered");
@@ -2259,7 +2270,8 @@ fn kr_req_23_30_a_draft_that_moved_while_the_plan_was_prepared_transmits_nothing
                 effect: EffectClass::Write,
                 capability: Some(capability("agent.prompt")),
                 needs_draft: true,
-                operation: kr_protocol::broker::PreparedOperation::UpstreamAttachment,
+                operation: Some(kr_protocol::broker::PreparedOperation::UpstreamAttachment),
+                decision: None,
             }],
         )
         .expect("the action is registered");
@@ -2318,7 +2330,8 @@ fn kr_req_11_28_arguments_that_name_a_member_twice_are_refused_before_the_marker
                 effect: EffectClass::Write,
                 capability: Some(capability("agent.prompt")),
                 needs_draft: false,
-                operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
+                operation: Some(kr_protocol::broker::PreparedOperation::UpstreamSubmit),
+                decision: None,
             }],
         )
         .expect("the action is registered");
@@ -2479,7 +2492,8 @@ fn attachment_action(capability: Option<CapabilityId>) -> RegisteredAction {
         effect: EffectClass::Write,
         capability,
         needs_draft: true,
-        operation: kr_protocol::broker::PreparedOperation::UpstreamAttachment,
+        operation: Some(kr_protocol::broker::PreparedOperation::UpstreamAttachment),
+        decision: None,
     }
 }
 

@@ -23,12 +23,15 @@
 
 use std::collections::BTreeMap;
 
+use kr_plugin_sdk::connector::{
+    AnswerError, ConnectorManifest, FieldPath, FieldSegment, MethodClass, RouteDirection,
+};
 use kr_protocol::broker::ActionProvenance;
 #[cfg(test)]
 use kr_protocol::gateway::RichOperation;
 use kr_protocol::gateway::{
-    DeclarativeTable, DownstreamRequestId, NativeClassification, ReverseExecutionSite,
-    ReverseOperation, RichMethodEntry, RichMethodTable,
+    DeclarativeTable, DownstreamRequestId, NativeClassification, NativeMethodClass,
+    ReverseExecutionSite, ReverseOperation, RichMethodEntry, RichMethodTable,
 };
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{
@@ -175,6 +178,31 @@ impl PreparedResponse {
     }
 }
 
+/// One native bridge channel: a launched application's own notifications, read with the
+/// connector table its installed package ships.
+///
+/// The core declarative table reads top-level members, and a channel's frames carry what their
+/// table reads inside `params`, so a channel is a connection of its own kind. It observes its
+/// instance, joins a gap's continuous set and is closed like any other connection; what reads a
+/// declarative table's shape (a response's correlation, a reverse request, a rich admission, a
+/// native client's own request) does not know it, and refuses it as an unknown connection.
+#[derive(Clone, Debug)]
+pub struct ChannelConnection {
+    /// The connection, which namespaces every downstream identifier it produces.
+    pub connection: GatewayConnectionId,
+    /// The instance it speaks for.
+    pub application_instance_id: ApplicationInstanceId,
+    /// The channel's own process, as the kernel named it.
+    pub process: ProcessStartIdentity,
+    /// The connector package whose table reads it.
+    pub plugin_id: kr_protocol::ids::PluginId,
+    /// That table, from the installed package, qualified against the running version.
+    pub table: std::sync::Arc<ConnectorManifest>,
+    /// The decisions a request this channel relays is offered when the table gives it meaning,
+    /// in the table's order and labelled as the package's answer action labels them.
+    pub offered: Vec<kr_protocol::broker::OfferedDecision>,
+}
+
 /// One reverse request the upstream asked this host to perform.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReverseRequest {
@@ -189,9 +217,14 @@ pub struct ReverseRequest {
 }
 
 /// The gateway's connections and the tables they are interpreted with.
+///
+/// The two kinds are kept apart. What every connection has (an instance it observes, a place in a
+/// gap's continuous set, a provenance) is answered for both; what reads a table is answered by the
+/// kind's own table.
 #[derive(Debug, Default)]
 pub struct Gateway {
     connections: BTreeMap<GatewayConnectionId, Connection>,
+    channels: BTreeMap<GatewayConnectionId, ChannelConnection>,
 }
 
 impl Gateway {
@@ -275,15 +308,68 @@ impl Gateway {
         Ok(())
     }
 
-    /// Closes one connection.
+    /// Closes one connection that reads a declarative table.
+    ///
+    /// A channel is not closed here: it ends through the broker's own close for it, which settles
+    /// what it relayed.
     pub fn close(&mut self, connection: GatewayConnectionId) -> Option<Connection> {
         self.connections.remove(&connection)
     }
 
-    /// Returns one connection.
+    /// Returns one connection that reads a declarative table.
     #[must_use]
     pub fn connection(&self, connection: GatewayConnectionId) -> Option<&Connection> {
         self.connections.get(&connection)
+    }
+
+    /// Opens one native bridge channel.
+    ///
+    /// The caller has established that the channel is the launched application's own and that
+    /// its table is qualified against the version running; this only keeps it.
+    pub fn open_channel(&mut self, channel: ChannelConnection) {
+        self.channels.insert(channel.connection, channel);
+    }
+
+    /// Closes one native bridge channel and returns it.
+    pub fn close_channel(&mut self, connection: GatewayConnectionId) -> Option<ChannelConnection> {
+        self.channels.remove(&connection)
+    }
+
+    /// Returns one native bridge channel.
+    #[must_use]
+    pub fn channel(&self, connection: GatewayConnectionId) -> Option<&ChannelConnection> {
+        self.channels.get(&connection)
+    }
+
+    /// Returns the channel open for one instance, where one is.
+    #[must_use]
+    pub fn channel_of(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+    ) -> Option<GatewayConnectionId> {
+        self.channels
+            .values()
+            .find(|channel| channel.application_instance_id == application_instance_id)
+            .map(|channel| channel.connection)
+    }
+
+    /// Returns the instance one connection of either kind speaks for.
+    #[must_use]
+    pub fn instance_of(&self, connection: GatewayConnectionId) -> Option<ApplicationInstanceId> {
+        self.connections
+            .get(&connection)
+            .map(|held| held.application_instance_id)
+            .or_else(|| {
+                self.channels
+                    .get(&connection)
+                    .map(|channel| channel.application_instance_id)
+            })
+    }
+
+    /// Returns true when a connection of either kind is open.
+    #[must_use]
+    pub fn contains(&self, connection: GatewayConnectionId) -> bool {
+        self.connections.contains_key(&connection) || self.channels.contains_key(&connection)
     }
 
     /// Returns how one connection's answers are recorded.
@@ -294,27 +380,38 @@ impl Gateway {
     /// records them as what they are.
     #[must_use]
     pub fn provenance(&self, connection: GatewayConnectionId) -> Option<ActionProvenance> {
-        self.connections
-            .get(&connection)
-            .map(|_| ActionProvenance::UpstreamTypedRpc)
+        self.contains(connection)
+            .then_some(ActionProvenance::UpstreamTypedRpc)
     }
 
-    /// Returns every open connection a worker-launched native terminal made.
+    /// Returns every open connection whose upstream is on the far side of this host's own owner:
+    /// a worker-launched native terminal's, and every native bridge channel.
     pub fn native_connections(&self) -> impl Iterator<Item = GatewayConnectionId> + '_ {
         self.connections
             .values()
             .filter(|connection| connection.origin.may_forward_natively())
             .map(|connection| connection.connection)
+            .chain(self.channels.keys().copied())
     }
 
-    /// Returns every connection to one instance, so a resolution can be fanned out.
+    /// Returns every connection of either kind to one instance, so a resolution can be fanned
+    /// out.
     pub fn observers(
         &self,
         application_instance_id: ApplicationInstanceId,
-    ) -> impl Iterator<Item = &Connection> {
+    ) -> impl Iterator<Item = GatewayConnectionId> + '_ {
         self.connections
             .values()
             .filter(move |connection| connection.application_instance_id == application_instance_id)
+            .map(|connection| connection.connection)
+            .chain(
+                self.channels
+                    .values()
+                    .filter(move |channel| {
+                        channel.application_instance_id == application_instance_id
+                    })
+                    .map(|channel| channel.connection),
+            )
     }
 
     /// Reads the method one native frame names and classifies it with the connection's own table.
@@ -375,6 +472,9 @@ impl Gateway {
         connection: GatewayConnectionId,
         frame: &[u8],
     ) -> Result<Forwarded> {
+        if let Some(channel) = self.channels.get(&connection) {
+            return forward_channel(channel, frame);
+        }
         let (method, classification) = self.classify_native(connection, frame)?;
         let held = self
             .connections
@@ -472,6 +572,9 @@ impl Gateway {
         method: &UpstreamMethod,
         option_id: &str,
     ) -> Result<PreparedResponse> {
+        if let Some(channel) = self.channels.get(&connection) {
+            return prepare_channel_answer(channel, upstream_request_id, method, option_id);
+        }
         let held = self
             .connections
             .get(&connection)
@@ -671,35 +774,248 @@ fn read_identifier(
     body: &serde_json::Map<String, serde_json::Value>,
     field: &str,
 ) -> Option<Result<UpstreamRequestId>> {
-    let member = body.get(field)?;
+    body.get(field).map(|member| identifier_of(member, field))
+}
+
+/// Carries one JSON member as an upstream request identifier, in its JSON form; see
+/// [`read_identifier`].
+fn identifier_of(member: &serde_json::Value, field: &str) -> Result<UpstreamRequestId> {
     let text = match member {
         serde_json::Value::String(value) if value.len() > MAX_OPAQUE_ID_LEN => {
-            return Some(Err(BrokerError::invalid(format!(
+            return Err(BrokerError::invalid(format!(
                 "{field} is {} bytes and an upstream request identifier is at most \
                  {MAX_OPAQUE_ID_LEN}",
                 value.len()
-            ))));
+            )));
         }
         serde_json::Value::String(_) | serde_json::Value::Number(_) => {
-            match serde_json::to_string(member) {
-                Ok(text) => text,
-                Err(error) => {
-                    return Some(Err(BrokerError::invalid(format!(
-                        "{field} is not a request identifier: {error}"
-                    ))));
-                }
-            }
+            serde_json::to_string(member).map_err(|error| {
+                BrokerError::invalid(format!("{field} is not a request identifier: {error}"))
+            })?
         }
         _ => {
-            return Some(Err(BrokerError::invalid(format!(
+            return Err(BrokerError::invalid(format!(
                 "{field} is not a request identifier"
-            ))));
+            )));
         }
     };
-    Some(
-        UpstreamRequestId::new(text)
-            .map_err(|error| BrokerError::invalid(format!("upstream request identifier: {error}"))),
-    )
+    UpstreamRequestId::new(text)
+        .map_err(|error| BrokerError::invalid(format!("upstream request identifier: {error}")))
+}
+
+/// Reads one frame of a native bridge channel with the table its connector package ships.
+///
+/// The table's own paths say where the method and the identifier are, and its routes say where a
+/// method travels. A method the table does not route towards this host is refused, and so is a
+/// frame whose method the table does not name: a channel carries only what the table describes.
+/// The identifier keeps its JSON type, as a declarative connection's does. A request that the
+/// table's decision destination answers expects an answer, so it becomes a pending resource.
+fn forward_channel(channel: &ChannelConnection, frame: &[u8]) -> Result<Forwarded> {
+    let body = read_channel_frame(frame)?;
+    let table = &channel.table;
+    let wire = member_at(&body, &table.method_path)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            BrokerError::invalid("this frame names no method where the connector's table reads one")
+        })?;
+    let route = table.route_for_wire_name(wire).ok_or_else(|| {
+        BrokerError::invalid(format!(
+            "{wire} is not a method the connector's table routes"
+        ))
+    })?;
+    if route.direction == RouteDirection::HostToUpstream {
+        return Err(BrokerError::invalid(format!(
+            "{wire} travels from this host to the application, and never arrives from it"
+        )));
+    }
+    let method = UpstreamMethod::new(wire)
+        .map_err(|error| BrokerError::invalid(format!("upstream method: {error}")))?;
+    let classification = table
+        .methods
+        .iter()
+        .find(|entry| entry.method == route.method)
+        .map_or_else(NativeClassification::presumed_mutation, |entry| {
+            NativeClassification::declared(native_class(entry.class))
+        });
+    let request = member_at(&body, &table.request_id_path)
+        .map(|member| identifier_of(member, "the request identifier"))
+        .transpose()?
+        .map(|upstream| DownstreamRequestId::new(channel.connection, upstream));
+    let expects_response = table
+        .decision_destination
+        .as_ref()
+        .is_some_and(|destination| destination.answers == route.method);
+    Ok(Forwarded {
+        request,
+        method,
+        classification,
+        suspends_rich_mutations: classification.suspends_rich_mutations(),
+        expects_response,
+    })
+}
+
+/// Writes the answer one decision becomes on a channel, from the table's decision destination.
+///
+/// The request is named by what was recorded from it (its method as the wire spells it and its
+/// identifier with its JSON type), and the value is the one the table maps for the decision, so
+/// nothing a caller typed goes in.
+fn prepare_channel_answer(
+    channel: &ChannelConnection,
+    upstream_request_id: &UpstreamRequestId,
+    method: &UpstreamMethod,
+    option_id: &str,
+) -> Result<PreparedResponse> {
+    let identifier: serde_json::Value = serde_json::from_str(upstream_request_id.as_str())
+        .map_err(|error| {
+            BrokerError::invalid(format!(
+                "{upstream_request_id} is not an identifier this host can write back: {error}"
+            ))
+        })?;
+    let decision = kr_plugin_sdk::ids::ParameterName::new(option_id).map_err(|error| {
+        BrokerError::invalid(format!(
+            "{option_id} is not a decision the table can map: {error}"
+        ))
+    })?;
+    let answer = channel
+        .table
+        .answer(method.as_str(), &identifier, &decision)
+        .map_err(|error| match error {
+            AnswerError::UnknownDecision { .. } | AnswerError::RequestId => {
+                BrokerError::invalid(error.to_string())
+            }
+            AnswerError::NoDestination
+            | AnswerError::NotAnswered { .. }
+            | AnswerError::Unwritable { .. } => BrokerError::UnsupportedCapability {
+                detail: error.to_string(),
+            },
+        })?;
+    let frame = serde_json::to_vec(&answer)
+        .map_err(|error| BrokerError::invalid(format!("this answer will not encode: {error}")))?;
+    if frame.len() > MAX_NATIVE_FRAME_BYTES {
+        return Err(BrokerError::invalid(format!(
+            "this answer is {} bytes and a native frame is at most {MAX_NATIVE_FRAME_BYTES}",
+            frame.len()
+        )));
+    }
+    Ok(PreparedResponse {
+        request: DownstreamRequestId::new(channel.connection, upstream_request_id.clone()),
+        upstream_request_id: upstream_request_id.clone(),
+        method: method.clone(),
+        option_id: option_id.to_owned(),
+        frame,
+    })
+}
+
+/// The class a package's table states, as the core names it.
+const fn native_class(class: MethodClass) -> NativeMethodClass {
+    match class {
+        MethodClass::Observation => NativeMethodClass::Observation,
+        MethodClass::Mutation => NativeMethodClass::Mutation,
+        MethodClass::Credential => NativeMethodClass::CredentialOrConfiguration,
+        MethodClass::Unsupported => NativeMethodClass::Unsupported,
+    }
+}
+
+/// Reads one channel frame: bounded, a JSON object, and naming no member twice at any depth,
+/// because a table reads members inside the frame and two readers of a repeated one could
+/// disagree about which it names.
+fn read_channel_frame(bytes: &[u8]) -> Result<serde_json::Value> {
+    if bytes.len() > MAX_NATIVE_FRAME_BYTES {
+        return Err(BrokerError::invalid(format!(
+            "a native frame is at most {MAX_NATIVE_FRAME_BYTES} bytes and this one is {}",
+            bytes.len()
+        )));
+    }
+    let mut deserialiser = serde_json::Deserializer::from_slice(bytes);
+    let _: Unrepeated = serde::Deserialize::deserialize(&mut deserialiser)
+        .map_err(|error| BrokerError::invalid(format!("this frame is not readable: {error}")))?;
+    let value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|error| BrokerError::invalid(format!("this frame is not readable: {error}")))?;
+    if !value.is_object() {
+        return Err(BrokerError::invalid(
+            "a frame this table describes is a JSON object",
+        ));
+    }
+    Ok(value)
+}
+
+/// Follows one table path into a frame.
+fn member_at<'a>(value: &'a serde_json::Value, path: &FieldPath) -> Option<&'a serde_json::Value> {
+    path.segments
+        .iter()
+        .try_fold(value, |current, segment| match segment {
+            FieldSegment::Member { name } => current.as_object()?.get(name),
+            FieldSegment::Index { index } => current.as_array()?.get(usize::try_from(*index).ok()?),
+        })
+}
+
+/// A JSON document that names no member twice in any of its objects.
+struct Unrepeated;
+
+impl<'de> serde::Deserialize<'de> for Unrepeated {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserialiser: D,
+    ) -> std::result::Result<Self, D::Error> {
+        deserialiser.deserialize_any(UnrepeatedVisitor)
+    }
+}
+
+struct UnrepeatedVisitor;
+
+impl<'de> serde::de::Visitor<'de> for UnrepeatedVisitor {
+    type Value = Unrepeated;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> std::result::Result<Unrepeated, E> {
+        Ok(Unrepeated)
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> std::result::Result<Unrepeated, E> {
+        Ok(Unrepeated)
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> std::result::Result<Unrepeated, E> {
+        Ok(Unrepeated)
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> std::result::Result<Unrepeated, E> {
+        Ok(Unrepeated)
+    }
+
+    fn visit_str<E>(self, _value: &str) -> std::result::Result<Unrepeated, E> {
+        Ok(Unrepeated)
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Unrepeated, E> {
+        Ok(Unrepeated)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+        self,
+        mut elements: A,
+    ) -> std::result::Result<Unrepeated, A::Error> {
+        while elements.next_element::<Unrepeated>()?.is_some() {}
+        Ok(Unrepeated)
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(
+        self,
+        mut members: A,
+    ) -> std::result::Result<Unrepeated, A::Error> {
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(name) = members.next_key::<String>()? {
+            if !seen.insert(name) {
+                return Err(serde::de::Error::custom(
+                    "an object names a member twice, and two readers of it could disagree",
+                ));
+            }
+            members.next_value::<Unrepeated>()?;
+        }
+        Ok(Unrepeated)
+    }
 }
 
 /// Reads one frame into its top-level members.
@@ -1285,10 +1601,7 @@ mod tests {
                 "1",
             )
             .expect("a client of another instance connects");
-        let observers: Vec<GatewayConnectionId> = gateway
-            .observers(instance())
-            .map(|connection| connection.connection)
-            .collect();
+        let observers: Vec<GatewayConnectionId> = gateway.observers(instance()).collect();
         assert_eq!(
             observers,
             vec![GatewayConnectionId::new(1), GatewayConnectionId::new(2)],

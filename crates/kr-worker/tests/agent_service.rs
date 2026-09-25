@@ -1866,7 +1866,8 @@ fn register_answer_action(host: &Host) {
                 effect: kr_protocol::authority::EffectClass::Write,
                 capability: Some(capability("agent.prompt")),
                 needs_draft: false,
-                operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
+                operation: Some(kr_protocol::broker::PreparedOperation::UpstreamSubmit),
+                decision: None,
             }],
         )
         .expect("the action is registered");
@@ -2047,5 +2048,268 @@ async fn kr_req_12_18_a_plugin_answer_is_refused_for_the_resource_it_names() {
         upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
         0,
         "nothing was carried to the upstream"
+    );
+}
+
+/// A Claude Code channel served for this suite's instance on the host's own broker: the instance
+/// launched, the connector read from a package laid out as the store extracts it, the package
+/// bound and its actions registered as the installation's binder will, and the channel server's
+/// end of the connection to drive.
+struct ServedChannel {
+    lines: tokio::io::Lines<tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+    writes: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    connector: Arc<kr_worker::broker::connectors::InstalledConnector>,
+    root: std::path::PathBuf,
+    _retire: tokio::sync::oneshot::Sender<()>,
+}
+
+impl ServedChannel {
+    async fn open(host: &Host) -> Self {
+        use kr_worker::broker::bridge::{
+            AdmittedBridge, BridgeProcess, BridgeStream, BridgeSurface,
+        };
+        use kr_worker::broker::connectors::{InstalledConnector, decoding_trust, fixture};
+        let broker = Arc::clone(host.service.broker());
+        let launched = ProcessStartIdentity::new(41, ProcessStartSource::MacosProcBsdInfo, 900);
+        broker
+            .register_instance(
+                instance(),
+                IntegrationMode::NativeBridge,
+                None,
+                Some(ManagedProcess::new(
+                    instance(),
+                    launched.clone(),
+                    TransportHandle {
+                        transport: BrokerTransport::PrivateSocket,
+                        application_instance_id: instance(),
+                        executable_digest: Digest256::from_bytes([3; 32]),
+                        process: launched.clone(),
+                    },
+                    Credential::from_bytes([9; 32]),
+                    false,
+                    TimestampMs::new(1),
+                )),
+            )
+            .expect("the launched instance is registered");
+        let root = std::env::temp_dir().join(format!("kr-channel-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(&root).expect("the store's directory");
+        let source =
+            fixture::claude_code_package(&root, std::path::Path::new("/opt/kalareach/bin/kr-hook"))
+                .expect("the package is written");
+        let connector =
+            Arc::new(InstalledConnector::read(source).expect("the installed package reads"));
+        let package_binding = BrokerBindingId::new(Uuid::from_bytes([0x33; 16]));
+        broker
+            .bind(
+                package_binding,
+                instance(),
+                connector.plugin_id(),
+                PublisherId::new("kalareach").expect("valid"),
+                connector.package_digest(),
+                BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
+                decoding_trust(&connector, TimestampMs::new(1)),
+                TimestampMs::new(1),
+            )
+            .expect("the package is bound");
+        broker
+            .register_actions(
+                package_binding,
+                connector.manifest().actions.iter().filter_map(|declared| {
+                    kr_worker::broker::RegisteredAction::from_declaration(declared).ok()
+                }),
+            )
+            .expect("its actions are registered");
+        let (ours, theirs) = tokio::io::duplex(64 * 1024);
+        let (reader, writer) = tokio::io::split(theirs);
+        let admitted = AdmittedBridge {
+            surface: BridgeSurface::Channel,
+            process: BridgeProcess {
+                identity: ProcessStartIdentity::new(43, ProcessStartSource::MacosProcBsdInfo, 902),
+                starter: Some(launched),
+                started: None,
+            },
+            stream: BridgeStream::new(
+                Box::new(reader),
+                Box::new(writer),
+                Vec::new(),
+                kr_worker::broker::Framing::new(kr_protocol::gateway::NativeFraming::JsonLines),
+            ),
+        };
+        let (retire, retired) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(kr_worker::broker::channels::serve(
+            kr_worker::broker::channels::ChannelLaunch {
+                broker,
+                application_instance_id: instance(),
+                connector: Arc::clone(&connector),
+                version: Some(fixture::QUALIFIED_VERSION.to_owned()),
+                site: host.environment_id,
+                os_user: "person".to_owned(),
+                views: None,
+            },
+            admitted,
+            async move {
+                let _ = retired.await;
+            },
+        ));
+        let (ours_reader, writes) = tokio::io::split(ours);
+        Self {
+            lines: tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(ours_reader)),
+            writes,
+            connector,
+            root,
+            _retire: retire,
+        }
+    }
+
+    /// Relays one tool approval, as the forwarder does, and waits for it to be interpreted.
+    async fn relay(
+        &mut self,
+        host: &Host,
+        request_id: &str,
+    ) -> kr_protocol::ids::PendingResourceId {
+        let frame = serde_json::json!({
+            "method": "notifications/claude/channel/permission_request",
+            "params": {
+                "request_id": request_id,
+                "tool_name": "Bash",
+                "description": "List the files here",
+                "input_preview": "ls -la",
+            },
+        });
+        tokio::io::AsyncWriteExt::write_all(&mut self.writes, format!("{frame}\n").as_bytes())
+            .await
+            .expect("the frame is written");
+        let started = tokio::time::Instant::now();
+        loop {
+            let found = host
+                .service
+                .broker()
+                .pending_resources()
+                .into_iter()
+                .find(|resource| {
+                    resource.request.upstream.as_str() == format!("\"{request_id}\"")
+                        && resource.interpretation_verified
+                });
+            if let Some(resource) = found {
+                return resource.resource_id;
+            }
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "the approval is interpreted"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Reads the next frame this host wrote on the channel.
+    async fn next(&mut self) -> serde_json::Value {
+        let line = tokio::time::timeout(LIVENESS_DEADLINE, self.lines.next_line())
+            .await
+            .expect("the channel is written to in time")
+            .expect("the channel reads")
+            .expect("the channel is open");
+        serde_json::from_str(&line).expect("a frame is JSON")
+    }
+}
+
+impl Drop for ServedChannel {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+/// One `plugin.action.invoke` of the channel package's answer action.
+fn channel_answer(
+    client: &LocalClient,
+    host: &Host,
+    connector: &kr_worker::broker::connectors::InstalledConnector,
+    request_id: u64,
+    resource_id: kr_protocol::ids::PendingResourceId,
+    decision: &str,
+) -> MutationRequest {
+    MutationRequest {
+        request_id: RequestId::new(request_id),
+        method: Method::PluginActionInvoke.into(),
+        method_version: MethodVersion::V1,
+        action_id: ActionId::new(kr_ipc::new_uuid()),
+        grant_id: Nullable::null(),
+        target: ActionTarget {
+            environment_id: host.environment_id,
+            session_id: Nullable::some(host.session_id),
+            session_epoch: Nullable::some(SessionEpoch::V1),
+            application_instance_id: Nullable::some(instance()),
+            agent_binding_revision: Nullable::some(AgentBindingRevision::new(1)),
+        },
+        expected: ParamsValue::empty(),
+        action_window_id: client.action_window().action_window_id.clone(),
+        requested_ttl_ms: DurationMs::new(60_000),
+        params: ParamsValue::from_typed(&kr_protocol::agent::PluginActionInvokeParams {
+            target: AgentMutationTarget {
+                subject: subject(host.session_id, instance()),
+                binding_revision: AgentBindingRevision::new(1),
+            },
+            plugin_id: connector.plugin_id(),
+            action: kr_protocol::broker::ActionName::new("approval.answer").expect("valid"),
+            draft_id: Nullable::null(),
+            resource_id: Nullable::some(resource_id),
+            parameters: kr_protocol::scalars::Bytes::from(
+                serde_json::to_vec(&serde_json::json!({ "decision": decision })).expect("encodes"),
+            ),
+        })
+        .expect("encodes"),
+    }
+}
+
+/// KR-REQ-12.18 and KR-REQ-11.34: with the Claude Code package bound as the installation's binder
+/// will bind it, `plugin.action.invoke` of its answer action writes the application's own verdict
+/// on the channel, once, from the table's decision destination with no component involved, and
+/// returns the action's own result with a receipt that says it was applied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_18_a_plugin_answer_goes_out_on_the_channel_and_reports_the_action() {
+    let host = host().await;
+    let mut channel = ServedChannel::open(&host).await;
+    let resource_id = channel.relay(&host, "abcde").await;
+    let mut client = cli(&host).await;
+
+    let mutation = channel_answer(&client, &host, &channel.connector, 60, resource_id, "allow");
+    let action_id = mutation.action_id;
+    let outcome = send(&mut client, mutation).await;
+    let Outcome::Ok(result) = outcome else {
+        panic!("the answer is carried: {outcome:?}");
+    };
+    let result: kr_protocol::agent::PluginActionInvokeResult =
+        result.to_typed().expect("the action's own result");
+    assert_eq!(result.action.as_str(), "approval.answer");
+    assert_eq!(
+        result.mutation.provenance,
+        kr_protocol::broker::ActionProvenance::UpstreamTypedRpc
+    );
+    assert_eq!(
+        channel.next().await,
+        serde_json::json!({
+            "method": "notifications/claude/channel/permission",
+            "params": { "request_id": "abcde", "behavior": "allow" }
+        })
+    );
+    assert_eq!(
+        receipt(&mut client, action_id).await.state,
+        ReceiptState::Applied
+    );
+    assert_eq!(
+        host.service
+            .broker()
+            .pending(resource_id)
+            .expect("held")
+            .state,
+        kr_protocol::gateway::PendingState::Resolved
+    );
+
+    // Once: the resource has its answer, and a second one is refused before its marker.
+    let again = channel_answer(&client, &host, &channel.connector, 61, resource_id, "deny");
+    let again_id = again.action_id;
+    assert!(matches!(send(&mut client, again).await, Outcome::Error(_)));
+    assert_eq!(
+        receipt(&mut client, again_id).await.state,
+        ReceiptState::Rejected
     );
 }

@@ -283,11 +283,14 @@ impl WorkerService {
         &self,
         config: crate::broker::commands::CommandBackendsConfig,
     ) -> Arc<crate::broker::commands::CommandBackends> {
-        let backends = Arc::new(crate::broker::commands::CommandBackends::new(
-            Arc::clone(&self.broker),
-            config,
-            tokio::runtime::Handle::current(),
-        ));
+        let backends = Arc::new(
+            crate::broker::commands::CommandBackends::new(
+                Arc::clone(&self.broker),
+                config,
+                tokio::runtime::Handle::current(),
+            )
+            .with_views(Arc::downgrade(&self.runtime)),
+        );
         self.runtime
             .session()
             .set_command_backends(Arc::clone(&backends));
@@ -4120,6 +4123,28 @@ impl WorkerService {
                     &params.plugin_id,
                     params.target.subject.application_instance_id,
                 )?;
+                // An action that answers a pending request through the connector table's decision
+                // destination is admitted as that answer: the transaction an approval answer
+                // makes, with the action's own checks inside it, and no component involved.
+                let answers = self
+                    .broker
+                    .registered_action(binding_id, &params.action)?
+                    .is_some_and(|registered| registered.decision.is_some());
+                if answers {
+                    self.wait_before_admission();
+                    let admitted = self.broker.admit_plugin_answer(
+                        &Self::broker_caller(caller),
+                        binding_id,
+                        &params,
+                        kr_ipc::now_ms(),
+                    )?;
+                    return Ok(Some(self.handoff(
+                        admitted,
+                        UpstreamKind::PluginAnswer {
+                            action: params.action,
+                        },
+                    )));
+                }
                 self.broker.check_invocable(
                     &Self::broker_caller(caller),
                     binding_id,
@@ -5253,10 +5278,17 @@ impl WorkerService {
                 ))
             }
             Method::PluginActionInvoke => {
+                // An answer through the connector table's decision destination was admitted
+                // before the marker, and its admission leaves this boundary as an approval
+                // answer's does. Every other action was refused before the marker, so only a
+                // component's prepared effect, which does not reach this broker, meets the refusal.
+                if let Some(handoff) = prepared {
+                    return Ok((
+                        ParamsValue::empty(),
+                        AfterEffect::Upstream(Box::new(handoff)),
+                    ));
+                }
                 let params: kr_protocol::agent::PluginActionInvokeParams = parse(params)?;
-                // The refusal above is decided before the marker, so nothing reaches this arm.
-                // It stays as the one place that would carry the invocation once the component's
-                // prepared effect reaches this broker.
                 Err(crate::broker::BrokerError::UnsupportedCapability {
                     detail: format!(
                         "{} has no prepared effect this broker validated",
@@ -6426,13 +6458,19 @@ pub struct PendingUpstream {
 /// hope: an upstream that has not answered by now leaves the outcome unknown, which is what it is.
 pub const UPSTREAM_SUBMIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Which of the broker's three recordings one admitted operation ends in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Which of the broker's recordings one admitted operation ends in.
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum UpstreamKind {
     /// A prompt, a steer or a cancellation.
     Mutation,
     /// An approval answer, which also resolves its pending resource.
     Approval,
+    /// A package's action that answers a pending request through the connector table's decision
+    /// destination: carried as an approval answer, and reported as the action that ran.
+    PluginAnswer {
+        /// The action.
+        action: kr_protocol::broker::ActionName,
+    },
 }
 
 /// One admitted operation, waiting for the session boundary to end before it is transmitted.
@@ -6469,6 +6507,14 @@ impl UpstreamHandoff {
             UpstreamKind::Approval => {
                 let flight = self.broker.record_approval(&self.admitted, now)?;
                 encode(&flight.settled(now).await?)
+            }
+            UpstreamKind::PluginAnswer { action } => {
+                let flight = self.broker.record_approval(&self.admitted, now)?;
+                let answered = flight.settled(now).await?;
+                encode(&kr_protocol::agent::PluginActionInvokeResult {
+                    mutation: answered.mutation,
+                    action,
+                })
             }
         }
     }

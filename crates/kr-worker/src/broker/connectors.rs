@@ -31,10 +31,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use kr_plugin_sdk::capability::PluginCapability;
-use kr_plugin_sdk::connector::ConnectorManifest;
+use kr_plugin_sdk::connector::{ConnectorManifest, RouteDirection};
+use kr_plugin_sdk::effect::{ActionImplementation, ParameterKind};
 use kr_plugin_sdk::plugin::PluginManifest;
-use kr_protocol::ids::PluginId;
-use kr_protocol::scalars::Digest256;
+use kr_protocol::broker::{DecodingTrust, OfferedDecision};
+use kr_protocol::ids::{PluginId, PublisherId, UpstreamMethod};
+use kr_protocol::scalars::{CanonicalSet, Digest256, TimestampMs, U64};
 
 use crate::broker::bridge::{BridgeSurface, InstalledBridge};
 
@@ -283,6 +285,93 @@ impl InstalledConnector {
             .iter()
             .any(|rule| rule.executable.matches_path(path))
     }
+
+    /// Returns the decisions a declarative interpretation offers: the ones the table's decision
+    /// destination maps, in the table's order, each labelled as the package's answer action labels
+    /// that choice, or with its own name where the action names none.
+    #[must_use]
+    pub fn offered_decisions(&self) -> Vec<OfferedDecision> {
+        let Some(destination) = self.table.decision_destination.as_ref() else {
+            return Vec::new();
+        };
+        let choices =
+            self.manifest
+                .actions
+                .iter()
+                .find_map(|action| match &action.implementation {
+                    ActionImplementation::DecisionDestination { decision } => action
+                        .parameters
+                        .parameters
+                        .iter()
+                        .find(|parameter| &parameter.name == decision)
+                        .and_then(|parameter| match &parameter.kind {
+                            ParameterKind::Choice { choices } => Some(choices),
+                            _ => None,
+                        }),
+                    _ => None,
+                });
+        destination
+            .decisions
+            .iter()
+            .map(|mapped| {
+                let label = choices
+                    .and_then(|choices| {
+                        choices
+                            .iter()
+                            .find(|choice| choice.id == mapped.decision)
+                            .map(|choice| choice.label.to_string())
+                    })
+                    .unwrap_or_else(|| mapped.decision.to_string());
+                OfferedDecision {
+                    option_id: mapped.decision.to_string(),
+                    label,
+                }
+            })
+            .collect()
+    }
+}
+
+/// The projection schema a request read from a connector's own decision destination is written
+/// against.
+pub const DECISION_SCHEMA: &str = "kalareach.decision/1";
+
+/// Returns the decoding trust an installation's grants give its connector's package, where they
+/// give any.
+///
+/// The trust is derived from what the installation was granted and never from what the package
+/// declares: none unless `approval.decode` is granted; the methods are the wire names of the
+/// routes that carry what the decision destination answers; the one schema is
+/// [`DECISION_SCHEMA`]; at most as many decisions as the destination maps; and it may encode an
+/// answer exactly when `approval.respond` is granted.
+#[must_use]
+pub fn decoding_trust(connector: &InstalledConnector, now: TimestampMs) -> Option<DecodingTrust> {
+    if !connector.granted(PluginCapability::ApprovalDecode) {
+        return None;
+    }
+    let table = connector.table();
+    let destination = table.decision_destination.as_ref()?;
+    let methods: CanonicalSet<UpstreamMethod> = table
+        .routes
+        .iter()
+        .filter(|route| {
+            route.method == destination.answers && route.direction != RouteDirection::HostToUpstream
+        })
+        .filter_map(|route| UpstreamMethod::new(route.wire_name.clone()).ok())
+        .collect();
+    if methods.is_empty() {
+        return None;
+    }
+    let publisher_id = PublisherId::new(connector.manifest().publisher_id.as_str()).ok()?;
+    Some(DecodingTrust {
+        plugin_id: connector.plugin_id(),
+        publisher_id,
+        package_digest: connector.package_digest(),
+        methods,
+        schema_versions: std::iter::once(DECISION_SCHEMA.to_owned()).collect(),
+        max_decisions: U64::new(u64::try_from(destination.decisions.len()).unwrap_or(u64::MAX)),
+        may_encode_response: connector.granted(PluginCapability::ApprovalRespond),
+        granted_at: now,
+    })
 }
 
 /// The connectors this worker may launch and serve, by the command each integration resolves.

@@ -38,7 +38,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use kr_protocol::broker::{AuthenticationState, BinaryIdentity, IntegrationMode, LaunchProfile};
 use kr_protocol::identity::ProcessStartIdentity;
@@ -196,6 +196,10 @@ struct Backend {
     /// Set when the backend is retired, so a reading of the executable in progress stops.
     stopped: Arc<AtomicBool>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// The operating-system user the session runs as.
+    os_user: String,
+    /// The session whose attached views a channel's transitions are delivered to, where one is.
+    views: Option<(SessionId, Weak<crate::runtime::SessionRuntime>)>,
     #[cfg(feature = "testing")]
     confirm_pause: Arc<Mutex<Option<ConfirmPause>>>,
 }
@@ -249,6 +253,10 @@ pub struct CommandBackends {
     publishes_credential_file: bool,
     backends: Mutex<Vec<Arc<Backend>>>,
     hashed: Arc<HashedFiles>,
+    /// The session whose attached views a channel's transitions are delivered to, where one is.
+    ///
+    /// Held weakly: the session holds these backends, so a strong hold would keep both alive.
+    views: Option<Weak<crate::runtime::SessionRuntime>>,
     /// Where the next committed launch stops before the launcher is told, for this host's own tests.
     #[cfg(feature = "testing")]
     confirm_pause: Arc<Mutex<Option<ConfirmPause>>>,
@@ -309,9 +317,18 @@ impl CommandBackends {
             publishes_credential_file: ManagedProcess::publishes_credential_file(),
             backends: Mutex::new(Vec::new()),
             hashed: Arc::new(HashedFiles::default()),
+            views: None,
             #[cfg(feature = "testing")]
             confirm_pause: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Delivers the transitions of every channel these backends serve to the session's attached
+    /// views.
+    #[must_use]
+    pub fn with_views(mut self, runtime: Weak<crate::runtime::SessionRuntime>) -> Self {
+        self.views = Some(runtime);
+        self
     }
 
     /// Stops the next launch that says it is going after it is committed and before the launcher is
@@ -609,6 +626,11 @@ impl CommandBackends {
             image_verified: crate::broker::image::VerifiedFiles::default(),
             stopped: Arc::new(AtomicBool::new(false)),
             tasks: Mutex::new(Vec::new()),
+            os_user: self.os_user.clone(),
+            views: self
+                .views
+                .as_ref()
+                .map(|runtime| (self.session_id, Weak::clone(runtime))),
             #[cfg(feature = "testing")]
             confirm_pause: Arc::clone(&self.confirm_pause),
         });
@@ -812,10 +834,32 @@ async fn admit(
                     let _ = backend.gateway.observe_hook(admitted).await;
                 }
                 BridgeSurface::Channel => {
-                    // The Channels consumer serves an admitted channel; until it is given one, the
-                    // channel is closed and Claude Code shows the server as failed.
-                    let mut stream = admitted.stream;
-                    stream.close().await;
+                    // Served in a task of its own, outside the admission bound, for as long as it
+                    // is open. It is not one of the backend's tasks, which retirement aborts: the
+                    // retirement is what ends it, and it ends through its own close, which settles
+                    // what it relayed.
+                    let version = backend
+                        .identity
+                        .borrow()
+                        .as_ref()
+                        .and_then(|read| read.as_ref().ok())
+                        .and_then(|identity| identity.version.clone());
+                    let launch = crate::broker::channels::ChannelLaunch {
+                        broker,
+                        application_instance_id: backend.application_instance_id,
+                        connector: Arc::clone(&backend.connector),
+                        version,
+                        site: environment_id,
+                        os_user: backend.os_user.clone(),
+                        views: backend.views.clone(),
+                    };
+                    let mut state = backend.lifecycle.state.subscribe();
+                    let retired = async move {
+                        let _ = state
+                            .wait_for(|state| matches!(state, BackendState::Retired))
+                            .await;
+                    };
+                    tokio::spawn(crate::broker::channels::serve(launch, admitted, retired));
                 }
             }
         }

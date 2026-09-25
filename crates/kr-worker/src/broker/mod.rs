@@ -51,6 +51,7 @@ pub mod arbitration;
 pub mod attach;
 pub mod bridge;
 pub mod capability;
+pub mod channels;
 pub mod commands;
 pub mod connectors;
 pub mod duplex;
@@ -669,6 +670,10 @@ pub struct Broker {
     /// Where the next recovery stops before it writes the gap, for this host's own tests.
     #[cfg(feature = "testing")]
     recovery_pause: Mutex<Option<RecoveryPause>>,
+    /// Where the next answer a channel writes stops before it is written, for this host's own
+    /// tests.
+    #[cfg(feature = "testing")]
+    channel_write_pause: Mutex<Option<channels::WritePause>>,
 }
 
 /// The two ends of one armed pause: what says the recovery arrived, and what lets it go on.
@@ -780,6 +785,8 @@ impl Broker {
             recorder: Mutex::new(recorder),
             #[cfg(feature = "testing")]
             recovery_pause: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            channel_write_pause: Mutex::new(None),
         })
     }
 
@@ -1315,6 +1322,45 @@ impl Broker {
             .get_mut(&binding_id)
             .ok_or_else(|| unknown_binding(binding_id))?;
         binding.grants = grants;
+        binding.trust = trust;
+        Ok(())
+    }
+
+    /// Withdraws one binding's right to answer what it decodes, leaving its decoding in place.
+    ///
+    /// The installation's grants narrow when `approval.respond` leaves them: the binding's trust
+    /// no longer encodes a response, the change is written, and every answer path meets the
+    /// recheck at the claim that refuses a decoder which may no longer encode. What it already
+    /// interpreted stays interpreted and visible.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnknownSubject`] when this broker holds no such binding, and
+    /// [`BrokerError::LedgerUnavailable`] when the change cannot be written.
+    pub fn withdraw_answering(&self, binding_id: BrokerBindingId) -> Result<()> {
+        let mut state = self.state();
+        let binding = state
+            .bindings
+            .get(&binding_id)
+            .ok_or_else(|| unknown_binding(binding_id))?;
+        let trust = binding.trust.clone().map(|trust| DecodingTrust {
+            may_encode_response: false,
+            ..trust
+        });
+        let record = BindingRecord {
+            binding_id,
+            application_instance_id: binding.application_instance_id,
+            grants: binding.grants.clone(),
+            trust: trust.clone(),
+            bound_at: TimestampMs::new(0),
+        };
+        state.stored(kr_ipc::now_ms(), "withdrawing an answer right", |ledger| {
+            ledger.put_binding(&record)
+        })?;
+        let binding = state
+            .bindings
+            .get_mut(&binding_id)
+            .ok_or_else(|| unknown_binding(binding_id))?;
         binding.trust = trust;
         Ok(())
     }
@@ -3274,7 +3320,6 @@ impl Broker {
         self.state()
             .gateway
             .observers(application_instance_id)
-            .map(|connection| connection.connection)
             .collect()
     }
 
@@ -3526,9 +3571,7 @@ impl BrokerState {
     fn reconcile_connected_in(&mut self, now: TimestampMs) -> Option<VolatileTransition> {
         let generation = self.volatile.generation();
         for (application_instance_id, connection) in self.volatile.owed() {
-            if !self.continuous.contains(&connection)
-                || self.gateway.connection(connection).is_none()
-            {
+            if !self.continuous.contains(&connection) || !self.gateway.contains(connection) {
                 continue;
             }
             let of_scope = |pending: &&Pending| {
@@ -3791,8 +3834,7 @@ impl BrokerState {
         }
         let application_instance_id = self
             .gateway
-            .connection(connection)
-            .map(|held| held.application_instance_id)
+            .instance_of(connection)
             .ok_or_else(|| BrokerError::unknown(format!("no gateway connection {connection}")))?;
         // The native path keeps working while the journal is faulted. What the gap records is
         // that it did.
@@ -4442,7 +4484,6 @@ impl BrokerState {
         let authorised: Vec<GatewayConnectionId> = self
             .gateway
             .observers(resource.application_instance_id)
-            .map(|connection| connection.connection)
             .collect();
         self.watchers.publish(
             &authorised,
