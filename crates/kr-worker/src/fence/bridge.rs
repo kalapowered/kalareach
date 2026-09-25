@@ -29,6 +29,7 @@ pub struct BridgeServer {
     runtime: Arc<SessionRuntime>,
     endpoint: HostEndpoint,
     expectation: WorkerExpectation,
+    holds: Holds,
 }
 
 impl BridgeServer {
@@ -43,7 +44,21 @@ impl BridgeServer {
             runtime,
             endpoint,
             expectation,
+            holds: Holds::NONE,
         }
+    }
+
+    /// Keeps each published fence from its connection's writer for `hold`, for this host's own
+    /// tests.
+    ///
+    /// A writer that is slow to put a fence on the socket is what a loaded machine produces now and
+    /// then, and this is how a test produces it every time. A build without the `testing` feature
+    /// has neither this method nor the wait it asks for.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub const fn holding_fences(mut self, hold: std::time::Duration) -> Self {
+        self.holds.fence = hold;
+        self
     }
 
     /// Returns the methods this endpoint serves.
@@ -119,7 +134,7 @@ impl BridgeServer {
                     observed,
                 ));
             }
-            let mut writing = tokio::spawn(write_outbound(writer, receiving));
+            let mut writing = tokio::spawn(write_outbound(writer, receiving, self.holds));
             self.pump(&mut reader, &mut writing).await;
             // The connection has ended. The driver stops queueing for it and the session hears that
             // its integration has gone, before the writer is waited on at all: a peer that has
@@ -204,10 +219,42 @@ impl BridgeServer {
     }
 }
 
+/// What this host's own tests keep from a connection's writer.
+///
+/// Empty in a build without the `testing` feature: there is nothing in it to set and nothing that
+/// waits on it.
+#[derive(Clone, Copy, Debug)]
+struct Holds {
+    /// How long each published fence waits before it is written.
+    #[cfg(feature = "testing")]
+    fence: std::time::Duration,
+}
+
+impl Holds {
+    /// Nothing kept.
+    const NONE: Self = Self {
+        #[cfg(feature = "testing")]
+        fence: std::time::Duration::ZERO,
+    };
+
+    /// Waits for as long as a test asked before `publication` is written.
+    #[cfg(feature = "testing")]
+    async fn before(self, publication: &kr_protocol::root::FencePublication) {
+        if matches!(
+            publication,
+            kr_protocol::root::FencePublication::Published(_)
+        ) && !self.fence.is_zero()
+        {
+            tokio::time::sleep(self.fence).await;
+        }
+    }
+}
+
 /// Writes what the driver queues, for as long as the connection lasts.
 async fn write_outbound(
     mut writer: BridgeWriter,
     mut queued: tokio::sync::mpsc::UnboundedReceiver<Outbound>,
+    #[cfg_attr(not(feature = "testing"), expect(unused_variables))] holds: Holds,
 ) {
     while let Some(frame) = queued.recv().await {
         let sent = match frame {
@@ -216,7 +263,11 @@ async fn write_outbound(
                 writer.send_request(id, *request).await
             }
             Outbound::EventResult { id, result } => writer.send_event_result(id, *result).await,
-            Outbound::Publication(publication) => writer.send_publication(publication).await,
+            Outbound::Publication(publication) => {
+                #[cfg(feature = "testing")]
+                holds.before(&publication).await;
+                writer.send_publication(publication).await
+            }
             Outbound::Revocation {
                 transaction,
                 reason,
