@@ -215,7 +215,10 @@ impl Host {
         .expect("an unreadable descriptor");
     }
 
-    /// Runs `kr` on plain pipes, with `extra` set on top of the host environment.
+    /// Runs `kr` on plain pipes, with `extra` set on top of the host environment. It keeps this
+    /// process's console, as a command piped to another at a console does, so a guard that let it
+    /// through could leave it waiting there for someone to type: past the deadline it is stopped
+    /// and the test fails rather than waiting for good.
     fn kr(&self, arguments: &[&str], extra: &[(&str, &str)]) -> std::process::Output {
         let cwd = self.system_drive_root();
         let mut command = std::process::Command::new(kr());
@@ -223,11 +226,81 @@ impl Host {
         for (name, value) in extra {
             command.env(name, value);
         }
-        command
+        let mut child = command
             .current_dir(&cwd)
             .stdin(std::process::Stdio::null())
-            .output()
-            .expect("runs kr")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("runs kr");
+        let stdout = Drained::collect(child.stdout.take().expect("kr's standard output"));
+        let stderr = Drained::collect(child.stderr.take().expect("kr's standard error"));
+        let started = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("kr's state") {
+                break status;
+            }
+            if started.elapsed() >= LIVENESS_DEADLINE {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "kr did not finish within {LIVENESS_DEADLINE:?}; its standard error says: {}",
+                    String::from_utf8_lossy(&stderr.so_far())
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        std::process::Output {
+            status,
+            stdout: stdout.finish(),
+            stderr: stderr.finish(),
+        }
+    }
+}
+
+/// Everything a pipe from `kr` has carried, read on a thread of its own so a full pipe never holds
+/// `kr` up.
+struct Drained {
+    seen: Arc<Mutex<Vec<u8>>>,
+    reader: std::thread::JoinHandle<()>,
+}
+
+impl Drained {
+    fn collect(mut pipe: impl Read + Send + 'static) -> Self {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let collected = Arc::clone(&seen);
+        let reader = std::thread::spawn(move || {
+            let mut buffer = [0_u8; 4096];
+            while let Ok(read) = pipe.read(&mut buffer) {
+                if read == 0 {
+                    break;
+                }
+                if let Ok(mut seen) = collected.lock() {
+                    seen.extend_from_slice(&buffer[..read]);
+                }
+            }
+        });
+        Self { seen, reader }
+    }
+
+    fn so_far(&self) -> Vec<u8> {
+        self.seen
+            .lock()
+            .map(|seen| seen.to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Everything the pipe carried, once it has closed, which it does when `kr` has ended.
+    fn finish(self) -> Vec<u8> {
+        let started = Instant::now();
+        while !self.reader.is_finished() {
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "a pipe from kr stayed open after kr ended"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.so_far()
     }
 }
 
