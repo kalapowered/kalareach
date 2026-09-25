@@ -14,8 +14,9 @@ use std::sync::{Arc, Mutex};
 
 use kr_client::error::ClientError;
 use kr_client::recovery::{
-    BundleStore, FreshRestore, RecoveryError, RetrievalPolicy, SETTINGS_FILENAME, ServiceAccess,
-    SettingsArchive, SettingsCollection, import_settings, parse_kit, render_kit,
+    ArchiveServices, BundleStore, FreshRestore, RecoveryError, RetrievalPolicy, SETTINGS_FILENAME,
+    ServiceAccess, SettingsArchive, SettingsCollection, Unsettled, import_settings, parse_kit,
+    render_kit,
 };
 use kr_client::services::account::{AccountToken, AccountTokenSource};
 use kr_client::services::backup::{BACKUP_MANIFEST_PATH, ManagedBackupManifestService};
@@ -24,11 +25,9 @@ use kr_client::services::storage::{
     STORAGE_UPLOAD_CREATE_PATH, STORAGE_UPLOAD_PART_PATH,
 };
 use kr_client::services::{
-    ArchiveAnswer, BackupManifestService, NewUpload, ObjectDeleted, ObjectRange, PartStored,
-    PartTable, RetentionChange, RetentionSet, ServiceFuture, ServiceSigner, StorageService,
-    StorageStatus, SyncBackupService, SyncExchanged, SyncFetched, SyncPosition, SyncRequestFence,
-    SyncRequestStatus, SyncRevision, UploadAborted, UploadCompleted, UploadCreated, UploadId,
-    UploadPart,
+    BackupManifestService, ServiceFuture, ServiceHttp, ServiceHttpAnswer, ServiceSigner,
+    StorageService, SyncBackupService, SyncExchanged, SyncFetched, SyncPosition, SyncRequestFence,
+    SyncRequestStatus, SyncRevision,
 };
 use kr_client::sync::{
     PrivacyRecord, SettingValue, SyncBody, SyncError, SyncObject, SyncSettings, SyncStore,
@@ -278,6 +277,7 @@ struct Owner {
     store: SyncStore,
     settings: SyncObject,
     bundle_disk: tempfile::TempDir,
+    records: tempfile::TempDir,
     _sync_disk: tempfile::TempDir,
 }
 
@@ -311,6 +311,7 @@ impl Owner {
             store,
             settings,
             bundle_disk: tempfile::tempdir().expect("a directory on the internal disk"),
+            records: tempfile::tempdir().expect("a directory on the internal disk"),
             _sync_disk: sync_disk,
         }
     }
@@ -344,6 +345,7 @@ impl Owner {
                 .recipient()
                 .expect("the recovery recipient")
                 .public(),
+            records: self.records.path().to_path_buf(),
         }
     }
 
@@ -368,23 +370,34 @@ impl Owner {
         archive: &SettingsArchive,
         generation: u64,
     ) -> Result<(), RecoveryError> {
-        self.back_up_through(archive, generation, &storage(&self.web, &self.device))
-            .await
+        self.back_up_through(
+            archive,
+            generation,
+            Arc::clone(&self.web) as Arc<dyn ServiceHttp>,
+            Arc::new(Tokens),
+        )
+        .await
     }
 
+    /// Backs up generation `generation` through `http`, with the account's tokens from `tokens`.
     async fn back_up_through(
         &self,
         archive: &SettingsArchive,
         generation: u64,
-        storage: &dyn StorageService,
+        http: Arc<dyn ServiceHttp>,
+        tokens: Arc<dyn AccountTokenSource>,
     ) -> Result<(), RecoveryError> {
         archive
             .back_up(
                 &self.store,
                 self.settings.object_id,
                 BackupGeneration::new(generation),
-                storage,
-                &manifest(&self.web, &self.device),
+                &ArchiveServices {
+                    origin: origin(),
+                    http,
+                    signer: Arc::clone(&self.device) as Arc<dyn ServiceSigner>,
+                    tokens,
+                },
                 now(),
             )
             .await
@@ -395,6 +408,14 @@ impl Owner {
                 );
                 assert!(!backed_up.published.duplicate);
             })
+    }
+
+    /// Takes the archive up again, as a device that enabled its writer earlier does.
+    async fn resume(&self, collection: SettingsCollection) -> Option<SettingsArchive> {
+        let mut bundles = self.bundle_store();
+        SettingsArchive::resume(collection, &mut bundles, &self.seed)
+            .await
+            .expect("the bundle is read")
     }
 }
 
@@ -417,6 +438,10 @@ async fn the_settings_go_out_as_an_archive_and_come_back_with_only_the_kit() {
         .expect("the settings are backed up");
     assert_eq!(owner.web.generations(&archive_id().to_string()), [1]);
     assert_eq!(owner.web.stored_objects(), 2, "the member and the manifest");
+    assert!(
+        archive.unsettled().expect("the record").is_empty(),
+        "a generation whose publication was answered is struck off"
+    );
 
     // A new device: the kit, read back from its printed form, and the account's access. Nothing
     // of the device that made the archive is held here.
@@ -565,6 +590,159 @@ async fn the_settings_writer_is_enrolled_only_after_the_bundle_naming_it_has_lan
 /* Privacy mode                                                                */
 /* -------------------------------------------------------------------------- */
 
+/// The request after whose answer privacy mode changes, counted from one among its kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum After {
+    Creation(u32),
+    Part(u32),
+    Completion(u32),
+}
+
+/// What privacy mode does then.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Change {
+    /// It is turned on, at the next generation.
+    Fence,
+    /// Its generation moves on, and it stays off.
+    MoveOn,
+}
+
+/// Changes one device's privacy mode, as the person does.
+fn change(store: &SyncStore, change: Change) {
+    let current = store.privacy().expect("the privacy state").generation.get();
+    match change {
+        Change::Fence => {
+            store
+                .record_privacy(PrivacyRecord {
+                    generation: U64::new(current + 1),
+                    fenced: true,
+                })
+                .expect("privacy mode on");
+        }
+        Change::MoveOn => {
+            store
+                .advance_privacy(current + 1)
+                .expect("privacy mode moves on");
+        }
+    }
+}
+
+/// The transport to the service, with privacy mode changed once one request has been answered: a
+/// change that lands while the device is in the middle of a generation.
+struct Meddling {
+    web: Arc<StorageWeb>,
+    store: SyncStore,
+    after: After,
+    change: Change,
+    seen: Mutex<(u32, u32, u32)>,
+}
+
+impl Meddling {
+    fn new(owner: &Owner, after: After, change: Change) -> Arc<Self> {
+        Arc::new(Self {
+            web: Arc::clone(&owner.web),
+            store: SyncStore::open(owner.store.directory()).expect("the same sync store"),
+            after,
+            change,
+            seen: Mutex::new((0, 0, 0)),
+        })
+    }
+
+    /// Counts one answered request and changes privacy mode when it is the one chosen.
+    fn answered(&self, url: &str) {
+        let reached = {
+            let mut seen = self.seen.lock().expect("the count");
+            if url.ends_with(STORAGE_UPLOAD_CREATE_PATH) {
+                seen.0 += 1;
+                After::Creation(seen.0)
+            } else if url.ends_with(STORAGE_UPLOAD_PART_PATH) {
+                seen.1 += 1;
+                After::Part(seen.1)
+            } else if url.ends_with(STORAGE_UPLOAD_COMPLETE_PATH) {
+                seen.2 += 1;
+                After::Completion(seen.2)
+            } else {
+                return;
+            }
+        };
+        if reached == self.after {
+            change(&self.store, self.change);
+        }
+    }
+}
+
+impl std::fmt::Debug for Meddling {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Meddling")
+            .field("after", &self.after)
+            .field("change", &self.change)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ServiceHttp for Meddling {
+    fn post_json<'a>(
+        &'a self,
+        url: &'a str,
+        body: &'a [u8],
+        headers: &'a [(&'a str, &'a str)],
+    ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+        Box::pin(async move {
+            let answer = self.web.post_json(url, body, headers).await;
+            self.answered(url);
+            answer
+        })
+    }
+
+    fn post_bytes<'a>(
+        &'a self,
+        url: &'a str,
+        body: &'a [u8],
+        headers: &'a [(&'a str, &'a str)],
+    ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+        Box::pin(async move {
+            let answer = self.web.post_bytes(url, body, headers).await;
+            self.answered(url);
+            answer
+        })
+    }
+}
+
+/// The account's tokens, with privacy mode turned on while the device waits for one of them: a
+/// fence that lands after a request's privacy was read and before the request leaves.
+struct FencingTokens {
+    web: Arc<StorageWeb>,
+    store: SyncStore,
+    at: usize,
+    asked: Mutex<usize>,
+    arrived_when_fenced: Mutex<Option<usize>>,
+}
+
+impl std::fmt::Debug for FencingTokens {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FencingTokens")
+            .field("at", &self.at)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AccountTokenSource for FencingTokens {
+    fn token<'a>(&'a self, scope: &'a str) -> ServiceFuture<'a, AccountToken> {
+        let asked = {
+            let mut asked = self.asked.lock().expect("the count");
+            *asked += 1;
+            *asked
+        };
+        if asked == self.at {
+            *self.arrived_when_fenced.lock().expect("the mark") = Some(self.web.arrived().len());
+            change(&self.store, Change::Fence);
+        }
+        Tokens.token(scope)
+    }
+}
+
 /// Section 24: while privacy mode is on the settings are not read for an archive, so nothing is
 /// sent.
 #[tokio::test]
@@ -591,176 +769,23 @@ async fn privacy_mode_on_refuses_the_settings_archive_before_anything_is_sent() 
         "{refused:?}"
     );
     assert_eq!(owner.web.arrived().len(), before, "nothing was sent");
+    assert!(archive.unsettled().expect("the record").is_empty());
 }
 
-/// The request of one kind after whose answer privacy mode changes, counted from one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum After {
-    Creation(u32),
-    Part(u32),
-    Completion(u32),
-}
-
-/// What privacy mode does then.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Change {
-    /// It is turned on, at the next generation.
-    Fence,
-    /// Its generation moves on, and it stays off.
-    MoveOn,
-}
-
-/// Managed storage as the device reaches it, with privacy mode changed once one request of the
-/// upload has been answered: a change that lands while the device is in the middle of an upload.
-struct Meddling {
-    storage: ManagedStorageService,
-    store: SyncStore,
-    after: After,
-    change: Change,
-    seen: Mutex<(u32, u32, u32)>,
-}
-
-impl Meddling {
-    fn new(owner: &Owner, after: After, change: Change) -> Self {
-        Self {
-            storage: storage(&owner.web, &owner.device),
-            store: SyncStore::open(owner.store.directory()).expect("the same sync store"),
-            after,
-            change,
-            seen: Mutex::new((0, 0, 0)),
-        }
-    }
-
-    /// Counts one answered request and changes privacy mode when it is the one chosen.
-    fn answered(&self, count: impl FnOnce(&mut (u32, u32, u32)) -> After) {
-        let reached = count(&mut self.seen.lock().expect("the count"));
-        if reached != self.after {
-            return;
-        }
-        let current = self
-            .store
-            .privacy()
-            .expect("the privacy state")
-            .generation
-            .get();
-        match self.change {
-            Change::Fence => {
-                self.store
-                    .record_privacy(PrivacyRecord {
-                        generation: U64::new(current + 1),
-                        fenced: true,
-                    })
-                    .expect("privacy mode on");
-            }
-            Change::MoveOn => {
-                self.store
-                    .advance_privacy(current + 1)
-                    .expect("privacy mode moves on");
-            }
-        }
-    }
-}
-
-impl std::fmt::Debug for Meddling {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("Meddling")
-            .field("after", &self.after)
-            .field("change", &self.change)
-            .finish_non_exhaustive()
-    }
-}
-
-impl StorageService for Meddling {
-    fn status(&self) -> ServiceFuture<'_, StorageStatus> {
-        StorageService::status(&self.storage)
-    }
-
-    fn set_retention<'a>(&'a self, change: &'a RetentionChange) -> ServiceFuture<'a, RetentionSet> {
-        StorageService::set_retention(&self.storage, change)
-    }
-
-    fn create_upload<'a>(
-        &'a self,
-        upload: &'a NewUpload,
-    ) -> ServiceFuture<'a, ArchiveAnswer<UploadCreated>> {
-        Box::pin(async move {
-            let created = StorageService::create_upload(&self.storage, upload).await;
-            self.answered(|seen| {
-                seen.0 += 1;
-                After::Creation(seen.0)
-            });
-            created
-        })
-    }
-
-    fn upload_part<'a>(
-        &'a self,
-        upload_id: &'a UploadId,
-        part: UploadPart<'a>,
-    ) -> ServiceFuture<'a, ArchiveAnswer<PartStored>> {
-        Box::pin(async move {
-            let stored = StorageService::upload_part(&self.storage, upload_id, part).await;
-            self.answered(|seen| {
-                seen.1 += 1;
-                After::Part(seen.1)
-            });
-            stored
-        })
-    }
-
-    fn complete_upload<'a>(
-        &'a self,
-        upload_id: &'a UploadId,
-        table: &'a PartTable,
-    ) -> ServiceFuture<'a, ArchiveAnswer<UploadCompleted>> {
-        Box::pin(async move {
-            let completed = StorageService::complete_upload(&self.storage, upload_id, table).await;
-            self.answered(|seen| {
-                seen.2 += 1;
-                After::Completion(seen.2)
-            });
-            completed
-        })
-    }
-
-    fn abort_upload<'a>(
-        &'a self,
-        upload_id: &'a UploadId,
-    ) -> ServiceFuture<'a, ArchiveAnswer<UploadAborted>> {
-        StorageService::abort_upload(&self.storage, upload_id)
-    }
-
-    fn read_object(
-        &self,
-        archive_id: ArchiveId,
-        object_id: BackupObjectId,
-        offset: u64,
-        length: u64,
-    ) -> ServiceFuture<'_, ObjectRange> {
-        StorageService::read_object(&self.storage, archive_id, object_id, offset, length)
-    }
-
-    fn delete_object(
-        &self,
-        archive_id: ArchiveId,
-        object_id: BackupObjectId,
-    ) -> ServiceFuture<'_, ObjectDeleted> {
-        StorageService::delete_object(&self.storage, archive_id, object_id)
-    }
-}
-
-/// Section 24: a generation read under one privacy generation is not published under another. The
-/// objects already stored stay unpublished, where no restore looks for them.
+/// Section 24: a generation read under one privacy generation is not published under another. What
+/// it had already stored is written down, and a device that starts again finds it listed.
 #[tokio::test]
-async fn a_privacy_generation_that_moved_refuses_the_publication() {
+async fn a_privacy_generation_that_moved_refuses_the_publication_and_what_was_stored_stays_listed()
+{
     let owner = Owner::new();
     let archive = owner
         .enable()
         .await
         .expect("the settings writer is enabled");
     let moving = Meddling::new(&owner, After::Completion(2), Change::MoveOn);
-    let refused = owner.back_up_through(&archive, 1, &moving).await;
+    let refused = owner
+        .back_up_through(&archive, 1, moving, Arc::new(Tokens))
+        .await;
     assert!(
         matches!(
             refused,
@@ -776,10 +801,56 @@ async fn a_privacy_generation_that_moved_refuses_the_publication() {
         "no publication was sent"
     );
     assert_eq!(owner.web.stored_objects(), 2);
+    drop(archive);
+
+    // The device starts again: what the refused generation stored is still listed, by identity.
+    let archive = owner
+        .resume(owner.collection())
+        .await
+        .expect("the archive is taken up again");
+    let [unsettled] = archive
+        .unsettled()
+        .expect("the record")
+        .try_into()
+        .unwrap_or_else(|listed: Vec<Unsettled>| {
+            panic!("one generation is listed, not {listed:?}")
+        });
+    assert_eq!(unsettled.backup_generation, BackupGeneration::new(1));
+    assert_eq!(unsettled.objects.len(), 2);
+    for object in &unsettled.objects {
+        assert!(
+            owner
+                .web
+                .stored(&archive_id().to_string(), &object.to_string())
+                .is_some(),
+            "object {object} is at the service"
+        );
+    }
+
+    // The next generation is published and struck off; the refused one stays until it is dealt
+    // with.
+    owner
+        .back_up(&archive, 2)
+        .await
+        .expect("the next generation");
+    let listed = archive.unsettled().expect("the record");
+    assert_eq!(
+        listed
+            .iter()
+            .map(|unsettled| unsettled.backup_generation)
+            .collect::<Vec<_>>(),
+        [BackupGeneration::new(1)]
+    );
+    assert!(
+        archive
+            .forget_unsettled(BackupGeneration::new(1))
+            .expect("the record")
+    );
+    assert!(archive.unsettled().expect("the record").is_empty());
 }
 
-/// Section 24: privacy mode turned on while an upload is under way stops it before its next
-/// request, whichever request was on its way, and the upload is abandoned at the service.
+/// Section 24: privacy mode turned on while an upload is under way keeps the next request on this
+/// device, whichever request was on its way, and the upload is abandoned at the service.
 #[tokio::test]
 async fn privacy_mode_turned_on_during_an_upload_stops_it_and_abandons_it() {
     for (after, parts) in [(After::Creation(1), 0), (After::Part(1), 1)] {
@@ -789,7 +860,9 @@ async fn privacy_mode_turned_on_during_an_upload_stops_it_and_abandons_it() {
             .await
             .expect("the settings writer is enabled");
         let fencing = Meddling::new(&owner, after, Change::Fence);
-        let refused = owner.back_up_through(&archive, 1, &fencing).await;
+        let refused = owner
+            .back_up_through(&archive, 1, fencing, Arc::new(Tokens))
+            .await;
         assert!(
             matches!(
                 refused,
@@ -822,46 +895,127 @@ async fn privacy_mode_turned_on_during_an_upload_stops_it_and_abandons_it() {
     }
 }
 
+/// Section 24: privacy mode turned on while the device waits for a request's account token keeps
+/// that request on the device: it is read at the moment the request would leave, after its token
+/// is in hand. Only abandonments leave afterwards.
+#[tokio::test]
+async fn privacy_mode_turned_on_while_a_token_is_fetched_keeps_that_request_on_the_device() {
+    // The member's creation, its part and its completion, the manifest's creation, and the
+    // publication: the first, second, third, fourth and seventh tokens asked for.
+    for at in [1, 2, 3, 4, 7] {
+        let owner = Owner::new();
+        let archive = owner
+            .enable()
+            .await
+            .expect("the settings writer is enabled");
+        let tokens = Arc::new(FencingTokens {
+            web: Arc::clone(&owner.web),
+            store: SyncStore::open(owner.store.directory()).expect("the same sync store"),
+            at,
+            asked: Mutex::new(0),
+            arrived_when_fenced: Mutex::new(None),
+        });
+        let refused = owner
+            .back_up_through(
+                &archive,
+                1,
+                Arc::clone(&owner.web) as Arc<dyn ServiceHttp>,
+                Arc::clone(&tokens) as Arc<dyn AccountTokenSource>,
+            )
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(RecoveryError::Sync(SyncError::Fenced { generation: 1 }))
+            ),
+            "token {at}: {refused:?}"
+        );
+        let fenced_at = tokens
+            .arrived_when_fenced
+            .lock()
+            .expect("the mark")
+            .expect("the fence was raised");
+        let after_the_fence: Vec<String> = owner.web.arrived()[fenced_at..]
+            .iter()
+            .map(|arrived| arrived.path.clone())
+            .collect();
+        assert!(
+            after_the_fence
+                .iter()
+                .all(|path| path == STORAGE_UPLOAD_ABORT_PATH),
+            "token {at}: only abandonments left after the fence: {after_the_fence:?}"
+        );
+        assert!(owner.web.generations(&archive_id().to_string()).is_empty());
+    }
+}
+
 /* -------------------------------------------------------------------------- */
 /* Taking the archive up again                                                 */
 /* -------------------------------------------------------------------------- */
 
 /// A device that enabled its writer earlier takes the archive up again only for the collection,
-/// the producer and the writer the authenticated bundle names, since a restore with only the kit
-/// finds and opens nothing else.
+/// the producer and the writer the bundle at the service names, read and authenticated then, since
+/// a restore with only the kit finds and opens nothing else. A bundle this device changed and could
+/// not commit counts for nothing.
 #[tokio::test]
-async fn an_archive_taken_up_again_is_held_to_what_the_bundle_names() {
+async fn an_archive_taken_up_again_is_held_to_what_the_bundle_at_the_service_names() {
     let owner = Owner::new();
     owner
         .enable()
         .await
         .expect("the settings writer is enabled");
-    let mut bundles = owner.bundle_store();
-    let bundle = bundles.fetch(&owner.seed).await.expect("the bundle");
 
-    let resumed = SettingsArchive::resume(owner.collection(), &bundles, &bundle)
-        .expect("the bundle names the collection, the producer and the writer");
+    // A second producer is enabled and its bundle write is lost: the bundle this device changed
+    // names it, and the bundle at the service does not.
+    *owner
+        .bundles
+        .lose_the_next_write
+        .lock()
+        .expect("the script") = true;
+    let mut replaced = owner.collection();
+    replaced.producer = StoredEnvelopeKeyPair::generate().expect("a producer key");
+    let other_producer = replaced.producer.clone();
+    {
+        let mut bundles = owner.bundle_store();
+        let mut bundle = bundles.fetch(&owner.seed).await.expect("the bundle");
+        let refused = SettingsArchive::enable(
+            replaced,
+            &mut bundles,
+            &owner.seed,
+            &mut bundle,
+            &owner.device.0,
+            &manifest(&owner.web, &owner.device),
+            now(),
+        )
+        .await;
+        assert!(refused.is_err(), "{refused:?}");
+    }
+
+    let resumed = owner
+        .resume(owner.collection())
+        .await
+        .expect("the bundle at the service names the collection, the producer and the writer");
     owner
         .back_up(&resumed, 1)
         .await
         .expect("the settings are backed up");
 
+    let mut uncommitted = owner.collection();
+    uncommitted.producer = other_producer;
+    assert!(
+        owner.resume(uncommitted).await.is_none(),
+        "a producer only an uncommitted bundle names"
+    );
     let mut elsewhere = owner.collection();
     elsewhere.archive_id = ArchiveId::new(Uuid::from_bytes([0x6f; 16]));
     assert!(
-        SettingsArchive::resume(elsewhere, &bundles, &bundle).is_none(),
+        owner.resume(elsewhere).await.is_none(),
         "a collection the bundle does not name"
-    );
-    let mut another_producer = owner.collection();
-    another_producer.producer = StoredEnvelopeKeyPair::generate().expect("a producer key");
-    assert!(
-        SettingsArchive::resume(another_producer, &bundles, &bundle).is_none(),
-        "a producer the bundle does not name"
     );
     let mut another_writer = owner.collection();
     another_writer.writer = AuthorisationKeyPair::generate().expect("a writer key");
     assert!(
-        SettingsArchive::resume(another_writer, &bundles, &bundle).is_none(),
+        owner.resume(another_writer).await.is_none(),
         "a writer the bundle does not name"
     );
 }

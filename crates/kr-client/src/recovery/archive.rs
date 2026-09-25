@@ -18,14 +18,20 @@
 //! # Privacy mode
 //!
 //! The export refuses while privacy mode is on, before anything is sent, and names the privacy
-//! generation it read the settings under. The device reads its privacy state again before each
-//! object's upload is created, once it is, before each further part and before the completion, and
-//! before the publication: a fence, or a generation that has moved on, refuses everything not yet
-//! sent, and an upload it stops is abandoned at the service.
+//! generation it read the settings under. After that, every request of the generation leaves
+//! through one transport that reads the device's privacy state at the moment it is handed the
+//! request, which is after the request's account token is in hand and the request is signed. A
+//! fence, or a generation that has moved on, that lands at any moment before then keeps the request
+//! on this device, and every request after it; an upload it stops is abandoned at the service.
 //!
-//! An object already stored when that happens stays at the service, unpublished, where no restore
-//! looks for it. This device keeps no record of it, so showing it among the archives privacy mode
-//! retains, or deleting it, is not built here.
+//! # What this device writes down
+//!
+//! Before an object of a generation leaves, its identity is written down in the collection's
+//! records directory, and a generation whose publication is answered is struck off. What stays
+//! listed, across a restart, is every generation whose objects may be at the service without a
+//! publication this device saw answered: one stopped by privacy mode, one that failed, and one
+//! whose publication was never answered. [`SettingsArchive::unsettled`] lists them, so they can be
+//! shown and removed; nothing here removes them.
 //!
 //! # What leaves this device
 //!
@@ -37,6 +43,9 @@
 //! under new keys, so it is made as the next generation.
 
 use std::fmt;
+use std::io::Write as _;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use kr_crypto::backup::{
     ArchivePlan, ArchiveRecipients, CollectionKind, ObjectSource, SealedArchive, seal_archive,
@@ -45,6 +54,7 @@ use kr_crypto::backup::{
 use kr_crypto::kdf::RecoverySeed;
 use kr_crypto::keys::{AuthorisationKeyPair, StoredEnvelopeKeyPair};
 use kr_crypto::sign::{SigningTranscript, sign};
+use kr_ipc::paths::{NameKind, flush_directory};
 use kr_protocol::archive::{
     BACKUP_PUBLICATION_DOMAIN, BACKUP_WRITER_DOMAIN, BackupGenerationPublication,
     BackupGenerationPublicationPayload, BackupWriterRecord, BackupWriterRecordPayload,
@@ -55,19 +65,27 @@ use kr_protocol::ids::{
     ArchiveId, BackupGeneration, BackupObjectId, BackupWriterRevision, DeviceId, SyncObjectId,
 };
 use kr_protocol::scalars::{Digest256, StoredEnvelopeKey, TimestampMs};
+use kr_protocol::service::GatewayOrigin;
+use serde::{Deserialize, Serialize};
 
 use crate::error::ClientError;
 use crate::recovery::{
     BundleStore, RecoveryError, Result, SETTINGS_FILENAME, WriterEnabled, export_settings,
 };
-use crate::services::storage::collection_deleted;
-use crate::services::{
-    ArchiveAnswer, BackupManifestService, Dispatched, NewUpload, Published, StorageService,
-    UploadProgress, upload_parts,
+use crate::services::account::AccountTokenSource;
+use crate::services::backup::ManagedBackupManifestService;
+use crate::services::storage::{
+    ManagedStorageService, STORAGE_UPLOAD_ABORT_PATH, collection_deleted,
 };
+use crate::services::{
+    ArchiveAnswer, BackupManifestService, Dispatched, NewUpload, Published, ServiceFuture,
+    ServiceHttp, ServiceHttpAnswer, ServiceSigner, StorageService, UploadProgress, upload_parts,
+};
+use crate::shown::{IoFault, Shown};
 use crate::sync::{SyncError, SyncStore};
 
-/// Where one device's settings archive goes, and the keys each generation of it is made with.
+/// Where one device's settings archive goes, the keys each generation of it is made with, and where
+/// this device writes down what each generation sent.
 pub struct SettingsCollection {
     /// The archive the settings go to.
     pub archive_id: ArchiveId,
@@ -83,6 +101,10 @@ pub struct SettingsCollection {
     pub producer: StoredEnvelopeKeyPair,
     /// The recovery recipient's public key, which every generation's manifest key is wrapped for.
     pub recovery: StoredEnvelopeKey,
+    /// The directory this device keeps its recovery state in, which has to exist already. One
+    /// archive's record of what its generations sent is kept there, named after the archive, and
+    /// one device makes an archive's generations from one place at a time.
+    pub records: PathBuf,
 }
 
 impl fmt::Debug for SettingsCollection {
@@ -94,6 +116,33 @@ impl fmt::Debug for SettingsCollection {
             .field("service_origin", &self.service_origin)
             .field("writer_key_id", &self.writer.key_id())
             .field("producer_key_id", &self.producer.key_id())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The managed services one generation goes to: the gateway, the transport, the key the requests
+/// are signed with, and the account whose backup storage the generation spends.
+///
+/// The requests are signed by the writer's own key, since the service takes a publication only
+/// from the writer it enrolled, and they carry the account's token for `backup.write`.
+pub struct ArchiveServices {
+    /// The gateway.
+    pub origin: GatewayOrigin,
+    /// The transport requests leave through.
+    pub http: Arc<dyn ServiceHttp>,
+    /// What signs each request.
+    pub signer: Arc<dyn ServiceSigner>,
+    /// Where the account's token comes from.
+    pub tokens: Arc<dyn AccountTokenSource>,
+}
+
+impl fmt::Debug for ArchiveServices {
+    /// The gateway and the signer's kind. Never a token.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ArchiveServices")
+            .field("origin", &self.origin)
+            .field("signer", &self.signer.signer())
             .finish_non_exhaustive()
     }
 }
@@ -123,6 +172,20 @@ pub struct SettingsBackedUp {
     pub backup_generation: BackupGeneration,
     /// What the backup manifest answered.
     pub published: Published,
+}
+
+/// One generation whose objects may be at the service without a publication this device saw
+/// answered.
+///
+/// Its publication may still have landed: one sent without an answer, or answered after this
+/// device could not write the answer down, is listed too. Ask the backup manifest before removing
+/// anything it names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unsettled {
+    /// The generation.
+    pub backup_generation: BackupGeneration,
+    /// Every object of it that left, or was about to leave, this device.
+    pub objects: Vec<BackupObjectId>,
 }
 
 impl SettingsArchive {
@@ -190,65 +253,68 @@ impl SettingsArchive {
         })
     }
 
-    /// The settings archive of a writer whose bundle has already landed, as a device that enabled
-    /// it earlier takes it up again.
+    /// Takes the settings archive up again, for a device that enabled its writer earlier.
     ///
-    /// `bundle` is the bundle `bundles` last authenticated, as [`BundleStore::fetch`] gave it back.
-    /// The archive is taken up only when that bundle names this collection at its origin, this
-    /// producer's key and this writer's key, as [`Self::enable`] committed them: a writer a restore
-    /// can verify is not enough when the restore could not find the collection or open its wraps.
-    /// Answers none otherwise.
-    #[must_use]
-    pub fn resume(
+    /// The bundle is read from the service and authenticated here, so what decides is what the
+    /// service holds and not a copy a caller kept. The archive is taken up only when that bundle
+    /// names this collection at its origin, this producer's key and this writer's key, as
+    /// [`Self::enable`] committed them: a writer a restore can verify is not enough when the
+    /// restore could not find the collection or open its wraps. Answers none otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`BundleStore::fetch`] returns.
+    pub async fn resume(
         collection: SettingsCollection,
-        bundles: &BundleStore,
-        bundle: &RecoveryBundle,
-    ) -> Option<Self> {
-        let enabled = bundles.writer_enabled(collection.writer.key_id())?;
-        let carried = enabled.bundle_revision() == bundle.revision.get()
-            && bundle.collections.iter().any(|held| {
-                held.archive_id == collection.archive_id
-                    && held.service_origin == collection.service_origin
-            })
-            && bundle.trusted_producers.iter().any(|held| {
-                held.sender_key_id == collection.producer.key_id()
-                    && held.stored_envelope_key == *collection.producer.public()
-            })
-            && bundle.trusted_writers.iter().any(|held| {
-                held.writer_key_id == collection.writer.key_id()
-                    && held.signing_key == *collection.writer.public()
-            });
-        carried.then_some(Self {
-            collection,
-            enabled,
-        })
+        bundles: &mut BundleStore,
+        seed: &RecoverySeed,
+    ) -> Result<Option<Self>> {
+        let bundle = bundles.fetch(seed).await?;
+        let carried = bundle.collections.iter().any(|held| {
+            held.archive_id == collection.archive_id
+                && held.service_origin == collection.service_origin
+        }) && bundle.trusted_producers.iter().any(|held| {
+            held.sender_key_id == collection.producer.key_id()
+                && held.stored_envelope_key == *collection.producer.public()
+        }) && bundle.trusted_writers.iter().any(|held| {
+            held.writer_key_id == collection.writer.key_id()
+                && held.signing_key == *collection.writer.public()
+        });
+        if !carried {
+            return Ok(None);
+        }
+        Ok(bundles
+            .writer_enabled(collection.writer.key_id())
+            .map(|enabled| Self {
+                collection,
+                enabled,
+            }))
     }
 
     /// Backs up this device's settings object as generation `generation`.
     ///
     /// The object is exported under the privacy generation in force, sealed as one member for the
-    /// recovery recipient, uploaded with the encrypted manifest through `storage`, and published
-    /// through `manifest`, which signs as the writer. Both present the account's proof: a
-    /// generation spends the account's backup storage.
+    /// recovery recipient, and uploaded with the encrypted manifest and published through
+    /// `services`, every request of it leaving through the privacy gate the module describes.
     ///
     /// # Errors
     ///
     /// Returns [`Sync`] with [`SyncError::Fenced`] while privacy mode is on, whether that is found
-    /// before anything is sent or before a later object or the publication leaves, and with
+    /// before anything is sent or when a later request is handed over, and with
     /// [`SyncError::LateResult`] once the privacy generation has moved on from the one the settings
     /// were read under. Returns [`Service`] when a service refuses or does not answer, a collection
-    /// deleted from the account console among them, and the export's and the producer's own errors
-    /// otherwise.
+    /// deleted from the account console among them, [`Storage`] when this device cannot write down
+    /// what a generation sent, and the export's and the producer's own errors otherwise.
     ///
     /// [`Sync`]: super::RecoveryError::Sync
     /// [`Service`]: super::RecoveryError::Service
+    /// [`Storage`]: super::RecoveryError::Storage
     pub async fn back_up(
         &self,
         store: &SyncStore,
         object_id: SyncObjectId,
         generation: BackupGeneration,
-        storage: &dyn StorageService,
-        manifest: &dyn BackupManifestService,
+        services: &ArchiveServices,
         now: TimestampMs,
     ) -> Result<SettingsBackedUp> {
         let collection = &self.collection;
@@ -280,6 +346,26 @@ impl SettingsArchive {
         // The plaintext is cleared here: everything after this is ciphertext.
         drop(exported);
 
+        let gate = Arc::new(PrivacyGate::new(
+            Arc::clone(&services.http),
+            store,
+            produced_under,
+        )?);
+        let transport: Arc<dyn ServiceHttp> = gate.clone();
+        let storage = ManagedStorageService::new(
+            services.origin.clone(),
+            Arc::clone(&transport),
+            Arc::clone(&services.signer),
+        )
+        .presenting(Arc::clone(&services.tokens));
+        let manifest = ManagedBackupManifestService::new(
+            services.origin.clone(),
+            transport,
+            Arc::clone(&services.signer),
+        )
+        .presenting(Arc::clone(&services.tokens));
+
+        let sent = self.journal();
         let encrypted_manifest = &sealed.descriptor.encrypted_manifest;
         for leaving in [
             Leaving {
@@ -293,18 +379,24 @@ impl SettingsArchive {
                 hash: encrypted_manifest.encrypted_object_hash,
             },
         ] {
-            still_in_force(store, produced_under)?;
-            self.upload(storage, store, produced_under, generation, leaving)
-                .await?;
+            sent.note_leaving(generation, leaving.object_id)?;
+            self.upload(&storage, &gate, generation, leaving).await?;
         }
 
-        still_in_force(store, produced_under)?;
         let publication = self.publication(&sealed, now)?;
-        match manifest.publish_dispatched(&publication).await? {
-            Dispatched::Answered(ArchiveAnswer::Done(published)) => Ok(SettingsBackedUp {
-                backup_generation: generation,
-                published,
-            }),
+        let manifest: &dyn BackupManifestService = &manifest;
+        let answered = match manifest.publish_dispatched(&publication).await {
+            Ok(answered) => answered,
+            Err(error) => return Err(gate.refusal().unwrap_or_else(|| error.into())),
+        };
+        match answered {
+            Dispatched::Answered(ArchiveAnswer::Done(published)) => {
+                sent.settle(generation)?;
+                Ok(SettingsBackedUp {
+                    backup_generation: generation,
+                    published,
+                })
+            }
             Dispatched::Answered(ArchiveAnswer::CollectionDeleted) => {
                 Err(collection_deleted().into())
             }
@@ -315,17 +407,59 @@ impl SettingsArchive {
         }
     }
 
+    /// Every generation of this archive whose objects may be at the service without a publication
+    /// this device saw answered, as this device wrote them down.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Storage`] when the record cannot be read, and [`Cbor`] when it is not one this
+    /// build reads.
+    ///
+    /// [`Storage`]: super::RecoveryError::Storage
+    /// [`Cbor`]: super::RecoveryError::Cbor
+    pub fn unsettled(&self) -> Result<Vec<Unsettled>> {
+        Ok(self
+            .journal()
+            .read()?
+            .generations
+            .into_iter()
+            .map(|written| Unsettled {
+                backup_generation: written.backup_generation,
+                objects: written.objects,
+            })
+            .collect())
+    }
+
+    /// Strikes one generation off the list, once whatever it left at the service has been dealt
+    /// with. Returns whether it was listed.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::unsettled`], and [`Storage`] when the record cannot be written.
+    ///
+    /// [`Storage`]: super::RecoveryError::Storage
+    pub fn forget_unsettled(&self, generation: BackupGeneration) -> Result<bool> {
+        self.journal().settle(generation)
+    }
+
+    fn journal(&self) -> Journal {
+        Journal {
+            directory: self.collection.records.clone(),
+            path: self.collection.records.join(format!(
+                "settings-archive-{}.sent",
+                self.collection.archive_id
+            )),
+        }
+    }
+
     /// Uploads one object of a generation whole, in the parts its table cuts.
     ///
-    /// Privacy mode can change while a request is on its way, so the device's privacy state is read
-    /// again once the upload exists, before each further part and before the completion. An upload
-    /// that meets a fence, or a generation that has moved on, is abandoned at the service and goes
-    /// no further.
+    /// A request the privacy gate keeps on this device fails, and an upload that is open by then is
+    /// abandoned at the service before the refusal is given back.
     async fn upload(
         &self,
         storage: &dyn StorageService,
-        store: &SyncStore,
-        produced_under: u64,
+        gate: &PrivacyGate,
         generation: BackupGeneration,
         leaving: Leaving<'_>,
     ) -> Result<()> {
@@ -343,55 +477,40 @@ impl SettingsArchive {
             total_bytes: total,
             encrypted_object_hash: hash,
         };
-        let mut progress = match storage.create_upload(&upload).await? {
-            ArchiveAnswer::Done(created) => created.progress(),
-            ArchiveAnswer::CollectionDeleted => return Err(collection_deleted().into()),
-            ArchiveAnswer::UploadGone => {
+        let mut progress = match storage.create_upload(&upload).await {
+            Ok(ArchiveAnswer::Done(created)) => created.progress(),
+            Ok(ArchiveAnswer::CollectionDeleted) => return Err(collection_deleted().into()),
+            Ok(ArchiveAnswer::UploadGone) => {
                 return Err(contrary("a creation as an upload it holds none of").into());
             }
+            Err(error) => return Err(gate.refusal().unwrap_or_else(|| error.into())),
         };
-        if let Err(stopped) = still_in_force(store, produced_under) {
-            return Err(abandon(storage, &progress, stopped).await);
-        }
-        let mut stopped: Option<RecoveryError> = None;
-        let sent = {
-            let mut before_the_next_part = |_: &UploadProgress| -> crate::Result<()> {
-                still_in_force(store, produced_under).map_err(|refusal| {
-                    stopped = Some(refusal);
-                    held_back()
-                })
-            };
-            upload_parts(storage, &mut progress, bytes, &mut before_the_next_part).await
-        };
-        if let Some(stopped) = stopped {
-            return Err(abandon(storage, &progress, stopped).await);
-        }
-        match sent? {
-            ArchiveAnswer::Done(()) => {}
-            ArchiveAnswer::CollectionDeleted => return Err(collection_deleted().into()),
-            ArchiveAnswer::UploadGone => {
+        let mut nothing_kept = |_: &UploadProgress| -> crate::Result<()> { Ok(()) };
+        match upload_parts(storage, &mut progress, bytes, &mut nothing_kept).await {
+            Ok(ArchiveAnswer::Done(())) => {}
+            Ok(ArchiveAnswer::CollectionDeleted) => return Err(collection_deleted().into()),
+            Ok(ArchiveAnswer::UploadGone) => {
                 return Err(contrary("a part as an upload it holds none of").into());
             }
-        }
-        if let Err(stopped) = still_in_force(store, produced_under) {
-            return Err(abandon(storage, &progress, stopped).await);
+            Err(error) => return Err(stopped_or(storage, gate, &progress, error).await),
         }
         match storage
             .complete_upload(&progress.upload_id, &progress.table)
-            .await?
+            .await
         {
-            ArchiveAnswer::Done(completed)
+            Ok(ArchiveAnswer::Done(completed))
                 if completed.object.object_id == object_id
                     && completed.object.encrypted_object_hash == hash
                     && completed.object.encrypted_len == total =>
             {
                 Ok(())
             }
-            ArchiveAnswer::Done(_) => Err(contrary("a completion of another object").into()),
-            ArchiveAnswer::CollectionDeleted => Err(collection_deleted().into()),
-            ArchiveAnswer::UploadGone => {
+            Ok(ArchiveAnswer::Done(_)) => Err(contrary("a completion of another object").into()),
+            Ok(ArchiveAnswer::CollectionDeleted) => Err(collection_deleted().into()),
+            Ok(ArchiveAnswer::UploadGone) => {
                 Err(contrary("a completion as an upload it holds none of").into())
             }
+            Err(error) => Err(stopped_or(storage, gate, &progress, error).await),
         }
     }
 
@@ -425,26 +544,218 @@ struct Leaving<'a> {
     hash: Digest256,
 }
 
-/// Abandons an upload privacy mode stopped, and gives back what stopped it.
+/// What a failed request of an open upload comes to: the privacy refusal, once the upload is
+/// abandoned, when the gate kept the request here; the error itself otherwise.
 ///
 /// The abandonment is asked for once. An upload it does not end was never completed, so it ends
 /// when its lifetime runs out.
-async fn abandon(
+async fn stopped_or(
     storage: &dyn StorageService,
+    gate: &PrivacyGate,
     progress: &UploadProgress,
-    stopped: RecoveryError,
+    error: ClientError,
 ) -> RecoveryError {
-    let _ = storage.abort_upload(&progress.upload_id).await;
-    stopped
+    match gate.refusal() {
+        Some(stopped) => {
+            let _ = storage.abort_upload(&progress.upload_id).await;
+            stopped
+        }
+        None => error.into(),
+    }
 }
 
-/// What stops an upload part-way once privacy mode has stopped it. Nothing reads it: the upload
-/// knows why it stopped.
-fn held_back() -> ClientError {
+/// The transport one generation's requests leave through, which reads this device's privacy state
+/// at the moment it is handed each request.
+///
+/// A request reaches it only once its account token is in hand and it is signed, which is the last
+/// moment before its bytes leave, so a fence or a moved generation that lands before then keeps
+/// the request on this device. Once it has kept one request it keeps every other. Abandoning an
+/// upload is let through: it carries no content, and it is how an upload privacy mode stopped is
+/// ended.
+struct PrivacyGate {
+    http: Arc<dyn ServiceHttp>,
+    store: SyncStore,
+    produced_under: u64,
+    kept: Mutex<Kept>,
+}
+
+/// Whether the gate has kept a request, and why, until the reason is taken.
+#[derive(Default)]
+struct Kept {
+    closed: bool,
+    because: Option<SyncError>,
+}
+
+impl PrivacyGate {
+    fn new(http: Arc<dyn ServiceHttp>, store: &SyncStore, produced_under: u64) -> Result<Self> {
+        Ok(Self {
+            http,
+            store: SyncStore::open(store.directory())?,
+            produced_under,
+            kept: Mutex::new(Kept::default()),
+        })
+    }
+
+    /// Lets one request through to the transport, or keeps it here.
+    fn admit(&self, url: &str) -> crate::Result<()> {
+        if url.ends_with(STORAGE_UPLOAD_ABORT_PATH) {
+            return Ok(());
+        }
+        let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
+        if kept.closed {
+            return Err(kept_here());
+        }
+        if let Err(because) = still_in_force(&self.store, self.produced_under) {
+            kept.closed = true;
+            kept.because = Some(because);
+            return Err(kept_here());
+        }
+        Ok(())
+    }
+
+    /// Why the gate kept a request, the first time it is asked after one was kept.
+    fn refusal(&self) -> Option<RecoveryError> {
+        self.kept
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .because
+            .take()
+            .map(RecoveryError::Sync)
+    }
+}
+
+impl fmt::Debug for PrivacyGate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PrivacyGate")
+            .field("produced_under", &self.produced_under)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ServiceHttp for PrivacyGate {
+    fn post_json<'a>(
+        &'a self,
+        url: &'a str,
+        body: &'a [u8],
+        headers: &'a [(&'a str, &'a str)],
+    ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+        match self.admit(url) {
+            Ok(()) => self.http.post_json(url, body, headers),
+            Err(kept) => Box::pin(async move { Err(kept) }),
+        }
+    }
+
+    fn post_bytes<'a>(
+        &'a self,
+        url: &'a str,
+        body: &'a [u8],
+        headers: &'a [(&'a str, &'a str)],
+    ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+        match self.admit(url) {
+            Ok(()) => self.http.post_bytes(url, body, headers),
+            Err(kept) => Box::pin(async move { Err(kept) }),
+        }
+    }
+}
+
+/// What a request the privacy gate kept fails with. Nothing reads it: the generation takes the
+/// reason from the gate.
+fn kept_here() -> ClientError {
     ClientError::Host(ProtocolError::new(
         ErrorCode::PermissionDenied,
-        "privacy mode stopped the upload before its next part".to_owned(),
+        "privacy mode kept this request on this device".to_owned(),
     ))
+}
+
+/// The record of what one archive's generations sent, in the collection's records directory.
+struct Journal {
+    directory: PathBuf,
+    path: PathBuf,
+}
+
+/// What the record holds.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Sent {
+    /// Every generation not struck off, oldest first.
+    generations: Vec<SentGeneration>,
+}
+
+/// One generation's objects that left, or were about to leave, this device.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SentGeneration {
+    backup_generation: BackupGeneration,
+    objects: Vec<BackupObjectId>,
+}
+
+impl Journal {
+    fn read(&self) -> Result<Sent> {
+        match std::fs::read(&self.path) {
+            Ok(bytes) => Ok(kr_cbor::from_canonical_slice(
+                &bytes,
+                &kr_cbor::Limits::DEFAULT,
+            )?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Sent::default()),
+            Err(source) => Err(RecoveryError::Storage {
+                path: Shown::root(&self.path),
+                fault: IoFault::from(source),
+            }),
+        }
+    }
+
+    /// Writes the record whole, through a partial file renamed into place and flushed, so a stop
+    /// at any point leaves the old record or the new one.
+    fn write(&self, sent: &Sent) -> Result<()> {
+        let bytes = kr_cbor::to_canonical_vec(sent)?;
+        let partial = self.path.with_extension("sent-partial");
+        let written = (|| {
+            let mut file = std::fs::File::create(&partial)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            std::fs::rename(&partial, &self.path)?;
+            flush_directory(&self.directory, NameKind::File)
+        })();
+        written.map_err(|source| {
+            let _ = std::fs::remove_file(&partial);
+            RecoveryError::Storage {
+                path: Shown::root(&self.path),
+                fault: IoFault::from(source),
+            }
+        })
+    }
+
+    /// Writes down that one object of a generation is about to leave, before it does.
+    fn note_leaving(&self, generation: BackupGeneration, object_id: BackupObjectId) -> Result<()> {
+        let mut sent = self.read()?;
+        match sent
+            .generations
+            .iter_mut()
+            .find(|held| held.backup_generation == generation)
+        {
+            Some(held) if held.objects.contains(&object_id) => return Ok(()),
+            Some(held) => held.objects.push(object_id),
+            None => sent.generations.push(SentGeneration {
+                backup_generation: generation,
+                objects: vec![object_id],
+            }),
+        }
+        self.write(&sent)
+    }
+
+    /// Strikes one generation off. Returns whether it was listed.
+    fn settle(&self, generation: BackupGeneration) -> Result<bool> {
+        let mut sent = self.read()?;
+        let before = sent.generations.len();
+        sent.generations
+            .retain(|held| held.backup_generation != generation);
+        if sent.generations.len() == before {
+            return Ok(false);
+        }
+        self.write(&sent)?;
+        Ok(true)
+    }
 }
 
 /// The owner's record enrolling `writer` for the collection.
@@ -471,21 +782,19 @@ fn enrolment(
 
 /// Refuses what is about to leave once privacy mode has fenced production, or has moved past the
 /// generation the settings were read under.
-fn still_in_force(store: &SyncStore, produced_under: u64) -> Result<()> {
+fn still_in_force(store: &SyncStore, produced_under: u64) -> std::result::Result<(), SyncError> {
     let privacy = store.privacy()?;
     let current = privacy.generation.get();
     if privacy.fenced {
         return Err(SyncError::Fenced {
             generation: current,
-        }
-        .into());
+        });
     }
     if current != produced_under {
         return Err(SyncError::LateResult {
             produced_under,
             current,
-        }
-        .into());
+        });
     }
     Ok(())
 }
