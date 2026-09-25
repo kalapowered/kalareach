@@ -1587,6 +1587,47 @@ async fn a_device_waits_inside_the_hosts_request_budget_for_an_owner_who_takes_t
     );
 }
 
+/// KR-REQ-10.36, KR-REQ-10.23: the owner approves just as the device changes to a fresh connection,
+/// which it does when the one it has is near the end of the questions a host answers on it. A host
+/// that has committed the device serves it no unpaired surface any more, so a device that had let
+/// its old connection go first could never learn what it became. This device keeps the old
+/// connection's last question until a fresh connection answers, and learns of the approval there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_approval_given_as_the_device_changes_connection_is_learned() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let invited = issue_direct(environment, &mut client, &owner).await;
+
+    let fresh = Gate::closed();
+    let (link, making) = watching({
+        let fresh = Arc::clone(&fresh);
+        move |link| {
+            link.reconnect_gate = Some(fresh);
+        }
+    });
+    let device = ProductDevice::new(Arc::new(host.room.clone()), making);
+    let (attempt, mut shown) = device.redeem(&direct_text(&invited));
+    awaiting_value(&mut shown).await;
+    // The device dials again once its connection nears the end of its questions, and that dial
+    // waits at the gate.
+    tokio::time::timeout(Duration::from_secs(90), async {
+        while made(&link).dials.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the device changes connection");
+    calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
+        .await
+        .expect("the owner approves while the device changes connection");
+    fresh.open();
+    let paired = outcome(attempt).await.expect("paired");
+    assert_eq!(paired.host_endpoint_id, host.network().endpoint_id());
+}
+
 /// KR-REQ-10.36: a direct invitation whose secret is wrong locks nothing; one redeemed at another
 /// host sends no proof; and a lock answered with another value shows no value.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

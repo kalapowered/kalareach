@@ -750,8 +750,9 @@ impl Pairing {
                 ));
             }
             // Each question stays inside the host's budget for the connection: it waits for the
-            // window to make room, and a connection with no questions left is let go for a fresh
-            // one, which is no loss of contact and is not shown as one.
+            // window to make room. Near the end of a connection's questions the device changes to
+            // a fresh one, which is no loss of contact and is not shown as one; a connection that
+            // has none left is let go.
             if let Some(unpaired) = held.as_mut() {
                 match unpaired.asked.turn(tokio::time::Instant::now(), &limits) {
                     Turn::Now => {}
@@ -766,12 +767,29 @@ impl Pairing {
                     }
                 }
             }
-            let asked = match held.as_mut() {
-                Some(unpaired) => {
-                    unpaired.asked.asked(tokio::time::Instant::now());
-                    within(self.step(&pending), unpaired.preauth.status(&params)).await
+            // The old connection keeps its last question until a fresh one has answered: a host
+            // that commits the device meanwhile serves it no unpaired surface on a new connection,
+            // and the old one is then the only place left to learn what the device became.
+            let changed = if held
+                .as_ref()
+                .is_some_and(|unpaired| unpaired.asked.nearly_spent(&limits))
+            {
+                self.fresh_answer(&pending, &params).await
+            } else {
+                None
+            };
+            let asked = match changed {
+                Some((fresh, answer)) => {
+                    held = Some(fresh);
+                    Ok(answer)
                 }
-                None => Err(LinkError::Lost("no connection".to_owned())),
+                None => match held.as_mut() {
+                    Some(unpaired) => {
+                        unpaired.asked.asked(tokio::time::Instant::now());
+                        within(self.step(&pending), unpaired.preauth.status(&params)).await
+                    }
+                    None => Err(LinkError::Lost("no connection".to_owned())),
+                },
             };
             match asked {
                 Ok(answer) => {
@@ -909,6 +927,21 @@ impl Pairing {
             progress.send_replace(awaiting(pending));
         }
         Ok(())
+    }
+
+    /// A fresh unpaired connection to the host of `pending`, and its answer to the first question
+    /// asked on it; `None` when no connection opens or it does not answer.
+    async fn fresh_answer(
+        &self,
+        pending: &PendingAttempt,
+        params: &PairStatusParams,
+    ) -> Option<(Unpaired, PairStatusResult)> {
+        let mut fresh = self.reconnect(pending).await?;
+        fresh.asked.asked(tokio::time::Instant::now());
+        let answer = within(self.step(pending), fresh.preauth.status(params))
+            .await
+            .ok()?;
+        Some((fresh, answer))
     }
 
     /// Dials the host again, unpaired, and opens its pre-authorisation surface.
@@ -1154,6 +1187,11 @@ impl Asked {
             }
             _ => Turn::Now,
         }
+    }
+
+    /// True when the connection has one question left, or none.
+    fn nearly_spent(&self, limits: &PreAuthLimits) -> bool {
+        self.total + 1 >= limits.max_requests
     }
 
     /// Counts one question, sent at `now`.
@@ -1717,10 +1755,17 @@ mod tests {
         );
         assert_eq!(asked.turn(start + window, &limits), Turn::Now);
 
-        // Every question the host answers on one connection, then none.
+        // Every question the host answers on one connection, then none. The device changes
+        // connection while one is left.
         let mut asked = Asked::after(1, start);
         let mut now = start;
         while asked.total < limits.max_requests {
+            assert_eq!(
+                asked.nearly_spent(&limits),
+                asked.total + 1 == limits.max_requests,
+                "{}",
+                asked.total
+            );
             match asked.turn(now, &limits) {
                 Turn::Now => asked.asked(now),
                 Turn::After(wait) => now += wait,
