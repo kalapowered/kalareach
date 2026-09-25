@@ -1633,7 +1633,22 @@ impl Controller {
                     | crate::grants::Refusal::OfflineValidityLapsed { .. },
             ))
         ) {
+            // A refusal the clock decided is answered only once the floor it stood on is on disk,
+            // as a workflow's is: before that, a clock wound back before the next start would
+            // decide the other way, so the answer states no lapse. An expiry found here still
+            // stops the connection's frames, which records nothing ([`Refusal::ExpiryUnrecorded`]).
+            let floor = policy.utc_floor_ms();
             self.owe_floor(&policy);
+            if self.utc_floor.written() < floor {
+                return Err(crate::config::ceilings::CeilingRefusal::Refused(
+                    match decided {
+                        Err(crate::config::ceilings::CeilingRefusal::Refused(
+                            crate::grants::Refusal::Expired { expired_at_ms },
+                        )) => crate::grants::Refusal::ExpiryUnrecorded { expired_at_ms },
+                        _ => crate::grants::Refusal::FloorUnrecorded,
+                    },
+                ));
+            }
         } else {
             // Before this answer goes out, and whatever it is: a refusal whose record could not be
             // written earlier is written as soon as storage takes it, rather than waiting for the
@@ -1906,7 +1921,10 @@ mod tests {
 
     /// A refusal the clock decided outlives a failed write of its floor: the next decision writes
     /// the floor as soon as storage takes it, permission or not, and a daemon started afterwards
-    /// with its clock wound back still refuses the grant.
+    /// with its clock wound back still refuses the grant. While the floor is not on disk the
+    /// device is not told of an expiry, which a clock wound back before the next start would
+    /// reverse: the answer is that the floor is unrecorded. Once it is on disk, the expiry is
+    /// answered.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_clock_refusal_whose_record_failed_is_written_by_the_next_decision_and_outlives_a_restart()
      {
@@ -1935,8 +1953,15 @@ mod tests {
             .decide_for_device(&expiring, &expiring_record, listing(&temp, expires + 1))
             .expect_err("the grant has run out by this reading");
         assert!(
-            matches!(refused, CeilingRefusal::Refused(Refusal::Expired { .. })),
-            "{refused:?}"
+            matches!(
+                refused,
+                CeilingRefusal::Refused(Refusal::ExpiryUnrecorded { .. })
+            ),
+            "the expiry is not answered while its floor is not on disk: {refused:?}"
+        );
+        assert_eq!(
+            refused.to_protocol_error().code,
+            kr_protocol::error::ErrorCode::StorageUnavailable
         );
         assert!(written_floor(&controller) < expires, "the write failed");
         // The clock is wound back. The floor in memory still refuses, and its write still fails.
@@ -1953,6 +1978,14 @@ mod tests {
         assert!(
             written_floor(&controller) > expires,
             "the floor the refusal stood on is written down"
+        );
+        // The control: with the floor on disk, the expiry is answered.
+        let refused = controller
+            .decide_for_device(&expiring, &expiring_record, listing(&temp, now))
+            .expect_err("the grant stays expired");
+        assert!(
+            matches!(refused, CeilingRefusal::Refused(Refusal::Expired { .. })),
+            "{refused:?}"
         );
 
         // A daemon started afterwards, with the clock still wound back, decides from that floor.
@@ -1997,11 +2030,8 @@ mod tests {
             .decide_for_device(&lasting, &lasting_record, listing(&temp, now + 2 * hour))
             .expect_err("the wall clock steps past the bound");
         assert!(
-            matches!(
-                refused,
-                CeilingRefusal::Refused(Refusal::OfflineValidityLapsed { .. })
-            ),
-            "{refused:?}"
+            matches!(refused, CeilingRefusal::Refused(Refusal::FloorUnrecorded)),
+            "the lapse is not answered while its floor is not on disk: {refused:?}"
         );
         assert!(written_floor(&controller) < now + hour, "the write failed");
 

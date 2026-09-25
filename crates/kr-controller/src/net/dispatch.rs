@@ -2607,7 +2607,10 @@ impl RemoteConnection {
                 // deadline makes, so it goes where that one goes: the latch stops every frame
                 // this connection would write next, its subscription's output among them, and
                 // the record keeps the device from coming back on another connection.
-                expired @ CeilingRefusal::Refused(crate::grants::Refusal::Expired { .. }) => {
+                expired @ CeilingRefusal::Refused(
+                    crate::grants::Refusal::Expired { .. }
+                    | crate::grants::Refusal::ExpiryUnrecorded { .. },
+                ) => {
                     self.authority.expire();
                     expired.to_protocol_error()
                 }

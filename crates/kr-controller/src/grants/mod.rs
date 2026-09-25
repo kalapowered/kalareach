@@ -165,6 +165,16 @@ pub enum Refusal {
     /// record, so it is not taken until the floor is written down
     /// ([`policy::UtcFloor::bound`]).
     FloorUnrecorded,
+    /// The grant's expiry has passed at a reading this host has not written down yet.
+    ///
+    /// It is answered as [`Self::FloorUnrecorded`] is: a clock wound back before the next start
+    /// would decide the other way, so the answer states no expiry until the floor is on disk. It
+    /// is its own variant because a paired device's connection stops its frames for it all the
+    /// same, as it does for an expiry, which records nothing.
+    ExpiryUnrecorded {
+        /// When it expired, in UTC milliseconds.
+        expired_at_ms: u64,
+    },
 }
 
 impl Refusal {
@@ -216,21 +226,21 @@ impl Refusal {
                  not been reached inside it"
                     .to_owned()
             }
-            Self::FloorUnrecorded => FLOOR_UNRECORDED.to_owned(),
+            Self::FloorUnrecorded | Self::ExpiryUnrecorded { .. } => FLOOR_UNRECORDED.to_owned(),
         }
     }
 
     /// The protocol error a refusal becomes.
     ///
-    /// Every one but [`Self::FloorUnrecorded`] is `PERMISSION_DENIED`. A caller learns that its
-    /// authority does not reach the request; which of this host's grants exist, and which
-    /// revisions it has seen, is not a question a refused caller gets answered. The exception says
-    /// nothing about the caller's authority: it is this host's store, and it passes when the store
-    /// takes the write.
+    /// Every one but [`Self::FloorUnrecorded`] and [`Self::ExpiryUnrecorded`] is
+    /// `PERMISSION_DENIED`. A caller learns that its authority does not reach the request; which
+    /// of this host's grants exist, and which revisions it has seen, is not a question a refused
+    /// caller gets answered. The exceptions say nothing about the caller's authority: they are this
+    /// host's store, and they pass when the store takes the write.
     #[must_use]
     pub fn to_protocol_error(&self) -> ProtocolError {
         let code = match self {
-            Self::FloorUnrecorded => ErrorCode::StorageUnavailable,
+            Self::FloorUnrecorded | Self::ExpiryUnrecorded { .. } => ErrorCode::StorageUnavailable,
             _ => ErrorCode::PermissionDenied,
         };
         ProtocolError::new(code, self.detail())
