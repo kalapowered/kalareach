@@ -699,10 +699,79 @@ mod windows {
         PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES,
         TOKEN_INFORMATION_CLASS, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenOwner, TokenUser,
     };
-    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateDirectoryW, FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
+    };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     use crate::error::{IpcError, Result};
+
+    /// The path separator, as one wide code unit.
+    const SEPARATOR: u16 = b'\\' as u16;
+
+    /// Whether `child` is a name directly inside `directory`, judged from the two open handles
+    /// rather than from the paths they were opened by.
+    ///
+    /// Each handle's final path is the one the operating system resolves it to now, with every
+    /// reparse point on the way already followed and the drive named in full. A name directly
+    /// inside the directory has the directory's own final path, then one separator, then a name with
+    /// no separator of its own. A file reached through a link the caller did not expect, or one in a
+    /// directory swapped for another since it was opened, resolves somewhere the directory's final
+    /// path does not begin, and is not a child. The handles are open, so each names one object for
+    /// as long as this holds it, whatever happens to the names on the way to them.
+    ///
+    /// A reparse point opened without following it is its own final path, so it looks like a child
+    /// of the directory it sits in: the caller refuses one by its attributes, not by this.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating system's error when either handle's final path cannot be read.
+    pub fn directory_contains(
+        directory: BorrowedHandle<'_>,
+        child: BorrowedHandle<'_>,
+    ) -> std::io::Result<bool> {
+        let directory = final_path(directory)?;
+        let child = final_path(child)?;
+        let Some(rest) = child.strip_prefix(directory.as_slice()) else {
+            return Ok(false);
+        };
+        // The directory's final path may or may not already end in a separator: a drive root does,
+        // an ordinary directory does not. Either way exactly one separator stands between it and the
+        // child's name, and the name that follows carries none of its own.
+        let leaf = match (directory.last(), rest.first()) {
+            (Some(&SEPARATOR), _) => rest,
+            (_, Some(&SEPARATOR)) => &rest[1..],
+            _ => return Ok(false),
+        };
+        Ok(!leaf.is_empty() && !leaf.contains(&SEPARATOR))
+    }
+
+    /// Reads the final path of an open handle as wide code units.
+    fn final_path(handle: BorrowedHandle<'_>) -> std::io::Result<Vec<u16>> {
+        let mut buffer = vec![0_u16; 512];
+        loop {
+            // SAFETY: the handle is borrowed for the call, and the buffer holds the length passed.
+            let needed = unsafe {
+                GetFinalPathNameByHandleW(
+                    handle.as_raw_handle(),
+                    buffer.as_mut_ptr(),
+                    u32::try_from(buffer.len()).unwrap_or(u32::MAX),
+                    FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+                )
+            };
+            let needed = usize::try_from(needed).unwrap_or(0);
+            if needed == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // The count excludes the terminator when the path fitted and includes it when it did
+            // not, so a value below the buffer means the path is in hand.
+            if needed < buffer.len() {
+                buffer.truncate(needed);
+                return Ok(buffer);
+            }
+            buffer.resize(needed, 0);
+        }
+    }
 
     /// The object's owner only, with inheritance blocked and children covered.
     ///
@@ -1139,7 +1208,7 @@ mod windows {
 }
 
 #[cfg(windows)]
-pub use self::windows::{AccessListRefusal, check_access_list};
+pub use self::windows::{AccessListRefusal, check_access_list, directory_contains};
 
 /// Returns the current user's identifier.
 #[cfg(unix)]
