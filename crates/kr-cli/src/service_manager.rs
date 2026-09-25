@@ -21,7 +21,7 @@
 //! the login keychain among it, and it ends with the login, as a desktop-bound session does; in the
 //! background domain it has no Aqua access and outlives the graphical login, as a headless session
 //! does. A host with no graphical login has no graphical domain at all. So the daemon runs where the
-//! sessions it creates by default run.
+//! sessions it creates by default run, and a definition in the other domain is out of date.
 //!
 //! The daemon it defines is the `kr-controller` installed beside this command, told this
 //! installation's own runtime and state roots, working in the environment's state directory and
@@ -33,12 +33,20 @@
 //! The record is `controller-service.json` in the environment's state directory, owner-only: the
 //! manager, the label, the domain, the file and its exact contents. The file on disk is compared
 //! with it rather than assumed, and a file under the label with no record is not kr's to replace or
-//! remove. Removing the definition never ends a daemon the manager is running: launchd keeps the
-//! job of a running daemon until that daemon ends, and the user manager keeps a running unit whose
-//! file has gone until it stops.
+//! remove. A file is moved aside before it is checked for replacing or removing, so what was checked
+//! is exactly what is replaced or removed, and one that turns out not to be what kr wrote goes back.
+//! What the manager holds is compared too: the program, the arguments and the directory it would
+//! run, and on Linux any drop-in of this unit's own, so a start request never has the manager run
+//! something other than what kr wrote.
+//!
+//! Setup, removal and a start request each hold the environment's `controller-service.lock` while
+//! they look at or change the definition or the manager's job, so none of them acts on what another
+//! has just changed: removing a definition cannot end a daemon a command is starting, and a start
+//! cannot begin while the definition is being replaced. Removing a definition never ends a daemon
+//! the manager is running: launchd keeps the job of a running daemon until that daemon ends, and the
+//! user manager keeps a running unit whose file has gone until it stops.
 
 use std::path::{Path, PathBuf};
-#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::time::{Duration, Instant};
 
 use kr_ipc::paths::EnvironmentPaths;
@@ -50,11 +58,19 @@ use crate::error::{CliError, Result};
 /// wrote.
 pub const RECORD_FILE: &str = "controller-service.json";
 
+/// The file in an environment's state directory whose lock setup, removal and a start request
+/// hold.
+pub const LOCK_FILE: &str = "controller-service.lock";
+
 /// The version of the record this build writes and reads.
 const RECORD_VERSION: u32 = 1;
 
 /// The largest record, or definition, this build reads: far more than it ever writes.
 const READ_LIMIT: u64 = 64 * 1024;
+
+/// How long a command waits for another to finish with the service start before it says who holds
+/// it: long enough for every command the other puts to the manager to have answered.
+const LOCK_WAIT: Duration = Duration::from_secs(60);
 
 /// How long one command put to the service manager is given to answer.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -104,6 +120,12 @@ pub struct Definition {
     pub path: PathBuf,
     /// The file's exact contents.
     pub contents: String,
+    /// The program it runs, the first of its arguments.
+    pub program: String,
+    /// Every argument it runs the program with, the program first.
+    pub arguments: Vec<String>,
+    /// The directory the program runs in.
+    pub working_directory: String,
 }
 
 impl Definition {
@@ -111,6 +133,33 @@ impl Definition {
     #[must_use]
     pub fn target(&self) -> String {
         target(self.manager, &self.label, self.domain.as_deref())
+    }
+
+    /// The definition this installation writes for `environment`, loaded into `domain` where the
+    /// manager has domains.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CliError::HostUnavailable`] when where this command is installed cannot be read,
+    /// and [`CliError::Usage`] when a path the definition names cannot be written into one.
+    pub fn write_for(environment: &EnvironmentPaths, domain: Option<String>) -> Result<Self> {
+        let program = crate::startup::daemon_program()?;
+        let state = environment.state_dir();
+        let arguments = vec![
+            text(&program)?.to_owned(),
+            "--runtime-dir".to_owned(),
+            text(environment.runtime_root())?.to_owned(),
+            "--state-dir".to_owned(),
+            text(environment.state_root())?.to_owned(),
+        ];
+        let log = state.join(crate::startup::LOG_FILE);
+        platform::render(
+            &label(environment),
+            domain,
+            arguments,
+            text(state)?,
+            text(&log)?,
+        )
     }
 }
 
@@ -207,10 +256,65 @@ impl Record {
     }
 }
 
+/// The service start's lock for one environment, held for as long as its holder looks at or
+/// changes the definition or the manager's job.
+#[derive(Debug)]
+pub struct Lock {
+    _file: std::fs::File,
+}
+
+impl Lock {
+    /// Takes the environment's lock, waiting [`LOCK_WAIT`] for another command to finish with it.
+    fn take(environment: &EnvironmentPaths) -> std::result::Result<Self, String> {
+        Self::take_within(environment, LOCK_WAIT)
+    }
+
+    /// Takes the environment's lock, waiting at most `wait`.
+    ///
+    /// The lock is the operating system's, on an open file, so a command that ends however it ends
+    /// lets go of it. The file stays where it is.
+    fn take_within(
+        environment: &EnvironmentPaths,
+        wait: Duration,
+    ) -> std::result::Result<Self, String> {
+        let path = environment.state_dir().join(LOCK_FILE);
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(&path)
+            .map_err(|error| format!("{} could not be opened: {error}", path.display()))?;
+        let deadline = Instant::now() + wait;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(format!(
+                        "another kr command has held {} for {} seconds while it sets up, removes \
+                         or starts this environment's daemon",
+                        path.display(),
+                        wait.as_secs()
+                    ));
+                }
+                Err(std::fs::TryLockError::Error(error)) => {
+                    return Err(format!("{} could not be locked: {error}", path.display()));
+                }
+            }
+        }
+    }
+}
+
 /// What the file where a definition belongs turned out to be.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
-    /// The file is what this installation writes, and nothing says kr did not write it.
+    /// The file is what this installation writes, and the record says kr wrote it.
     Matches,
     /// There is no file.
     Missing,
@@ -221,6 +325,8 @@ pub enum State {
     /// kr wrote the file and nobody changed it, but this installation writes something else now:
     /// another program, other directories or another domain.
     Outdated,
+    /// The file is exactly what this installation writes, and kr has no record of writing it.
+    Unrecorded,
 }
 
 impl State {
@@ -233,6 +339,7 @@ impl State {
             Self::Changed => "changed",
             Self::Foreign => "foreign",
             Self::Outdated => "outdated",
+            Self::Unrecorded => "unrecorded",
         }
     }
 
@@ -258,39 +365,85 @@ impl State {
                  another domain than this installation's; {SETUP_ACTION} to write this \
                  installation's"
             )),
+            Self::Unrecorded => Some(format!(
+                "the service definition {path} is what kr writes, and kr has no record of writing \
+                 it; {SETUP_ACTION} to record it"
+            )),
         }
     }
 }
 
 /// Compares the file at `path` with what kr recorded writing there and with what this
-/// installation writes now.
+/// installation writes now, `expected`.
 ///
 /// kr writes a definition owner-only, as a regular file, so anything else at the path, a link or a
 /// file others may write, is not what kr wrote.
-fn state(path: &Path, record: Option<&Record>, expected: &[Definition]) -> State {
+fn state(path: &Path, record: Option<&Record>, expected: &Definition) -> State {
     let bytes = match kr_ipc::paths::read_owner_only_file(path, READ_LIMIT) {
         Ok(None) => return State::Missing,
         Ok(Some(bytes)) => bytes,
         Err(_) if record.is_some() => return State::Changed,
         Err(_) => return State::Foreign,
     };
-    let current = |contents: &str| {
-        expected
-            .iter()
-            .any(|definition| definition.path == path && definition.contents == contents)
-    };
+    let current = expected.path == path && bytes == expected.contents.as_bytes();
     match record {
         Some(record) if bytes == record.contents.as_bytes() => {
-            if current(&record.contents) {
+            if current {
                 State::Matches
             } else {
                 State::Outdated
             }
         }
         Some(_) => State::Changed,
-        None if std::str::from_utf8(&bytes).is_ok_and(current) => State::Matches,
+        None if current => State::Unrecorded,
         None => State::Foreign,
     }
+}
+
+/// Moves the file at `path` to a name of its own beside it, so that what is checked next is
+/// exactly what will be replaced or removed. Nothing there is not an error.
+fn move_aside(path: &Path) -> std::result::Result<Option<PathBuf>, String> {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let aside = path.with_file_name(format!(".{name}.{}.kr-moving", kr_ipc::new_uuid()));
+    match std::fs::rename(path, &aside) {
+        Ok(()) => Ok(Some(aside)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("{} could not be moved: {error}", path.display())),
+    }
+}
+
+/// Puts a file moved aside back where it was, unless something has taken its place since, and
+/// says where it is otherwise.
+///
+/// A regular file goes back by a link, which is refused when the name is taken, so a file written
+/// there meanwhile is never replaced. Anything else goes back by a rename once the name is seen to
+/// be free.
+fn put_back(aside: &Path, path: &Path) -> std::result::Result<(), String> {
+    let regular = std::fs::symlink_metadata(aside).is_ok_and(|about| about.file_type().is_file());
+    let restored = if regular {
+        std::fs::hard_link(aside, path).and_then(|()| std::fs::remove_file(aside))
+    } else if std::fs::symlink_metadata(path).is_err() {
+        std::fs::rename(aside, path)
+    } else {
+        Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+    };
+    restored.map_err(|error| {
+        format!(
+            "it is at {}, because it could not be put back at {}: {error}",
+            aside.display(),
+            path.display()
+        )
+    })
+}
+
+/// Whether a file moved aside is exactly `contents`, read as kr writes a definition: owner-only
+/// and regular.
+fn moved_is(aside: &Path, contents: &str) -> bool {
+    kr_ipc::paths::read_owner_only_file(aside, READ_LIMIT)
+        .is_ok_and(|bytes| bytes.as_deref() == Some(contents.as_bytes()))
 }
 
 /// What the service start has on this host for an environment, for a person to read.
@@ -300,7 +453,7 @@ pub struct Inspection {
     pub manager: Manager,
     /// The label.
     pub label: String,
-    /// The launchd domain, when the record names one.
+    /// The launchd domain the definition is, or would be, loaded into.
     pub domain: Option<String>,
     /// Where the definition is, or belongs.
     pub path: PathBuf,
@@ -342,35 +495,40 @@ impl Inspection {
 }
 
 /// Inspects what the service start has for an environment: the recorded definition, or, where
-/// `selected` says the service start is chosen and nothing is recorded, where one would be. Nothing
-/// is asked of the manager, and an environment with neither has nothing to inspect.
+/// `selected` says the service start is chosen and nothing is recorded, where one would be. The
+/// domain is the one the environment's default execution profile implies now. An environment with
+/// neither a record nor the choice has nothing to inspect, and nothing is changed either way.
 ///
-/// # Errors
-///
-/// Returns [`CliError::HostUnavailable`] when the record cannot be read, and what stops a
-/// definition being written on this host otherwise.
-pub fn inspect(environment: &EnvironmentPaths, selected: bool) -> Result<Option<Inspection>> {
-    let record = Record::read(environment).map_err(CliError::HostUnavailable)?;
-    let Some(manager) = platform::MANAGER else {
-        return Ok(None);
+/// Returns none when there is nothing to inspect, and why not when what is there cannot be
+/// established.
+#[must_use]
+pub fn inspect(
+    environment: &EnvironmentPaths,
+    selected: bool,
+) -> Option<std::result::Result<Inspection, String>> {
+    let record = match Record::read(environment) {
+        Ok(record) => record,
+        Err(why) => return Some(Err(why)),
     };
+    let manager = platform::MANAGER?;
     if record.is_none() && !selected {
-        return Ok(None);
+        return None;
     }
-    let expected = match &record {
-        Some(record) => vec![Definition::write_for(environment, record.domain.clone())?],
-        None => platform::domains()
-            .into_iter()
-            .map(|domain| Definition::write_for(environment, domain))
-            .collect::<Result<Vec<_>>>()?,
+    let expected = match platform::domain_for(environment)
+        .and_then(|domain| Definition::write_for(environment, domain))
+    {
+        Ok(expected) => expected,
+        Err(error) => return Some(Err(error.to_string())),
     };
     let path = record
         .as_ref()
-        .map_or_else(|| expected[0].path.clone(), |record| record.path.clone());
-    Ok(Some(Inspection {
+        .map_or_else(|| expected.path.clone(), |record| record.path.clone());
+    Some(Ok(Inspection {
         manager: record.as_ref().map_or(manager, |record| record.manager),
         label: label(environment),
-        domain: record.as_ref().and_then(|record| record.domain.clone()),
+        domain: record
+            .as_ref()
+            .map_or_else(|| expected.domain.clone(), |record| record.domain.clone()),
         state: state(&path, record.as_ref(), &expected),
         path,
         recorded: record.is_some(),
@@ -380,8 +538,6 @@ pub fn inspect(environment: &EnvironmentPaths, selected: bool) -> Result<Option<
 /// What `kr host startup --set service` did.
 #[derive(Debug)]
 pub struct Installed {
-    /// The definition as it now stands.
-    pub inspection: Inspection,
     /// What a person should know about what the manager holds.
     pub notes: Vec<String>,
 }
@@ -389,7 +545,7 @@ pub struct Installed {
 /// Writes the definition of an environment's daemon, records it, and has the manager take it.
 ///
 /// Nothing is written over a definition kr did not write or one changed since it did, and neither
-/// the command nor the manager starts the daemon here.
+/// the command nor the manager starts the daemon here. The environment's directories must exist.
 ///
 /// # Errors
 ///
@@ -400,6 +556,7 @@ pub fn install(environment: &EnvironmentPaths) -> Result<Installed> {
     platform::available()?;
     let domain = platform::domain_for(environment)?;
     let expected = Definition::write_for(environment, domain)?;
+    let _lock = Lock::take(environment).map_err(CliError::HostUnavailable)?;
     let record = Record::read(environment).map_err(CliError::Usage)?;
     if let Some(record) = &record
         && record.path != expected.path
@@ -411,62 +568,69 @@ pub fn install(environment: &EnvironmentPaths) -> Result<Installed> {
             expected.path.display()
         )));
     }
-    let before = state(
-        &expected.path,
-        record.as_ref(),
-        std::slice::from_ref(&expected),
-    );
-    let mut notes = Vec::new();
-    match before {
-        State::Foreign | State::Changed => {
-            return Err(CliError::Usage(
-                before.trouble(&expected.path).unwrap_or_default(),
-            ));
-        }
-        State::Matches => {}
-        State::Missing | State::Outdated => {
+    let before = state(&expected.path, record.as_ref(), &expected);
+    let refused = |state: State| CliError::Usage(state.trouble(&expected.path).unwrap_or_default());
+    match (before, &record) {
+        (State::Foreign | State::Changed, _) => return Err(refused(before)),
+        (State::Matches | State::Unrecorded, _) => {}
+        (State::Missing, _) => {
             if let Some(parent) = expected.path.parent() {
                 std::fs::create_dir_all(parent).map_err(|error| {
                     CliError::Ipc(kr_ipc::IpcError::io("create", parent, error))
                 })?;
             }
-            // A definition that is not there is published only if it is still not there, so one
-            // that appeared meanwhile is never replaced.
-            let written = if before == State::Missing {
-                kr_ipc::paths::create_new_owner_only_file(
-                    &expected.path,
-                    expected.contents.as_bytes(),
-                )
-            } else {
-                kr_ipc::paths::write_owner_only_file(&expected.path, expected.contents.as_bytes())
-            };
-            written.map_err(|error| {
-                CliError::Usage(format!(
-                    "the service definition {} could not be written: {error}",
-                    expected.path.display()
-                ))
-            })?;
-            // A domain the earlier definition was loaded into and this one is not is let go of.
-            if let Some(record) = &record
-                && record.domain != expected.domain
-            {
-                notes.extend(platform::release(record)?);
-            }
+            publish(&expected)?;
         }
+        (State::Outdated, Some(record)) => {
+            // The file is moved aside and checked once it is out of the way, so a file changed
+            // since it was read above goes back rather than being replaced.
+            let Some(aside) = move_aside(&expected.path).map_err(CliError::HostUnavailable)? else {
+                return Err(refused(State::Missing));
+            };
+            if !moved_is(&aside, &record.contents) {
+                return Err(CliError::Usage(match put_back(&aside, &expected.path) {
+                    Ok(()) => refused(State::Changed).to_string(),
+                    Err(where_it_is) => format!(
+                        "the service definition {} was changed after kr wrote it; {where_it_is}",
+                        expected.path.display()
+                    ),
+                }));
+            }
+            if let Err(error) = publish(&expected) {
+                if let Err(where_it_is) = put_back(&aside, &expected.path) {
+                    return Err(CliError::HostUnavailable(format!(
+                        "{error}; the earlier one: {where_it_is}"
+                    )));
+                }
+                return Err(error);
+            }
+            let _ = std::fs::remove_file(&aside);
+        }
+        (State::Outdated, None) => return Err(refused(State::Foreign)),
+    }
+    let mut notes = Vec::new();
+    // A job the earlier definition was loaded as, in a domain this one is not loaded into, is let
+    // go of.
+    if let Some(record) = &record
+        && record.target() != expected.target()
+    {
+        notes.extend(platform::release(record)?);
     }
     Record::write(environment, &expected)?;
-    notes.extend(platform::take(&expected, before != State::Matches)?);
-    Ok(Installed {
-        inspection: Inspection {
-            manager: expected.manager,
-            label: expected.label.clone(),
-            domain: expected.domain.clone(),
-            path: expected.path.clone(),
-            state: State::Matches,
-            recorded: true,
-        },
-        notes,
-    })
+    notes.extend(platform::take(&expected)?);
+    Ok(Installed { notes })
+}
+
+/// Publishes a definition where none is, and never over one that appeared meanwhile.
+fn publish(definition: &Definition) -> Result<()> {
+    kr_ipc::paths::create_new_owner_only_file(&definition.path, definition.contents.as_bytes())
+        .map_err(|error| {
+            CliError::Usage(format!(
+                "the service definition {} could not be written, and whatever is there now is \
+                 left as it is: {error}",
+                definition.path.display()
+            ))
+        })
 }
 
 /// What removing the service start's definition did.
@@ -483,35 +647,51 @@ pub struct Removal {
 /// Removes exactly what `kr host startup --set service` wrote for an environment, and its record,
 /// without ending a daemon the manager is running.
 ///
-/// An environment with no record has nothing of the service start's to remove. A definition
-/// changed after kr wrote it is no longer kr's to remove, and is left, with its record gone.
+/// An environment with no record has nothing of the service start's to remove, and is not locked
+/// or changed at all. A definition changed after kr wrote it is no longer kr's to remove, and is
+/// left, with its record gone.
 ///
 /// # Errors
 ///
 /// Returns [`CliError::Usage`] when the record cannot be read, and what failed while removing.
 pub fn remove(environment: &EnvironmentPaths) -> Result<Removal> {
+    if Record::read(environment)
+        .map_err(CliError::Usage)?
+        .is_none()
+    {
+        return Ok(Removal::default());
+    }
+    let _lock = Lock::take(environment).map_err(CliError::HostUnavailable)?;
     let Some(record) = Record::read(environment).map_err(CliError::Usage)? else {
         return Ok(Removal::default());
     };
     let mut removal = Removal::default();
-    let written = match kr_ipc::paths::read_owner_only_file(&record.path, READ_LIMIT) {
-        Ok(Some(bytes)) => Some(bytes == record.contents.as_bytes()),
-        Ok(None) => None,
-        Err(_) => Some(false),
-    };
-    match written {
-        Some(true) => {
-            removal.notes.extend(platform::release(&record)?);
-            std::fs::remove_file(&record.path).map_err(|error| {
-                CliError::Ipc(kr_ipc::IpcError::io("remove", &record.path, error))
-            })?;
-            removal.removed.push(record.path.clone());
-        }
-        Some(false) => removal.left.push((
-            record.path.clone(),
-            "it was changed after kr wrote it, so it is no longer kr's to remove".to_owned(),
-        )),
+    match move_aside(&record.path).map_err(CliError::HostUnavailable)? {
         None => removal.notes.extend(platform::release(&record)?),
+        Some(aside) if moved_is(&aside, &record.contents) => match platform::release(&record) {
+            Ok(notes) => {
+                removal.notes.extend(notes);
+                std::fs::remove_file(&aside).map_err(|error| {
+                    CliError::Ipc(kr_ipc::IpcError::io("remove", &aside, error))
+                })?;
+                removal.removed.push(record.path.clone());
+            }
+            Err(error) => {
+                if let Err(where_it_is) = put_back(&aside, &record.path) {
+                    return Err(CliError::HostUnavailable(format!(
+                        "{error}; the definition: {where_it_is}"
+                    )));
+                }
+                return Err(error);
+            }
+        },
+        Some(aside) => {
+            let why = "it was changed after kr wrote it, so it is no longer kr's to remove";
+            match put_back(&aside, &record.path) {
+                Ok(()) => removal.left.push((record.path.clone(), why.to_owned())),
+                Err(where_it_is) => removal.left.push((aside, format!("{why}; {where_it_is}"))),
+            }
+        }
     }
     let recorded = Record::path(environment);
     std::fs::remove_file(&recorded)
@@ -526,7 +706,7 @@ pub fn remove(environment: &EnvironmentPaths) -> Result<Removal> {
 pub enum Refusal {
     /// The service start is not set up as it has to be: what is wrong, and the setup action.
     NotSetUp(String),
-    /// The manager was asked and did not start the daemon.
+    /// The manager was asked and did not start the daemon, or could not be asked.
     Failed(String),
 }
 
@@ -539,24 +719,39 @@ pub struct Asked {
     pub pid: Option<u32>,
 }
 
-/// Asks the manager to start an environment's daemon from the definition kr wrote.
+/// A definition checked for a start request, with the environment's lock held until the request
+/// has been made.
+#[derive(Debug)]
+pub struct Verified {
+    record: Record,
+    expected: Definition,
+    _lock: Lock,
+}
+
+/// Checks the definition kr wrote for an environment before `kr new` asks the manager to start
+/// the daemon from it, and holds the environment's lock until it has.
 ///
-/// The definition is checked first, and one that is not exactly what kr wrote and this
-/// installation writes is a refusal with the setup action: nothing is written and nothing is
-/// started. A daemon the manager is already running is the one it reports.
+/// One that is not exactly what kr recorded writing and what this installation writes now, in the
+/// domain the environment's default execution profile implies, is a refusal with the setup action.
+/// Nothing is written or started.
 ///
 /// # Errors
 ///
 /// Returns the refusal.
-pub fn start(environment: &EnvironmentPaths) -> std::result::Result<Asked, Refusal> {
-    let record = Record::read(environment)
-        .map_err(|why| Refusal::NotSetUp(format!("{why}; {SETUP_ACTION}")))?
-        .ok_or_else(|| {
-            Refusal::NotSetUp(format!(
-                "startup.controller is service and no service definition was written for this \
-                 environment; {SETUP_ACTION}"
-            ))
-        })?;
+pub fn verify(environment: &EnvironmentPaths) -> std::result::Result<Verified, Refusal> {
+    let not_set_up = || {
+        Refusal::NotSetUp(format!(
+            "startup.controller is service and no service definition was written for this \
+             environment; {SETUP_ACTION}"
+        ))
+    };
+    let read = || {
+        Record::read(environment).map_err(|why| Refusal::NotSetUp(format!("{why}; {SETUP_ACTION}")))
+    };
+    // An environment that never had a definition written has no lock file to take either.
+    read()?.ok_or_else(not_set_up)?;
+    let lock = Lock::take(environment).map_err(Refusal::Failed)?;
+    let record = read()?.ok_or_else(not_set_up)?;
     if platform::MANAGER != Some(record.manager) {
         return Err(Refusal::NotSetUp(format!(
             "the service definition kr recorded is for {}, which this host does not start \
@@ -564,41 +759,31 @@ pub fn start(environment: &EnvironmentPaths) -> std::result::Result<Asked, Refus
             record.manager.as_str()
         )));
     }
-    let expected = Definition::write_for(environment, record.domain.clone())
+    let expected = platform::domain_for(environment)
+        .and_then(|domain| Definition::write_for(environment, domain))
         .map_err(|error| Refusal::NotSetUp(format!("{error}; {SETUP_ACTION}")))?;
-    let found = state(&record.path, Some(&record), std::slice::from_ref(&expected));
+    let found = state(&record.path, Some(&record), &expected);
     if let Some(trouble) = found.trouble(&record.path) {
         return Err(Refusal::NotSetUp(trouble));
     }
-    platform::start(&record)
+    Ok(Verified {
+        record,
+        expected,
+        _lock: lock,
+    })
 }
 
-impl Definition {
-    /// The definition this installation writes for `environment`, loaded into `domain` where the
-    /// manager has domains.
+impl Verified {
+    /// Asks the manager to start the daemon from the checked definition, once the manager is seen
+    /// to hold exactly that definition, and lets go of the environment's lock.
+    ///
+    /// A daemon the manager is already running is the one it reports.
     ///
     /// # Errors
     ///
-    /// Returns [`CliError::HostUnavailable`] when where this command is installed cannot be read,
-    /// and [`CliError::Usage`] when a path the definition names cannot be written into one.
-    pub fn write_for(environment: &EnvironmentPaths, domain: Option<String>) -> Result<Self> {
-        let program = crate::startup::daemon_program()?;
-        let state = environment.state_dir();
-        let arguments = [
-            text(&program)?.to_owned(),
-            "--runtime-dir".to_owned(),
-            text(environment.runtime_root())?.to_owned(),
-            "--state-dir".to_owned(),
-            text(environment.state_root())?.to_owned(),
-        ];
-        let log = state.join(crate::startup::LOG_FILE);
-        platform::render(
-            &label(environment),
-            domain,
-            &arguments,
-            text(state)?,
-            text(&log)?,
-        )
+    /// Returns the refusal.
+    pub fn start(self) -> std::result::Result<Asked, Refusal> {
+        platform::start(&self.record, &self.expected)
     }
 }
 
@@ -729,7 +914,9 @@ mod platform {
     use kr_ipc::paths::EnvironmentPaths;
     use kr_protocol::identity::WorkerProfile;
 
-    use super::{Asked, Definition, Manager, Record, Refusal, refused, run, same_file, text};
+    use super::{
+        Asked, Definition, Manager, Record, Refusal, SETUP_ACTION, refused, run, same_file, text,
+    };
     use crate::error::{CliError, Result};
 
     /// The manager this platform's definitions are for.
@@ -742,17 +929,6 @@ mod platform {
 
     /// What `launchctl print` exits with for a job the domain does not have.
     const NOT_LOADED: i32 = 113;
-
-    /// This user's two domains.
-    fn domains_here() -> [String; 2] {
-        let uid = kr_ipc::paths::current_uid();
-        [format!("gui/{uid}"), format!("user/{uid}")]
-    }
-
-    /// Every domain a definition may be written for.
-    pub(super) fn domains() -> Vec<Option<String>> {
-        domains_here().into_iter().map(Some).collect()
-    }
 
     /// launchd is always there; what it needs is the domain, and that is asked when it is chosen.
     pub(super) fn available() -> Result<()> {
@@ -771,10 +947,10 @@ mod platform {
                 kr_ipc::identity::boot_identity()?,
             )),
         };
-        let [graphical, background] = domains_here();
+        let uid = kr_ipc::paths::current_uid();
         let domain = match profile {
-            WorkerProfile::DesktopBound => graphical,
-            WorkerProfile::HeadlessUser => background,
+            WorkerProfile::DesktopBound => format!("gui/{uid}"),
+            WorkerProfile::HeadlessUser => format!("user/{uid}"),
         };
         match run(LAUNCHCTL, &["print", &domain]) {
             Ok(output) if output.status.success() => Ok(Some(domain)),
@@ -801,7 +977,7 @@ mod platform {
     pub(super) fn render(
         label: &str,
         domain: Option<String>,
-        arguments: &[String],
+        arguments: Vec<String>,
         working_directory: &str,
         log: &str,
     ) -> Result<Definition> {
@@ -832,7 +1008,7 @@ mod platform {
         contents.push_str("\t<key>Label</key>\n");
         contents.push_str(&string(label));
         contents.push_str("\t<key>ProgramArguments</key>\n\t<array>\n");
-        for argument in arguments {
+        for argument in &arguments {
             contents.push_str(&format!("\t{}", string(argument)));
         }
         contents.push_str("\t</array>\n");
@@ -860,6 +1036,9 @@ mod platform {
             domain: Some(domain),
             path,
             contents,
+            program: arguments[0].clone(),
+            arguments,
+            working_directory: working_directory.to_owned(),
         })
     }
 
@@ -872,34 +1051,83 @@ mod platform {
     }
 
     /// What launchd holds under one target.
+    #[derive(Debug, PartialEq, Eq)]
     enum Job {
         NotLoaded,
-        Loaded {
-            path: Option<PathBuf>,
-            program: Option<String>,
-            pid: Option<u32>,
-        },
+        Loaded(Loaded),
+    }
+
+    /// A job launchd holds, as `launchctl print` describes it.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    pub(super) struct Loaded {
+        path: Option<PathBuf>,
+        program: Option<String>,
+        arguments: Vec<String>,
+        working_directory: Option<String>,
+        pid: Option<u32>,
+    }
+
+    impl Loaded {
+        /// Reads what `launchctl print <domain>/<label>` printed for a loaded job.
+        ///
+        /// The job's own fields are at the first level of the description, one tab in; its
+        /// arguments are the lines two tabs in under `arguments = {`.
+        pub(super) fn read(printed: &str) -> Self {
+            let mut loaded = Self::default();
+            let mut in_arguments = false;
+            for line in printed.lines() {
+                if in_arguments {
+                    match line.strip_prefix("\t\t") {
+                        Some(argument) => loaded.arguments.push(argument.to_owned()),
+                        None => in_arguments = false,
+                    }
+                    continue;
+                }
+                let Some((name, value)) = line.strip_prefix('\t').and_then(|field| {
+                    (!field.starts_with('\t'))
+                        .then(|| field.split_once(" = "))
+                        .flatten()
+                }) else {
+                    continue;
+                };
+                match name {
+                    "path" => loaded.path = Some(PathBuf::from(value)),
+                    "program" => loaded.program = Some(value.to_owned()),
+                    "working directory" => loaded.working_directory = Some(value.to_owned()),
+                    "pid" => loaded.pid = value.trim().parse().ok(),
+                    "arguments" if value == "{" => in_arguments = true,
+                    _ => {}
+                }
+            }
+            loaded
+        }
+
+        /// Whether launchd would run exactly what `definition` says, from its file.
+        fn runs(&self, definition: &Definition) -> bool {
+            self.program.as_deref() == Some(definition.program.as_str())
+                && self.arguments == definition.arguments
+                && self.working_directory.as_deref().is_some_and(|directory| {
+                    same_file(
+                        Path::new(directory),
+                        Path::new(&definition.working_directory),
+                    )
+                })
+        }
+
+        /// Whether it was loaded from the file at `path`.
+        fn from(&self, path: &Path) -> bool {
+            self.path
+                .as_deref()
+                .is_some_and(|from| same_file(from, path))
+        }
     }
 
     fn job(target: &str) -> std::result::Result<Job, String> {
         let output = run(LAUNCHCTL, &["print", target])?;
         match output.status.code() {
-            Some(0) => {
-                let printed = String::from_utf8_lossy(&output.stdout);
-                let field = |name: &str| {
-                    printed.lines().find_map(|line| {
-                        line.strip_prefix('\t')?
-                            .strip_prefix(name)?
-                            .strip_prefix(" = ")
-                            .map(str::to_owned)
-                    })
-                };
-                Ok(Job::Loaded {
-                    path: field("path").map(PathBuf::from),
-                    program: field("program"),
-                    pid: field("pid").and_then(|pid| pid.trim().parse().ok()),
-                })
-            }
+            Some(0) => Ok(Job::Loaded(Loaded::read(&String::from_utf8_lossy(
+                &output.stdout,
+            )))),
             Some(NO_SUCH_DOMAIN | NOT_LOADED) => Ok(Job::NotLoaded),
             _ => Err(refused(&format!("launchctl print {target}"), &output)),
         }
@@ -917,81 +1145,82 @@ mod platform {
         }
     }
 
-    /// Loads the definition at `path` into `domain`, and settles a load that another command made
-    /// first as a load.
-    fn load(domain: &str, target: &str, path: &Path) -> std::result::Result<(), String> {
-        let loaded = succeeded(&["bootstrap", domain, &path.display().to_string()]);
-        match (loaded, job(target)?) {
-            (Ok(_), _) => Ok(()),
-            (
-                Err(_),
-                Job::Loaded {
-                    path: Some(from), ..
-                },
-            ) if same_file(&from, path) => Ok(()),
-            (Err(why), _) => Err(why),
-        }
+    /// Loads the definition at `path` into `domain`.
+    fn load(domain: &str, path: &Path) -> std::result::Result<(), String> {
+        succeeded(&["bootstrap", domain, &path.display().to_string()]).map(|_| ())
     }
 
-    /// Has launchd hold the definition just written: loaded where it was not, and loaded again
-    /// where launchd holds an earlier one and runs no daemon from it.
-    pub(super) fn take(definition: &Definition, rewritten: bool) -> Result<Vec<String>> {
+    /// Why a job launchd holds under a definition's label is not that definition's, when it is not.
+    fn foreign(loaded: &Loaded, definition: &Definition) -> Option<String> {
+        (!loaded.from(&definition.path)).then(|| {
+            format!(
+                "launchd holds a job labelled {} in {} from another definition, {}; remove it with \
+                 launchctl bootout {}, then {SETUP_ACTION}",
+                definition.label,
+                definition.domain.as_deref().unwrap_or_default(),
+                loaded.path.as_deref().map_or_else(
+                    || "one it does not name".to_owned(),
+                    |path| path.display().to_string()
+                ),
+                definition.target()
+            )
+        })
+    }
+
+    /// Has launchd hold exactly the definition just written, with the environment's lock held: it
+    /// is loaded where launchd does not hold it, and loaded again where launchd holds an earlier
+    /// form of it and runs no daemon from that. One it runs a daemon from is left to that daemon.
+    pub(super) fn take(definition: &Definition) -> Result<Vec<String>> {
         let domain = definition.domain.as_deref().unwrap_or_default();
         let target = definition.target();
         let failed = |why: String| CliError::HostUnavailable(why);
         match job(&target).map_err(failed)? {
-            Job::NotLoaded => load(domain, &target, &definition.path).map_err(failed)?,
-            Job::Loaded { path, pid, program } => {
-                let from = path.unwrap_or_default();
-                if !same_file(&from, &definition.path) {
-                    return Err(CliError::Usage(format!(
-                        "launchd holds a job labelled {} in {domain} from another definition, {}; \
-                         remove it with launchctl bootout {target}, then run kr host startup --set \
-                         service",
-                        definition.label,
-                        from.display()
-                    )));
+            Job::NotLoaded => load(domain, &definition.path).map_err(failed)?,
+            Job::Loaded(loaded) => {
+                if let Some(why) = foreign(&loaded, definition) {
+                    return Err(CliError::Usage(why));
                 }
-                if rewritten {
-                    match pid {
-                        Some(pid) if program != program_of(&definition.contents) => {
+                if !loaded.runs(definition) {
+                    match loaded.pid {
+                        Some(pid) => {
                             return Ok(vec![format!(
-                                "launchd holds the earlier definition while the daemon it started \
-                                 from it runs (process {pid}); run kr host startup --set service \
-                                 again once that daemon has ended"
+                                "launchd holds an earlier form of the definition while the daemon \
+                                 it started from it runs (process {pid}); run kr host startup \
+                                 --set service again once that daemon has ended"
                             )]);
                         }
-                        Some(_) => {}
                         None => {
                             succeeded(&["bootout", &target]).map_err(failed)?;
-                            load(domain, &target, &definition.path).map_err(failed)?;
+                            load(domain, &definition.path).map_err(failed)?;
                         }
                     }
                 }
             }
         }
-        Ok(Vec::new())
+        match job(&target).map_err(failed)? {
+            Job::Loaded(loaded) if loaded.from(&definition.path) && loaded.runs(definition) => {
+                Ok(Vec::new())
+            }
+            found => Err(CliError::HostUnavailable(format!(
+                "launchd does not hold the definition just loaded as {target}: {found:?}"
+            ))),
+        }
     }
 
-    /// Lets go of the job a record names without ending a daemon: a job with no process is
-    /// removed, and one running a daemon is left to it.
+    /// Lets go of the job a record names without ending a daemon, with the environment's lock
+    /// held: a job of that definition with no process is removed, and one running a daemon is left
+    /// to it.
     pub(super) fn release(record: &Record) -> Result<Vec<String>> {
         let target = record.target();
         let failed = |why: String| CliError::HostUnavailable(why);
         match job(&target).map_err(failed)? {
             Job::NotLoaded => Ok(Vec::new()),
-            Job::Loaded { path, .. }
-                if !path
-                    .as_ref()
-                    .is_some_and(|path| same_file(path, &record.path)) =>
-            {
-                Ok(Vec::new())
-            }
-            Job::Loaded { pid: Some(pid), .. } => Ok(vec![format!(
+            Job::Loaded(loaded) if !loaded.from(&record.path) => Ok(Vec::new()),
+            Job::Loaded(Loaded { pid: Some(pid), .. }) => Ok(vec![format!(
                 "the daemon launchd started (process {pid}) keeps serving, and launchd keeps its \
                  job {target} until that daemon has ended"
             )]),
-            Job::Loaded { pid: None, .. } => {
+            Job::Loaded(_) => {
                 succeeded(&["bootout", &target]).map_err(failed)?;
                 Ok(Vec::new())
             }
@@ -1004,37 +1233,33 @@ mod platform {
         Vec::new()
     }
 
-    /// Asks launchd to start the job the record names, loading it first where launchd does not
-    /// hold it, as it does not after a restart until the domain is set up again.
-    pub(super) fn start(record: &Record) -> std::result::Result<Asked, Refusal> {
+    /// Asks launchd to start the job the record names, with the environment's lock held. It is
+    /// loaded first where launchd does not hold it, as after a restart until the domain has loaded
+    /// it again, and then it has to be exactly the checked definition.
+    pub(super) fn start(
+        record: &Record,
+        expected: &Definition,
+    ) -> std::result::Result<Asked, Refusal> {
         let domain = record.domain.as_deref().unwrap_or_default();
         let target = record.target();
-        let program = program_of(&record.contents);
-        match job(&target).map_err(Refusal::Failed)? {
-            Job::NotLoaded => load(domain, &target, &record.path).map_err(Refusal::Failed)?,
-            Job::Loaded {
-                path,
-                program: loaded,
-                ..
-            } => {
-                let from = path.unwrap_or_default();
-                if !same_file(&from, &record.path) {
-                    return Err(Refusal::NotSetUp(format!(
-                        "launchd holds a job labelled {} in {domain} from another definition, {}; \
-                         remove it with launchctl bootout {target}, then run kr host startup --set \
-                         service",
-                        record.label,
-                        from.display()
-                    )));
-                }
-                if loaded.is_some() && loaded != program {
-                    return Err(Refusal::NotSetUp(format!(
-                        "launchd holds an earlier definition of {target}, which runs {}; run kr \
-                         host startup --set service to have it take the one kr wrote",
-                        loaded.unwrap_or_default()
-                    )));
-                }
-            }
+        if job(&target).map_err(Refusal::Failed)? == Job::NotLoaded {
+            load(domain, &record.path).map_err(Refusal::Failed)?;
+        }
+        let Job::Loaded(loaded) = job(&target).map_err(Refusal::Failed)? else {
+            return Err(Refusal::Failed(format!(
+                "launchd does not hold {target} after loading it"
+            )));
+        };
+        if let Some(why) = foreign(&loaded, expected) {
+            return Err(Refusal::NotSetUp(why));
+        }
+        if !loaded.runs(expected) {
+            return Err(Refusal::NotSetUp(format!(
+                "launchd holds an earlier form of {target}, which runs {} {:?}; {SETUP_ACTION} to \
+                 have it take the one kr wrote",
+                loaded.program.as_deref().unwrap_or_default(),
+                loaded.arguments
+            )));
         }
         let output = run(LAUNCHCTL, &["kickstart", "-p", &target]).map_err(Refusal::Failed)?;
         if !output.status.success() {
@@ -1048,41 +1273,25 @@ mod platform {
             pid: String::from_utf8_lossy(&output.stdout).trim().parse().ok(),
         })
     }
-
-    /// The program a definition this module wrote runs: the first of its program arguments.
-    fn program_of(contents: &str) -> Option<String> {
-        let start = contents.find("<key>ProgramArguments</key>")?;
-        let first = contents[start..].find("<string>")? + start + "<string>".len();
-        let end = contents[first..].find("</string>")? + first;
-        Some(
-            contents[first..end]
-                .replace("&lt;", "<")
-                .replace("&gt;", ">")
-                .replace("&amp;", "&"),
-        )
-    }
 }
 
 #[cfg(target_os = "linux")]
 mod platform {
     //! The systemd user manager.
 
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use kr_ipc::paths::EnvironmentPaths;
 
-    use super::{Asked, Definition, Manager, Record, Refusal, refused, run, same_file, text};
+    use super::{
+        Asked, Definition, Manager, Record, Refusal, SETUP_ACTION, refused, run, same_file, text,
+    };
     use crate::error::{CliError, Result};
 
     /// The manager this platform's definitions are for.
     pub(super) const MANAGER: Option<Manager> = Some(Manager::Systemd);
 
     const SYSTEMCTL: &str = "systemctl";
-
-    /// The one user manager has no domains.
-    pub(super) fn domains() -> Vec<Option<String>> {
-        vec![None]
-    }
 
     /// `systemctl --user` with the arguments given, never paging and never asking for a password.
     fn systemctl(arguments: &[&str]) -> std::result::Result<std::process::Output, String> {
@@ -1121,14 +1330,14 @@ mod platform {
         Ok(None)
     }
 
-    /// A value as a unit file's command line takes it: one quoted word, with the characters the
-    /// manager expands in one written so it takes them as they are.
-    fn word(value: &str) -> String {
+    /// A value as a unit file's command line takes it: one quoted word, with the specifier
+    /// character doubled. The command carries the prefix that turns environment expansion off, so
+    /// a dollar sign is taken as it is.
+    pub(super) fn word(value: &str) -> String {
         let escaped = value
             .replace('\\', "\\\\")
             .replace('"', "\\\"")
-            .replace('%', "%%")
-            .replace('$', "$$");
+            .replace('%', "%%");
         format!("\"{escaped}\"")
     }
 
@@ -1141,7 +1350,7 @@ mod platform {
     pub(super) fn render(
         label: &str,
         _domain: Option<String>,
-        arguments: &[String],
+        arguments: Vec<String>,
         working_directory: &str,
         log: &str,
     ) -> Result<Definition> {
@@ -1161,7 +1370,9 @@ mod platform {
                         .to_owned(),
                 )
             })?;
-        let command: Vec<String> = arguments.iter().map(|argument| word(argument)).collect();
+        // `:` before the program turns environment expansion off for the whole command line.
+        let mut command = vec![word(&format!(":{}", arguments[0]))];
+        command.extend(arguments[1..].iter().map(|argument| word(argument)));
         let contents = format!(
             "# The KalaReach control daemon, started when a kr command finds none running.\n\
              # kr host startup wrote this file and kr host startup --clear removes it.\n\
@@ -1191,53 +1402,110 @@ mod platform {
             domain: None,
             path,
             contents,
+            program: arguments[0].clone(),
+            arguments,
+            working_directory: working_directory.to_owned(),
         })
     }
 
-    /// What the user manager holds under one unit name.
-    struct Unit {
+    /// What the user manager holds under one unit name, as `systemctl --user show` describes it.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    pub(super) struct Unit {
         load_state: String,
         fragment: Option<PathBuf>,
+        drop_ins: String,
+        need_reload: bool,
+        exec_start: String,
         pid: Option<u32>,
     }
 
-    fn unit(name: &str) -> std::result::Result<Unit, String> {
-        let output = succeeded(&["show", "--property=LoadState,FragmentPath,MainPID", name])?;
-        let printed = String::from_utf8_lossy(&output.stdout);
-        let field = |key: &str| {
-            printed
-                .lines()
-                .find_map(|line| line.strip_prefix(key)?.strip_prefix('=').map(str::to_owned))
-        };
-        Ok(Unit {
-            load_state: field("LoadState").unwrap_or_default(),
-            fragment: field("FragmentPath")
-                .filter(|path| !path.is_empty())
-                .map(PathBuf::from),
-            pid: field("MainPID")
-                .and_then(|pid| pid.parse().ok())
-                .filter(|pid| *pid != 0),
-        })
+    /// The properties [`Unit`] is read from.
+    const PROPERTIES: &str =
+        "--property=LoadState,FragmentPath,DropInPaths,NeedDaemonReload,ExecStart,MainPID";
+
+    impl Unit {
+        /// Reads what `systemctl --user show` printed for [`PROPERTIES`].
+        pub(super) fn read(printed: &str) -> Self {
+            let field = |key: &str| {
+                printed
+                    .lines()
+                    .find_map(|line| line.strip_prefix(key)?.strip_prefix('=').map(str::to_owned))
+            };
+            Self {
+                load_state: field("LoadState").unwrap_or_default(),
+                fragment: field("FragmentPath")
+                    .filter(|path| !path.is_empty())
+                    .map(PathBuf::from),
+                drop_ins: field("DropInPaths").unwrap_or_default(),
+                need_reload: field("NeedDaemonReload").as_deref() == Some("yes"),
+                exec_start: field("ExecStart").unwrap_or_default(),
+                pid: field("MainPID")
+                    .and_then(|pid| pid.parse().ok())
+                    .filter(|pid| *pid != 0),
+            }
+        }
+
+        /// Why the manager would not run exactly what `definition` says, from its file, when it
+        /// would not.
+        ///
+        /// A drop-in that belongs to this unit alone can change anything about it, so there must
+        /// be none. Drop-ins every service reads are the host's own and are left to it, but the
+        /// command the manager runs must still be the definition's: the program and every
+        /// argument.
+        pub(super) fn difference(&self, definition: &Definition) -> Option<String> {
+            let name = definition.target();
+            match &self.fragment {
+                Some(fragment) if same_file(fragment, &definition.path) => {}
+                Some(fragment) => {
+                    return Some(format!(
+                        "the user manager loads {name} from {}, not from the definition kr wrote, \
+                         {}",
+                        fragment.display(),
+                        definition.path.display()
+                    ));
+                }
+                None => {
+                    return Some(format!(
+                        "the user manager has not read the definition kr wrote, {} ({name} is {})",
+                        definition.path.display(),
+                        self.load_state
+                    ));
+                }
+            }
+            if self.drop_ins.contains(&format!("/{name}.d/")) {
+                return Some(format!(
+                    "the user manager reads drop-ins of {name}'s own, {}, which change what kr \
+                     wrote; remove them",
+                    self.drop_ins
+                ));
+            }
+            let program = format!("path={} ;", definition.program);
+            let arguments = format!("argv[]={} ;", definition.arguments.join(" "));
+            if !(self.exec_start.contains(&program) && self.exec_start.contains(&arguments)) {
+                return Some(format!(
+                    "the user manager runs another command for {name}: {}",
+                    self.exec_start
+                ));
+            }
+            None
+        }
     }
 
-    /// Has the user manager read the definition just written, and checks that it reads it from
-    /// where it was written.
-    pub(super) fn take(definition: &Definition, _rewritten: bool) -> Result<Vec<String>> {
+    fn unit(name: &str) -> std::result::Result<Unit, String> {
+        let output = succeeded(&["show", PROPERTIES, name])?;
+        Ok(Unit::read(&String::from_utf8_lossy(&output.stdout)))
+    }
+
+    /// Has the user manager read the definition just written, and checks that it would run exactly
+    /// that, from where it was written.
+    pub(super) fn take(definition: &Definition) -> Result<Vec<String>> {
         let failed = |why: String| CliError::HostUnavailable(why);
         succeeded(&["daemon-reload"]).map_err(failed)?;
-        let name = definition.target();
-        let found = unit(&name).map_err(failed)?;
-        match found.fragment {
-            Some(fragment) if same_file(&fragment, &definition.path) => Ok(Vec::new()),
-            fragment => Err(CliError::HostUnavailable(format!(
-                "the user manager does not read {} (it has {name} {}): it reads unit files from \
-                 another directory than this command writes them to, so the definition is not \
-                 in use; kr host startup --clear removes it",
-                definition.path.display(),
-                fragment.map_or_else(
-                    || found.load_state.clone(),
-                    |fragment| format!("from {}", fragment.display())
-                )
+        let found = unit(&definition.target()).map_err(failed)?;
+        match found.difference(definition) {
+            None => Ok(Vec::new()),
+            Some(why) => Err(CliError::HostUnavailable(format!(
+                "{why}; the definition is not in use, and kr host startup --clear removes it"
             ))),
         }
     }
@@ -1269,28 +1537,22 @@ mod platform {
         }
     }
 
-    /// Asks the user manager to start the unit the record names.
-    pub(super) fn start(record: &Record) -> std::result::Result<Asked, Refusal> {
+    /// Asks the user manager to start the unit the record names, with the environment's lock held,
+    /// once the manager is seen to hold exactly the checked definition.
+    pub(super) fn start(
+        record: &Record,
+        expected: &Definition,
+    ) -> std::result::Result<Asked, Refusal> {
         let name = record.target();
         let found = unit(&name).map_err(Refusal::Failed)?;
-        match &found.fragment {
-            Some(fragment) if same_file(fragment, &record.path) => {}
-            Some(fragment) => {
-                return Err(Refusal::NotSetUp(format!(
-                    "the user manager loads {name} from {}, not from the definition kr wrote, {}; \
-                     run kr host startup --set service",
-                    fragment.display(),
-                    record.path.display()
-                )));
-            }
-            None => {
-                return Err(Refusal::NotSetUp(format!(
-                    "the user manager has not read the definition kr wrote, {} ({name} is {}); run \
-                     kr host startup --set service",
-                    record.path.display(),
-                    found.load_state
-                )));
-            }
+        if let Some(why) = found.difference(expected) {
+            return Err(Refusal::NotSetUp(format!("{why}; {SETUP_ACTION}")));
+        }
+        if found.need_reload {
+            return Err(Refusal::NotSetUp(format!(
+                "the user manager has not read {} since it last changed; {SETUP_ACTION}",
+                Path::new(&expected.path).display()
+            )));
         }
         succeeded(&["start", &name]).map_err(Refusal::Failed)?;
         Ok(Asked {
@@ -1310,10 +1572,6 @@ mod platform {
     use crate::error::{CliError, Result};
 
     pub(super) const MANAGER: Option<Manager> = None;
-
-    pub(super) fn domains() -> Vec<Option<String>> {
-        Vec::new()
-    }
 
     /// Why the service start cannot be set up here, and what to do instead.
     fn unsupported() -> CliError {
@@ -1336,15 +1594,15 @@ mod platform {
     pub(super) fn render(
         _label: &str,
         _domain: Option<String>,
-        _arguments: &[String],
+        _arguments: Vec<String>,
         _working_directory: &str,
         _log: &str,
     ) -> Result<Definition> {
         Err(unsupported())
     }
 
-    pub(super) fn take(_definition: &Definition, _rewritten: bool) -> Result<Vec<String>> {
-        Ok(Vec::new())
+    pub(super) fn take(_definition: &Definition) -> Result<Vec<String>> {
+        Err(unsupported())
     }
 
     pub(super) fn release(_record: &Record) -> Result<Vec<String>> {
@@ -1355,12 +1613,11 @@ mod platform {
         Vec::new()
     }
 
-    pub(super) fn start(_record: &Record) -> std::result::Result<Asked, Refusal> {
-        Err(Refusal::NotSetUp(
-            "this platform has no service start; start the control daemon, kr-controller, for \
-             this environment"
-                .to_owned(),
-        ))
+    pub(super) fn start(
+        _record: &Record,
+        _expected: &Definition,
+    ) -> std::result::Result<Asked, Refusal> {
+        Err(Refusal::NotSetUp(unsupported().to_string()))
     }
 }
 
@@ -1376,6 +1633,13 @@ mod tests {
             domain: Some("gui/501".to_owned()),
             path: path.to_path_buf(),
             contents: contents.to_owned(),
+            program: "/opt/kr/kr-controller".to_owned(),
+            arguments: vec![
+                "/opt/kr/kr-controller".to_owned(),
+                "--state-dir".to_owned(),
+                "/state".to_owned(),
+            ],
+            working_directory: "/state/dir".to_owned(),
         }
     }
 
@@ -1391,42 +1655,41 @@ mod tests {
         let path = host.root().join("kr-controller-test.plist");
         let written = definition(&path, "the definition\n");
         let record = Record::of(&written);
-        let expected = std::slice::from_ref(&written);
 
-        assert_eq!(state(&path, Some(&record), expected), State::Missing);
-        assert_eq!(state(&path, None, expected), State::Missing);
+        assert_eq!(state(&path, Some(&record), &written), State::Missing);
+        assert_eq!(state(&path, None, &written), State::Missing);
 
         kr_ipc::paths::write_owner_only_file(&path, written.contents.as_bytes()).expect("writes");
-        assert_eq!(state(&path, Some(&record), expected), State::Matches);
+        assert_eq!(state(&path, Some(&record), &written), State::Matches);
         assert_eq!(
-            state(&path, None, expected),
-            State::Matches,
-            "a file exactly as this installation writes it is the definition, recorded or not"
+            state(&path, None, &written),
+            State::Unrecorded,
+            "exactly what this installation writes, with no record of kr writing it"
         );
         let elsewhere = definition(&path, "another program's definition\n");
         assert_eq!(
-            state(&path, Some(&record), std::slice::from_ref(&elsewhere)),
+            state(&path, Some(&record), &elsewhere),
             State::Outdated,
             "what kr wrote, unchanged, but not what this installation writes now"
         );
 
         kr_ipc::paths::write_owner_only_file(&path, b"the definition, edited\n").expect("edits");
-        assert_eq!(state(&path, Some(&record), expected), State::Changed);
-        assert_eq!(state(&path, None, expected), State::Foreign);
+        assert_eq!(state(&path, Some(&record), &written), State::Changed);
+        assert_eq!(state(&path, None, &written), State::Foreign);
 
         kr_ipc::paths::write_owner_only_file(&path, written.contents.as_bytes()).expect("writes");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("widens");
         assert_eq!(
-            state(&path, None, expected),
+            state(&path, None, &written),
             State::Foreign,
             "kr writes a definition owner-only, so one others can write is not kr's"
         );
-        assert_eq!(state(&path, Some(&record), expected), State::Changed);
+        assert_eq!(state(&path, Some(&record), &written), State::Changed);
 
         std::fs::remove_file(&path).expect("removes");
         std::os::unix::fs::symlink(host.root().join("elsewhere"), &path).expect("links");
         assert_eq!(
-            state(&path, None, expected),
+            state(&path, None, &written),
             State::Foreign,
             "a link is not followed"
         );
@@ -1442,6 +1705,7 @@ mod tests {
             State::Changed,
             State::Foreign,
             State::Outdated,
+            State::Unrecorded,
         ] {
             let trouble = state.trouble(path).expect("a trouble");
             assert!(
@@ -1481,6 +1745,47 @@ mod tests {
         );
     }
 
+    /// Setup, removal and a start request exclude one another: a second holder waits, and says who
+    /// holds the lock when its wait runs out.
+    #[test]
+    fn one_command_at_a_time_holds_the_service_start() {
+        let host = kr_ipc::testing::TempHost::create();
+        let environment = host.environment();
+        let held = Lock::take_within(&environment, Duration::ZERO).expect("the first takes it");
+        let refused = Lock::take_within(&environment, Duration::from_millis(100))
+            .expect_err("the second waits and gives up");
+        assert!(refused.contains(LOCK_FILE), "{refused}");
+        drop(held);
+        Lock::take_within(&environment, Duration::ZERO).expect("free once the first lets go");
+    }
+
+    /// A file moved aside for a check goes back where it was, and never over a file that took its
+    /// place meanwhile.
+    #[test]
+    fn a_file_moved_aside_goes_back_only_where_nothing_took_its_place() {
+        let host = kr_ipc::testing::TempHost::create();
+        let path = host.root().join("kr-controller-test.plist");
+        assert_eq!(move_aside(&path), Ok(None), "nothing there to move");
+
+        kr_ipc::paths::write_owner_only_file(&path, b"what kr wrote\n").expect("writes");
+        let aside = move_aside(&path).expect("moves").expect("a file");
+        assert!(!path.exists() && moved_is(&aside, "what kr wrote\n"));
+        assert!(!moved_is(&aside, "something else\n"));
+        put_back(&aside, &path).expect("goes back");
+        assert!(!aside.exists());
+        assert_eq!(std::fs::read(&path).expect("back"), b"what kr wrote\n");
+
+        let aside = move_aside(&path).expect("moves").expect("a file");
+        std::fs::write(&path, b"written meanwhile\n").expect("somebody writes there");
+        let left = put_back(&aside, &path).expect_err("not over the new file");
+        assert!(left.contains(&aside.display().to_string()), "{left}");
+        assert_eq!(std::fs::read(&path).expect("kept"), b"written meanwhile\n");
+        assert!(
+            aside.exists(),
+            "and the moved file is where the sentence says"
+        );
+    }
+
     /// A definition names only paths either manager can be told exactly.
     #[cfg(unix)]
     #[test]
@@ -1505,7 +1810,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_launchd_job_is_started_only_when_asked_in_its_domains_session_type() {
-        let arguments = [
+        let arguments = vec![
             "/opt/k&r/kr-controller".to_owned(),
             "--runtime-dir".to_owned(),
             "/tmp/<runtime>".to_owned(),
@@ -1513,7 +1818,7 @@ mod tests {
         let graphical = platform::render(
             "kr-controller-test",
             Some("gui/501".to_owned()),
-            &arguments,
+            arguments.clone(),
             "/state/dir",
             "/state/dir/controller.log",
         )
@@ -1537,10 +1842,12 @@ mod tests {
                 .ends_with("Library/LaunchAgents/kr-controller-test.plist")
         );
         assert_eq!(graphical.target(), "gui/501/kr-controller-test");
+        assert_eq!(graphical.program, "/opt/k&r/kr-controller");
+        assert_eq!(graphical.arguments, arguments);
         let background = platform::render(
             "kr-controller-test",
             Some("user/501".to_owned()),
-            &arguments,
+            arguments,
             "/state/dir",
             "/state/dir/controller.log",
         )
@@ -1552,20 +1859,69 @@ mod tests {
         );
     }
 
+    /// What launchd holds is read from its own description: the definition's file, the program,
+    /// every argument and the working directory, and a process when there is one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_loaded_job_is_read_from_launchds_description() {
+        let printed = "user/501/kr-controller-test = {\n\
+                       \tactive count = 1\n\
+                       \tpath = /Users/someone/Library/LaunchAgents/kr-controller-test.plist\n\
+                       \tstate = running\n\
+                       \n\
+                       \tprogram = /opt/kr/kr-controller\n\
+                       \targuments = {\n\
+                       \t\t/opt/kr/kr-controller\n\
+                       \t\t--state-dir\n\
+                       \t\t/a b/c\n\
+                       \t}\n\
+                       \n\
+                       \tworking directory = /state/dir\n\
+                       \tdefault environment = {\n\
+                       \t\tPATH => /usr/bin:/bin\n\
+                       \t}\n\
+                       \tpid = 4242\n\
+                       \tendpoints = {\n\
+                       \t\tstate = not running\n\
+                       \t}\n\
+                       }\n";
+        let loaded = platform::Loaded::read(printed);
+        assert_eq!(
+            loaded,
+            platform::Loaded::read(printed),
+            "reading is deterministic"
+        );
+        let debug = format!("{loaded:?}");
+        for expected in [
+            "/Users/someone/Library/LaunchAgents/kr-controller-test.plist",
+            "/opt/kr/kr-controller",
+            "\"--state-dir\", \"/a b/c\"",
+            "/state/dir",
+            "4242",
+        ] {
+            assert!(debug.contains(expected), "{expected}: {debug}");
+        }
+        assert!(
+            !debug.contains("PATH =>"),
+            "nested sections are not arguments: {debug}"
+        );
+    }
+
     /// KR-REQ-07.12: a systemd user unit runs the daemon with this installation's roots, in the
-    /// environment's own directory, only when started, with every word taken exactly as it is.
+    /// environment's own directory, only when started, with every word taken exactly as it is,
+    /// a dollar sign in the program's own path included.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_user_unit_is_started_only_when_asked_and_takes_every_word_as_it_is() {
-        let arguments = [
-            "/opt/k r/kr-controller".to_owned(),
+        let arguments = vec![
+            "/opt/k r$HOME/kr-controller".to_owned(),
             "--state-dir".to_owned(),
             "/tmp/100%/$HOME/\"q\"\\".to_owned(),
         ];
         let unit = platform::render(
             "kr-controller-test",
             None,
-            &arguments,
+            arguments.clone(),
             "/state/50%",
             "/state/50%/controller.log",
         )
@@ -1573,7 +1929,7 @@ mod tests {
         let contents = &unit.contents;
         for expected in [
             "Type=exec\n",
-            "ExecStart=\"/opt/k r/kr-controller\" \"--state-dir\" \"/tmp/100%%/$$HOME/\\\"q\\\"\\\\\"\n",
+            "ExecStart=\":/opt/k r$HOME/kr-controller\" \"--state-dir\" \"/tmp/100%%/$HOME/\\\"q\\\"\\\\\"\n",
             "WorkingDirectory=/state/50%%\n",
             "StandardOutput=append:/state/50%%/controller.log\n",
             "UMask=0077\n",
@@ -1590,5 +1946,81 @@ mod tests {
                 .ends_with("systemd/user/kr-controller-test.service")
         );
         assert_eq!(unit.target(), "kr-controller-test.service");
+        assert_eq!(unit.program, "/opt/k r$HOME/kr-controller");
+        assert_eq!(unit.arguments, arguments);
+    }
+
+    /// The user manager's own description decides whether it would run exactly the definition: the
+    /// file it loaded, drop-ins of the unit's own, and the command.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_user_unit_differs_when_the_manager_would_run_anything_else() {
+        let written = Definition {
+            manager: Manager::Systemd,
+            domain: None,
+            ..definition(
+                Path::new("/home/someone/.config/systemd/user/kr-controller-test.service"),
+                "the unit\n",
+            )
+        };
+        let described = |fragment: &str, drop_ins: &str, command: &str| {
+            platform::Unit::read(&format!(
+                "LoadState=loaded\nFragmentPath={fragment}\nDropInPaths={drop_ins}\n\
+                 NeedDaemonReload=no\nExecStart={{ path={} ; argv[]={} ; ignore_errors=no ; \
+                 start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }}\n\
+                 MainPID=0\n",
+                command,
+                command_line(command)
+            ))
+        };
+        fn command_line(program: &str) -> String {
+            format!("{program} --state-dir /state")
+        }
+        let path = written.path.display().to_string();
+        assert_eq!(
+            described(&path, "", "/opt/kr/kr-controller").difference(&written),
+            None
+        );
+        assert_eq!(
+            described(
+                &path,
+                "/usr/lib/systemd/user/service.d/10-timeout-abort.conf",
+                "/opt/kr/kr-controller"
+            )
+            .difference(&written),
+            None,
+            "a drop-in every service reads is the host's own"
+        );
+        for (fragment, drop_ins, command, what) in [
+            (
+                "/etc/systemd/user/kr-controller-test.service",
+                "",
+                "/opt/kr/kr-controller",
+                "loads kr-controller-test.service from",
+            ),
+            (
+                path.as_str(),
+                "/home/someone/.config/systemd/user/kr-controller-test.service.d/override.conf",
+                "/opt/kr/kr-controller",
+                "drop-ins of kr-controller-test.service's own",
+            ),
+            (
+                path.as_str(),
+                "",
+                "/opt/other/kr-controller",
+                "another command",
+            ),
+        ] {
+            let why = described(fragment, drop_ins, command)
+                .difference(&written)
+                .expect("a difference");
+            assert!(why.contains(what), "{what}: {why}");
+        }
+        assert!(
+            platform::Unit::read("LoadState=not-found\nFragmentPath=\n")
+                .difference(&written)
+                .expect("not read")
+                .contains("has not read the definition")
+        );
     }
 }
