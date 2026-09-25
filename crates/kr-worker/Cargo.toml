@@ -78,8 +78,9 @@ kr-cbor.workspace = true
 # so the measurement uses the client library rather than a second opinion about it.
 kr-client = { workspace = true, features = ["terminal"] }
 # The host tests start a real control daemon beside a real worker. The dependency is only in
-# tests, so the two crates do not depend on each other at build time.
-kr-controller.workspace = true
+# tests, so the two crates do not depend on each other at build time. Its test support registers
+# the environment's scheduled task a Windows daemon starts each worker through.
+kr-controller = { workspace = true, features = ["testing"] }
 kr-ipc = { workspace = true, features = ["testing"] }
 # The committed time fixture is JSON, and so is the shell package manifest the host tests describe:
 # one records what three operating systems report, the other an installation of their own.
