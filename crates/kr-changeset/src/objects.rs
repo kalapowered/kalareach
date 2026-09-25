@@ -101,7 +101,7 @@ impl ObjectStore {
                     // before this returns, because a caller is about to commit a version row that
                     // names this object and a name that is not durable is a version whose content
                     // a power failure can take away.
-                    shelf.sync()?;
+                    shelf.sync(kr_ipc::paths::NameKind::File)?;
                     return Ok(digest);
                 }
                 // The name **is** the digest of the content, so a file at it that hashes to
@@ -156,12 +156,12 @@ impl ObjectStore {
         let _ = shelf.remove(&temporary);
         match published {
             Ok(()) => {
-                shelf.sync()?;
+                shelf.sync(kr_ipc::paths::NameKind::File)?;
                 Ok(digest)
             }
             Err(error) => {
                 if matches!(self.reads_back(digest)?, ReadBack::Content) {
-                    shelf.sync()?;
+                    shelf.sync(kr_ipc::paths::NameKind::File)?;
                     Ok(digest)
                 } else {
                     Err(ChangeSetError::StorageUnavailable {

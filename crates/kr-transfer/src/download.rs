@@ -19,6 +19,7 @@
 
 use std::io::Write as _;
 
+use kr_ipc::paths::NameKind;
 use kr_protocol::ids::{ActorId, GrantId, TransferId};
 use kr_protocol::scalars::{Bytes, Digest256, TimestampMs, U64};
 use kr_protocol::transfer::{
@@ -547,7 +548,7 @@ impl TransferService {
             }
         };
         // The name is durable before the record that says it serves bytes.
-        self.staging.snapshots().sync()?;
+        self.staging.snapshots().sync(NameKind::File)?;
         let mut destination = self
             .staging
             .snapshots()
@@ -638,7 +639,7 @@ impl TransferService {
         {
             let name = snapshot_name(row.transfer_id, stored)?;
             self.staging.snapshots().remove(&name)?;
-            self.staging.snapshots().sync()?;
+            self.staging.snapshots().sync(NameKind::File)?;
         }
         self.locked()?.release_snapshot_payload(row.transfer_id)
     }
@@ -1164,7 +1165,7 @@ impl<'destination> DownloadWriter<'destination> {
                 self.placement.destination_name
             )));
         }
-        self.destination.sync()?;
+        self.destination.sync(NameKind::File)?;
         // Taken only now. Until this point the drop still owns the temporary name, so a failure
         // anywhere above leaves nothing partial behind.
         self.temporary = None;

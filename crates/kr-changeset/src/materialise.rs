@@ -167,7 +167,7 @@ pub fn materialise(
         // byte is written until the row is in.
         drop(directory);
         let _ = parent.handle().remove_dir(&directory_name);
-        let _ = parent.sync();
+        let _ = parent.sync(kr_ipc::paths::NameKind::Directory);
         return Err(error);
     }
     let mut written = 0_u64;
@@ -180,7 +180,7 @@ pub fn materialise(
             Err(_) => held.unapplied.push(entry.path.clone()),
         }
     }
-    directory.sync()?;
+    directory.sync(kr_ipc::paths::NameKind::File)?;
     held.paths_written = U64::new(written);
     service
         .locked()?
@@ -225,7 +225,7 @@ fn write_path(
         .sync_all()
         .map_err(ChangeSetError::storage)?;
     set_executable(&file, entry.executable)?;
-    here.sync()?;
+    here.sync(kr_ipc::paths::NameKind::File)?;
     // What this host left behind, so a re-read can tell a file nobody touched from one a run
     // rewrote with the same bytes: the object, its length, and when it was last written.
     let identity = file.identity();
@@ -951,7 +951,7 @@ pub fn release(
                 .handle()
                 .remove_dir(name.as_str())
                 .map_err(ChangeSetError::storage)?;
-            parent.sync()?;
+            parent.sync(kr_ipc::paths::NameKind::Directory)?;
         }
         // A plain absence is a release that already happened. Anything else is a failure: this
         // host does not record a release it could not establish.

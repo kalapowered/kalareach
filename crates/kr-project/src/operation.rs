@@ -250,7 +250,7 @@ impl Destination {
                     .into()
                 },
             })?;
-        parent.sync()?;
+        parent.sync(kr_ipc::paths::NameKind::Directory)?;
         Ok(parent.subdirectory(&self.name)?)
     }
 
@@ -573,7 +573,7 @@ pub(crate) fn remove_staging_directory(
             )
             .into(),
         })?;
-    parent.sync()?;
+    parent.sync(kr_ipc::paths::NameKind::Directory)?;
     Ok(())
 }
 
@@ -692,7 +692,7 @@ pub fn publish(
     let staged = found.identity;
     let tree = RelativeName::parse(STAGED_TREE)?;
     rename_no_replace(&staging.directory, &tree, parent, destination.name())?;
-    parent.sync()?;
+    parent.sync(kr_ipc::paths::NameKind::Directory)?;
     // The object at the destination has to be the object that was staged. A rename preserves the
     // identity, so a mismatch here is something else having taken the name.
     let published = parent.subdirectory(destination.name())?;

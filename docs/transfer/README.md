@@ -214,15 +214,15 @@ none of them says what the staging area holds.
 The directory that names a payload is flushed before the record that depends on it commits: after a
 `create`, after the rename that publishes, and after each directory of the staging tree is created.
 Without that a power loss could leave SQLite saying `published` while the rename was still only in
-the page cache. The flush opens a descriptor of its own for the directory, because the handle this
-service holds may be a reference to the directory rather than a file description, which is what
-Linux gives for an ordinary directory open and refuses to flush.
+the page cache. The flush opens the directory a second time from the handle this service holds,
+never through its name. On Unix that second descriptor is opened for reading, because the handle
+held may be a reference to the directory rather than a file description, which is what Linux gives
+for an ordinary directory open and refuses to flush. Windows flushes a directory only through a
+handle that may add to it, so there the second handle holds the right to add a file for a payload's
+name, and the right to add a directory for a staging directory's.
 
-On Windows there is no directory flush to make: the platform refuses one on a directory handle, and
-a rename inside one volume is its own ordered metadata operation. So the ordering above is a Unix
-guarantee, and on Windows the guarantee is that rename's own. A retried `upload.finish` resolves a
-`publishing` row the same way, so a caller does not have to wait for the next start to learn what
-happened.
+A retried `upload.finish` resolves a `publishing` row the same way, so a caller does not have to
+wait for the next start to learn what happened.
 
 Cleanup is owned by the row, not by the caller that happened to close it. Closing an upload or a
 snapshot marks it as still holding a payload, and the reservation is released only when the file is
