@@ -2473,9 +2473,10 @@ uploader asks whether the service holds the unknown one. If it does, the publica
 the newer one: the generation is written down as published and keeps everything. If not, it never
 will, so each of its objects is deleted once, and the service gives the storage back after its
 tombstone window. Each deletion is written down in `backup.sqlite`'s `releases` table before its
-request leaves, and its answer after. An object that another generation this host still holds also
-names is kept, because the service holds one object under one name, and the store refuses to write
-a deletion of such an object down. From the moment a deletion is written down no generation this host
+request leaves, and its answer after. An object that another generation this host records also
+names is kept, whatever that generation's state, because the service holds one object under one
+name and an unknown generation may yet be one the service holds; the store refuses to write a
+deletion of such an object down. From the moment a deletion is written down no generation this host
 admits names that object, so neither the request, a later one for the same object, nor one delayed
 on its way can reach an object admitted after it. Nothing is deleted under privacy mode's line,
 whose retained artifacts go only by the person's own action, and nothing of a collection deleted

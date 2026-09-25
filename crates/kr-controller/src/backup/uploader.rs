@@ -81,14 +81,15 @@
 //! which it does if the publication landed before the newer one: that one is written down as
 //! published and keeps everything. Otherwise it never will, and each of its objects is deleted
 //! once and the answer written down, and the service gives the storage back after its tombstone
-//! window. An object another generation this host still holds also names is kept, because the
-//! service holds one object under one name. A deletion is written down before its request leaves,
-//! in a write the store refuses for such an object, and from then on no generation this host
-//! admits names that object, so neither that request, a later one, nor one delayed on its way can
-//! reach an object admitted after it. Nothing is deleted under privacy mode's line, whose
-//! retained artifacts go only by the person's own action, nor from a collection deleted from the
-//! account console, which the service empties itself; privacy mode is read again after every
-//! answer the service gives, since it may have moved while this host waited.
+//! window. An object another generation this host records also names is kept, whatever that
+//! generation's state, because the service holds one object under one name and an outcome this
+//! host cannot establish may still be a publication the service holds. A deletion is written down
+//! before its request leaves, in a write the store refuses for such an object, and from then on no
+//! generation this host admits names that object, so neither that request, a later one, nor one
+//! delayed on its way can reach an object admitted after it. Nothing is deleted under privacy
+//! mode's line, whose retained artifacts go only by the person's own action, nor from a collection
+//! deleted from the account console, which the service empties itself; privacy mode is read again
+//! after every answer the service gives, since it may have moved while this host waited.
 //!
 //! # A restart with a publication on its way
 //!
@@ -1488,9 +1489,11 @@ impl Uploader {
     /// Each such generation is asked about until the service is known not to hold it: this
     /// process asked, or a deletion of one of its objects is written down, which is only ever
     /// asked for after that. Then each object of it is deleted that is not yet written down as
-    /// released and that no other generation this host records names, unless that generation is
-    /// one no publication can name either and the service is known not to hold. Nothing is done
-    /// under privacy mode, whose retained artifacts are deleted only by the person's own action.
+    /// released and that no other generation this host records names, whatever that generation's
+    /// state: the service holds one object under one name, and an outcome this host cannot
+    /// establish may still be a publication the service holds. The store decides the same again
+    /// when the deletion is written down, before its request leaves. Nothing is done under privacy
+    /// mode, whose retained artifacts are deleted only by the person's own action.
     fn reclaimable(&self, outbox: &[Attempt], privacy: &PrivacyStatus) -> Result<Vec<Reclaim>> {
         if privacy.inhibited_at().is_some() {
             return Ok(Vec::new());
@@ -1532,13 +1535,6 @@ impl Uploader {
                     .push(record.backup_generation);
             }
         }
-        let settled = |archive_id: ArchiveId, backup_generation: BackupGeneration| {
-            behind.iter().any(|(left, _, unheld)| {
-                *unheld
-                    && left.archive_id == archive_id
-                    && left.backup_generation == backup_generation
-            })
-        };
         let mut work = Vec::new();
         for (record, objects, unheld) in &behind {
             let unreleased = objects
@@ -1551,14 +1547,12 @@ impl Uploader {
                 continue;
             }
             for object in unreleased {
-                let held_elsewhere = named
+                let named_elsewhere = named
                     .get(&(object.archive_id, object.object_id))
                     .into_iter()
                     .flatten()
-                    .any(|other| {
-                        *other != record.backup_generation && !settled(record.archive_id, *other)
-                    });
-                if !held_elsewhere {
+                    .any(|other| *other != record.backup_generation);
+                if !named_elsewhere {
                     work.push(Reclaim::Delete(record.clone(), object.clone()));
                 }
             }

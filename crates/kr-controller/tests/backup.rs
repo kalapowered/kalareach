@@ -5431,7 +5431,7 @@ fn as_version_6(state: &std::path::Path) {
              DROP TABLE uploads;
              DROP TRIGGER a_deletion_is_asked_for_once;
              DROP TRIGGER only_an_object_of_an_unknown_generation_is_deleted;
-             DROP TRIGGER an_object_a_held_generation_names_is_not_deleted;
+             DROP TRIGGER an_object_another_generation_names_is_not_deleted;
              DROP TRIGGER a_deletion_asked_for_keeps_what_it_is;
              DROP TRIGGER a_deletion_asked_for_is_never_taken_back;
              DROP TRIGGER an_object_this_host_asked_to_delete_is_named_no_more;
@@ -5525,14 +5525,17 @@ fn a_version_6_store_holding_a_rule_this_build_never_wrote_is_refused_and_left_a
     assert_eq!(release_objects(&connection), 0);
 }
 
-/// A deletion is written down before it is asked for, once, only for an object of a generation
-/// whose outcome is unknown, and only when no generation this host still holds names it; its
-/// answer is written once. Nothing changes or takes either back, no generation admitted afterwards
-/// names that object, and a restart reads both back.
+/// A deletion is written down before it is asked for, once, and the store decides it from its own
+/// state: only for an object of a generation whose outcome is unknown, once a newer generation of
+/// its archive is published, while privacy mode holds no fence, and only when no other generation
+/// this host records names the object, whatever that generation's state. Its answer is written
+/// once, nothing changes or takes either back, no generation admitted afterwards names that
+/// object, and a restart reads both back.
 #[test]
-fn a_deletion_is_asked_for_once_only_for_what_no_held_generation_names_and_never_unsaid() {
+fn a_deletion_is_asked_for_once_only_for_what_no_other_generation_names_and_never_unsaid() {
     let (_root, state) = state_directory();
     let producer = Producer::generate();
+    let writer = producer.writer.key_id();
     // Two generations, each naming an object of its own and the same encrypted manifest.
     let first = [stage(1, "a.cbor", b"one")];
     let second = [stage(2, "b.cbor", b"two")];
@@ -5542,7 +5545,7 @@ fn a_deletion_is_asked_for_once_only_for_what_no_held_generation_names_and_never
             .reconcile(TimestampMs::new(4_000))
             .expect("the startup reconciliation");
         service
-            .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+            .enrol_writer(writer, archive_id(), TimestampMs::new(1))
             .expect("the writer is enrolled");
         let mut admitted = Vec::new();
         for (generation, objects) in [(1, &first), (2, &second)] {
@@ -5550,7 +5553,7 @@ fn a_deletion_is_asked_for_once_only_for_what_no_held_generation_names_and_never
                 .admit(
                     &producer.seal(generation, objects),
                     objects,
-                    producer.writer.key_id(),
+                    writer,
                     TimestampMs::new(5_000 + generation),
                 )
                 .expect("the generation is admitted")
@@ -5564,35 +5567,79 @@ fn a_deletion_is_asked_for_once_only_for_what_no_held_generation_names_and_never
     };
     let (generation_one, generation_two) = (BackupGeneration::new(1), BackupGeneration::new(2));
     let (own, shared) = (object_id(1), object_id(0xf0));
+    {
+        let mut store = BackupStore::open(&state).expect("the backup store");
+        // A generation still producing has nothing deleted.
+        let producing =
+            store.note_deletion_asked(archive_id(), generation_one, own, TimestampMs::new(6_000));
+        assert!(
+            matches!(producing, Err(ControllerError::InvalidArgument(_))),
+            "{producing:?}"
+        );
+        // Nor one whose outcome is unknown while no newer generation is published: its
+        // publication may still land.
+        store
+            .note_attempt_stopped(one, TimestampMs::new(6_100))
+            .expect("its upload stops");
+        store
+            .cancel_production(
+                archive_id(),
+                generation_one,
+                "given up",
+                TimestampMs::new(6_100),
+            )
+            .expect("its production ends");
+        let unpassed =
+            store.note_deletion_asked(archive_id(), generation_one, own, TimestampMs::new(6_200));
+        assert!(
+            matches!(unpassed, Err(ControllerError::InvalidArgument(_))),
+            "{unpassed:?}"
+        );
+        let unasked =
+            store.note_object_released(archive_id(), generation_one, own, TimestampMs::new(6_300));
+        assert!(
+            matches!(unasked, Err(ControllerError::InvalidArgument(_))),
+            "an answer to a deletion never asked for: {unasked:?}"
+        );
+    }
+
+    // A newer generation is published, naming an object of its own and the same manifest.
+    {
+        let service = BackupService::open(&state).expect("the service opens again");
+        service
+            .reconcile(TimestampMs::new(6_400))
+            .expect("the startup reconciliation");
+        let third = [stage(3, "c.cbor", b"three")];
+        let upload = service
+            .admit(
+                &producer.seal(3, &third),
+                &third,
+                writer,
+                TimestampMs::new(6_500),
+            )
+            .expect("the generation is admitted")
+            .sequence;
+        service
+            .note_dispatched(upload, EXECUTOR, TimestampMs::new(6_600))
+            .expect("its upload leaves");
+        let publication = dispatch_publication(
+            &service,
+            upload,
+            BackupGeneration::new(3),
+            TimestampMs::new(6_700),
+        );
+        service
+            .note_published(
+                publication,
+                PrivacyGeneration::new(0),
+                TimestampMs::new(6_800),
+            )
+            .expect("the service holds it");
+    }
+
     let mut store = BackupStore::open(&state).expect("the backup store");
-
-    // A generation still producing has nothing deleted.
-    let producing =
-        store.note_deletion_asked(archive_id(), generation_one, own, TimestampMs::new(6_000));
-    assert!(
-        matches!(producing, Err(ControllerError::InvalidArgument(_))),
-        "{producing:?}"
-    );
-
-    // The first generation ends with its outcome unknown: an object only it names may be deleted,
-    // and the manifest the second generation, still producing, names too may not.
-    store
-        .note_attempt_stopped(one, TimestampMs::new(6_100))
-        .expect("its upload stops");
-    store
-        .cancel_production(
-            archive_id(),
-            generation_one,
-            "given up",
-            TimestampMs::new(6_100),
-        )
-        .expect("its production ends");
-    let unasked =
-        store.note_object_released(archive_id(), generation_one, own, TimestampMs::new(6_500));
-    assert!(
-        matches!(unasked, Err(ControllerError::InvalidArgument(_))),
-        "an answer to a deletion never asked for: {unasked:?}"
-    );
+    // An object only the unknown generation names may be deleted now; the manifest two other
+    // generations name may not.
     store
         .note_deletion_asked(archive_id(), generation_one, own, TimestampMs::new(7_000))
         .expect("an object only it names may be deleted");
@@ -5607,7 +5654,8 @@ fn a_deletion_is_asked_for_once_only_for_what_no_held_generation_names_and_never
         "{named:?}"
     );
 
-    // Asked for once: asking again after an unanswered request writes nothing new.
+    // Asked for once: asking again after an unanswered request writes nothing new, and the answer
+    // is written once.
     store
         .note_deletion_asked(archive_id(), generation_one, own, TimestampMs::new(8_000))
         .expect("asked again");
@@ -5618,7 +5666,8 @@ fn a_deletion_is_asked_for_once_only_for_what_no_held_generation_names_and_never
         .note_object_released(archive_id(), generation_one, own, TimestampMs::new(10_000))
         .expect("the same answer again changes nothing");
 
-    // Once the second generation ends that way too, the manifest they share may be deleted.
+    // Nor is the manifest deleted once the second generation ends with its outcome unknown too:
+    // that outcome may still be a publication the service holds, naming the manifest.
     store
         .note_attempt_stopped(two, TimestampMs::new(11_000))
         .expect("its upload stops");
@@ -5630,14 +5679,16 @@ fn a_deletion_is_asked_for_once_only_for_what_no_held_generation_names_and_never
             TimestampMs::new(11_000),
         )
         .expect("its production ends");
-    store
-        .note_deletion_asked(
-            archive_id(),
-            generation_one,
-            shared,
-            TimestampMs::new(12_000),
-        )
-        .expect("the shared manifest may be deleted");
+    let still_named = store.note_deletion_asked(
+        archive_id(),
+        generation_one,
+        shared,
+        TimestampMs::new(12_000),
+    );
+    assert!(
+        matches!(still_named, Err(ControllerError::Refused { .. })),
+        "{still_named:?}"
+    );
 
     let deletions =
         |store: &BackupStore| -> Vec<(BackupObjectId, Option<TimestampMs>, Option<TimestampMs>)> {
@@ -5660,12 +5711,13 @@ fn a_deletion_is_asked_for_once_only_for_what_no_held_generation_names_and_never
             Some(TimestampMs::new(7_000)),
             Some(TimestampMs::new(9_000)),
         ),
-        (shared, Some(TimestampMs::new(12_000)), None),
+        (shared, None, None),
     ];
     assert_eq!(deletions(&store), expected);
     drop(store);
 
-    // No generation admitted afterwards names an object this host asked to delete.
+    // No generation admitted afterwards names an object this host asked to delete, and while
+    // privacy mode holds a fence nothing is asked for.
     {
         let service = BackupService::open(&state).expect("the service opens again");
         service
@@ -5673,9 +5725,9 @@ fn a_deletion_is_asked_for_once_only_for_what_no_held_generation_names_and_never
             .expect("the startup reconciliation");
         let again = [stage(1, "a.cbor", b"one again")];
         let reused = service.admit(
-            &producer.seal(3, &again),
+            &producer.seal(4, &again),
             &again,
-            producer.writer.key_id(),
+            writer,
             TimestampMs::new(13_000),
         );
         assert!(
@@ -5684,11 +5736,28 @@ fn a_deletion_is_asked_for_once_only_for_what_no_held_generation_names_and_never
         );
         assert!(
             service
-                .generation(archive_id(), BackupGeneration::new(3))
+                .generation(archive_id(), BackupGeneration::new(4))
                 .expect("a read")
                 .is_none()
         );
+        // Accepted and not yet raised: this host is at the same privacy generation, and privacy
+        // mode already holds.
+        service
+            .accept_privacy_request(PrivacyGeneration::new(1), TimestampMs::new(14_000))
+            .expect("privacy mode is asked for");
     }
+    let mut store = BackupStore::open(&state).expect("the backup store");
+    let fenced = store.note_deletion_asked(
+        archive_id(),
+        generation_two,
+        object_id(2),
+        TimestampMs::new(15_000),
+    );
+    assert!(
+        matches!(fenced, Err(ControllerError::Refused { .. })),
+        "{fenced:?}"
+    );
+    drop(store);
 
     // Nothing that writes to the database changes or takes back a deletion, or names its object.
     let connection =
@@ -7744,6 +7813,18 @@ async fn an_unknown_generation_privacy_mode_keeps_is_never_deleted() {
             "{object:?}"
         );
     }
+    // The store refuses it too, whoever asks: the generation belongs to the line privacy mode drew.
+    let mut store = BackupStore::open(&host.state).expect("the backup store");
+    let refused = store.note_deletion_asked(
+        archive_id(),
+        BackupGeneration::new(1),
+        member_of(1, 0),
+        TimestampMs::new(36_000),
+    );
+    assert!(
+        matches!(refused, Err(ControllerError::Refused { .. })),
+        "{refused:?}"
+    );
 }
 
 /// A collection deleted from the account console is the service's to empty: this host asks for

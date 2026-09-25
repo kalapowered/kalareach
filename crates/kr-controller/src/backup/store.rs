@@ -916,12 +916,13 @@ macro_rules! uploads_definition {
 /// once, and never asked for again. A deletion is written down before its request leaves, and the
 /// store decides in that write whether it may be asked for at all. Its rules: a deletion is asked
 /// for once, only for an object of a generation whose production ended with its outcome unknown,
-/// and only when every generation this host records that names the object ended that way too;
-/// what was asked for is never changed or taken back, and the answer is written once; and no
-/// generation admitted afterwards names an object this host asked to delete. So no object that a
-/// producing, complete or published generation names is ever asked for, and a request, or a later
-/// one for the same object, can never reach an object admitted after it. It holds identities and
-/// instants, as the rest of the store does.
+/// and only when no other generation this host records names the object, whatever that
+/// generation's state, since an outcome this host cannot establish may still be a publication the
+/// service holds; what was asked for is never changed or taken back, and the answer is written
+/// once; and no generation admitted afterwards names an object this host asked to delete. So no
+/// object another generation names is ever asked for, and a request, a later one for the same
+/// object, or one delayed on its way can never reach an object admitted after it. It holds
+/// identities and instants, as the rest of the store does.
 ///
 /// One text, in [`DEFINITION`] and in the step that brings a version-6 store to this schema, so the
 /// two cannot write these objects differently.
@@ -958,19 +959,15 @@ macro_rules! releases_definition {
                      SELECT RAISE(ABORT, 'only an object of a generation whose production ended \
                                           with its outcome unknown is deleted');
                  END;
-                 CREATE TRIGGER IF NOT EXISTS an_object_a_held_generation_names_is_not_deleted
+                 CREATE TRIGGER IF NOT EXISTS an_object_another_generation_names_is_not_deleted
                  BEFORE INSERT ON releases
                  WHEN EXISTS (SELECT 1 FROM objects
-                                JOIN generations
-                                  ON generations.archive_id = objects.archive_id
-                                 AND generations.backup_generation = objects.backup_generation
-                               WHERE objects.archive_id = NEW.archive_id
-                                 AND objects.object_id = NEW.object_id
-                                 AND NOT (generations.production = 'cancelled'
-                                          AND generations.remote = 'unknown'))
+                               WHERE archive_id = NEW.archive_id
+                                 AND object_id = NEW.object_id
+                                 AND backup_generation <> NEW.backup_generation)
                  BEGIN
-                     SELECT RAISE(ABORT, 'an object named by a generation this host still holds \
-                                          is not deleted');
+                     SELECT RAISE(ABORT, 'an object another backup generation names is not \
+                                          deleted');
                  END;
                  CREATE TRIGGER IF NOT EXISTS a_deletion_asked_for_keeps_what_it_is
                  BEFORE UPDATE ON releases
@@ -2506,18 +2503,24 @@ impl BackupStore {
     /// request leaves.
     ///
     /// The store decides here whether it may be asked for at all, in the transaction that writes
-    /// it down: the object's generation ended with its outcome unknown, and every generation this
-    /// host records that names the object ended that way too. From then on no generation this host
-    /// admits names the object, so the request, and any later one for the same object, can only
-    /// ever reach this object. A deletion already written down is left as it is, so asking again
-    /// after an unanswered request writes nothing new.
+    /// it down, from its own state and nothing a caller read before: the object's generation ended
+    /// with its outcome unknown; this host holds a newer generation of the archive as published,
+    /// so the service takes no publication of the old one any more; privacy mode holds no fence
+    /// and drew no line under the generation, whose retained artifacts go only by the person's own
+    /// action; and no other generation this host records names the object, whatever its state,
+    /// since an outcome this host cannot establish may still be a publication the service holds.
+    /// That the service does not hold the old generation is the caller's to have asked. From then
+    /// on no generation this host admits names the object, so the request, and any later one for
+    /// the same object, can only ever reach this object. A deletion already written down is left as
+    /// it is, so asking again after an unanswered request writes nothing new.
     ///
     /// # Errors
     ///
     /// Returns [`ControllerError::InvalidArgument`] when the object's generation did not end with
-    /// its outcome unknown, [`ControllerError::Refused`] when a generation this host still holds
-    /// names the object, and [`ControllerError::RegistryUnavailable`] when the store refuses the
-    /// write.
+    /// its outcome unknown or no newer generation of its archive is published,
+    /// [`ControllerError::Refused`] when privacy mode stands in the way or another generation this
+    /// host records names the object, and [`ControllerError::RegistryUnavailable`] when the store
+    /// refuses the write.
     pub fn note_deletion_asked(
         &mut self,
         archive_id: ArchiveId,
@@ -2568,25 +2571,64 @@ impl BackupStore {
                     .to_owned(),
             ));
         }
-        let held: i64 = transaction
+        let passed: i64 = transaction
             .read_one(
                 sql!(
-                    "SELECT COUNT(*) FROM objects
-                   JOIN generations
-                     ON generations.archive_id = objects.archive_id
-                    AND generations.backup_generation = objects.backup_generation
-                  WHERE objects.archive_id = ?1 AND objects.object_id = ?2
-                    AND NOT (generations.production = 'cancelled'
-                             AND generations.remote = 'unknown')"
+                    "SELECT COUNT(*) FROM generations
+                  WHERE archive_id = ?1 AND backup_generation > ?2 AND remote = 'published'"
                 ),
-                params![archive, object],
+                params![archive, generation],
                 |row| row.get(0),
             )
             .map_err(ControllerError::registry)?;
-        if held > 0 {
+        if passed == 0 {
+            return Err(ControllerError::InvalidArgument(
+                "no newer generation of that archive is published, so a publication of this one \
+                 may still land"
+                    .to_owned(),
+            ));
+        }
+        if let Some(fenced) = inhibited_at(&transaction)? {
             return Err(ControllerError::Refused {
                 code: kr_protocol::error::ErrorCode::PermissionDenied,
-                detail: "a backup generation this host still holds names that object".to_owned(),
+                detail: format!(
+                    "no backup object is deleted while privacy mode holds, fenced at privacy \
+                     generation {fenced}"
+                ),
+            });
+        }
+        let admitted_under: i64 = transaction
+            .read_one(
+                sql!(
+                    "SELECT privacy_generation FROM generations
+                  WHERE archive_id = ?1 AND backup_generation = ?2"
+                ),
+                params![archive, generation],
+                |row| row.get(0),
+            )
+            .map_err(ControllerError::registry)?;
+        if admitted_under != current_generation(&transaction)? {
+            return Err(ControllerError::Refused {
+                code: kr_protocol::error::ErrorCode::PermissionDenied,
+                detail: "that generation belongs to work privacy mode drew its line under, whose \
+                         objects go only by the person's own action"
+                    .to_owned(),
+            });
+        }
+        let named: i64 = transaction
+            .read_one(
+                sql!(
+                    "SELECT COUNT(*) FROM objects
+                  WHERE archive_id = ?1 AND object_id = ?2 AND backup_generation <> ?3"
+                ),
+                params![archive, object, generation],
+                |row| row.get(0),
+            )
+            .map_err(ControllerError::registry)?;
+        if named > 0 {
+            return Err(ControllerError::Refused {
+                code: kr_protocol::error::ErrorCode::PermissionDenied,
+                detail: "another backup generation this host records names that object".to_owned(),
             });
         }
         transaction
