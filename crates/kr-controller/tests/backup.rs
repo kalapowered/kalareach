@@ -5677,11 +5677,32 @@ fn a_deletion_is_asked_for_once_only_for_what_no_other_generation_names_and_neve
         .note_object_released(archive_id(), generation_one, own, TimestampMs::new(10_000))
         .expect("the same answer again changes nothing");
 
-    // Nor is the manifest deleted once the second generation ends with its outcome unknown too:
-    // that outcome may still be a publication the service holds, naming the manifest.
+    // A generation whose upload stopped with its outcome unknown goes on producing, and has
+    // nothing deleted while it does, even with a newer generation published and an object of its
+    // own.
     store
         .note_attempt_stopped(two, TimestampMs::new(11_000))
         .expect("its upload stops");
+    assert_eq!(
+        store
+            .generation(archive_id(), generation_two)
+            .expect("a read")
+            .map(|record| (record.production, record.remote)),
+        Some((Production::Producing, Remote::Unknown))
+    );
+    let still_producing = store.note_deletion_asked(
+        archive_id(),
+        generation_two,
+        object_id(2),
+        TimestampMs::new(11_050),
+    );
+    assert!(
+        matches!(still_producing, Err(ControllerError::InvalidArgument(_))),
+        "{still_producing:?}"
+    );
+
+    // Nor is the manifest deleted once the second generation ends with its outcome unknown too:
+    // that outcome may still be a publication the service holds, naming the manifest.
     store
         .cancel_production(
             archive_id(),
