@@ -2,7 +2,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-11.42 | every test below: the invocations the Claude Code bridge registers parse, and nothing else does |
+//! | KR-REQ-11.42 | every test below: the invocations the Claude Code, Gemini CLI and Qoder CLI bridges register parse, and nothing else does |
 //! | KR-REQ-11.43 | `outside_a_launch_a_hook_answers_neutrally_and_reaches_for_nothing` |
 
 mod common;
@@ -14,7 +14,8 @@ const SESSION_START: &[u8] = br#"{"session_id":"4d1c0a57-1b1e-4c3a-9d2e-6a0f0c5b
 
 /// KR-REQ-11.42: an unknown application, an unknown surface, a surface in the wrong case, an extra
 /// argument or an undeclared flag is refused before anything is read, on standard error, with the
-/// usage code, which is not the code Claude Code reads as a request to block.
+/// usage code, which is not the code Claude Code or Qoder CLI reads as a request to block. Gemini
+/// CLI and Qoder CLI have hooks and nothing else, so a channel is not a surface of theirs.
 #[test]
 fn kr_req_11_42_anything_but_a_registered_invocation_is_a_usage_error() {
     let placed = Placed::new();
@@ -29,6 +30,21 @@ fn kr_req_11_42_anything_but_a_registered_invocation_is_a_usage_error() {
         &["claude-code", "hook", "--close-after-hello"][..],
         &["relay", "extra"][..],
         &["--help-me"][..],
+        &["gemini-cli"][..],
+        &["gemini"][..],
+        &["gemini", "hook"][..],
+        &["Gemini-CLI", "hook"][..],
+        &["gemini-cli", "hooks"][..],
+        &["gemini-cli", "Hook"][..],
+        &["gemini-cli", "hook", "extra"][..],
+        &["gemini-cli", "channel"][..],
+        &["gemini-cli", "hook", "--close-after-hello"][..],
+        &["qoder-cli"][..],
+        &["qoder", "hook"][..],
+        &["qodercli", "hook"][..],
+        &["qoder-cli", "HOOK"][..],
+        &["qoder-cli", "hook", "--session", "4d1c0a57"][..],
+        &["qoder-cli", "channel"][..],
     ] {
         let ran = run_with_input(placed.command(arguments), SESSION_START);
         assert_eq!(
@@ -54,6 +70,8 @@ fn kr_req_11_42_anything_but_a_registered_invocation_is_a_usage_error() {
         &["--help"][..],
         &["--version"][..],
         &["claude-code", "--help"][..],
+        &["gemini-cli", "--help"][..],
+        &["qoder-cli", "--help"][..],
     ] {
         let ran = run_with_input(placed.command(arguments), b"");
         assert_eq!(ran.code, Some(0), "{arguments:?}");
