@@ -107,6 +107,16 @@ describe("the phone's bar, when the connection is lost for no stated reason (KR-
     })
   }
 
+  it('says the same when its first answer is a loss with a blank reason', async () => {
+    const { port, controls } = fakeHost()
+    controls.setConnected(false, '   ')
+    open(port)
+    await waitFor(() => {
+      expect(bar()?.textContent).toBe('Not in contact')
+    })
+    expect(bar()?.hasAttribute('title')).toBe(false)
+  })
+
   it('shows a reason with words as native code sent it, and keeps all of it in the title', async () => {
     const { port, controls } = fakeHost()
     open(port)

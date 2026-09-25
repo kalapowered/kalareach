@@ -722,6 +722,47 @@ test.describe('a session in a window 320 px wide', () => {
     wholeAndUnshrunk(narrow, wide, terminal)
     inReadingOrder(narrow)
     expect.soft(await runningPast(page.locator('main')), 'what runs past its own box').toEqual([])
+
+    // In View mode the heading says something else and the sizes can be pressed; it all still fits.
+    await page.getByRole('tab', { name: 'View' }).click()
+    await expect(page.getByTestId('raw-terminal')).toHaveAttribute('data-mode', 'view')
+    expect.soft(await pageOverflow(page), 'the page in View mode').toBeLessThanOrEqual(1)
+    expect
+      .soft(await runningPast(page.locator('main')), 'what runs past its own box in View mode')
+      .toEqual([])
+    inReadingOrder(await placed(footer))
+  })
+
+  test('the header fits and reads in order at every width up to a wide window, and with larger text', async ({
+    page
+  }) => {
+    await openSession(page)
+    const header = page.locator('.session-header')
+    const wide = await placed(header)
+    // Either side of the width where the sidebar goes, and the widths between a phone and a desktop.
+    for (const width of [360, 390, 480, 600, 719, 721, 800, 1024]) {
+      await page.setViewportSize({ width, height: 720 })
+      expect.soft(await pageOverflow(page), `the page at ${width} px`).toBeLessThanOrEqual(1)
+      expect.soft(await spill(header), `the header at ${width} px`).toBeLessThanOrEqual(1)
+      const placedNow = await placed(header)
+      wholeAndUnshrunk(placedNow, wide, { left: 0, right: width })
+      inReadingOrder(placedNow)
+    }
+
+    // A person's own larger text size: every size given in rem grows with it, controls included.
+    await page.setViewportSize({ width: 320, height: 720 })
+    for (const scale of ['125%', '150%']) {
+      await page.evaluate((size) => {
+        document.documentElement.style.fontSize = size
+      }, scale)
+      expect.soft(await pageOverflow(page), `the page with text at ${scale}`).toBeLessThanOrEqual(1)
+      expect.soft(await spill(header), `the header with text at ${scale}`).toBeLessThanOrEqual(1)
+      const grown = await placed(header)
+      for (const control of grown) {
+        expect.soft(control.right, `${control.name} inside the window with text at ${scale}`).toBeLessThanOrEqual(321)
+      }
+      inReadingOrder(grown)
+    }
   })
 
   test('the header and the footer still fit with touch targets of 44 and 48 px', async ({ page }) => {

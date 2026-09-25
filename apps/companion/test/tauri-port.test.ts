@@ -73,10 +73,15 @@ describe('the desktop port and the connection state', () => {
     return states
   }
 
-  it('takes a blank reason in as no reason, from a read and from a change', async () => {
+  it('takes a blank reason in as no reason when it reads the state', async () => {
     for (const blank of ['', '   ', '\n\t ']) {
       shell.answers.set('connection_state', lost(blank))
       expect(await tauriPort().connectionState()).toEqual(lost(null))
+    }
+  })
+
+  it('takes a blank reason in as no reason when it hears a change', async () => {
+    for (const blank of ['', '   ', '\n\t ']) {
       expect(await heard(lost(blank))).toEqual([lost(null)])
     }
   })
