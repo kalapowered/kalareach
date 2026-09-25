@@ -14,7 +14,6 @@
 
 #![cfg(unix)]
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -115,11 +114,14 @@ fn workspace() -> PathBuf {
     std::fs::canonicalize(&root).expect("the workspace")
 }
 
-/// The origin checker, copied to the internal disk, as everything a test launches runs from there.
+/// The origin checker, placed on the internal disk, as everything a test launches runs from there.
+///
+/// A process of its own writes the copy, so no child the other test starts meanwhile is handed a
+/// descriptor that holds it open for writing when this test starts it.
 fn checker(scratch: &Path) -> PathBuf {
-    let copy = scratch.join("kr-e2e-m1b-origin");
-    std::fs::copy(env!("CARGO_BIN_EXE_kr-e2e-m1b-origin"), &copy).expect("the checker copies");
-    copy
+    let placed = scratch.join("kr-e2e-m1b-origin");
+    kr_ipc::testing::place_program(Path::new(env!("CARGO_BIN_EXE_kr-e2e-m1b-origin")), &placed);
+    placed
 }
 
 /// Whether `said` repeats `origin`, whole or its part after the scheme.
@@ -199,10 +201,10 @@ fn each_script_refuses_what_the_product_refuses_before_it_prints_builds_or_sends
     let checker = checker(&scratch.0);
     let bin = scratch.0.join("bin");
     std::fs::create_dir(&bin).expect("a directory for the stand-in");
-    let stand_in = bin.join("cargo");
-    std::fs::write(&stand_in, STAND_IN).expect("the stand-in is written");
-    std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755))
-        .expect("the stand-in is executable");
+    // Written aside as text and placed by a process of its own, as the checker is.
+    let text = scratch.0.join("cargo.text");
+    std::fs::write(&text, STAND_IN).expect("the stand-in is written");
+    kr_ipc::testing::place_program(&text, &bin.join("cargo"));
     let record = scratch.0.join("asked");
     let artefacts = scratch.0.join("artefacts");
     let path = format!(

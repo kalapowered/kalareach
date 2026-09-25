@@ -92,5 +92,11 @@ portable-pty = { workspace = true, optional = true }
 # Signals by recorded process, and the modes of a terminal read from the device itself.
 rustix = { workspace = true, features = ["fs", "process", "termios"], optional = true }
 
+[dev-dependencies]
+# A program a test starts is placed by a process of its own, so that no child another test starts
+# holds it open for writing. Only the tests build it: the checker the scripts build and run
+# without the legs does not.
+kr-ipc = { workspace = true, features = ["testing"] }
+
 [lints]
 workspace = true
