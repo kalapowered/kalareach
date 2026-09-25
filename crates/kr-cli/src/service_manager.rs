@@ -1343,10 +1343,10 @@ mod platform {
     //! The systemd user manager.
     //!
     //! Every question kr puts to it and every request it makes go through `systemctl --user`, each
-    //! from the same environment with the runtime directory set, so each follows `systemctl`'s own
-    //! choice of manager, its own socket or a bus, and all of them reach the same one. What the
-    //! manager holds is read from `systemctl show`'s key=value lines, and the drop-ins it names are
-    //! read from disk.
+    //! from the same environment with the runtime directory set, so each makes `systemctl`'s own
+    //! choice of manager, its own socket or a bus, the same way: while the managers and the bus
+    //! stay as they are, all of them reach the same one. What the manager holds is read from
+    //! `systemctl show`'s key=value lines, and the drop-ins it names are read from disk.
 
     use std::path::PathBuf;
 
