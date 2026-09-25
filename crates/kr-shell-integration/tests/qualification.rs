@@ -425,8 +425,15 @@ fn every_case_holds_against_the_package_it_names() {
     let mut failures = Vec::new();
     let mut ran = 0;
 
-    // One case at a time, for a run that is looking at one of them.
+    // One case at a time, for a run that is looking at one of them. A name that is not a case of
+    // the corpus would select nothing, and a run that selected nothing has qualified nothing.
     let only = std::env::var("KR_QUALIFICATION_CASE").ok();
+    if let Some(wanted) = only.as_deref() {
+        assert!(
+            corpus.iter().any(|case| case.id == wanted),
+            "KR_QUALIFICATION_CASE names {wanted:?}, which is not a case of the corpus"
+        );
+    }
     for case in &corpus {
         if only.as_deref().is_some_and(|wanted| wanted != case.id) {
             continue;
@@ -496,10 +503,10 @@ fn every_case_holds_against_the_package_it_names() {
 
     record_outcomes("qualification-cases.tsv", &outcomes);
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
-    // A corpus whose every case was left out qualified nothing, and a run that asked for one case
-    // is the one run allowed to drive none of the others.
+    // A run that drove no case qualified nothing, whatever it selected: a selected case that is
+    // not supported is one this run cannot qualify either.
     assert!(
-        ran > 0 || only.is_some(),
+        ran > 0,
         "no case of the corpus ran, so nothing was qualified"
     );
 }
