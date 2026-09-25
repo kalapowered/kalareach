@@ -97,10 +97,11 @@ client makes, and an association cannot outlive the connection that produced the
   comparing its revision and replacing it is one step against every other window and every other
   process. A second editor that lost the comparison is told so and overwrites nothing. Reading the
   note beside a draft takes the exclusive lock instead, because a note this build cannot read is
-  removed rather than returned. The contents are flushed before the rename on every platform; on
-  Unix the directory entry is flushed too: every level the store creates has its own name flushed
-  into the level above it, and a replacement or a removal flushes the directory it happened in. On
-  Windows this build flushes none and claims no durability for the names themselves.
+  removed rather than returned. The contents are flushed before the rename, and the directory entry
+  afterwards, on every platform: every level the store creates has its own name flushed into the
+  level above it, and a replacement or a removal flushes the directory it happened in. On Windows
+  the entry is flushed through a handle on the directory that may add a file to it, which is what
+  the operating system asks of a flush there.
 - `Associations::connection_lost` clears every association and touches no draft. A `Session` does
   not own the associations and does not clear them: whoever holds both calls it when a connection
   ends, which is the same caller that binds a draft to a new attachment on reconnect.
@@ -505,12 +506,11 @@ status and fence, sending nothing and moving no head, and only then forgets the 
 a join or a new collection waits for both, so nothing it sent can still run in the membership that
 follows. A change is reported done only at a head fetched after the change was recorded.
 
-The file is replaced whole: written to a temporary name, flushed, renamed over the old one, and on
-Unix the directory entry is flushed too. On Windows nothing flushes the directory entry, so after a
-power loss a Windows device can come back with the file as it stood before its last writes: a
-removal the owner recorded is gone and is shown no longer pending, and a candidate's dispatch mark
-is gone, so the device marks and sends the same record again under the same request identity,
-which the service answers from its receipt. A crash of the process alone loses nothing on either.
+The file is replaced whole: written to a temporary name, flushed, renamed over the old one, and the
+directory entry flushed too, so a write the reconciler has returned from survives a power loss. On
+Windows the entry is flushed through a handle on the directory that may add a file to it, which is
+what the operating system asks of a flush there. A crash of the process alone loses nothing on
+either platform.
 
 Two limits are stated rather than closed:
 
