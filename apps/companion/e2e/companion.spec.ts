@@ -751,7 +751,7 @@ test.describe('a session in a window 320 px wide', () => {
     inReadingOrder(await placed(footer))
   })
 
-  test('the header fits and reads in order at every width up to a wide window, and with larger text', async ({
+  test("the header fits and reads in order at widths from a phone's to a desktop's, and with larger text", async ({
     page
   }) => {
     await openSession(page)
