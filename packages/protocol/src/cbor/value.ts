@@ -91,7 +91,7 @@ export function krMap (
   const sorted = [...entries].sort((left, right) => compareKeys(left[0], right[0]))
   for (let index = 1; index < sorted.length; index += 1) {
     if (sorted[index - 1][0] === sorted[index][0]) {
-      fail('duplicate_key', `duplicate map key ${JSON.stringify(sorted[index][0])}`)
+      fail('duplicate_key', 'duplicate map key')
     }
   }
   return { kind: 'map', entries: sorted }
@@ -106,13 +106,10 @@ export function krMapFromSorted (
     const current = entries[index][0]
     const order = compareKeys(previous, current)
     if (order === 0) {
-      fail('duplicate_key', `duplicate map key ${JSON.stringify(current)}`)
+      fail('duplicate_key', 'duplicate map key')
     }
     if (order > 0) {
-      fail(
-        'unsorted_map_keys',
-        `map keys ${JSON.stringify(previous)} and ${JSON.stringify(current)} are not in canonical order`
-      )
+      fail('unsorted_map_keys', 'map keys are not in canonical order')
     }
   }
   return { kind: 'map', entries }
@@ -227,10 +224,10 @@ export function validateCanonical (value: CanonicalValue): void {
         if (index > 0) {
           const order = compareKeys(value.entries[index - 1][0], key)
           if (order === 0) {
-            fail('duplicate_key', `duplicate map key ${JSON.stringify(key)}`)
+            fail('duplicate_key', 'duplicate map key')
           }
           if (order > 0) {
-            fail('unsorted_map_keys', `map key ${JSON.stringify(key)} is out of canonical order`)
+            fail('unsorted_map_keys', 'map keys are not in canonical order')
           }
         }
         validateCanonical(entry)

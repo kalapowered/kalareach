@@ -2,7 +2,9 @@
  * Typed KR-CBOR-1 failures.
  *
  * Every rule name matches `CborError::rule` in the Rust crate, so the shared fixtures assert the
- * same error class in both languages.
+ * same error class in both languages. A message names the rule and never quotes text read from the
+ * input, because a map key can carry anything its sender put there; the offset, where one applies,
+ * is a property of its own.
  */
 
 /** The stable rule identifiers a decoder can report. */

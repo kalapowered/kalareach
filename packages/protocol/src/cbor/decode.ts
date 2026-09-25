@@ -257,14 +257,10 @@ class Reader {
         const previous = entries[entries.length - 1][0]
         const order = compareKeys(previous, key)
         if (order === 0) {
-          fail('duplicate_key', `duplicate map key ${JSON.stringify(key)}`, keyOffset)
+          fail('duplicate_key', 'duplicate map key', keyOffset)
         }
         if (order > 0) {
-          fail(
-            'unsorted_map_keys',
-            `map keys ${JSON.stringify(previous)} and ${JSON.stringify(key)} are not in canonical order`,
-            keyOffset
-          )
+          fail('unsorted_map_keys', 'map keys are not in canonical order', keyOffset)
         }
       }
       entries.push([key, this.readValue(depth + 1)] as const)
