@@ -22,6 +22,8 @@ use std::fmt;
 
 use serde::de::{self, DeserializeOwned, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 
+use crate::shown::{Said, Shown};
+
 /// Reads one JSON text as `T`, once no object in it names a member twice.
 ///
 /// The whole text is walked first, so a repeat anywhere refuses it, in a member `T` never reads as
@@ -59,7 +61,7 @@ pub fn read<T: DeserializeOwned>(text: &[u8]) -> Result<T, Unreadable> {
 /// Which rule the text broke, and the line and column it was found at. Both help somebody
 /// diagnosing a mismatch, and neither is anything that travelled. It is also what this crate says
 /// about any other JSON failure, through [`crate::shown::Shown::json`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Unreadable {
     fault: Fault,
     line: usize,
@@ -107,8 +109,8 @@ impl From<&serde_json::Error> for Unreadable {
     }
 }
 
-impl fmt::Display for Unreadable {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Said for Unreadable {
+    fn said(&self) -> Shown {
         let what = match self.fault {
             Fault::Unread => "could not be read",
             Fault::NotJson => "is not JSON",
@@ -116,13 +118,12 @@ impl fmt::Display for Unreadable {
             Fault::NamedTwice => "names one member of an object twice",
             Fault::NotTheShape => "is not the shape this client reads",
         };
-        write!(
-            formatter,
-            "it {what} at line {} column {}",
-            self.line, self.column
-        )
+        crate::shown!("it {} at line {} column {}", what, self.line, self.column)
     }
 }
+
+crate::display_as_said!(Unreadable);
+crate::debug_as_display!(Unreadable);
 
 impl std::error::Error for Unreadable {}
 
@@ -554,5 +555,27 @@ mod tests {
             assert!(fault.to_string().contains(what), "{text}: {fault}");
             assert!(!fault.names_a_member_twice(), "{text}");
         }
+    }
+
+    /// What a text that is not read says, in its `Display` and its `Debug` alike: the rule it broke
+    /// and where, and nothing it held.
+    #[test]
+    fn an_unread_text_says_its_rule_and_its_place() {
+        let rejected = serde_json::from_str::<u8>(&format!("\"{NEVER_RENDERED}\""))
+            .expect_err("a string is not a number");
+        let said = Unreadable::from(&rejected);
+        assert_eq!(
+            said.to_string(),
+            "it is not the shape this client reads at line 1 column 28"
+        );
+        assert_eq!(
+            format!("{said:?}"),
+            "Unreadable(\"it is not the shape this client reads at line 1 column 28\")"
+        );
+        let twice = read::<serde_json::Value>(b"{\"a\":1,\"a\":2}").expect_err("a repeated name");
+        assert_eq!(
+            twice.to_string(),
+            "it names one member of an object twice at line 1 column 10"
+        );
     }
 }
