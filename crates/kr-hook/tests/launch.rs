@@ -111,6 +111,33 @@ fn retarget(link: &Path, target: &Path) {
     std::fs::rename(&staged, link).expect("the link is replaced");
 }
 
+/// Writes `staged` over `program`'s own bytes, in the same inode, and puts its modification time
+/// back.
+///
+/// The bytes are written by a process of its own, which starts nothing, and not by this one: this
+/// test binary runs its cases on several threads, and a child another thread starts while this one
+/// holds the program open for writing is handed a copy of that descriptor and keeps it until its
+/// own program takes over, and no process can execute the program while any descriptor holds it
+/// open for writing (`kr_ipc::testing::place_program` says the same of placing one). The time is
+/// put back through a descriptor opened to read, which the kernel lets the file's owner do.
+#[cfg(target_os = "linux")]
+fn rewrite_in_place(staged: &Path, program: &Path, modified: std::time::SystemTime) {
+    let wrote = std::process::Command::new("dd")
+        .arg(format!("if={}", staged.display()))
+        .arg(format!("of={}", program.display()))
+        .args(["conv=notrunc", "status=none"])
+        .stdin(std::process::Stdio::null())
+        .status()
+        .expect("dd runs");
+    assert!(
+        wrote.success(),
+        "its bytes written back, one changed: {wrote}"
+    );
+    std::fs::File::open(program)
+        .and_then(|file| file.set_modified(modified))
+        .expect("its modification time put back");
+}
+
 /// A POSIX shell running `script`, with nothing of a surrounding session in its environment.
 fn sh(script: &str) -> std::process::Command {
     let mut command = std::process::Command::new("/bin/sh");
@@ -784,12 +811,10 @@ fn kr_req_05_09_a_refused_launch_runs_the_invocation_as_typed() {
 
     // An executable that is a script.
     let script = shell.placed.host.root().join("bin").join("script");
-    std::fs::write(&script, "#!/bin/sh\nexec /bin/sh \"$@\"\n").expect("a script");
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-            .expect("executable");
-    }
+    // Written aside and placed by a process of its own, as a program this process starts is.
+    let text = shell.placed.host.root().join("script.text");
+    std::fs::write(&text, "#!/bin/sh\nexec /bin/sh \"$@\"\n").expect("a script");
+    kr_ipc::testing::place_program(&text, &script);
     let answer = shell.establish_for(&script);
     let mut scripted = shell.launcher(&script, &Shell::answered(), None);
     shell.prepare(&mut scripted, Some(&answer), "script", &[]);
@@ -1405,18 +1430,22 @@ fn kr_req_05_09_a_replacement_that_maps_the_hashed_program_is_refused() {
 #[cfg(target_os = "linux")]
 #[test]
 fn kr_req_05_09_a_program_rewritten_in_place_after_it_was_hashed_is_refused() {
-    use std::io::Write as _;
     let shell = Shell::new();
     let hook = shell.placed.forwarder.display().to_string();
     let program = shell.placed.host.root().join("bin").join("rewritten");
-    std::fs::copy("/bin/bash", &program).expect("a copy of the program, which Linux runs anywhere");
+    // A copy of the program, which Linux runs anywhere, placed by a process of its own: see
+    // `rewrite_in_place`.
+    kr_ipc::testing::place_program(Path::new("/bin/bash"), &program);
     let answer = shell.establish_for(&program);
-    // The changed bytes are made before the launch, so the window holds only the write itself.
+    // The changed bytes are made before the launch, in a file nothing runs, so the window holds
+    // only the write itself.
     let mut bytes = std::fs::read(&program).expect("the program's bytes");
     // The file's last byte, in its section headers, which nothing reads to run it.
     if let Some(last) = bytes.last_mut() {
         *last ^= 0xff;
     }
+    let staged = shell.placed.host.root().join("rewritten.bytes");
+    std::fs::write(&staged, &bytes).expect("the changed bytes, staged");
     let modified = std::fs::metadata(&program)
         .and_then(|metadata| metadata.modified())
         .expect("its modification time");
@@ -1435,18 +1464,8 @@ fn kr_req_05_09_a_program_rewritten_in_place_after_it_was_hashed_is_refused() {
     );
     let mut held = held.spawn().expect("the launcher starts");
     shell.at_the_confirmation(arrived);
-    {
-        // Through the page cache the kernel executes from, so nothing needs to reach the disk.
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&program)
-            .expect("the same inode, opened to write");
-        file.write_all(&bytes)
-            .expect("its bytes written back, one changed");
-        file.set_modified(modified)
-            .expect("its modification time put back");
-    }
-    // Closed: the launcher may execute the file now without its being busy.
+    rewrite_in_place(&staged, &program, modified);
+    // Nothing holds the program open for writing now: the launcher may execute it.
     std::fs::write(&changed, "").expect("the change is complete");
     release.send(()).expect("the launch goes on");
     let report = shell.report_from("rewritten", &mut held);
@@ -1640,7 +1659,8 @@ fn kr_req_12_07_an_upgrade_while_the_program_runs_leaves_it_its_bridges() {
     let (program, another) = shells();
     let path = shell.placed.host.root().join("bin").join("upgraded");
     if cfg!(target_os = "linux") {
-        std::fs::copy(program, &path).expect("a copy of the program, which Linux runs anywhere");
+        // A copy of the program, which Linux runs anywhere, placed by a process of its own.
+        kr_ipc::testing::place_program(program, &path);
     } else {
         std::os::unix::fs::symlink(program, &path).expect("the program");
     }
