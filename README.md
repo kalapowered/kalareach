@@ -68,23 +68,28 @@ A build needs:
 - the toolchain `rust-toolchain.toml` pins, which rustup installs on first use, with its
   `wasm32-wasip2` target for the plugin runtime's test components;
 - Node 22 and the pnpm release `package.json` names;
-- a C compiler, Git and Python 3;
+- a C and a C++ compiler, CMake and libclang, which the description service's model runtime is
+  built with, and Git and Python 3;
 - on Linux, the headers of the system WebView the companion application's backend links: WebKitGTK
   4.1, GTK 3, libayatana-appindicator, librsvg and libsoup 3;
-- for the managed shell packages, the ncurses headers, CMake and gettext, and PowerShell 7 for the
-  PSReadLine package.
+- on macOS, Fish, which the worker's terminal suite starts as a root shell;
+- for the managed shell packages, curl, make, patch and tar, the ncurses headers and gettext, and
+  for the PSReadLine package PowerShell 7.4 or later with PSReadLine 2.3.4 or later and before
+  3.0.0.
 
 The lists below are the whole list, in order.
 [`scripts/check-clean-checkout.sh`](scripts/check-clean-checkout.sh) runs them in a fresh clone of
-one commit, with a home directory, a Cargo home, a pnpm store and a
-temporary directory of its own, and `--help` says how to choose groups. Before it runs anything it
-refuses a tree that names a working record kept outside the repository, a commit message with more
-than its subject line, and a relative Markdown link to a path the tree does not have;
-`--self-test` shows each refusal on a fixture with its defect planted.
+one commit, with a home directory, a Cargo home, a pnpm store and a temporary directory of its own,
+and with a PATH reduced to the system directories and those of the programs the list uses, whose
+paths and digests it prints first; on macOS the fresh home directory has a keychain of its own.
+`--help` says how to choose groups. Before it runs a step it refuses a tree that names a working
+record kept outside the repository, a commit message longer than one line, and a relative link in
+a Markdown file, read as text, to a path the tree does not have; `--self-test` shows each refusal
+on a fixture with its defect planted.
 
 Setup: the target, the JavaScript dependencies, the test components the plugin runtime's tests
 load, and the managed shell packages with the PSReadLine qualification. `--no-upstream-tests`
-leaves out the shells' own test suites, which continuous integration runs.
+leaves out the shells' own test suites, which continuous integration runs for Bash and Zsh.
 
 <!-- clean-checkout: setup -->
 
@@ -137,14 +142,14 @@ The last group is separate because of what it costs. `scripts/end-to-end.sh` run
 end-to-end demonstrations one at a time, with real daemons, workers, shells and terminals, and takes
 about a minute. `scripts/performance.sh` builds a release profile and takes four measurements, each
 against its requirement's bound: the latency forwarding ordinary input adds (KR-PERF-001), the paste
-recogniser's deadline for every prefix length and for a delimiter split across frames
-(KR-PERF-002), what twenty idle sessions with thirty-two views cost in memory and processor time,
-averaged over five minutes (KR-PERF-003), and the time from attaching to a usable screen
-(KR-PERF-004). The five-minute average makes it take more than five minutes. Both take an optional
-log path, and both exit non-zero when anything they were meant to demonstrate did not happen. The
-terminal engine's output handling (KR-PERF-007) and the transport's scheduling and reconnection
-(KR-PERF-005 and KR-PERF-006) are measured by their own suites in an optimised build, one test at a
-time.
+recogniser's deadline for every prefix length and for a delimiter split across frames (KR-PERF-002),
+the processor time twenty idle sessions with thirty-two views use, averaged over five minutes, and
+the memory they hold, read once at the end of those five minutes (KR-PERF-003), and the time from
+attaching to a usable screen (KR-PERF-004). The five-minute window makes it take more than five
+minutes. Both take an optional log path, and both exit non-zero when anything they were meant to
+demonstrate did not happen. The terminal engine's output handling (KR-PERF-007) and the transport's
+scheduling and reconnection (KR-PERF-005 and KR-PERF-006) are measured by their own suites in an
+optimised build, one test at a time.
 
 <!-- clean-checkout: demonstrations -->
 
@@ -214,7 +219,7 @@ directory per environment beneath each. `KR_RUNTIME_DIR` and `KR_STATE_DIR` over
 
 | Directory | macOS | Linux | Windows |
 | --- | --- | --- | --- |
-| Runtime: the local endpoints and each worker's published descriptor | `$TMPDIR/kalareach` | `$XDG_RUNTIME_DIR/kalareach`, else `~/.cache/kalareach/run` | `%LOCALAPPDATA%\KalaReach\run` |
+| Runtime: the local endpoints and each worker's published descriptor | `$TMPDIR/kalareach`, else `/tmp/kalareach-<uid>` | `$XDG_RUNTIME_DIR/kalareach`, else `~/.cache/kalareach/run` | `%LOCALAPPDATA%\KalaReach\run` |
 | State: the registry, the worker journals, the output spools, the secret-store fallback, the transfer and backup stores, and the daemon's log | `~/Library/Application Support/KalaReach` | `$XDG_STATE_HOME/kalareach`, else `~/.local/state/kalareach` | `%LOCALAPPDATA%\KalaReach` |
 
 On Windows the endpoints are named pipes rather than files.
