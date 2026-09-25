@@ -9,10 +9,18 @@
 //!
 //! # What a service may hold
 //!
-//! The kinds are closed. [`SyncObjectKind`] is settings, drafts and a client's own position, and
-//! nothing else: section 20 gives host grants and revocation state one host authority, so they are
-//! not synchronised objects and restoring a synchronised object can never reach them. A draft is a
-//! draft: it is never an execution request, and nothing about this contract submits one.
+//! The kinds are closed. [`SyncObjectKind`] is settings, drafts, a client's own position and the
+//! recovery bundle, and nothing else: section 20 gives host grants and revocation state one host
+//! authority, so they are not synchronised objects and restoring a synchronised object can never
+//! reach them. A draft is a draft: it is never an execution request, and nothing about this
+//! contract submits one.
+//!
+//! The recovery bundle is the owner's key material: the collection locators, the trusted writers'
+//! public keys and the verified generation checkpoints a restore reads, encrypted as one
+//! `secretstream` object under a key the recovery seed derives for the origin and locator it is
+//! kept at. It grants nothing and names no host authority. It is kept at the stable locator the
+//! recovery kit prints, by the same compare and swap as every other kind, so it travels as a
+//! [`SealedRecoveryBundle`] with a bound of its own rather than as a [`SealedSyncObject`].
 //!
 //! # Why a revision is not a counter
 //!
@@ -47,11 +55,21 @@ pub enum SyncObjectKind {
     Draft,
     /// A client's own selection and position: which session it was looking at and where.
     ClientSelection,
+    /// The owner's recovery bundle, at the stable locator the recovery kit prints.
+    ///
+    /// Key material a restore authenticates with the kit and reads, never authority: it grants
+    /// nothing, and a restore that reads it recreates no host control.
+    RecoveryBundle,
 }
 
 impl SyncObjectKind {
     /// Every kind, in declaration order.
-    pub const ALL: [Self; 3] = [Self::Settings, Self::Draft, Self::ClientSelection];
+    pub const ALL: [Self; 4] = [
+        Self::Settings,
+        Self::Draft,
+        Self::ClientSelection,
+        Self::RecoveryBundle,
+    ];
 
     /// Returns the stable wire string.
     #[must_use]
@@ -60,7 +78,15 @@ impl SyncObjectKind {
             Self::Settings => "settings",
             Self::Draft => "draft",
             Self::ClientSelection => "client_selection",
+            Self::RecoveryBundle => "recovery_bundle",
         }
+    }
+
+    /// Returns true for a kind stored as a [`SealedSyncObject`], and false for the recovery
+    /// bundle, which is stored as a [`SealedRecoveryBundle`].
+    #[must_use]
+    pub const fn holds_a_sealed_object(self) -> bool {
+        !matches!(self, Self::RecoveryBundle)
     }
 }
 
@@ -180,6 +206,85 @@ impl SealedSyncObject {
 /// make one device's allowance depend on how the service happens to hold it.
 pub const SYNC_RECORD_BYTES: u64 = 256;
 
+/// The fewest bytes a sealed recovery bundle can be: a `secretstream` header of 24 bytes and one
+/// final record carrying no message, which is its 17-byte tag and nothing else.
+pub const MIN_SEALED_RECOVERY_BUNDLE_BYTES: u64 = 24 + 17;
+
+/// The most bytes a sealed recovery bundle may be.
+///
+/// A bundle holds locators, public keys and checkpoints, a hundred or so bytes each, so this is
+/// room for about a thousand of them. It travels base64url-encoded inside one settings-sync
+/// request, as 174,763 bytes, well inside the 256 KiB a request may be, so the bundle needs no
+/// path of its own.
+pub const MAX_SEALED_RECOVERY_BUNDLE_BYTES: u64 = 128 * 1024;
+
+/// The owner's recovery bundle as a service stores it: one `secretstream` object.
+///
+/// The stream carries its own header, so there is no nonce beside it, and no declared bucket: section
+/// 20 lets a service see an object's size. The service holds the bytes and nothing it could open:
+/// the key is derived from the recovery seed and the origin and locator the bundle is kept at.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SealedRecoveryBundle {
+    /// The sealed bundle.
+    pub ciphertext: Bytes,
+}
+
+/// Why a sealed recovery bundle is not one this contract admits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RecoveryBundleError {
+    /// Shorter than any stream a bundle is sealed as.
+    #[error("a sealed recovery bundle is at least {min} bytes; this one is {len}")]
+    TooShort {
+        /// The length that arrived.
+        len: u64,
+        /// The fewest bytes a sealed bundle can be.
+        min: u64,
+    },
+    /// Larger than a sealed bundle may be.
+    #[error("a sealed recovery bundle is at most {limit} bytes; this one is {len}")]
+    TooLarge {
+        /// The length that arrived.
+        len: u64,
+        /// The limit.
+        limit: u64,
+    },
+}
+
+impl SealedRecoveryBundle {
+    /// The bytes this bundle occupies: the ciphertext and the record around it.
+    #[must_use]
+    pub fn stored_bytes(&self) -> u64 {
+        (self.ciphertext.as_slice().len() as u64).saturating_add(SYNC_RECORD_BYTES)
+    }
+
+    /// Checks everything about this bundle that needs no key: its length, and nothing else.
+    ///
+    /// The stream's tags are checked only where it is opened. A service holds no key, so it
+    /// cannot tell a bundle from other bytes of the same length, and a device that opens one
+    /// authenticates every record, the final one included.
+    ///
+    /// # Errors
+    ///
+    /// Returns the rule the bundle breaks.
+    pub fn check_structure(&self) -> Result<(), RecoveryBundleError> {
+        let len = self.ciphertext.as_slice().len() as u64;
+        if len < MIN_SEALED_RECOVERY_BUNDLE_BYTES {
+            return Err(RecoveryBundleError::TooShort {
+                len,
+                min: MIN_SEALED_RECOVERY_BUNDLE_BYTES,
+            });
+        }
+        if len > MAX_SEALED_RECOVERY_BUNDLE_BYTES {
+            return Err(RecoveryBundleError::TooLarge {
+                len,
+                limit: MAX_SEALED_RECOVERY_BUNDLE_BYTES,
+            });
+        }
+        Ok(())
+    }
+}
+
 /// One synchronised object as the service holds it now.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -237,13 +342,80 @@ mod tests {
     }
 
     #[test]
-    fn the_kinds_are_settings_drafts_and_a_client_position() {
+    fn the_kinds_are_settings_drafts_a_client_position_and_the_recovery_bundle() {
         // The closed set is the whole of what may be synchronised. Host grants and revocation state
-        // have one host authority, so no kind names them and no restore can reach them.
+        // have one host authority, so no kind names them and no restore can reach them. The
+        // recovery bundle is key material a restore reads, and grants nothing.
         assert_eq!(
             SyncObjectKind::ALL.map(SyncObjectKind::as_str),
-            ["settings", "draft", "client_selection"]
+            ["settings", "draft", "client_selection", "recovery_bundle"]
         );
+        assert_eq!(
+            SyncObjectKind::ALL.map(SyncObjectKind::holds_a_sealed_object),
+            [true, true, true, false]
+        );
+    }
+
+    fn bundle(len: u64) -> SealedRecoveryBundle {
+        SealedRecoveryBundle {
+            ciphertext: Bytes::new(vec![0xcd; usize::try_from(len).expect("a length")]),
+        }
+    }
+
+    #[test]
+    fn a_recovery_bundle_is_admitted_from_an_empty_stream_to_its_bound() {
+        for len in [
+            MIN_SEALED_RECOVERY_BUNDLE_BYTES,
+            4_096,
+            MAX_SEALED_RECOVERY_BUNDLE_BYTES,
+        ] {
+            assert_eq!(bundle(len).check_structure(), Ok(()), "{len}");
+        }
+        assert_eq!(
+            bundle(MIN_SEALED_RECOVERY_BUNDLE_BYTES - 1).check_structure(),
+            Err(RecoveryBundleError::TooShort {
+                len: MIN_SEALED_RECOVERY_BUNDLE_BYTES - 1,
+                min: MIN_SEALED_RECOVERY_BUNDLE_BYTES,
+            })
+        );
+        assert_eq!(
+            bundle(MAX_SEALED_RECOVERY_BUNDLE_BYTES + 1).check_structure(),
+            Err(RecoveryBundleError::TooLarge {
+                len: MAX_SEALED_RECOVERY_BUNDLE_BYTES + 1,
+                limit: MAX_SEALED_RECOVERY_BUNDLE_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn a_recovery_bundle_is_its_stream_and_nothing_beside_it() {
+        // The stream carries its own header, so there is no nonce and no bucket beside it, and a
+        // member nobody agreed on is refused rather than stored.
+        let object = bundle(64);
+        let value = serde_json::to_value(&object).expect("a bundle");
+        assert_eq!(
+            value
+                .as_object()
+                .expect("an object")
+                .keys()
+                .collect::<Vec<_>>(),
+            ["ciphertext"]
+        );
+        let mut extra = value;
+        extra["nonce"] = serde_json::json!("AAAA");
+        assert!(serde_json::from_value::<SealedRecoveryBundle>(extra).is_err());
+        assert_eq!(
+            object.stored_bytes(),
+            64 + SYNC_RECORD_BYTES,
+            "the ciphertext and the record"
+        );
+    }
+
+    #[test]
+    fn the_smallest_bundle_is_a_stream_header_and_one_final_record() {
+        // A `secretstream` object is a 24-byte header and records of at least their 17-byte tag, so
+        // the empty stream is 41 bytes, and every bundle a device seals is at least that.
+        assert_eq!(MIN_SEALED_RECOVERY_BUNDLE_BYTES, 24 + 17);
     }
 
     #[test]

@@ -1300,7 +1300,8 @@ methods! {
     selectors: [Mailbox],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ServiceCredential,
     confirmation: None, idempotency: keyed("collection generation"),
-    doc: "Publish encrypted settings or draft state under a compare-and-exchange generation.";
+    doc: "Publish encrypted settings, draft state or the recovery bundle under a \
+          compare-and-exchange generation.";
 
     BackupManifest = "backup.manifest", Services,
     effect: Write, ingress: [ServiceClient], rights: [basis(ServiceCredential)],

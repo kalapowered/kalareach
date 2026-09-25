@@ -4188,7 +4188,7 @@
       "resource_selectors": [
         "mailbox"
       ],
-      "summary": "Publish encrypted settings or draft state under a compare-and-exchange generation.",
+      "summary": "Publish encrypted settings, draft state or the recovery bundle under a compare-and-exchange generation.",
       "version": 1
     },
     {

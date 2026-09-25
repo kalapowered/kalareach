@@ -377,9 +377,9 @@ impl std::fmt::Display for RequestRevision {
 pub(crate) fn collection_of(kind: SyncObjectKind, object_id: SyncObjectId) -> String {
     match kind {
         SyncObjectKind::Draft => crate::drafts::draft_collection(DraftId::new(object_id.get())),
-        SyncObjectKind::Settings | SyncObjectKind::ClientSelection => {
-            super::sync_collection(kind, object_id)
-        }
+        SyncObjectKind::Settings
+        | SyncObjectKind::ClientSelection
+        | SyncObjectKind::RecoveryBundle => super::sync_collection(kind, object_id),
     }
 }
 

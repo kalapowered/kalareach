@@ -2253,6 +2253,7 @@ export interface KalaReachProtocol {
   root_eof_detach_result?: RootEofDetachResult
   run_tests_params?: RunTestsParams
   sealed_envelope?: SealedEnvelope
+  sealed_recovery_bundle?: SealedRecoveryBundle
   semantic_change?: SemanticChange
   semantic_continuation?: SemanticContinuation
   service_request_signature?: ServiceRequestSignature
@@ -21810,6 +21811,19 @@ export interface VersionRef11 {
   version: string
 }
 /**
+ * The owner's recovery bundle as a service stores it: one `secretstream` object.
+ *
+ * The stream carries its own header, so there is no nonce beside it, and no declared bucket: section
+ * 20 lets a service see an object's size. The service holds the bytes and nothing it could open:
+ * the key is derived from the recovery seed and the origin and locator the bundle is kept at.
+ */
+export interface SealedRecoveryBundle {
+  /**
+   * The sealed bundle.
+   */
+  ciphertext: string
+}
+/**
  * One semantic change in the changed-since-last-visit view.
  */
 export interface SemanticChange {
@@ -23517,7 +23531,7 @@ export interface SyncConflictCopy {
   /**
    * What kind of object it is.
    */
-  kind: 'settings' | 'draft' | 'client_selection'
+  kind: 'settings' | 'draft' | 'client_selection' | 'recovery_bundle'
   object: SealedSyncObject
   /**
    * The object the rejected write was about.
@@ -23556,7 +23570,7 @@ export interface SyncObjectRecord {
   /**
    * What kind of object it is.
    */
-  kind: 'settings' | 'draft' | 'client_selection'
+  kind: 'settings' | 'draft' | 'client_selection' | 'recovery_bundle'
   object: SealedSyncObject1
   /**
    * The object.

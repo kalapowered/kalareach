@@ -26,13 +26,17 @@ import {
   MAX_MAILBOX_BYTES,
   MAX_MAILBOX_ITEMS,
   MAX_MAILBOX_ITEM_LIFETIME_MS,
+  MAX_SEALED_RECOVERY_BUNDLE_BYTES,
   MAX_SYNC_CONFLICT_COPIES,
   MAX_SYNC_OBJECTS_PER_COLLECTION,
   MAX_SYNC_OBJECT_PLAINTEXT_BYTES,
+  MIN_SEALED_RECOVERY_BUNDLE_BYTES,
   ORGANISATION_POLICY_DOMAIN,
   REVOCATION_DOMAIN,
+  SEALED_SYNC_OBJECT_KINDS,
   SEAL_OVERHEAD_BYTES,
   SYNC_OBJECT_KINDS,
+  SYNC_RECORD_BYTES,
   ServicesSchemaError,
   authorisationKeyId,
   authorityRevisionSigningInput,
@@ -49,6 +53,7 @@ import {
   readBackupWriterRecord,
   readRevocationAcknowledgement,
   checkSealedEnvelope,
+  checkSealedRecoveryBundle,
   checkSealedSyncObject,
   envelopeStoredBytes,
   granularityForBucket,
@@ -57,7 +62,9 @@ import {
   mailboxSizeBucket,
   organisationPolicySigningInput,
   readSealedEnvelope,
+  readSealedRecoveryBundle,
   readSealedSyncObject,
+  recoveryBundleStoredBytes,
   revocationRequestSigningInput,
   routingMatchesPlaintext,
   storedEnvelopeKeyId,
@@ -69,6 +76,7 @@ import {
   type OrganisationPolicy,
   type RevocationRequest,
   type SealedEnvelope,
+  type SealedRecoveryBundle,
   type SyncConflictCopy,
   type SyncObjectRecord
 } from '../src/index.js'
@@ -482,6 +490,52 @@ describe('settings sync', () => {
     // Host grants and revocation state have one host authority, so no kind names them.
     expect(SYNC_OBJECT_KINDS).not.toContain('grant')
     expect(SYNC_OBJECT_KINDS).not.toContain('revocation')
+    // The recovery bundle is key material, stored as a stream of its own rather than a sealed
+    // object, so it is a kind and not one of the kinds a sealed object is read for.
+    expect(SYNC_OBJECT_KINDS).toEqual(['settings', 'draft', 'client_selection', 'recovery_bundle'])
+    expect(document.sync_limits['sealed_object_kinds']).toEqual(SEALED_SYNC_OBJECT_KINDS)
+    expect(SEALED_SYNC_OBJECT_KINDS).toEqual(['settings', 'draft', 'client_selection'])
+    expect(document.sync_limits['recovery_bundle_bytes']).toEqual({
+      min: String(MIN_SEALED_RECOVERY_BUNDLE_BYTES),
+      max: String(MAX_SEALED_RECOVERY_BUNDLE_BYTES)
+    })
+  })
+
+  const bundleOf = (length: number): SealedRecoveryBundle => ({
+    ciphertext: bytesToBase64Url(new Uint8Array(length).fill(0xcd))
+  })
+
+  it('reads a sealed recovery bundle as its stream and nothing beside it', () => {
+    const bundle = bundleOf(64)
+    expect(readSealedRecoveryBundle(bundle)).toEqual(bundle)
+    // The stream carries its own header: a nonce or a bucket beside it is a member nobody agreed
+    // on, and it would be stored and counted as something it is not.
+    for (const extra of [{ nonce: 'AAAA' }, { size_bucket_bytes: '64' }]) {
+      expect(() => readSealedRecoveryBundle({ ...bundle, ...extra })).toThrow(ServicesSchemaError)
+    }
+    expect(() => readSealedRecoveryBundle({})).toThrow(ServicesSchemaError)
+    expect(() => readSealedRecoveryBundle({ ciphertext: 'not base64url!' })).toThrow(
+      ServicesSchemaError
+    )
+    expect(recoveryBundleStoredBytes(bundle)).toBe(64 + SYNC_RECORD_BYTES)
+  })
+
+  it('admits a recovery bundle from an empty stream to its bound, and nothing outside it', () => {
+    for (const length of [
+      MIN_SEALED_RECOVERY_BUNDLE_BYTES,
+      4096,
+      MAX_SEALED_RECOVERY_BUNDLE_BYTES
+    ]) {
+      expect(checkSealedRecoveryBundle(bundleOf(length))).toBeNull()
+    }
+    for (const length of [MIN_SEALED_RECOVERY_BUNDLE_BYTES - 1, MAX_SEALED_RECOVERY_BUNDLE_BYTES + 1]) {
+      expect(checkSealedRecoveryBundle(bundleOf(length))).toEqual({
+        reason: 'bundle_length',
+        length,
+        min: MIN_SEALED_RECOVERY_BUNDLE_BYTES,
+        max: MAX_SEALED_RECOVERY_BUNDLE_BYTES
+      })
+    }
   })
 
   it('admits the published object and measures what it stores', () => {

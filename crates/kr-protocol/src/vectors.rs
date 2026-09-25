@@ -65,8 +65,9 @@ use crate::service::{
     ServiceRequestSigner, body_digest, installation_id,
 };
 use crate::sync::{
-    MAX_SYNC_CONFLICT_COPIES, MAX_SYNC_OBJECT_PLAINTEXT_BYTES, MAX_SYNC_OBJECTS_PER_COLLECTION,
-    SealedSyncObject, SyncConflictCopy, SyncObjectKind, SyncObjectRecord,
+    MAX_SEALED_RECOVERY_BUNDLE_BYTES, MAX_SYNC_CONFLICT_COPIES, MAX_SYNC_OBJECT_PLAINTEXT_BYTES,
+    MAX_SYNC_OBJECTS_PER_COLLECTION, MIN_SEALED_RECOVERY_BUNDLE_BYTES, SealedSyncObject,
+    SyncConflictCopy, SyncObjectKind, SyncObjectRecord,
 };
 
 /// The service-request credential vectors.
@@ -994,7 +995,16 @@ fn services() -> Value {
             "object_plaintext_bytes": U64::new(MAX_SYNC_OBJECT_PLAINTEXT_BYTES).to_string(),
             "objects_per_collection": U64::new(MAX_SYNC_OBJECTS_PER_COLLECTION).to_string(),
             "conflict_copies_per_object": U64::new(MAX_SYNC_CONFLICT_COPIES).to_string(),
-            "object_kinds": SyncObjectKind::ALL.map(SyncObjectKind::as_str)
+            "object_kinds": SyncObjectKind::ALL.map(SyncObjectKind::as_str),
+            "sealed_object_kinds": SyncObjectKind::ALL
+                .iter()
+                .filter(|kind| kind.holds_a_sealed_object())
+                .map(|kind| kind.as_str())
+                .collect::<Vec<_>>(),
+            "recovery_bundle_bytes": {
+                "min": U64::new(MIN_SEALED_RECOVERY_BUNDLE_BYTES).to_string(),
+                "max": U64::new(MAX_SEALED_RECOVERY_BUNDLE_BYTES).to_string()
+            }
         },
         "cases": [
             json!({

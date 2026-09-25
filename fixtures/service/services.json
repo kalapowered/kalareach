@@ -1009,9 +1009,19 @@
     "object_kinds": [
       "settings",
       "draft",
-      "client_selection"
+      "client_selection",
+      "recovery_bundle"
     ],
     "object_plaintext_bytes": "65536",
-    "objects_per_collection": "256"
+    "objects_per_collection": "256",
+    "recovery_bundle_bytes": {
+      "max": "131072",
+      "min": "41"
+    },
+    "sealed_object_kinds": [
+      "settings",
+      "draft",
+      "client_selection"
+    ]
   }
 }

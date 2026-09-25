@@ -16,8 +16,9 @@
 //!
 //! # What may be synchronised, and what may not
 //!
-//! [`kr_protocol::sync::SyncObjectKind`] is settings, drafts and a client's own position. The set
-//! is closed, and what it leaves out is as load bearing as what it holds: host grants and
+//! [`kr_protocol::sync::SyncObjectKind`] is settings, drafts, a client's own position and the
+//! recovery bundle, which [`crate::recovery::BundleStore`] writes and this module never does. The
+//! set is closed, and what it leaves out is as load bearing as what it holds: host grants and
 //! revocation state have one host authority, so no kind names them and restoring a synchronised
 //! object can never reach them. This client makes that as structural as a client can. [`SyncBody`]
 //! has a variant for settings and one for a client's position and **no variant for anything else**,

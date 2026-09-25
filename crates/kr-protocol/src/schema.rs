@@ -200,7 +200,7 @@ use crate::skill::{
     AgentToolsInstallResult, AgentToolsParams, AgentToolsRemoveResult, AgentToolsStatusResult,
     ChangeManifest, ChangeOperation, InstalledFile,
 };
-use crate::sync::{SyncConflictCopy, SyncObjectRecord};
+use crate::sync::{SealedRecoveryBundle, SyncConflictCopy, SyncObjectRecord};
 use crate::transfer::{
     AgentDraftAddAttachmentParams, AgentDraftAddAttachmentResult, AttachmentContribution,
     AttachmentHandle, AttachmentReadGrant, DownloadBeginParams, DownloadBeginResult,
@@ -517,6 +517,7 @@ pub fn protocol_schema() -> Value {
         "root_eof_detach_params" => RootEofDetachParams,
         "root_eof_detach_result" => RootEofDetachResult,
         "sealed_envelope" => SealedEnvelope,
+        "sealed_recovery_bundle" => SealedRecoveryBundle,
         "semantic_continuation" => SemanticContinuation,
         "service_request_signature" => ServiceRequestSignature,
         "session_attach_params" => SessionAttachParams,

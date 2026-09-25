@@ -17014,7 +17014,7 @@
         },
         {
           "const": "sync.compare_exchange",
-          "description": "Publish encrypted settings or draft state under a compare-and-exchange generation.",
+          "description": "Publish encrypted settings, draft state or the recovery bundle under a compare-and-exchange generation.",
           "type": "string"
         },
         {
@@ -28118,6 +28118,20 @@
       ],
       "type": "object"
     },
+    "SealedRecoveryBundle": {
+      "additionalProperties": false,
+      "description": "The owner's recovery bundle as a service stores it: one `secretstream` object.\n\nThe stream carries its own header, so there is no nonce beside it, and no declared bucket: section\n20 lets a service see an object's size. The service holds the bytes and nothing it could open:\nthe key is derived from the recovery seed and the origin and locator the bundle is kept at.",
+      "properties": {
+        "ciphertext": {
+          "$ref": "#/$defs/Bytes",
+          "description": "The sealed bundle."
+        }
+      },
+      "required": [
+        "ciphertext"
+      ],
+      "type": "object"
+    },
     "SealedSyncObject": {
       "additionalProperties": false,
       "description": "One encrypted synchronised object as it is stored.\n\nThe service holds the nonce and the ciphertext and the declared bucket. It holds no plaintext\nfield of any kind: what an object is about is inside the encryption, and the kind beside it is\nwhat the service needs to answer a read for that kind.",
@@ -30056,6 +30070,11 @@
         {
           "const": "client_selection",
           "description": "A client's own selection and position: which session it was looking at and where.",
+          "type": "string"
+        },
+        {
+          "const": "recovery_bundle",
+          "description": "The owner's recovery bundle, at the stable locator the recovery kit prints.\n\nKey material a restore authenticates with the kit and reads, never authority: it grants\nnothing, and a restore that reads it recreates no host control.",
           "type": "string"
         }
       ]
@@ -35737,6 +35756,9 @@
     },
     "sealed_envelope": {
       "$ref": "#/$defs/SealedEnvelope"
+    },
+    "sealed_recovery_bundle": {
+      "$ref": "#/$defs/SealedRecoveryBundle"
     },
     "semantic_change": {
       "$ref": "#/$defs/SemanticChange"
