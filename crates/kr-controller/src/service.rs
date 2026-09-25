@@ -13069,12 +13069,14 @@ mod a_read_that_meets_a_worker_on_its_way_out {
     use kr_protocol::error::ErrorCode;
     use kr_protocol::frame::StreamKind;
     use kr_protocol::identity::WorkerProfile;
-    use kr_protocol::ids::{AuthorityRevision, ConnectionId, RequestId, SessionEpoch};
+    use kr_protocol::ids::{AuthorityRevision, ConnectionId, RequestId, SessionEpoch, SessionId};
     use kr_protocol::method::Method;
-    use kr_protocol::scalars::Nullable;
+    use kr_protocol::root::{CwdRevision, PromptGeneration, RootCommandBlockParams};
+    use kr_protocol::scalars::{Nullable, U64};
     use kr_protocol::session::{
         ClosureReason, ClosureRecord, Durability, OwnershipCoverage, SessionCloseResult,
         SessionListParams, SessionListResult, SessionReadParams, SessionReadResult, SessionState,
+        SessionSummary,
     };
     use tokio::sync::{Notify, oneshot};
 
@@ -13120,6 +13122,21 @@ mod a_read_that_meets_a_worker_on_its_way_out {
                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
                 Some(End { arrived, go: going });
             (arrival, go)
+        }
+    }
+
+    /// The last command a scripted worker's session ran, which every read it answers carries: the
+    /// session's content, beside its description.
+    fn command_block(session_id: SessionId) -> RootCommandBlockParams {
+        RootCommandBlockParams {
+            session_id,
+            prompt_generation: PromptGeneration(U64::new(1)),
+            command: "make test".to_owned(),
+            started_at_ms: kr_ipc::now_ms(),
+            duration_ms: Nullable::null(),
+            exit_status: Nullable::null(),
+            cwd: "/work".to_owned(),
+            cwd_revision: CwdRevision(U64::new(1)),
         }
     }
 
@@ -13184,6 +13201,8 @@ mod a_read_that_meets_a_worker_on_its_way_out {
                                 if script.closing.load(Ordering::Acquire) {
                                     read.session.state = SessionState::Closing;
                                 }
+                                read.last_command_block =
+                                    Nullable::some(command_block(identity.session_id()));
                                 vec![respond(request.request_id, &read)]
                             }
                             (None, ControlFrame::Forwarded(forwarded))
@@ -13293,14 +13312,9 @@ mod a_read_that_meets_a_worker_on_its_way_out {
     async fn a_read_that_meets_the_end_of_a_worker_whose_close_was_accepted_answers_closing() {
         let script = Arc::new(Scripted::default());
         let world = scripted(&script).await;
-        assert_eq!(
-            read(&world)
-                .await
-                .expect("the worker answers")
-                .session
-                .state,
-            SessionState::Live
-        );
+        let live = read(&world).await.expect("the worker answers");
+        assert_eq!(live.session.state, SessionState::Live);
+        assert!(live.last_command_block.0.is_some());
         assert_eq!(close(&world).await.state, SessionState::Closing);
 
         // The worker finishes its closure and goes while a read is waiting on it.
@@ -13309,11 +13323,21 @@ mod a_read_that_meets_a_worker_on_its_way_out {
         let answer = read(&world)
             .await
             .expect("a closing session is answered for from this daemon's own record");
-        assert_eq!(answer.session.session_id, world.session_id);
-        assert_eq!(answer.session.state, SessionState::Closing);
+        assert_eq!(
+            answer.session,
+            SessionSummary {
+                state: SessionState::Closing,
+                ..live.session
+            },
+            "the session as its worker last described it, closing"
+        );
         assert!(
             answer.endpoint.0.is_none(),
             "an endpoint that has stopped answering is not handed out"
+        );
+        assert!(
+            answer.last_command_block.0.is_none(),
+            "and the session's content is its worker's to hand out, not this daemon's"
         );
         assert!(
             !recorded(&world).await,
