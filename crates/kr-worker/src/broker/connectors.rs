@@ -701,6 +701,14 @@ pub mod fixture {
         serde_json::to_string_pretty(&manifest).expect("a literal manifest encodes")
     }
 
+    /// Returns the same installation, granted to read files too: a connector whose launch is
+    /// granted the directory it was resolved in.
+    #[must_use]
+    pub fn reading(mut source: ConnectorSource) -> ConnectorSource {
+        source.granted.insert(PluginCapability::FilesystemRead);
+        source
+    }
+
     /// Writes the package under `root` as the store extracts it, and returns what an installation
     /// hands over for it, with every capability the package declares granted.
     ///

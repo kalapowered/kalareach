@@ -149,6 +149,19 @@ struct Shell {
 
 impl Shell {
     fn new() -> Self {
+        Self::with_source(|source| source)
+    }
+
+    /// A shell whose connector's installation is granted to read files as well.
+    fn reading() -> Self {
+        Self::with_source(fixture::reading)
+    }
+
+    fn with_source(
+        installed: impl FnOnce(
+            kr_worker::broker::connectors::ConnectorSource,
+        ) -> kr_worker::broker::connectors::ConnectorSource,
+    ) -> Self {
         let placed = Placed::new();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -164,8 +177,10 @@ impl Shell {
         let store = placed.host.root().join("store");
         std::fs::create_dir_all(&store).expect("a store");
         let sources = Arc::new(ConnectorSources::new());
-        let source = fixture::claude_code_package(&store, &placed.forwarder)
-            .expect("the package is written");
+        let source = installed(
+            fixture::claude_code_package(&store, &placed.forwarder)
+                .expect("the package is written"),
+        );
         assert!(sources.replace(vec![source]).is_empty());
         let broker = Arc::new(
             Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens"),
@@ -232,6 +247,15 @@ impl Shell {
     }
 
     fn establish_with(&self, executable: &Path, typed: &[String]) -> CommandBackend {
+        self.establish_where(executable, typed, self.placed.host.root())
+    }
+
+    /// Establishes a backend for an invocation the shell reported running in `cwd`.
+    fn establish_in(&self, cwd: &Path) -> CommandBackend {
+        self.establish_where(&self.executable, &Self::typed(), cwd)
+    }
+
+    fn establish_where(&self, executable: &Path, typed: &[String], cwd: &Path) -> CommandBackend {
         let generation = self
             .generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -248,7 +272,7 @@ impl Shell {
                 added: &added,
                 integration: &integration,
                 executable: executable.to_str().expect("a text path"),
-                cwd: self.placed.host.root().to_str().expect("a text path"),
+                cwd: cwd.to_str().expect("a text path"),
                 cwd_revision: CwdRevision::new(1),
                 root_shell: kr_ipc::identity::current_process_start_identity()
                     .expect("this process"),
@@ -1403,6 +1427,103 @@ fn kr_req_12_07_an_upgrade_while_the_program_runs_leaves_it_its_bridges() {
         selected(&shell, instance).as_deref(),
         Some(SECOND_THREAD),
         "the running program's second hook is admitted after the upgrade"
+    );
+    let _ = finish(child);
+}
+
+/// A text file reached from the root directory through another mount, where this host has one:
+/// Linux's `/proc/version`, on procfs, and on macOS this crate's own manifest when the source tree
+/// is on a volume of its own.
+fn across_a_mount() -> Option<PathBuf> {
+    if cfg!(target_os = "linux") {
+        return Some(PathBuf::from("/proc/version"));
+    }
+    use std::os::unix::fs::MetadataExt as _;
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let root = std::fs::metadata("/").ok()?.dev();
+    let file = std::fs::metadata(&manifest).ok()?.dev();
+    (root != file).then_some(manifest)
+}
+
+/// Performs one reverse read through a grant, as the gateway does for an upstream that asks.
+fn read_through(
+    files: &Arc<kr_worker::broker::host::HostFiles>,
+    path: &Path,
+) -> kr_worker::broker::host::Answer {
+    let body = serde_json::json!({ "params": { "path": path.display().to_string() } });
+    let body = body.as_object().expect("an object");
+    match kr_worker::broker::host::Plan::decide(
+        body,
+        "params",
+        kr_protocol::gateway::ReverseOperation::FilesystemRead,
+        Some(files),
+        EnvironmentId::new(Uuid::from_bytes([4; 16])),
+        true,
+    ) {
+        kr_worker::broker::host::Plan::Perform(performance) => performance.perform().answer,
+        kr_worker::broker::host::Plan::Refuse(refusal) => {
+            kr_worker::broker::host::Answer::Refused(refusal)
+        }
+    }
+}
+
+/// KR-REQ-12.16: a launch whose connector's installation may read files is granted the directory
+/// the shell reported for the invocation, for reading and confined to its own mount. A reverse read
+/// inside it runs in the host's environment; one that crosses into another mount is refused; and a
+/// launch whose connector may not read files is granted no directory at all.
+#[test]
+fn kr_req_12_16_a_launch_is_granted_the_directory_it_was_resolved_in_for_reading() {
+    let shell = Shell::reading();
+    let project = shell.placed.host.root().join("project");
+    std::fs::create_dir_all(&project).expect("a project directory");
+    std::fs::write(project.join("notes.txt"), "first\nsecond\n").expect("a file in it");
+    let answer = shell.establish_in(&project);
+    let child = shell.launch(&answer, "reading", &[("LINGER", "2")]);
+    let instance = instance_of(&shell.report("reading"));
+    let files = shell
+        .broker
+        .host_files(instance)
+        .expect("the directory it was resolved in is granted");
+    assert_eq!(files.access(), kr_worker::broker::host::FileAccess::Read);
+    let kr_worker::broker::host::Answer::Result(read) =
+        read_through(&files, &project.join("notes.txt"))
+    else {
+        panic!("a read inside the granted directory runs");
+    };
+    assert!(read.to_string().contains("first"), "{read}");
+    let (status, said) = finish(child);
+    assert!(status.success(), "{said}");
+    eventually("the grant ends with the instance", || {
+        shell.broker.host_files(instance).is_none()
+    });
+
+    // A directory whose tree holds another mount: a read of a text file that would cross into it is
+    // refused, where this host has such a file.
+    if let Some(across) = across_a_mount() {
+        let answer = shell.establish_in(Path::new("/"));
+        let child = shell.launch(&answer, "root", &[("LINGER", "2")]);
+        let instance = instance_of(&shell.report("root"));
+        let files = shell
+            .broker
+            .host_files(instance)
+            .expect("the root directory is granted");
+        let read = read_through(&files, &across);
+        assert!(
+            matches!(read, kr_worker::broker::host::Answer::Refused(_)),
+            "a read of {} crosses into another mount and is refused: {read:?}",
+            across.display()
+        );
+        let _ = finish(child);
+    }
+
+    // A connector whose installation may not read files.
+    let plain = Shell::new();
+    let answer = plain.establish();
+    let child = plain.launch(&answer, "plain", &[("LINGER", "1")]);
+    let instance = instance_of(&plain.report("plain"));
+    assert!(
+        plain.broker.host_files(instance).is_none(),
+        "no directory is granted without the grant to read files"
     );
     let _ = finish(child);
 }

@@ -1650,6 +1650,19 @@ impl Broker {
         Ok(())
     }
 
+    /// Returns the directory one instance's upstream may ask this host to read or write in, where
+    /// one is granted.
+    #[must_use]
+    pub fn host_files(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+    ) -> Option<std::sync::Arc<HostFiles>> {
+        self.state()
+            .instances
+            .get(&application_instance_id)
+            .and_then(|instance| instance.host_files.clone())
+    }
+
     /// Withdraws one instance's granted host directory.
     ///
     /// Nothing new is admitted under it from here. An operation already admitted holds the grant

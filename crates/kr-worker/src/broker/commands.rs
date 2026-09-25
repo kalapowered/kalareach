@@ -198,6 +198,9 @@ struct Backend {
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// The operating-system user the session runs as.
     os_user: String,
+    /// The directory the shell reported for this invocation, opened when the backend was
+    /// established, for a connector whose installation may read files.
+    host_directory: Option<kr_transfer::authority::AuthorisedDirectory>,
     /// The session whose attached views a channel's transitions are delivered to, where one is.
     views: Option<(SessionId, Weak<crate::runtime::SessionRuntime>)>,
     #[cfg(feature = "testing")]
@@ -607,6 +610,20 @@ impl CommandBackends {
             BrokerError::ledger(format!("could not write the launch record: {error}"))
         })?;
         let (identity_sender, identity) = tokio::sync::watch::channel(None);
+        // A connector whose installation may read files is granted the directory the shell
+        // reported for this invocation. It is opened now, so what the launch is granted is the
+        // directory at the reported revision, whatever the path names later; one that cannot be
+        // opened leaves the launch with no directory, and every reverse file request refused.
+        let host_directory = connector
+            .granted(kr_plugin_sdk::capability::PluginCapability::FilesystemRead)
+            .then(|| {
+                kr_transfer::authority::AuthorisedDirectory::open_root(
+                    self.environment_id,
+                    Path::new(request.cwd),
+                )
+                .ok()
+            })
+            .flatten();
         let backend = Arc::new(Backend {
             application_instance_id,
             prompt_generation: request.prompt_generation,
@@ -627,6 +644,7 @@ impl CommandBackends {
             stopped: Arc::new(AtomicBool::new(false)),
             tasks: Mutex::new(Vec::new()),
             os_user: self.os_user.clone(),
+            host_directory,
             views: self
                 .views
                 .as_ref()
@@ -1135,6 +1153,19 @@ async fn admit_claimed<'a>(
     let registered = reservation
         .register(IntegrationMode::NativeBridge, Some(managed))
         .map_err(|refused| refused.error)?;
+    // The directory the invocation was resolved in, for reading only and confined to its own
+    // mount. The grant is the instance's, so it goes with the instance: a launch given back takes
+    // it along, and so does the program's end.
+    if let Some(files) = backend
+        .host_directory
+        .as_ref()
+        .and_then(|directory| directory.try_clone().ok())
+        .and_then(|root| {
+            crate::broker::host::HostFiles::new(root, crate::broker::host::FileAccess::Read).ok()
+        })
+    {
+        broker.grant_host_files(backend.application_instance_id, files)?;
+    }
     let registration = Registration::new(
         backend.gateway.address().clone(),
         backend.profile_id.clone(),
