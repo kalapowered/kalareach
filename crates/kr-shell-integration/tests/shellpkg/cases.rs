@@ -185,10 +185,12 @@ impl Session {
     /// The publication is whole on the endpoint before this returns, so a reader that takes its
     /// mailbox before it acts on a key judges a key typed afterwards against the fence, whichever
     /// of the endpoint and the terminal it notices first. Zsh and Fish read the mailbox at every
-    /// key-sequence boundary, before that sequence's binding runs, and Bash's reader reads it
-    /// before every byte it takes from the terminal, so this holds for any key. The PowerShell
-    /// editor reads it after a key's operation has run, so there it holds only for the
-    /// end-of-file gesture, whose decision reads the mailbox first.
+    /// key-sequence boundary, before that sequence's binding runs. Bash's reader reads it before
+    /// its next ordinary read from the terminal and whenever the endpoint becomes ready while it
+    /// waits, which at this drained prompt comes before any key typed afterwards. So on those
+    /// three it holds for any key. The PowerShell editor reads it after a key's operation has
+    /// run, so there it holds only for the end-of-file gesture, whose decision reads the mailbox
+    /// first.
     pub fn fenced_prompt(&mut self, index: u8) -> (RootEditorEnterParams, EditorFence) {
         let mut entry = self.next_prompt();
         // One deadline covers the exchanges and the waits between them, so asking the reader again
