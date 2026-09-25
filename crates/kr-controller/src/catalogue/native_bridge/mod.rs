@@ -60,7 +60,7 @@ pub use kr_worker::broker::connectors::{BridgeFacts, QualifiedExecutable};
 use self::journal::{
     Change, Journal, Journals, Kept, Publication, RecordedFacts, Release, Removal, Staging, State,
 };
-use self::tree::{Child, Dir, Entry, Fetched, Identity, Walk};
+use self::tree::{Child, Dir, Entry, Fetched, Identity, Unstaged, Walk};
 use crate::catalogue::files;
 use crate::error::{ControllerError, Result};
 
@@ -176,8 +176,7 @@ pub enum Settled {
     Applied,
     /// Nothing this host placed is left, apart from what its report names as changed since.
     Removed,
-    /// The recipe was refused. Nothing it placed is left, apart from what its report names as
-    /// changed since.
+    /// The recipe was refused, and nothing of the release is in place.
     Refused(String),
     /// Something may be this host's and cannot be shown to be, or could not be taken out this
     /// time, so nothing is reported as applied or as clean.
@@ -224,6 +223,7 @@ struct Testing {
     stop_at: std::sync::atomic::AtomicUsize,
     taken: std::sync::atomic::AtomicUsize,
     before_publishing: std::sync::Mutex<Option<PublishingHook>>,
+    staging_fails: std::sync::Mutex<Option<PublishingHook>>,
     trace: std::sync::Mutex<Vec<String>>,
 }
 
@@ -281,22 +281,20 @@ impl Found {
     }
 }
 
-/// What an unrecorded publication came to.
+/// What an unrecorded publication came to at its destination.
 enum Settlement {
     /// Nothing of it is in place: it was never renamed, and its staged copy, which this host could
     /// show it made, is gone.
     Absent,
     /// It is in place under the identity it was staged with, and its directory is flushed.
     Placed(Identity),
-    /// Something is at its temporary name that this host cannot show it made, and is left.
-    Unproven(String),
     /// What is at its destination is not what this host staged.
     NotOurs,
 }
 
 /// What was at a staged object's temporary name.
 enum Cleared {
-    /// Nothing.
+    /// Nothing, and its directory is flushed, so no removal an earlier run made there is lost.
     Absent,
     /// The object this host staged, now removed and its directory flushed.
     Removed,
@@ -480,8 +478,15 @@ impl NativeBridges {
                         .iter()
                         .any(|kept| kept.path == path && kept.key.as_deref() == key);
                     if !blocked {
-                        notes
-                            .push(kept(&release.directory, change, "not yet taken out").describe());
+                        notes.push(
+                            kept_in(
+                                &release.directory,
+                                release.directory_identity,
+                                change,
+                                "not yet taken out",
+                            )
+                            .describe(),
+                        );
                     }
                 }
             }
@@ -535,6 +540,17 @@ impl NativeBridges {
         *self
             .testing
             .before_publishing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(hook));
+    }
+
+    /// Makes every later staged write fail once it has made its file, after running `hook` with
+    /// that file's path.
+    #[cfg(feature = "testing")]
+    pub fn staging_fails(&self, hook: impl Fn(&Path) + Send + Sync + 'static) {
+        *self
+            .testing
+            .staging_fails
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(hook));
     }
@@ -635,6 +651,7 @@ impl NativeBridges {
     /// is reported as clean only when nothing of the release is left and nothing is unsettled.
     fn refuse(&self, journal: &mut Journal, reason: String) -> Run<Settled> {
         self.settle(journal)?;
+        let earlier = journal.leftovers.len();
         if !journal.changes.is_empty() {
             self.undo(journal)?;
         }
@@ -646,11 +663,23 @@ impl NativeBridges {
         };
         recheck(journal);
         self.save(journal)?;
-        if !journal.changes.is_empty() || !journal.unresolved.is_empty() {
-            return Ok(Settled::Unsettled(format!(
-                "{reason}; and {}",
-                outstanding(journal)
-            )));
+        // What this refusal had to leave in place, because it changed since it was placed, is
+        // named as left, and the refusal is not reported as clean.
+        let left: Vec<String> = journal
+            .leftovers
+            .iter()
+            .skip(earlier)
+            .map(Kept::describe)
+            .collect();
+        if !journal.changes.is_empty() || !journal.unresolved.is_empty() || !left.is_empty() {
+            let mut outstanding = outstanding(journal);
+            if !left.is_empty() {
+                if !outstanding.is_empty() {
+                    outstanding.push_str("; and ");
+                }
+                outstanding.push_str(&format!("left in place: {}", left.join("; ")));
+            }
+            return Ok(Settled::Unsettled(format!("{reason}; and {outstanding}")));
         }
         Ok(Settled::Refused(reason))
     }
@@ -680,12 +709,7 @@ impl NativeBridges {
                 directory.display()
             )
         })?;
-        let directory_identity = root.identity().map_err(|error| {
-            format!(
-                "{application}'s directory {} cannot be read: {error}",
-                directory.display()
-            )
-        })?;
+        let directory_identity = root.identity();
         // A release recorded here was applied in one directory, and the one at the path now is
         // another: the record says nothing about what is in it.
         if let Some(release) = journal.release.as_ref()
@@ -949,9 +973,7 @@ impl NativeBridges {
             .child(&temporary)
             .map_err(|error| refused(root, path, &error))?
         {
-            Child::Directory(made) => made
-                .identity()
-                .map_err(|error| refused(root, path, &error))?,
+            Child::Directory(made) => made.identity(),
             _ => return Err(Fault::Refused(substituted(root, path))),
         };
         set_publication(
@@ -976,12 +998,9 @@ impl NativeBridges {
                 if let Cleared::Left(reason) =
                     self.clear_staged(base, &temporary, Kind::Directory, Some(identity))?
                 {
-                    journal.unresolved.push(Kept {
-                        directory: root.path().to_path_buf(),
-                        path: sibling(path, &temporary),
-                        key: None,
-                        reason,
-                    });
+                    journal
+                        .unresolved
+                        .push(unproven_at(root, path, &temporary, reason));
                 }
             }
             Err(error) => return Err(refused(root, path, &error)),
@@ -1028,9 +1047,13 @@ impl NativeBridges {
         self.save(journal)?;
         let index = journal.changes.len() - 1;
         self.step("stage", &directory.join(&temporary))?;
-        let identity = directory
-            .stage(&temporary, bytes, files::READABLE)
-            .map_err(|error| refused(root, path, &error))?;
+        let identity = match self.stage(directory, &temporary, bytes, files::READABLE) {
+            Ok(identity) => identity,
+            Err(unstaged) => {
+                journal.changes.remove(index);
+                return Err(self.unstaged(journal, root, directory, path, &temporary, unstaged));
+            }
+        };
         set_publication(
             &mut journal.changes[index],
             Publication::Staged { identity },
@@ -1082,7 +1105,7 @@ impl NativeBridges {
             };
             let (bytes, created_members, created_document, mode) = match &read {
                 None => (
-                    created_document_text(&members, value)?,
+                    creation(&shown, &members, value).map_err(Fault::Refused)?,
                     members.len() - 1,
                     true,
                     files::PRIVATE,
@@ -1117,9 +1140,13 @@ impl NativeBridges {
             self.save(journal)?;
             let index = journal.changes.len() - 1;
             self.step("stage", &directory.join(&temporary))?;
-            let identity = directory
-                .stage(&temporary, &bytes, mode)
-                .map_err(|error| refused(root, file, &error))?;
+            let identity = match self.stage(directory, &temporary, &bytes, mode) {
+                Ok(identity) => identity,
+                Err(unstaged) => {
+                    journal.changes.remove(index);
+                    return Err(self.unstaged(journal, root, directory, file, &temporary, unstaged));
+                }
+            };
             set_publication(
                 &mut journal.changes[index],
                 Publication::Staged { identity },
@@ -1131,11 +1158,11 @@ impl NativeBridges {
                 identity,
             };
             if read.is_some() {
-                let listed = files::extended_access_controls(&directory.join(&temporary));
+                let listed = staged_listed(directory, &temporary, &identity);
                 if !matches!(listed, Ok(false)) {
                     self.discard(journal, index, root, directory, &staged)?;
                     return Err(Fault::Refused(match listed {
-                        Err(error) => error.to_string(),
+                        Err(reason) => reason,
                         Ok(_) => format!(
                             "a new file in {} is given an access-control list by the directory \
                              itself, so replacing {shown} here would change who can read it",
@@ -1202,6 +1229,30 @@ impl NativeBridges {
         self.save(journal)
     }
 
+    /// Takes back the file a staged write that did not finish had made, where it is still that
+    /// file, and says why the write failed. Anything else at the name is left and named. The
+    /// caller has forgotten the change that noted it.
+    fn unstaged(
+        &self,
+        journal: &mut Journal,
+        root: &Dir,
+        directory: &Dir,
+        path: &str,
+        temporary: &str,
+        unstaged: Unstaged,
+    ) -> Fault {
+        match self.clear_staged(directory, temporary, Kind::File, unstaged.made) {
+            Ok(Cleared::Left(reason)) => {
+                journal
+                    .unresolved
+                    .push(unproven_at(root, path, temporary, reason));
+            }
+            Ok(Cleared::Absent | Cleared::Removed) => {}
+            Err(fault) => return fault,
+        }
+        refused(root, path, &unstaged.error)
+    }
+
     /// Removes a copy this run staged, where it is still that copy; anything else at its name is
     /// left and recorded as not settled.
     fn take_back(
@@ -1217,12 +1268,9 @@ impl NativeBridges {
             Kind::File,
             Some(staged.identity),
         )? {
-            journal.unresolved.push(Kept {
-                directory: root.path().to_path_buf(),
-                path: sibling(staged.file, staged.temporary),
-                key: None,
-                reason,
-            });
+            journal
+                .unresolved
+                .push(unproven_at(root, staged.file, staged.temporary, reason));
         }
         Ok(())
     }
@@ -1238,7 +1286,12 @@ impl NativeBridges {
         staged: Option<Identity>,
     ) -> Run<Cleared> {
         match object_at(directory, temporary, kind).map_err(halted)? {
-            Object::Absent => Ok(Cleared::Absent),
+            // An earlier run may have taken it and stopped before its directory was flushed.
+            // Its record goes only once that removal is durable.
+            Object::Absent => {
+                self.flush(directory).map_err(halted)?;
+                Ok(Cleared::Absent)
+            }
             Object::Found(found) if staged.is_some_and(|staged| same(kind, &staged, &found)) => {
                 match kind {
                     Kind::File => {
@@ -1286,7 +1339,12 @@ impl NativeBridges {
             Root::Gone => journal.changes.clear(),
             Root::Substituted(reason) => {
                 for change in std::mem::take(&mut journal.changes) {
-                    let found = unreachable(&release.directory, change, &reason);
+                    let found = unreachable(
+                        &release.directory,
+                        release.directory_identity,
+                        change,
+                        &reason,
+                    );
                     journal.changes.extend(found.change);
                     journal.unresolved.extend(found.unresolved);
                 }
@@ -1311,120 +1369,99 @@ impl NativeBridges {
         let (path, _) = placed_path(&change);
         let (parent, name) = match tree::parent_of(root, path).map_err(halted)? {
             Walk::Found { parent, name } => (parent, name),
-            // A directory on the way is not there, so neither is anything the change made.
-            Walk::Missing { .. } => return Ok(Found::drop()),
+            // A directory on the way is not there, so neither is anything the change made. That
+            // is recorded only once the deepest directory that is there is flushed.
+            Walk::Missing { reached } => {
+                self.flush(reached.as_ref().unwrap_or(root))
+                    .map_err(halted)?;
+                return Ok(Found::drop());
+            }
             Walk::Substituted(at) => {
                 return Ok(unreachable(
                     root.path(),
+                    root.identity(),
                     change,
                     &substituted_reason(root, &at),
                 ));
             }
         };
         let directory = parent.as_ref().unwrap_or(root);
-        let unproven_at = |temporary: &str, reason: String| Kept {
-            directory: root.path().to_path_buf(),
-            path: sibling(path, temporary),
-            key: None,
-            reason,
-        };
-        match &change {
+        let mut found = Found::keep(change.clone());
+        // An edit that was taking a key out when the run stopped. Its staged copy goes where this
+        // host can show it made it; the key itself is decided by the removal.
+        if let Change::Key {
+            removing: Some(staging),
+            ..
+        } = &change
+        {
+            if let Cleared::Left(reason) =
+                self.clear_staged(directory, &staging.temporary, Kind::File, staging.identity)?
+            {
+                found
+                    .unresolved
+                    .push(unproven_at(root, path, &staging.temporary, reason));
+            }
+            if let Some(settled) = found.change.as_mut() {
+                set_removing(settled, None);
+            }
+        }
+        let (temporary, publication, kind) = match &change {
             Change::Directory {
                 temporary,
                 publication,
                 ..
-            }
-            | Change::File {
+            } => (temporary, *publication, Kind::Directory),
+            Change::File {
                 temporary,
                 publication,
                 ..
-            } => {
-                let kind = if matches!(change, Change::Directory { .. }) {
-                    Kind::Directory
-                } else {
-                    Kind::File
-                };
-                Ok(
-                    match self.settle_publication(directory, temporary, name, *publication, kind)? {
-                        Settlement::Placed(identity) => {
-                            let mut placed = change.clone();
-                            set_publication(&mut placed, Publication::Published { identity });
-                            Found::keep(placed)
-                        }
-                        Settlement::Absent | Settlement::NotOurs => Found::drop(),
-                        Settlement::Unproven(reason) => Found {
-                            change: None,
-                            unresolved: vec![unproven_at(temporary, reason)],
-                        },
-                    },
-                )
             }
-            Change::Key {
-                key,
-                value,
+            | Change::Key {
                 temporary,
                 publication,
-                removing,
                 ..
-            } => {
-                let mut found = Found::keep(change.clone());
-                // An edit that was taking the key out when the run stopped. Its staged copy goes
-                // where this host can show it made it; the key itself is decided by the removal.
-                if let Some(staging) = removing {
-                    if let Cleared::Left(reason) = self.clear_staged(
-                        directory,
-                        &staging.temporary,
-                        Kind::File,
-                        staging.identity,
-                    )? {
-                        found
-                            .unresolved
-                            .push(unproven_at(&staging.temporary, reason));
-                    }
-                    if let Some(settled) = found.change.as_mut() {
-                        set_removing(settled, None);
-                    }
+            } => (temporary, *publication, Kind::File),
+        };
+        // What is at the temporary name and what is at the destination are settled apart: an
+        // object somebody put at the temporary name after the rename says nothing about the
+        // destination, which may hold what this host published.
+        let (settlement, beside) =
+            self.settle_publication(directory, temporary, name, publication, kind)?;
+        if let Some(reason) = beside {
+            found
+                .unresolved
+                .push(unproven_at(root, path, temporary, reason));
+        }
+        match settlement {
+            Settlement::Placed(identity) => {
+                if let Some(settled) = found.change.as_mut() {
+                    set_publication(settled, Publication::Published { identity });
                 }
-                match self.settle_publication(
-                    directory,
-                    temporary,
-                    name,
-                    *publication,
-                    Kind::File,
-                )? {
-                    Settlement::Placed(identity) => {
-                        if let Some(settled) = found.change.as_mut() {
-                            set_publication(settled, Publication::Published { identity });
-                        }
-                    }
-                    Settlement::Absent => found.change = None,
-                    Settlement::Unproven(reason) => {
-                        found.change = None;
-                        found.unresolved.push(unproven_at(temporary, reason));
-                    }
-                    // The document at the name is not the one this host renamed there. The key in
-                    // it may be this host's, carried across by whoever replaced the document, or
-                    // somebody's own.
-                    Settlement::NotOurs => {
-                        found.change = None;
-                        if key_holds(directory, name, key, value) != Some(false) {
-                            found.unresolved.push(kept(
-                                root.path(),
-                                &change,
-                                "the document was replaced after this host wrote the key and \
-                                 before it recorded doing so, so whether the key is this host's \
-                                 cannot be shown",
-                            ));
-                        }
-                    }
+            }
+            Settlement::Absent => found.change = None,
+            Settlement::NotOurs => {
+                found.change = None;
+                // The document at the name is not the one this host renamed there. The key in it
+                // may be this host's, carried across by whoever replaced the document, or
+                // somebody's own.
+                if let Change::Key { key, value, .. } = &change
+                    && key_holds(directory, name, key, value) != Some(false)
+                {
+                    found.unresolved.push(kept(
+                        root,
+                        &change,
+                        "the document was replaced after this host wrote the key and before it \
+                         recorded doing so, so whether the key is this host's cannot be shown",
+                    ));
                 }
-                Ok(found)
             }
         }
+        Ok(found)
     }
 
-    /// Settles one unrecorded publication from what is at its temporary name and its destination.
-    /// A publication already recorded is left as it is.
+    /// Settles one unrecorded publication: says what came of it at its destination and, apart
+    /// from that, why anything left at its temporary name is left. A publication already recorded
+    /// is left as it is.
     fn settle_publication(
         &self,
         directory: &Dir,
@@ -1432,28 +1469,31 @@ impl NativeBridges {
         name: &str,
         publication: Publication,
         kind: Kind,
-    ) -> Run<Settlement> {
+    ) -> Run<(Settlement, Option<String>)> {
         let staged = match publication {
-            Publication::Published { identity } => return Ok(Settlement::Placed(identity)),
+            Publication::Published { identity } => {
+                return Ok((Settlement::Placed(identity), None));
+            }
             Publication::Staged { identity } => Some(identity),
             Publication::Noted => None,
         };
         // While the staged object is at its temporary name, it was never renamed into place.
-        match self.clear_staged(directory, temporary, kind, staged)? {
-            Cleared::Removed => return Ok(Settlement::Absent),
-            Cleared::Left(reason) => return Ok(Settlement::Unproven(reason)),
-            Cleared::Absent => {}
-        }
+        let beside = match self.clear_staged(directory, temporary, kind, staged)? {
+            Cleared::Removed => return Ok((Settlement::Absent, None)),
+            Cleared::Left(reason) => Some(reason),
+            Cleared::Absent => None,
+        };
+        // Only a staged object is ever renamed into place.
         let Some(staged) = staged else {
-            return Ok(Settlement::Absent);
+            return Ok((Settlement::Absent, beside));
         };
         match object_at(directory, name, kind).map_err(halted)? {
             Object::Found(found) if same(kind, &staged, &found) => {
                 // The rename happened. It is recorded only once its directory is flushed.
                 self.flush(directory).map_err(halted)?;
-                Ok(Settlement::Placed(staged))
+                Ok((Settlement::Placed(staged), beside))
             }
-            _ => Ok(Settlement::NotOurs),
+            _ => Ok((Settlement::NotOurs, beside)),
         }
     }
 
@@ -1464,7 +1504,9 @@ impl NativeBridges {
     /// Takes out every change of the release, in the order the recipe's removal says, then the
     /// directories this host made, deepest first. What changed since it was placed is left and
     /// named; what could not be taken out this time stays recorded for the next run, and so does
-    /// every directory that still holds it.
+    /// every directory that still holds it. While another directory is at the application
+    /// directory's path, nothing is taken out and everything stays recorded, to be taken out if
+    /// the directory the release was applied in comes back.
     fn undo(&self, journal: &mut Journal) -> Run<()> {
         journal.state = State::Removing;
         journal.blocked.clear();
@@ -1480,13 +1522,21 @@ impl NativeBridges {
                 return self.save(journal);
             }
             // What the release placed is in the directory it was applied in, which is not the one
-            // at the path now. Nothing is taken out of this one, and what was placed is named.
+            // at the path now. Nothing is taken out of this one.
             Root::Substituted(reason) => {
-                for change in std::mem::take(&mut journal.changes) {
-                    journal
-                        .leftovers
-                        .push(kept(&release.directory, &change, &reason));
-                }
+                let blocked: Vec<Kept> = journal
+                    .changes
+                    .iter()
+                    .map(|change| {
+                        kept_in(
+                            &release.directory,
+                            release.directory_identity,
+                            change,
+                            &reason,
+                        )
+                    })
+                    .collect();
+                journal.blocked.extend(blocked);
                 return self.save(journal);
             }
         };
@@ -1520,11 +1570,9 @@ impl NativeBridges {
             .collect();
         for index in uncovered.into_iter().rev() {
             let change = journal.changes.remove(index);
-            journal.leftovers.push(kept(
-                root.path(),
-                &change,
-                "the recipe names no removal for it",
-            ));
+            journal
+                .leftovers
+                .push(kept(&root, &change, "the recipe names no removal for it"));
         }
         let mut made: Vec<String> = journal
             .changes
@@ -1565,10 +1613,10 @@ impl NativeBridges {
             }
             Outcome::Kept(reason) => {
                 let change = journal.changes.remove(index);
-                journal.leftovers.push(kept(root.path(), &change, &reason));
+                journal.leftovers.push(kept(root, &change, &reason));
             }
             Outcome::Unfinished(reason) => {
-                let blocked = kept(root.path(), &journal.changes[index], &reason);
+                let blocked = kept(root, &journal.changes[index], &reason);
                 journal.blocked.push(blocked);
             }
         }
@@ -1684,25 +1732,24 @@ impl NativeBridges {
                 );
                 self.save(journal)?;
                 self.step("stage", &directory.join(&temporary))?;
-                let identity = match directory.stage(&temporary, edited.as_bytes(), read.mode) {
+                let identity = match self.stage(directory, &temporary, edited.as_bytes(), read.mode)
+                {
                     Ok(identity) => identity,
-                    Err(error) => {
-                        // A copy the write could not finish is removed by the write itself.
-                        // Whatever is at the name now is not one this host can show it made.
+                    Err(unstaged) => {
+                        // The file the write made is taken back where it is still that file;
+                        // anything else at the name is left and named.
                         if let Cleared::Left(reason) =
-                            self.clear_staged(directory, &temporary, Kind::File, None)?
+                            self.clear_staged(directory, &temporary, Kind::File, unstaged.made)?
                         {
-                            journal.unresolved.push(Kept {
-                                directory: root.path().to_path_buf(),
-                                path: sibling(&file, &temporary),
-                                key: None,
-                                reason,
-                            });
+                            journal
+                                .unresolved
+                                .push(unproven_at(root, &file, &temporary, reason));
                         }
                         set_removing(&mut journal.changes[index], None);
                         self.save(journal)?;
                         return Ok(Outcome::Unfinished(format!(
-                            "the edit could not be written: {error}"
+                            "the edit could not be written: {}",
+                            unstaged.error
                         )));
                     }
                 };
@@ -1719,11 +1766,11 @@ impl NativeBridges {
                     temporary: &temporary,
                     identity,
                 });
-                let listed = files::extended_access_controls(&directory.join(&temporary));
+                let listed = staged_listed(directory, &temporary, &identity);
                 if !matches!(listed, Ok(false)) {
                     self.withdraw_removal(journal, index, root, directory, staged.as_ref())?;
                     return Ok(Outcome::Unfinished(match listed {
-                        Err(error) => error.to_string(),
+                        Err(reason) => reason,
                         Ok(_) => format!(
                             "a new file in {} is given an access-control list by the directory \
                              itself, so replacing the document here would change who can read it",
@@ -1828,15 +1875,9 @@ impl NativeBridges {
             Ok(Child::NotADirectory) => Ok(Outcome::Kept(
                 "it is now a link, or not a directory".to_owned(),
             )),
-            Ok(Child::Directory(found))
-                if !found
-                    .identity()
-                    .is_ok_and(|found| found.same_object(&identity)) =>
-            {
-                Ok(Outcome::Kept(
-                    "it is not the directory this host made".to_owned(),
-                ))
-            }
+            Ok(Child::Directory(found)) if !found.identity().same_object(&identity) => Ok(
+                Outcome::Kept("it is not the directory this host made".to_owned()),
+            ),
             Ok(Child::Directory(_)) => {
                 self.step("unmake", &directory.join(name))?;
                 match directory.remove_directory(name) {
@@ -1896,8 +1937,7 @@ impl NativeBridges {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Root::Gone),
             Err(error) => return Err(halted(error)),
         };
-        let identity = root.identity().map_err(halted)?;
-        if !identity.same_object(&release.directory_identity) {
+        if !root.identity().same_object(&release.directory_identity) {
             return Ok(Root::Substituted(format!(
                 "{} is now another directory than the one this host applied the bridge in, so \
                  nothing in it is taken as this host's",
@@ -1948,6 +1988,32 @@ impl NativeBridges {
             return Err(std::io::Error::other(error.to_string()));
         }
         directory.flush()
+    }
+
+    /// Writes a staged copy; a test can have the write fail once it has made its file.
+    fn stage(
+        &self,
+        directory: &Dir,
+        temporary: &str,
+        bytes: &[u8],
+        mode: u32,
+    ) -> std::result::Result<Identity, Unstaged> {
+        let identity = directory.stage(temporary, bytes, mode)?;
+        #[cfg(feature = "testing")]
+        if let Some(hook) = self
+            .testing
+            .staging_fails
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            hook(&directory.join(temporary));
+            return Err(Unstaged {
+                error: std::io::Error::other("the write was stopped by a test"),
+                made: Some(identity),
+            });
+        }
+        Ok(identity)
     }
 
     fn about_to_publish(&self, destination: &Path) {
@@ -2155,7 +2221,9 @@ fn key_is_ours(
     let shown = tree::display(root.path(), file);
     let members: Vec<&str> = key.split('.').collect();
     match tree::parent_of(root, file).map_err(|error| format!("{shown}: {error}"))? {
-        Walk::Missing { .. } => Ok(false),
+        // Not there: the document it would be written into is made now, without writing it, so
+        // one this host could not read back is refused before anything is written.
+        Walk::Missing { .. } => creation(&shown, &members, value).map(|_| false),
         Walk::Substituted(at) => Err(substituted(root, &at)),
         Walk::Found { parent, name } => {
             let directory = parent.as_ref().unwrap_or(root);
@@ -2163,7 +2231,7 @@ fn key_is_ours(
                 .fetch(name, DOCUMENT_LIMIT)
                 .map_err(|error| format!("{shown}: {error}"))?
             {
-                Fetched::Absent => return Ok(false),
+                Fetched::Absent => return creation(&shown, &members, value).map(|_| false),
                 Fetched::NotRegular => {
                     return Err(format!("{shown} is a link, or not a regular file"));
                 }
@@ -2279,15 +2347,60 @@ fn still_the_same(
                 && now.mode == read.mode
                 && now.bytes == read.bytes =>
         {
-            Ok(
-                match files::guard_access_controls(&directory.join(name), INSTEAD) {
-                    Ok(()) => Sameness::Same,
-                    Err(error) => Sameness::Refused(error.to_string()),
-                },
-            )
+            Ok(guard_held(directory, name, &now.identity))
         }
         _ => Ok(Sameness::Changed),
     }
+}
+
+/// The access-control guard for a document about to be replaced. It can only read through paths,
+/// so it runs while the directory's path leads to the held directory and the document's path to
+/// the document just read through it, checked before and after: what it reads is about them, and
+/// not about something put in their place.
+fn guard_held(directory: &Dir, name: &str, identity: &Identity) -> Sameness {
+    let reached = || directory.path_leads_here() && directory.path_leads_to(name, identity);
+    let lost = || {
+        Sameness::Refused(format!(
+            "{} no longer leads to the document this host read, so its protection cannot be read",
+            directory.join(name).display()
+        ))
+    };
+    if !reached() {
+        return lost();
+    }
+    let guarded = files::guard_access_controls(&directory.join(name), INSTEAD);
+    if !reached() {
+        return lost();
+    }
+    match guarded {
+        Ok(()) => Sameness::Same,
+        Err(error) => Sameness::Refused(error.to_string()),
+    }
+}
+
+/// Whether the copy staged at `temporary` was given an access-control list by its directory, read
+/// through its path while the paths lead to the held directory and to the copy.
+fn staged_listed(
+    directory: &Dir,
+    temporary: &str,
+    identity: &Identity,
+) -> std::result::Result<bool, String> {
+    let reached = || directory.path_leads_here() && directory.path_leads_to(temporary, identity);
+    let lost = || {
+        format!(
+            "{} no longer leads to the copy this host staged, so its protection cannot be read",
+            directory.join(temporary).display()
+        )
+    };
+    if !reached() {
+        return Err(lost());
+    }
+    let listed = files::extended_access_controls(&directory.join(temporary))
+        .map_err(|error| error.to_string());
+    if !reached() {
+        return Err(lost());
+    }
+    listed
 }
 
 /// `Some(true)` when the document holds `value` at `key`, `Some(false)` when it holds something
@@ -2315,7 +2428,7 @@ fn object_at(directory: &Dir, name: &str, kind: Kind) -> std::io::Result<Object>
         }),
         Kind::Directory => Ok(match directory.child(name)? {
             Child::Absent => Object::Absent,
-            Child::Directory(found) => Object::Found(found.identity()?),
+            Child::Directory(found) => Object::Found(found.identity()),
             Child::NotADirectory => Object::Other,
         }),
     }
@@ -2385,10 +2498,7 @@ fn drift(journal: &Journal) -> Vec<String> {
         Ok(root) => root,
         Err(error) => return vec![format!("{}: {error}", release.directory.display())],
     };
-    if !root
-        .identity()
-        .is_ok_and(|identity| identity.same_object(&release.directory_identity))
-    {
+    if !root.identity().same_object(&release.directory_identity) {
         return vec![format!(
             "{} is now another directory than the one this host applied the bridge in",
             release.directory.display()
@@ -2466,6 +2576,10 @@ fn confirmed_gone(kept: &Kept) -> bool {
         Ok(root) => root,
         Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
     };
+    // Another directory at the path says nothing about what is in the one the record is about.
+    if !root.identity().same_object(&kept.directory_identity) {
+        return false;
+    }
     match tree::parent_of(&root, &kept.path) {
         Ok(Walk::Missing { .. }) => true,
         Ok(Walk::Found { parent, name }) => {
@@ -2496,7 +2610,7 @@ fn key_holds_anything(directory: &Dir, name: &str, key: &str) -> Option<bool> {
 /// What a change becomes when what it may have left cannot be reached: every name it may have left
 /// something at is recorded as not settled, and a change already published stays, for its removal
 /// to decide.
-fn unreachable(directory: &Path, change: Change, reason: &str) -> Found {
+fn unreachable(directory: &Path, identity: Identity, change: Change, reason: &str) -> Found {
     if !in_flight(&change) {
         return Found::keep(change);
     }
@@ -2537,6 +2651,7 @@ fn unreachable(directory: &Path, change: Change, reason: &str) -> Found {
         .into_iter()
         .map(|(path, key)| Kept {
             directory: directory.to_path_buf(),
+            directory_identity: identity,
             path,
             key,
             reason: reason.to_owned(),
@@ -2578,14 +2693,33 @@ fn placed_path(change: &Change) -> (&str, Option<&str>) {
     }
 }
 
-/// A record of something left in place, and why.
-fn kept(directory: &Path, change: &Change, reason: &str) -> Kept {
+/// A record of what a change placed, in the directory this run holds, and why it is named.
+fn kept(root: &Dir, change: &Change, reason: &str) -> Kept {
+    kept_in(root.path(), root.identity(), change, reason)
+}
+
+/// A record of what a change placed, in the directory with this path and identity, and why it is
+/// named.
+fn kept_in(directory: &Path, identity: Identity, change: &Change, reason: &str) -> Kept {
     let (path, key) = placed_path(change);
     Kept {
         directory: directory.to_path_buf(),
+        directory_identity: identity,
         path: path.to_owned(),
         key: key.map(str::to_owned),
         reason: reason.to_owned(),
+    }
+}
+
+/// A record of something at `temporary` beside `path` that may be this host's and cannot be shown
+/// to be.
+fn unproven_at(root: &Dir, path: &str, temporary: &str, reason: String) -> Kept {
+    Kept {
+        directory: root.path().to_path_buf(),
+        directory_identity: root.identity(),
+        path: sibling(path, temporary),
+        key: None,
+        reason,
     }
 }
 
@@ -2643,18 +2777,26 @@ fn set_removing(change: &mut Change, staging: Option<Staging>) {
     }
 }
 
-/// The text of a document this host creates to hold one key.
-fn created_document_text(members: &[&str], value: &str) -> Run<Vec<u8>> {
+/// The text of a document this host creates to hold one key, within the size this host reads
+/// back.
+fn creation(shown: &str, members: &[&str], value: &str) -> std::result::Result<Vec<u8>, String> {
     let mut document: serde_json::Value = serde_json::from_str(value)
-        .map_err(|error| Fault::Refused(format!("the recipe's value is not JSON: {error}")))?;
+        .map_err(|error| format!("the recipe's value is not JSON: {error}"))?;
     for member in members.iter().rev() {
         let mut object = serde_json::Map::new();
         object.insert((*member).to_owned(), document);
         document = serde_json::Value::Object(object);
     }
     let text = serde_json::to_string_pretty(&document)
-        .map_err(|error| Fault::Refused(format!("the document cannot be written: {error}")))?;
-    Ok(format!("{text}\n").into_bytes())
+        .map_err(|error| format!("the document cannot be written: {error}"))?;
+    let bytes = format!("{text}\n").into_bytes();
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > DOCUMENT_LIMIT {
+        return Err(format!(
+            "{shown} would be larger than the {DOCUMENT_LIMIT} bytes this host reads back once \
+             the key is written"
+        ));
+    }
+    Ok(bytes)
 }
 
 /// The recipe's value, as the one spelling this host writes and compares.

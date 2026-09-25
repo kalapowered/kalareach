@@ -206,6 +206,9 @@ pub(super) enum Publication {
 pub(super) struct Kept {
     /// The application's directory it is under.
     pub(super) directory: PathBuf,
+    /// That directory's identity. Another directory at its path says nothing about what is in
+    /// this one.
+    pub(super) directory_identity: Identity,
     /// The file or directory, under that directory.
     pub(super) path: String,
     /// The key in that file, where it is a key.

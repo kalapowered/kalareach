@@ -78,6 +78,17 @@ pub(super) enum Fetched {
     TooLarge,
 }
 
+/// A staged write that did not finish: why, and the identity of the file it had made by then, so
+/// the caller can take back that file and nothing else.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+pub(super) struct Unstaged {
+    /// Why it did not finish.
+    pub(super) error: std::io::Error,
+    /// The file it made, as it was when the write stopped; `None` when it made none, or its
+    /// identity could not be read.
+    pub(super) made: Option<Identity>,
+}
+
 /// A file read through the directory's handle.
 #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 pub(super) struct Read {
@@ -100,13 +111,14 @@ mod platform {
     use rustix::fs::{AtFlags, FileType, Mode, OFlags, RenameFlags};
     use rustix::io::Errno;
 
-    use super::{Child, Entry, Fetched, Identity, Read};
+    use super::{Child, Entry, Fetched, Identity, Read, Unstaged};
 
-    /// An open directory, and the path it was reached by, for messages and for the checks that
-    /// only take a path.
+    /// An open directory, its identity, and the path it was reached by, for messages and for the
+    /// checks that only take a path.
     #[derive(Debug)]
     pub(in crate::catalogue::native_bridge) struct Dir {
         handle: OwnedFd,
+        identity: Identity,
         path: PathBuf,
     }
 
@@ -119,9 +131,15 @@ mod platform {
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
                 Mode::empty(),
             )?;
+            Self::held(handle, path.to_path_buf())
+        }
+
+        fn held(handle: OwnedFd, path: PathBuf) -> std::io::Result<Self> {
+            let identity = identity(&std::fs::File::from(handle.try_clone()?).metadata()?);
             Ok(Self {
                 handle,
-                path: path.to_path_buf(),
+                identity,
+                path,
             })
         }
 
@@ -135,10 +153,26 @@ mod platform {
             self.path.join(name)
         }
 
-        /// Returns this directory's own identity.
-        pub(in crate::catalogue::native_bridge) fn identity(&self) -> std::io::Result<Identity> {
-            let file = std::fs::File::from(self.handle.try_clone()?);
-            Ok(identity(&file.metadata()?))
+        /// Returns this directory's own identity, as it was opened. A directory's device and inode
+        /// do not change while it is held.
+        pub(in crate::catalogue::native_bridge) const fn identity(&self) -> Identity {
+            self.identity
+        }
+
+        /// True when this directory's path, followed as any program would follow it, still leads
+        /// to this directory.
+        pub(in crate::catalogue::native_bridge) fn path_leads_here(&self) -> bool {
+            leads_to(&self.path, &self.identity)
+        }
+
+        /// True when the path of `name` in this directory, followed as any program would follow
+        /// it, leads to the file object `identity` names.
+        pub(in crate::catalogue::native_bridge) fn path_leads_to(
+            &self,
+            name: &str,
+            identity: &Identity,
+        ) -> bool {
+            leads_to(&self.join(name), identity)
         }
 
         /// Opens a directory in this one, without following a link.
@@ -152,10 +186,7 @@ mod platform {
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
             ) {
-                Ok(handle) => Ok(Child::Directory(Self {
-                    handle,
-                    path: self.join(name),
-                })),
+                Ok(handle) => Ok(Child::Directory(Self::held(handle, self.join(name))?)),
                 Err(Errno::NOENT) => Ok(Child::Absent),
                 Err(Errno::LOOP | Errno::NOTDIR) => Ok(Child::NotADirectory),
                 Err(error) => Err(error.into()),
@@ -227,19 +258,25 @@ mod platform {
         }
 
         /// Writes `bytes` to a new file at `name` with exactly the permission bits of `mode`,
-        /// flushes it, and returns its identity.
+        /// flushes it, and returns its identity. A write that does not finish leaves the file it
+        /// made where it is and says which file that is: its name is already recorded, so taking
+        /// it back is the caller's, by the same identity check as any other cleanup.
         pub(in crate::catalogue::native_bridge) fn stage(
             &self,
             name: &str,
             bytes: &[u8],
             mode: u32,
-        ) -> std::io::Result<Identity> {
+        ) -> Result<Identity, Unstaged> {
             let handle = rustix::fs::openat(
                 self.handle.as_fd(),
                 name,
                 OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 permissions(mode),
-            )?;
+            )
+            .map_err(|error| Unstaged {
+                error: error.into(),
+                made: None,
+            })?;
             // The creation mask narrows what the file is created with. The bits are set again,
             // before anything is written, so a replacement has the protection of the file it
             // replaces, no more and no less.
@@ -249,16 +286,12 @@ mod platform {
                 .and_then(|()| file.write_all(bytes))
                 .and_then(|()| file.sync_all())
                 .and_then(|()| file.metadata());
-            match staged {
-                Ok(metadata) => Ok(identity(&metadata)),
-                Err(error) => {
-                    // This call made the file and nothing else knows its name yet, so a copy it
-                    // could not finish is its own to remove.
-                    drop(file);
-                    let _ = rustix::fs::unlinkat(self.handle.as_fd(), name, AtFlags::empty());
-                    Err(error)
-                }
-            }
+            staged
+                .map(|metadata| identity(&metadata))
+                .map_err(|error| Unstaged {
+                    error,
+                    made: file.metadata().ok().map(|metadata| identity(&metadata)),
+                })
         }
 
         /// Renames `from` to `to` only where nothing is at `to`.
@@ -326,6 +359,15 @@ mod platform {
         }
     }
 
+    /// True when `path`, followed as any program would follow it, leads to the file object
+    /// `identity` names.
+    fn leads_to(path: &Path, identity: &Identity) -> bool {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata(path).is_ok_and(|metadata| {
+            metadata.dev() == identity.device && metadata.ino() == identity.inode
+        })
+    }
+
     /// The permission bits of `mode`, whatever width this platform's mode has.
     fn permissions(mode: u32) -> Mode {
         [
@@ -362,7 +404,7 @@ mod platform {
 mod platform {
     use std::path::{Path, PathBuf};
 
-    use super::{Child, Entry, Fetched, Identity};
+    use super::{Child, Entry, Fetched, Identity, Unstaged};
 
     fn unsupported() -> std::io::Error {
         std::io::Error::new(
@@ -374,6 +416,7 @@ mod platform {
     /// An open directory. None is ever opened on this platform.
     #[derive(Debug)]
     pub(in crate::catalogue::native_bridge) struct Dir {
+        identity: Identity,
         path: PathBuf,
     }
 
@@ -390,8 +433,20 @@ mod platform {
             self.path.join(name)
         }
 
-        pub(in crate::catalogue::native_bridge) fn identity(&self) -> std::io::Result<Identity> {
-            Err(unsupported())
+        pub(in crate::catalogue::native_bridge) const fn identity(&self) -> Identity {
+            self.identity
+        }
+
+        pub(in crate::catalogue::native_bridge) fn path_leads_here(&self) -> bool {
+            false
+        }
+
+        pub(in crate::catalogue::native_bridge) fn path_leads_to(
+            &self,
+            _name: &str,
+            _identity: &Identity,
+        ) -> bool {
+            false
         }
 
         pub(in crate::catalogue::native_bridge) fn child(
@@ -428,8 +483,11 @@ mod platform {
             _name: &str,
             _bytes: &[u8],
             _mode: u32,
-        ) -> std::io::Result<Identity> {
-            Err(unsupported())
+        ) -> Result<Identity, Unstaged> {
+            Err(Unstaged {
+                error: unsupported(),
+                made: None,
+            })
         }
 
         pub(in crate::catalogue::native_bridge) fn rename_new(
