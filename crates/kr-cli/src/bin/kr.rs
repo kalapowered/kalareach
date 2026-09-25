@@ -923,27 +923,22 @@ async fn run(cli: Cli) -> Result<Completion> {
                     let stored = kr_client::services::voice::AccountTokenFile::at(path.clone())
                         .stored()
                         .ok();
+                    // The origin as a diagnostic names one and the scopes as this build knows
+                    // them, for a person and for a script alike. The token itself is never
+                    // printed by anything.
+                    let held = kr_cli::account::Held::of(&path, stored.as_ref());
                     if cli.json {
                         print_json(&serde_json::json!({
                             "ok": true,
-                            "path": path.display().to_string(),
-                            "imported": stored.is_some(),
-                            "origin": stored.as_ref().map(|stored| stored.origin.clone()),
-                            "scopes": stored
-                                .as_ref()
-                                .map(|stored| stored.scopes.clone())
-                                .unwrap_or_default(),
+                            "path": held.path,
+                            "imported": held.imported,
+                            "origin": held.origin,
+                            "scopes": held.scopes,
+                            "unknown_scopes": held.unknown_scopes,
                         }));
                     } else {
-                        println!("This host reads its account token from {}.", path.display());
-                        match stored {
-                            // The description is the origin, the scopes and the expiry. The token
-                            // itself is never printed by anything.
-                            Some(stored) => println!("It holds {}.", stored.description()),
-                            None => println!(
-                                "No account token has been imported. Write one with `kr account \
-                                 token import <path>`."
-                            ),
+                        for line in held.lines() {
+                            println!("{line}");
                         }
                     }
                     Ok(Completion::Done)
