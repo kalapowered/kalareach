@@ -1797,10 +1797,36 @@ pub(super) mod tests {
         temp: &kr_ipc::testing::TempHost,
         boot_identity: kr_protocol::identity::BootIdentity,
     ) -> Arc<Controller> {
+        Controller::start(setup(temp, boot_identity))
+            .await
+            .expect("the daemon starts")
+    }
+
+    /// Starts a daemon as [`daemon`] does, on clocks this test moves by hand.
+    async fn daemon_on(
+        temp: &kr_ipc::testing::TempHost,
+        clocks: crate::service::Clocks,
+    ) -> Arc<Controller> {
+        Controller::start_on_clocks(
+            setup(
+                temp,
+                kr_ipc::identity::boot_identity().expect("a boot identity"),
+            ),
+            clocks,
+        )
+        .await
+        .expect("the daemon starts")
+    }
+
+    /// What a test daemon is started with, in the boot `boot_identity` names.
+    fn setup(
+        temp: &kr_ipc::testing::TempHost,
+        boot_identity: kr_protocol::identity::BootIdentity,
+    ) -> ControllerSetup {
         let environment = temp.environment();
         let environment_id = temp.environment_id();
         let secrets = environment.secrets_dir();
-        Controller::start(ControllerSetup {
+        ControllerSetup {
             paths: environment,
             environment_id,
             identity: Box::new(move || {
@@ -1821,9 +1847,7 @@ pub(super) mod tests {
             release: "0".to_owned(),
             shell_packages: None,
             terminal: Box::new(crate::supervision::NoTerminal),
-        })
-        .await
-        .expect("the daemon starts")
+        }
     }
 
     /// A redeemed grant to one device, carrying viewing.
@@ -2580,21 +2604,29 @@ pub(super) mod tests {
 
     /// The offline bound runs out on the continuous clock it was anchored on. A decision taken
     /// after the wall clock was wound back reads UTC inside the bound again, and is refused all the
-    /// same; a synchronisation of the authority feed anchors the bound afresh.
+    /// same; a synchronisation of the authority feed anchors the bound afresh. On clocks the test
+    /// moves by hand, so no step depends on how much real time passes between two others.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_offline_bound_runs_out_on_the_clock_it_was_anchored_on() {
         let temp = kr_ipc::testing::TempHost::create();
-        let controller = daemon(&temp).await;
-        let revision = controller.policy().authority_revision();
+        let continuous = kr_transport::clock::ManualClock::new();
         let synchronised = kr_ipc::now_ms().get();
-        controller
-            .update_policy(|policy| {
-                policy.set_offline_validity(Some(kr_protocol::sharing::OfflineValidityPolicy {
-                    maximum_offline_ms: kr_protocol::scalars::DurationMs::new(200),
-                    last_synchronised_at_ms: Nullable::some(TimestampMs::new(synchronised)),
-                }));
-            })
-            .expect("the owner chooses an offline bound of a fifth of a second");
+        let wall = Arc::new(std::sync::atomic::AtomicU64::new(synchronised));
+        let controller = daemon_on(
+            &temp,
+            crate::service::Clocks {
+                continuous: Arc::new(continuous.clone()),
+                wall: {
+                    let wall = Arc::clone(&wall);
+                    crate::service::WallClock::from_fn(move || {
+                        wall.load(std::sync::atomic::Ordering::SeqCst)
+                    })
+                },
+            },
+        )
+        .await;
+        let revision = controller.policy().authority_revision();
+        choose_offline_bound(&controller, synchronised, 200);
         let (lasting, lasting_record) = granted(GrantExpiry::Never, revision);
         let decision = controller
             .decide_for_device(&lasting, &lasting_record, listing(&temp, synchronised))
@@ -2604,25 +2636,26 @@ pub(super) mod tests {
             "and the bound is anchored"
         );
 
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        // The wall clock has been wound back five seconds. With the floor this host holds, UTC is
-        // still inside the bound.
-        let refused = controller
-            .decide_for_device(
+        // The continuous clock passes the bound, and the wall clock is wound back five seconds.
+        // With the floor this host holds, UTC is still inside the bound.
+        continuous.advance(std::time::Duration::from_millis(300));
+        wall.store(synchronised - 5_000, std::sync::atomic::Ordering::SeqCst);
+        offline_lapsed(
+            controller.decide_for_device(
                 &lasting,
                 &lasting_record,
                 listing(&temp, synchronised - 5_000),
-            )
-            .expect_err("the bound ran out on the continuous clock");
-        assert!(
-            matches!(
-                refused,
-                CeilingRefusal::Refused(Refusal::OfflineValidityLapsed { .. })
             ),
-            "{refused:?}"
+            "the bound ran out on the continuous clock",
         );
 
+        // The control: a later reading alone anchors nothing, so the bound stays run out.
         let again = synchronised + 1_000;
+        wall.store(again, std::sync::atomic::Ordering::SeqCst);
+        offline_lapsed(
+            controller.decide_for_device(&lasting, &lasting_record, listing(&temp, again)),
+            "nothing anchored the bound afresh",
+        );
         controller
             .update_policy(|policy| policy.note_feed_synchronised(again))
             .expect("the authority feed synchronises");
