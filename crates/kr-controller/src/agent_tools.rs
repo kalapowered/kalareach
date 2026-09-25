@@ -783,9 +783,9 @@ impl Installer {
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::PermissionDenied`] on a platform this host cannot change an
-    /// installation on, or where a document it would rewrite is protected by an access-control
-    /// list, and [`ControllerError::InvalidArgument`] when the scope needs a project directory
+    /// Returns [`ControllerError::PermissionDenied`] where a document it would rewrite has access
+    /// controls a replacement could not carry, [`ControllerError::Storage`] where they cannot be
+    /// read, and [`ControllerError::InvalidArgument`] when the scope needs a project directory
     /// that was not given, or the record cannot be read.
     pub fn check_removal(&self, params: &AgentToolsParams) -> Result<()> {
         self.removable(params).map(|_| ())
@@ -793,7 +793,6 @@ impl Installer {
 
     /// Reads what a removal would work from, refusing everything it cannot do.
     fn removable(&self, params: &AgentToolsParams) -> Result<Option<InstallationRecord>> {
-        supported_platform()?;
         // A removal of something never installed still has to know where it would have been, or it
         // is not the removal of anything in particular.
         self.layout(params)?;
@@ -823,7 +822,6 @@ impl Installer {
     /// there and this host did not write it, and [`ControllerError::InvalidArgument`] when the
     /// scope needs a project directory that was not given.
     pub fn check(&self, params: &AgentToolsParams) -> Result<()> {
-        supported_platform()?;
         let layout = self.layout(params)?;
         let root = layout.skills.clone();
         self.check_before_writing(params, &layout, &root)
@@ -1762,32 +1760,6 @@ fn is_digest_name(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-/// Refuses a change to an agent's installation on a platform where this host cannot check that a
-/// replacement keeps who may read the file it replaces.
-///
-/// Every file an installation rewrites, its own record included, is replaced by a new file renamed
-/// over it, and the new file carries whatever access-control list its directory gives it. Before
-/// one takes an existing file's place this host compares the two, and it reads those lists on
-/// macOS and Linux only (see [`guard_access_controls`] and [`write_atomically`]). Windows gives
-/// every file a list, so there every replacement would be refused, the first of them part way
-/// through, once the installation's record had been written. Rather than begin a change it would
-/// have to abandon, this host makes none on Windows: `kr skill status` still reports what is
-/// there, and the agent's own command adds the server.
-fn supported_platform() -> Result<()> {
-    // A compile-time value rather than a conditional body, so both answers are checked on every
-    // platform this crate builds for.
-    if cfg!(windows) {
-        return Err(ControllerError::PermissionDenied {
-            detail: format!(
-                "this host does not install or remove {SKILL_NAME} on Windows, because it does not \
-                 read access-control lists there and so cannot tell whether replacing a file would \
-                 change who can read it; add the server with the agent's own command instead"
-            ),
-        });
-    }
-    Ok(())
-}
-
 /// Refuses to replace a document whose protection this host cannot carry across.
 ///
 /// A replacement by rename gives the new file its own access control. The mode bits are carried
@@ -1802,8 +1774,7 @@ fn guard_access_controls(path: &Path) -> Result<()> {
     if extended_access_controls(path)? {
         return Err(ControllerError::PermissionDenied {
             detail: format!(
-                "{} is protected by an access-control list, and changing it here would not carry \
-                 that across; add or remove the server with the agent's own command instead",
+                "{} {NOT_CARRIED}; add or remove the server with the agent's own command instead",
                 display(path)
             ),
         });
@@ -1870,12 +1841,55 @@ fn interpret_probe(answer: std::result::Result<usize, rustix::io::Errno>) -> Res
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// Returns true when the file has access controls a new file written beside it would not be
+/// given: an owner other than the one this process gives the files it creates, a list protected
+/// from its directory, absent or empty, or an entry set on the file itself where its list records
+/// which entries it inherited.
+///
+/// A replacement is a new file renamed over the old one, and Windows gives a new file its owner
+/// from this process and its lists from its directory. A list written the older way does not
+/// record which entries it inherited, so an entry set on such a file is not seen here; the write
+/// compares the copy it made with the file before either replaces the other, and refuses there.
+///
+/// # Errors
+///
+/// Returns [`ControllerError::Storage`] when the file's access cannot be read, and
+/// [`ControllerError::PermissionDenied`] when it carries a control this host does not evaluate:
+/// encryption, or an entry of a kind this host does not read.
+#[cfg(windows)]
+fn extended_access_controls(path: &Path) -> Result<bool> {
+    let access =
+        kr_ipc::paths::FileAccess::of(path).map_err(|refusal| refused_read(path, refusal))?;
+    let owned = access
+        .is_owned_as_new_files_are()
+        .map_err(|refusal| refused_read(path, refusal))?;
+    Ok(!owned || !access.records_nothing_set_here())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn extended_access_controls(path: &Path) -> Result<bool> {
     // Nothing here can read this platform's access controls, so nothing here can promise to keep
     // them. An existing document is refused rather than replaced.
     let _ = path;
     Ok(true)
+}
+
+/// Answers a refusal of the Windows access reader: a read that failed is a storage failure, and a
+/// control the reader does not evaluate is a refusal to change the file.
+#[cfg(windows)]
+fn refused_read(path: &Path, refusal: kr_ipc::paths::AccessListRefusal) -> ControllerError {
+    match refusal {
+        kr_ipc::paths::AccessListRefusal::Unreadable(detail) => storage(std::io::Error::other(
+            format!("{}: {detail}", display(path)),
+        )),
+        kr_ipc::paths::AccessListRefusal::Policy(detail) => ControllerError::PermissionDenied {
+            detail: format!(
+                "{}: {detail}, so this host cannot tell whether replacing it would change who can \
+                 read it; add or remove the server with the agent's own command instead",
+                display(path)
+            ),
+        },
+    }
 }
 
 /// Returns true when files created in this directory are given access controls by it.
@@ -1905,10 +1919,62 @@ fn inheritable_access_controls(directory: &Path) -> Result<bool> {
     ))
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// On Windows a document whose descriptor records nothing set on it carries what its directory
+/// gives its files, which a replacement made there is given too, so the directory is not read
+/// here. Where the directory's list changed since the document inherited from it, or the document
+/// was moved in from another directory, the write compares the copy it made with the document and
+/// refuses there.
+#[cfg(windows)]
+fn inheritable_access_controls(directory: &Path) -> Result<bool> {
+    let _ = directory;
+    Ok(false)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn inheritable_access_controls(directory: &Path) -> Result<bool> {
     let _ = directory;
     Ok(true)
+}
+
+/// Why a document is refused when its access controls are ones a replacement would not carry.
+#[cfg(not(windows))]
+const NOT_CARRIED: &str =
+    "is protected by an access-control list, and changing it here would not carry that across";
+
+/// Why a document is refused when its access controls are ones a replacement would not carry.
+#[cfg(windows)]
+const NOT_CARRIED: &str = "has an owner or an access-control list that a new file in its directory \
+     would not be given, and changing it here would change who can read it";
+
+/// What a copy that would change who can read the document it replaces is given.
+#[cfg(not(windows))]
+const COPY_DIFFERS: &str = "is given an access-control list by the directory itself";
+
+/// What a copy that would change who can read the document it replaces is given.
+#[cfg(windows)]
+const COPY_DIFFERS: &str =
+    "is given another owner or access-control list than the file it would replace";
+
+/// Returns true when the copy about to take `document`'s place would change who can read it.
+///
+/// On macOS and Linux the copy was created with the document's mode bits, so what it can differ in
+/// is an access-control list its directory gave it.
+#[cfg(not(windows))]
+fn copy_changes_access(_copy: &std::fs::File, temporary: &Path, _document: &Path) -> Result<bool> {
+    extended_access_controls(temporary)
+}
+
+/// Returns true when the copy about to take `document`'s place would change who can read it.
+///
+/// On Windows the copy's owner and lists, read through the handle that created it, are compared
+/// with the document's, read again now, whole.
+#[cfg(windows)]
+fn copy_changes_access(copy: &std::fs::File, temporary: &Path, document: &Path) -> Result<bool> {
+    let copy = kr_ipc::paths::FileAccess::read(copy)
+        .map_err(|refusal| refused_read(temporary, refusal))?;
+    let document = kr_ipc::paths::FileAccess::of(document)
+        .map_err(|refusal| refused_read(document, refusal))?;
+    Ok(copy != document)
 }
 
 /// Makes a directory's own entries durable.
@@ -2096,17 +2162,27 @@ fn write_atomically(path: &Path, bytes: &[u8], default_mode: u32) -> Result<()> 
     }
     #[cfg(not(unix))]
     let _ = default_mode;
+    // On Windows the copy's own handle reads its access back, which needs it to read as well.
+    #[cfg(windows)]
+    options.read(true);
     let mut file = options.open(&temporary).map_err(storage)?;
     // The copy that is about to take an existing file's place, before anything is written into it.
     // A directory can give what is created in it access its own files do not have, and the rename
-    // below would hand that to the document being replaced.
-    if path.exists() && extended_access_controls(&temporary)? {
+    // below would hand that to the document being replaced. A check that cannot be made refuses as
+    // one that fails does, and neither leaves the copy behind.
+    let changes = if path.exists() {
+        copy_changes_access(&file, &temporary, path)
+    } else {
+        Ok(false)
+    };
+    if !matches!(changes, Ok(false)) {
         drop(file);
         let _ = std::fs::remove_file(&temporary);
+        changes?;
         return Err(ControllerError::PermissionDenied {
             detail: format!(
-                "a new file in {} is given an access-control list by the directory itself, so \
-                 replacing {} here would change who can read it",
+                "a new file in {} {COPY_DIFFERS}, so replacing {} here would change who can read \
+                 it",
                 display(parent),
                 display(path)
             ),
@@ -3215,6 +3291,204 @@ mod tests {
             "the tree the restricted document was in is removed: {}",
             root.display()
         );
+    }
+
+    /// Runs one of this platform's own tools on a file this test made, and fails the test when it
+    /// fails.
+    #[cfg(windows)]
+    fn run(program: &str, arguments: &[&std::ffi::OsStr]) {
+        let output = std::process::Command::new(program)
+            .args(arguments)
+            .output()
+            .unwrap_or_else(|error| panic!("{program} starts: {error}"));
+        assert!(
+            output.status.success(),
+            "{program} failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Who can reach a file, as the installer reads it.
+    #[cfg(windows)]
+    fn access_of(path: &Path) -> kr_ipc::paths::FileAccess {
+        kr_ipc::paths::FileAccess::of(path)
+            .unwrap_or_else(|refusal| panic!("{} is read: {refusal:?}", path.display()))
+    }
+
+    /// KR-REQ-11.50: on Windows a configuration with an entry set on it is not replaced: an
+    /// installation and a removal both refuse before anything is written, and the document keeps
+    /// its bytes and who can read it.
+    #[cfg(windows)]
+    #[test]
+    fn a_configuration_with_an_entry_set_on_it_is_refused_before_anything_is_written() {
+        let tree = Tree::create();
+        let installer = tree.installer();
+        let params = params(AgentTarget::Codex, InstallScope::User);
+        installer.install(&params).expect("installs");
+        let document = tree.home().join(".codex/config.toml");
+        run(
+            "icacls.exe",
+            &[
+                document.as_os_str(),
+                "/grant".as_ref(),
+                "*S-1-1-0:(R)".as_ref(),
+            ],
+        );
+        let bytes = std::fs::read(&document).expect("the document");
+        let access = access_of(&document);
+        let before = files_under(&tree.root);
+
+        let refused = installer
+            .install(&params)
+            .expect_err("refuses to replace it");
+        assert!(
+            matches!(refused, ControllerError::PermissionDenied { ref detail }
+                if detail.contains("access-control list")),
+            "{refused:?}"
+        );
+        let refused = installer
+            .remove(&params)
+            .expect_err("refuses to rewrite it");
+        assert!(
+            matches!(refused, ControllerError::PermissionDenied { ref detail }
+                if detail.contains("access-control list")),
+            "{refused:?}"
+        );
+        assert_eq!(
+            files_under(&tree.root),
+            before,
+            "nothing was written or taken"
+        );
+        assert_eq!(std::fs::read(&document).expect("the document"), bytes);
+        assert_eq!(access_of(&document), access);
+    }
+
+    /// KR-REQ-11.50: on Windows a configuration its directory made is replaced by one that reads
+    /// back the same owner and lists, by an installation and again by a removal.
+    #[cfg(windows)]
+    #[test]
+    fn a_configuration_its_directory_made_is_replaced_with_the_same_access() {
+        let tree = Tree::create();
+        let document = tree.home().join(".claude.json");
+        std::fs::write(&document, r#"{"theme":"dark"}"#).expect("writes the configuration");
+        let before = access_of(&document);
+        let installer = tree.installer();
+        let params = params(AgentTarget::ClaudeCode, InstallScope::User);
+
+        installer.install(&params).expect("installs");
+        let written = std::fs::read_to_string(&document).expect("the document");
+        assert!(written.contains(SERVER_NAME), "{written}");
+        assert_eq!(
+            access_of(&document),
+            before,
+            "the installation kept who can read it"
+        );
+
+        installer.remove(&params).expect("removes");
+        let written = std::fs::read_to_string(&document).expect("the document");
+        assert!(!written.contains(SERVER_NAME), "{written}");
+        assert_eq!(access_of(&document), before, "and so did the removal");
+    }
+
+    /// On Windows a configuration moved in from a directory that gives its files more than this
+    /// one does records nothing set on it, so it passes the check before the change; the write
+    /// compares the copy it made with it, refuses, and leaves the document's bytes and access as
+    /// they were. The installation that stopped there is reported as unfinished.
+    #[cfg(windows)]
+    #[test]
+    fn a_configuration_moved_in_from_elsewhere_is_refused_where_it_would_be_replaced() {
+        let tree = Tree::create();
+        let elsewhere = tree.root.join("elsewhere");
+        std::fs::create_dir(&elsewhere).expect("another directory");
+        run(
+            "icacls.exe",
+            &[
+                elsewhere.as_os_str(),
+                "/grant".as_ref(),
+                "*S-1-1-0:(OI)(R)".as_ref(),
+            ],
+        );
+        let made = elsewhere.join("settings.json");
+        std::fs::write(&made, r#"{"theme":"dark"}"#).expect("writes the configuration");
+        let document = tree.home().join(".claude.json");
+        std::fs::rename(&made, &document).expect("moves it in, with what it was given there");
+        let bytes = std::fs::read(&document).expect("the document");
+        let access = access_of(&document);
+        let installer = tree.installer();
+        let params = params(AgentTarget::ClaudeCode, InstallScope::User);
+
+        installer
+            .check(&params)
+            .expect("nothing it records is set on it");
+        let refused = installer
+            .install(&params)
+            .expect_err("refused where the copy would replace it");
+        assert!(
+            matches!(refused, ControllerError::PermissionDenied { ref detail }
+                if detail.contains("another owner or access-control list")),
+            "{refused:?}"
+        );
+        let refused = write_atomically(&document, b"anything", PRIVATE).expect_err("refuses");
+        assert!(
+            matches!(refused, ControllerError::PermissionDenied { .. }),
+            "{refused:?}"
+        );
+        assert_eq!(std::fs::read(&document).expect("the document"), bytes);
+        assert_eq!(access_of(&document), access);
+        assert!(
+            !installer.status(&params).expect("reads").installed,
+            "the installation did not finish"
+        );
+    }
+
+    /// On Windows an encrypted configuration is refused before anything is written: who can read
+    /// it depends on keys, which a copy written beside it would not carry.
+    #[cfg(windows)]
+    #[test]
+    fn an_encrypted_configuration_is_refused_before_anything_is_written() {
+        let tree = Tree::create();
+        let document = tree.home().join(".claude.json");
+        std::fs::write(&document, "{}").expect("writes the configuration");
+        run(
+            "cipher.exe",
+            &["/e".as_ref(), "/a".as_ref(), document.as_os_str()],
+        );
+        let before = files_under(&tree.root);
+        let refused = tree
+            .installer()
+            .install(&params(AgentTarget::ClaudeCode, InstallScope::User))
+            .expect_err("refuses");
+        assert!(
+            matches!(refused, ControllerError::PermissionDenied { ref detail }
+                if detail.contains("encrypted")),
+            "{refused:?}"
+        );
+        assert_eq!(files_under(&tree.root), before, "nothing was written");
+    }
+
+    /// A read of a file's access that failed is a storage failure, and a control the reader does
+    /// not evaluate is a refusal to change the file.
+    #[cfg(windows)]
+    #[test]
+    fn a_refused_read_of_a_files_access_is_answered_by_its_kind() {
+        use kr_ipc::paths::AccessListRefusal;
+
+        let path = Path::new("C:\\somewhere\\config.toml");
+        assert!(matches!(
+            refused_read(
+                path,
+                AccessListRefusal::Unreadable("it could not be read".to_owned())
+            ),
+            ControllerError::Storage { .. }
+        ));
+        assert!(matches!(
+            refused_read(
+                path,
+                AccessListRefusal::Policy("it is encrypted".to_owned())
+            ),
+            ControllerError::PermissionDenied { .. }
+        ));
     }
 
     /// The access-control list a test put on a document, taken off again when this is dropped.

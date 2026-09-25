@@ -52,20 +52,6 @@ impl WorkerSupervisor for NoWorkers {
     }
 }
 
-/// What this platform refuses such a removal with.
-///
-/// Everywhere the skill can be installed, the request is what is wrong with it. On Windows nothing
-/// gets as far as the request: this host does not read access-control lists there, so it cannot
-/// tell whether replacing a file would change who can read it, and it makes no change at all.
-/// Either way the refusal comes before the dispatch marker, which is what this test is about.
-fn refusal() -> ErrorCode {
-    if cfg!(windows) {
-        ErrorCode::PermissionDenied
-    } else {
-        ErrorCode::InvalidArgument
-    }
-}
-
 fn build() -> BuildId {
     BuildId::new("kr-test/0").expect("a build identifier")
 }
@@ -144,15 +130,9 @@ async fn a_removal_the_daemon_will_not_do_leaves_no_dispatch_marker() {
         .expect("the call reaches the daemon")
         .expect_err("and is refused");
 
-    assert_eq!(refused.code, refusal(), "{refused:?}");
-    if cfg!(windows) {
-        assert!(
-            refused
-                .message
-                .contains("does not read access-control lists"),
-            "the refusal gives this platform's reason: {refused:?}"
-        );
-    }
+    // The request is what is wrong with it, on every platform: the daemon gets as far as asking
+    // which project the removal is for.
+    assert_eq!(refused.code, ErrorCode::InvalidArgument, "{refused:?}");
     let actions = host.state_dir.join("agent-tools/actions");
     assert!(
         !actions.exists()
@@ -170,10 +150,9 @@ async fn a_removal_the_daemon_will_not_do_leaves_no_dispatch_marker() {
         .await
         .expect("the call reaches the daemon")
         .expect_err("and is refused again");
-    assert_eq!(again.code, refusal(), "{again:?}");
+    assert_eq!(again.code, ErrorCode::InvalidArgument, "{again:?}");
 }
 
-#[cfg(not(windows))]
 mod fence_support;
 
 /// KR-REQ-09.09, 09.12 and 26.16: a withdrawal whose fence could not be raised stops an
@@ -182,9 +161,6 @@ mod fence_support;
 /// the marker is written beside, and the refusal is the fence's own. The installation is Codex's at
 /// project scope, into a directory of this test's own: nothing is written there, and no marker is
 /// left, so an exact retry is refused again rather than answered as an outcome nobody knows.
-///
-/// Not on Windows, which refuses every installation before the marker for a reason of its own.
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_installation_is_not_dispatched_while_a_fence_is_owed() {
     let host = host().await;
@@ -242,10 +218,8 @@ async fn an_installation_is_not_dispatched_while_a_fence_is_owed() {
 }
 
 /// A daemon this test started, killed where it stands when it goes out of scope.
-#[cfg(unix)]
 struct Daemon(Option<std::process::Child>);
 
-#[cfg(unix)]
 impl Daemon {
     fn kill(&mut self) {
         if let Some(mut child) = self.0.take() {
@@ -255,7 +229,6 @@ impl Daemon {
     }
 }
 
-#[cfg(unix)]
 impl Drop for Daemon {
     fn drop(&mut self) {
         self.kill();
@@ -263,7 +236,6 @@ impl Drop for Daemon {
 }
 
 /// Starts the copied daemon on this test's directories, with `home` as its home directory.
-#[cfg(unix)]
 fn start_daemon(
     program: &std::path::Path,
     host: &kr_ipc::testing::TempHost,
@@ -294,7 +266,6 @@ fn start_daemon(
 }
 
 /// Connects to the daemon once it answers.
-#[cfg(unix)]
 async fn connect_to_daemon(host: &kr_ipc::testing::TempHost) -> LocalClient {
     let endpoint = host
         .environment()
@@ -316,7 +287,6 @@ async fn connect_to_daemon(host: &kr_ipc::testing::TempHost) -> LocalClient {
 }
 
 /// Asks for an installation change and decodes the answer as `kr skill` does.
-#[cfg(unix)]
 async fn change<T: kr_protocol::wire::WireMessage>(
     client: &mut LocalClient,
     environment_id: EnvironmentId,
@@ -338,7 +308,6 @@ async fn change<T: kr_protocol::wire::WireMessage>(
 }
 
 /// Reads an installation's record and decodes the answer as `kr skill status` does.
-#[cfg(unix)]
 async fn recorded(
     client: &mut LocalClient,
     params: &AgentToolsParams,
@@ -353,7 +322,6 @@ async fn recorded(
 }
 
 /// The operations, in an order that does not depend on the order they were run in.
-#[cfg(unix)]
 fn sorted(operations: &[kr_protocol::skill::ChangeOperation]) -> Vec<String> {
     let mut rendered: Vec<String> = operations
         .iter()
@@ -363,7 +331,6 @@ fn sorted(operations: &[kr_protocol::skill::ChangeOperation]) -> Vec<String> {
     rendered
 }
 
-#[cfg(unix)]
 fn json_document(path: &std::path::Path) -> serde_json::Value {
     serde_json::from_str(
         &std::fs::read_to_string(path)
@@ -380,13 +347,14 @@ fn json_document(path: &std::path::Path) -> serde_json::Value {
 /// already there and is recorded with the removal operations that undo it; the record is the
 /// host's, so a replacement daemon reads it back; and removal runs exactly that record, leaving
 /// every other setting as it was.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_skill_installs_reports_and_removes_at_both_scopes_by_its_removal_record() {
     use kr_protocol::skill::{AgentToolsInstallResult, AgentToolsRemoveResult, InstalledFile};
 
     let host = kr_ipc::testing::TempHost::create();
-    let program = host.root().join("kr-controller");
+    let program = host
+        .root()
+        .join(format!("kr-controller{}", std::env::consts::EXE_SUFFIX));
     kr_ipc::testing::place_program(
         std::path::Path::new(env!("CARGO_BIN_EXE_kr-controller")),
         &program,
