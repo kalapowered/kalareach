@@ -381,6 +381,7 @@ impl Session {
             send_queue_bytes: 8 * 1024 * 1024,
             resident_bytes: 4 * 1024 * 1024,
             launch_profile: kr_protocol::session::LaunchProfile::default(),
+            time: kr_worker::action::time::TimeSources::system(),
         };
         let mut session = WorkerSession::open(config).expect("opens the session");
         session.launch().expect("launches the root program");
