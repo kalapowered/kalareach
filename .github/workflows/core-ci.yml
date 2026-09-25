@@ -601,15 +601,15 @@ jobs:
         run: cargo test --locked -p kr-ipc --test windows
 
       # The crate's own tests, among them the environment identity's list and the profile it is
-      # kept in. Two of the frame writer's tests are left out: on this platform a named pipe with
-      # no reader takes less of one write than a socket does, and reports room while it is full,
-      # and what that means for the writer's backpressure has not been established.
+      # kept in, and the two frame-writer tests that used to be skipped here: on this platform a
+      # named pipe has no writability of its own the writer can hold while the reader holds the other
+      # half, so a waiter polls rather than parking and a fresh pipe answers the first offer as
+      # pending, and both tests now assert that pipe-granularity behaviour by condition. The cost of
+      # the poll and the rule that every caller bounds it are on `Readiness::ready` and in
+      # `docs/transport/README.md`.
       - name: Test the local IPC library
         if: ${{ !cancelled() }}
-        run: >-
-          cargo test --locked -p kr-ipc --lib --
-          --skip framed::tests::a_checked_write_asks_before_every_transport_write
-          --skip framed::tests::a_peer_that_stops_reading_blocks_the_attempt_rather_than_holding_the_writer
+        run: cargo test --locked -p kr-ipc --lib
 
       # What the originating agent may do with a question on this platform's identities: a caller
       # token works only for the helper it was issued to.
