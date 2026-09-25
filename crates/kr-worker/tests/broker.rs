@@ -1578,6 +1578,126 @@ async fn kr_req_11_26_a_connection_identifier_keeps_its_package_across_a_restart
     restore(&restarted, gapped, &package()).expect("restored under its own package's tables");
 }
 
+/// KR-REQ-11.26: a binding identifier names one package for as long as it is bound. Binding it
+/// again to another package is refused and leaves the binding as it was; the same package may bind
+/// it again. After a restart, when nothing is bound yet, an identifier bound to another package
+/// cannot answer what the first package's decoder interpreted under it, and the first package bound
+/// under it again, in a later process, can.
+#[tokio::test]
+async fn kr_req_11_26_a_binding_identifier_keeps_its_package() {
+    let foreign = other_package();
+    let bind_as = |broker: &Broker, package: &PackageIdentity| {
+        broker.bind(
+            binding(9),
+            instance(2),
+            package.plugin_id.clone(),
+            package.publisher_id.clone(),
+            package.package_digest,
+            BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
+            Some(DecodingTrust {
+                plugin_id: package.plugin_id.clone(),
+                publisher_id: package.publisher_id.clone(),
+                package_digest: package.package_digest,
+                ..trust(&[permission_method()], true)
+            }),
+            TimestampMs::new(1),
+        )
+    };
+
+    let broker = broker_with(
+        BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
+        Some(trust(&[permission_method()], true)),
+    );
+    offer(&broker, instance(2), binding(9), "11", 2).expect("interpreted");
+    let refusal = bind_as(&broker, &foreign)
+        .expect_err("another package does not take an identifier that is bound");
+    assert!(
+        matches!(refusal, BrokerError::InvalidArgument { .. }),
+        "{refusal}"
+    );
+    assert_eq!(
+        broker.binding_record(binding(9)).expect("bound").package(),
+        installed(),
+        "and the binding is as it was"
+    );
+    bind_as(&broker, &installed()).expect("the same package binds it again");
+
+    // Across restarts, where a restarted process holds no binding until one is made.
+    let directory = std::env::temp_dir().join(format!("kr-broker-{}", kr_ipc::new_uuid()));
+    std::fs::create_dir_all(&directory).expect("the directory is created");
+    let path = directory.join("session.sqlite");
+    let process = |bound: &PackageIdentity| {
+        let broker = Broker::open(Some(&path), session(), JournalHealth::shared())
+            .expect("the broker opens");
+        broker
+            .register_instance(
+                instance(2),
+                IntegrationMode::Gateway,
+                None,
+                Some(managed(instance(2), true)),
+            )
+            .expect("the instance is registered");
+        bind_as(&broker, bound).expect("bound");
+        broker
+            .pin_table(instance(2), installed(), declarative_table(), rich_table())
+            .expect("the installed tables are pinned");
+        broker
+    };
+    let (first, second) = {
+        let broker = process(&installed());
+        broker
+            .open_native_connection(
+                instance(2),
+                &CREDENTIAL,
+                &process_identity(41, 900),
+                &package(),
+                "1",
+            )
+            .expect("the native connection is authenticated");
+        (
+            offer(&broker, instance(2), binding(9), "11", 2).expect("interpreted"),
+            offer(&broker, instance(2), binding(9), "12", 4).expect("interpreted"),
+        )
+    };
+    let restored = |broker: &Broker| {
+        broker
+            .restore_native_connection(
+                GatewayConnectionId::new(1),
+                instance(2),
+                &CREDENTIAL,
+                &process_identity(41, 900),
+                &package(),
+                "1",
+            )
+            .expect("the connection is restored under its own package's tables");
+        equip(broker)
+    };
+    {
+        let broker = process(&foreign);
+        let _upstream = restored(&broker);
+        let refusal = answer(&broker, first.resource_id, "allow", 6)
+            .await
+            .expect_err("another package bound under the identifier does not answer it");
+        assert!(
+            matches!(refusal, BrokerError::PermissionDenied { .. }),
+            "{refusal}"
+        );
+        assert_eq!(
+            broker.pending(first.resource_id).expect("held").state,
+            PendingState::Pending,
+            "refused before any claim"
+        );
+    }
+    let broker = process(&installed());
+    let upstream = restored(&broker);
+    answer(&broker, second.resource_id, "allow", 8)
+        .await
+        .expect("the package that interpreted it answers it");
+    assert_eq!(upstream.submitted().len(), 1);
+    drop(broker);
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
 /// KR-REQ-11.25: narrowing an installation's grants narrows a component package's trust with them.
 /// `approval.respond` leaving takes the answer away and leaves the decoding; `approval.decode`
 /// leaving drops the trust whole. Both are written where a restart reads them.
