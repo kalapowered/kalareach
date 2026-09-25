@@ -213,14 +213,14 @@ A line past the bound ends the connection. So does a line the connection cuts sh
 
 ## Hooks
 
-Whatever happens, a hook writes exactly `{}` to standard output and exits 0. It waits for the
-worker for at most 500 milliseconds from its start and then answers anyway, and it never waits for
-a person. A diagnostic goes to standard error only after the answer, and is waited for only until
+Whatever happens, a hook writes exactly `{}` to standard output and exits 0. It waits for the worker
+for at most 500 milliseconds from its start and then answers anyway, and it never waits for a
+person. A diagnostic goes to standard error only after the answer, and is waited for only until
 those 500 milliseconds are up: a standard error nobody reads cannot hold the hook, and a line not
-written by then is lost. Claude Code writes standard error to its debug log for an exit-0 hook and
-shows it to nobody. A report counts only if the worker admits its hook while the hook is
-still running: the worker checks the hook's process as it admits it, so a report whose hook has
-already answered and gone is lost, and nothing tells the worker it was sent.
+written by then may be lost when the hook ends. Claude Code writes standard error to its debug log
+for an exit-0 hook and shows it to nobody. A report counts only if the worker admits its hook while
+the hook is still running: the worker checks the hook's process as it admits it, so a report whose
+hook has already answered and gone is lost, and nothing tells the worker it was sent.
 
 Inside a launch, the forwarder turns Claude Code's payload into one observation and sends it
 straight behind the hello. It reads only what it reports and skips the rest, including a tool's

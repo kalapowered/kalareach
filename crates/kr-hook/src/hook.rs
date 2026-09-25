@@ -127,7 +127,8 @@ pub fn run(application: &'static Application) -> std::process::ExitCode {
     std::thread::spawn(move || {
         let _ = finished.send(observe(application, started));
     });
-    let failure = match outcome.recv_timeout(HOOK_DEADLINE) {
+    // The wait ends the deadline after the hook's own start, not after the thread above started.
+    let failure = match outcome.recv_timeout(HOOK_DEADLINE.saturating_sub(started.elapsed())) {
         Ok(Ok(())) => None,
         Ok(Err(failure)) => Some(failure),
         Err(_) => Some(format!(
