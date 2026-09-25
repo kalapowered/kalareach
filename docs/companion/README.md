@@ -94,7 +94,9 @@ native code does the rest with `kr-client`'s pairing module:
 An invitation on the pasteboard is read by native code, not by the page. A code invitation that
 names a service other than this computer's raises the system's own alert, modal to the companion's
 window, before anything connects there. The alert names both services, and declining it connects
-nowhere. Each change reaches the page as a view on the `kr://pairing` event.
+nowhere. Each change reaches the page as a view on the `kr://pairing` event. The page reads each
+view, and the connection's state for the indicator in its top bar, only once its listener is
+registered, and keeps a change it heard over a read that answers later.
 
 `src-tauri/tests/pairing.rs` pairs this computer both ways against kr-controller's in-process host,
 confirms one request as its owner and declines another. It calls the pairing commands the way the
