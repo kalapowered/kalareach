@@ -1,4 +1,5 @@
-//! `kr new` starting this environment's control daemon itself, under the standalone start.
+//! `kr new` starting this environment's control daemon: itself, under the standalone start, or
+//! through the user's own service manager, under the service start.
 //!
 //! What these establish, with the real `kr`, `kr-controller` and `kr-worker` on a real environment
 //! tree. KR-REQ-07.12: with the standalone start selected and no daemon running, `kr new` starts
@@ -28,6 +29,19 @@
 //! Only a process's own parent signals it, and only before collecting it, so no number is ever
 //! signalled after it could have passed to something else, and the test process signals nothing.
 //! Every runtime and state directory is inside the test's own temporary tree.
+//!
+//! The service start. KR-REQ-07.12 and KR-REQ-26.04: `kr host startup --set service` writes the
+//! definition of a per-user service in the home it is given, records it and has the service
+//! manager take it; three `kr new` commands at once then converge on the one daemon the manager
+//! starts, whose parent is the manager; `kr doctor` reports that the definition matches; `--clear`
+//! removes the definition and its record and the daemon keeps serving; and a definition kr did not
+//! write, one changed since, or one that has gone is named and never replaced. The installation for
+//! these has the real daemon behind a script that hands over to it with `exec`, so the process the
+//! manager starts is the daemon itself. On macOS the manager is launchd, and the definition, in the
+//! test's own home, is loaded under a label that names the test's own environment. On Linux it is a
+//! user manager of the test's own, run in a delegated scope with the test's home as its home, so it
+//! reads the definition from there; ending the scope ends everything it started. A host with no
+//! user manager says why these did not run, unless `KR_REQUIRE_SERVICE_MANAGER` is set.
 
 #![cfg(unix)]
 
@@ -587,23 +601,7 @@ impl Standalone {
 
     /// Whether anything answers on this environment's endpoint now.
     fn answers(&self) -> bool {
-        let endpoint = self
-            .tree
-            .environment()
-            .controller_endpoint()
-            .expect("an endpoint");
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("a runtime");
-        runtime.block_on(async {
-            tokio::time::timeout(
-                STREAMS_DEADLINE,
-                LocalClient::connect(&endpoint, LocalClientKind::Cli, build()),
-            )
-            .await
-            .is_ok_and(|reached| reached.is_ok())
-        })
+        answers(&self.tree.environment())
     }
 
     /// Asks this environment's daemon one question.
@@ -612,27 +610,7 @@ impl Standalone {
         method: Method,
         params: &impl serde::Serialize,
     ) -> T {
-        let endpoint = self
-            .tree
-            .environment()
-            .controller_endpoint()
-            .expect("an endpoint");
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("a runtime");
-        runtime.block_on(async {
-            let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
-                .await
-                .expect("reaches the daemon");
-            client
-                .request(method, params)
-                .await
-                .expect("the call reaches the daemon")
-                .expect("the daemon answers")
-                .to_typed()
-                .expect("decodes")
-        })
+        ask(&self.tree.environment(), method, params)
     }
 
     /// Establishes that a daemon is detached from whatever started it: it leads a session and a
@@ -663,6 +641,48 @@ impl Standalone {
             "and works in the environment's own directory"
         );
     }
+}
+
+/// Whether anything answers on an environment's endpoint now.
+fn answers(environment: &kr_ipc::paths::EnvironmentPaths) -> bool {
+    let endpoint = environment.controller_endpoint().expect("an endpoint");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    runtime.block_on(async {
+        tokio::time::timeout(
+            STREAMS_DEADLINE,
+            LocalClient::connect(&endpoint, LocalClientKind::Cli, build()),
+        )
+        .await
+        .is_ok_and(|reached| reached.is_ok())
+    })
+}
+
+/// Asks an environment's daemon one question.
+fn ask<T: kr_protocol::wire::WireMessage>(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+    method: Method,
+    params: &impl serde::Serialize,
+) -> T {
+    let endpoint = environment.controller_endpoint().expect("an endpoint");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    runtime.block_on(async {
+        let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("reaches the daemon");
+        client
+            .request(method, params)
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the daemon answers")
+            .to_typed()
+            .expect("decodes")
+    })
 }
 
 /// The working directory of a process of this user's.
@@ -1271,12 +1291,12 @@ fn the_start_is_selected_with_no_daemon_and_the_doctor_names_its_source() {
     assert_eq!(unchosen["startup"]["source"], "default", "{unchosen}");
 
     let refused =
-        start(host.kr(&["host", "startup", "--set", "service"])).finish("kr host startup");
+        start(host.kr(&["host", "startup", "--set", "elsewhere"])).finish("kr host startup");
     assert_eq!(refused.status.code(), Some(2), "a usage failure");
+    let said = String::from_utf8_lossy(&refused.stderr);
     assert!(
-        String::from_utf8_lossy(&refused.stderr).contains("standalone"),
-        "the refusal names what can be chosen: {}",
-        String::from_utf8_lossy(&refused.stderr)
+        said.contains("standalone") && said.contains("service"),
+        "the refusal names what can be chosen: {said}"
     );
     assert!(!host.document().exists(), "and nothing was written");
 
@@ -1770,4 +1790,874 @@ fn a_failing_test_with_a_partial_record_keeps_its_tree_and_does_not_end_the_suit
     assert!(root.is_dir(), "the tree was kept for somebody to look at");
     // Nothing runs in it: the only record names no process. This test made it, so it removes it.
     std::fs::remove_dir_all(&root).expect("removes the kept tree");
+}
+
+// ------------------------------------------------------------------------------------------------
+// The service start
+// ------------------------------------------------------------------------------------------------
+
+/// Set where the service-start tests must run: a host with no user service manager then fails
+/// them, rather than saying why they did not run.
+const REQUIRE_SERVICE_MANAGER: &str = "KR_REQUIRE_SERVICE_MANAGER";
+
+/// How long one call to a service manager in a test's teardown may take.
+const TEARDOWN_BOUND: Duration = Duration::from_secs(60);
+
+/// The installation the service-start tests run, on the internal disk: `kr` and its guard, the
+/// worker, the real daemon, and beside them the `kr-controller` a definition names.
+///
+/// That `kr-controller` is a script that hands over, with `exec`, to the real daemon with its keys
+/// in the environment's own `secrets` directory, so that nothing reaches the credential store of the
+/// person running the tests. The handover replaces the script's process rather than starting a
+/// child, so the process the service manager started is the daemon itself, and the manager is the
+/// daemon's parent.
+fn service_installation() -> &'static Path {
+    static PLACED: OnceLock<PathBuf> = OnceLock::new();
+    PLACED.get_or_init(|| {
+        let (Some(controller), Some(worker)) = (
+            beside_this_test("kr-controller"),
+            beside_this_test("kr-worker"),
+        ) else {
+            panic!(
+                "the kr-controller and kr-worker executables are not built beside this test, so \
+                 this check cannot run; a workspace test run builds them, and so does \
+                 `cargo build -p kr-controller -p kr-worker`"
+            );
+        };
+        let directory = support::command_binaries().join("service");
+        std::fs::create_dir(&directory).expect("a directory for the service installation");
+        for source in [
+            Path::new(env!("CARGO_BIN_EXE_kr")),
+            Path::new(env!("CARGO_BIN_EXE_kr-attach-guard")),
+        ] {
+            let name = source.file_name().expect("the binary has a name");
+            kr_ipc::testing::place_and_start_once(source, &directory.join(name), &["--version"]);
+        }
+        kr_ipc::testing::place_and_start_once(
+            &worker,
+            &directory.join("kr-worker"),
+            &["--version"],
+        );
+        let daemon = directory.join(DAEMON_UNDER_TEST);
+        kr_ipc::testing::place_and_start_once(&controller, &daemon, &["--version"]);
+        let source = directory.join("kr-controller.sh");
+        std::fs::write(
+            &source,
+            format!(
+                "#!/bin/sh\nexec '{}' --secret-store file \"$@\"\n",
+                daemon.display()
+            ),
+        )
+        .expect("writes the daemon script");
+        kr_ipc::testing::place_program(&source, &directory.join("kr-controller"));
+        directory
+    })
+}
+
+/// Runs a command to its end within `bound`, ending and collecting it when it has not ended.
+///
+/// For teardown, which must not panic: every failure is returned as what it was.
+fn bounded(mut command: Command, bound: Duration) -> Result<Output, String> {
+    let what = format!("{command:?}");
+    let mut child = spawning(|| {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+    })
+    .map_err(|error| format!("{what} could not be started: {error}"))?;
+    let stdout = child.stdout.take().map(read_aside);
+    let stderr = child.stderr.take().map(read_aside);
+    let begun = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if begun.elapsed() < bound => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) | Err(_) => {
+                // This test's own child, not collected yet, so the number is still its.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{what} did not end within {bound:?}"));
+            }
+        }
+    };
+    let collect = |stream: Option<Receiver<Vec<u8>>>| {
+        stream
+            .and_then(|stream| stream.recv_timeout(STREAMS_DEADLINE).ok())
+            .unwrap_or_default()
+    };
+    Ok(Output {
+        status,
+        stdout: collect(stdout),
+        stderr: collect(stderr),
+    })
+}
+
+/// The parent of a process of this user's, and the parent's name.
+fn parent_of(pid: u32) -> (u32, String) {
+    let asked = |arguments: &[&str]| {
+        let output =
+            spawning(|| Command::new("/bin/ps").args(arguments).output()).expect("runs ps");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+    let parent: u32 = asked(&["-o", "ppid=", "-p", &pid.to_string()])
+        .parse()
+        .expect("ps names the parent");
+    let name = asked(&["-o", "comm=", "-p", &parent.to_string()]);
+    (parent, name)
+}
+
+/// A user service manager of a test's own: a second `systemd --user`, run in a scope of the user
+/// manager of whoever runs the tests, with that scope's cgroup delegated to it.
+///
+/// Its home is the test's own, so it reads unit files from there, and its runtime directory is its
+/// own, so `systemctl --user` reaches it through `XDG_RUNTIME_DIR` and nothing else. It starts
+/// nothing by itself: its default target has no dependencies. Ending the scope ends every process
+/// in it, the manager and whatever the manager started, which is how a test's teardown ends it.
+#[cfg(target_os = "linux")]
+struct UserManager {
+    /// The scope it runs in.
+    scope: String,
+    /// The manager, which `systemd-run` became: this test process's own child.
+    process: Option<Child>,
+    /// Its runtime directory, outside the test's tree so that it outlives the tree's removal
+    /// until the manager has ended.
+    runtime: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl UserManager {
+    /// Starts a manager whose home is `home`, or says why none can be started here.
+    fn start(home: &Path) -> Result<Self, String> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let program = ["/usr/lib/systemd/systemd", "/lib/systemd/systemd"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|candidate| candidate.is_file())
+            .ok_or("this host has no systemd to run a user manager with")?;
+        let mut asked = Command::new("systemctl");
+        asked.args(["--user", "show", "--property=Version", "--value"]);
+        let answered = bounded(asked, STREAMS_DEADLINE)?;
+        if !answered.status.success() {
+            return Err(format!(
+                "no user manager answers for whoever runs these tests, so there is no scope to run \
+                 a manager of the test's own in: {}",
+                String::from_utf8_lossy(&answered.stderr).trim()
+            ));
+        }
+        let units = home.join(".config/systemd/user");
+        std::fs::create_dir_all(&units).map_err(|error| error.to_string())?;
+        std::fs::write(
+            units.join("kr-test-idle.target"),
+            "[Unit]\nDescription=Nothing, so that this manager starts only what a test asks for\n\
+             DefaultDependencies=no\n",
+        )
+        .map_err(|error| error.to_string())?;
+        let runtime =
+            std::env::temp_dir().join(format!("krm-{}", &kr_ipc::new_uuid().to_string()[..8]));
+        std::fs::create_dir(&runtime).map_err(|error| error.to_string())?;
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| error.to_string())?;
+        let log = std::fs::File::create(runtime.join("manager.log"))
+            .map_err(|error| error.to_string())?;
+        let scope = format!("kr-test-manager-{}.scope", kr_ipc::new_uuid());
+        let process = spawning(|| {
+            Command::new("systemd-run")
+                .args(["--user", "--scope", "--quiet", "--property=Delegate=yes"])
+                .arg(format!("--unit={scope}"))
+                .args(["--", "env", "-i"])
+                .arg(format!("HOME={}", home.display()))
+                .arg(format!("XDG_RUNTIME_DIR={}", runtime.display()))
+                .arg("PATH=/usr/bin:/bin")
+                .arg(&program)
+                .args([
+                    "--user",
+                    "--unit=kr-test-idle.target",
+                    "--log-target=console",
+                ])
+                .stdin(Stdio::null())
+                .stdout(log.try_clone().expect("the log twice"))
+                .stderr(log)
+                .spawn()
+        })
+        .map_err(|error| format!("systemd-run could not be started: {error}"))?;
+        let mut manager = Self {
+            scope,
+            process: Some(process),
+            runtime,
+        };
+        let begun = Instant::now();
+        loop {
+            let mut asked = manager.systemctl(&["show", "--property=Version", "--value"]);
+            asked.env_remove("DBUS_SESSION_BUS_ADDRESS");
+            if bounded(asked, STREAMS_DEADLINE).is_ok_and(|answer| answer.status.success()) {
+                return Ok(manager);
+            }
+            let ended = manager
+                .process
+                .as_mut()
+                .is_some_and(|process| matches!(process.try_wait(), Ok(Some(_))));
+            if ended || begun.elapsed() > LIVENESS_DEADLINE {
+                return Err(format!(
+                    "the test's user manager did not come up: {}",
+                    std::fs::read_to_string(manager.runtime.join("manager.log"))
+                        .unwrap_or_default()
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// `systemctl --user` pointed at this manager and at nothing else: with no session bus named,
+    /// a manager that did not answer on its own socket is not replaced by the user's own.
+    fn systemctl(&self, arguments: &[&str]) -> Command {
+        let mut command = Command::new("systemctl");
+        command
+            .arg("--user")
+            .args(arguments)
+            .env("XDG_RUNTIME_DIR", &self.runtime)
+            .env_remove("DBUS_SESSION_BUS_ADDRESS");
+        command
+    }
+
+    /// The manager's own process.
+    fn pid(&self) -> u32 {
+        self.process.as_ref().expect("the manager is running").id()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for UserManager {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // The scope belongs to the user manager of whoever runs the tests, so it is asked there.
+        let mut stop = Command::new("systemctl");
+        stop.args(["--user", "stop", &self.scope]);
+        let stopped = bounded(stop, TEARDOWN_BOUND);
+        if !stopped.as_ref().is_ok_and(|answer| answer.status.success()) {
+            eprintln!("stopping {}: {stopped:?}", self.scope);
+            let mut kill = Command::new("systemctl");
+            kill.args(["--user", "kill", "--signal=SIGKILL", &self.scope]);
+            let _ = bounded(kill, TEARDOWN_BOUND);
+        }
+        if let Some(mut process) = self.process.take() {
+            let begun = Instant::now();
+            while matches!(process.try_wait(), Ok(None)) && begun.elapsed() < STREAMS_DEADLINE {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            // This test's own child, not collected yet, so the number is still its.
+            let _ = process.kill();
+            let _ = process.wait();
+        }
+        // The manager makes directories nobody may write in its runtime directory, which could not
+        // be removed otherwise.
+        let mut waiting = vec![self.runtime.clone()];
+        while let Some(directory) = waiting.pop() {
+            let _ = std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700));
+            for entry in std::fs::read_dir(&directory)
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    waiting.push(entry.path());
+                }
+            }
+        }
+        if let Err(error) = std::fs::remove_dir_all(&self.runtime) {
+            eprintln!(
+                "the test's user manager left {}: {error}",
+                self.runtime.display()
+            );
+        }
+    }
+}
+
+/// A host tree of a test's own where the service start is chosen: a home of the test's own that
+/// the definition is written in, and the user service manager that starts the daemon.
+///
+/// On macOS that manager is launchd, and the definition is loaded into this user's own domain under
+/// a label that names the tree's own environment, so no other test has it. On Linux it is a
+/// [`UserManager`] of the test's own.
+///
+/// However a test ends, the daemon the manager started is ended through the manager first; then the
+/// tree ends every worker the daemon recorded; then, on Linux, the test's own manager ends.
+struct ServiceHost {
+    tree: teardown::Tree,
+    home: PathBuf,
+    #[cfg(target_os = "linux")]
+    manager: UserManager,
+}
+
+impl Drop for ServiceHost {
+    fn drop(&mut self) {
+        if let Err(why) = self.end_the_daemon() {
+            self.tree.hold(why);
+        }
+    }
+}
+
+impl ServiceHost {
+    /// A tree with a user service manager, or none where this host has no manager to test with,
+    /// having said why; a host that sets [`REQUIRE_SERVICE_MANAGER`] fails instead.
+    fn create() -> Option<Self> {
+        let tree = teardown::Tree::create();
+        let home = tree.root().join("home");
+        std::fs::create_dir_all(&home).expect("a home of this test's own");
+        #[cfg(target_os = "macos")]
+        {
+            let domain = format!("user/{}", kr_ipc::paths::current_uid());
+            let mut print = Command::new("/bin/launchctl");
+            print.args(["print", &domain]);
+            match bounded(print, STREAMS_DEADLINE) {
+                Ok(printed) if printed.status.success() => Some(Self { tree, home }),
+                answered => Self::not_here(&format!(
+                    "launchd has no {domain} domain for this user to load a definition into: \
+                     {answered:?}"
+                )),
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            match UserManager::start(&home) {
+                Ok(manager) => Some(Self {
+                    tree,
+                    home,
+                    manager,
+                }),
+                Err(why) => Self::not_here(&why),
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            drop((tree, home));
+            Self::not_here("this platform has no service start")
+        }
+    }
+
+    /// Says why a service test did not run, or fails it where it has to run.
+    fn not_here(why: &str) -> Option<Self> {
+        assert!(
+            std::env::var_os(REQUIRE_SERVICE_MANAGER).is_none(),
+            "{REQUIRE_SERVICE_MANAGER} is set and the service start cannot be tested here: {why}"
+        );
+        eprintln!("the service start is not tested here: {why}");
+        None
+    }
+
+    /// The label the service manager knows this environment's daemon by.
+    fn label(&self) -> String {
+        format!("kr-controller-{}", self.tree.environment_id())
+    }
+
+    /// Where the definition of this environment's daemon belongs, in the test's own home.
+    fn definition(&self) -> PathBuf {
+        if cfg!(target_os = "macos") {
+            self.home
+                .join("Library/LaunchAgents")
+                .join(format!("{}.plist", self.label()))
+        } else {
+            self.home
+                .join(".config/systemd/user")
+                .join(format!("{}.service", self.label()))
+        }
+    }
+
+    /// Where `kr host startup` records the definition it wrote.
+    fn record(&self) -> PathBuf {
+        self.tree
+            .environment()
+            .state_dir()
+            .join("controller-service.json")
+    }
+
+    /// Where this environment's configuration document is.
+    fn document(&self) -> PathBuf {
+        self.tree.environment().state_dir().join("config.json")
+    }
+
+    /// `kr` from the service installation, against this tree, this home and this host's manager.
+    fn kr(&self, arguments: &[&str]) -> Command {
+        let mut command = Command::new(service_installation().join("kr"));
+        command
+            .args(arguments)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &self.home)
+            .env(
+                kr_ipc::paths::RUNTIME_DIR_VARIABLE,
+                self.tree.paths().runtime_root(),
+            )
+            .env(
+                kr_ipc::paths::STATE_DIR_VARIABLE,
+                self.tree.paths().state_root(),
+            )
+            .current_dir(service_installation())
+            .stdin(Stdio::null());
+        if let Some(temporary) = std::env::var_os("TMPDIR") {
+            command.env("TMPDIR", temporary);
+        }
+        #[cfg(target_os = "linux")]
+        command.env("XDG_RUNTIME_DIR", &self.manager.runtime);
+        command
+    }
+
+    /// `kr new` for an invisible, headless session of `/bin/sh` working in this tree.
+    fn new_session(&self) -> Command {
+        let cwd = self.tree.root().display().to_string();
+        self.kr(&[
+            "--json",
+            "new",
+            "--invisible",
+            "--headless",
+            "--cwd",
+            &cwd,
+            "--shell",
+            "/bin/sh",
+            "--startup",
+            "interactive",
+        ])
+    }
+
+    /// Chooses the service start as a person does, and returns what `kr host startup` reported.
+    fn select_service(&self) -> Value {
+        let output = start(self.kr(&["--json", "host", "startup", "--set", "service"]))
+            .finish("kr host startup");
+        let chosen = document(&output, "kr host startup");
+        assert!(
+            output.status.success(),
+            "{chosen}; it said {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(chosen["startup"]["controller"], "service", "{chosen}");
+        let definition = &chosen["startup"]["definition"];
+        assert_eq!(definition["state"], "matches", "{chosen}");
+        assert_eq!(definition["label"], self.label(), "{chosen}");
+        assert_eq!(
+            definition["path"],
+            self.definition().display().to_string(),
+            "{chosen}"
+        );
+        chosen
+    }
+
+    /// Closes a session this test created, through the daemon that holds it.
+    fn close(&self, created: &Value) {
+        let session = created["session_id"]
+            .as_str()
+            .expect("a session identifier");
+        let output = start(self.kr(&["--json", "close", session])).finish("kr close");
+        let closed = document(&output, "kr close");
+        assert!(output.status.success(), "{closed}");
+    }
+
+    /// Whether anything answers on this environment's endpoint now.
+    fn answers(&self) -> bool {
+        answers(&self.tree.environment())
+    }
+
+    /// Asks this environment's daemon one question.
+    fn ask<T: kr_protocol::wire::WireMessage>(
+        &self,
+        method: Method,
+        params: &impl serde::Serialize,
+    ) -> T {
+        ask(&self.tree.environment(), method, params)
+    }
+
+    /// The process the service manager says the daemon's job is running, when it says one is.
+    fn daemon(&self) -> Option<u32> {
+        #[cfg(target_os = "macos")]
+        {
+            let uid = kr_ipc::paths::current_uid();
+            [format!("gui/{uid}"), format!("user/{uid}")]
+                .into_iter()
+                .find_map(|domain| {
+                    let mut print = Command::new("/bin/launchctl");
+                    print.args(["print", &format!("{domain}/{}", self.label())]);
+                    let printed = bounded(print, STREAMS_DEADLINE).ok()?;
+                    String::from_utf8_lossy(&printed.stdout)
+                        .lines()
+                        .find_map(|line| line.strip_prefix("\tpid = ")?.trim().parse().ok())
+                })
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let unit = format!("{}.service", self.label());
+            let shown = bounded(
+                self.manager
+                    .systemctl(&["show", "--property=MainPID", "--value", &unit]),
+                STREAMS_DEADLINE,
+            )
+            .ok()?;
+            String::from_utf8_lossy(&shown.stdout)
+                .trim()
+                .parse()
+                .ok()
+                .filter(|pid| *pid != 0)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            None
+        }
+    }
+
+    /// Establishes that the service manager started the daemon: its parent is the manager, it
+    /// leads a process group of its own outside the session this test runs in, it has no
+    /// controlling terminal, and it works in the environment's own directory.
+    fn assert_started_by_the_manager(&self, pid: u32) {
+        let (parent, name) = parent_of(pid);
+        #[cfg(target_os = "macos")]
+        assert!(
+            parent == 1 && name.ends_with("launchd"),
+            "launchd started the daemon: its parent is {parent} ({name})"
+        );
+        #[cfg(target_os = "linux")]
+        assert!(
+            parent == self.manager.pid() && name == "systemd",
+            "the user manager started the daemon: its parent is {parent} ({name}), and the \
+             manager is {}",
+            self.manager.pid()
+        );
+        let process = rustix::process::Pid::from_raw(i32::try_from(pid).expect("a process number"))
+            .expect("a process number");
+        assert_eq!(
+            rustix::process::getpgid(Some(process)).expect("its process group"),
+            process,
+            "the daemon leads a process group of its own"
+        );
+        assert_ne!(
+            rustix::process::getsid(Some(process)).expect("its session"),
+            rustix::process::getsid(None).expect("this test's session"),
+            "and is outside the session this test and its commands run in"
+        );
+        assert_eq!(
+            kr_ipc::identity::controlling_terminal(pid).expect("its controlling terminal"),
+            None,
+            "and has no controlling terminal"
+        );
+        assert_eq!(
+            working_directory(pid),
+            std::fs::canonicalize(self.tree.environment().state_dir())
+                .expect("the state directory"),
+            "and works in the environment's own directory"
+        );
+    }
+
+    /// Ends the daemon through the service manager that started it, and says what could not be
+    /// established as ended.
+    fn end_the_daemon(&self) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        {
+            let uid = kr_ipc::paths::current_uid();
+            for domain in [format!("gui/{uid}"), format!("user/{uid}")] {
+                let target = format!("{domain}/{}", self.label());
+                let loaded = |target: &str| {
+                    let mut print = Command::new("/bin/launchctl");
+                    print.args(["print", target]);
+                    bounded(print, STREAMS_DEADLINE).map(|printed| printed.status.success())
+                };
+                if !loaded(&target)? {
+                    continue;
+                }
+                let mut bootout = Command::new("/bin/launchctl");
+                bootout.args(["bootout", &target]);
+                let removed = bounded(bootout, TEARDOWN_BOUND)?;
+                if loaded(&target)? {
+                    return Err(format!(
+                        "{target} is still loaded after it was removed: {}",
+                        String::from_utf8_lossy(&removed.stderr).trim()
+                    ));
+                }
+            }
+            Ok(())
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // Ending the manager's scope ends the daemon too; stopping it here first means no worker
+            // is started while the tree ends the ones that are running.
+            let unit = format!("{}.service", self.label());
+            bounded(self.manager.systemctl(&["stop", &unit]), TEARDOWN_BOUND).map(|_| ())
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            Ok(())
+        }
+    }
+}
+
+/// KR-REQ-07.12: with the service start chosen, three first invocations at once converge on the
+/// one control daemon the user's service manager starts.
+///
+/// `kr host startup --set service` writes the definition in the test's own home and has the
+/// manager take it. Three `kr new` commands then start together with no daemon running, and each
+/// asks the manager to start the daemon. The manager starts one: its parent is the manager, the
+/// environment's generation advanced once, and every session the three commands created is in its
+/// registry. The commands write nothing in the home: asking a manager to start what it was given
+/// installs nothing.
+#[test]
+fn three_first_invocations_at_once_converge_on_the_one_daemon_the_service_manager_starts() {
+    let Some(host) = ServiceHost::create() else {
+        return;
+    };
+    host.select_service();
+    let before = every_path_under(&host.home);
+
+    let started: Vec<Running> = (0..3).map(|_| start(host.new_session())).collect();
+    let mut sessions = Vec::new();
+    let mut documents = Vec::new();
+    for (index, running) in started.into_iter().enumerate() {
+        let what = format!("kr new {index}");
+        let output = running.finish(&what);
+        let created = document(&output, &what);
+        assert!(
+            output.status.success(),
+            "{what} created its session: {created}; it said {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(created["state"], "live", "{what}: {created}");
+        let session_id: SessionId = created["session_id"]
+            .as_str()
+            .expect("a session identifier")
+            .parse()
+            .expect("parses");
+        sessions.push(session_id);
+        documents.push(created);
+    }
+
+    let daemon = host
+        .daemon()
+        .expect("the service manager reports the daemon it started");
+    host.assert_started_by_the_manager(daemon);
+    let info: HostInfoResult = host.ask(Method::HostInfo, &());
+    assert_eq!(info.environment_id, host.tree.environment_id());
+    assert_eq!(
+        info.generation.get(),
+        1,
+        "the environment's generation advanced once, for the one daemon the manager started"
+    );
+    let listed: SessionListResult = host.ask(
+        Method::SessionList,
+        &SessionListParams {
+            environment_id: Nullable::some(host.tree.environment_id()),
+            include_closed: false,
+        },
+    );
+    for session_id in &sessions {
+        assert!(
+            listed
+                .sessions
+                .iter()
+                .any(|summary| summary.session_id == *session_id),
+            "session {session_id} is in the one daemon's registry: {:?}",
+            listed.sessions
+        );
+    }
+    assert!(
+        every_path_under(&host.home) == before,
+        "kr new wrote, removed or changed nothing in the home: it only asked the manager"
+    );
+    for created in &documents {
+        host.close(created);
+    }
+}
+
+/// KR-REQ-07.12, KR-REQ-26.04: the service start's definition and its record are what
+/// `kr host startup --set service` wrote, `kr doctor` reports the choice, its source and that the
+/// definition matches, and `--clear` removes the definition and its record without ending the
+/// daemon, which keeps serving.
+#[test]
+fn clearing_the_service_start_removes_its_definition_and_record_and_the_daemon_keeps_serving() {
+    let Some(host) = ServiceHost::create() else {
+        return;
+    };
+    host.select_service();
+    assert!(host.definition().is_file(), "the definition was written");
+    let record: Value =
+        serde_json::from_slice(&std::fs::read(host.record()).expect("the record was written"))
+            .expect("the record is JSON");
+    assert_eq!(
+        record["path"],
+        host.definition().display().to_string(),
+        "the record names the definition: {record}"
+    );
+
+    let output = start(host.new_session()).finish("kr new");
+    let created = document(&output, "kr new");
+    assert!(
+        output.status.success(),
+        "{created}; it said {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let daemon = host
+        .daemon()
+        .expect("the service manager reports the daemon it started");
+
+    // A diagnostic that did not pass makes the command's status a failure, and the document it
+    // printed is still the whole report.
+    let reported = |what: &str| {
+        let output = start(host.kr(&["--json", "doctor"])).finish(what);
+        document(&output, what)
+    };
+    let report = reported("kr doctor");
+    let row = report["configuration"]["values"]
+        .as_array()
+        .and_then(|values| {
+            values
+                .iter()
+                .find(|value| value["key"] == "startup.controller")
+                .cloned()
+        })
+        .unwrap_or_else(|| panic!("kr doctor reports the startup: {report}"));
+    assert_eq!(row["value"], "service", "{row}");
+    assert_eq!(row["source"], "host_configuration", "{row}");
+    let check = report["doctor"]["checks"]
+        .as_array()
+        .and_then(|checks| {
+            checks
+                .iter()
+                .find(|check| check["id"] == "startup-definition")
+                .cloned()
+        })
+        .unwrap_or_else(|| panic!("kr doctor reports the definition: {report}"));
+    assert_eq!(check["status"], "ok", "{check}");
+
+    let cleared =
+        start(host.kr(&["--json", "host", "startup", "--clear"])).finish("kr host startup");
+    let none = document(&cleared, "kr host startup");
+    assert!(cleared.status.success(), "{none}");
+    assert_eq!(none["startup"]["controller"], Value::Null, "{none}");
+    let removed: Vec<&str> = none["removed"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the clear says what it removed: {none}"))
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    for path in [host.definition(), host.record()] {
+        assert!(
+            removed.contains(&path.display().to_string().as_str()),
+            "{} is among what the clear removed: {none}",
+            path.display()
+        );
+        assert!(!path.exists(), "{} is gone", path.display());
+    }
+    assert!(host.answers(), "and the daemon keeps serving");
+    assert_eq!(
+        host.daemon(),
+        Some(daemon),
+        "the same daemon, which nothing ended"
+    );
+    let listed = start(host.kr(&["--json", "list"])).finish("kr list");
+    assert!(
+        listed.status.success(),
+        "a command reaches it: {}",
+        String::from_utf8_lossy(&listed.stdout)
+    );
+
+    let report = reported("kr doctor after the clear");
+    let row = report["configuration"]["values"]
+        .as_array()
+        .and_then(|values| {
+            values
+                .iter()
+                .find(|value| value["key"] == "startup.controller")
+                .cloned()
+        })
+        .unwrap_or_else(|| panic!("kr doctor reports the startup: {report}"));
+    assert_eq!(row["value"], "none", "{row}");
+    assert_eq!(row["source"], "default", "{row}");
+    assert!(
+        report["doctor"]["checks"]
+            .as_array()
+            .is_some_and(|checks| checks
+                .iter()
+                .all(|check| check["id"] != "startup-definition")),
+        "and no definition is left to report: {report}"
+    );
+    host.close(&created);
+}
+
+/// KR-REQ-07.12, KR-REQ-26.04: a definition kr did not write, under the label this environment's
+/// daemon would have, is refused and left exactly as it was: nothing is recorded, the choice is not
+/// made, and the manager is asked to load or start nothing under that label.
+#[test]
+fn a_foreign_definition_under_the_same_label_is_refused_and_left_as_it_was() {
+    let Some(host) = ServiceHost::create() else {
+        return;
+    };
+    let foreign = b"# another program's definition, under the label this environment would use\n";
+    std::fs::create_dir_all(host.definition().parent().expect("a directory"))
+        .expect("the directory definitions live in");
+    std::fs::write(host.definition(), foreign).expect("writes a foreign definition");
+
+    let output = start(host.kr(&["--json", "host", "startup", "--set", "service"]))
+        .finish("kr host startup");
+    let refused = document(&output, "kr host startup");
+    assert_eq!(output.status.code(), Some(2), "refused: {refused}");
+    let message = refused["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(&host.definition().display().to_string())
+            && message.contains("did not write"),
+        "the refusal names the definition and whose it is not: {message}"
+    );
+    assert_eq!(
+        std::fs::read(host.definition()).expect("the foreign definition"),
+        foreign,
+        "the definition is left exactly as it was"
+    );
+    assert!(!host.record().exists(), "nothing was recorded");
+    assert!(!host.document().exists(), "and the choice was not made");
+    assert_eq!(
+        host.daemon(),
+        None,
+        "and nothing was started under the label"
+    );
+    assert!(!host.answers());
+}
+
+/// KR-REQ-07.12: with the service start chosen, a definition that was changed after kr wrote it, or
+/// that has gone, stops `kr new` with a failure that names it and the setup action. The command
+/// replaces nothing and starts nothing.
+#[test]
+fn a_definition_that_was_changed_or_has_gone_is_named_and_never_replaced() {
+    let Some(host) = ServiceHost::create() else {
+        return;
+    };
+    host.select_service();
+    let mut changed = std::fs::read(host.definition()).expect("the definition");
+    changed.extend_from_slice(b"\n");
+    std::fs::write(host.definition(), &changed).expect("changes the definition");
+
+    let output = start(host.new_session()).finish("kr new with the definition changed");
+    let failure = document(&output, "kr new");
+    assert_eq!(failure["code"], "HOST_NOT_CONFIGURED", "{failure}");
+    let message = failure["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("changed") && message.contains("kr host startup --set service"),
+        "the failure names what is wrong and what to do about it: {message}"
+    );
+    assert_eq!(
+        std::fs::read(host.definition()).expect("the definition"),
+        changed,
+        "the changed definition was not replaced"
+    );
+
+    std::fs::remove_file(host.definition()).expect("removes the definition");
+    let output = start(host.new_session()).finish("kr new with the definition gone");
+    let failure = document(&output, "kr new");
+    assert_eq!(failure["code"], "HOST_NOT_CONFIGURED", "{failure}");
+    let message = failure["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("missing") && message.contains("kr host startup --set service"),
+        "the failure names what is wrong and what to do about it: {message}"
+    );
+    assert!(
+        !host.definition().exists(),
+        "and nothing was written in its place"
+    );
+    assert_eq!(host.daemon(), None, "nothing was started");
+    assert!(!host.answers());
 }
