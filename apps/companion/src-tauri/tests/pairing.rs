@@ -105,6 +105,34 @@ impl Ceremony for StubCeremony {
     }
 }
 
+/// A ceremony a person takes their time over, and then confirms.
+struct SlowCeremony {
+    takes: Duration,
+}
+
+impl Ceremony for SlowCeremony {
+    fn kind(&self) -> CeremonyKind {
+        CeremonyKind::TouchId
+    }
+
+    fn verify<'a>(&'a self, _reason: &'a str, within: Duration) -> BoxFuture<'a, CeremonyOutcome> {
+        Box::pin(async move {
+            tokio::time::sleep(self.takes.min(within)).await;
+            CeremonyOutcome::Confirmed
+        })
+    }
+}
+
+/// What a host asks its owner to confirm: an invitation for a viewer, offered on its network.
+fn an_invitation() -> ConfirmationSubject {
+    ConfirmationSubject::IssueInvitation {
+        mode: InviteModeKind::Direct,
+        rendezvous_origin: Nullable::null(),
+        grant_kind: InviteGrantKind::SessionInvitation,
+        proposed_grant: viewer(),
+    }
+}
+
 /// Every way a secret could appear in the page's text.
 fn spellings(bytes: &[u8]) -> Vec<String> {
     use std::fmt::Write as _;
@@ -458,6 +486,127 @@ async fn the_watcher_never_cuts_off_an_attempt_that_shares_its_relay() {
     .expect("the owned host asks its owner");
     support::listed(&watcher, |request| request.checkable).await;
     support::owned_host_shown(&device, true).await;
+}
+
+/// KR-REQ-10.06, KR-REQ-10.27: this computer owns two hosts whose configurations share a relay and
+/// select different resolvers, so reaching either closes the endpoint the other was reached
+/// through. The watcher visits both in turn and lists what each asks. While the person takes their
+/// time over the first host's request, spanning several of the watcher's cycles, the watcher does
+/// not reach the second host, whose connection would close the endpoint the review answers
+/// through: the review confirms, the first host records the answer, and once the review has ended
+/// the second host is reached again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_watcher_never_cuts_off_a_review_that_shares_its_relay() {
+    const RELAY: &str = "https://relay.pairing.test";
+    let owner_keys = DeviceKeys::generate().expect("keys");
+    let first =
+        Host::start_with_endpoint(&owner_keys, on_relay(RELAY, "http://127.0.0.1:9/pkarr")).await;
+    let second =
+        Host::start_with_endpoint(&owner_keys, on_relay(RELAY, "http://127.0.0.1:10/pkarr")).await;
+    let data = tempfile::tempdir().expect("a directory");
+    let device = owner_device(&first, &owner_keys, data.path());
+    support::record_owned(&device, &second, "the second host");
+    let watcher = Owner::new(
+        Arc::clone(&device),
+        Arc::new(SlowCeremony {
+            takes: companion_tauri::owner::INTERVAL * 4,
+        }),
+        || {},
+    );
+    watcher.start();
+
+    let mut first_client = first.client().await;
+    let asked = calls::request(first.environment_id, &mut first_client, an_invitation())
+        .await
+        .expect("the first host asks");
+    let mut second_client = second.client().await;
+    calls::request(second.environment_id, &mut second_client, an_invitation())
+        .await
+        .expect("the second host asks");
+    let request = support::listed(&watcher, |request| request.host_name == "the test host").await;
+    support::listed(&watcher, |request| request.host_name == "the second host").await;
+
+    let outcome = tokio::time::timeout(WATCHDOG, watcher.review(&request.reference))
+        .await
+        .expect("the review ends")
+        .expect("reviewed");
+    assert_eq!(outcome, ReviewOutcome::Confirmed);
+    assert!(
+        first
+            .network()
+            .pairing()
+            .rows()
+            .acceptance(asked.request.confirmation_id)
+            .expect("readable")
+            .is_some(),
+        "the first host recorded the answer"
+    );
+    support::listed(&watcher, |request| request.host_name == "the second host").await;
+}
+
+/// KR-REQ-10.06: one of this computer's hosts takes each connection, completes the authorised
+/// handshake and then answers nothing, holding the connection open. It holds up nothing else:
+/// each visit to it ends within its bound, the other host's request is listed soon after that host
+/// asks, a review of it confirms while the watcher waits on the silent host, and the silent host is
+/// shown out of contact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_silent_host_holds_up_no_other_hosts_confirmations() {
+    let owner_keys = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner_keys).await;
+    let data = tempfile::tempdir().expect("a directory");
+    let device = owner_device(&host, &owner_keys, data.path());
+    let silent = support::SilentHost::start(&owner_keys, "a silent host").await;
+    device
+        .pairing()
+        .hosts
+        .record(silent.record.clone())
+        .expect("the silent host is recorded");
+    let watcher = Owner::new(
+        Arc::clone(&device),
+        Arc::new(StubCeremony {
+            answer: CeremonyOutcome::Confirmed,
+            asked: AtomicUsize::new(0),
+        }),
+        || {},
+    );
+    watcher.start();
+    // The watcher is waiting on the silent host's answer.
+    silent.accepted(1).await;
+
+    let mut client = host.client().await;
+    let asked = calls::request(host.environment_id, &mut client, an_invitation())
+        .await
+        .expect("the host asks");
+    let started = std::time::Instant::now();
+    let request = support::listed(&watcher, |request| request.host_name == "the test host").await;
+    let bound = companion_tauri::owner::VISIT_WITHIN * 2 + companion_tauri::owner::INTERVAL * 2;
+    assert!(
+        started.elapsed() < bound,
+        "listed in {:?}, past {bound:?}",
+        started.elapsed()
+    );
+    let outcome = tokio::time::timeout(
+        companion_tauri::owner::VISIT_WITHIN * 2,
+        watcher.review(&request.reference),
+    )
+    .await
+    .expect("the review does not wait on the silent host")
+    .expect("reviewed");
+    assert_eq!(outcome, ReviewOutcome::Confirmed);
+    assert!(
+        host.network()
+            .pairing()
+            .rows()
+            .acceptance(asked.request.confirmation_id)
+            .expect("readable")
+            .is_some(),
+        "the host recorded the answer"
+    );
+    assert_eq!(
+        support::in_contact_with(&device, "a silent host"),
+        Some(false)
+    );
+    silent.stop().await;
 }
 
 /// A room that counts the sockets it is asked to open, and ends each before any host speaks.
