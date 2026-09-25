@@ -77,6 +77,7 @@ impl Pairing {
         )
         .await
         .map_err(|error| reached(&error))?;
+        let opened = tokio::time::Instant::now();
         let selection = preauth.selection().clone();
         if selection.endpoint_id != payload.endpoint_id {
             return Err(PairingFailure::new(
@@ -187,7 +188,7 @@ impl Pairing {
         // Two questions were asked on the connection: the challenge and the proof.
         self.await_approval(
             pending,
-            Some(Unpaired::new(connection, preauth, 2)),
+            Some(Unpaired::new(connection, preauth, opened, 2)),
             progress,
         )
         .await
