@@ -3819,7 +3819,9 @@ at.
 The hand-over to a component belongs to the plugin host, which owns the runtime that invokes
 `prepare_action`. The broker issues and spends the token around the operation it dispatches itself,
 and a `plugin.action.invoke` that would cross into that runtime is refused before the dispatch
-marker rather than carried.
+marker rather than carried. An action that answers through its connector's decision destination
+does not cross into it: no component prepares the answer, so no token is issued, and the broker
+writes the answer from the connector's table under the approval's own claim.
 
 ### Capability evidence
 
@@ -4033,6 +4035,13 @@ read may return is refused rather than cut short, a write over its bound is refu
 is opened, and a read returns text. A write replaces the file's content; a file that does not exist
 is created, readable and writable by its owner only and never executable.
 
+A launch from the shell is granted the directory the shell reported for its command, for reading
+only, when its connector's installation holds `filesystem.read`. The worker opens that directory
+when it establishes the launch's backend, so what is granted is the directory the command was typed
+in, whatever its path names later, and a read that would cross into another mount is refused. The
+grant ends with the instance. No other launch is granted a directory, and no launch is granted
+writing.
+
 The request is recorded, what to do about it is decided, and the one admission to answer it is taken
 with the dispatch marker committed, all under the broker's one lock and all before the operation
 runs. No native answer and no rich answer can take that admission afterwards, so this host's answer
@@ -4190,6 +4199,19 @@ registered, and the process must be running the forwarder the installation put i
 session identifier in the environment is carried as a diagnostic and decides none of it. A refused
 bridge is closed without a word; an admitted one is answered with one admission line.
 
+Such an application can also be launched from the managed shell, when its connector integrates the
+command the person typed. The worker then establishes a backend before the shell forks: an
+endpoint, a credential and a launch record in a fresh owner-only directory, with nothing reserved.
+The forked child runs the installation's `kr-hook launch`, which presents its own process with the
+credential. The worker admits it only as the root shell's own child, started after the establish,
+running the file the worker hashed with the vector it answered. Then it registers the instance,
+publishes the registration naming that process and commits, and only then does the launcher exec
+the program in place, so the registration names the program before it runs. Anything short of the
+commit runs the command as typed, without the integration's flags. Every bridge of such a launch is
+also checked against the running image: the process must still execute what was hashed, and one
+mismatch refuses that bridge and every later one. The launcher's contract is in the Claude Code
+bridge's documentation.
+
 An admitted hook sends one observation and waits for this host to apply it and close the connection.
 When that exchange completes, the host has the report before the hook answers the application. It
 does not when the hook reaches its deadline first, or when the application moves on without waiting,
@@ -4223,9 +4245,17 @@ identifier is used again (an exact retry, or another question of the same instan
 identifier, with a recorded thread or none), no later report binds either question; one already
 bound by then was bound by its own call's report and stays bound.
 
-The gateway hands an admitted channel's connection to its caller, which serves the application's own
-protocol on it as JSON lines within the gateway's native frame bound. The Claude Code bridge is
-described in [`docs/bridges/claude-code/README.md`](../bridges/claude-code/README.md).
+An admitted channel is served by this host for as long as it is open, on a gateway connection of its
+own kind, and only the launched application's own: its starter must be the process the launch
+registered, an instance has one channel open at a time, and the connector's table must be qualified
+for the version a signed qualification record names for the executable the launch hashed. What it
+relays goes through the same native admission as any upstream request and is recorded as a pending
+resource with its source frame; whether that can be answered is decided by the decoding trust and
+the arbitration above, as for any connection. A frame its table does not route towards this host
+closes it. However it closes, and in any mode, it settles what it relayed as what has already
+happened: what was never dispatched is cancelled and what was dispatched is uncertain, so no closed
+channel holds a recovery open. The Claude Code bridge is described in
+[`docs/bridges/claude-code/README.md`](../bridges/claude-code/README.md).
 
 ## Agent methods
 
@@ -4284,7 +4314,10 @@ permit that carried its answer.
 An answer's transport is the one that speaks for the connection whose resource it resolves, chosen
 when the answer is admitted; a connection that has gone is `UPSTREAM_UNAVAILABLE` before anything
 is claimed. The transport work happens after the session boundary ends, because terminal ingestion
-needs that boundary and an upstream that is slow to answer must not stop a person typing.
+needs that boundary and an upstream that is slow to answer must not stop a person typing. It runs
+on a thread of its own under this worker's ten-second bound, so a transport that blocks cannot hold
+the caller past it: at the bound the caller is told `UPSTREAM_UNAVAILABLE`, and the receipt records
+an outcome nobody can establish.
 
 `plugin.action.invoke` validates the registered action, the grant that action declares, its effect
 class and whether a draft the action needs was named, and then issues the action token that
@@ -4308,6 +4341,16 @@ the token was spent to invite the work and is not proof by the time the work com
 transmits is the plan that was validated: the operation it prepares travels in the frame, carried
 in the permit rather than attested by a flag beside it. The draft store itself — whose the draft is
 and what else it holds — is not this host's, and what it supplies here is the snapshot.
+
+An action whose implementation is its connector's decision destination is an approval answer, and
+`plugin.action.invoke` admits it as one: every check an approval answer meets applies, in the
+transaction `agent.approval.respond` uses, with the action's own checks inside it. The call must
+name the resource it answers. The action must be registered for this binding with the
+`approval.respond` effect, and the binding must still hold that action's grant. This binding must be
+the resource's decoder, because the answer carries the decoder's meaning, and the decision, read
+from the parameter the action names for it, must be one the interpretation offered. No action token
+is issued and no component is asked: the answer is written from the connection's own table under
+the approval's claim, and the method answers with its own result, the mutation and the action.
 
 An adapter checkpoints the cursor it consumed, and the cursor survives a restart. A restart resumes
 the numbering after it, so a new entry never takes a cursor an adapter has already passed and a
