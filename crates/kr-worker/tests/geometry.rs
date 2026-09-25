@@ -18,8 +18,9 @@ use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_protocol::actor::ActorIngress;
 use kr_protocol::attachment::{
     AttachMode, AttachmentCapability, AttachmentConfigureParams, AttachmentViewportParams,
-    AttachmentViewportResult, GeometryResult, SessionAttachParams, SessionDetachParams,
-    TerminalGeometryTransferParams, TerminalPresentationMode, TerminalResizeParams,
+    AttachmentViewportResult, GeometryResult, PresentationReason, SessionAttachParams,
+    SessionDetachParams, TerminalGeometryTransferParams, TerminalPresentationMode,
+    TerminalResizeParams,
 };
 use kr_protocol::authority::{AuthorityDecision, CapabilityRequirement};
 use kr_protocol::envelope::{ActionTarget, ControlFrame};
@@ -931,10 +932,11 @@ impl Typist {
     }
 }
 
-/// KR-REQ-08.01, KR-REQ-08.03: every terminal attachment has a presentation of its own, decided
-/// apart from who owns the size. Direct needs the session's geometry and a qualified terminal
-/// profile together: the owner of the size is projected when its terminal is not qualified, and a
-/// terminal that owns nothing is sent the live stream when it has both.
+/// KR-REQ-08.01, KR-REQ-08.02, KR-REQ-08.03: every terminal attachment has a presentation of its
+/// own, decided apart from who owns the size. Direct needs the session's geometry and a qualified
+/// terminal profile together: the owner of the size is projected when its terminal is not
+/// qualified, and a terminal that owns nothing is sent the live stream when it has both. Each
+/// projected one says why, and the direct one gives no reason.
 #[tokio::test(flavor = "multi_thread")]
 async fn presentation_is_decided_apart_from_who_owns_the_size() {
     let host = kr_ipc::testing::TempHost::create();
@@ -1000,6 +1002,27 @@ async fn presentation_is_decided_apart_from_who_owns_the_size() {
         presentation(undeclared),
         Some(TerminalPresentationMode::Viewport),
         "the session's size with no qualified profile is projected"
+    );
+    let reason = |attachment_id: AttachmentId| {
+        attachments
+            .iter()
+            .find(|summary| summary.attachment_id == attachment_id)
+            .and_then(|summary| summary.presentation_reason)
+    };
+    assert_eq!(
+        reason(owner),
+        Some(PresentationReason::UnqualifiedTerminalProfile)
+    );
+    assert_eq!(
+        reason(matching),
+        None,
+        "a direct attachment needs no reason"
+    );
+    assert_eq!(reason(smaller), Some(PresentationReason::SizeMismatch));
+    assert_eq!(
+        reason(undeclared),
+        Some(PresentationReason::NoTerminalProfile),
+        "declaring no profile is a reason of its own, apart from declaring one not qualified"
     );
 }
 

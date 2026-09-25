@@ -13,8 +13,8 @@
 use std::collections::BTreeMap;
 
 use kr_protocol::attachment::{
-    AttachMode, AttachmentCapability, AttachmentSummary, GeometryState, SessionAttachParams,
-    TerminalPresentationMode,
+    AttachMode, AttachmentCapability, AttachmentSummary, GeometryState, PresentationReason,
+    SessionAttachParams, TerminalPresentationMode,
 };
 use kr_protocol::ids::{AttachmentId, AttachmentOrdinal, GeometryEpoch};
 use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs};
@@ -78,30 +78,36 @@ impl Attachment {
     }
 
     fn to_wire(&self, geometry: Dimensions, carryable: bool) -> AttachmentSummary {
+        let presented = self.presentation(geometry, carryable);
         AttachmentSummary {
             attachment_id: self.id,
             ordinal: AttachmentOrdinal::new(self.ordinal),
             mode: self.mode,
             claim_geometry: self.claim_geometry,
             dimensions: Nullable(self.dimensions),
-            presentation: Nullable(self.presentation(geometry, carryable)),
+            presentation: Nullable(presented.map(|(mode, _)| mode)),
+            presentation_reason: presented.and_then(|(_, reason)| reason),
             terminal_profile_id: Nullable(self.terminal_profile_id.clone()),
             granted: self.granted.clone(),
             attached_at_ms: self.attached_at_ms,
         }
     }
 
-    /// Returns how this attachment is shown the session.
+    /// Returns how this attachment is shown the session, and why when it is not shown the live
+    /// stream.
     ///
-    /// Direct mode is qualified on three things together, and each one alone is not enough:
+    /// Direct mode is qualified on every one of these together, and each alone is not enough:
     ///
-    /// * **The size.** Wrapping and cursor coordinates depend on the column count, so only a
-    ///   terminal of exactly the canonical size can take the byte stream unchanged.
     /// * **The profile.** A client declares which terminal it is after probing it, and the name it
     ///   declares has to be one this build has qualified against the kr-vt/1 output the session
     ///   produces. Without a declaration the host does not know what those bytes would do there,
     ///   and `--no-probe` is exactly the case where the client chose not to find out; with an
     ///   unqualified one the host knows, and the answer is that they would not do the right thing.
+    /// * **The size.** Wrapping and cursor coordinates depend on the column count, so only a
+    ///   terminal of exactly the canonical size can take the byte stream unchanged.
+    /// * **The window.** A window above the live page is not the live byte stream, whatever this
+    ///   terminal's size is: what it shows is rows the session retained, which no stream of what
+    ///   the application is writing now can produce.
     /// * **The stream.** The engine reports when the output stops being something a physical
     ///   terminal can be handed at all, and `carryable` is that answer.
     /// * **The screen it was given.** A terminal continues the stream from the screen the host drew
@@ -113,34 +119,52 @@ impl Attachment {
     ///   an attachment waiting for one is held in a projection until it arrives. This is the one
     ///   condition that is about a moment rather than about the attachment.
     ///
-    /// Everything else displays a clipped viewport of the canonical grid; nothing is reflowed.
+    /// Everything else displays a clipped viewport of the canonical grid; nothing is reflowed. The
+    /// reason is the first condition in that order that does not hold, which is the order
+    /// [`PresentationReason`] lists them in: what lasts as long as the attachment stays as it is
+    /// comes before what passes by itself.
     fn presentation(
         &self,
         geometry: Dimensions,
         carryable: bool,
-    ) -> Option<TerminalPresentationMode> {
+    ) -> Option<(TerminalPresentationMode, Option<PresentationReason>)> {
         if self.mode != AttachMode::Terminal {
             return None;
         }
-        match self.dimensions {
-            Some(own)
-                if carryable
-                    && self.restoration_continues
-                    && !self.forwarding_held
-                    // A window above the live page is not the live byte stream, whatever this
-                    // terminal's size is: what it shows is rows the session retained, which no
-                    // stream of what the application is writing now can produce.
-                    && self.history_top_row.is_none()
-                    && own == geometry
-                    && self
-                        .terminal_profile_id
-                        .as_deref()
-                        .is_some_and(is_qualified_terminal) =>
-            {
-                Some(TerminalPresentationMode::Direct)
+        let own = self.dimensions?;
+        Some(match self.kept_off_the_stream(own, geometry, carryable) {
+            None => (TerminalPresentationMode::Direct, None),
+            Some(reason) => (TerminalPresentationMode::Viewport, Some(reason)),
+        })
+    }
+
+    /// The first condition, in the order [`PresentationReason`] lists them, that keeps this
+    /// terminal attachment off the live stream, or `None` when every one holds.
+    fn kept_off_the_stream(
+        &self,
+        own: Dimensions,
+        geometry: Dimensions,
+        carryable: bool,
+    ) -> Option<PresentationReason> {
+        match self.terminal_profile_id.as_deref() {
+            None => return Some(PresentationReason::NoTerminalProfile),
+            Some(profile) if !is_qualified_terminal(profile) => {
+                return Some(PresentationReason::UnqualifiedTerminalProfile);
             }
-            Some(_) => Some(TerminalPresentationMode::Viewport),
-            None => None,
+            Some(_) => {}
+        }
+        if own != geometry {
+            Some(PresentationReason::SizeMismatch)
+        } else if self.history_top_row.is_some() {
+            Some(PresentationReason::HistoryWindow)
+        } else if !carryable {
+            Some(PresentationReason::StreamNotCarryable)
+        } else if !self.restoration_continues {
+            Some(PresentationReason::RestorationIncomplete)
+        } else if self.forwarding_held {
+            Some(PresentationReason::AwaitingParserBoundary)
+        } else {
+            None
         }
     }
 }
@@ -505,6 +529,7 @@ impl AttachmentTable {
             .ok_or_else(|| unknown(id))?;
         attachment
             .presentation(canonical, carryable)
+            .map(|(mode, _)| mode)
             .ok_or_else(|| {
                 WorkerError::InvalidArgument(
                     "a semantic attachment has no terminal presentation".to_owned(),
@@ -540,7 +565,7 @@ impl AttachmentTable {
             .filter_map(|attachment| {
                 let own = attachment.dimensions?;
                 match attachment.presentation(canonical, self.carryable) {
-                    Some(TerminalPresentationMode::Viewport) => Some((attachment.id, own)),
+                    Some((TerminalPresentationMode::Viewport, _)) => Some((attachment.id, own)),
                     _ => None,
                 }
             })
@@ -1133,6 +1158,171 @@ mod tests {
             TerminalPresentationMode::Viewport
         );
         assert_eq!(table.projected().len(), 1);
+    }
+
+    /// What one attachment's summary says about how it is presented, and why.
+    fn presented(
+        table: &AttachmentTable,
+        id: u8,
+    ) -> (Option<TerminalPresentationMode>, Option<PresentationReason>) {
+        let summary = table
+            .summaries()
+            .into_iter()
+            .find(|summary| summary.attachment_id == identifier(id))
+            .expect("the attachment is summarised");
+        (
+            summary.presentation.as_ref().copied(),
+            summary.presentation_reason,
+        )
+    }
+
+    /// KR-REQ-08.02: each condition that keeps a terminal off the live stream is reported as its own
+    /// reason, the two cases of the profile apart, and a direct attachment has none.
+    #[test]
+    fn each_condition_that_keeps_a_terminal_off_the_stream_is_its_own_reason() {
+        let mut table = AttachmentTable::new(Dimensions::new(120, 40));
+        attach(&mut table, 1, &terminal(120, 40, true));
+        attach(
+            &mut table,
+            2,
+            &SessionAttachParams {
+                terminal_profile_id: Nullable::null(),
+                ..terminal(120, 40, false)
+            },
+        );
+        attach(
+            &mut table,
+            3,
+            &SessionAttachParams {
+                terminal_profile_id: Nullable::some("dumb".to_owned()),
+                ..terminal(120, 40, false)
+            },
+        );
+        attach(&mut table, 4, &terminal(100, 30, false));
+        attach(&mut table, 5, &terminal(120, 40, false));
+        table
+            .viewport(identifier(5), Dimensions::new(120, 40), Some(17))
+            .expect("reports a window above the live page");
+        attach(&mut table, 6, &terminal(120, 40, false));
+        table.note_restoration(identifier(6), false);
+        attach(&mut table, 7, &terminal(120, 40, false));
+        assert!(table.hold_forwarding(identifier(7), true));
+
+        let direct = Some(TerminalPresentationMode::Direct);
+        let viewport = Some(TerminalPresentationMode::Viewport);
+        assert_eq!(
+            presented(&table, 1),
+            (direct, None),
+            "a direct one has none"
+        );
+        for (id, reason) in [
+            (2, PresentationReason::NoTerminalProfile),
+            (3, PresentationReason::UnqualifiedTerminalProfile),
+            (4, PresentationReason::SizeMismatch),
+            (5, PresentationReason::HistoryWindow),
+            (6, PresentationReason::RestorationIncomplete),
+            (7, PresentationReason::AwaitingParserBoundary),
+        ] {
+            assert_eq!(
+                presented(&table, id),
+                (viewport, Some(reason)),
+                "{reason:?}"
+            );
+        }
+
+        // The output stops being something a terminal can be handed: the one that was direct says
+        // so, and every other keeps the reason that comes before it.
+        assert!(table.set_carryable(false));
+        assert_eq!(
+            presented(&table, 1),
+            (viewport, Some(PresentationReason::StreamNotCarryable))
+        );
+        assert_eq!(
+            presented(&table, 4),
+            (viewport, Some(PresentationReason::SizeMismatch))
+        );
+
+        // An attachment that is not a terminal has no presentation and so no reason.
+        let semantic = SessionAttachParams {
+            mode: AttachMode::Semantic,
+            claim_geometry: false,
+            dimensions: Nullable::null(),
+            terminal_profile_id: Nullable::null(),
+            requested: capabilities(&[AttachmentCapability::ObserveSemantic]),
+            ..terminal(120, 40, false)
+        };
+        table
+            .attach(
+                &semantic,
+                capabilities(&[AttachmentCapability::ObserveSemantic]),
+                identifier(8),
+                TimestampMs::new(8),
+            )
+            .expect("a semantic attachment joins");
+        assert_eq!(presented(&table, 8), (None, None));
+    }
+
+    /// KR-REQ-08.02: when several conditions hold at once, the reason given is the first of them in
+    /// the order the reasons are listed, and once that one clears the next is given.
+    #[test]
+    fn when_several_conditions_hold_the_first_in_order_is_given() {
+        let mut table = AttachmentTable::new(Dimensions::new(120, 40));
+        let undeclared = SessionAttachParams {
+            terminal_profile_id: Nullable::null(),
+            ..terminal(100, 30, false)
+        };
+        attach(&mut table, 1, &undeclared);
+        attach(&mut table, 2, &terminal(100, 30, false));
+        attach(&mut table, 3, &terminal(120, 40, false));
+        attach(&mut table, 4, &terminal(120, 40, false));
+        for id in 1..=3 {
+            let own = table
+                .own_dimensions(identifier(id))
+                .flatten()
+                .expect("its own size");
+            table
+                .viewport(identifier(id), own, Some(3))
+                .expect("reports a window above the live page");
+        }
+        for id in 1..=4 {
+            table.note_restoration(identifier(id), false);
+            table.hold_forwarding(identifier(id), true);
+        }
+        table.set_carryable(false);
+
+        let viewport = Some(TerminalPresentationMode::Viewport);
+        assert_eq!(
+            presented(&table, 1),
+            (viewport, Some(PresentationReason::NoTerminalProfile)),
+            "everything fails, and the profile is named"
+        );
+        assert_eq!(
+            presented(&table, 2),
+            (viewport, Some(PresentationReason::SizeMismatch))
+        );
+        assert_eq!(
+            presented(&table, 3),
+            (viewport, Some(PresentationReason::HistoryWindow))
+        );
+        assert_eq!(
+            presented(&table, 4),
+            (viewport, Some(PresentationReason::StreamNotCarryable))
+        );
+        table.set_carryable(true);
+        assert_eq!(
+            presented(&table, 4),
+            (viewport, Some(PresentationReason::RestorationIncomplete))
+        );
+        table.note_restoration(identifier(4), true);
+        assert_eq!(
+            presented(&table, 4),
+            (viewport, Some(PresentationReason::AwaitingParserBoundary))
+        );
+        table.hold_forwarding(identifier(4), false);
+        assert_eq!(
+            presented(&table, 4),
+            (Some(TerminalPresentationMode::Direct), None)
+        );
     }
 
     #[test]

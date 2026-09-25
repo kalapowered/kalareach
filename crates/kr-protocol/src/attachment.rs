@@ -56,6 +56,102 @@ pub enum TerminalPresentationMode {
     Viewport,
 }
 
+impl TerminalPresentationMode {
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Viewport => "viewport",
+        }
+    }
+}
+
+/// Why a terminal attachment is shown a viewport of the canonical grid rather than the live byte
+/// stream.
+///
+/// Direct presentation needs every one of these conditions to hold, and an attachment that is not
+/// direct is given one reason: the first in this order that does not hold. The order runs from what
+/// lasts as long as the attachment stays as it is, its terminal and then its size, through where
+/// its window is, to the session's own state, which passes by itself: the output leaving what a
+/// terminal can be handed, a restoration that could not carry the screen, and forwarding waiting
+/// for a parser boundary.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PresentationReason {
+    /// The client declared no terminal profile, so what the session's output would do on its
+    /// terminal is not known.
+    NoTerminalProfile,
+    /// The client declared a terminal profile this build has not qualified to take the session's
+    /// output unchanged.
+    UnqualifiedTerminalProfile,
+    /// The attachment's own size is not the session's canonical size.
+    SizeMismatch,
+    /// The attachment's window is above the live screen, on rows the session retained.
+    HistoryWindow,
+    /// The session's output is no longer something a physical terminal can be handed.
+    StreamNotCarryable,
+    /// The screen the attachment was last given could not carry the state the application
+    /// addresses next.
+    RestorationIncomplete,
+    /// Forwarding waits for the session's output to reach a parser-ground boundary.
+    AwaitingParserBoundary,
+}
+
+impl PresentationReason {
+    /// Every reason, in the order the first that holds is reported.
+    pub const ALL: [Self; 7] = [
+        Self::NoTerminalProfile,
+        Self::UnqualifiedTerminalProfile,
+        Self::SizeMismatch,
+        Self::HistoryWindow,
+        Self::StreamNotCarryable,
+        Self::RestorationIncomplete,
+        Self::AwaitingParserBoundary,
+    ];
+
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoTerminalProfile => "no_terminal_profile",
+            Self::UnqualifiedTerminalProfile => "unqualified_terminal_profile",
+            Self::SizeMismatch => "size_mismatch",
+            Self::HistoryWindow => "history_window",
+            Self::StreamNotCarryable => "stream_not_carryable",
+            Self::RestorationIncomplete => "restoration_incomplete",
+            Self::AwaitingParserBoundary => "awaiting_parser_boundary",
+        }
+    }
+
+    /// Returns what the reason means, for a person.
+    #[must_use]
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::NoTerminalProfile => {
+                "its client declared no terminal profile, so what the session's output would do on \
+                 its terminal is not known"
+            }
+            Self::UnqualifiedTerminalProfile => {
+                "the terminal profile its client declared is not one this build has qualified"
+            }
+            Self::SizeMismatch => "its size is not the session's",
+            Self::HistoryWindow => "its window is above the live screen",
+            Self::StreamNotCarryable => {
+                "the session's output is no longer something a terminal can be handed as it is"
+            }
+            Self::RestorationIncomplete => {
+                "the screen it was last given could not carry everything the application addresses"
+            }
+            Self::AwaitingParserBoundary => {
+                "forwarding waits for the session's output to reach the end of a sequence"
+            }
+        }
+    }
+}
+
 /// What an attachment asks to be able to do.
 ///
 /// A request is not a grant. The host intersects these with the actor's rights, and an attachment
@@ -144,6 +240,16 @@ pub struct AttachmentSummary {
     pub dimensions: Nullable<Dimensions>,
     /// How the attachment displays the canonical grid.
     pub presentation: Nullable<TerminalPresentationMode>,
+    /// Why a terminal attachment is shown a viewport, when it is.
+    ///
+    /// Section 8 asks every presentation to be reported with its reason. A direct attachment needs
+    /// none and an attachment that is not a terminal has no presentation, so both leave this out,
+    /// and a direct attachment's summary is byte for byte what a client built before reasons
+    /// expects. A worker built before reasons leaves it out of every summary, and a reader takes
+    /// that as no reason reported rather than as a direct presentation: `presentation` says which
+    /// the attachment is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation_reason: Option<PresentationReason>,
     /// The terminal profile it presents.
     pub terminal_profile_id: Nullable<String>,
     /// The capabilities the host granted, which are the requested ones intersected with the
@@ -380,5 +486,58 @@ mod tests {
                 .expect("and so does one that named nothing");
         assert!(!unqualified.attachment_id.is_present());
         assert!(!unqualified.line_token.is_present());
+    }
+    /// KR-REQ-08.02: a viewport carries its reason, a direct attachment carries none and is encoded
+    /// as it was before reasons existed, and a summary from a worker built before reasons still
+    /// reads, as one with no reason reported.
+    #[test]
+    fn a_viewport_says_why_and_a_direct_attachment_is_encoded_as_before() {
+        let summary = |presentation, reason| AttachmentSummary {
+            attachment_id: crate::ids::AttachmentId::new(crate::scalars::Uuid::from_bytes([7; 16])),
+            ordinal: crate::ids::AttachmentOrdinal::new(1),
+            mode: AttachMode::Terminal,
+            claim_geometry: false,
+            dimensions: Nullable::some(Dimensions::new(80, 24)),
+            presentation: Nullable::some(presentation),
+            presentation_reason: reason,
+            terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+            granted: CanonicalSet::new(),
+            attached_at_ms: TimestampMs::new(1),
+        };
+        let direct =
+            serde_json::to_value(summary(TerminalPresentationMode::Direct, None)).expect("encodes");
+        assert_eq!(direct["presentation"], "direct");
+        assert!(
+            direct.get("presentation_reason").is_none(),
+            "a direct attachment has no reason to carry: {direct}"
+        );
+        let projected = serde_json::to_value(summary(
+            TerminalPresentationMode::Viewport,
+            Some(PresentationReason::SizeMismatch),
+        ))
+        .expect("encodes");
+        assert_eq!(projected["presentation"], "viewport");
+        assert_eq!(projected["presentation_reason"], "size_mismatch");
+        for reason in PresentationReason::ALL {
+            assert_eq!(
+                serde_json::to_value(reason).expect("encodes"),
+                serde_json::json!(reason.as_str()),
+                "the wire word is the one as_str names"
+            );
+            assert!(!reason.describe().is_empty());
+        }
+
+        let mut earlier = projected;
+        earlier
+            .as_object_mut()
+            .expect("an object")
+            .remove("presentation_reason");
+        let read: AttachmentSummary =
+            serde_json::from_value(earlier).expect("a summary from a build before reasons reads");
+        assert_eq!(
+            read.presentation.as_ref(),
+            Some(&TerminalPresentationMode::Viewport)
+        );
+        assert_eq!(read.presentation_reason, None, "with no reason reported");
     }
 }

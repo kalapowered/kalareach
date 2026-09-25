@@ -195,6 +195,25 @@ export type AttachmentCapability = 'observe_terminal' | 'observe_semantic' | 'in
  */
 export type TerminalPresentationMode = 'direct' | 'viewport'
 /**
+ * Why a terminal attachment is shown a viewport of the canonical grid rather than the live byte
+ * stream.
+ *
+ * Direct presentation needs every one of these conditions to hold, and an attachment that is not
+ * direct is given one reason: the first in this order that does not hold. The order runs from what
+ * lasts as long as the attachment stays as it is, its terminal and then its size, through where
+ * its window is, to the session's own state, which passes by itself: the output leaving what a
+ * terminal can be handed, a restoration that could not carry the screen, and forwarding waiting
+ * for a parser boundary.
+ */
+export type PresentationReason =
+  | 'no_terminal_profile'
+  | 'unqualified_terminal_profile'
+  | 'size_mismatch'
+  | 'history_window'
+  | 'stream_not_carryable'
+  | 'restoration_incomplete'
+  | 'awaiting_parser_boundary'
+/**
  * Where an attachment's window sits in the session's rows.
  *
  * A window is normally on the live screen, which is what no position at all means. A client
@@ -4530,6 +4549,17 @@ export interface AttachmentSummary {
    * How the attachment displays the canonical grid.
    */
   presentation: TerminalPresentationMode | null
+  /**
+   * Why a terminal attachment is shown a viewport, when it is.
+   *
+   * Section 8 asks every presentation to be reported with its reason. A direct attachment needs
+   * none and an attachment that is not a terminal has no presentation, so both leave this out,
+   * and a direct attachment's summary is byte for byte what a client built before reasons
+   * expects. A worker built before reasons leaves it out of every summary, and a reader takes
+   * that as no reason reported rather than as a direct presentation: `presentation` says which
+   * the attachment is.
+   */
+  presentation_reason?: PresentationReason | null
   /**
    * The terminal profile it presents.
    */
@@ -22084,6 +22114,17 @@ export interface AttachmentSummary1 {
    * How the attachment displays the canonical grid.
    */
   presentation: TerminalPresentationMode | null
+  /**
+   * Why a terminal attachment is shown a viewport, when it is.
+   *
+   * Section 8 asks every presentation to be reported with its reason. A direct attachment needs
+   * none and an attachment that is not a terminal has no presentation, so both leave this out,
+   * and a direct attachment's summary is byte for byte what a client built before reasons
+   * expects. A worker built before reasons leaves it out of every summary, and a reader takes
+   * that as no reason reported rather than as a direct presentation: `presentation` says which
+   * the attachment is.
+   */
+  presentation_reason?: PresentationReason | null
   /**
    * The terminal profile it presents.
    */

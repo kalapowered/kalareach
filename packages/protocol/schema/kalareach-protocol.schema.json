@@ -2413,6 +2413,17 @@
           ],
           "description": "How the attachment displays the canonical grid."
         },
+        "presentation_reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PresentationReason"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why a terminal attachment is shown a viewport, when it is.\n\nSection 8 asks every presentation to be reported with its reason. A direct attachment needs\nnone and an attachment that is not a terminal has no presentation, so both leave this out,\nand a direct attachment's summary is byte for byte what a client built before reasons\nexpects. A worker built before reasons leaves it out of every summary, and a reader takes\nthat as no reason reported rather than as a direct presentation: `presentation` says which\nthe attachment is."
+        },
         "terminal_profile_id": {
           "anyOf": [
             {
@@ -21332,6 +21343,46 @@
         {
           "const": "invisible",
           "description": "Create without any local terminal attachment.",
+          "type": "string"
+        }
+      ]
+    },
+    "PresentationReason": {
+      "description": "Why a terminal attachment is shown a viewport of the canonical grid rather than the live byte\nstream.\n\nDirect presentation needs every one of these conditions to hold, and an attachment that is not\ndirect is given one reason: the first in this order that does not hold. The order runs from what\nlasts as long as the attachment stays as it is, its terminal and then its size, through where\nits window is, to the session's own state, which passes by itself: the output leaving what a\nterminal can be handed, a restoration that could not carry the screen, and forwarding waiting\nfor a parser boundary.",
+      "oneOf": [
+        {
+          "const": "no_terminal_profile",
+          "description": "The client declared no terminal profile, so what the session's output would do on its\nterminal is not known.",
+          "type": "string"
+        },
+        {
+          "const": "unqualified_terminal_profile",
+          "description": "The client declared a terminal profile this build has not qualified to take the session's\noutput unchanged.",
+          "type": "string"
+        },
+        {
+          "const": "size_mismatch",
+          "description": "The attachment's own size is not the session's canonical size.",
+          "type": "string"
+        },
+        {
+          "const": "history_window",
+          "description": "The attachment's window is above the live screen, on rows the session retained.",
+          "type": "string"
+        },
+        {
+          "const": "stream_not_carryable",
+          "description": "The session's output is no longer something a physical terminal can be handed.",
+          "type": "string"
+        },
+        {
+          "const": "restoration_incomplete",
+          "description": "The screen the attachment was last given could not carry the state the application\naddresses next.",
+          "type": "string"
+        },
+        {
+          "const": "awaiting_parser_boundary",
+          "description": "Forwarding waits for the session's output to reach a parser-ground boundary.",
           "type": "string"
         }
       ]
