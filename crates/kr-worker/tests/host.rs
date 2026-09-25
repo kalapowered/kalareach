@@ -219,6 +219,16 @@ impl Host {
     /// and on Windows when a run asks for the path the shipping daemon still takes, a detached
     /// process of the daemon's own.
     fn platform_supervisor(&self) -> Box<dyn WorkerSupervisor> {
+        #[cfg(windows)]
+        if let Some(task) = &self.task {
+            return Box::new(
+                kr_controller::supervision::windows::TaskSupervisor::new(
+                    self.paths(),
+                    &task.definition().starter,
+                )
+                .expect("the task supervisor"),
+            );
+        }
         Box::new(DetachedSupervisor::new())
     }
 
