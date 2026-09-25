@@ -13073,8 +13073,7 @@ mod one_barrier_for_every_restriction {
         controller: Arc<Controller>,
         temp: &kr_ipc::testing::TempHost,
     ) -> Arc<Controller> {
-        drop(controller);
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        super::net::tests::stopped(controller).await;
         super::a_floor_owed_its_record::daemon(temp).await
     }
 

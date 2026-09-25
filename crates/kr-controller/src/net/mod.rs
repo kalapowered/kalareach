@@ -1750,7 +1750,7 @@ impl Controller {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::sync::Arc;
 
     use kr_protocol::actor::ActorIngress;
@@ -2007,13 +2007,25 @@ mod tests {
         .expect("the floor is this environment's, for this boot")
     }
 
+    /// Stops `controller` once nothing else holds it, so its environment lock is released.
+    pub(in crate::service) async fn stopped(controller: Arc<Controller>) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while Arc::strong_count(&controller) > 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stopped daemon is still held"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        drop(controller);
+    }
+
     /// Stops `controller` and starts the next daemon on the same environment, in this boot.
     async fn restarted(
         controller: Arc<Controller>,
         temp: &kr_ipc::testing::TempHost,
     ) -> Arc<Controller> {
-        drop(controller);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        stopped(controller).await;
         daemon(temp).await
     }
 
@@ -2066,12 +2078,9 @@ mod tests {
         // Another boot: the earlier boot's file is replaced by a floor that starts at the record.
         // On Unix only: on Windows a file cannot be replaced while anything maps it, and in another
         // boot nothing does.
-        drop(controller);
+        stopped(controller).await;
         #[cfg(unix)]
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            another_boot_replaces_the_floor(&temp, &worker, identity, ahead).await;
-        }
+        another_boot_replaces_the_floor(&temp, &worker, identity, ahead).await;
     }
 
     /// Starts a daemon in another boot on `temp`, whose floor `worker` maps as `identity` with its
@@ -2217,8 +2226,7 @@ mod tests {
         let controller = restarted(controller, &temp).await;
         assert!(controller.utc_floor().continuity_lost());
         let current = worker_mapping(&temp).identity();
-        drop(controller);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        stopped(controller).await;
         std::fs::rename(&kept, &path).expect("the lost file is moved back");
         let controller = daemon(&temp).await;
         let adopted = worker_mapping(&temp).identity();
