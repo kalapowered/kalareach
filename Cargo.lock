@@ -4514,6 +4514,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "kr-e2e-m1b"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "futures-util",
+ "iroh",
+ "kr-cbor",
+ "kr-client",
+ "kr-controller",
+ "kr-crypto",
+ "kr-ipc",
+ "kr-pairing",
+ "kr-plugin-catalogue",
+ "kr-plugin-sdk",
+ "kr-protocol",
+ "kr-term",
+ "kr-transport",
+ "kr-worker",
+ "portable-pty",
+ "rustix",
+ "rustls-platform-verifier",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tokio-websockets",
+ "url",
+]
+
+[[package]]
 name = "kr-hook"
 version = "0.1.0"
 dependencies = [
