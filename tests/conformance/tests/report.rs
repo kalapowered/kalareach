@@ -462,11 +462,58 @@ fn a_test_whose_step_stopped_after_building_it_is_not_run_with_the_steps_error()
     let reason = record.tests[0].reason.as_deref().unwrap_or_default();
     assert!(
         reason.starts_with("`cargo test --locked --lib")
-            && reason.contains("built this target and did not run it")
+            && reason.contains("built this target, and no run of it can be read from that step")
             && reason.contains("its path has a space in it"),
         "{reason}"
     );
     assert!(!document.passed(), "a step that stopped fails the run");
+}
+
+#[test]
+fn a_test_its_step_stopped_before_reaching_is_not_run_with_the_steps_error() {
+    // Without `--no-fail-fast`, Cargo stops at the library's failing test and never runs the
+    // integration test it built after it.
+    let evidence = tempfile::tempdir().expect("an evidence directory");
+    let target = std::env::temp_dir().join("kr-conformance-fixture-target-outcomes-stops");
+    let options = Options {
+        root: tree("outcomes"),
+        evidence: kr_conformance::evidence::check_directory(evidence.path()).expect("inside"),
+        selection: Some(vec![Group::Rust]),
+        all_terminals: false,
+        platform: Platform::current(),
+        case_tables: &[],
+        lanes: &[],
+        applications: None,
+        steps: Some(vec![Step::cargo(
+            Group::Rust,
+            "the tree's tests, stopping at the first failure",
+            &["test", "--locked", "--workspace"],
+        )]),
+        lister: lister(),
+        environment: vec![(
+            "CARGO_TARGET_DIR".to_owned(),
+            target.to_string_lossy().into_owned(),
+        )],
+    };
+    let document = report::run(&options, &mut |_| {}).expect("runs");
+    let error = document.steps[0].error.as_deref().unwrap_or_default();
+    assert!(
+        error.contains("ended before it ran"),
+        "{:?}",
+        document.steps[0]
+    );
+    assert_eq!(
+        document.identifiers["KR-REQ-04.03"].verdict,
+        Verdict::Failed
+    );
+    let unreached = &document.identifiers["KR-REQ-04.07"];
+    assert_eq!(unreached.verdict, Verdict::NotRun);
+    let reason = unreached.tests[0].reason.as_deref().unwrap_or_default();
+    assert!(
+        reason.contains("built this target, and no run of it can be read from that step")
+            && reason.contains("ended before it ran"),
+        "{reason}"
+    );
 }
 
 #[test]
