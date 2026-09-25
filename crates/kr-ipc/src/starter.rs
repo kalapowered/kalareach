@@ -77,8 +77,13 @@ pub enum JobPlan {
 /// Breakaway is looked at first: a job that kills on close but permits breakaway is left, which is
 /// what makes the kill on close irrelevant to the child.
 #[must_use]
-pub fn job_plan(limit_flags: Option<u32>) -> JobPlan {
-    todo!("not built yet")
+pub const fn job_plan(limit_flags: Option<u32>) -> JobPlan {
+    match limit_flags {
+        None => JobPlan::Plain,
+        Some(flags) if flags & (BREAKAWAY_OK | SILENT_BREAKAWAY_OK) != 0 => JobPlan::BreakAway,
+        Some(flags) if flags & KILL_ON_JOB_CLOSE != 0 => JobPlan::Refuse,
+        Some(_) => JobPlan::StayInJob,
+    }
 }
 
 /// A request that this environment's starter start the control daemon.
@@ -104,7 +109,7 @@ impl StartClaim {
     /// Whether a starter may still act on this claim at `now_boot_ms` of `boot`.
     #[must_use]
     pub fn admits(&self, boot: &BootIdentity, now_boot_ms: u64) -> bool {
-        todo!("not built yet")
+        self.boot == *boot && now_boot_ms < self.deadline_boot_ms
     }
 }
 
@@ -128,7 +133,7 @@ impl TakenClaim {
     /// made when the claim was taken, is the point at which a start is admitted.
     #[must_use]
     pub fn admits(&self, boot: &BootIdentity, now_boot_ms: u64) -> bool {
-        todo!("not built yet")
+        self.claim.admits(boot, now_boot_ms)
     }
 
     /// Removes the taken claim, once the starter has acted on it or decided not to.
@@ -137,7 +142,11 @@ impl TakenClaim {
     ///
     /// Returns an error when the file cannot be removed.
     pub fn discard(self) -> Result<()> {
-        todo!("not built yet")
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(IpcError::io("remove", &self.path, error)),
+        }
     }
 }
 
@@ -159,7 +168,23 @@ const TAKEN: &str = "taken";
 ///
 /// Returns an error when the claims directory cannot be made or the claim cannot be written.
 pub fn leave_claim(environment: &EnvironmentPaths, claim: &StartClaim) -> Result<()> {
-    todo!("not built yet")
+    let directory = environment.start_claims_dir();
+    crate::paths::create_private_tree(environment.runtime_root(), &directory)?;
+    let path = directory.join(format!("{}.{WAITING}", claim.request));
+    let bytes = kr_cbor::to_canonical_vec(claim).map_err(|error| {
+        IpcError::io(
+            "encode",
+            &path,
+            std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()),
+        )
+    })?;
+    match crate::paths::create_new_owner_only_file(&path, &bytes) {
+        Ok(()) => Ok(()),
+        Err(IpcError::Io { source, .. }) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Takes one claim this starter may act on, if there is one.
@@ -178,7 +203,44 @@ pub fn take_claim(
     boot: &BootIdentity,
     now_boot_ms: u64,
 ) -> Result<Option<TakenClaim>> {
-    todo!("not built yet")
+    let directory = environment.start_claims_dir();
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(IpcError::io("read", &directory, error)),
+    };
+    let mut waiting: Vec<Uuid> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let request: Uuid = name
+                .to_str()?
+                .strip_suffix(&format!(".{WAITING}"))?
+                .parse()
+                .ok()?;
+            (format!("{request}.{WAITING}") == name.to_str()?).then_some(request)
+        })
+        .collect();
+    waiting.sort();
+    for request in waiting {
+        let from = directory.join(format!("{request}.{WAITING}"));
+        let to = directory.join(format!("{request}.{TAKEN}"));
+        match std::fs::rename(&from, &to) {
+            Ok(()) => {}
+            // Another starter took it first.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(IpcError::io("take", &from, error)),
+        }
+        let taken = TakenClaim {
+            claim: read_claim(&to)?,
+            path: to,
+        };
+        if taken.admits(boot, now_boot_ms) {
+            return Ok(Some(taken));
+        }
+        taken.discard()?;
+    }
+    Ok(None)
 }
 
 /// Reads one claim this host wrote.
@@ -225,7 +287,15 @@ pub struct RecordedSession {
 ///
 /// Returns an error when the record cannot be written.
 pub fn record_session(environment: &EnvironmentPaths, recorded: &RecordedSession) -> Result<()> {
-    todo!("not built yet")
+    let path = environment.session_record();
+    let bytes = kr_cbor::to_canonical_vec(recorded).map_err(|error| {
+        IpcError::io(
+            "encode",
+            &path,
+            std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()),
+        )
+    })?;
+    crate::paths::write_owner_only_file(&path, &bytes)
 }
 
 /// Reads the login session this environment's work runs in, when one is recorded.
@@ -234,7 +304,11 @@ pub fn record_session(environment: &EnvironmentPaths, recorded: &RecordedSession
 ///
 /// Returns an error when a record exists and cannot be read.
 pub fn recorded_session(environment: &EnvironmentPaths) -> Result<Option<RecordedSession>> {
-    todo!("not built yet")
+    let path = environment.session_record();
+    match crate::paths::read_owner_only_file(&path, MAX_RECORD_LEN)? {
+        Some(bytes) => decode(&path, &bytes).map(Some),
+        None => Ok(None),
+    }
 }
 
 /// Removes the record of the login session this environment's work runs in.
@@ -243,7 +317,12 @@ pub fn recorded_session(environment: &EnvironmentPaths) -> Result<Option<Recorde
 ///
 /// Returns an error when a record exists and cannot be removed.
 pub fn clear_recorded_session(environment: &EnvironmentPaths) -> Result<()> {
-    todo!("not built yet")
+    let path = environment.session_record();
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(IpcError::io("remove", &path, error)),
+    }
 }
 
 #[cfg(windows)]
@@ -349,7 +428,45 @@ mod windows {
         /// Returns the operating system's error when the instance cannot be created, and a
         /// permission error when its list is not this user's alone.
         pub fn create(endpoint: &Endpoint) -> io::Result<Self> {
-            todo!("not built yet")
+            let name = pipe_name(endpoint);
+            let descriptor = OwnedDescriptor::parse(OWNER_ONLY_PIPE)?;
+            let attributes = SECURITY_ATTRIBUTES {
+                nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(0),
+                lpSecurityDescriptor: descriptor.0,
+                bInheritHandle: 0,
+            };
+            let frame = u32::try_from(MAX_LAUNCH_FRAME).unwrap_or(u32::MAX);
+            // SAFETY: `name` is a terminated wide string and `attributes` points at a descriptor
+            // that lives until after the call. Remote clients are refused, the instance is
+            // overlapped so every wait on it has a deadline, and it is a byte stream.
+            let handle = unsafe {
+                CreateNamedPipeW(
+                    name.as_ptr(),
+                    PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                    PIPE_UNLIMITED_INSTANCES,
+                    frame,
+                    frame,
+                    0,
+                    &raw const attributes,
+                )
+            };
+            drop(descriptor);
+            if handle == INVALID_HANDLE_VALUE {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: the call above returned a new handle that nothing else owns.
+            let pipe = unsafe { OwnedHandle::from_raw_handle(handle) };
+            match crate::paths::check_access_list(pipe.as_handle(), "the launch pipe", true) {
+                Ok(()) => Ok(Self { pipe }),
+                Err(crate::paths::AccessListRefusal::Policy(detail)) => Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("the launch pipe's name is held with another list: {detail}"),
+                )),
+                Err(crate::paths::AccessListRefusal::Unreadable(detail)) => {
+                    Err(io::Error::other(detail))
+                }
+            }
         }
 
         /// Waits until `deadline` for a starter to reach this instance.
@@ -362,7 +479,25 @@ mod windows {
         ///
         /// Returns the operating system's error when the wait itself fails.
         pub fn accept(self, deadline: Instant) -> io::Result<Option<LaunchStream>> {
-            todo!("not built yet")
+            let pipe = self.pipe.as_raw_handle();
+            // SAFETY: the pipe is open for as long as `self` is, and the structure the call is
+            // given is live until `complete` has seen the operation finish or be cancelled.
+            let connected = complete(pipe, deadline, |overlapped| unsafe {
+                ConnectNamedPipe(pipe, overlapped)
+            });
+            match connected {
+                Ok(_) => {}
+                // Reached between the instance's creation and the wait, which is still a reach.
+                Err(error) if code(&error) == Some(ERROR_PIPE_CONNECTED) => {}
+                Err(error) if error.kind() == io::ErrorKind::TimedOut => return Ok(None),
+                // Reached and left again before anything was said.
+                Err(error) if code(&error) == Some(ERROR_NO_DATA) => return Ok(None),
+                Err(error) => return Err(error),
+            }
+            Ok(Some(LaunchStream {
+                pipe: self.pipe,
+                side: Side::Server,
+            }))
         }
     }
 
@@ -405,7 +540,62 @@ mod windows {
     /// Returns a permission error when the server runs as another account, and the operating
     /// system's error when the pipe cannot be opened for any other reason.
     pub fn connect(endpoint: &Endpoint, deadline: Instant) -> io::Result<Reached> {
-        todo!("not built yet")
+        let name = pipe_name(endpoint);
+        loop {
+            // SAFETY: `name` is a terminated wide string, no attributes or template are given, and
+            // the call returns a new handle or the invalid value.
+            let handle = unsafe {
+                CreateFileW(
+                    name.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                    std::ptr::null_mut(),
+                )
+            };
+            if handle != INVALID_HANDLE_VALUE {
+                // SAFETY: the call above returned a new handle that nothing else owns.
+                let stream = LaunchStream {
+                    pipe: unsafe { OwnedHandle::from_raw_handle(handle) },
+                    side: Side::Client,
+                };
+                let server = stream.peer()?;
+                if !server.same_user {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "the launch pipe is served by process {}, which runs as another \
+                             account, so nothing it offers is run",
+                            server.pid
+                        ),
+                    ));
+                }
+                return Ok(Reached::Connected(stream));
+            }
+            let error = io::Error::last_os_error();
+            match code(&error) {
+                Some(ERROR_FILE_NOT_FOUND) => return Ok(Reached::NoInstance),
+                Some(ERROR_PIPE_BUSY) => {
+                    let wait = millis_until(deadline);
+                    // A wait of zero would ask for the pipe's default, which is not a deadline.
+                    if wait == 0 {
+                        return Ok(Reached::Busy);
+                    }
+                    // SAFETY: `name` is a terminated wide string; the call only waits.
+                    if unsafe { WaitNamedPipeW(name.as_ptr(), wait) } == 0 {
+                        let error = io::Error::last_os_error();
+                        match code(&error) {
+                            Some(ERROR_SEM_TIMEOUT) => return Ok(Reached::Busy),
+                            Some(ERROR_FILE_NOT_FOUND) => return Ok(Reached::NoInstance),
+                            _ => return Err(error),
+                        }
+                    }
+                }
+                _ => return Err(error),
+            }
+        }
     }
 
     impl LaunchStream {
@@ -416,7 +606,19 @@ mod windows {
         ///
         /// Returns the operating system's error when the process cannot be named or opened.
         pub fn peer(&self) -> io::Result<PeerProcess> {
-            todo!("not built yet")
+            let mut pid = 0_u32;
+            let pipe = self.pipe.as_raw_handle();
+            // SAFETY: the pipe is open and connected, and `pid` is a live out parameter.
+            let asked = unsafe {
+                match self.side {
+                    Side::Server => GetNamedPipeClientProcessId(pipe, &raw mut pid),
+                    Side::Client => GetNamedPipeServerProcessId(pipe, &raw mut pid),
+                }
+            };
+            if asked == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            process_facts(pid)
         }
 
         /// Sends one frame, whole, by `deadline`.
@@ -426,13 +628,44 @@ mod windows {
         /// Returns an error when the payload is larger than a frame may be, when the other end has
         /// gone, or when the deadline passes first.
         pub fn send(&mut self, payload: &[u8], deadline: Instant) -> io::Result<()> {
-            todo!("not built yet")
+            let length = u32::try_from(payload.len())
+                .ok()
+                .filter(|_| payload.len() <= MAX_LAUNCH_FRAME)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "a frame larger than the launch pipe's bound",
+                    )
+                })?;
+            let mut frame = Vec::with_capacity(4 + payload.len());
+            frame.extend_from_slice(&length.to_le_bytes());
+            frame.extend_from_slice(payload);
+            self.write_all(&frame, deadline)
         }
 
         /// Writes `bytes` as they are, by `deadline`. A frame is written through this whole; a
         /// test writes a hostile head through it.
         pub(crate) fn write_all(&mut self, bytes: &[u8], deadline: Instant) -> io::Result<()> {
-            todo!("not built yet")
+            let pipe = self.pipe.as_raw_handle();
+            let mut written = 0_usize;
+            while written < bytes.len() {
+                let rest = &bytes[written..];
+                let size = u32::try_from(rest.len()).unwrap_or(u32::MAX);
+                // SAFETY: `rest` is a live buffer of `size` bytes that outlives the operation,
+                // which `complete` waits for before it returns.
+                let sent = complete(pipe, deadline, |overlapped| unsafe {
+                    WriteFile(pipe, rest.as_ptr(), size, std::ptr::null_mut(), overlapped)
+                })
+                .map_err(closed_as_eof)?;
+                if sent == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "the launch pipe took nothing",
+                    ));
+                }
+                written += usize::try_from(sent).unwrap_or(rest.len());
+            }
+            Ok(())
         }
 
         /// Receives one frame, whole, by `deadline`.
@@ -442,7 +675,18 @@ mod windows {
         /// Returns an error when the other end has gone, when the frame declares more than a frame
         /// may hold, or when the deadline passes first.
         pub fn receive(&mut self, deadline: Instant) -> io::Result<Vec<u8>> {
-            todo!("not built yet")
+            let mut head = [0_u8; 4];
+            self.read_exact(&mut head, deadline)?;
+            let length = usize::try_from(u32::from_le_bytes(head)).unwrap_or(usize::MAX);
+            if length > MAX_LAUNCH_FRAME {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("a frame of {length} bytes, over the launch pipe's bound"),
+                ));
+            }
+            let mut payload = vec![0_u8; length];
+            self.read_exact(&mut payload, deadline)?;
+            Ok(payload)
         }
 
         fn read_exact(&mut self, buffer: &mut [u8], deadline: Instant) -> io::Result<()> {
@@ -502,7 +746,16 @@ mod windows {
     ///
     /// Returns the operating system's error when the process cannot be opened or its token read.
     pub fn process_facts(pid: u32) -> io::Result<PeerProcess> {
-        todo!("not built yet")
+        let process = open_process(pid)?;
+        let image = image_of(&process)?;
+        let token = Token::of(process.as_raw_handle())?;
+        let own = Token::of(current_process())?;
+        Ok(PeerProcess {
+            pid,
+            image,
+            session: token.session()?,
+            same_user: token.same_user_as(&own)?,
+        })
     }
 
     /// Returns the login session this process runs in.
@@ -511,7 +764,7 @@ mod windows {
     ///
     /// Returns the operating system's error when this process's token cannot be read.
     pub fn current_session() -> io::Result<u32> {
-        todo!("not built yet")
+        Token::of(current_process())?.session()
     }
 
     /// What a starter is asked to run.
@@ -575,7 +828,122 @@ mod windows {
     /// Returns a [`ChildRefusal`] naming what was wrong. Its `remaining_pid` is set only when a
     /// refused child could not be ended, which is the one case where something may still exist.
     pub fn start_child(command: &ChildCommand<'_>) -> Result<StartedChild, ChildRefusal> {
-        todo!("not built yet")
+        let flags = crate::paths::current_job_limit_flags().map_err(|error| {
+            ChildRefusal::nothing_created(format!(
+                "this starter could not read the job it runs in, so it cannot tell whether a \
+                 process it starts would be ended with it: {error}"
+            ))
+        })?;
+        let plan = job_plan(flags);
+        if plan == JobPlan::Refuse {
+            return Err(ChildRefusal::nothing_created(format!(
+                "this starter runs inside a job that ends its members when it closes and does not \
+                 let them leave (limit flags {:#x}), so a process started here would end with the \
+                 starter; nothing was started",
+                flags.unwrap_or(0)
+            )));
+        }
+        let mut creation = CREATE_SUSPENDED
+            | CREATE_NEW_PROCESS_GROUP
+            | DETACHED_PROCESS
+            | CREATE_UNICODE_ENVIRONMENT;
+        if plan == JobPlan::BreakAway {
+            creation |= CREATE_BREAKAWAY_FROM_JOB;
+        }
+        let application = wide(command.application.as_os_str());
+        let mut line: Vec<u16> = command
+            .command_line
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let directory = wide(command.directory.as_os_str());
+        let block = environment_block(command.environment);
+        // SAFETY: all-zero is the documented initial state of both structures; the size field of
+        // the first is set next.
+        let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
+        startup.cb = u32::try_from(std::mem::size_of::<STARTUPINFOW>()).unwrap_or(0);
+        let mut created: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: every string is terminated and outlives the call, the command line is a mutable
+        // buffer as the call requires, the environment is either absent or a terminated block of
+        // wide strings, no handle is inherited, and `created` is a live out parameter.
+        let ok = unsafe {
+            CreateProcessW(
+                application.as_ptr(),
+                line.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                creation,
+                block
+                    .as_ref()
+                    .map_or(std::ptr::null(), |block| block.as_ptr().cast()),
+                directory.as_ptr(),
+                &raw const startup,
+                &raw mut created,
+            )
+        };
+        if ok == 0 {
+            let error = io::Error::last_os_error();
+            let detail = if plan == JobPlan::BreakAway && code(&error) == Some(ERROR_ACCESS_DENIED)
+            {
+                format!(
+                    "a job above this starter's own does not let a process leave it, so {} was \
+                     not started: {error}",
+                    command.application.display()
+                )
+            } else {
+                format!("start {}: {error}", command.application.display())
+            };
+            return Err(ChildRefusal::nothing_created(detail));
+        }
+        // SAFETY: the call above returned two new handles that nothing else owns.
+        let child = Suspended {
+            process: unsafe { OwnedHandle::from_raw_handle(created.hProcess) },
+            thread: unsafe { OwnedHandle::from_raw_handle(created.hThread) },
+            pid: created.dwProcessId,
+        };
+        let in_job = match child.in_any_job() {
+            Ok(in_job) => in_job,
+            Err(error) => {
+                return Err(child.end(format!(
+                    "whether the new process is in a job could not be read, so it was ended: \
+                     {error}"
+                )));
+            }
+        };
+        if in_job && plan != JobPlan::StayInJob {
+            return Err(child.end(
+                "the new process is still inside a job after it was started outside this \
+                 starter's own: a job above does not let it leave, so it was ended rather than \
+                 run there"
+                    .to_owned(),
+            ));
+        }
+        let session = match child.session() {
+            Ok(session) => session,
+            Err(error) => {
+                return Err(child.end(format!(
+                    "the new process's login session could not be read, so it was ended: {error}"
+                )));
+            }
+        };
+        if session != command.session {
+            return Err(child.end(format!(
+                "the new process is in login session {session}, not {}, the daemon's; it was \
+                 ended rather than run in a session whose sign-out would not be the daemon's",
+                command.session
+            )));
+        }
+        let identity = match child.identity() {
+            Ok(identity) => identity,
+            Err(detail) => return Err(child.end(detail)),
+        };
+        child.resume()?;
+        Ok(StartedChild {
+            identity,
+            session,
+            in_job,
+        })
     }
 
     /// A child created suspended, with both of its handles.
@@ -733,7 +1101,36 @@ mod windows {
         ///
         /// Returns the operating system's error when the job cannot be created or limited.
         pub fn create(limit_flags: u32) -> io::Result<Self> {
-            todo!("not built yet")
+            use windows_sys::Win32::System::JobObjects::{
+                CreateJobObjectW, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                JobObjectExtendedLimitInformation, SetInformationJobObject,
+            };
+
+            // SAFETY: no attributes and no name; the call returns a new handle or null.
+            let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if handle.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: the call above returned a new handle that nothing else owns.
+            let job = Self(unsafe { OwnedHandle::from_raw_handle(handle) });
+            // SAFETY: all-zero is the structure's documented initial state.
+            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+            limits.BasicLimitInformation.LimitFlags = limit_flags;
+            let size = u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+                .unwrap_or(0);
+            // SAFETY: the job is open, and `limits` is a live structure of the size given.
+            let set = unsafe {
+                SetInformationJobObject(
+                    job.0.as_raw_handle(),
+                    JobObjectExtendedLimitInformation,
+                    (&raw const limits).cast(),
+                    size,
+                )
+            };
+            if set == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(job)
         }
 
         /// Puts `process` in this job, nested beneath whatever job it is already in.
@@ -742,7 +1139,16 @@ mod windows {
         ///
         /// Returns the operating system's error when the process cannot be assigned.
         pub fn assign(&self, process: BorrowedHandle<'_>) -> io::Result<()> {
-            todo!("not built yet")
+            use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+
+            // SAFETY: both handles are open for the length of the call.
+            let assigned = unsafe {
+                AssignProcessToJobObject(self.0.as_raw_handle(), process.as_raw_handle())
+            };
+            if assigned == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
         }
     }
 
@@ -1298,8 +1704,9 @@ mod tests {
             let endpoint = endpoint();
             let first = LaunchListener::create(&endpoint).expect("an instance");
             let second = LaunchListener::create(&endpoint).expect("a second instance");
-            let starters: Vec<_> = [b'a', b'b']
-                .into_iter()
+            let starters: Vec<_> = b"ab"
+                .iter()
+                .copied()
                 .map(|mark| {
                     let endpoint = endpoint.clone();
                     std::thread::spawn(move || {
@@ -1490,10 +1897,12 @@ mod tests {
             writeln!(helper.stdin.take().expect("the helper's input"), "go")
                 .expect("the word is given");
             let output = std::io::BufReader::new(helper.stdout.take().expect("its output"));
+            // The test harness prints a test's name before running it, so the helper's line may
+            // follow the name on the same line of output.
             let reported = output
                 .lines()
                 .map_while(std::result::Result::ok)
-                .find(|line| line.starts_with("result "))
+                .find_map(|line| line.find("result ").map(|at| line[at..].to_owned()))
                 .unwrap_or_default();
             let status = helper.wait().expect("the helper ends");
             assert!(status.success(), "the helper ran cleanly: {status:?}");
@@ -1501,9 +1910,9 @@ mod tests {
         }
 
         /// The nesting a breakaway decision cannot see through: a starter whose own job permits
-        /// breakaway, under a job that
-        /// kills on close and does not, asks for its child to leave; the child leaves the inner
-        /// job only, is still inside the outer one, and is ended rather than run there.
+        /// breakaway, under a job that kills on close and does not, asks for its child to leave;
+        /// the child leaves the inner job only, is still inside the outer one, and is ended rather
+        /// than run there.
         #[test]
         fn a_child_a_job_above_will_not_let_go_is_ended_and_refused() {
             let (reported, _jobs) = starter_in("nested", &[KILL_ON_JOB_CLOSE, BREAKAWAY_OK]);
