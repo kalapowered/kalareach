@@ -130,7 +130,7 @@ impl<'r> Host<'r> {
         let child = command.spawn().expect("the daemon starts");
         let identity = self
             .run
-            .record_pid(child.id(), "the control daemon")
+            .record_child(child.id(), "the control daemon")
             .unwrap_or_else(|| panic!("the daemon ended at once: {}", self.daemon_said()));
         *self.daemon.lock().unwrap_or_else(PoisonError::into_inner) =
             Some(Daemon { child, identity });
@@ -214,22 +214,23 @@ impl<'r> Host<'r> {
     /// The registry is where the host itself keeps each worker's identity, and it is readable
     /// whether or not the daemon still answers. So a leg that stops part way still reaches the
     /// sessions it made, their shells and what runs in them, through the record rather than by a
-    /// name. A search that cannot finish is tried again within [`DISCOVERY`], and one that still
-    /// cannot is kept with the run, whose closing check then fails rather than report a search
-    /// that did not finish.
+    /// name. A search that does not finish is kept with the run, whose closing check then fails
+    /// rather than report a search that did not finish, and it is tried again within
+    /// [`DISCOVERY`] so that the run can still end what a later search finds. A later search that
+    /// finishes does not clear the earlier failure: what the earlier one missed may since have
+    /// left the tree it searched.
     pub fn record_workers(&self) {
         let started = Instant::now();
         loop {
             match self.discover_workers() {
-                Ok(()) => {
-                    self.run.discovered();
-                    return;
-                }
-                Err(why) if started.elapsed() >= DISCOVERY => {
+                Ok(()) => return,
+                Err(why) => {
                     self.run.undiscovered(&why);
-                    return;
+                    if started.elapsed() >= DISCOVERY {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
                 }
-                Err(_) => std::thread::sleep(Duration::from_millis(250)),
             }
         }
     }

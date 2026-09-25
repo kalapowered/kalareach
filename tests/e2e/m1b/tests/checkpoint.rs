@@ -27,6 +27,10 @@ const PROBE: Duration = Duration::from_secs(5);
 /// asked.
 const RELEASE_WAIT: Duration = Duration::from_secs(40);
 
+/// What the command line of an agent's tool server holds: `kr agent-tools`, which the agent starts
+/// as its own child.
+const TOOLS: &str = "agent-tools";
+
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -441,18 +445,20 @@ fn check<'a>(document: &'a serde_json::Value, id: &str) -> Option<&'a serde_json
     }
 }
 
-/// The identity of the worker process that serves `session_id`, as the process table names it.
+/// The identity of the worker process that serves `session_id`: the process running this run's
+/// copy of `kr-worker` for that session, recorded only while its start holds the number the
+/// process table gave.
 fn worker_of(run: &Run, session_id: &str) -> kr_protocol::identity::ProcessStartIdentity {
     let started = std::time::Instant::now();
+    let session = format!("--session {session_id}");
     loop {
-        if let Some((pid, _)) = kr_e2e_m1b::run::processes_under(run.root())
+        if let Some(identity) = kr_e2e_m1b::run::processes_under(run.root())
             .unwrap_or_default()
             .into_iter()
-            .find(|(_, command)| {
-                command.contains("kr-worker")
-                    && command.contains(&format!("--session {session_id}"))
+            .filter(|(_, command)| command.contains("kr-worker") && command.contains(&session))
+            .find_map(|(pid, _)| {
+                run.record_named(pid, "the session's worker", &["kr-worker", &session])
             })
-            && let Some(identity) = run.record_pid(pid, "the session's worker")
         {
             return identity;
         }
@@ -464,15 +470,17 @@ fn worker_of(run: &Run, session_id: &str) -> kr_protocol::identity::ProcessStart
     }
 }
 
-/// Waits until `read` answers with a process identifier, and records that process.
+/// Waits until `read` answers with a process identifier, and records that process once its
+/// command line names this run's directory and holds every one of `marks`.
 fn recorded(
     run: &Run,
     what: &str,
+    marks: &[&str],
     read: impl Fn() -> Option<u32>,
 ) -> kr_protocol::identity::ProcessStartIdentity {
     let started = std::time::Instant::now();
     loop {
-        if let Some(identity) = read().and_then(|pid| run.record_pid(pid, what)) {
+        if let Some(identity) = read().and_then(|pid| run.record_named(pid, what, marks)) {
             return identity;
         }
         assert!(
@@ -678,8 +686,11 @@ fn a_device_uses_an_agent_in_a_managed_shell_and_reattaches_to_the_screen_kr_att
     // Launch an agent, as a person does, by typing its name at the prompt.
     local.type_text(first.command_line("first").as_bytes());
     let _ = local.wait_for_screen(ASKED, "the first agent asks its question");
-    let first_agent = recorded(&run, "the first agent", || first.pid());
-    let first_tools = recorded(&run, "the first agent's tool server", || first.tools_pid());
+    let first_program = first.program().display().to_string();
+    let first_agent = recorded(&run, "the first agent", &[&first_program], || first.pid());
+    let first_tools = recorded(&run, "the first agent's tool server", &[TOOLS], || {
+        first.tools_pid()
+    });
 
     // Use it remotely: the device attaches over iroh and is drawn the session's screen.
     let snapshot: EventsSnapshotResult = runtime
@@ -902,8 +913,11 @@ fn a_device_uses_an_agent_in_a_managed_shell_and_reattaches_to_the_screen_kr_att
     let _ = runtime
         .block_on(view.type_text(&remote, &second.command_line("second")))
         .unwrap_or_else(|why| panic!("{why}"));
-    let second_agent = recorded(&run, "the second agent", || second.pid());
-    let second_tools = recorded(&run, "the second agent's tool server", || {
+    let second_program = second.program().display().to_string();
+    let second_agent = recorded(&run, "the second agent", &[&second_program], || {
+        second.pid()
+    });
+    let second_tools = recorded(&run, "the second agent's tool server", &[TOOLS], || {
         second.tools_pid()
     });
     let started = std::time::Instant::now();
@@ -1272,14 +1286,11 @@ fn the_installed_package_is_bound_into_the_session_and_acts_through_its_broker()
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    let _ = run.record_pid(
-        agent.pid().expect("the application's process"),
-        "the application",
-    );
-    let _ = run.record_pid(
-        agent.tools_pid().expect("its tool server's process"),
-        "the application's tool server",
-    );
+    let program = agent.program().display().to_string();
+    let _ = recorded(&run, "the application", &[&program], || agent.pid());
+    let _ = recorded(&run, "the application's tool server", &[TOOLS], || {
+        agent.tools_pid()
+    });
 
     // The package is active in the running session's worker.
     let started = std::time::Instant::now();

@@ -132,7 +132,7 @@ impl Window {
             .spawn_command(command)
             .unwrap_or_else(|error| panic!("{what} could not start: {error}"));
         if let Some(pid) = child.process_id() {
-            run.record_pid(pid, what);
+            run.record_child(pid, what);
         }
         let collected = Collected::collect(pair.master.try_clone_reader().expect("a reader"));
         let keys = Arc::new(Mutex::new(pair.master.take_writer().expect("a writer")));

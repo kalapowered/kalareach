@@ -8,17 +8,28 @@
 //! here too.
 //!
 //! A process is recorded by its start identity, never by its number alone: a number comes round
-//! again, and a run that signalled a number it stored earlier could end somebody else's work. The
-//! closing check asks three questions of the operating system, and a run that leaves anything
-//! behind fails on it: whether any recorded process still runs, whether any process at all still
-//! runs out of this run's directory, and whether the service manager still holds a job this run's
-//! daemon defined.
+//! again, and a run that signalled a number it stored earlier could end somebody else's work. So a
+//! number becomes a record in one of three ways only. A child this process started is recorded
+//! before it is reaped, while its number cannot pass to anyone else ([`Run::record_child`]). A
+//! number learned from a listing or a file is recorded only when, read while one start holds it,
+//! the process is beneath a process this run recorded ([`Run::record_descendants`]) or its command
+//! line names this run's directory, which is new for every run ([`Run::record_named`]). A worker's
+//! identity comes whole from the host's own registry.
+//!
+//! The closing check asks four questions, and a run that leaves anything behind fails on it:
+//! whether any recorded process still runs, whether any process at all still runs out of this
+//! run's directory, whether the service manager still holds a job this run's daemon defined, and
+//! whether every search for the processes a leg's host started finished. A search that did not
+//! finish fails the check for good: a later one that finished cannot show what the earlier one
+//! missed.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use kr_ipc::identity::{ProcessState, process_start_identity, process_state};
+use kr_ipc::identity::{
+    ProcessQuery, ProcessState, process_start_identity, process_state, query_process,
+};
 use kr_protocol::identity::ProcessStartIdentity;
 
 /// The binaries a leg launches, by the name each is built and copied under.
@@ -47,10 +58,10 @@ pub struct Run {
     leg: String,
     root: PathBuf,
     owned: Mutex<Vec<Owned>>,
-    /// Why finding the processes a leg's host started could not be completed, when it could not.
+    /// Why a search for the processes a leg's host started did not finish, once for each reason.
     ///
     /// A closing check that did not look for everything has not shown that nothing is left, so
-    /// while this holds anything the check fails.
+    /// while this holds anything the check fails. Nothing clears it.
     undiscovered: Mutex<Vec<String>>,
     /// Set once the closing check has passed, so the directory can go.
     passed: Mutex<bool>,
@@ -149,9 +160,41 @@ impl Run {
         });
     }
 
-    /// Records a process by the number it has now, when the kernel still describes it.
-    pub fn record_pid(&self, pid: u32, what: &str) -> Option<ProcessStartIdentity> {
+    /// Records a child this process started, by the number its spawn returned.
+    ///
+    /// Only for a child that has not been reaped: until it is, its number cannot pass to another
+    /// process, so the start identity read now is the child's.
+    pub fn record_child(&self, pid: u32, what: &str) -> Option<ProcessStartIdentity> {
         let identity = process_start_identity(pid).ok()?;
+        self.record(identity.clone(), what);
+        Some(identity)
+    }
+
+    /// Records the process that has the number `pid` now, when its command line names this run's
+    /// directory and holds every one of `marks`; returns nothing otherwise, and when the kernel does
+    /// not say.
+    ///
+    /// For a number learned from a process listing or a file, which can pass to another process
+    /// before it is recorded. The start identity is read first and the command line after it, while
+    /// that start still holds the number, so the command line is that start's. Only this run's
+    /// processes name its directory, which is new for every run, and `marks` tell its processes
+    /// apart.
+    pub fn record_named(
+        &self,
+        pid: u32,
+        what: &str,
+        marks: &[&str],
+    ) -> Option<ProcessStartIdentity> {
+        let ProcessQuery::Present(identity) = query_process(pid) else {
+            return None;
+        };
+        let described = describe(&identity).ok()??;
+        let root = self.root.display().to_string();
+        if !described.command.contains(&root)
+            || !marks.iter().all(|mark| described.command.contains(mark))
+        {
+            return None;
+        }
         self.record(identity.clone(), what);
         Some(identity)
     }
@@ -288,14 +331,18 @@ impl Run {
     /// them this run's is their place in the process table, below a process this run recorded.
     ///
     /// A number the table lists can pass to another process before it is recorded, so each one is
-    /// checked where it is recorded: its start identity is read, then its parent is read again, then
-    /// the identity is read once more. Only a process that is the same start across the parent read,
-    /// whose parent is then the process recorded above it and still that process, is recorded.
+    /// checked where it is recorded: its start identity is read, then its parent and command line
+    /// while that start holds the number, and then the process recorded above it must still be
+    /// running, so it was the parent that was read. A process is passed over only when the kernel
+    /// says it has ended; an answer the kernel or `ps` did not give ends the search with an error.
+    /// A process whose parent ends while the search runs is passed over with it: it is no longer
+    /// beneath anything this run recorded, and the closing check finds it only if its command line
+    /// names this run's directory.
     ///
     /// # Errors
     ///
-    /// Returns why the process table could not be read. The failure is kept with the run too, so
-    /// its closing check does not pass on a search that did not finish.
+    /// Returns why the search did not finish. The failure is kept with the run too, so its closing
+    /// check does not pass on a search that did not finish.
     pub fn record_descendants(
         &self,
         ancestor: &ProcessStartIdentity,
@@ -309,47 +356,48 @@ impl Run {
     }
 
     fn descend(&self, ancestor: &ProcessStartIdentity, what: &str) -> Result<(), String> {
-        if !running(ancestor) {
+        if !still_running(ancestor, what)? {
             return Ok(());
         }
         let table = process_table()?;
         let mut under = vec![ancestor.clone()];
         while let Some(parent) = under.pop() {
-            let parent_pid = u32::try_from(parent.pid.get()).unwrap_or(0);
+            let parent_pid = u32::try_from(parent.pid.get())
+                .map_err(|_| format!("process {} has no number ps lists", parent.pid.get()))?;
             for entry in table.iter().filter(|entry| entry.parent == parent_pid) {
-                let Ok(identity) = process_start_identity(entry.pid) else {
-                    // It has gone since the table was read.
+                let identity = match query_process(entry.pid) {
+                    ProcessQuery::Present(identity) => identity,
+                    // It has ended since the table was read.
+                    ProcessQuery::Gone => continue,
+                    ProcessQuery::CannotEstablish(error) => {
+                        return Err(format!(
+                            "process {} beneath {what} could not be identified: {error}",
+                            entry.pid
+                        ));
+                    }
+                };
+                let Some(described) = describe(&identity)? else {
                     continue;
                 };
-                let Some(parent_now) = parent_of(entry.pid)? else {
-                    continue;
-                };
-                let same = matches!(process_state(&identity), ProcessState::Running);
-                let parent_same = matches!(process_state(&parent), ProcessState::Running);
-                if !(same && parent_same && parent_now == parent_pid) {
+                if described.parent != parent_pid || !still_running(&parent, what)? {
                     continue;
                 }
-                self.record(identity.clone(), &format!("{what}: {}", entry.command));
+                self.record(identity.clone(), &format!("{what}: {}", described.command));
                 under.push(identity);
             }
         }
         Ok(())
     }
 
-    /// Keeps why finding a leg's processes could not be completed, which fails the closing check.
+    /// Keeps why a search for a leg's processes did not finish, which fails the closing check.
     pub fn undiscovered(&self, why: &str) {
-        self.undiscovered
+        let mut reasons = self
+            .undiscovered
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(why.to_owned());
-    }
-
-    /// Forgets the reasons earlier searches did not finish, once a later one has.
-    pub fn discovered(&self) {
-        self.undiscovered
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
+            .unwrap_or_else(PoisonError::into_inner);
+        if !reasons.iter().any(|reason| reason == why) {
+            reasons.push(why.to_owned());
+        }
     }
 
     /// The labels of every job definition this run's daemon wrote.
@@ -487,27 +535,68 @@ pub fn process_table() -> Result<Vec<Entry>, String> {
         .collect())
 }
 
-/// The parent of one process, read now, or `None` when there is no such process any more.
+/// What `ps` says about one process: its parent and its command line.
+#[derive(Clone, Debug)]
+pub struct Described {
+    /// The parent's number.
+    pub parent: u32,
+    /// The command line.
+    pub command: String,
+}
+
+/// The parent and the command line of the process `identity` names, read while that start holds
+/// its number, or `None` once the kernel says it has ended.
+///
+/// The start identity is checked again after `ps` has answered: a process that ran before and
+/// after the answer held its number throughout, so the answer is that process's. A `ps` that named
+/// nothing is read as an ended process only when that check says so.
 ///
 /// # Errors
 ///
-/// Returns why `ps` could not answer.
-pub fn parent_of(pid: u32) -> Result<Option<u32>, String> {
+/// Returns why neither answer is established: `ps` did not answer or failed for a process that
+/// runs, or the kernel would not say whether the process runs.
+pub fn describe(identity: &ProcessStartIdentity) -> Result<Option<Described>, String> {
+    let pid = identity.pid.get();
     let mut ps = std::process::Command::new("/bin/ps");
-    ps.args(["-o", "ppid=", "-p", &pid.to_string()])
+    ps.args(["-ww", "-o", "ppid=,command=", "-p", &pid.to_string()])
         .env_clear()
         .env("PATH", "/usr/bin:/bin");
     let output = output_within(ps, SERVICE_MANAGER_BOUND)
-        .map_err(|why| format!("the parent of process {pid} could not be read: ps {why}"))?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    let text = text.trim();
-    if !output.status.success() && text.is_empty() {
-        // `ps -p` answers a process that is not there with nothing and a failure.
+        .map_err(|why| format!("process {pid} could not be described: ps {why}"))?;
+    if !still_running(identity, &format!("process {pid}"))? {
         return Ok(None);
     }
-    text.parse()
-        .map(Some)
-        .map_err(|_| format!("ps named no parent for process {pid}: {text:?}"))
+    if !output.status.success() {
+        return Err(format!(
+            "ps did not describe process {pid}, which runs: it ended with {}",
+            output.status
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let text = text.trim();
+    let (parent, command) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+    let parent = parent
+        .parse()
+        .map_err(|_| format!("ps named no parent for process {pid}: {text:?}"))?;
+    Ok(Some(Described {
+        parent,
+        command: command.trim().to_owned(),
+    }))
+}
+
+/// Whether a recorded process still runs, as the kernel says: `false` once it has ended.
+///
+/// # Errors
+///
+/// Returns why the kernel's answer is not established, naming the process as `what`.
+fn still_running(identity: &ProcessStartIdentity, what: &str) -> Result<bool, String> {
+    match process_state(identity) {
+        ProcessState::Running => Ok(true),
+        ProcessState::Ended => Ok(false),
+        ProcessState::Unknown { detail } => Err(format!(
+            "whether {what} still runs is not established: {detail}"
+        )),
+    }
 }
 
 /// Every process whose command line names `root`, other than this one.
