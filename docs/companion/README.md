@@ -41,7 +41,9 @@ prompt generation than the view has heard since, its buttons start disabled.
 
 Nothing claims contact, or its loss, before an answer says which. Until the first answer the
 desktop's bar and the phone's say they are checking the connection, with no status dot, and a phone
-session opened from a notification shows no banner about the host.
+session opened from a notification shows no banner about the host. A reason for a lost connection
+that is empty or only spaces is no reason: the page takes it in as none, so both bars say they are
+not in contact, and setup warns that no host is answering and that no reason was given.
 
 Each raw terminal view, on the desktop and on the phone, reads the session's snapshot and says how
 the host presents it: the session's output directly, or a viewport with the host's reason in the

@@ -197,7 +197,9 @@ export function Setup(): ReactNode {
     return {
       identity: who,
       capabilities: what,
-      failure: what ? null : (state.reason ?? 'There is no host on this machine yet.')
+      // A loss with no reason says only that: no host answered, and nothing said why. It is not
+      // a claim that this machine has no host.
+      failure: what ? null : (state.reason ?? 'No reason was given.')
     }
   }, [port])
 
@@ -314,7 +316,7 @@ export function Setup(): ReactNode {
         ))}
       </ol>
 
-      {failure && step !== 0 ? (
+      {failure !== null && step !== 0 ? (
         <Banner
           tone="warning"
           title="No host is answering on this machine"

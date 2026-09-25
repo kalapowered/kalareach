@@ -63,8 +63,23 @@ export interface ConnectionState {
   readonly connected: boolean
   /** The environment the connection belongs to, when there is one. */
   readonly environment_id: string | null
-  /** Why there is no connection, in plain words, when there is none. */
+  /**
+   * Why there is no connection, in plain words, when there is none. Never blank: a reason that is
+   * empty or only spaces says nothing, so the page takes it in as null (`receivedConnection`), and a
+   * reader's own words for a loss with no reason show in its place.
+   */
   readonly reason: string | null
+}
+
+/**
+ * A connection state as the page takes it in: a blank reason is no reason.
+ *
+ * Every state a port hands the page, read or heard, passes through here, so a reader tells a
+ * reason from its absence by null alone. A reason with words is kept exactly as it was sent.
+ */
+export function receivedConnection(sent: ConnectionState): ConnectionState {
+  const words = sent.reason?.trim() ?? ''
+  return { ...sent, reason: words.length > 0 ? sent.reason : null }
 }
 
 /* ---- First-start setup ------------------------------------------------------------------------

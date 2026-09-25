@@ -62,6 +62,7 @@ import type {
   VoiceStartRequest,
   Written
 } from './port'
+import { receivedConnection } from './port'
 import { codeComplete } from '../pairing/words'
 import { terminalAttachment } from '../terminal/modes'
 
@@ -75,6 +76,9 @@ const SESSION_OFFLINE = '8a7b6c50-22bb-4c3d-8e4f-000000000103'
 
 /** The moment every timestamp in this host is measured from, so a run is reproducible. */
 export const FAKE_NOW_MS = 1_763_000_000_000
+
+/** What native code says when this host cannot be reached, unless a test gives other words. */
+const UNREACHABLE = 'this host cannot be contacted right now'
 
 /** A failure shaped the way a command's failure arrives. */
 export class FakeHostError extends Error {
@@ -194,8 +198,12 @@ export interface FakeHostControls {
   appendNode(node: DocumentNode, sessionId?: string): void
   /** Moves the prompt generation on, which disables the launch buttons. */
   changePromptGeneration(): void
-  /** Marks the host as unreachable, or reachable again, and says so as native code does. */
-  setConnected(connected: boolean): void
+  /**
+   * Marks the host as unreachable, or reachable again, and says so as native code does. `reason`
+   * is native code's words for the loss, which can be blank; without it, the host cannot be
+   * contacted right now.
+   */
+  setConnected(connected: boolean, reason?: string): void
   /**
    * Holds every answer to `read` from now on, as a slow backend would, until the test answers it.
    * Each answer is what the host held when the read was made, a refusal included, so a test can
@@ -336,6 +344,8 @@ export interface HeldReads {
 /** The fake host, and the controls a test drives it with. */
 export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
   let connected = true
+  /** Native code's words for the loss of the connection, while it is lost. */
+  let lostBecause = UNREACHABLE
   let promptGeneration = 7
   let bufferRevision = 12
   let pairing: PairingView = {
@@ -446,11 +456,13 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
   const emit = (event: HostEvent) => {
     for (const listener of listeners) listener(event)
   }
-  const connectionNow = (): ConnectionState => ({
-    connected,
-    environment_id: connected ? ENVIRONMENT : null,
-    reason: connected ? null : 'this host cannot be contacted right now'
-  })
+  // What native code says, taken in the way the desktop port takes it in: a blank reason is none.
+  const connectionNow = (): ConnectionState =>
+    receivedConnection({
+      connected,
+      environment_id: connected ? ENVIRONMENT : null,
+      reason: connected ? null : lostBecause
+    })
   const connectionListeners = new Set<(state: ConnectionState) => void>()
 
   /** The answers each held kind of read is waiting to give, in the order the reads were made. */
@@ -1156,8 +1168,9 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
         body: { kind: 'prompt_generation', prompt_generation: String(promptGeneration) }
       })
     },
-    setConnected(next) {
+    setConnected(next, reason = UNREACHABLE) {
       connected = next
+      lostBecause = reason
       for (const listener of connectionListeners) listener(connectionNow())
     },
     hold(read) {

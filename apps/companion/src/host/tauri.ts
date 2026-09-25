@@ -38,6 +38,7 @@ import type {
   VoiceClosure,
   Written
 } from './port'
+import { receivedConnection } from './port'
 
 /** The event the backend publishes each host notification on. */
 export const HOST_EVENT = 'kr://event'
@@ -108,8 +109,13 @@ export function tauriPort(): HostPort {
     call<T>(command, { params, subject })
 
   return {
-    connectionState: () => call<ConnectionState>('connection_state', {}),
-    onConnection: (listener) => listening<ConnectionState>(CONNECTION_EVENT, listener),
+    // Native code's reason can arrive blank; it is taken in as none, from a read and a change alike.
+    connectionState: () =>
+      call<ConnectionState>('connection_state', {}).then(receivedConnection),
+    onConnection: (listener) =>
+      listening<ConnectionState>(CONNECTION_EVENT, (state) => {
+        listener(receivedConnection(state))
+      }),
 
     hostInfo: () => call('host_info', {}),
     environmentList: () => call('environment_list', {}),
