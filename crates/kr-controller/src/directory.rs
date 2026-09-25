@@ -8,6 +8,10 @@
 //! spawned from. It might be stale, or it might have been planted; the daemon cannot tell and does
 //! not need to, because either way it is not a session.
 //!
+//! Beside each worker is what it last said about its session. A worker that has finished its
+//! closure stops answering before the kernel says its process has ended, and in between that is
+//! what the daemon knows of the session.
+//!
 //! Nothing here kills a worker. A daemon restart is not a reason to end a shell.
 
 use std::collections::BTreeMap;
@@ -18,6 +22,8 @@ use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::identity::BootIdentity;
 use kr_protocol::ids::{BuildId, ControllerGeneration, SessionId};
 use kr_protocol::local::LocalClientKind;
+use kr_protocol::scalars::Nullable;
+use kr_protocol::session::{SessionReadResult, SessionState};
 use kr_protocol::worker::WorkerDescriptor;
 
 use crate::error::Result;
@@ -47,6 +53,15 @@ pub struct Quarantined {
     pub reason: String,
 }
 
+/// What one worker last said about its session.
+#[derive(Debug, Default)]
+struct Heard {
+    /// The worker's last answer to a read, where one has reached this daemon since it started.
+    read: Option<SessionReadResult>,
+    /// Whether the worker accepted a close this daemon passed to it.
+    closing: bool,
+}
+
 /// The result of rebuilding the directory.
 #[derive(Debug, Default)]
 pub struct Directory {
@@ -54,6 +69,9 @@ pub struct Directory {
     pub verified: BTreeMap<SessionId, KnownWorker>,
     /// Descriptors that did not, which are never spawned from.
     pub quarantined: Vec<Quarantined>,
+    /// What each verified worker last said. An entry goes with its worker, so what a worker said
+    /// is never kept past the closure that took it out of the directory.
+    heard: BTreeMap<SessionId, Heard>,
 }
 
 impl Directory {
@@ -130,14 +148,61 @@ impl Directory {
         self.verified.insert(worker.descriptor.session_id, worker);
     }
 
-    /// Removes a worker whose session has closed.
+    /// Removes a worker whose session has closed, and what it last said.
     pub fn remove(&mut self, session_id: SessionId) {
         self.verified.remove(&session_id);
+        self.heard.remove(&session_id);
     }
 
     /// Returns every verified worker.
     pub fn iter(&self) -> impl Iterator<Item = &KnownWorker> {
         self.verified.values()
+    }
+
+    /// Keeps what a worker in the directory has just said about its session.
+    ///
+    /// A worker that has left the directory had its closure recorded while it was being asked,
+    /// and the record is the answer from then on, so what it said is not kept.
+    pub fn heard(&mut self, session_id: SessionId, read: &SessionReadResult) {
+        if self.verified.contains_key(&session_id) {
+            self.heard.entry(session_id).or_default().read = Some(read.clone());
+        }
+    }
+
+    /// Notes that a worker in the directory accepted a close this daemon passed to it.
+    pub fn accepted_close(&mut self, session_id: SessionId) {
+        if self.verified.contains_key(&session_id) {
+            self.heard.entry(session_id).or_default().closing = true;
+        }
+    }
+
+    /// Describes a session whose worker has stopped answering, where its end is under way.
+    ///
+    /// A worker that has finished its closure stops answering before the kernel says its process
+    /// has ended, and until then no closure can be recorded. The session is what its worker last
+    /// said it was, and `closing` where the worker had not said so but had accepted a close this
+    /// daemon passed to it: the closure is this daemon's to record once the kernel says the worker
+    /// has gone. The endpoint, the launch profile and the launches waiting on it are left out,
+    /// because they are how a client reaches a worker that no longer answers.
+    ///
+    /// Nothing is described where no end is under way, or where the worker has not answered this
+    /// daemon since it started. That is a worker this daemon cannot reach, and nothing here says
+    /// what its session is now.
+    #[must_use]
+    pub fn ending(&self, session_id: SessionId) -> Option<SessionReadResult> {
+        let heard = self.heard.get(&session_id)?;
+        let mut read = heard.read.clone()?;
+        match read.session.state {
+            SessionState::Closing | SessionState::Closed => {}
+            SessionState::Creating | SessionState::Live if heard.closing => {
+                read.session.state = SessionState::Closing;
+            }
+            SessionState::Creating | SessionState::Live => return None,
+        }
+        read.endpoint = Nullable::null();
+        read.launch_profile = Nullable::null();
+        read.outstanding_launches = Nullable::null();
+        Some(read)
     }
 }
 
