@@ -357,14 +357,33 @@ impl InstalledConnector {
 /// against.
 pub const DECISION_SCHEMA: &str = "kalareach.decision/1";
 
+/// Returns the projection schema a component's decoded request is written against.
+///
+/// It is the plugin contract's own, named for the WIT version this build speaks
+/// (`kalareach.plugin.decoded-request/<WIT version>`): the worker writes it when it converts what a
+/// component decoded, and a component cannot choose it.
+#[must_use]
+pub fn component_schema() -> String {
+    format!(
+        "kalareach.plugin.decoded-request/{}",
+        kr_plugin_sdk::version::WIT_VERSION
+    )
+}
+
 /// Returns the decoding trust an installation's grants give its connector's package, where they
 /// give any.
 ///
-/// The trust is derived from what the installation was granted and never from what the package
-/// declares: none unless `approval.decode` is granted; the methods are the wire names of the
-/// routes that carry what the decision destination answers; the one schema is
-/// [`DECISION_SCHEMA`]; at most as many decisions as the destination maps; and it may encode an
-/// answer exactly when `approval.respond` is granted.
+/// The trust is derived from what the installation was granted and from the installed package's
+/// own connector table, and never from anything a component reports: none unless `approval.decode`
+/// is granted; the package, publisher and installed hash are the installed package's; the methods
+/// are the wire names of the routes that carry, towards this host, what the table's decision
+/// destination answers; the schemas are [`DECISION_SCHEMA`], and [`component_schema`] as well when
+/// the package ships a component; at most as many decisions as the destination maps; and it may
+/// encode an answer exactly when `approval.respond` is granted.
+///
+/// The decision destination is the one statement of which routed request asks for a decision, so a
+/// package whose table has none, or whose answers are responses to the request rather than a
+/// request of their own, is given no trust here.
 #[must_use]
 pub fn decoding_trust(connector: &InstalledConnector, now: TimestampMs) -> Option<DecodingTrust> {
     if !connector.granted(PluginCapability::ApprovalDecode) {
@@ -383,13 +402,18 @@ pub fn decoding_trust(connector: &InstalledConnector, now: TimestampMs) -> Optio
     if methods.is_empty() {
         return None;
     }
-    let publisher_id = PublisherId::new(connector.manifest().publisher_id.as_str()).ok()?;
+    let mut schema_versions: CanonicalSet<String> =
+        std::iter::once(DECISION_SCHEMA.to_owned()).collect();
+    if connector.manifest().has_component() {
+        schema_versions.insert(component_schema());
+    }
+    let package = connector.package();
     Some(DecodingTrust {
-        plugin_id: connector.plugin_id(),
-        publisher_id,
-        package_digest: connector.package_digest(),
+        plugin_id: package.plugin_id.clone(),
+        publisher_id: package.publisher_id.clone(),
+        package_digest: package.package_digest,
         methods,
-        schema_versions: std::iter::once(DECISION_SCHEMA.to_owned()).collect(),
+        schema_versions,
         max_decisions: U64::new(u64::try_from(destination.decisions.len()).unwrap_or(u64::MAX)),
         may_encode_response: connector.granted(PluginCapability::ApprovalRespond),
         granted_at: now,
