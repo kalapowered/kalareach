@@ -107,10 +107,12 @@ pub struct Exchange {
 impl Exchange {
     /// Connects to the registration's endpoint and writes the hello that declares this bridge.
     ///
-    /// Nothing else is written until the worker has admitted the connection; see
-    /// [`Exchange::admitted`]. A hook writes its one observation straight after the hello, which is
-    /// safe for the same reason a pipelined request is: the worker reads nothing past the hello
-    /// until it has authenticated the connection.
+    /// Nothing else is written here; the worker's answer is [`Exchange::admitted`]. A hook writes
+    /// its one observation straight after the hello, as a pipelined request is written: the worker
+    /// reads nothing past the hello until it has authenticated the connection. A worker that
+    /// refuses closes the connection without reading further, and that can happen before the
+    /// observation is written, so a write behind the hello can find the connection gone. A caller
+    /// that writes ahead therefore reads the worker's answer before it counts a failed write.
     ///
     /// # Errors
     ///
