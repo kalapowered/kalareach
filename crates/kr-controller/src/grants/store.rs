@@ -207,7 +207,8 @@ pub struct GrantRevocation {
     /// the session list.
     pub covers_every_session: bool,
     /// The debt this revocation wrote in the transaction that revoked, when it withdrew live
-    /// authority: one row for the whole change, retired only by a barrier that follows it.
+    /// authority a worker can hold work under (every grant but a voice grant): one row for the
+    /// whole change, retired only by a barrier that follows it.
     pub debt: Option<DebtId>,
 }
 
@@ -940,11 +941,12 @@ impl GrantDirectory {
             if let Some(session_id) = record.session_id {
                 sessions.insert(session_id);
             }
-            if record.is_active() && debt.is_none() {
+            if record.is_active() && debt.is_none() && owes_a_fence(&record.grant) {
                 // Debt only for authority that was live, and one row for the change, written in
                 // the transaction that is its restriction. Withdrawing a proposal nobody redeemed
                 // takes nothing away from anybody, so there is nothing to fence, and recording it
-                // would make an ordinary cancellation fence the host later.
+                // would make an ordinary cancellation fence the host later. Nor does a voice
+                // grant's withdrawal, since no worker holds work under one.
                 *debt = Some(owe_within(connection, covers, now_ms)?);
             }
             revoked.push(record.grant.grant_id);
@@ -2397,6 +2399,21 @@ fn read_row(row: &rusqlite::Row<'_>) -> Row {
         revoked_at_ms: revoked.map(|moment| u64::try_from(moment).unwrap_or_default()),
         revoked_by_parent: by_parent.as_deref().and_then(uuid_of).map(GrantId::new),
     })
+}
+
+/// Whether withdrawing `grant` owes a fence: whether a worker can hold work under it.
+///
+/// Every grant but a voice grant, the one that carries `voice.use`. A voice grant is decided only
+/// inside the control daemon. The device door takes `voice.use` out of the grant it decides every
+/// request under and puts it back only for a method that needs it, and each of those is a voice
+/// method the daemon serves itself; a forwarded mutation carries the rights its decision
+/// permitted, and a forwarded read carries none; and the voice module performs its one effect, a
+/// session read, as the daemon's own request, which carries no rights. So no frame a worker
+/// receives carries a voice right, and a worker holds nothing a voice grant's withdrawal has to
+/// stop. A grant delegated from a voice grant that does not carry `voice.use` is not a voice grant
+/// and owes its fence as any other does.
+fn owes_a_fence(grant: &Grant) -> bool {
+    !grant.permits(kr_protocol::rights::ActionRight::VoiceUse)
 }
 
 /// Writes one change's fence debt inside the caller's transaction ([`GrantDirectory::owe_fence`]).

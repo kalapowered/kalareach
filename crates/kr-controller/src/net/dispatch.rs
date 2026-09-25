@@ -2620,39 +2620,9 @@ impl RemoteConnection {
         Ok(decided)
     }
 
-    /// The grant this device's requests are decided against: the one its pairing committed, with
-    /// one right resolved elsewhere.
-    ///
-    /// `voice.use` lives in the separate voice grant section 15 paragraph 7 intersects with this
-    /// one, not in the grant this connection was admitted under: a person holds their ordinary
-    /// authority and chooses separately how much of it voice may use. So it is taken out of this
-    /// grant and put back only for a method that needs it, when this device holds a live voice
-    /// grant carrying it. The policy and the configured ceiling then apply to it like any other
-    /// right, and the coordinator takes the intersection again at the moment of each decision.
+    /// The grant this device's requests are decided against ([`decided_with_voice`]).
     fn decided_grant(&self, entry: &'static MethodEntry) -> kr_protocol::grant::Grant {
-        let needs_voice = entry.required_rights.iter().any(|required| {
-            matches!(
-                required.authority,
-                RequiredAuthority::Right {
-                    right: ActionRight::VoiceUse
-                }
-            )
-        });
-        let mut actions: CanonicalSet<ActionRight> = self
-            .device
-            .grant
-            .actions
-            .iter()
-            .copied()
-            .filter(|right| *right != ActionRight::VoiceUse)
-            .collect();
-        if needs_voice && self.holds_voice_grant() {
-            actions.insert(ActionRight::VoiceUse);
-        }
-        kr_protocol::grant::Grant {
-            actions,
-            ..self.device.grant.clone()
-        }
+        decided_with_voice(&self.device.grant, entry, || self.holds_voice_grant())
     }
 
     /// Whether this device holds a live voice grant on this host.
@@ -2923,6 +2893,48 @@ const fn window_refusal_detail(refusal: kr_transport::window::WindowRefusal) -> 
     }
 }
 
+/// The grant a paired device's request for `entry` is decided against: the one its pairing
+/// committed (`paired`), with one right resolved elsewhere.
+///
+/// `voice.use` lives in the separate voice grant section 15 paragraph 7 intersects with this one,
+/// not in the grant a connection was admitted under: a person holds their ordinary authority and
+/// chooses separately how much of it voice may use. So it is taken out of the pairing grant and
+/// put back only for a method that needs it, when the device holds a live voice grant carrying it
+/// (`holds_voice_grant`, asked only then). The policy and the configured ceiling then apply to it
+/// like any other right, and the coordinator takes the intersection again at the moment of each
+/// decision.
+///
+/// Every method that needs it is a voice method this daemon serves itself, so the rights a
+/// forwarded mutation carries to a worker, which its decision cut from this grant, never include
+/// it: a worker holds no work under a voice grant, and a voice grant's withdrawal owes no fence.
+fn decided_with_voice(
+    paired: &kr_protocol::grant::Grant,
+    entry: &MethodEntry,
+    holds_voice_grant: impl FnOnce() -> bool,
+) -> kr_protocol::grant::Grant {
+    let needs_voice = entry.required_rights.iter().any(|required| {
+        matches!(
+            required.authority,
+            RequiredAuthority::Right {
+                right: ActionRight::VoiceUse
+            }
+        )
+    });
+    let mut actions: CanonicalSet<ActionRight> = paired
+        .actions
+        .iter()
+        .copied()
+        .filter(|right| *right != ActionRight::VoiceUse)
+        .collect();
+    if needs_voice && holds_voice_grant() {
+        actions.insert(ActionRight::VoiceUse);
+    }
+    kr_protocol::grant::Grant {
+        actions,
+        ..paired.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use kr_protocol::attachment::{AttachMode, AttachmentCapability, SessionAttachParams};
@@ -2985,6 +2997,66 @@ mod tests {
                 ]
             )),
             "and an ordinary observing attachment claims nothing"
+        );
+    }
+
+    /// No frame a worker receives carries a voice right, whatever the method, which is why a
+    /// voice grant's withdrawal owes no fence. A forwarded mutation carries the rights its decision
+    /// permitted, cut from the grant this door decides under, and a forwarded read or input
+    /// carries none. For a device whose pairing grant carries every right, `voice.use` included,
+    /// and which holds a live voice grant, that grant carries `voice.use` only for a method that
+    /// requires it, and every such method is one the daemon's voice module serves itself, so none
+    /// of them is forwarded.
+    #[test]
+    fn no_frame_a_worker_receives_carries_a_voice_right() {
+        use kr_protocol::authority::RequiredAuthority;
+        use kr_protocol::rights::ActionRight;
+
+        let (mut paired, _) = crate::service::net::tests::granted(
+            kr_protocol::grant::GrantExpiry::Never,
+            kr_protocol::ids::AuthorityRevision::new(1),
+        );
+        paired.actions = ActionRight::ALL.iter().copied().collect();
+        let mut voice_methods = 0;
+        for method in Method::ALL {
+            let entry = method.entry();
+            let decided = super::decided_with_voice(&paired, entry, || true);
+            let requires_voice = entry.required_rights.iter().any(|required| {
+                matches!(
+                    required.authority,
+                    RequiredAuthority::Right {
+                        right: ActionRight::VoiceUse
+                    }
+                )
+            });
+            assert_eq!(
+                decided.permits(ActionRight::VoiceUse),
+                requires_voice,
+                "{method:?} is decided with voice.use exactly when it requires it"
+            );
+            if requires_voice {
+                voice_methods += 1;
+                assert!(
+                    crate::voice::VoiceModule::serves(*method),
+                    "{method:?} requires voice.use, so the daemon serves it and never forwards it"
+                );
+            }
+            // Every other right the pairing grant carries is decided as it stands.
+            assert!(
+                paired
+                    .actions
+                    .iter()
+                    .filter(|right| **right != ActionRight::VoiceUse)
+                    .all(|right| decided.permits(*right)),
+                "{method:?}"
+            );
+        }
+        assert!(voice_methods > 0, "the registry has voice methods");
+        // Without a live voice grant not even a voice method is decided with it.
+        let voice_start = Method::VoiceStart.entry();
+        assert!(
+            !super::decided_with_voice(&paired, voice_start, || false)
+                .permits(ActionRight::VoiceUse)
         );
     }
 }

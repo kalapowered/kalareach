@@ -305,6 +305,7 @@ async fn host() -> Host {
             Arc::clone(controller.sharing()),
             Arc::clone(controller.devices()),
             controller.sharing().host_device_id(),
+            Arc::downgrade(&controller),
         )),
         Arc::new(kr_controller::voice::ControllerDispatch::new(
             Arc::downgrade(&controller),
@@ -727,6 +728,7 @@ async fn an_unlocked_screen_action_is_refused_without_a_signed_confirmation() {
         Arc::clone(host.controller.sharing()),
         Arc::clone(host.controller.devices()),
         host.controller.sharing().host_device_id(),
+        Arc::downgrade(&host.controller),
     );
     assert!(
         authority

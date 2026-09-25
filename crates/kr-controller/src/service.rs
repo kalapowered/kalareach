@@ -1811,6 +1811,26 @@ impl Controller {
         }
     }
 
+    /// Publishes the debt of a change made where nothing can wait, and raises its barrier on a
+    /// task of its own.
+    ///
+    /// A voice revocation runs inside the voice coordinator's lock. A voice grant's withdrawal owes
+    /// no fence, but its cascade can also withdraw a grant delegated from it that is not a voice
+    /// grant, and that debt is published here the moment the store has committed, so every
+    /// admission and forward is refused until the barrier retires it.
+    pub(crate) fn publish_and_fence(self: &Arc<Self>, debt: crate::grants::store::DebtId) {
+        self.publish_debts(&[(debt, Reach::Host)]);
+        let daemon = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(error) = daemon.raise_owed_barrier().await {
+                eprintln!(
+                    "kr-controller: a barrier this host owes could not be raised yet, so nothing \
+                     is admitted or forwarded until it is: {error}"
+                );
+            }
+        });
+    }
+
     fn debts(&self) -> std::sync::MutexGuard<'_, Debts> {
         self.debts
             .lock()
@@ -3920,6 +3940,7 @@ impl Controller {
             Arc::clone(&self.sharing),
             Arc::clone(&self.devices),
             self.sharing.host_device_id(),
+            self.me.clone(),
         ));
         // Reaching a managed service needs an HTTP exchange, which the client library leaves to
         // the embedder: a desktop build, a mobile build and a test each reach the network
@@ -4291,6 +4312,7 @@ impl Controller {
             Arc::clone(&self.sharing),
             Arc::clone(&self.devices),
             self.sharing.host_device_id(),
+            self.me.clone(),
         );
         let store = |error: kr_voice::VoiceError| ControllerError::Refused {
             code: error.code(),
@@ -11837,6 +11859,7 @@ mod a_create_that_launches_nothing {
             Arc::clone(&controller.sharing),
             Arc::clone(&controller.devices),
             controller.sharing.host_device_id(),
+            Arc::downgrade(&controller),
         );
         let plan = voice_plan(&controller);
         let held = |device_id| {
@@ -11918,6 +11941,139 @@ mod a_create_that_launches_nothing {
         );
     }
 
+    /// A voice grant's withdrawal owes no fence. Withdrawing one through the seam, as stopping a
+    /// call or replacing a standing grant does, writes no debt, publishes none and advances no
+    /// revision: no worker holds work under a grant that carries `voice.use`. The control: a grant
+    /// delegated from a voice grant that is not one itself is withdrawn with it, and the debt it
+    /// owes is published the moment the store commits and retired by one barrier.
+    ///
+    /// On one thread, so the spawned barrier cannot run before the publication is checked.
+    #[tokio::test]
+    async fn a_voice_grants_withdrawal_through_the_seam_fences_nothing() {
+        use kr_voice::seams::VoiceAuthority as _;
+
+        let (_temp, controller, _asked) = daemon().await;
+        let (connection_id, _actor_id) = admitted(&controller).await;
+        let authority = crate::voice::GrantAuthority::new(
+            Arc::clone(&controller.sharing),
+            Arc::clone(&controller.devices),
+            controller.sharing.host_device_id(),
+            Arc::downgrade(&controller),
+        );
+        let admission = |carried| super::VoiceAdmission::new(Arc::clone(&controller), carried);
+        let revision = || {
+            let controller = Arc::clone(&controller);
+            async move {
+                controller
+                    .registry
+                    .lock()
+                    .await
+                    .authority_revision()
+                    .expect("readable")
+                    .get()
+            }
+        };
+        let before = revision().await;
+
+        let plan = voice_plan(&controller);
+        let voice = authority
+            .issue(
+                &plan,
+                &admission(live_admission(&controller, connection_id)),
+            )
+            .expect("a voice grant");
+        authority
+            .revoke(
+                voice.grant_id,
+                5,
+                &admission(live_admission(&controller, connection_id)),
+            )
+            .expect("withdrawn");
+        assert!(
+            controller
+                .sharing
+                .grants()
+                .fence_owed()
+                .expect("readable")
+                .is_empty(),
+            "a voice grant's withdrawal writes no debt"
+        );
+        assert!(
+            controller.debts().published.is_empty(),
+            "and publishes none"
+        );
+        controller.check_fence().expect("so nothing is refused");
+        assert_eq!(revision().await, before, "and no barrier advances");
+
+        // The control: a standing voice grant that may share, and a grant delegated from it that
+        // carries no voice right.
+        let mut sharing_plan = voice_plan(&controller);
+        sharing_plan
+            .rights
+            .insert(kr_protocol::rights::ActionRight::SessionShare);
+        let voice = authority
+            .issue(
+                &sharing_plan,
+                &admission(live_admission(&controller, connection_id)),
+            )
+            .expect("a voice grant that may share");
+        let delegated = kr_protocol::grant::Grant {
+            grant_id: kr_protocol::ids::GrantId::new(kr_ipc::new_uuid()),
+            parent_grant_id: Nullable::some(voice.grant_id),
+            issuer_device_id: voice.recipient_device_id,
+            recipient_device_id: kr_protocol::ids::DeviceId::new(kr_ipc::new_uuid()),
+            actions: [kr_protocol::rights::ActionRight::SessionView]
+                .into_iter()
+                .collect(),
+            ..voice.clone()
+        };
+        controller
+            .sharing
+            .grants()
+            .issue(
+                &crate::grants::GrantRecord {
+                    grant: delegated,
+                    session_id: None,
+                    issued_at_ms: 1,
+                    activated_at_ms: Some(1),
+                    revoked_at_ms: None,
+                    revoked_by_parent: None,
+                },
+                || Ok(()),
+            )
+            .expect("a delegated grant");
+        authority
+            .revoke(
+                voice.grant_id,
+                6,
+                &admission(live_admission(&controller, connection_id)),
+            )
+            .expect("withdrawn with what was delegated from it");
+        let owed = controller.sharing.grants().fence_owed().expect("readable");
+        assert_eq!(owed.len(), 1, "the delegated grant owes one debt");
+        assert!(
+            controller.debts().published.contains_key(&owed[0]),
+            "published the moment the store committed"
+        );
+        controller
+            .check_fence()
+            .expect_err("every admission is refused until its barrier");
+        controller
+            .raise_owed_barrier()
+            .await
+            .expect("the barrier is raised");
+        assert_eq!(revision().await, before + 1, "one barrier retires it");
+        assert!(
+            controller
+                .sharing
+                .grants()
+                .fence_owed()
+                .expect("readable")
+                .is_empty()
+        );
+        controller.check_fence().expect("and nothing is refused");
+    }
+
     /// The voice admission, asked through a probe that first records whether the grant store held
     /// its write lock at that moment.
     ///
@@ -11972,6 +12128,7 @@ mod a_create_that_launches_nothing {
             Arc::clone(&controller.sharing),
             Arc::clone(&controller.devices),
             controller.sharing.host_device_id(),
+            Arc::downgrade(&controller),
         );
         let probe = |carried| AskedUnderTheStoreLock {
             admission: super::VoiceAdmission::new(Arc::clone(&controller), carried),

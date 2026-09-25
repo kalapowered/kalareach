@@ -315,6 +315,80 @@ fn a_revocation_writes_its_fence_debt_down_before_the_fence_is_attempted() {
     assert_eq!(owed, [one, other].into_iter().collect());
 }
 
+/// A voice grant's withdrawal owes no fence, on every revocation path: no worker holds work under a
+/// grant that carries `voice.use`. A voice grant and the call under it write no row, whether the
+/// grant itself or the device holding it is revoked. A grant delegated from a voice grant that
+/// does not carry `voice.use` is not a voice grant, and the change that withdraws it writes its one
+/// row.
+#[test]
+fn a_voice_grants_withdrawal_owes_no_fence() {
+    let directory = GrantDirectory::in_memory().expect("a grant store");
+    let voice_rights = [ActionRight::VoiceUse, ActionRight::SessionView];
+    let standing = grant(1, None, &voice_rights, GrantExpiry::Never);
+    directory
+        .issue(&record(standing.clone()), || Ok(()))
+        .expect("written");
+    let call = grant(
+        2,
+        Some(standing.grant_id),
+        &voice_rights,
+        GrantExpiry::Never,
+    );
+    directory.issue(&record(call), || Ok(())).expect("written");
+    let withdrawn = directory
+        .revoke(standing.grant_id, 4_000, || Ok(()))
+        .expect("revoked");
+    assert_eq!(withdrawn.revoked.len(), 2, "the call went with its grant");
+    assert_eq!(
+        withdrawn.debt, None,
+        "a voice grant's withdrawal owes no fence"
+    );
+    assert!(directory.fence_owed().expect("readable").is_empty());
+
+    // The device's revocation withdraws its voice grants under no row either.
+    let other = grant(3, None, &voice_rights, GrantExpiry::Never);
+    directory.issue(&record(other), || Ok(())).expect("written");
+    let device = directory
+        .revoke_device(device_id(0xf1), 4_100, || Ok(()), None)
+        .expect("revoked");
+    assert_eq!(device.revoked.len(), 1);
+    assert_eq!(device.debt, None);
+    assert!(directory.fence_owed().expect("readable").is_empty());
+
+    // The control: a grant delegated from a voice grant that carries no voice right owes the row
+    // its withdrawal writes.
+    let sharing = grant(
+        4,
+        None,
+        &[
+            ActionRight::VoiceUse,
+            ActionRight::SessionView,
+            ActionRight::SessionShare,
+        ],
+        GrantExpiry::Never,
+    );
+    directory
+        .issue(&record(sharing.clone()), || Ok(()))
+        .expect("written");
+    let delegated = grant(
+        5,
+        Some(sharing.grant_id),
+        &[ActionRight::SessionView],
+        GrantExpiry::Never,
+    );
+    directory
+        .issue(&record(delegated), || Ok(()))
+        .expect("written");
+    let withdrawn = directory
+        .revoke(sharing.grant_id, 4_200, || Ok(()))
+        .expect("revoked");
+    assert_eq!(withdrawn.revoked.len(), 2);
+    assert_eq!(
+        directory.fence_owed().expect("readable"),
+        vec![withdrawn.debt.expect("the delegated grant owes a fence")]
+    );
+}
+
 /// A store an earlier build wrote keyed its fence debt by what it withdrew. That debt is still
 /// owed: it comes forward as one debt under the identity it had, which a barrier retires like any
 /// other, and a second opening changes nothing.
