@@ -435,6 +435,18 @@ async fn attaching_to_a_closed_session_answers_with_its_closure_and_starts_nothi
             document["closure"]["reason"], "close_requested",
             "{document}"
         );
+        // The whole record: whose it is, and what the closure terminated.
+        assert_eq!(
+            document["closure"]["session_id"],
+            Value::String(session.clone())
+        );
+        assert!(
+            document["closure"]["terminated"]
+                .as_array()
+                .is_some_and(|terminated| !terminated.is_empty()),
+            "the shell it terminated is named: {document}"
+        );
+        assert!(document["closure"]["surviving"].is_array(), "{document}");
     }
     let said = host.kr(&["attach", &session]);
     assert_eq!(said.status.code(), Some(8));

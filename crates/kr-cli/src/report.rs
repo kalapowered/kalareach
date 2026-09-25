@@ -127,10 +127,23 @@ pub fn session(summary: &SessionSummary) -> Value {
     })
 }
 
-/// Renders a session's closure record.
+/// Renders a session's closure record, whole: how it closed, what it terminated and what survived
+/// it.
 #[must_use]
 pub fn closure(record: &ClosureRecord) -> Value {
     json!({
+        "session_id": record.session_id.to_string(),
+        "session_epoch": serde_json::to_value(record.session_epoch).unwrap_or(Value::Null),
+        "terminated": record.terminated.iter().map(|process| json!({
+            "pid": process.identity.pid.get(),
+            "start": serde_json::to_value(&process.identity).unwrap_or(Value::Null),
+            "name": process.name.as_ref().cloned(),
+            "forced": process.forced,
+        })).collect::<Vec<_>>(),
+        "surviving": record.surviving.iter().map(|resource| json!({
+            "kind": resource.kind,
+            "detail": resource.detail,
+        })).collect::<Vec<_>>(),
         "reason": record.reason.as_str(),
         "exit_code": record.root_exit_code.as_ref().map(|code| code.get()),
         "signal": record.root_signal.as_ref().cloned(),
@@ -452,6 +465,45 @@ mod tests {
             root_process: kr_protocol::scalars::Nullable::null(),
             closure: kr_protocol::scalars::Nullable::null(),
         }
+    }
+
+    #[test]
+    fn a_closure_is_rendered_whole() {
+        let record = ClosureRecord {
+            session_id: kr_protocol::ids::SessionId::new(kr_protocol::scalars::Uuid::from_bytes(
+                [2; 16],
+            )),
+            session_epoch: kr_protocol::ids::SessionEpoch::V1,
+            reason: kr_protocol::session::ClosureReason::CloseRequested,
+            root_exit_code: kr_protocol::scalars::Nullable::null(),
+            root_signal: kr_protocol::scalars::Nullable::null(),
+            terminated: vec![kr_protocol::session::TerminatedProcess {
+                identity: kr_protocol::identity::ProcessStartIdentity::new(
+                    42,
+                    kr_protocol::identity::ProcessStartSource::LinuxProcStat,
+                    7,
+                ),
+                name: kr_protocol::scalars::Nullable::some("sh".to_owned()),
+                forced: true,
+            }],
+            surviving: vec![kr_protocol::session::SurvivingResource {
+                kind: "desktop_resource".to_owned(),
+                detail: "a window the broker opened".to_owned(),
+            }],
+            ownership_coverage: kr_protocol::session::OwnershipCoverage::Complete,
+            durability: kr_protocol::session::Durability::Durable,
+            closed_at_ms: kr_protocol::scalars::TimestampMs::new(9),
+        };
+        let rendered = closure(&record);
+        assert_eq!(rendered["session_id"], json!(record.session_id.to_string()));
+        assert!(!rendered["session_epoch"].is_null(), "{rendered}");
+        assert_eq!(rendered["terminated"][0]["pid"], json!(42));
+        assert_eq!(rendered["terminated"][0]["name"], json!("sh"));
+        assert_eq!(rendered["terminated"][0]["forced"], json!(true));
+        assert!(rendered["terminated"][0]["start"].is_object(), "{rendered}");
+        assert_eq!(rendered["surviving"][0]["kind"], json!("desktop_resource"));
+        assert_eq!(rendered["reason"], json!("close_requested"));
+        assert_eq!(rendered["closed_at_ms"], json!(9));
     }
 
     #[test]

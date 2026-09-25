@@ -1040,10 +1040,22 @@ the host's sleep setting is doing:
 }
 ```
 
-A closed session carries its record instead of a null:
+A closed session carries its record instead of a null: whose it is, how it closed, the owned
+processes the closure terminated and anything that survived it.
 
 ```json
 {
+  "session_id": "d6d64b2b-f6f1-4617-a07a-bb89a08cd3fd",
+  "session_epoch": "1",
+  "terminated": [
+    {
+      "pid": 48213,
+      "start": { "pid": "48213", "source": "macos_proc_bsd_info", "start_value": "1789484600112233" },
+      "name": "zsh",
+      "forced": false
+    }
+  ],
+  "surviving": [],
   "reason": "close_requested",
   "exit_code": null,
   "signal": null,
