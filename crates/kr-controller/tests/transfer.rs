@@ -799,11 +799,10 @@ fn a_sweep_waiting_to_run_does_not_keep_its_daemon() {
             .expect_err("a sweep whose daemon has gone does nothing");
         assert_eq!(refused.code, ErrorCode::ResourceUnavailable);
 
-        // The environment is free: another daemon takes it on its first try.
-        let replacement = Controller::start(setup(&environment, environment_id))
-            .await
-            .expect("another daemon takes the environment at once");
-        drop(replacement);
+        // Another daemon takes the environment. The daemon's last reference may have gone on
+        // another thread, which lets the environment go only once it has closed the daemon's
+        // stores, so the start waits for that, within a bound.
+        drop(start_controller(&environment, environment_id).await);
     });
 }
 
