@@ -222,7 +222,7 @@ pub fn run(paths: &HostPaths, arguments: &StartupArguments, json: bool) -> Resul
                 "document_state": chosen.state.as_str(),
                 "revision": chosen.revision.to_string(),
                 "definition": inspection.as_ref().map(service_manager::Inspection::json),
-                "definition_unestablished": unestablished,
+                "definition_unestablished": unestablished.as_ref().map(Shown::as_str),
             },
         });
         if !removal.removed.is_empty() || !removal.left.is_empty() {
@@ -239,7 +239,7 @@ pub fn run(paths: &HostPaths, arguments: &StartupArguments, json: bool) -> Resul
                     .iter()
                     .map(|(path, why)| serde_json::json!({
                         "path": path.display().to_string(),
-                        "why": why,
+                        "why": why.as_str(),
                     }))
                     .collect::<Vec<_>>()
             );
@@ -324,19 +324,21 @@ pub struct Started {
 impl Started {
     /// What `kr new` tells a person it did, for the environment the daemon serves.
     #[must_use]
-    pub fn describe(&self, environment: kr_protocol::ids::EnvironmentId) -> String {
+    pub fn describe(&self, environment: kr_protocol::ids::EnvironmentId) -> Shown {
         let process = self
             .pid
-            .map_or_else(String::new, |pid| format!(" (process {pid})"));
+            .map_or_else(|| Shown::said(""), |pid| shown!(" (process {})", pid));
         match self.manager {
-            Some(manager) => format!(
-                "{} started the control daemon for environment {environment}{process} under the \
-                 service start",
-                manager.as_str()
+            Some(manager) => shown!(
+                "{} started the control daemon for environment {}{} under the service start",
+                manager.as_str(),
+                environment,
+                process
             ),
-            None => format!(
-                "started the control daemon for environment {environment}{process} under the {} \
-                 start",
+            None => shown!(
+                "started the control daemon for environment {}{} under the {} start",
+                environment,
+                process,
                 self.start.as_str()
             ),
         }
@@ -650,15 +652,17 @@ async fn managed(
     bounds: Bounds,
 ) -> Result<(LocalClient, Option<Started>)> {
     let refused = |refusal| match refusal {
-        service_manager::Refusal::NotSetUp(why) => resolve::not_running(error, &why),
-        service_manager::Refusal::Failed(why) => unanswered(&format!(
-            "the service manager did not start the control daemon for environment {}: {why}",
-            environment.environment_id()
+        service_manager::Refusal::NotSetUp(why) => resolve::not_running(error, why),
+        service_manager::Refusal::Failed(why) => unanswered(shown!(
+            "the service manager did not start the control daemon for environment {}: {}",
+            environment.environment_id(),
+            why
         )),
     };
     let blocked = |error: tokio::task::JoinError| {
-        CliError::Other(format!(
-            "asking the service manager to start the control daemon failed: {error}"
+        CliError::Other(shown!(
+            "asking the service manager to start the control daemon failed: {}",
+            Shown::task(&error)
         ))
     };
     // The definition first, with the environment's service lock held from here until the manager
@@ -688,19 +692,22 @@ async fn managed(
         Err(last) => last,
     };
     let said = log.last_line().map_or_else(
-        || "its log holds nothing since it started".to_owned(),
-        |line| format!("the last line its log holds since it started is: {line}"),
+        || Shown::said("its log holds nothing since it started"),
+        |line| last_line_said(&line),
     );
-    Err(unanswered(&format!(
+    let process = asked
+        .pid
+        .map_or_else(|| Shown::said(""), |pid| shown!(" (process {})", pid));
+    Err(unanswered(shown!(
         "the control daemon {} started for environment {}{} did not answer within {} seconds: \
-         {last}; {said}; what it writes is in {}",
+         {}; {}; what it writes is in {}",
         asked.manager.as_str(),
         environment.environment_id(),
-        asked
-            .pid
-            .map_or_else(String::new, |pid| format!(" (process {pid})")),
+        process,
         bounds.start.as_secs(),
-        log.path.display()
+        last,
+        said,
+        Shown::root(&log.path)
     )))
 }
 
@@ -894,7 +901,7 @@ mod tests {
             manager: None,
         };
         assert_eq!(
-            standalone.describe(environment),
+            standalone.describe(environment).as_str(),
             format!(
                 "started the control daemon for environment {environment} (process 4242) under \
                  the standalone start"
@@ -906,7 +913,7 @@ mod tests {
             manager: Some(service_manager::Manager::Systemd),
         };
         assert_eq!(
-            service.describe(environment),
+            service.describe(environment).as_str(),
             format!(
                 "systemd started the control daemon for environment {environment} under the \
                  service start"
