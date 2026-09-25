@@ -256,6 +256,9 @@ struct Refusal {
 }
 
 /// The `data` of one answer, or why there is none.
+///
+/// The answer is read through the client's one reader, so a text that names a member twice is not
+/// a renewal, and what a failure says is where the text failed, never what it held.
 fn data_of<T: serde::de::DeserializeOwned>(answer: &ServiceHttpAnswer) -> Result<T, String> {
     if answer.body.len() > MAX_ANSWER_BYTES {
         return Err(format!(
@@ -263,7 +266,7 @@ fn data_of<T: serde::de::DeserializeOwned>(answer: &ServiceHttpAnswer) -> Result
             answer.body.len()
         ));
     }
-    match serde_json::from_slice::<Envelope<T>>(&answer.body) {
+    match kr_client::services::json::read::<Envelope<T>>(&answer.body) {
         Ok(Envelope {
             ok: true,
             data: Some(data),
@@ -280,8 +283,8 @@ fn data_of<T: serde::de::DeserializeOwned>(answer: &ServiceHttpAnswer) -> Result
             "the gateway answered {} without a renewal",
             answer.status
         )),
-        Err(error) => Err(format!(
-            "the gateway's answer ({}) could not be read: {error}",
+        Err(fault) => Err(format!(
+            "the gateway's answer ({}) could not be read: {fault}",
             answer.status
         )),
     }
@@ -444,6 +447,52 @@ mod tests {
         kr_crypto::sign::SigningTranscript::from_canonical_bytes(domain, input)
             .and_then(|transcript| kr_crypto::sign::verify(public, &transcript, signature))
             .is_ok()
+    }
+
+    /// KR-REQ-04.19: the gateway's answer is read through the client's one reader. One that names
+    /// a member twice is not a renewal, whichever member it is, and no failure repeats what the
+    /// answer held.
+    #[test]
+    fn an_answer_that_names_a_member_twice_is_not_a_renewal_and_no_failure_quotes_one() {
+        const MARKER: &str = "a-marker-nobody-should-see";
+        let host = kr_crypto::keys::AuthorisationKeyPair::generate().expect("a key");
+        let fresh = credential(10, now() + 30 * 24 * 60 * 60 * 1000 - 1_000);
+        let answer = renewed_answer(&record(&host, &fresh), &fresh).to_string();
+        let read = |text: String| {
+            data_of::<SenderResult>(&ServiceHttpAnswer {
+                status: 200,
+                body: text.into_bytes(),
+            })
+        };
+
+        // A member the renewal reads, and one nothing reads.
+        for repeated in [
+            answer.replacen(r#""ok":true"#, r#""ok":true,"ok":true"#, 1),
+            answer.replacen(r#""ok":true"#, r#""ok":true,"note":1,"note":2"#, 1),
+        ] {
+            assert_ne!(
+                repeated, answer,
+                "the answer names its members once to begin with"
+            );
+            let refused = read(repeated).err().expect("not a renewal");
+            assert!(
+                refused.contains("names one member of an object twice"),
+                "{refused}"
+            );
+        }
+
+        // An answer this host cannot read is described by where it failed, not by what it held.
+        let refused = read(format!(r#"{{"ok":true,"data":{{"record":"{MARKER}"}}}}"#))
+            .err()
+            .expect("not a renewal");
+        assert!(!refused.contains(MARKER), "{refused}");
+        assert!(
+            refused.contains("is not the shape this client reads"),
+            "{refused}"
+        );
+
+        // The control: the same answer naming its members once is the renewal.
+        assert!(read(answer).is_ok());
     }
 
     #[test]

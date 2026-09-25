@@ -98,6 +98,9 @@ impl GatewayClient {
     }
 
     /// What one answer from the gateway means for the request that received it.
+    ///
+    /// A success is read through the client's one reader, so a text that names a member twice
+    /// decides nothing, and what a failure says is where the text failed, never what it held.
     fn answered(answer: &ServiceHttpAnswer, notification_id: NotificationId) -> SendOutcome {
         if answer.body.len() > MAX_ANSWER_BYTES {
             return SendOutcome::Unknown {
@@ -110,7 +113,7 @@ impl GatewayClient {
         }
         let text = String::from_utf8_lossy(&answer.body);
         match answer.status {
-            200 => match serde_json::from_slice::<Envelope>(&answer.body) {
+            200 => match kr_client::services::json::read::<Envelope>(&answer.body) {
                 Ok(Envelope {
                     ok: true,
                     data: Some(ack),
@@ -118,8 +121,8 @@ impl GatewayClient {
                 Ok(_) => SendOutcome::Unknown {
                     detail: "the gateway answered without a decision".to_owned(),
                 },
-                Err(error) => SendOutcome::Unknown {
-                    detail: format!("the gateway's answer could not be read: {error}"),
+                Err(fault) => SendOutcome::Unknown {
+                    detail: format!("the gateway's answer could not be read: {fault}"),
                 },
             },
             // Section 16: a refused credential is renewed, not retried. The gateway answers 401
@@ -256,4 +259,78 @@ pub(super) fn bearer(bytes: &[u8]) -> String {
     use base64::Engine as _;
 
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use kr_protocol::push::PushDeliveryState;
+    use kr_protocol::scalars::{Nullable, Uuid};
+
+    use super::*;
+
+    /// Stands for anything an answer carries that no failure may repeat.
+    const MARKER: &str = "a-marker-nobody-should-see";
+
+    fn notification() -> NotificationId {
+        NotificationId::new(Uuid::from_bytes([5; 16]))
+    }
+
+    /// The gateway's answer to a delivery it queued, in the text it arrives as.
+    fn queued() -> String {
+        serde_json::json!({
+            "ok": true,
+            "data": PushDeliveryAck {
+                decided_at_ms: TimestampMs::new(1_800_000_000_000),
+                notification_id: notification(),
+                state: PushDeliveryState::Queued,
+                suppression: Nullable::null(),
+            },
+        })
+        .to_string()
+    }
+
+    fn answered(text: String) -> SendOutcome {
+        GatewayClient::answered(
+            &ServiceHttpAnswer {
+                status: 200,
+                body: text.into_bytes(),
+            },
+            notification(),
+        )
+    }
+
+    /// KR-REQ-04.19: the gateway's answer is read through the client's one reader. One that names
+    /// a member twice decides nothing, whichever member it is, so the outcome is unknown and the
+    /// delivery is not presented again; and no detail repeats what the answer held.
+    #[test]
+    fn an_answer_that_names_a_member_twice_is_an_unknown_outcome_and_no_detail_quotes_one() {
+        let answer = queued();
+        // A member the decision is read from, and one nothing reads.
+        for repeated in [
+            answer.replacen(r#""ok":true"#, r#""ok":true,"ok":true"#, 1),
+            answer.replacen(r#""ok":true"#, r#""ok":true,"note":1,"note":2"#, 1),
+        ] {
+            assert_ne!(
+                repeated, answer,
+                "the answer names its members once to begin with"
+            );
+            let SendOutcome::Unknown { detail } = answered(repeated) else {
+                panic!("an unknown outcome");
+            };
+            assert!(
+                detail.contains("names one member of an object twice"),
+                "{detail}"
+            );
+        }
+
+        let SendOutcome::Unknown { detail } =
+            answered(format!(r#"{{"ok":true,"data":"{MARKER}"}}"#))
+        else {
+            panic!("an unknown outcome");
+        };
+        assert!(!detail.contains(MARKER), "{detail}");
+
+        // The control: the same answer naming its members once is the gateway's decision.
+        assert!(matches!(answered(answer), SendOutcome::Decided(_)));
+    }
 }

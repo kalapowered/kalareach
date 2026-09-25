@@ -347,10 +347,12 @@ enum Envelope {
 }
 
 /// Reads the envelope out of a body, or nothing when the body is not one.
+///
+/// The body is read through the client's one reader, so a text that names a member twice, in the
+/// envelope or anywhere inside it, is not the service's envelope.
 fn envelope(body: &[u8]) -> Option<Envelope> {
-    let serde_json::Value::Object(mut members) = serde_json::from_slice(body).ok()? else {
-        return None;
-    };
+    let mut members: serde_json::Map<String, serde_json::Value> =
+        kr_client::services::json::read(body).ok()?;
     match (members.remove("ok"), members.len()) {
         (Some(serde_json::Value::Bool(true)), 1) => members.remove("data").map(Envelope::Answered),
         (Some(serde_json::Value::Bool(false)), 1) => {
@@ -559,6 +561,55 @@ mod tests {
         }
         assert_eq!(
             code(released(200, r#"{"ok":true,"data":{"released":false}}"#)),
+            ErrorCode::RendezvousConfigError
+        );
+    }
+
+    /// KR-REQ-04.19: an answer that names a member twice is not the service's envelope, whatever
+    /// else it says, so the status decides what it is, as it does for any answer without the
+    /// envelope: a success is an origin that serves no rendezvous, and a fault is the service
+    /// being unavailable.
+    #[test]
+    fn an_answer_that_names_a_member_twice_is_not_the_services_envelope() {
+        // One reader would take the first for a taken locator and another for a reservation, and
+        // the refusal for a rate limit or for an origin that is configured wrongly.
+        for (status, body, expected) in [
+            (
+                200,
+                r#"{"ok":true,"data":{"reserved":false,"reserved":true,"advertised_expires_at_ms":"1764003600000"}}"#,
+                ErrorCode::RendezvousConfigError,
+            ),
+            (
+                503,
+                r#"{"ok":false,"error":{"code":"RATE_LIMITED","code":"NOT_CONFIGURED","message":"No."}}"#,
+                ErrorCode::RendezvousUnavailable,
+            ),
+        ] {
+            assert_eq!(code(reserved(status, body)), expected, "{status} {body}");
+        }
+        assert_eq!(
+            code(released(
+                200,
+                r#"{"ok":true,"data":{"released":false},"data":{"released":true}}"#
+            )),
+            ErrorCode::RendezvousConfigError
+        );
+
+        // The controls: each answer naming its members once reads as itself.
+        assert!(
+            reserved(
+                200,
+                r#"{"ok":true,"data":{"reserved":true,"advertised_expires_at_ms":"1764003600000"}}"#
+            )
+            .expect("an answer")
+        );
+        assert!(!reserved(200, r#"{"ok":true,"data":{"reserved":false}}"#).expect("an answer"));
+        released(200, r#"{"ok":true,"data":{"released":true}}"#).expect("released");
+        assert_eq!(
+            code(reserved(
+                503,
+                r#"{"ok":false,"error":{"code":"NOT_CONFIGURED","message":"No."}}"#
+            )),
             ErrorCode::RendezvousConfigError
         );
     }
