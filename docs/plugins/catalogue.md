@@ -359,14 +359,15 @@ that writes nothing:
   set, whatever its value;
 - a configuration document is edited only when it is strict JSON with no member name repeated in any
   object, when the key leaves it, or the document the key creates, within the 1 MiB the host reads
-  back, and when a replacement keeps its protection: one with an access-control list, or in a
-  directory that would give its replacement one, is refused.
+  back, and when a replacement keeps its protection: one with an access-control list, one in a
+  directory that would give its replacement one, and one another user owns are refused.
 
 A configuration key is spliced into the document's own text and every other byte is kept, so the
 document's layout, its members' order and its numbers are as they were, and removing the key
 restores the document exactly. The replacement has exactly the permission bits of the document it
-replaces. A document whose bytes or permission bits change between the host's reading and its
-replacement is read again, so what somebody changed meanwhile is kept, and one that gains an
+replaces, and one that would belong to another user or group than the document does is not put in
+its place. A document whose bytes, permission bits or owners change between the host's reading and
+its replacement is read again, so what somebody changed meanwhile is kept, and one that gains an
 access-control list meanwhile is not replaced. Access-control lists are read through paths, so they
 are read only while the paths still lead to the directory the host holds and the document it read,
 and the replacement is refused otherwise. Each file is written under a temporary name, flushed and

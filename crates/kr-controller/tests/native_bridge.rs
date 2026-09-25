@@ -1625,6 +1625,93 @@ fn a_replaced_document_keeps_exactly_its_permission_bits() {
     }
 }
 
+/// A document a replacement would give another group is not replaced: the replacement would
+/// change who can read or change it.
+#[cfg(unix)]
+#[test]
+fn a_document_a_replacement_would_give_another_group_is_refused() {
+    use std::os::unix::fs::MetadataExt as _;
+    let site = Site::new();
+    let document = site.application().join("settings.json");
+    let current = std::fs::metadata(&document).expect("reads").gid();
+    let groups = std::process::Command::new("id")
+        .arg("-G")
+        .output()
+        .expect("the account's groups");
+    let other = String::from_utf8_lossy(&groups.stdout)
+        .split_whitespace()
+        .filter_map(|group| group.parse::<u32>().ok())
+        .find(|group| *group != current);
+    let Some(other) = other else {
+        eprintln!("skipped: this account belongs to no second group to give the document");
+        return;
+    };
+    std::os::unix::fs::chown(&document, None, Some(other)).expect("another group");
+    let before = site.tree();
+
+    let settled = site
+        .bridges()
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("reconciles");
+
+    assert!(refused(&settled).contains("belongs to"), "{settled:?}");
+    assert_eq!(site.tree(), before, "nothing of the recipe is left");
+    assert_eq!(
+        std::fs::metadata(&document).expect("reads").gid(),
+        other,
+        "the document keeps its group"
+    );
+}
+
+/// A document given another group between the read and the replacement is read again, and not
+/// replaced by a copy that would take that group away.
+#[cfg(unix)]
+#[test]
+fn a_document_given_another_group_meanwhile_is_not_replaced() {
+    use std::os::unix::fs::MetadataExt as _;
+    let site = Site::new();
+    let document = site.application().join("settings.json");
+    let current = std::fs::metadata(&document).expect("reads").gid();
+    let groups = std::process::Command::new("id")
+        .arg("-G")
+        .output()
+        .expect("the account's groups");
+    let other = String::from_utf8_lossy(&groups.stdout)
+        .split_whitespace()
+        .filter_map(|group| group.parse::<u32>().ok())
+        .find(|group| *group != current);
+    let Some(other) = other else {
+        eprintln!("skipped: this account belongs to no second group to give the document");
+        return;
+    };
+    let bridges = site.bridges();
+    {
+        let document = document.clone();
+        bridges.before_publishing(move |destination: &Path| {
+            if destination == document {
+                std::os::unix::fs::chown(&document, None, Some(other))
+                    .expect("somebody gives it another group meanwhile");
+            }
+        });
+    }
+
+    let settled = bridges
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("reconciles");
+
+    assert!(refused(&settled).contains("belongs to"), "{settled:?}");
+    assert_eq!(
+        std::fs::metadata(&document).expect("reads").gid(),
+        other,
+        "the document keeps the group it was given"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&document).expect("reads"),
+        SETTINGS,
+        "and its bytes"
+    );
+}
+
 /// A document whose permission bits change between the read and the replacement is read again, and
 /// the replacement keeps the new bits.
 #[cfg(unix)]

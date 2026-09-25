@@ -1162,19 +1162,12 @@ impl NativeBridges {
                 temporary: &temporary,
                 identity,
             };
-            if read.is_some() {
-                let listed = staged_listed(directory, &temporary, &identity);
-                if !matches!(listed, Ok(false)) {
-                    self.discard(journal, index, root, directory, &staged)?;
-                    return Err(Fault::Refused(match listed {
-                        Err(reason) => reason,
-                        Ok(_) => format!(
-                            "a new file in {} is given an access-control list by the directory \
-                             itself, so replacing {shown} here would change who can read it",
-                            directory.path().display()
-                        ),
-                    }));
-                }
+            if let Some(document) = read.as_ref()
+                && let Err(reason) =
+                    staged_protection(directory, &temporary, &identity, document, &shown)
+            {
+                self.discard(journal, index, root, directory, &staged)?;
+                return Err(Fault::Refused(reason));
             }
             self.about_to_publish(&directory.join(name));
             // The document must still be the one the edit was made from, with the protection it
@@ -1771,17 +1764,15 @@ impl NativeBridges {
                     temporary: &temporary,
                     identity,
                 });
-                let listed = staged_listed(directory, &temporary, &identity);
-                if !matches!(listed, Ok(false)) {
+                if let Err(reason) = staged_protection(
+                    directory,
+                    &temporary,
+                    &identity,
+                    &read,
+                    &directory.join(name).display().to_string(),
+                ) {
                     self.withdraw_removal(journal, index, root, directory, staged.as_ref())?;
-                    return Ok(Outcome::Unfinished(match listed {
-                        Err(reason) => reason,
-                        Ok(_) => format!(
-                            "a new file in {} is given an access-control list by the directory \
-                             itself, so replacing the document here would change who can read it",
-                            directory.path().display()
-                        ),
-                    }));
+                    return Ok(Outcome::Unfinished(reason));
                 }
             }
             self.about_to_publish(&directory.join(name));
@@ -2245,6 +2236,14 @@ fn key_is_ours(
             };
             files::guard_access_controls(&directory.join(name), INSTEAD)
                 .map_err(|error| error.to_string())?;
+            if read.owners.user != tree::acting_user() {
+                return Err(format!(
+                    "{shown} belongs to user {}, and a replacement written by this host would \
+                     belong to user {}, so replacing it would change who can read or change it",
+                    read.owners.user,
+                    tree::acting_user()
+                ));
+            }
             let text =
                 std::str::from_utf8(&read.bytes).map_err(|_| format!("{shown} is not text"))?;
             let document = json::Document::read(text).map_err(|reason| {
@@ -2350,6 +2349,7 @@ fn still_the_same(
         (Some(read), Fetched::File(now))
             if now.identity == read.identity
                 && now.mode == read.mode
+                && now.owners == read.owners
                 && now.bytes == read.bytes =>
         {
             Ok(guard_held(directory, name, &now.identity))
@@ -2381,6 +2381,41 @@ fn guard_held(directory: &Dir, name: &str, identity: &Identity) -> Sameness {
         Ok(()) => Sameness::Same,
         Err(error) => Sameness::Refused(error.to_string()),
     }
+}
+
+/// Why the copy staged at `temporary` would not keep the protection of the document it is to
+/// replace, where it would not: its directory gave it an access-control list, or it belongs to
+/// another user or group than the document does.
+fn staged_protection(
+    directory: &Dir,
+    temporary: &str,
+    identity: &Identity,
+    document: &tree::Read,
+    shown: &str,
+) -> std::result::Result<(), String> {
+    if staged_listed(directory, temporary, identity)? {
+        return Err(format!(
+            "a new file in {} is given an access-control list by the directory itself, so \
+             replacing {shown} here would change who can read it",
+            directory.path().display()
+        ));
+    }
+    let staged = directory
+        .owners(temporary)
+        .map_err(|error| error.to_string())?;
+    if staged != Some(document.owners) {
+        return Err(format!(
+            "{shown} belongs to user {} and group {}, and a replacement written here would belong \
+             to {}, so replacing it would change who can read or change it",
+            document.owners.user,
+            document.owners.group,
+            staged.map_or_else(
+                || "nothing this host can read".to_owned(),
+                |owners| format!("user {} and group {}", owners.user, owners.group)
+            )
+        ));
+    }
+    Ok(())
 }
 
 /// Whether the copy staged at `temporary` was given an access-control list by its directory, read

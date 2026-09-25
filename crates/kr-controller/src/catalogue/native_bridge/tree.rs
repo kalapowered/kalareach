@@ -98,9 +98,20 @@ pub(super) struct Read {
     pub(super) identity: Identity,
     /// Its permission bits.
     pub(super) mode: u32,
+    /// The user and the group that own it.
+    pub(super) owners: Owners,
 }
 
-pub(super) use platform::Dir;
+/// The user and the group that own a file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Owners {
+    /// The owning user.
+    pub(super) user: u32,
+    /// The owning group.
+    pub(super) group: u32,
+}
+
+pub(super) use platform::{Dir, acting_user};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod platform {
@@ -111,7 +122,7 @@ mod platform {
     use rustix::fs::{AtFlags, FileType, Mode, OFlags, RenameFlags};
     use rustix::io::Errno;
 
-    use super::{Child, Entry, Fetched, Identity, Read, Unstaged};
+    use super::{Child, Entry, Fetched, Identity, Owners, Read, Unstaged};
 
     /// An open directory, its identity, and the path it was reached by, for messages and for the
     /// checks that only take a path.
@@ -193,6 +204,21 @@ mod platform {
             }
         }
 
+        /// Returns who owns what is at `name`, without following a link; `None` when nothing is.
+        pub(in crate::catalogue::native_bridge) fn owners(
+            &self,
+            name: &str,
+        ) -> std::io::Result<Option<Owners>> {
+            match rustix::fs::statat(self.handle.as_fd(), name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(stat) => Ok(Some(Owners {
+                    user: stat.st_uid,
+                    group: stat.st_gid,
+                })),
+                Err(Errno::NOENT) => Ok(None),
+                Err(error) => Err(error.into()),
+            }
+        }
+
         /// Makes a directory in this one; false when something was already there.
         pub(in crate::catalogue::native_bridge) fn make_child(
             &self,
@@ -249,11 +275,15 @@ mod platform {
             if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limit {
                 return Ok(Fetched::TooLarge);
             }
-            use std::os::unix::fs::PermissionsExt as _;
+            use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
             Ok(Fetched::File(Read {
                 bytes,
                 identity: identity(&metadata),
                 mode: metadata.permissions().mode() & 0o777,
+                owners: Owners {
+                    user: metadata.uid(),
+                    group: metadata.gid(),
+                },
             }))
         }
 
@@ -359,6 +389,11 @@ mod platform {
         }
     }
 
+    /// The user this process acts as.
+    pub(in crate::catalogue::native_bridge) fn acting_user() -> u32 {
+        rustix::process::geteuid().as_raw()
+    }
+
     /// True when `path`, followed as any program would follow it, leads to the file object
     /// `identity` names.
     fn leads_to(path: &Path, identity: &Identity) -> bool {
@@ -404,13 +439,18 @@ mod platform {
 mod platform {
     use std::path::{Path, PathBuf};
 
-    use super::{Child, Entry, Fetched, Identity, Unstaged};
+    use super::{Child, Entry, Fetched, Identity, Owners, Unstaged};
 
     fn unsupported() -> std::io::Error {
         std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "this host does not change an application's directory on this platform",
         )
+    }
+
+    /// No user is named here: nothing is ever replaced on this platform.
+    pub(in crate::catalogue::native_bridge) fn acting_user() -> u32 {
+        u32::MAX
     }
 
     /// An open directory. None is ever opened on this platform.
@@ -460,6 +500,13 @@ mod platform {
             &self,
             _name: &str,
         ) -> std::io::Result<bool> {
+            Err(unsupported())
+        }
+
+        pub(in crate::catalogue::native_bridge) fn owners(
+            &self,
+            _name: &str,
+        ) -> std::io::Result<Option<Owners>> {
             Err(unsupported())
         }
 
