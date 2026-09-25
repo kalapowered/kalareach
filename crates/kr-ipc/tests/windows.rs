@@ -886,32 +886,45 @@ fn a_descriptor_is_replaced_whole_and_a_reader_keeps_the_version_it_opened() {
     );
     drop(held);
 
+    // At least this many reads race the republication, so the evidence is a rate over a run long
+    // enough to catch a reader that opens a version mid-replacement: the reader that opened the file
+    // by full path and checked its list afterwards refused a handful of reads in every thousand,
+    // where the reader that opens each entry relative to the directory handle refuses none.
+    const CONCURRENT_READS: u64 = 1_200;
     let versions = [first, second];
+    let reads = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let reader = std::thread::spawn({
         let paths = paths.clone();
+        let reads = std::sync::Arc::clone(&reads);
         let stop = std::sync::Arc::clone(&stop);
         let versions = versions.clone();
         move || {
-            let mut reads = 0_u64;
             let mut wrong = Vec::new();
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 match kr_ipc::descriptor::read(&paths, versions[0].session_id) {
                     Ok(Some(found)) if versions.contains(&found) => {}
                     other => wrong.push(format!("{other:?}")),
                 }
-                reads += 1;
+                reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            (reads, wrong)
+            wrong
         }
     });
-    for round in 0..300 {
+    let mut round = 0_usize;
+    while reads.load(std::sync::atomic::Ordering::Relaxed) < CONCURRENT_READS {
         kr_ipc::descriptor::publish(&paths, &versions[round % 2])
             .unwrap_or_else(|error| panic!("publication {round} failed: {error}"));
+        round += 1;
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let (reads, wrong) = reader.join().expect("the reader finishes");
-    assert!(reads > 0, "the descriptor was read while it was published");
+    let wrong = reader.join().expect("the reader finishes");
+    let reads = reads.load(std::sync::atomic::Ordering::Relaxed);
+    println!("== concurrent reads: {reads}; refused: {}", wrong.len());
+    assert!(
+        reads >= CONCURRENT_READS,
+        "the descriptor was read while it was published"
+    );
     assert!(
         wrong.is_empty(),
         "{} of {reads} reads found something other than a whole version: {:?}",
@@ -940,14 +953,15 @@ fn run(program: &str, arguments: &[&std::ffi::OsStr]) -> String {
 /// Adding an entry is what every account may do to a thing it owns, so it is reliable across hosts
 /// in a way that narrowing a list with `icacls` is not: the same narrowing produced a different
 /// list on a hosted runner than on this machine, which is why these tests widen a list to prove a
-/// refusal rather than narrow one.
+/// refusal rather than narrow one. The grant carries no inheritance flags, which `icacls` applies
+/// to a file and a directory alike; the object's own list is what the reader checks.
 fn grant_full(path: &Path, account: &str) {
     run(
         "icacls.exe",
         &[
             path.as_os_str(),
             "/grant".as_ref(),
-            format!("*{account}:(OI)(CI)F").as_ref(),
+            format!("*{account}:F").as_ref(),
         ],
     );
 }
@@ -1061,11 +1075,13 @@ fn a_descriptor_reached_through_a_junction_is_refused() {
     );
 }
 
-/// KR-REQ-05.03: a descriptor directory swapped for another after it was checked is refused. The
-/// reader holds a handle on the directory it checked and opens every entry relative to it, so a
-/// file in a directory that took the checked one's name since is not one it reads.
+/// KR-REQ-05.03: a descriptor directory swapped for another after it was checked never hands back a
+/// file from the directory that took its name. The reader holds a handle on the directory it checked
+/// and opens every entry relative to it, the way `openat` does on Unix, so an impostor written into
+/// a directory that took the checked one's name since is never the file it reads: it reads the real
+/// descriptor from the directory it checked, or nothing.
 #[test]
-fn a_descriptor_directory_swapped_after_its_check_is_refused() {
+fn a_descriptor_directory_swapped_after_its_check_never_returns_the_impostor() {
     let host = TempHost::create();
     let paths = host.environment();
     let real = descriptor(&host, 7, "kalareach-descriptor-before-the-swap");
@@ -1076,7 +1092,8 @@ fn a_descriptor_directory_swapped_after_its_check_is_refused() {
         .expect("the directory is there");
 
     // The checked directory is moved aside and another put in its place, holding an impostor under
-    // the real descriptor's own name. The handle above still names the directory that was checked.
+    // the real descriptor's own name. The handle above still names the directory that was checked,
+    // which still holds the real descriptor.
     let sessions = paths.descriptors_dir();
     let moved = host.root().join("sessions-moved");
     std::fs::rename(&sessions, &moved).expect("the checked directory is moved aside");
@@ -1092,11 +1109,14 @@ fn a_descriptor_directory_swapped_after_its_check_is_refused() {
     )
     .expect("the impostor is written into the new directory");
 
-    let error = directory
+    // Read relative to the checked directory: the real descriptor, never the impostor.
+    let read = directory
         .read_entry(&paths.descriptor_file(real.session_id))
-        .expect_err("a file in the swapped directory is refused");
+        .expect("reads relative to the checked directory")
+        .expect("the real descriptor is still there");
     assert_eq!(
-        error.code(),
-        kr_protocol::error::ErrorCode::PermissionDenied
+        read, real,
+        "the reader reads the real descriptor, not the impostor"
     );
+    assert_ne!(read, impostor, "the impostor is never returned");
 }
