@@ -13,10 +13,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use kr_controller::service::net::rendezvous::{
+use kr_protocol::pairing::{Locator, RendezvousOrigin};
+use kr_protocol::rendezvous::{
     ClientFrame, CloseReason, MAX_FRAME_BYTES, ServiceFrame, decode_service_frame, encode_frame,
 };
-use kr_protocol::pairing::{Locator, RendezvousOrigin};
 use rustls_platform_verifier::BuilderVerifierExt;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;

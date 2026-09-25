@@ -26,9 +26,6 @@ use kr_client::error::ClientError;
 use kr_client::session::Session;
 use kr_client::transport::NetworkTransport;
 use kr_controller::service::net::pairing::HostPairingClock;
-use kr_controller::service::net::rendezvous::{
-    ClientFrame, ServiceFrame, decode_message, encode_message,
-};
 use kr_crypto::connect::PairedPeer;
 use kr_crypto::keys::DeviceKeys;
 use kr_pairing::budget::DurableClientBudgetStore;
@@ -58,6 +55,7 @@ use kr_protocol::pairing::{
 use kr_protocol::preauth::{
     PairFinishResult, PairRedeemParams, PairRedeemResult, PairStatusParams, PairStatusResult,
 };
+use kr_protocol::rendezvous::{ClientFrame, ServiceFrame, decode_message, encode_message};
 use kr_protocol::scalars::{Bytes, CanonicalSet, Digest256, DurationMs, EndpointKey, Nullable};
 use kr_transport::config::EndpointConfig;
 use kr_transport::handshake::{self, CandidateConnection, LocalIdentity};

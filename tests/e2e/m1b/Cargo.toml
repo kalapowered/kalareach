@@ -59,8 +59,8 @@ iroh = { workspace = true, optional = true }
 kr-cbor = { workspace = true, optional = true }
 # The paired device is this library, with the projected screen a client draws from.
 kr-client = { workspace = true, features = ["terminal"], optional = true }
-# The room's frame vocabulary, the owner-confirmation digest of a catalogue enrolment and the
-# pairing clock. The host itself is the `kr-controller` binary, never this library.
+# The owner-confirmation digest of a catalogue enrolment, the pairing clock and the host's worker
+# registry. The host itself is the `kr-controller` binary, never this library.
 kr-controller = { workspace = true, optional = true }
 kr-crypto = { workspace = true, optional = true }
 # Host directories, process identities and placing a binary on the internal disk.
