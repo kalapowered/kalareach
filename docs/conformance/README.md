@@ -63,12 +63,16 @@ Every `cargo test` step that keeps each test's output captured runs with `--show
 prints what every passing test wrote under its name. A step that shows the output as it is written,
 with `--nocapture`, keeps its script's command. Before a step runs, its tests are built and listed
 by the step's own command, so the build and its features are the step's, with `kr-conformance` as
-Cargo's runner, which frames each binary's list with the binary's own path. Every test binary the
-build made then has to be run and read: a listing that fails, a binary the log never ran, and a log
-that cannot be read are each the step's error. A target whose manifest
-gives it a harness of its own (`harness = false`) is a program that prints neither a list nor
-verdicts: the runner does not run it while the tests are listed, it is run with the step, its exit
-status is the step's, and a comment on it is a reference.
+Cargo's runner, which frames each binary's list with the binary's own path. Cargo hands the same
+runner to rustdoc, and the programs rustdoc builds of a crate's documentation tests are none of the
+build's and are keyed nowhere, so the listing passes over them; a test binary whose list overlaps
+another program's cannot be read and is the step's error. Every test binary the build made then has
+to be run and read: a listing that fails, a binary the log never ran, and a log that cannot be read
+are each the step's error, and the tests of a target the step built and did not run are not run,
+with that error as the reason. A target whose manifest gives it a harness of its own
+(`harness = false`) is a program that prints neither a list nor verdicts: the runner does not run
+it while the tests are listed, it is run with the step, its exit status is the step's, and a
+comment on it is a reference.
 
 A test that no selected group runs on this platform is reported as not run, with the reason. It is
 never reported as passed.
@@ -170,7 +174,7 @@ Each keyed test has one outcome on this platform:
 | `passed` | A step ran it and it passed |
 | `failed` | A step ran it and it failed, or its binary's output could not be read against the summary the harness printed |
 | `ignored` | Every step that listed it left it out, with the reason its `#[ignore]` gives |
-| `not_run` | No step of this run ran it here: a step's own flags left it out, no selected group runs its target on this platform, another toolchain builds it, or it returned early and said why. The reason says which |
+| `not_run` | No step of this run ran it here: a step's own flags left it out, no selected group runs its target on this platform, another toolchain builds it, a step that would run it failed before it did, or it returned early and said why. The reason says which |
 | `not_built` | A step ran its target and this platform's build of it has no such test |
 | `known_difference` | It ran and held what the profile defines, and it recorded that the application it is about reads the same thing differently |
 
