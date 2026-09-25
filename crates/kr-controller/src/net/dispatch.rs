@@ -3460,22 +3460,18 @@ mod tests {
         world.serving.abort();
     }
 
-    /// A device committed to `controller`'s records whose grant admits every read the method table
-    /// lets a paired device make: every right, every environment and session, the whole retained
-    /// history and the live screen, and a live voice grant beside it. What such a device is answered
-    /// is the routing's decision rather than its grant's.
-    fn paired_with_every_right(
+    /// A device committed to `controller`'s records, paired under the grant `shape` makes of one
+    /// that sees every session and nothing else: `session.view`, no retained history, no live
+    /// screen and no expiry.
+    fn paired(
         controller: &crate::service::Controller,
         byte: u8,
+        shape: impl FnOnce(&mut kr_protocol::grant::Grant),
     ) -> crate::service::net::devices::DeviceRecord {
-        use kr_protocol::rights::ActionRight;
-
         let revision = controller.policy().authority_revision();
         let (mut paired, _) =
             crate::service::net::tests::granted(kr_protocol::grant::GrantExpiry::Never, revision);
-        paired.actions = ActionRight::ALL.iter().copied().collect();
-        paired.history.lower_bound_ms = Nullable::some(kr_protocol::scalars::TimestampMs::new(0));
-        paired.history.include_live_screen = true;
+        shape(&mut paired);
         let device = crate::service::net::devices::DeviceRecord {
             device_id: paired.recipient_device_id,
             endpoint_id: kr_protocol::scalars::EndpointKey::from_bytes([byte; 32]),
@@ -3485,20 +3481,39 @@ mod tests {
             notification_preview: None,
             device_name: kr_protocol::pairing::DeviceName::new("A phone").expect("a name"),
             platform: kr_protocol::pairing::DevicePlatform::Ios,
-            grant: paired.clone(),
+            grant: paired,
             paired_at_ms: kr_protocol::scalars::TimestampMs::new(1),
             revoked_at_ms: None,
             committed_invitation_id: None,
             expired_at_ms: None,
         };
         controller.devices().commit(&device).expect("paired");
+        device
+    }
+
+    /// A device whose grant admits every read the method table lets a paired device make: every
+    /// right, every environment and session, the whole retained history and the live screen, and a
+    /// live voice grant beside it. What such a device is answered is the routing's decision rather
+    /// than its grant's.
+    fn paired_with_every_right(
+        controller: &crate::service::Controller,
+        byte: u8,
+    ) -> crate::service::net::devices::DeviceRecord {
+        use kr_protocol::rights::ActionRight;
+
+        let device = paired(controller, byte, |grant| {
+            grant.actions = ActionRight::ALL.iter().copied().collect();
+            grant.history.lower_bound_ms =
+                Nullable::some(kr_protocol::scalars::TimestampMs::new(0));
+            grant.history.include_live_screen = true;
+        });
         let voice_grant = kr_protocol::grant::Grant {
             grant_id: kr_protocol::ids::GrantId::new(kr_ipc::new_uuid()),
             issuer_device_id: controller.sharing().host_device_id(),
             actions: [ActionRight::VoiceUse, ActionRight::SessionView]
                 .into_iter()
                 .collect(),
-            ..paired
+            ..device.grant.clone()
         };
         controller
             .sharing()
@@ -3585,6 +3600,501 @@ mod tests {
             unrouted.is_empty(),
             "reads the method table admits for a paired device that reach the refusal kept for \
              methods it does not admit: {unrouted:?}"
+        );
+        world.serving.abort();
+    }
+
+    /// What a test's worker answers a forwarded read with, by the request; `None` refuses it.
+    type Answers = std::sync::Arc<
+        dyn Fn(&kr_protocol::envelope::Request) -> Option<ParamsValue> + Send + Sync,
+    >;
+
+    /// A daemon whose one worker answers each read a device's connection forwards to it with what
+    /// `answers` makes of the request, and refuses one `answers` has nothing for. Like the recording
+    /// worker, it installs any authority revision it is told of, answers the daemon's own
+    /// `session.read` with a live session and refuses every other request and forwarded mutation;
+    /// every frame it is sent after its handshake is kept in `recorded`.
+    async fn answering_worker(
+        answers: Answers,
+        recorded: crate::service::a_close_a_worker_never_answers::Recorded,
+    ) -> crate::service::a_close_a_worker_never_answers::Silent {
+        use std::sync::Arc;
+
+        use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+        use kr_protocol::error::{ErrorCode, ProtocolError};
+
+        use crate::service::a_close_a_worker_never_answers as fake;
+
+        let refused = |request_id: RequestId| {
+            ControlFrame::Response(Response {
+                request_id,
+                outcome: Outcome::Error(ProtocolError::new(
+                    ErrorCode::ResourceUnavailable,
+                    "this worker answers only the reads its test gave it",
+                )),
+            })
+        };
+        fake::fake_world(move |listener, identity, endpoint_text| {
+            tokio::spawn(async move {
+                loop {
+                    let Ok((connection, peer)) = listener.accept().await else {
+                        return;
+                    };
+                    let identity = Arc::clone(&identity);
+                    let endpoint_text = endpoint_text.clone();
+                    let answers = Arc::clone(&answers);
+                    let recorded = Arc::clone(&recorded);
+                    tokio::spawn(async move {
+                        let (mut reader, mut writer) = kr_ipc::framed::split(
+                            connection,
+                            kr_protocol::frame::StreamKind::Control,
+                        );
+                        let connection_id = kr_protocol::ids::ConnectionId::new(kr_ipc::new_uuid());
+                        while let Ok(frame) = reader.read_message::<ControlFrame>().await {
+                            let replies = match fake::handshake(
+                                &frame,
+                                &identity,
+                                &endpoint_text,
+                                connection_id,
+                                &peer,
+                            ) {
+                                Some(replies) => replies,
+                                None => {
+                                    let reply = match &frame {
+                                        ControlFrame::AuthorityRevision(notice) => {
+                                            Some(ControlFrame::AuthorityRevisionAck(
+                                                kr_protocol::worker::AuthorityRevisionAck {
+                                                    session_id: identity.session_id(),
+                                                    revision: notice.revision,
+                                                    fence: None,
+                                                },
+                                            ))
+                                        }
+                                        ControlFrame::Request(request)
+                                            if request.method == Method::SessionRead.into() =>
+                                        {
+                                            Some(ControlFrame::Response(Response {
+                                                request_id: request.request_id,
+                                                outcome: Outcome::Ok(
+                                                    ParamsValue::from_typed(&fake::read_result(
+                                                        identity.session_id(),
+                                                    ))
+                                                    .expect("encodes"),
+                                                ),
+                                            }))
+                                        }
+                                        ControlFrame::Request(request) => {
+                                            Some(refused(request.request_id))
+                                        }
+                                        ControlFrame::Forwarded(forwarded) => {
+                                            Some(refused(forwarded.mutation.request_id))
+                                        }
+                                        ControlFrame::ForwardedRead(forwarded) => {
+                                            Some(match answers(&forwarded.request) {
+                                                Some(value) => ControlFrame::Response(Response {
+                                                    request_id: forwarded.request.request_id,
+                                                    outcome: Outcome::Ok(value),
+                                                }),
+                                                None => refused(forwarded.request.request_id),
+                                            })
+                                        }
+                                        _ => None,
+                                    };
+                                    recorded
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .push(frame);
+                                    reply.into_iter().collect()
+                                }
+                            };
+                            for reply in replies {
+                                if writer.write_message(&reply).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    });
+                }
+            })
+        })
+        .await
+    }
+
+    /// The reads a worker was forwarded, in the order they arrived.
+    fn forwarded_reads(
+        recorded: &crate::service::a_close_a_worker_never_answers::Recorded,
+    ) -> Vec<kr_protocol::local::ForwardedRequest> {
+        recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter_map(|frame| match frame {
+                kr_protocol::envelope::ControlFrame::ForwardedRead(forwarded) => {
+                    Some(forwarded.as_ref().clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// One request of `method` from a device, with `params`.
+    fn device_request<P: serde::Serialize>(
+        request_id: u64,
+        method: Method,
+        params: &P,
+    ) -> kr_protocol::envelope::Request {
+        kr_protocol::envelope::Request {
+            request_id: RequestId::new(request_id),
+            method: method.into(),
+            method_version: MethodVersion::V1,
+            params: ParamsValue::from_typed(params).expect("encodes"),
+        }
+    }
+
+    /// The result an answer carries, or a panic naming the refusal it carries instead.
+    fn answered<T: kr_protocol::wire::WireMessage>(
+        answer: kr_protocol::envelope::ControlFrame,
+    ) -> T {
+        match answer {
+            kr_protocol::envelope::ControlFrame::Response(kr_protocol::envelope::Response {
+                outcome: kr_protocol::envelope::Outcome::Ok(value),
+                ..
+            }) => value.to_typed().expect("a result of the declared shape"),
+            other => panic!("the read was not answered: {other:?}"),
+        }
+    }
+
+    /// The refusal an answer carries, or a panic naming what it carries instead.
+    fn refusal(answer: kr_protocol::envelope::ControlFrame) -> kr_protocol::error::ProtocolError {
+        match answer {
+            kr_protocol::envelope::ControlFrame::Response(kr_protocol::envelope::Response {
+                outcome: kr_protocol::envelope::Outcome::Error(error),
+                ..
+            }) => error,
+            other => panic!("the read was not refused: {other:?}"),
+        }
+    }
+
+    /// One question the application inside `session_id` asked, as that session's worker holds it.
+    fn asked(
+        session_id: SessionId,
+        byte: u8,
+        created_at_ms: u64,
+    ) -> kr_protocol::question::Question {
+        use kr_protocol::question::{
+            Question, QuestionChoice, QuestionKind, QuestionSource, QuestionState,
+        };
+
+        Question {
+            question_id: kr_protocol::ids::QuestionId::new(Uuid::from_bytes([byte; 16])),
+            revision: kr_protocol::ids::QuestionRevision::new(1),
+            state: QuestionState::Pending,
+            session_id,
+            session_epoch: SessionEpoch::V1,
+            kind: QuestionKind::Confirm,
+            context: "two tests fail".to_owned(),
+            question: "push anyway?".to_owned(),
+            choices: vec![QuestionChoice::something_else()],
+            source: QuestionSource {
+                application_instance_id: kr_protocol::ids::ApplicationInstanceId::new(
+                    Uuid::from_bytes([3; 16]),
+                ),
+                process: kr_protocol::identity::ProcessStartIdentity::new(
+                    42,
+                    kr_protocol::identity::ProcessStartSource::LinuxProcStat,
+                    7,
+                ),
+                executable: Nullable::some("/usr/bin/some-agent".to_owned()),
+                agent_label: Nullable::null(),
+                connection_id: kr_protocol::ids::ConnectionId::new(Uuid::from_bytes([4; 16])),
+                launch_channel: false,
+                session_member: true,
+                ancestry: true,
+                agent_binding_revision: Nullable::null(),
+            },
+            created_at_ms: kr_protocol::scalars::TimestampMs::new(created_at_ms),
+            expires_at_ms: kr_protocol::scalars::TimestampMs::new(
+                created_at_ms.saturating_add(86_400_000),
+            ),
+            answer: Nullable::null(),
+            resolved_at_ms: Nullable::null(),
+        }
+    }
+
+    /// `question.read` from a paired device is answered by the worker of the session it names,
+    /// which is asked under the device's own envelope. What comes back is narrowed to the grant's
+    /// history scope: a question the grant names explicitly, and any asked at or after the moment
+    /// the grant reaches back to. A question the device names that the scope does not reach is
+    /// refused rather than answered empty, and a grant that retains no history and names no
+    /// question reads none. A device whose grant does not admit the session is refused before
+    /// anything reaches the worker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_device_reads_the_questions_its_grant_reaches_from_the_sessions_worker() {
+        use std::sync::Arc;
+
+        use kr_protocol::actor::ActorIngress;
+        use kr_protocol::error::ErrorCode;
+        use kr_protocol::ids::QuestionId;
+        use kr_protocol::question::{QuestionReadParams, QuestionReadResult};
+
+        use crate::service::a_close_a_worker_never_answers as fake;
+
+        // Three questions the session's worker holds: two asked before the moment the grant
+        // reaches back to, one of which the grant names, and one asked after it.
+        const EARLIER: u8 = 0x21;
+        const NAMED: u8 = 0x22;
+        const LATER: u8 = 0x23;
+        let question = |byte: u8| QuestionId::new(Uuid::from_bytes([byte; 16]));
+        let recorded: fake::Recorded = Arc::default();
+        let world = answering_worker(
+            Arc::new(|request: &kr_protocol::envelope::Request| {
+                if request.method != Method::QuestionRead.into() {
+                    return None;
+                }
+                let params: QuestionReadParams = request.params.to_typed().ok()?;
+                let questions = [
+                    asked(params.session_id, EARLIER, 1_000),
+                    asked(params.session_id, NAMED, 1_000),
+                    asked(params.session_id, LATER, 5_000),
+                ]
+                .into_iter()
+                .filter(|asked| {
+                    params
+                        .question_id
+                        .as_ref()
+                        .is_none_or(|wanted| asked.question_id == *wanted)
+                })
+                .collect();
+                ParamsValue::from_typed(&QuestionReadResult { questions }).ok()
+            }),
+            Arc::clone(&recorded),
+        )
+        .await;
+        let controller = &world.controller;
+        fake::acknowledged(controller, world.session_id);
+        let read = |request_id: u64, question_id: Option<QuestionId>| {
+            device_request(
+                request_id,
+                Method::QuestionRead,
+                &QuestionReadParams {
+                    session_id: world.session_id,
+                    question_id: Nullable(question_id),
+                    include_resolved: true,
+                },
+            )
+        };
+        let shown = |answer| {
+            answered::<QuestionReadResult>(answer)
+                .questions
+                .into_iter()
+                .map(|asked| asked.question_id)
+                .collect::<Vec<_>>()
+        };
+
+        // A device that sees this session, reaching back to 2 000 and naming one earlier question.
+        let reaching = paired(controller, 10, |grant| {
+            grant.history.lower_bound_ms =
+                Nullable::some(kr_protocol::scalars::TimestampMs::new(2_000));
+            grant.history.named_questions = [question(NAMED)].into_iter().collect();
+        });
+        let connection = super::RemoteConnection::for_test(controller, reaching.clone());
+        assert_eq!(
+            shown(connection.read(&read(1, None)).await),
+            vec![question(NAMED), question(LATER)],
+            "the question the grant names and the one asked after its lower bound, and not the one \
+             asked before it"
+        );
+        assert_eq!(
+            shown(connection.read(&read(2, Some(question(NAMED)))).await),
+            vec![question(NAMED)]
+        );
+        let hidden = refusal(connection.read(&read(3, Some(question(EARLIER)))).await);
+        assert_eq!(hidden.code, ErrorCode::PermissionDenied, "{hidden:?}");
+
+        // Each read reached the worker, and under this device's own envelope.
+        let forwarded = forwarded_reads(&recorded);
+        assert_eq!(forwarded.len(), 3, "{forwarded:?}");
+        for read in &forwarded {
+            assert_eq!(read.request.method, Method::QuestionRead.into());
+            assert_eq!(read.actor.ingress, ActorIngress::PairedDevice);
+            assert_eq!(read.actor.device_id, Nullable::some(reaching.device_id));
+            assert_eq!(read.actor.grant_id, Nullable::some(reaching.grant.grant_id));
+        }
+
+        // A grant that retains no history and names no question reads none of them.
+        let current_only = paired(controller, 11, |_| {});
+        let connection = super::RemoteConnection::for_test(controller, current_only);
+        assert!(shown(connection.read(&read(4, None)).await).is_empty());
+        assert_eq!(forwarded_reads(&recorded).len(), 4);
+
+        // A device whose grant sees another session is refused, and nothing reaches the worker.
+        let elsewhere = paired(controller, 12, |grant| {
+            grant.session_selector = kr_protocol::grant::SessionSelector::These {
+                session_ids: [SessionId::new(kr_ipc::new_uuid())].into_iter().collect(),
+            };
+        });
+        let connection = super::RemoteConnection::for_test(controller, elsewhere);
+        let outside = refusal(connection.read(&read(5, None)).await);
+        assert_eq!(outside.code, ErrorCode::PermissionDenied, "{outside:?}");
+        assert_eq!(
+            forwarded_reads(&recorded).len(),
+            4,
+            "a read the grant does not admit reaches no worker"
+        );
+        world.serving.abort();
+    }
+
+    /// `agent.capabilities` and `agent.commands` from a paired device are answered by the worker of
+    /// the session their subject names, which is asked under the device's own envelope, and they
+    /// come back as the worker answered them. The session a subject names is the one the grant is
+    /// checked against: a device whose grant does not admit it is refused before anything reaches
+    /// the worker, as it is for a read that names its session at the top of its parameters.
+    /// `agent.snapshot` is refused by name, because the shared history filter does not cover an
+    /// agent's retained history, and nothing reaches the worker for it either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_device_reads_an_agents_capabilities_and_commands_from_the_sessions_worker() {
+        use std::sync::Arc;
+
+        use kr_protocol::actor::ActorIngress;
+        use kr_protocol::agent::{
+            AgentBindingState, AgentCapabilitiesParams, AgentCapabilitiesResult, AgentCommand,
+            AgentCommandsParams, AgentCommandsResult, AgentSnapshotParams, AgentSubject,
+        };
+        use kr_protocol::error::ErrorCode;
+
+        use crate::service::a_close_a_worker_never_answers as fake;
+
+        let binding = AgentBindingState {
+            binding_revision: kr_protocol::ids::AgentBindingRevision::new(3),
+            thread_id: Nullable::null(),
+            turn_id: Nullable::null(),
+            profile_id: Nullable::null(),
+            mode: kr_protocol::broker::IntegrationMode::Gateway,
+            rich_mutations_suspended: false,
+            suspension_reason: Nullable::null(),
+        };
+        let capabilities = AgentCapabilitiesResult {
+            binding: binding.clone(),
+            capabilities: kr_protocol::broker::CapabilityMap {
+                records: Vec::new(),
+            },
+        };
+        let commands = AgentCommandsResult {
+            binding,
+            commands: vec![AgentCommand {
+                name: "new".to_owned(),
+                summary: "start a new conversation".to_owned(),
+                parameter_encoding: "none".to_owned(),
+            }],
+        };
+        let recorded: fake::Recorded = Arc::default();
+        let world = answering_worker(
+            {
+                let capabilities = capabilities.clone();
+                let commands = commands.clone();
+                Arc::new(move |request: &kr_protocol::envelope::Request| {
+                    match request.method.method()? {
+                        Method::AgentCapabilities => ParamsValue::from_typed(&capabilities).ok(),
+                        Method::AgentCommands => ParamsValue::from_typed(&commands).ok(),
+                        _ => None,
+                    }
+                })
+            },
+            Arc::clone(&recorded),
+        )
+        .await;
+        let controller = &world.controller;
+        fake::acknowledged(controller, world.session_id);
+        let subject = AgentSubject {
+            session_id: world.session_id,
+            application_instance_id: kr_protocol::ids::ApplicationInstanceId::new(
+                Uuid::from_bytes([5; 16]),
+            ),
+        };
+
+        // A device that sees every session.
+        let viewer = paired(controller, 13, |_| {});
+        let connection = super::RemoteConnection::for_test(controller, viewer.clone());
+        let read = device_request(
+            1,
+            Method::AgentCapabilities,
+            &AgentCapabilitiesParams { subject },
+        );
+        assert_eq!(
+            answered::<AgentCapabilitiesResult>(connection.read(&read).await),
+            capabilities
+        );
+        let read = device_request(2, Method::AgentCommands, &AgentCommandsParams { subject });
+        assert_eq!(
+            answered::<AgentCommandsResult>(connection.read(&read).await),
+            commands
+        );
+        let forwarded = forwarded_reads(&recorded);
+        assert_eq!(
+            forwarded
+                .iter()
+                .map(|read| read.request.method.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Method::AgentCapabilities.into(),
+                Method::AgentCommands.into()
+            ]
+        );
+        for read in &forwarded {
+            assert_eq!(read.actor.ingress, ActorIngress::PairedDevice);
+            assert_eq!(read.actor.device_id, Nullable::some(viewer.device_id));
+            assert_eq!(read.actor.grant_id, Nullable::some(viewer.grant.grant_id));
+        }
+
+        // The snapshot is refused by name, and nothing reaches the worker for it.
+        let read = device_request(
+            3,
+            Method::AgentSnapshot,
+            &AgentSnapshotParams {
+                subject,
+                from_node: Nullable::null(),
+            },
+        );
+        let snapshot = refusal(connection.read(&read).await);
+        assert_eq!(
+            snapshot.code,
+            ErrorCode::UnsupportedCapability,
+            "{snapshot:?}"
+        );
+        assert!(
+            snapshot.message.contains("agent.snapshot"),
+            "the refusal names the read: {snapshot:?}"
+        );
+        assert_eq!(forwarded_reads(&recorded).len(), 2);
+
+        // A device whose grant sees another session is refused the subject in this one, and
+        // nothing reaches the worker.
+        let elsewhere = paired(controller, 14, |grant| {
+            grant.session_selector = kr_protocol::grant::SessionSelector::These {
+                session_ids: [SessionId::new(kr_ipc::new_uuid())].into_iter().collect(),
+            };
+        });
+        let connection = super::RemoteConnection::for_test(controller, elsewhere);
+        for read in [
+            device_request(
+                4,
+                Method::AgentCapabilities,
+                &AgentCapabilitiesParams { subject },
+            ),
+            device_request(5, Method::AgentCommands, &AgentCommandsParams { subject }),
+        ] {
+            let outside = refusal(connection.read(&read).await);
+            assert_eq!(
+                outside.code,
+                ErrorCode::PermissionDenied,
+                "{}: {outside:?}",
+                read.method.as_str()
+            );
+        }
+        assert_eq!(
+            forwarded_reads(&recorded).len(),
+            2,
+            "a read the grant does not admit reaches no worker"
         );
         world.serving.abort();
     }
