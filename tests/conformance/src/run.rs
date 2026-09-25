@@ -7,11 +7,11 @@
 //! both have a test target called `fixtures`, and only the executable tells them apart.
 //!
 //! What the build names is what the run is held to. Every test binary it built is listed, through
-//! Cargo, and has to be run and read; a listing that fails, a binary the log never ran, and a log
-//! that cannot be read are each the step's error, so a step can never pass on less output than it
-//! was built for. A target with a harness of its own (`harness = false`) is a program that prints
-//! neither a list nor verdicts: it is never named in a listing, it is run with the step, and only
-//! its exit status, which is the step's, counts.
+//! Cargo and one target at a time, and has to be run and read; a listing that fails, a binary the
+//! log never ran, and a log that cannot be read are each the step's error, so a step can never pass
+//! on less output than it was built for. A target with a harness of its own (`harness = false`) is
+//! a program that prints neither a list nor verdicts: it is never named in a listing, it is run with
+//! the step, and only its exit status, which is the step's, counts.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -239,13 +239,13 @@ pub fn has_harness(packages: &[Package], target: &TargetId) -> bool {
 }
 
 /// Every test each binary of a step holds, whatever the step's own filters are, as Cargo lists
-/// them: one `cargo test -- --list` for each package, naming exactly the step's targets of that
-/// package, so each binary runs in the environment Cargo gives it. A target with a harness of its
-/// own is a program that would run rather than list, so it is never named.
+/// them: one `cargo test -- --list` for each of the step's targets, named by its own selector, so
+/// each binary lists in the environment Cargo gives it and each list is that one binary's. A target
+/// with a harness of its own is a program that would run rather than list, so it is never named.
 ///
 /// # Errors
 ///
-/// Returns the listing that failed, or one whose lists and binaries do not pair up: a binary that
+/// Returns the listing that failed, or one that printed other than exactly one list: a binary that
 /// lists nothing would have its tests judged from the run alone.
 fn list(
     step: &Step,
@@ -253,15 +253,12 @@ fn list(
     executables: &BTreeMap<String, TargetId>,
     packages: &[Package],
 ) -> Result<BTreeMap<TargetId, BTreeSet<String>>, String> {
-    let mut by_package: BTreeMap<&str, Vec<&TargetId>> = BTreeMap::new();
-    for target in executables.values() {
-        if has_harness(packages, target) {
-            by_package.entry(&target.package).or_default().push(target);
-        }
-    }
     let release = step.command.iter().any(|word| word == "--release");
     let mut listed = BTreeMap::new();
-    for (package, targets) in by_package {
+    for target in executables.values() {
+        if !has_harness(packages, target) || listed.contains_key(target) {
+            continue;
+        }
         let mut command: Vec<String> = ["cargo", "test", "--locked"]
             .into_iter()
             .map(str::to_owned)
@@ -269,16 +266,14 @@ fn list(
         if release {
             command.push("--release".to_owned());
         }
-        command.extend(["-p".to_owned(), package.to_owned()]);
-        for target in &targets {
-            command.extend(
-                target
-                    .kind
-                    .selector(&target.name)
-                    .split(' ')
-                    .map(str::to_owned),
-            );
-        }
+        command.extend(["-p".to_owned(), target.package.clone()]);
+        command.extend(
+            target
+                .kind
+                .selector(&target.name)
+                .split(' ')
+                .map(str::to_owned),
+        );
         command.extend(["--".to_owned(), "--list".to_owned()]);
         let output = place
             .command(&command)
@@ -296,54 +291,25 @@ fn list(
                     .map_or_else(|| "by a signal".to_owned(), |code| code.to_string())
             ));
         }
-        // Cargo's lines are on standard error and the binaries' on standard output, so the two are
-        // read apart and paired in order: each binary Cargo announces prints one list, which ends
-        // with its count line.
-        let announced: Vec<String> = libtest::plain(&String::from_utf8_lossy(&output.stderr))
-            .lines()
-            .filter_map(|line| {
-                let rest = line.trim_start().strip_prefix("Running ")?;
-                let (_, executable) = rest.rsplit_once(" (")?;
-                Some(file_name(executable.strip_suffix(')')?))
-            })
-            .collect();
-        let mut lists: Vec<BTreeSet<String>> = Vec::new();
-        let mut current = BTreeSet::new();
+        let mut names = BTreeSet::new();
+        let mut counts = 0;
         for line in libtest::plain(&String::from_utf8_lossy(&output.stdout)).lines() {
             if let Some(name) = line
                 .strip_suffix(": test")
                 .or_else(|| line.strip_suffix(": bench"))
             {
-                current.insert(name.to_owned());
+                names.insert(name.to_owned());
             } else if is_count(line) {
-                lists.push(std::mem::take(&mut current));
+                counts += 1;
             }
         }
-        if lists.len() != announced.len() {
+        if counts != 1 {
             return Err(format!(
-                "`{}` printed {} lists for the {} binaries Cargo announced",
-                command.join(" "),
-                lists.len(),
-                announced.len()
+                "`{}` printed {counts} lists where its one binary prints one",
+                command.join(" ")
             ));
         }
-        for (executable, names) in announced.into_iter().zip(lists) {
-            let target = executables.get(&executable).ok_or_else(|| {
-                format!("the listing names {executable}, which the step's build did not make")
-            })?;
-            listed.insert(target.clone(), names);
-        }
-        let unlisted: Vec<String> = targets
-            .iter()
-            .filter(|target| !listed.contains_key(**target))
-            .map(ToString::to_string)
-            .collect();
-        if !unlisted.is_empty() {
-            return Err(format!(
-                "the listing leaves out {}, which the step's build made",
-                unlisted.join(", ")
-            ));
-        }
+        listed.insert(target.clone(), names);
     }
     Ok(listed)
 }
