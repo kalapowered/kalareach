@@ -382,8 +382,8 @@ settles from what is on disk. What is still at its temporary name with the recor
 never put in place, and is removed. A destination holding that identity is the host's, whatever is
 at the temporary name now, and is recorded as in place only after its directory is flushed. An
 absence is flushed before its record goes too, so a removal a stopped run made is durable before it
-is forgotten, and a record of something left or not settled goes only once what it names is gone
-from its own directory and that is flushed. Anything else is left alone.
+is forgotten, and a record goes only once what it names is gone from its own directory and that is
+flushed, with the document synced too where the record is a key. Anything else is left alone.
 
 Two things can be the host's without the host being able to show it: something at a temporary name
 when the run stopped before recording what it made there, and a key whose document was replaced
@@ -401,10 +401,10 @@ the removal is reported as unfinished, and it is taken out once the original com
 An application either finishes, or is taken out and recorded as refused with its reason. When
 something cannot be taken out, such as a file in a directory that is no longer writable, the bridge
 stays recorded as being removed, names what is left, and the next reconciliation tries again. A
-refusal is reported as clean only when nothing of it is left: what its undo had to leave because
-somebody changed it is recorded with the refusal and named, and the refusal stays unsettled, in the
-journal and in every later report, until that is gone. A release is reported as applied only once
-every change is in place and nothing is unsettled.
+refusal is reported as clean only when nothing the host placed is left: while anything a removal or
+a refusal had to leave because somebody changed it is still there, the refusal is reported as
+unsettled, by every later run and report, and what is left is named. A release is reported as
+applied only once every change is in place and nothing is unsettled.
 
 A removal takes out each file only while it is the file the host installed and still holds the bytes
 installed: a copy with the same bytes put in its place is somebody's own, and is left. The key goes
