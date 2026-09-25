@@ -1590,6 +1590,9 @@ mod platform {
     /// How the unit kr writes is started.
     const START_TYPE: &str = "exec";
 
+    /// The load state of a unit the manager read without a fault.
+    const LOADED: &str = "loaded";
+
     impl Unit {
         /// Why the user manager would not run the definition kr wrote as kr wrote it, when it
         /// would not.
@@ -1619,6 +1622,14 @@ mod platform {
                         self.load_state
                     ));
                 }
+            }
+            if self.load_state != LOADED {
+                return Some(format!(
+                    "the user manager holds {name} as {}, not as the definition kr wrote loaded \
+                     cleanly; {}",
+                    self.load_state,
+                    self.reads()
+                ));
             }
             let written = Command {
                 program: definition.program.clone(),
@@ -2456,6 +2467,13 @@ mod tests {
             ),
             (held(&path, Vec::new(), &[]), "ExecStartEx with no command"),
             (started("notify"), "Type notify"),
+            (
+                platform::Unit {
+                    load_state: "bad-setting".to_owned(),
+                    ..held(&path, only(exact.clone()), &["/x/y.service.d/broken.conf"])
+                },
+                "holds kr-controller-test.service as bad-setting",
+            ),
         ] {
             let why = unit.difference(&written).expect("a difference");
             assert!(why.contains(what), "{what}: {why}");
