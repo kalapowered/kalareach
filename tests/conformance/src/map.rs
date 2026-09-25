@@ -14,8 +14,9 @@
 //!   module;
 //! * in test code, a comment on a function keys every test of the same target whose body calls it,
 //!   which is how a case that thin per-shell or per-platform tests share is keyed where it is
-//!   written; a call is resolved as the compiler resolves it, through `use` declarations and
-//!   globs, and one the reading cannot follow to that one function keys nothing;
+//!   written; a call is followed step by step through definitions, `crate`, `self`, `super`, a
+//!   `use` that keeps the item's name and a glob one module answers for, and one the reading cannot
+//!   follow to that one function keys nothing;
 //! * a `const` or `static` case table names identifiers in its `covers` fields, and those key every
 //!   test of the same package whose body names the table.
 //!
@@ -414,21 +415,50 @@ enum Resolved {
 const DEPTH: usize = 8;
 
 impl Scope {
-    /// The declarations that bring names into `module`: the calling body's own first, then the
-    /// module's.
-    fn imports_of<'a>(
-        &'a self,
-        module: &[String],
-        local: &'a [Import],
-    ) -> impl Iterator<Item = &'a Import> {
-        local
-            .iter()
-            .chain(self.imports.get(module).into_iter().flatten())
+    /// Whether the calling body brings `name` in for itself, in any of its blocks, or brings in
+    /// a glob, which could be any name. A name a body binds is not followed.
+    fn bound_in_body(local: &[Import], name: &str) -> bool {
+        local.iter().any(|import| match import {
+            Import::Name { name: bound, .. } => bound == name,
+            Import::Glob { .. } => true,
+        })
+    }
+
+    /// The path of the `use` of `module` that brings `name` in by that very name. `Err` when a
+    /// `use` brings some other item in under that name, which is not followed.
+    fn plain_import(&self, module: &[String], name: &str) -> Result<Option<&Vec<String>>, ()> {
+        for import in self.imports.get(module).into_iter().flatten() {
+            if let Import::Name { name: bound, path } = import
+                && bound == name
+            {
+                return if path.last().map(String::as_str) == Some(name) {
+                    Ok(Some(path))
+                } else {
+                    Err(())
+                };
+            }
+        }
+        Ok(None)
+    }
+
+    /// The modules of `module`'s globs, as far as each can be followed.
+    fn globs(&self, module: &[String], depth: usize) -> Vec<Vec<String>> {
+        self.imports
+            .get(module)
+            .into_iter()
+            .flatten()
+            .filter_map(|import| match import {
+                Import::Glob { path } => self.module(module, path, &[], depth + 1),
+                Import::Name { .. } => None,
+            })
+            .collect()
     }
 
     /// The module `path` names when it is written in `from`: from the crate's root after `crate`,
     /// from `from` after `self`, up one module for each `super`, and otherwise from a first name
-    /// that is a child module of `from` or a module a `use` there brings in.
+    /// that is a child module of `from`, or a module a `use` there brings in by its own name, or a
+    /// child of exactly one module a glob there brings in. Every later name has to be a child
+    /// module. Anything else is not followed.
     fn module(
         &self,
         from: &[String],
@@ -443,7 +473,12 @@ impl Scope {
             None => return Some(from.to_vec()),
             Some("crate") => (Vec::new(), &path[1..]),
             Some("self" | "super") => (from.to_vec(), path),
-            Some(first) => (self.named_module(from, first, local, depth)?, &path[1..]),
+            Some(first) => {
+                if Self::bound_in_body(local, first) {
+                    return None;
+                }
+                (self.named_module(from, first, depth)?, &path[1..])
+            }
         };
         for segment in rest {
             match segment.as_str() {
@@ -462,74 +497,64 @@ impl Scope {
         Some(at)
     }
 
-    /// The module one name refers to in `from`: a child module, a module a `use` brings in by that
-    /// name, or a child of a module a glob brings in.
-    fn named_module(
-        &self,
-        from: &[String],
-        name: &str,
-        local: &[Import],
-        depth: usize,
-    ) -> Option<Vec<String>> {
+    /// The module one name refers to in `from`, as [`Self::module`] reads a first name.
+    fn named_module(&self, from: &[String], name: &str, depth: usize) -> Option<Vec<String>> {
         let child: Vec<String> = from.iter().cloned().chain([name.to_owned()]).collect();
         if self.modules.contains(&child) {
             return Some(child);
         }
-        for import in self.imports_of(from, local) {
-            if let Import::Name {
-                name: imported,
-                path,
-            } = import
-                && imported == name
-            {
-                return self.module(from, path, &[], depth + 1);
-            }
+        match self.plain_import(from, name) {
+            Err(()) => return None,
+            Ok(Some(path)) => return self.module(from, path, &[], depth + 1),
+            Ok(None) => {}
         }
-        self.imports_of(from, local)
-            .find_map(|import| match import {
-                Import::Glob { path } => {
-                    let mut child = self.module(from, path, &[], depth + 1)?;
-                    child.push(name.to_owned());
-                    self.modules.contains(&child).then_some(child)
-                }
-                Import::Name { .. } => None,
+        let found: BTreeSet<Vec<String>> = self
+            .globs(from, depth)
+            .into_iter()
+            .map(|mut module| {
+                module.push(name.to_owned());
+                module
             })
+            .filter(|module| self.modules.contains(module))
+            .collect();
+        (found.len() == 1)
+            .then(|| found.into_iter().next())
+            .flatten()
     }
 
-    /// What calling `name` in `from` calls. The calling body's own `use` comes first; then a
-    /// function of the module itself, or a name a `use` of the module brings in, followed to where
-    /// it is defined; then the modules its globs bring in, where exactly one of them must have it.
+    /// The function calling `name` in `from` calls: the module's own function of that name, the
+    /// one a `use` of the module brings in by its own name, or the one exactly one of its globs
+    /// brings in. A name the calling body binds, a `use` that renames, and anything else are not
+    /// followed, and a call that is not followed keys nothing.
     fn function(&self, from: &[String], name: &str, local: &[Import], depth: usize) -> Resolved {
-        if depth > DEPTH {
+        if depth > DEPTH || Self::bound_in_body(local, name) {
             return Resolved::Unproved;
-        }
-        let follow = |path: Vec<String>| {
-            let Some((last, modules)) = path.split_last() else {
-                return Resolved::Unproved;
-            };
-            self.module(from, modules, local, depth + 1)
-                .map_or(Resolved::Unproved, |module| {
-                    self.function(&module, last, &[], depth + 1)
-                })
-        };
-        if let Some(path) = imported(local.iter(), name) {
-            return follow(path);
         }
         if self.functions.contains(&(from.to_vec(), name.to_owned())) {
             return Resolved::Function(from.to_vec());
         }
-        if let Some(path) = imported(self.imports.get(from).into_iter().flatten(), name) {
-            return follow(path);
-        }
-        let mut found = BTreeSet::new();
-        for import in self.imports_of(from, local) {
-            if let Import::Glob { path } = import
-                && let Some(module) = self.module(from, path, &[], depth + 1)
-                && let Resolved::Function(defined) = self.function(&module, name, &[], depth + 1)
-            {
-                found.insert(defined);
+        match self.plain_import(from, name) {
+            Err(()) => return Resolved::Unproved,
+            Ok(Some(path)) => {
+                let modules = &path[..path.len().saturating_sub(1)];
+                return self
+                    .module(from, modules, &[], depth + 1)
+                    .map_or(Resolved::Unproved, |module| {
+                        self.function(&module, name, &[], depth + 1)
+                    });
             }
+            Ok(None) => {}
         }
+        let found: BTreeSet<Vec<String>> = self
+            .globs(from, depth)
+            .into_iter()
+            .filter_map(
+                |module| match self.function(&module, name, &[], depth + 1) {
+                    Resolved::Function(defined) => Some(defined),
+                    Resolved::Unproved => None,
+                },
+            )
+            .collect();
         match found.len() {
             1 => Resolved::Function(found.into_iter().next().unwrap_or_default()),
             _ => Resolved::Unproved,
@@ -537,22 +562,14 @@ impl Scope {
     }
 }
 
-/// The path a `use` among `imports` brings `name` in by.
-fn imported<'a>(mut imports: impl Iterator<Item = &'a Import>, name: &str) -> Option<Vec<String>> {
-    imports.find_map(|import| match import {
-        Import::Name {
-            name: imported,
-            path,
-        } if imported == name => Some(path.clone()),
-        _ => None,
-    })
-}
-
 /// Whether a call written in the module `from` by `path` reaches `helper`.
 ///
-/// Only a call the target's own source proves is one: the path is resolved the way the compiler
-/// resolves it, through the calling body's `use` declarations, the module's functions, its `use`
-/// declarations and its globs, and a call this reading cannot follow to one function keys nothing.
+/// A call keys a helper only when the reading follows it, step by step, to that helper: through
+/// module definitions, `crate`, `self` and `super`, a `use` that brings an item in by its own name,
+/// and a glob that exactly one module answers for. It gives up at a renaming `use`, at a name or a
+/// glob the calling body brings in for itself, and at anything else, and a call it gives up on
+/// keys nothing. So a key is never one the compiler would not make; a call the reading cannot
+/// follow leaves the helper's identifiers as references, which the result lists.
 fn reaches(
     path: &[String],
     from: &[String],
