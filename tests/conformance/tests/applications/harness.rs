@@ -48,7 +48,7 @@ use kr_protocol::scalars::{CanonicalSet, Nullable};
 use kr_protocol::session::{Dimensions, DisplayNumber, ShellMode};
 use kr_worker::pty::ShellCommand;
 use kr_worker::runtime::SessionRuntime;
-use kr_worker::service::{ServiceBinding, WorkerService};
+use kr_worker::service::{MAX_OUTPUT_EVENT_BYTES, ServiceBinding, WorkerService};
 use kr_worker::session::{Session as WorkerSession, SessionConfig};
 
 /// How long a wait for something to happen is given. It is a liveness bound, not a measurement:
@@ -236,10 +236,12 @@ pub struct Session {
 struct Capture {
     /// The bytes, in the order they came.
     bytes: Vec<u8>,
-    /// The greatest stream position an event it was sent names: where an output span starts, or
-    /// the position a projected screen describes. One connection delivers in order, so every span
-    /// that starts before it has already arrived.
-    latest: Option<u64>,
+    /// The greatest stream position a whole delivery it was sent names: where an output span
+    /// starts, the position a screen describes, or the position of a projected screen, a change to
+    /// it or its reset. A delivery that takes several events, a large span or screen in chunks or a
+    /// projected screen in pages, counts only once its last event has arrived. One connection
+    /// delivers in order, so everything sent before it has arrived as well.
+    settled: Option<u64>,
     /// How many events of each type it was sent, which a failure reports.
     seen: std::collections::BTreeMap<String, u64>,
     /// How many times the worker told the terminal its view was no longer continuous, which the
@@ -249,6 +251,18 @@ struct Capture {
     /// ended, an event could not be decoded, a new subscription was refused, or the terminal was
     /// detached.
     broken: Option<String>,
+}
+
+impl Capture {
+    /// Takes note of an event at `position`, which ends its delivery when `last` says so.
+    fn took(&mut self, position: u64, last: bool) {
+        if last {
+            self.settled = Some(
+                self.settled
+                    .map_or(position, |settled| settled.max(position)),
+            );
+        }
+    }
 }
 
 struct Keys {
@@ -534,7 +548,7 @@ impl Session {
                 if let Some(broken) = &capture.broken {
                     panic!("the typing terminal's capture is not the whole stream: {broken}");
                 }
-                if capture.latest.is_some_and(|latest| latest >= boundary)
+                if capture.settled.is_some_and(|settled| settled >= boundary)
                     || !crate::queries::find(&capture.bytes).is_empty()
                 {
                     return capture.bytes.clone();
@@ -718,9 +732,10 @@ async fn keep_output(
         if let Ok(mut kept) = capture.lock() {
             *kept.seen.entry(kind.clone()).or_default() += 1;
         }
-        // Where in the stream the event is: an output span's start, or the position a projected
-        // screen, a page of its rows, a change to it or its reset describes. A terminal the worker
-        // has moved to a projection is sent no bytes at all until it is moved back.
+        // Where in the stream the event is, and whether it ends its delivery: an output span's
+        // start or a screen's position, whose last chunk is the one shorter than a full chunk; a
+        // projected screen, whose last page says there is no more; a change to one, or its reset.
+        // A terminal the worker has moved to a projection is sent no bytes until it is moved back.
         let position = match kind.as_str() {
             "session.output" => notification
                 .payload
@@ -729,35 +744,38 @@ async fn keep_output(
                     if let Ok(mut kept) = capture.lock() {
                         kept.bytes.extend_from_slice(event.bytes.as_slice());
                     }
-                    Some(event.cursor.get())
+                    Some((
+                        event.cursor.get(),
+                        event.bytes.as_slice().len() < MAX_OUTPUT_EVENT_BYTES,
+                    ))
                 })
                 .map_err(|error| error.to_string()),
             PROJECTION_SNAPSHOT_EVENT => notification
                 .payload
                 .to_typed::<ProjectionSnapshot>()
-                .map(|snapshot| Some(snapshot.output_cursor.get()))
+                .map(|snapshot| Some((snapshot.output_cursor.get(), false)))
                 .map_err(|error| error.to_string()),
             PROJECTION_ROWS_EVENT => notification
                 .payload
                 .to_typed::<ProjectionRowPage>()
-                .map(|page| Some(page.output_cursor.get()))
+                .map(|page| Some((page.output_cursor.get(), !page.more)))
                 .map_err(|error| error.to_string()),
             PROJECTION_DELTA_EVENT => notification
                 .payload
                 .to_typed::<ProjectionDelta>()
-                .map(|delta| Some(delta.next_cursor.get()))
+                .map(|delta| Some((delta.next_cursor.get(), true)))
                 .map_err(|error| error.to_string()),
             PROJECTION_RESET_EVENT => notification
                 .payload
                 .to_typed::<ProjectionReset>()
-                .map(|reset| Some(reset.cursor.get()))
+                .map(|reset| Some((reset.cursor.get(), true)))
                 .map_err(|error| error.to_string()),
             _ => Ok(None),
         };
         match position {
-            Ok(Some(position)) => {
+            Ok(Some((position, last))) => {
                 if let Ok(mut kept) = capture.lock() {
-                    kept.latest = Some(kept.latest.map_or(position, |latest| latest.max(position)));
+                    kept.took(position, last);
                 }
             }
             Ok(None) => {}
@@ -968,4 +986,28 @@ pub fn ascii_suffix_column(screen: &Screen, row: usize, suffix: &str) -> Option<
     let tail = &run.text[at..];
     tail.is_ascii()
         .then(|| run.column + run.cells - tail.len() as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Capture;
+
+    #[test]
+    fn a_delivery_in_several_events_settles_only_with_its_last() {
+        let mut capture = Capture::default();
+        // A screen in two chunks at one position: the first is not the whole screen.
+        capture.took(40, false);
+        assert_eq!(capture.settled, None);
+        capture.took(40, true);
+        assert_eq!(capture.settled, Some(40));
+        // A projected screen's header and a page with more to come settle nothing further.
+        capture.took(90, false);
+        capture.took(90, false);
+        assert_eq!(capture.settled, Some(40));
+        capture.took(90, true);
+        assert_eq!(capture.settled, Some(90));
+        // An earlier position never takes a settled one back.
+        capture.took(60, true);
+        assert_eq!(capture.settled, Some(90));
+    }
 }

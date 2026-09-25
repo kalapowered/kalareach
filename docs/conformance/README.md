@@ -279,8 +279,10 @@ screen the program itself says it is showing, and shows that no query the progra
 attached terminal: the stream the attachment was sent is searched for every request a terminal
 answers, independently of the engine's own class table. That search waits until the attachment has
 provably been sent everything up to the end of the program's last query: the worker sends each event
-with the position in the stream it starts at or describes, in order, so once an event from past that
-point has arrived, nothing before it is still on its way. An attachment the worker tells to
+with the position in the stream it starts at or describes, in order, so once a delivery from past
+that point has arrived whole, nothing before it is still on its way. A delivery that takes several
+events, a screen in chunks or a projected screen in pages, is whole only once its last event has
+arrived. An attachment the worker tells to
 resynchronise subscribes again, as the product's own client does, and is sent a fresh screen from
 the session's position; one the worker moves to a projection is sent screens rather than bytes, so
 nothing the program writes reaches it at all. A capture that broke, through a lost connection, an
