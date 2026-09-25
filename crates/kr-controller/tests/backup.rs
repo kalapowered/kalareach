@@ -5550,6 +5550,9 @@ enum Fault {
     /// It arrives and is never answered, and nothing is done: the caller waits for as long as it
     /// is willing to.
     Hang,
+    /// A publication on its way that has not reached the service: the caller waits for as long as
+    /// it is willing to, and the request arrives only when [`Web::deliver_late`] delivers it.
+    Delayed,
 }
 
 /// Where one upload the scripted service created has got to.
@@ -5581,6 +5584,8 @@ struct Scripted {
     times_stored: BTreeMap<(ArchiveId, BackupObjectId), u32>,
     times_written: BTreeMap<(String, u32), u32>,
     published: BTreeMap<(ArchiveId, BackupGeneration), BackupGenerationPublication>,
+    /// Publications on their way that have not reached the service.
+    in_flight: Vec<BackupGenerationPublication>,
     asked: Vec<Asked>,
     faults: Vec<(Kind, usize, Fault)>,
     sent: BTreeMap<Kind, usize>,
@@ -5595,7 +5600,9 @@ type PartHook = Box<dyn FnMut(u32) + Send>;
 /// An object's identity stays live while an upload of it is open or it is stored. A part sent
 /// again is answered as the part the service holds, a completion asked for again with the result
 /// it gave, and a publication sent again as a duplicate; a publication is held to its writer's
-/// signature, and a deleted collection takes neither an upload nor a publication.
+/// signature, and a deleted collection takes neither an upload nor a publication. A collection
+/// takes no generation at or below the newest it has held, whatever order publications arrive in,
+/// and a fetch of the newest is answered with the highest generation it holds.
 struct Web {
     writer: AuthorisationKey,
     writer_key_id: KeyId,
@@ -5657,7 +5664,8 @@ fn answered<T>(
             let _ = take();
             Err(unanswered())
         }
-        Some(Fault::Hang) | None => take(),
+        // A publication told to hang or to be delayed never gets here: it waits first.
+        Some(Fault::Hang | Fault::Delayed) | None => take(),
     }
 }
 
@@ -5772,7 +5780,7 @@ impl Web {
         self.stored_once();
     }
 
-    /// Counts one request of `kind`, notes it unless it never arrives, and returns the fault
+    /// Counts one request of `kind`, notes it unless it has not arrived, and returns the fault
     /// scripted for it.
     fn arriving(&self, kind: Kind, asked: Asked) -> Option<Fault> {
         let mut state = self.scripted();
@@ -5785,10 +5793,31 @@ impl Web {
             .iter()
             .position(|(which, at, _)| *which == kind && *at == nth)
             .map(|index| scripted.faults.remove(index).2);
-        if fault != Some(Fault::Dropped) {
+        if !matches!(fault, Some(Fault::Dropped | Fault::Delayed)) {
             scripted.asked.push(asked);
         }
         fault
+    }
+
+    /// The publications on their way reach the service now, in the order they were sent, and
+    /// each is answered as the service answers it then.
+    fn deliver_late(&self) -> Vec<kr_client::Result<ArchiveAnswer<Published>>> {
+        let late = std::mem::take(&mut self.scripted().in_flight);
+        late.iter()
+            .map(|publication| {
+                self.scripted().asked.push(Asked::Publish(
+                    publication.payload.descriptor.backup_generation,
+                ));
+                self.take_publication(publication)
+            })
+            .collect()
+    }
+
+    /// The publication a fetch of the archive's newest generation is answered with.
+    fn newest(&self) -> Option<BackupGenerationPublication> {
+        self.find_generation(archive_id(), None)
+            .expect("a fetch")
+            .map(|fetched| fetched.publication)
     }
 
     fn take_create(&self, upload: &NewUpload) -> kr_client::Result<ArchiveAnswer<UploadCreated>> {
@@ -6023,6 +6052,20 @@ impl Web {
                 ));
             }
             None => {
+                // The collection's checkpoint: the newest generation it has ever held. Nothing
+                // here drops a publication, so the newest one held is that checkpoint.
+                let checkpoint = scripted
+                    .published
+                    .keys()
+                    .filter(|(archive, _)| *archive == descriptor.archive_id)
+                    .map(|(_, generation)| *generation)
+                    .max();
+                if checkpoint.is_some_and(|newest| descriptor.backup_generation <= newest) {
+                    return Err(refused(
+                        ErrorCode::PermissionDenied,
+                        "This collection has published that generation or a later one.",
+                    ));
+                }
                 scripted.published.insert(key, publication.clone());
                 false
             }
@@ -6203,7 +6246,10 @@ impl BackupManifestService for Web {
                 Kind::Publish,
                 Asked::Publish(publication.payload.descriptor.backup_generation),
             );
-            if fault == Some(Fault::Hang) {
+            if fault == Some(Fault::Delayed) {
+                self.scripted().in_flight.push(publication.clone());
+            }
+            if matches!(fault, Some(Fault::Hang | Fault::Delayed)) {
                 std::future::pending::<()>().await;
             }
             answered(fault, || self.take_publication(publication))
@@ -6606,6 +6652,72 @@ async fn a_crash_after_any_step_and_a_restart_finish_the_generation_once_with_no
             "every attempt ended after a stop after {stopped_after} steps"
         );
         assert_eq!(host.web.stored_objects(), 2);
+        host.web.nothing_asked_twice();
+    }
+}
+
+/// A publication on its way when this host stopped is the one outcome a restart can leave unknown,
+/// and it changes nothing newer. Reaching the service after the next generation is published, it
+/// is refused, because the service takes no generation at or below the newest it has held; the
+/// newer generation stays the one a fetch of the newest is answered with.
+#[tokio::test]
+async fn a_publication_that_lands_after_a_newer_generation_is_refused_and_hides_nothing() {
+    for lands_first in [false, true] {
+        let mut host = Host::open();
+        host.admit(1, &[64]);
+        host.web.fail(Kind::Publish, 1, Fault::Delayed);
+        {
+            let mut uploader = host.uploader(10_000);
+            let stopped = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                uploader.pass(TimestampMs::new(10_000)),
+            )
+            .await;
+            assert!(
+                stopped.is_err(),
+                "the host stopped while its publication was on its way"
+            );
+        }
+        let (mut uploader, settled) = host.restart(20_000).await;
+        assert!(settled.is_empty(), "the service does not hold it yet");
+        assert_eq!(host.generation(1).remote, Remote::Unknown);
+
+        if lands_first {
+            // The control. Before a newer generation is published the service takes this same
+            // publication, so what refuses it below is when it arrives, not what it is.
+            let answers = host.web.deliver_late();
+            assert!(
+                matches!(answers.as_slice(), [Ok(ArchiveAnswer::Done(_))]),
+                "{answers:?}"
+            );
+        }
+
+        // The next generation carries the backup.
+        host.admit(2, &[64]);
+        passes(&mut uploader, 20_000).await;
+        let record = host.generation(2);
+        assert_eq!(record.production, Production::Complete, "{lands_first}");
+        assert_eq!(record.remote, Remote::Published, "{lands_first}");
+        let newer = host
+            .web
+            .publication(2)
+            .expect("the next generation is published");
+
+        if !lands_first {
+            let answers = host.web.deliver_late();
+            let [Err(ClientError::Refused { error, .. })] = answers.as_slice() else {
+                panic!("the service took a publication older than one it holds: {answers:?}");
+            };
+            assert_eq!(error.code, ErrorCode::PermissionDenied);
+            assert!(host.web.publication(1).is_none(), "nothing of it is held");
+        }
+        // Whenever it arrived, the newer generation is as it was published and is the newest.
+        assert_eq!(host.web.publication(2).as_ref(), Some(&newer));
+        assert_eq!(host.web.newest(), Some(newer), "{lands_first}");
+
+        // This host sent it once and never again.
+        passes(&mut uploader, 20_000 + ADMISSIBLE_MS).await;
+        assert!(host.service.outbox().expect("a read").is_empty());
         host.web.nothing_asked_twice();
     }
 }
