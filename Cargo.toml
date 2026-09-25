@@ -201,7 +201,7 @@ wezterm-escape-parser = { git = "https://github.com/kalapowered/wezterm", rev = 
 wezterm-surface = { git = "https://github.com/kalapowered/wezterm", rev = "9a9015119497fd5803c35a10ea4ffc503f2a7dfb" }
 wezterm-term = { git = "https://github.com/kalapowered/wezterm", rev = "9a9015119497fd5803c35a10ea4ffc503f2a7dfb" }
 widestring = "=1.2.0"
-windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
+windows-sys = { version = "=0.61.2", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
 wit-parser = "=0.259.0"
 zeroize = { version = "=1.9.0", features = ["derive"] }
 
