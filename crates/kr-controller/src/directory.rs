@@ -10,7 +10,8 @@
 //!
 //! Beside each worker is what it last said about its session. A worker that has finished its
 //! closure stops answering before the kernel says its process has ended, and in between that is
-//! what the daemon knows of the session.
+//! what the daemon knows of the session. A worker this daemon finds when it starts is admitted
+//! with its own description of its session, asked for over the connection it proved itself on.
 //!
 //! Nothing here kills a worker. A daemon restart is not a reason to end a shell.
 
@@ -22,14 +23,16 @@ use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::identity::BootIdentity;
 use kr_protocol::ids::{BuildId, ControllerGeneration, SessionId};
 use kr_protocol::local::LocalClientKind;
+use kr_protocol::method::Method;
 use kr_protocol::scalars::Nullable;
-use kr_protocol::session::{SessionReadResult, SessionState, SessionSummary};
+use kr_protocol::session::{SessionReadParams, SessionReadResult, SessionState, SessionSummary};
 use kr_protocol::worker::WorkerDescriptor;
 
 use crate::error::Result;
 use crate::registry::Registry;
 
-/// How long one worker has to answer its challenge and accept a generation during a rebuild.
+/// How long one worker has to answer its challenge, accept a generation and describe its session
+/// during a rebuild.
 ///
 /// A silent endpoint is a reason to quarantine one descriptor, never a reason for the daemon not
 /// to finish starting.
@@ -121,13 +124,13 @@ impl Directory {
                 continue;
             }
             match reconnect_to(&descriptor, reconnect).await {
-                Ok(endpoint) => {
-                    directory.verified.insert(
-                        descriptor.session_id,
+                Ok((endpoint, described)) => {
+                    directory.insert(
                         KnownWorker {
                             descriptor,
                             endpoint,
                         },
+                        Some(described),
                     );
                 }
                 Err(reason) => directory.quarantined.push(Quarantined {
@@ -145,9 +148,21 @@ impl Directory {
         self.verified.get(&session_id)
     }
 
-    /// Adds a worker the rendezvous has just established.
-    pub fn insert(&mut self, worker: KnownWorker) {
-        self.verified.insert(worker.descriptor.session_id, worker);
+    /// Adds a worker, with its own description of its session where this daemon has one.
+    ///
+    /// A worker found at a start or recovered later is admitted only with one ([`describe`]). A
+    /// worker the rendezvous has just established has none yet, and the create waiting on it asks
+    /// for one at once.
+    pub fn insert(&mut self, worker: KnownWorker, described: Option<SessionSummary>) {
+        let session_id = worker.descriptor.session_id;
+        self.verified.insert(session_id, worker);
+        self.heard.insert(
+            session_id,
+            Heard {
+                session: described,
+                closing: false,
+            },
+        );
     }
 
     /// Removes a worker whose session has closed, and what it last said.
@@ -168,16 +183,16 @@ impl Directory {
     /// puts the session earlier in its lifecycle than the one kept is not kept either: the
     /// lifecycle only moves forward, so such an answer is one an earlier moment gave and a later
     /// one overtook.
-    pub fn heard(&mut self, session_id: SessionId, read: &SessionReadResult) {
+    pub fn heard(&mut self, session_id: SessionId, described: &SessionSummary) {
         if !self.verified.contains_key(&session_id) {
             return;
         }
         let kept = &mut self.heard.entry(session_id).or_default().session;
         if kept
             .as_ref()
-            .is_none_or(|kept| stage(read.session.state) >= stage(kept.state))
+            .is_none_or(|kept| stage(described.state) >= stage(kept.state))
         {
-            *kept = Some(read.session.clone());
+            *kept = Some(described.clone());
         }
     }
 
@@ -188,27 +203,24 @@ impl Directory {
         }
     }
 
-    /// Says what this daemon holds of a session whose worker has stopped answering, where the
-    /// session's end is under way.
+    /// Describes a session whose worker has stopped answering, where its end is under way.
     ///
     /// A worker that has finished its closure stops answering before the kernel says its process
     /// has ended, and until the kernel says so this daemon neither takes the session over from
-    /// its worker nor writes a closure of its own for it. The session is then closing, or closed
-    /// where its worker said so, and what is left of the closure is this daemon's to record.
+    /// its worker nor writes a closure of its own for it. The session is what its worker last said
+    /// it was, and `closing` where the worker had not said so but had accepted a close this daemon
+    /// passed to it: what is left of the closure is this daemon's to record. The rest of a read is
+    /// left unsaid. The endpoint, the launch profile and the launches waiting on the worker are how
+    /// a client reaches a worker that no longer answers, and the last command block is the
+    /// session's content, which only its worker hands out.
     ///
-    /// Nothing is said where no end is under way: the worker has said nothing of one, and no
-    /// close this daemon passed to it was accepted. That is a worker this daemon cannot reach, and
-    /// nothing here says what its session is now.
+    /// Nothing is described where no end is under way, or where the worker has never described its
+    /// session to this daemon: that is a worker this daemon cannot reach, and nothing here says
+    /// what its session is now.
     #[must_use]
-    pub fn ending(&self, session_id: SessionId) -> Option<Ending> {
+    pub fn ending(&self, session_id: SessionId) -> Option<SessionReadResult> {
         let heard = self.heard.get(&session_id)?;
-        let Some(mut session) = heard.session.clone() else {
-            return heard
-                .closing
-                .then(|| self.verified.get(&session_id).cloned())
-                .flatten()
-                .map(Ending::Accepted);
-        };
+        let mut session = heard.session.clone()?;
         match session.state {
             SessionState::Closing | SessionState::Closed => {}
             SessionState::Creating | SessionState::Live if heard.closing => {
@@ -216,31 +228,14 @@ impl Directory {
             }
             SessionState::Creating | SessionState::Live => return None,
         }
-        Some(Ending::Described(Box::new(SessionReadResult {
+        Some(SessionReadResult {
             session,
             endpoint: Nullable::null(),
             launch_profile: Nullable::null(),
             last_command_block: Nullable::null(),
             outstanding_launches: Nullable::null(),
-        })))
+        })
     }
-}
-
-/// What this daemon holds of a session whose worker has stopped answering while its end is under
-/// way ([`Directory::ending`]).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Ending {
-    /// The session as its worker last described it, `closing` where the worker had not said so
-    /// but had accepted a close this daemon passed to it since.
-    ///
-    /// The rest of a read is left unsaid. The endpoint, the launch profile and the launches waiting
-    /// on the worker are how a client reaches a worker that no longer answers, and the last command
-    /// block is the session's content, which only its worker hands out.
-    Described(Box<SessionReadResult>),
-    /// A session whose worker accepted a close this daemon passed to it before describing the
-    /// session to this daemon, as after a start that found the worker running. The session is
-    /// closing, and the worker this daemon verified is what it has to describe it by.
-    Accepted(KnownWorker),
 }
 
 /// Where a state is in the session lifecycle, which only moves forward: creating, live, closing,
@@ -270,11 +265,11 @@ pub struct Reconnect<'a> {
 async fn reconnect_to(
     descriptor: &WorkerDescriptor,
     reconnect: &Reconnect<'_>,
-) -> std::result::Result<Endpoint, String> {
+) -> std::result::Result<(Endpoint, SessionSummary), String> {
     let endpoint = Endpoint::from_path(&descriptor.endpoint).map_err(|error| error.to_string())?;
     // Bounded, because starting the daemon must not depend on a worker that never answers. A
     // descriptor that runs out of time is quarantined like any other that fails its challenge.
-    tokio::time::timeout(RECONNECT_TIMEOUT, async {
+    let described = tokio::time::timeout(RECONNECT_TIMEOUT, async {
         let mut client = LocalClient::connect(
             &endpoint,
             LocalClientKind::Controller,
@@ -297,9 +292,32 @@ async fn reconnect_to(
             })
             .await
             .map_err(|error| error.to_string())?;
-        Ok::<(), String>(())
+        describe(&mut client, descriptor.session_id).await
     })
     .await
-    .map_err(|_| "the worker did not answer its challenge in time".to_owned())??;
-    Ok(endpoint)
+    .map_err(|_| "the worker did not prove itself and describe its session in time".to_owned())??;
+    Ok((endpoint, described))
+}
+
+/// Asks a worker this daemon has just verified to describe its session.
+///
+/// A worker is admitted with its own description, so a read that later meets it on its way out is
+/// answered from what the worker said ([`Directory::ending`]). A worker that proves itself and
+/// does not describe its session is not admitted yet: it is asked again, challenge and all, when
+/// the daemon next looks for its workers. An answer from a worker of an earlier build is read as
+/// that build wrote it.
+///
+/// # Errors
+///
+/// Returns why the worker did not describe its session.
+pub(crate) async fn describe(
+    client: &mut LocalClient,
+    session_id: SessionId,
+) -> std::result::Result<SessionSummary, String> {
+    let answer = client
+        .request(Method::SessionRead, &SessionReadParams { session_id })
+        .await
+        .map_err(|error| error.to_string())?;
+    let value = answer.map_err(|refused| refused.to_string())?;
+    crate::service::reported_read(&value).map(|read| read.session)
 }
