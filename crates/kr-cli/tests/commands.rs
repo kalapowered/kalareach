@@ -270,16 +270,24 @@ impl Tree {
         }
     }
 
-    /// Runs `kr` with this tree's directories, on plain pipes, from the root directory.
+    /// Runs `kr` with this tree's directories, on plain pipes, from the directory the binaries
+    /// are in, which is on the internal disk.
     fn kr(&self, line: &[&str]) -> Output {
         Command::new(support::kr())
             .args(line)
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("HOME", self.temp.root())
-            .env("KR_RUNTIME_DIR", self.temp.paths().runtime_root())
-            .env("KR_STATE_DIR", self.temp.paths().state_root())
-            .current_dir("/")
+            .env(
+                kr_ipc::paths::RUNTIME_DIR_VARIABLE,
+                self.temp.paths().runtime_root(),
+            )
+            .env(
+                kr_ipc::paths::STATE_DIR_VARIABLE,
+                self.temp.paths().state_root(),
+            )
+            // Whatever session the tests themselves run in is not the one these commands ask
+            // about.
+            .env_remove("KR_SESSION")
+            .env_remove("KR_ATTACHMENT")
+            .current_dir(support::command_binaries())
             .stdin(Stdio::null())
             .output()
             .expect("kr runs")
