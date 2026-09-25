@@ -119,7 +119,7 @@ record_patterns=(
   'kalareach-ledge[r]'
   'kalareach-goa[l]'
   'kalareach-artifact[s]'
-  "(^|[^[:alnum:]_./-])/Volume[s]/[^/[:space:]\"'*)\`]"
+  "(^|[^[:alnum:]_./-])/Volume[s]/[^/[:space:]\"'*)\`\\]"
 )
 
 # The programs README.md's list runs. A step's PATH holds the directories these are found in, in
@@ -528,7 +528,8 @@ self_test() {
   make_fixture "$directory"
   {
     echo "The plugin service answers with a Handoff, and pending_hand""off is a column."
-    echo "macOS keeps it on /System/Volumes/Data, and a path under \"/Volumes/\" is removable."
+    echo "macOS keeps it on /System/Volumes/Data, and a path under \"/Vol""umes/\" is removable."
+    echo 'A Rust string "/Vol''umes/\" and a JSON one \"/Vol''umes/\" name no volume.'
     echo "SHA-256, UTF-8, KR-PERF-001 and PORT""-123 are not records."
     echo "Pre""view 3 is a screen, and a review of the diff is not numbered."
   } > "$directory/docs/words.md"
