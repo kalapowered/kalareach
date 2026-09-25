@@ -598,7 +598,7 @@ async fn the_watcher_never_cuts_off_an_attempt_that_shares_its_relay() {
 /// time over the first host's request, spanning several of the watcher's cycles, the watcher does
 /// not reach the second host, whose connection would close the endpoint the review answers
 /// through: the review confirms, the first host records the answer, and once the review has ended
-/// the second host is reached again.
+/// the second host is reached again, its request listed under the reference it had.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_watcher_never_cuts_off_a_review_that_shares_its_relay() {
     const RELAY: &str = "https://relay.pairing.test";
@@ -628,7 +628,7 @@ async fn the_watcher_never_cuts_off_a_review_that_shares_its_relay() {
         .await
         .expect("the second host asks");
     let request = support::listed(&watcher, |request| request.host_name == "the test host").await;
-    support::listed(&watcher, |request| request.host_name == "the second host").await;
+    let waiting = support::listed(&watcher, |request| request.host_name == "the second host").await;
 
     let outcome = tokio::time::timeout(WATCHDOG, watcher.review(&request.reference))
         .await
@@ -645,7 +645,10 @@ async fn the_watcher_never_cuts_off_a_review_that_shares_its_relay() {
             .is_some(),
         "the first host recorded the answer"
     );
-    support::listed(&watcher, |request| request.host_name == "the second host").await;
+    // The second host was out of contact while the review held the relay. Its request is listed
+    // again under the reference it had, so whatever the page knew of it still holds.
+    let again = support::listed(&watcher, |request| request.host_name == "the second host").await;
+    assert_eq!(again.reference, waiting.reference);
 }
 
 /// KR-REQ-10.06: one of this computer's hosts takes each connection, completes the authorised
