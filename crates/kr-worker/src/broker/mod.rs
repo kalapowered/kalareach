@@ -127,9 +127,9 @@ pub use crate::broker::listener::{
     BoundBinary, BridgeHello, ListenerAddress, Registration, reject_browser_origin,
 };
 pub use crate::broker::methods::{
-    ActionInFlight, AnswerInFlight, Caller, MutationAdmission, MutationInFlight,
-    PendingTransmission, RegisteredAction, Responsible, UpstreamBody, UpstreamDispatch,
-    UpstreamOutcome, UpstreamRequest, command, subject,
+    ActionInFlight, AnswerInFlight, Caller, MarkedAnswer, MutationAdmission, MutationInFlight,
+    PendingTransmission, RegisteredAction, Responsible, TakenMutation, UpstreamBody,
+    UpstreamDispatch, UpstreamOutcome, UpstreamRequest, command, subject,
 };
 pub use crate::broker::process::{
     BackendStop, BrokerTransport, Credential, ManagedProcess, SourceFrame, TransportHandle,

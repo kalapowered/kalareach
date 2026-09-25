@@ -309,45 +309,41 @@ impl UpstreamDispatch for RecordingUpstream {
     }
 }
 
-/// A transport that stops the host at the moment the bytes go.
-///
-/// Section 24 puts the durable marker before the effect so that this state is readable
-/// afterwards: the marker is in, the answer may already have reached the upstream, and nothing
-/// records what came of it. Reconciliation, not a second answer, is what settles it.
+/// A transport that panics as it takes an answer, in a host that goes on running.
 #[derive(Debug, Default)]
-struct StoppingUpstream;
+struct PanickingUpstream;
 
-const STOPPED: &str =
-    "this test stops the host here, after the marker and before the outcome is recorded";
+const PANICKED: &str = "this transport panics as it takes the answer, after the marker";
 
-impl UpstreamDispatch for StoppingUpstream {
+impl UpstreamDispatch for PanickingUpstream {
     fn admit(&self, _request: &UpstreamRequest) -> Result<(), BrokerError> {
         Ok(())
     }
 
     fn submit(&self, _request: &UpstreamRequest) -> Result<PendingTransmission, BrokerError> {
-        panic!("{STOPPED}")
+        panic!("{PANICKED}")
     }
 }
 
-/// Puts the transport that stops the host on the connection answers go out on.
+/// Puts the transport that panics on the connection answers go out on.
 ///
 /// An admission carries the transport it was taken with, so this is bound before the answer is
 /// admitted rather than after.
-fn stop_the_host_at_the_bytes(broker: &Broker) {
+fn panic_at_the_bytes(broker: &Broker) {
     broker.bind_connection_dispatch(
         GatewayConnectionId::new(1),
-        std::sync::Arc::new(StoppingUpstream) as _,
+        std::sync::Arc::new(PanickingUpstream) as _,
     );
 }
 
-/// Runs one step that transmits over that transport, and checks the host stopped in it.
-fn stopping(step: impl FnOnce()) {
-    let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(step));
-    let payload = stopped.expect_err("the host stopped where the transport stops it");
+/// Runs one step that transmits over that transport, catches its panic, and checks it was that
+/// transport's.
+fn panicking(step: impl FnOnce()) {
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(step));
+    let payload = caught.expect_err("the transport panicked");
     assert_eq!(
         payload.downcast_ref::<String>().map(String::as_str),
-        Some(STOPPED)
+        Some(PANICKED)
     );
 }
 
@@ -851,6 +847,36 @@ fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_
     let _ = std::fs::remove_dir_all(&directory);
 }
 
+/// KR-REQ-11.27: a transport that panics as it takes an answer, in a host that goes on running,
+/// leaves the resource uncertain before the panic reaches whoever catches it: the marker is in, and
+/// nothing can establish whether the bytes went.
+#[tokio::test]
+async fn kr_req_11_27_a_transport_that_panics_after_the_marker_leaves_the_answer_uncertain() {
+    let (broker, _upstream) = broker_recording(
+        BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
+        Some(trust(&[permission_method()], true)),
+    );
+    let resource = offer(&broker, instance(2), binding(9), "11", 2).expect("the offer is accepted");
+    panic_at_the_bytes(&broker);
+    let admitted =
+        reserve(&broker, resource.resource_id, "allow", 4).expect("the answer reserves it");
+    panicking(|| {
+        let _ = broker.record_approval(&admitted, TimestampMs::new(6));
+    });
+    assert_eq!(
+        broker
+            .pending(resource.resource_id)
+            .expect("recorded")
+            .state,
+        PendingState::Uncertain,
+        "the broker goes on, and the answer that may have gone is uncertain"
+    );
+    assert!(
+        reserve(&broker, resource.resource_id, "allow", 7).is_err(),
+        "and it is never answered again"
+    );
+}
+
 /// KR-REQ-11.27: one resolution per pending resource, and a reconnect reconciles an answer that
 /// went without reissuing it.
 #[tokio::test]
@@ -860,7 +886,6 @@ async fn kr_req_11_27_one_resolution_each_and_a_reconnect_leaves_a_sent_answer_u
         Some(trust(&[permission_method()], true)),
     );
     let resource = offer(&broker, instance(2), binding(9), "11", 2).expect("the offer is accepted");
-    stop_the_host_at_the_bytes(&broker);
 
     let admitted =
         reserve(&broker, resource.resource_id, "allow", 4).expect("the first answer reserves it");
@@ -883,10 +908,13 @@ async fn kr_req_11_27_one_resolution_each_and_a_reconnect_leaves_a_sent_answer_u
     );
 
     // The answer leaves this host. The marker goes in immediately before the bytes, and this host
-    // stops before anything records what came of them.
-    stopping(|| {
-        let _ = broker.record_approval(&admitted, TimestampMs::new(6));
-    });
+    // stops there, before anything records what came of them: nothing of it runs afterwards, not
+    // even a destructor, which is what forgetting the marked answer stands for.
+    std::mem::forget(
+        broker
+            .mark_approval(&admitted, TimestampMs::new(6))
+            .expect("the marker is committed"),
+    );
     assert_eq!(
         broker
             .pending(resource.resource_id)

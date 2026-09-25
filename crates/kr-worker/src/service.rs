@@ -2817,38 +2817,11 @@ impl WorkerService {
     /// answered by then leaves an outcome nobody can establish, which section 9 records as unknown
     /// rather than as a refusal the caller would read as "nothing happened".
     async fn finish_upstream(&self, pending: PendingUpstream) -> ControlFrame {
-        // The transmission runs on a thread of its own. Handing an operation to its transport is a
-        // call into the transport, and one that blocks there would hold whatever runs it: on this
-        // task the deadline below could never fire. On its own thread it waits for its outcome or
-        // for the word to stop, so the deadline ends the caller's wait whatever the transport
-        // does, and a transmission still waiting for its outcome is dropped at the deadline, as
-        // it always was.
-        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-        let handoff = pending.handoff;
-        let runtime = tokio::runtime::Handle::current();
-        let carrying = tokio::task::spawn_blocking(move || {
-            runtime.block_on(async move {
-                tokio::select! {
-                    biased;
-                    carried = handoff.carry() => Some(carried),
-                    _ = stopped => None,
-                }
-            })
-        });
-        let carried = tokio::time::timeout(UPSTREAM_SUBMIT_DEADLINE, carrying).await;
-        drop(stop);
-        let outcome = match carried {
-            Ok(Ok(Some(outcome))) => outcome,
-            Ok(Ok(None) | Err(_)) | Err(_) => Err(WorkerError::Broker(
-                crate::broker::BrokerError::UpstreamUnavailable {
-                    detail: format!(
-                        "the upstream did not answer within {} seconds, so whether the operation \
-                         reached it cannot be established",
-                        UPSTREAM_SUBMIT_DEADLINE.as_secs()
-                    ),
-                },
-            )),
-        };
+        // Everything the broker settles happens on this task, and the resource an answer resolves
+        // is settled before the receipt is recorded and before the caller hears: at the deadline,
+        // what `carry` was waiting for is dropped here, and an answer's claim goes with it.
+        let deadline = tokio::time::Instant::now() + UPSTREAM_SUBMIT_DEADLINE;
+        let outcome = pending.handoff.carry(deadline).await;
         self.settle_upstream(&pending.actor_id, pending.action_id, outcome.as_ref());
         match outcome {
             Ok(value) => ControlFrame::Response(Response {
@@ -6549,27 +6522,36 @@ impl UpstreamHandoff {
         self.broker.abandon(&self.admitted);
     }
 
-    /// Carries the admitted operation to its upstream and encodes what the upstream did.
+    /// Carries the admitted operation to its upstream and encodes what the upstream did, or stops
+    /// waiting at `deadline`.
     ///
     /// Nothing of this worker's is held while this runs. The admission already carries everything
     /// the broker checked and the transport it checked against, so the transmission needs no lock
     /// of its own. What is awaited is the transport's own account of the operation: the bytes
     /// reaching the socket, and then, for a request, the upstream's own answer. A receipt says
     /// `applied` for this and for nothing earlier.
-    async fn carry(self) -> Result<ParamsValue> {
+    ///
+    /// The broker's own steps (the permit, the marker and an answer's settlement) happen on this
+    /// task. Only the transport's call that takes the operation runs on a thread of its own, since
+    /// a transport can block there and on this task the deadline could never fire. At the
+    /// deadline this stops waiting for that call or for the upstream, and an answer's claim, which
+    /// never left this task, leaves its resource uncertain before this returns; whatever the
+    /// transport does afterwards settles nothing.
+    async fn carry(self, deadline: tokio::time::Instant) -> Result<ParamsValue> {
         let now = kr_ipc::now_ms();
         match self.kind {
             UpstreamKind::Mutation => {
-                let flight = self.broker.dispatch_mutation(&self.admitted, now)?;
-                encode(&flight.settled().await?)
+                let taken = self.broker.take_mutation(&self.admitted)?;
+                let pending = submit_within(taken.transmission(), deadline).await?;
+                let flight = taken.submitted(pending);
+                encode(&within(deadline, flight.settled()).await??)
             }
             UpstreamKind::Approval => {
-                let flight = self.broker.record_approval(&self.admitted, now)?;
-                encode(&flight.settled(now).await?)
+                let answered = answer_within(&self.broker, &self.admitted, now, deadline).await?;
+                encode(&answered)
             }
             UpstreamKind::PluginAnswer { action } => {
-                let flight = self.broker.record_approval(&self.admitted, now)?;
-                let answered = flight.settled(now).await?;
+                let answered = answer_within(&self.broker, &self.admitted, now, deadline).await?;
                 encode(&kr_protocol::agent::PluginActionInvokeResult {
                     mutation: answered.mutation,
                     action,
@@ -6577,6 +6559,76 @@ impl UpstreamHandoff {
             }
         }
     }
+}
+
+/// Carries one admitted answer to its upstream, settling its resource with what the transport
+/// says, or as uncertain when `deadline` passes first.
+async fn answer_within(
+    broker: &crate::broker::Broker,
+    admitted: &crate::broker::MutationAdmission,
+    now: kr_protocol::scalars::TimestampMs,
+    deadline: tokio::time::Instant,
+) -> Result<kr_protocol::agent::AgentApprovalRespondResult> {
+    let marked = broker.mark_approval(admitted, now)?;
+    // On a refusal or at the deadline `marked` is dropped here, which leaves the resource
+    // uncertain before the caller is told anything.
+    let pending = match submit_within(marked.transmission(), deadline).await {
+        Ok(pending) => pending,
+        Err(error) => {
+            drop(marked);
+            return Err(error);
+        }
+    };
+    let flight = marked.submitted(pending);
+    // At the deadline the answer in flight is dropped with the timeout, which settles it the
+    // same way.
+    Ok(within(deadline, flight.settled(now)).await??)
+}
+
+/// Makes the transport's own call that takes an operation on a thread of its own, and waits for
+/// it until `deadline`.
+///
+/// A transport that blocks there holds that thread and nothing else. What it returns after the
+/// deadline is dropped: the call's outcome is no longer anybody's to report.
+async fn submit_within(
+    (dispatch, request): (
+        Arc<dyn crate::broker::UpstreamDispatch>,
+        crate::broker::UpstreamRequest,
+    ),
+    deadline: tokio::time::Instant,
+) -> Result<crate::broker::PendingTransmission> {
+    let submitting = tokio::task::spawn_blocking(move || dispatch.submit(&request));
+    match tokio::time::timeout_at(deadline, submitting).await {
+        Ok(Ok(submitted)) => Ok(submitted?),
+        Ok(Err(_)) => Err(WorkerError::Broker(
+            crate::broker::BrokerError::UpstreamUnavailable {
+                detail: "the transport's call ended without saying whether it took the operation"
+                    .to_owned(),
+            },
+        )),
+        Err(_) => Err(unanswered()),
+    }
+}
+
+/// Waits for `waited` until `deadline`, and says the upstream did not answer when it passes.
+async fn within<T>(
+    deadline: tokio::time::Instant,
+    waited: impl core::future::Future<Output = T>,
+) -> Result<T> {
+    tokio::time::timeout_at(deadline, waited)
+        .await
+        .map_err(|_| unanswered())
+}
+
+/// The failure an operation meets when its upstream does not answer within this worker's bound.
+fn unanswered() -> WorkerError {
+    WorkerError::Broker(crate::broker::BrokerError::UpstreamUnavailable {
+        detail: format!(
+            "the upstream did not answer within {} seconds, so whether the operation reached it \
+             cannot be established",
+            UPSTREAM_SUBMIT_DEADLINE.as_secs()
+        ),
+    })
 }
 
 /// What a mutation left for the caller to do once the session boundary is over.

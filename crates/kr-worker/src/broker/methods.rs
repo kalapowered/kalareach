@@ -591,6 +591,99 @@ impl Drop for AnswerInFlight<'_> {
     }
 }
 
+/// One admitted answer whose dispatch marker is committed and whose bytes the transport has not
+/// taken yet.
+///
+/// It holds the claim, so it is the settlement authority from the marker on. The transport's own
+/// call is made with [`MarkedAnswer::transmission`], wherever the caller chooses, and its result
+/// comes back through [`MarkedAnswer::submitted`] or [`MarkedAnswer::refused`].
+///
+/// Dropping one leaves the resource **uncertain**, as dropping an [`AnswerInFlight`] does: the
+/// marker says the answer may have gone, and a caller that stops waiting for the transport cannot
+/// establish that it did not.
+#[derive(Debug)]
+pub struct MarkedAnswer<'a> {
+    broker: &'a Broker,
+    claim: Option<Claim>,
+    dispatch: std::sync::Arc<dyn UpstreamDispatch>,
+    request: UpstreamRequest,
+    binding_revision: AgentBindingRevision,
+    upstream_request_id: kr_protocol::ids::UpstreamRequestId,
+    resource_id: kr_protocol::ids::PendingResourceId,
+}
+
+impl<'a> MarkedAnswer<'a> {
+    /// Returns what the transport is handed: the transport chosen at admission and the exact
+    /// request. Neither is authority: the claim stays here.
+    #[must_use]
+    pub fn transmission(&self) -> (std::sync::Arc<dyn UpstreamDispatch>, UpstreamRequest) {
+        (std::sync::Arc::clone(&self.dispatch), self.request.clone())
+    }
+
+    /// The transport took the answer: the claim goes with it to the wait for what it says.
+    #[must_use]
+    pub fn submitted(mut self, pending: PendingTransmission) -> AnswerInFlight<'a> {
+        AnswerInFlight {
+            broker: self.broker,
+            claim: self.claim.take(),
+            pending: Some(pending),
+            binding_revision: self.binding_revision,
+            upstream_request_id: self.upstream_request_id.clone(),
+            resource_id: self.resource_id,
+        }
+    }
+
+    /// The transport refused the answer after its marker: the resource is left uncertain, and the
+    /// refusal is returned for the caller to report.
+    #[must_use]
+    pub fn refused(self, error: BrokerError) -> BrokerError {
+        drop(self);
+        error
+    }
+}
+
+impl Drop for MarkedAnswer<'_> {
+    fn drop(&mut self) {
+        let Some(claim) = self.claim.take() else {
+            return;
+        };
+        // The marker is committed and nothing says what became of the bytes, so nothing can
+        // establish that the answer did not go. The time is now, because that is when this host
+        // stopped waiting.
+        crate::broker::settled(self.broker.uncertain(&claim, kr_ipc::now_ms()));
+    }
+}
+
+/// One admitted mutation whose permit is taken and whose bytes the transport has not taken yet.
+///
+/// A mutation settles no resource, so nothing is owed when one is dropped: its receipt is the
+/// caller's to record.
+#[derive(Debug)]
+pub struct TakenMutation {
+    dispatch: std::sync::Arc<dyn UpstreamDispatch>,
+    request: UpstreamRequest,
+    binding_revision: AgentBindingRevision,
+    turn_id: Option<kr_protocol::ids::AgentTurnId>,
+}
+
+impl TakenMutation {
+    /// Returns what the transport is handed: the transport chosen at admission and the request.
+    #[must_use]
+    pub fn transmission(&self) -> (std::sync::Arc<dyn UpstreamDispatch>, UpstreamRequest) {
+        (std::sync::Arc::clone(&self.dispatch), self.request.clone())
+    }
+
+    /// The transport took the mutation: what follows is the wait for what the upstream did.
+    #[must_use]
+    pub fn submitted(self, pending: PendingTransmission) -> MutationInFlight {
+        MutationInFlight {
+            pending,
+            binding_revision: self.binding_revision,
+            turn_id: self.turn_id,
+        }
+    }
+}
+
 /// One admitted mutation whose bytes are on their way to the upstream.
 #[derive(Debug)]
 pub struct MutationInFlight {
@@ -1063,7 +1156,8 @@ impl Broker {
 
     /// Hands an admitted approval to its upstream, and returns the answer in flight.
     ///
-    /// The marker is committed and the bytes are queued here. What settles the resource is
+    /// The marker is committed and the bytes are queued here, on the caller's own thread: it is
+    /// [`Broker::mark_approval`] followed by the transport's call. What settles the resource is
     /// [`AnswerInFlight::settled`], because the resource's state is what the transmission says it
     /// is and that is not known yet: the permit's holder is the only caller that may settle, and
     /// this is the object it holds.
@@ -1077,6 +1171,32 @@ impl Broker {
         admitted: &MutationAdmission,
         now: TimestampMs,
     ) -> Result<AnswerInFlight<'_>> {
+        let marked = self.mark_approval(admitted, now)?;
+        let (dispatch, request) = marked.transmission();
+        match dispatch.submit(&request) {
+            Ok(pending) => Ok(marked.submitted(pending)),
+            Err(error) => Err(marked.refused(error)),
+        }
+    }
+
+    /// Takes an admitted approval's permit and commits its dispatch marker, without handing it to
+    /// the transport yet.
+    ///
+    /// What comes back holds the claim from the marker on, so the caller that waits for the
+    /// transport keeps the settlement: the transport's own call can run anywhere, and however long
+    /// it takes, the caller can stop waiting and leave the resource uncertain there and then, and
+    /// nothing the transport does afterwards settles it again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::InvalidArgument`] for an admission that answers no approval,
+    /// [`BrokerError::AlreadyTransmitted`] for a permit already taken, and the marker's own failure,
+    /// after giving the reservation back so the resource stays answerable.
+    pub fn mark_approval(
+        &self,
+        admitted: &MutationAdmission,
+        now: TimestampMs,
+    ) -> Result<MarkedAnswer<'_>> {
         // The kind is checked before the permit is taken, so an admission handed to the wrong
         // entry point comes back unspent rather than being destroyed by the mistake.
         if admitted.resource_id().is_none() {
@@ -1102,17 +1222,11 @@ impl Broker {
             crate::broker::settled(self.release_claim(&claim, now));
             return Err(error);
         }
-        let pending = match permit.dispatch.submit(&permit.request) {
-            Ok(pending) => pending,
-            Err(error) => {
-                crate::broker::settled(self.uncertain(&claim, now));
-                return Err(error);
-            }
-        };
-        Ok(AnswerInFlight {
+        Ok(MarkedAnswer {
             broker: self,
             claim: Some(claim),
-            pending: Some(pending),
+            dispatch: permit.dispatch,
+            request: permit.request,
             binding_revision: admitted.binding_revision(),
             upstream_request_id: dispatch.upstream_request_id.clone(),
             resource_id: dispatch.resource.resource_id,
@@ -1835,6 +1949,20 @@ impl Broker {
         now: TimestampMs,
     ) -> Result<MutationInFlight> {
         let _ = now;
+        let taken = self.take_mutation(admitted)?;
+        let (dispatch, request) = taken.transmission();
+        Ok(taken.submitted(dispatch.submit(&request)?))
+    }
+
+    /// Takes one admitted mutation's permit without handing it to the transport, so the caller
+    /// can make the transport's own call wherever it chooses.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::InvalidArgument`] for an admission that answers a pending resource,
+    /// which is recorded by the route that settles it, and [`BrokerError::AlreadyTransmitted`] for
+    /// a permit already taken.
+    pub fn take_mutation(&self, admitted: &MutationAdmission) -> Result<TakenMutation> {
         // An answer settles its resource, and this route does not settle anything. Refusing it
         // before the permit is taken leaves the approval's own admission intact.
         if admitted.resource_id().is_some() {
@@ -1844,12 +1972,11 @@ impl Broker {
             ));
         }
         let permit = admitted.take()?;
-        let turn_id = permit.request.turn_id.clone();
-        let pending = permit.dispatch.submit(&permit.request)?;
-        Ok(MutationInFlight {
-            pending,
+        Ok(TakenMutation {
+            turn_id: permit.request.turn_id.clone(),
+            dispatch: permit.dispatch,
+            request: permit.request,
             binding_revision: admitted.binding_revision(),
-            turn_id,
         })
     }
 

@@ -752,9 +752,9 @@ fn approval_table() -> kr_protocol::gateway::DeclarativeTable {
 /// The host set up by `register` is the rich half. This is the native half: the qualified table,
 /// the authenticated connection, the transport that would carry an answer out, and one request a
 /// decoder has given meaning to.
-fn offer_approval(
+fn offer_approval<U: UpstreamDispatch + 'static>(
     host: &Host,
-    upstream: Arc<CountingUpstream>,
+    upstream: Arc<U>,
 ) -> kr_protocol::ids::PendingResourceId {
     let broker = host.service.broker();
     broker
@@ -2378,5 +2378,106 @@ async fn a_transport_that_blocks_as_it_takes_an_operation_meets_the_upstream_dea
         receipt(&mut client, action_id).await.state,
         ReceiptState::Unknown,
         "whether it reached the upstream cannot be established"
+    );
+}
+
+/// The state one pending resource is in now.
+fn state_of(
+    host: &Host,
+    resource_id: kr_protocol::ids::PendingResourceId,
+) -> kr_protocol::gateway::PendingState {
+    host.service
+        .broker()
+        .pending(resource_id)
+        .expect("the resource is held")
+        .state
+}
+
+/// KR-REQ-09, KR-REQ-11.27: an answer whose transport blocks while it takes it is settled as
+/// uncertain when the upstream deadline passes, before its receipt is recorded and before its
+/// caller hears; the transport letting go afterwards, and saying it took the answer, settles
+/// nothing again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_09_an_answer_whose_transport_blocks_is_uncertain_before_its_caller_hears() {
+    let host = host().await;
+    let (release, held) = std::sync::mpsc::channel();
+    register(&host, None);
+    let resource_id = offer_approval(
+        &host,
+        Arc::new(BlockingUpstream {
+            release: std::sync::Mutex::new(held),
+        }),
+    );
+    let mut client = cli(&host).await;
+    let mutation = approval_mutation(&client, &host, 71, resource_id);
+    let action_id = mutation.action_id;
+    let deadline = kr_worker::service::UPSTREAM_SUBMIT_DEADLINE;
+    let outcome = tokio::time::timeout(
+        deadline + std::time::Duration::from_secs(30),
+        send(&mut client, mutation),
+    )
+    .await
+    .expect("the caller is answered at the deadline, not when the transport lets go");
+    let when_answered = state_of(&host, resource_id);
+    let Outcome::Error(error) = outcome else {
+        panic!("an answer that never finished going is not applied: {outcome:?}");
+    };
+    assert_eq!(error.code, ErrorCode::UpstreamUnavailable);
+    assert_eq!(
+        when_answered,
+        kr_protocol::gateway::PendingState::Uncertain,
+        "the resource was settled before the caller heard"
+    );
+
+    let _ = release.send(());
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(
+        state_of(&host, resource_id),
+        kr_protocol::gateway::PendingState::Uncertain,
+        "what the transport did afterwards settles nothing again"
+    );
+    assert_eq!(
+        receipt(&mut client, action_id).await.state,
+        ReceiptState::Unknown
+    );
+}
+
+/// KR-REQ-09, KR-REQ-11.27: an answer the transport took and the upstream never acknowledged is
+/// settled as uncertain at the upstream deadline, before its caller hears.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_09_an_answer_never_acknowledged_is_uncertain_before_its_caller_hears() {
+    let host = host().await;
+    let (_never, waiting) = tokio::sync::oneshot::channel::<()>();
+    register(&host, None);
+    let resource_id = offer_approval(
+        &host,
+        Arc::new(WaitingUpstream {
+            release: std::sync::Mutex::new(Some(waiting)),
+            carried: std::sync::atomic::AtomicUsize::new(0),
+        }),
+    );
+    let mut client = cli(&host).await;
+    let mutation = approval_mutation(&client, &host, 72, resource_id);
+    let action_id = mutation.action_id;
+    let deadline = kr_worker::service::UPSTREAM_SUBMIT_DEADLINE;
+    let outcome = tokio::time::timeout(
+        deadline + std::time::Duration::from_secs(30),
+        send(&mut client, mutation),
+    )
+    .await
+    .expect("the caller is answered at the deadline");
+    let when_answered = state_of(&host, resource_id);
+    let Outcome::Error(error) = outcome else {
+        panic!("an answer nobody acknowledged is not applied: {outcome:?}");
+    };
+    assert_eq!(error.code, ErrorCode::UpstreamUnavailable);
+    assert_eq!(
+        when_answered,
+        kr_protocol::gateway::PendingState::Uncertain,
+        "the resource was settled before the caller heard"
+    );
+    assert_eq!(
+        receipt(&mut client, action_id).await.state,
+        ReceiptState::Unknown
     );
 }

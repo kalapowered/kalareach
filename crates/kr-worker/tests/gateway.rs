@@ -231,28 +231,6 @@ impl UpstreamDispatch for RecordingUpstream {
     }
 }
 
-/// A transport that stops the host at the moment the bytes go.
-///
-/// Section 24 puts the durable marker before the effect so that exactly this state is readable
-/// afterwards: the marker is in, the answer may already have reached the upstream, and nothing
-/// records what came of it. It is the state a worker that died mid-answer comes back to, and it
-/// is reconciliation, not a second answer, that settles it.
-#[derive(Debug, Default)]
-struct StoppingUpstream;
-
-const STOPPED: &str =
-    "this test stops the host here, after the marker and before the outcome is recorded";
-
-impl UpstreamDispatch for StoppingUpstream {
-    fn admit(&self, _request: &UpstreamRequest) -> Result<(), BrokerError> {
-        Ok(())
-    }
-
-    fn submit(&self, _request: &UpstreamRequest) -> Result<PendingTransmission, BrokerError> {
-        panic!("{STOPPED}")
-    }
-}
-
 fn caller(name: &str) -> Caller {
     Caller {
         actor_id: actor(name),
@@ -287,38 +265,25 @@ fn reserve(
 
 /// Answers one approval and stops the host at the moment its bytes go.
 ///
-/// What is left behind is a resource with a committed dispatch marker and no recorded outcome,
-/// which is what a restart reads back and what reconciliation has to settle.
-fn answer_and_stop(
-    broker: &Broker,
-    upstream: &std::sync::Arc<RecordingUpstream>,
-    resource_id: PendingResourceId,
-    now: u64,
-) {
-    broker.bind_connection_dispatch(
-        GatewayConnectionId::new(1),
-        std::sync::Arc::new(StoppingUpstream),
-    );
-    // The host stops inside `submit`, which the admission reaches before anything is awaited,
-    // so the stop is caught here rather than in a future nobody polls.
-    let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let admitted = broker
-            .admit_approval(
-                &caller("device-1"),
-                &respond(resource_id, "allow"),
-                TimestampMs::new(now),
-            )
-            .expect("the answer is admitted");
-        let _ = broker.record_approval(&admitted, TimestampMs::new(now));
-    }));
-    let payload = stopped.expect_err("the host stopped where the transport stops it");
-    assert_eq!(
-        payload.downcast_ref::<String>().map(String::as_str),
-        Some(STOPPED)
-    );
-    broker.bind_connection_dispatch(
-        GatewayConnectionId::new(1),
-        std::sync::Arc::clone(upstream) as _,
+/// Section 24 puts the durable marker before the effect so that exactly this state is readable
+/// afterwards: the marker is in, the answer may already have reached the upstream, and nothing
+/// records what came of it. It is the state a worker that died mid-answer comes back to, and it is
+/// reconciliation, not a second answer, that settles it.
+fn answer_and_stop(broker: &Broker, resource_id: PendingResourceId, now: u64) {
+    let admitted = broker
+        .admit_approval(
+            &caller("device-1"),
+            &respond(resource_id, "allow"),
+            TimestampMs::new(now),
+        )
+        .expect("the answer is admitted");
+    // The marker goes in, and the host stops there, before its bytes are handed over: nothing of
+    // it runs afterwards, not even a destructor, which is what forgetting the marked answer stands
+    // for.
+    std::mem::forget(
+        broker
+            .mark_approval(&admitted, TimestampMs::new(now))
+            .expect("the marker is committed"),
     );
 }
 
@@ -1144,11 +1109,11 @@ async fn kr_req_11_37_recovery_commits_the_gap_and_reconciles_before_rich_work_r
     let mut store = common::SharedStore::open();
     let path = store.path.clone();
     let (surviving, answered) = {
-        let (broker, upstream) = gateway_sharing(&store);
+        let (broker, _upstream) = gateway_sharing(&store);
         let surviving = approval(&broker, "1", 2).expect("an interpretation before the fault");
         let answered = approval(&broker, "2", 4).expect("another one");
         // An answer went before the fault and this host never recorded what came of it.
-        answer_and_stop(&broker, &upstream, answered.resource_id, 6);
+        answer_and_stop(&broker, answered.resource_id, 6);
 
         store.fault_acceptance();
         assert_eq!(broker.mode(), GatewayMode::NativeOnlyVolatile);
