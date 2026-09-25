@@ -1531,7 +1531,7 @@ fn stage(
             });
         }
     }
-    directory.sync(kr_ipc::paths::NameKind::File)?;
+    directory.sync(kr_flush::NameKind::File)?;
     Ok(directory)
 }
 
@@ -1712,7 +1712,7 @@ fn install(
             if let Err(error) = here.remove(&leaf_name) {
                 return Ok(Installed::Unresolved(error.to_string()));
             }
-            here.sync(kr_ipc::paths::NameKind::File)?;
+            here.sync(kr_flush::NameKind::File)?;
             match here.probe(&leaf_name) {
                 Err(kr_transfer::Escape::NotFound { .. }) => {}
                 Ok(_) => {
@@ -1773,7 +1773,7 @@ fn install(
         if matches!(
             here.probe(&temporary),
             Err(kr_transfer::Escape::NotFound { .. })
-        ) && here.sync(kr_ipc::paths::NameKind::Directory).is_ok()
+        ) && here.sync(kr_flush::NameKind::Directory).is_ok()
         {
             staging.gone(path)?;
         }
@@ -1922,7 +1922,7 @@ fn install(
             }
         }
         staged_directory.rename_into(&content, &here, &leaf_name)?;
-        here.sync(kr_ipc::paths::NameKind::File)?;
+        here.sync(kr_flush::NameKind::File)?;
         // The content is gone as a temporary: the rename is what published it. What is left is an
         // empty directory of this host's own, and the same cleanup that asks for it to be taken
         // away after a failure asks for that after a success too, below, once this closure has
@@ -2046,7 +2046,7 @@ fn take_staged(
         Err(_) => return Staged::NotOurs,
     };
     let Some(directory) = opened else {
-        return if here.sync(kr_ipc::paths::NameKind::Directory).is_ok() {
+        return if here.sync(kr_flush::NameKind::Directory).is_ok() {
             Staged::NotThere
         } else {
             Staged::Kept
@@ -2090,7 +2090,7 @@ fn take_staged(
             return Staged::Kept;
         }
         drop(found);
-        if directory.sync(kr_ipc::paths::NameKind::File).is_err() {
+        if directory.sync(kr_flush::NameKind::File).is_err() {
             return Staged::Kept;
         }
     }
@@ -2100,7 +2100,7 @@ fn take_staged(
     // one this host can show belongs to this account.
     drop(directory);
     if crate::removal::take_directory(here.handle(), temporary.as_str()).is_err()
-        || here.sync(kr_ipc::paths::NameKind::Directory).is_err()
+        || here.sync(kr_flush::NameKind::Directory).is_err()
     {
         return Staged::Kept;
     }
@@ -2272,7 +2272,7 @@ fn descend_or_create(
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(ChangeSetError::storage(error)),
             }
-            here.sync(kr_ipc::paths::NameKind::Directory)?;
+            here.sync(kr_flush::NameKind::Directory)?;
             Ok(here.subdirectory(name)?)
         }
         Err(error) => Err(error.into()),
@@ -3174,7 +3174,7 @@ fn staged_now(repository: &OpenedRepository, entry: &crate::store::StagedPath) -
             // staging directory's own name: a rename of an ancestor that a power failure reverses
             // would otherwise bring the whole subtree back after its record had gone.
             Err(kr_transfer::Escape::NotFound { .. }) => {
-                return if here.sync(kr_ipc::paths::NameKind::Directory).is_ok() {
+                return if here.sync(kr_flush::NameKind::Directory).is_ok() {
                     Staged::NotThere
                 } else {
                     Staged::Kept

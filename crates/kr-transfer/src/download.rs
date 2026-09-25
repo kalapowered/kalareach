@@ -19,7 +19,7 @@
 
 use std::io::Write as _;
 
-use kr_ipc::paths::NameKind;
+use kr_flush::NameKind;
 use kr_protocol::ids::{ActorId, GrantId, TransferId};
 use kr_protocol::scalars::{Bytes, Digest256, TimestampMs, U64};
 use kr_protocol::transfer::{

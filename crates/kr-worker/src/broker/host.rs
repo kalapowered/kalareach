@@ -647,7 +647,7 @@ fn write(files: &HostFiles, name: &RelativeName, content: &str) -> Performed {
     // A new file's content is durable once the file is flushed; its name is durable once the
     // directory that holds the name is. Without this a power failure can take the name away after
     // the answer said the file was written.
-    if created && let Err(escape) = directory.sync(kr_ipc::paths::NameKind::File) {
+    if created && let Err(escape) = directory.sync(kr_flush::NameKind::File) {
         return Performed::unfinished(format!(
             "{name} was written and its new name could not be made durable ({escape}), so whether \
              it survives a failure cannot be established"

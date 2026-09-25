@@ -14,6 +14,7 @@ publish.workspace = true
 cap-fs-ext.workspace = true
 cap-std.workspace = true
 kr-cbor.workspace = true
+kr-flush.workspace = true
 kr-ipc.workspace = true
 kr-protocol.workspace = true
 kr-transfer.workspace = true

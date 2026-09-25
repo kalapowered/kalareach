@@ -76,7 +76,8 @@
 
 use std::path::{Path, PathBuf};
 
-use kr_ipc::paths::{NameKind, flush_directory, flush_path_names};
+use kr_flush::{NameKind, flush_directory};
+use kr_ipc::paths::flush_path_names;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{DraftId, DraftRevision, SyncConflictId, SyncObjectId, SyncRevisionId};
 use kr_protocol::mailbox::mailbox_size_bucket;

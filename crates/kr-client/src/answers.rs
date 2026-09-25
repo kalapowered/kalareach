@@ -402,8 +402,7 @@ impl AnswerDrafts {
             let _ = std::fs::remove_file(&partial);
             return Err(store(error));
         }
-        kr_ipc::paths::flush_directory(&self.directory, kr_ipc::paths::NameKind::File)
-            .map_err(store)
+        kr_flush::flush_directory(&self.directory, kr_flush::NameKind::File).map_err(store)
     }
 
     /// Returns every answer kept on this device, oldest first.
@@ -442,13 +441,12 @@ impl AnswerDrafts {
     pub fn discard(&self, question_id: QuestionId) -> Result<()> {
         let path = self.path(question_id);
         match std::fs::remove_file(&path) {
-            Ok(()) => {
-                kr_ipc::paths::flush_directory(&self.directory, kr_ipc::paths::NameKind::File)
-                    .map_err(|error| AnswerError::Store {
-                        path: Shown::root(&self.directory),
-                        fault: IoFault::from(error),
-                    })
-            }
+            Ok(()) => kr_flush::flush_directory(&self.directory, kr_flush::NameKind::File).map_err(
+                |error| AnswerError::Store {
+                    path: Shown::root(&self.directory),
+                    fault: IoFault::from(error),
+                },
+            ),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(AnswerError::Store {
                 path: stored(&path),

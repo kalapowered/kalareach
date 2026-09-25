@@ -4323,6 +4323,7 @@ version = "0.1.0"
 dependencies = [
  "cap-std",
  "kr-cbor",
+ "kr-flush",
  "kr-ipc",
  "kr-project",
  "kr-protocol",
@@ -4378,6 +4379,7 @@ dependencies = [
  "iroh",
  "kr-cbor",
  "kr-crypto",
+ "kr-flush",
  "kr-ipc",
  "kr-pairing",
  "kr-plugin-sdk",
@@ -4435,6 +4437,7 @@ dependencies = [
  "kr-controller",
  "kr-crypto",
  "kr-delivery",
+ "kr-flush",
  "kr-ipc",
  "kr-pairing",
  "kr-plugin-catalogue",
@@ -4558,6 +4561,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kr-flush"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "kr-hook"
 version = "0.1.0"
 dependencies = [
@@ -4583,6 +4594,7 @@ dependencies = [
  "interprocess",
  "kr-cbor",
  "kr-crypto",
+ "kr-flush",
  "kr-ipc",
  "kr-protocol",
  "libproc",
@@ -4604,6 +4616,7 @@ dependencies = [
  "hex",
  "kr-cbor",
  "kr-crypto",
+ "kr-flush",
  "kr-ipc",
  "kr-protocol",
  "serde",
@@ -4623,6 +4636,7 @@ dependencies = [
  "futures",
  "jiff",
  "kr-crypto",
+ "kr-flush",
  "kr-ipc",
  "kr-plugin-sdk",
  "kr-protocol",
@@ -4725,6 +4739,7 @@ dependencies = [
  "cap-fs-ext",
  "cap-std",
  "kr-cbor",
+ "kr-flush",
  "kr-ipc",
  "kr-protocol",
  "kr-transfer",
@@ -4814,6 +4829,7 @@ dependencies = [
  "cap-std",
  "image",
  "kr-cbor",
+ "kr-flush",
  "kr-ipc",
  "kr-protocol",
  "libc",
@@ -4878,6 +4894,7 @@ dependencies = [
  "kr-client",
  "kr-controller",
  "kr-crypto",
+ "kr-flush",
  "kr-ipc",
  "kr-plugin-sdk",
  "kr-protocol",

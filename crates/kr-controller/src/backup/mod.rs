@@ -41,7 +41,7 @@ use kr_crypto::backup::{
     GenerationExpectation, Material, RestoreAdmissions, RestoreGeneration, SealedArchive,
     StagedObject, admit_for_restore,
 };
-use kr_ipc::paths::{NameKind, flush_directory};
+use kr_flush::{NameKind, flush_directory};
 use kr_protocol::archive::{
     ArchiveCheckpoint, BackupGenerationPublication, BackupWriterRecord, BackupWriterRecordPayload,
 };

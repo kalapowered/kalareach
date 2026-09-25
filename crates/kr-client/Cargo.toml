@@ -17,6 +17,7 @@ futures-util.workspace = true
 iroh.workspace = true
 kr-cbor.workspace = true
 kr-crypto.workspace = true
+kr-flush.workspace = true
 kr-ipc.workspace = true
 # The candidate's half of pairing: its state machines, proofs and attempt budget, which the pairing
 # module drives over the transport the host serves.

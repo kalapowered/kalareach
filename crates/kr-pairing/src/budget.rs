@@ -36,7 +36,7 @@ use std::sync::Arc;
 
 use kr_crypto::secret::SymmetricKey;
 use kr_crypto::store::{SecretName, SecretStore};
-use kr_ipc::paths::{NameKind, flush_directory};
+use kr_flush::{NameKind, flush_directory};
 use kr_protocol::scalars::Mac256;
 use serde::{Deserialize, Serialize};
 

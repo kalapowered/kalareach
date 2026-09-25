@@ -3227,7 +3227,7 @@ impl ProjectService {
                 )
                 .into(),
             })?;
-        parent.sync(kr_ipc::paths::NameKind::Directory)?;
+        parent.sync(kr_flush::NameKind::Directory)?;
         // A worktree's administrative record inside the repository outlives its directory, so it
         // is pruned rather than left naming a path that is gone. `prune` removes that record and
         // nothing of the user's.
