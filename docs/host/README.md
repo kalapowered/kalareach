@@ -2270,10 +2270,16 @@ manifest and builds the public descriptor. Object storage is the storage service
 owns is the part in between, which is the part a crash can lose.
 
 `backup.sqlite` sits beside the registry in the environment's state directory, with the staged
-ciphertext in a `backup/` directory next to it. It holds generation records, object rows, dispatch
-attempts and the cleanup privacy mode is owed. It holds **no object key, no plaintext and no
-filename**: the keys stay with the producer until the generation is sealed, and the filenames are
-inside the encrypted manifest.
+ciphertext in a `backup/` directory next to it. It holds generation records, object rows, each
+object's upload in progress, dispatch attempts and the cleanup privacy mode is owed. It holds **no
+object key, no plaintext and no filename**: the keys stay with the producer until the generation is
+sealed, and the filenames are inside the encrypted manifest. An upload in progress is the identity
+the storage service gave it and how many of its parts the service has acknowledged, nothing more.
+
+The store is at schema version 7. A store at version 6 has no upload table, and the first open by
+this build adds the table and its rules in one transaction with the new version. That step compares
+the result with this build's schema before it commits, so a version-6 store holding anything this
+build does not define is refused like any other and stays at version 6.
 
 Every database write changes the state *and* whatever follows from it, in one transaction.
 Admitting a generation writes its object rows and its first upload attempt with it. The object that
@@ -2423,11 +2429,52 @@ caller's export and import paths are the gate. **This build has no such path**: 
 an archive back into a host, so what is here is the check a future import will make, not an import
 that makes it.
 
+### The uploader
+
+`backup::uploader` is the executor the outbox waits for. It takes the attempts in order, dispatches
+each to itself under one executor name, uploads the generation's staged objects through the storage
+service and publishes the descriptor through the backup manifest once every object is there. Each
+answer is written down as it arrives, under the attempt that carried the work.
+
+An object goes up in 8 MiB parts. The upload's identity and the count of parts the service
+acknowledged are recorded before the next part leaves, so after a crash the uploader goes on at the
+next part. A part whose answer was lost is sent again and answered as the part the service already
+holds, and a completion asked for again gets the result the first one got: nothing is stored twice.
+A creation whose answer was lost is the awkward case. The service holds that upload open under an
+identity this host never learned and refuses another creation until the upload's lifetime runs
+out, and a pass after that creates it again.
+
+A publication is signed at the instant its generation was admitted, so every send of it is the same
+bytes and the service answers a repeat as a duplicate. The uploader still does not send one again
+while an earlier send may be on its way. It fetches the generation instead, and sends again only
+once the service does not hold it and no request sent for it can be admitted any more, two
+freshness windows after it was signed. After a restart, `Uploader::settle` makes that fetch for
+every publication an earlier process dispatched, and a daemon calls it before reconciliation, which
+would otherwise write the outcome down as unknown. A process that stopped between dispatching a
+publication and sending it leaves that generation unknown: its production ends there, and the next
+generation carries the backup.
+
+An attempt ends on evidence about its own work. A collection deleted from the account console
+stops the attempt, retires this host's writer for that archive and cancels what it was still
+producing there, and the report says the collection was deleted and that backing up again means
+enrolling a new collection. A staged object that is gone, or is no longer the ciphertext that was
+admitted, stops its generation. Any other refusal, and any failure of the transport, leaves the
+attempt for the next pass. When the service refuses a part or a completion as not permitted, the
+uploader asks it to abandon the upload: a confirmed abandonment means the object goes up again
+under a new upload, and a refused one leaves the upload to go on as it was.
+
+Under a privacy fence nothing new leaves, whether a dispatch, a further part, an object or a
+publication. The upload in progress is abandoned at the service and its attempt stopped, which is
+what lets the fence's cleanup finish. Nothing is sent before the store has reconciled, while a
+privacy step this host could not take is outstanding, or while the storage service says backup
+storage is off, and a pass with no work asks the service nothing.
+
 ### What it does not do
 
-It serves no method. `backup.manifest` is a *service* method, which this host calls rather than
-answers, and nothing in this build carries an object to a service: the daemon accounts for what was
-admitted, staged and dispatched, and the upload path itself belongs with the storage service.
+It serves no method. `storage.*` and `backup.manifest` are *service* methods, which this host calls
+rather than answers. The daemon does not start the uploader in this build, and it holds no source
+for the account token that spends an account's storage beside the host's signature, so a running
+host still carries nothing to a service.
 
 ## Privacy mode
 

@@ -5,11 +5,24 @@
 //! applies to every path here: `backup.sqlite` and every staged byte live under the platform
 //! temporary directory, which is on the internal disk, and nothing in this file launches a process.
 
-use kr_controller::backup::store::{
-    AttemptOutcome, AttemptStatus, BackupStore, FenceRelease, LocalState, ObligationKind,
-    Production, Publication, Remote, SCHEMA_VERSION, Step, UploadRecord,
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
+
+use kr_client::error::ClientError;
+use kr_client::retry::UserAction;
+use kr_client::services::{
+    ArchiveAnswer, BackupManifestService, BackupState, CollectionSummary, Enrolled,
+    FetchedGeneration, GenerationSummary, NewUpload, ObjectDeleted, ObjectRange, PartStored,
+    PartTable, Published, RetentionChange, RetentionPolicy, RetentionSet, ServiceFuture,
+    StorageLimits, StoragePrincipal, StorageService, StorageStatus, StorageUsage, StoredObject,
+    UploadAborted, UploadCompleted, UploadCreated, UploadId, UploadPart, WriterSummary,
 };
-use kr_controller::backup::{BackupService, RestoreRequest, SUBSYSTEM_NAME};
+use kr_controller::backup::store::{
+    AttemptOutcome, AttemptStatus, BackupStore, FenceRelease, GenerationRecord, LocalState,
+    ObligationKind, Production, Publication, Remote, SCHEMA_VERSION, Step, UploadRecord,
+};
+use kr_controller::backup::uploader::{EXECUTOR as UPLOADER, Idle, Stepped, Uploader};
+use kr_controller::backup::{Admitted, BackupService, RestoreRequest, SUBSYSTEM_NAME};
 use kr_controller::error::ControllerError;
 use kr_crypto::backup::{
     ArchivePlan, ArchiveRecipients, CheckpointSource, CollectionKind, GenerationExpectation,
@@ -17,13 +30,16 @@ use kr_crypto::backup::{
 };
 use kr_crypto::keys::{AuthorisationKeyPair, StoredEnvelopeKeyPair};
 use kr_protocol::archive::{
-    ArchiveCheckpoint, BackupGenerationPublication, BackupGenerationPublicationPayload,
-    BackupWriterRecord, BackupWriterRecordPayload, TrustedWriter,
+    ArchiveCheckpoint, ArchiveDescriptor, BackupGenerationPublication,
+    BackupGenerationPublicationPayload, BackupWriterRecord, BackupWriterRecordPayload,
+    TrustedWriter,
 };
+use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{
     ArchiveId, BackupGeneration, BackupObjectId, BackupWriterRevision, DeviceId,
 };
-use kr_protocol::scalars::{Digest256, TimestampMs, Uuid};
+use kr_protocol::pairing::GenerationCheckpoint;
+use kr_protocol::scalars::{AuthorisationKey, Digest256, KeyId, TimestampMs, Uuid};
 use kr_worker::privacy::{PrivacyGeneration, PrivacyMode, PrivacySubsystem};
 
 /// Who these tests hand a dispatch attempt to. A real one names the transport that carries it.
@@ -5481,4 +5497,1520 @@ fn a_version_6_store_holding_a_rule_this_build_never_wrote_is_refused_and_left_a
         rusqlite::Connection::open(state.join("backup.sqlite")).expect("the backup store");
     assert_eq!(schema_version(&connection), 6);
     assert_eq!(upload_objects(&connection), 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The uploader: the outbox carried to managed storage and the backup manifest.
+// ---------------------------------------------------------------------------------------------
+
+/// One part, as the storage service cuts every object.
+const PART: usize = 8 * 1024 * 1024;
+
+/// A plaintext whose ciphertext is two parts.
+const TWO_PARTS: usize = PART + 4096;
+
+/// A plaintext whose ciphertext is three parts.
+const THREE_PARTS: usize = 2 * PART + 4096;
+
+/// How long after it was signed a request can still be admitted: two freshness windows.
+const ADMISSIBLE_MS: u64 = 2 * kr_protocol::service::SERVICE_REQUEST_FRESHNESS_MS;
+
+/// A request that reached the scripted service.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Asked {
+    Status,
+    Create(BackupObjectId),
+    Part(String, u32),
+    Complete(String),
+    Abort(String),
+    Publish(BackupGeneration),
+    Fetch(BackupGeneration),
+}
+
+/// The requests a fault can be scripted for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Kind {
+    Create,
+    Part,
+    Complete,
+    Abort,
+    Publish,
+    Fetch,
+}
+
+/// What the scripted service does with one request it was told to fail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fault {
+    /// It never arrives, and the caller hears nothing back.
+    Dropped,
+    /// It is carried out, and its answer never reaches the caller.
+    Lost,
+    /// It is refused as not permitted, and nothing is done.
+    Forbidden,
+}
+
+/// Where one upload the scripted service created has got to.
+#[derive(Clone, Debug)]
+enum Held {
+    Open,
+    Completed(UploadCompleted),
+    Abandoned,
+}
+
+#[derive(Debug)]
+struct ScriptedUpload {
+    archive_id: ArchiveId,
+    backup_generation: BackupGeneration,
+    object_id: BackupObjectId,
+    table: PartTable,
+    hash: Digest256,
+    declared: u64,
+    parts: BTreeMap<u32, Vec<u8>>,
+    held: Held,
+}
+
+#[derive(Debug, Default)]
+struct Scripted {
+    backup_off: bool,
+    deleted: BTreeSet<ArchiveId>,
+    uploads: BTreeMap<String, ScriptedUpload>,
+    stored: BTreeMap<(ArchiveId, BackupObjectId), Vec<u8>>,
+    times_stored: BTreeMap<(ArchiveId, BackupObjectId), u32>,
+    times_written: BTreeMap<(String, u32), u32>,
+    published: BTreeMap<(ArchiveId, BackupGeneration), BackupGenerationPublication>,
+    asked: Vec<Asked>,
+    faults: Vec<(Kind, usize, Fault)>,
+    sent: BTreeMap<Kind, usize>,
+    created: u64,
+}
+
+/// What the scripted service runs when a part reaches it, before it takes the part.
+type PartHook = Box<dyn FnMut(u32) + Send>;
+
+/// Managed storage and the backup manifest, answering as the service does, held in memory.
+///
+/// An object's identity stays live while an upload of it is open or it is stored. A part sent
+/// again is answered as the part the service holds, a completion asked for again with the result
+/// it gave, and a publication sent again as a duplicate; a publication is held to its writer's
+/// signature, and a deleted collection takes neither an upload nor a publication.
+struct Web {
+    writer: AuthorisationKey,
+    writer_key_id: KeyId,
+    state: Mutex<Scripted>,
+    on_part: Mutex<Option<PartHook>>,
+}
+
+impl std::fmt::Debug for Web {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Web").finish_non_exhaustive()
+    }
+}
+
+fn refused(code: ErrorCode, message: &str) -> ClientError {
+    ClientError::Refused {
+        error: ProtocolError::new(code, message),
+        retry_after_seconds: None,
+        action: UserAction::Nothing,
+    }
+}
+
+fn unanswered() -> ClientError {
+    ClientError::Host(ProtocolError::new(
+        ErrorCode::OutcomeUnknown,
+        "the answer did not arrive",
+    ))
+}
+
+fn not_scripted() -> ClientError {
+    refused(ErrorCode::UnsupportedCapability, "not scripted")
+}
+
+fn account() -> StoragePrincipal {
+    StoragePrincipal::Account("account-one".to_owned())
+}
+
+fn collection(archive: ArchiveId) -> CollectionSummary {
+    CollectionSummary {
+        archive_id: archive,
+        checkpoint_generation: 1,
+        generations: Vec::new(),
+        bytes: 0,
+        allowance_bytes: None,
+    }
+}
+
+/// What a caller hears about a request the scripted service was told to fail, or else its answer.
+fn answered<T>(
+    fault: Option<Fault>,
+    take: impl FnOnce() -> kr_client::Result<T>,
+) -> kr_client::Result<T> {
+    match fault {
+        Some(Fault::Dropped) => Err(unanswered()),
+        Some(Fault::Forbidden) => Err(refused(
+            ErrorCode::PermissionDenied,
+            "not permitted this time",
+        )),
+        Some(Fault::Lost) => {
+            let _ = take();
+            Err(unanswered())
+        }
+        None => take(),
+    }
+}
+
+impl Web {
+    fn new(writer: AuthorisationKey, writer_key_id: KeyId) -> Self {
+        Self {
+            writer,
+            writer_key_id,
+            state: Mutex::default(),
+            on_part: Mutex::new(None),
+        }
+    }
+
+    fn scripted(&self) -> std::sync::MutexGuard<'_, Scripted> {
+        self.state.lock().expect("the scripted service")
+    }
+
+    /// Fails the `nth` request of one kind, counting from one, the way `fault` says.
+    fn fail(&self, kind: Kind, nth: usize, fault: Fault) {
+        self.scripted().faults.push((kind, nth, fault));
+    }
+
+    fn when_a_part_arrives(&self, hook: impl FnMut(u32) + Send + 'static) {
+        *self.on_part.lock().expect("the hook") = Some(Box::new(hook));
+    }
+
+    fn turn_backup_off(&self) {
+        self.scripted().backup_off = true;
+    }
+
+    /// The account console deletes an archive's collection.
+    fn delete_collection(&self, archive: ArchiveId) {
+        self.scripted().deleted.insert(archive);
+    }
+
+    /// Every open upload's lifetime runs out, which frees the identity of the object it carried.
+    fn expire_uploads(&self) {
+        for upload in self.scripted().uploads.values_mut() {
+            if matches!(upload.held, Held::Open) {
+                upload.held = Held::Abandoned;
+            }
+        }
+    }
+
+    fn asked(&self) -> Vec<Asked> {
+        self.scripted().asked.clone()
+    }
+
+    fn count(&self, which: impl Fn(&Asked) -> bool) -> usize {
+        self.scripted()
+            .asked
+            .iter()
+            .filter(|asked| which(asked))
+            .count()
+    }
+
+    /// The part numbers that reached the service under one upload, in the order they arrived.
+    fn parts_of(&self, upload: &str) -> Vec<u32> {
+        self.scripted()
+            .asked
+            .iter()
+            .filter_map(|asked| match asked {
+                Asked::Part(id, number) if id == upload => Some(*number),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn stored_bytes(&self, object: BackupObjectId) -> Option<Vec<u8>> {
+        self.scripted().stored.get(&(archive_id(), object)).cloned()
+    }
+
+    fn stored_objects(&self) -> usize {
+        self.scripted().stored.len()
+    }
+
+    fn publication(&self, generation: u64) -> Option<BackupGenerationPublication> {
+        self.scripted()
+            .published
+            .get(&(archive_id(), BackupGeneration::new(generation)))
+            .cloned()
+    }
+
+    /// Asserts that the service stored every object once and wrote every part once.
+    fn stored_once(&self) {
+        let state = self.scripted();
+        assert!(
+            state.times_stored.values().all(|times| *times == 1),
+            "objects stored: {:?}",
+            state.times_stored
+        );
+        assert!(
+            state.times_written.values().all(|times| *times == 1),
+            "parts written: {:?}",
+            state.times_written
+        );
+    }
+
+    /// Asserts that nothing but a read reached the service twice.
+    fn nothing_asked_twice(&self) {
+        let asked = self.asked();
+        let mut seen = BTreeSet::new();
+        for request in asked
+            .iter()
+            .filter(|request| !matches!(request, Asked::Status | Asked::Fetch(_)))
+        {
+            assert!(
+                seen.insert(format!("{request:?}")),
+                "{request:?} reached the service twice: {asked:?}"
+            );
+        }
+        self.stored_once();
+    }
+
+    /// Counts one request of `kind`, notes it unless it never arrives, and returns the fault
+    /// scripted for it.
+    fn arriving(&self, kind: Kind, asked: Asked) -> Option<Fault> {
+        let mut state = self.scripted();
+        let scripted = &mut *state;
+        let sent = scripted.sent.entry(kind).or_default();
+        *sent += 1;
+        let nth = *sent;
+        let fault = scripted
+            .faults
+            .iter()
+            .position(|(which, at, _)| *which == kind && *at == nth)
+            .map(|index| scripted.faults.remove(index).2);
+        if fault != Some(Fault::Dropped) {
+            scripted.asked.push(asked);
+        }
+        fault
+    }
+
+    fn take_create(&self, upload: &NewUpload) -> kr_client::Result<ArchiveAnswer<UploadCreated>> {
+        let mut state = self.scripted();
+        let scripted = &mut *state;
+        if scripted.deleted.contains(&upload.archive_id) {
+            return Ok(ArchiveAnswer::CollectionDeleted);
+        }
+        if scripted.backup_off {
+            return Err(refused(
+                ErrorCode::PermissionDenied,
+                "backup storage is off for this account",
+            ));
+        }
+        let identity = (upload.archive_id, upload.object_id);
+        let live = scripted.stored.contains_key(&identity)
+            || scripted.uploads.values().any(|held| {
+                (held.archive_id, held.object_id) == identity
+                    && !matches!(held.held, Held::Abandoned)
+            });
+        if live {
+            return Err(refused(
+                ErrorCode::PermissionDenied,
+                "that object of that archive is already being uploaded or already stored",
+            ));
+        }
+        let Some(table) = PartTable::for_total(upload.total_bytes) else {
+            return Err(refused(
+                ErrorCode::InvalidArgument,
+                "no part table cuts that total",
+            ));
+        };
+        scripted.created += 1;
+        let upload_id = format!("upload-{}", scripted.created);
+        scripted.uploads.insert(
+            upload_id.clone(),
+            ScriptedUpload {
+                archive_id: upload.archive_id,
+                backup_generation: upload.backup_generation,
+                object_id: upload.object_id,
+                table,
+                hash: upload.encrypted_object_hash,
+                declared: upload.declared_max_bytes,
+                parts: BTreeMap::new(),
+                held: Held::Open,
+            },
+        );
+        Ok(ArchiveAnswer::Done(UploadCreated {
+            upload_id: UploadId::new(upload_id).expect("an upload identity"),
+            table,
+            reserved_bytes: upload.declared_max_bytes,
+            expires_at: "2026-09-25T18:00:00.000Z".to_owned(),
+            principal: account(),
+        }))
+    }
+
+    fn take_part(
+        &self,
+        upload_id: &UploadId,
+        number: u32,
+        bytes: &[u8],
+    ) -> kr_client::Result<ArchiveAnswer<PartStored>> {
+        let mut state = self.scripted();
+        let scripted = &mut *state;
+        let Some(upload) = scripted.uploads.get_mut(upload_id.as_str()) else {
+            return Ok(ArchiveAnswer::UploadGone);
+        };
+        match upload.held {
+            Held::Abandoned => return Ok(ArchiveAnswer::UploadGone),
+            Held::Completed(_) => {
+                return Err(refused(
+                    ErrorCode::PermissionDenied,
+                    "that upload is stored and takes no part",
+                ));
+            }
+            Held::Open => {}
+        }
+        let Some(range) = upload.table.part(number) else {
+            return Err(refused(
+                ErrorCode::InvalidArgument,
+                "that upload has no such part",
+            ));
+        };
+        if bytes.len() as u64 != range.end - range.start {
+            return Err(refused(
+                ErrorCode::InvalidArgument,
+                "a part is the length its table gives it",
+            ));
+        }
+        let duplicate = match upload.parts.get(&number) {
+            Some(held) if held.as_slice() == bytes => true,
+            Some(_) => {
+                return Err(refused(
+                    ErrorCode::PermissionDenied,
+                    "that part was declared twice two ways",
+                ));
+            }
+            None => {
+                upload.parts.insert(number, bytes.to_vec());
+                *scripted
+                    .times_written
+                    .entry((upload_id.as_str().to_owned(), number))
+                    .or_default() += 1;
+                false
+            }
+        };
+        Ok(ArchiveAnswer::Done(PartStored {
+            duplicate,
+            parts_stored: u32::try_from(upload.parts.len()).expect("a count"),
+            bytes_stored: upload.parts.values().map(|part| part.len() as u64).sum(),
+        }))
+    }
+
+    fn take_completion(
+        &self,
+        upload_id: &UploadId,
+        table: &PartTable,
+    ) -> kr_client::Result<ArchiveAnswer<UploadCompleted>> {
+        let mut state = self.scripted();
+        let scripted = &mut *state;
+        let Some(upload) = scripted.uploads.get_mut(upload_id.as_str()) else {
+            return Ok(ArchiveAnswer::UploadGone);
+        };
+        if scripted.deleted.contains(&upload.archive_id) {
+            return Ok(ArchiveAnswer::CollectionDeleted);
+        }
+        match &upload.held {
+            Held::Abandoned => return Ok(ArchiveAnswer::UploadGone),
+            Held::Completed(completed) => {
+                return Ok(ArchiveAnswer::Done(UploadCompleted {
+                    duplicate: true,
+                    ..completed.clone()
+                }));
+            }
+            Held::Open => {}
+        }
+        if *table != upload.table {
+            return Err(refused(
+                ErrorCode::InvalidArgument,
+                "that is not the upload's part table",
+            ));
+        }
+        let mut whole = Vec::new();
+        for number in 1..=upload.table.part_count() {
+            let Some(part) = upload.parts.get(&number) else {
+                return Err(refused(
+                    ErrorCode::InvalidArgument,
+                    "not every part of the upload is here",
+                ));
+            };
+            whole.extend_from_slice(part);
+        }
+        if Digest256::from_bytes(kr_cbor::sha256(&whole)) != upload.hash {
+            return Err(refused(
+                ErrorCode::InvalidArgument,
+                "the object is not the hash its upload declared",
+            ));
+        }
+        let completed = UploadCompleted {
+            duplicate: false,
+            archive_id: upload.archive_id,
+            backup_generation: upload.backup_generation,
+            object: StoredObject {
+                object_id: upload.object_id,
+                encrypted_object_hash: upload.hash,
+                encrypted_len: whole.len() as u64,
+            },
+            committed_bytes: whole.len() as u64,
+            stored_at: "2026-09-25T17:00:00.000Z".to_owned(),
+        };
+        upload.held = Held::Completed(completed.clone());
+        let identity = (upload.archive_id, upload.object_id);
+        scripted.stored.insert(identity, whole);
+        *scripted.times_stored.entry(identity).or_default() += 1;
+        Ok(ArchiveAnswer::Done(completed))
+    }
+
+    fn take_abandonment(
+        &self,
+        upload_id: &UploadId,
+    ) -> kr_client::Result<ArchiveAnswer<UploadAborted>> {
+        let mut state = self.scripted();
+        let Some(upload) = state.uploads.get_mut(upload_id.as_str()) else {
+            return Ok(ArchiveAnswer::UploadGone);
+        };
+        if matches!(upload.held, Held::Completed(_)) {
+            return Err(refused(
+                ErrorCode::PermissionDenied,
+                "that upload is stored; delete the object instead",
+            ));
+        }
+        upload.held = Held::Abandoned;
+        Ok(ArchiveAnswer::Done(UploadAborted {
+            cleaned: true,
+            released_bytes: Some(upload.declared),
+        }))
+    }
+
+    fn take_publication(
+        &self,
+        publication: &BackupGenerationPublication,
+    ) -> kr_client::Result<ArchiveAnswer<Published>> {
+        let transcript = kr_crypto::sign::SigningTranscript::from_canonical_bytes(
+            kr_protocol::archive::BACKUP_PUBLICATION_DOMAIN,
+            publication
+                .payload
+                .signing_input()
+                .expect("a publication input"),
+        )
+        .expect("a transcript");
+        if publication.payload.writer_key_id != self.writer_key_id
+            || kr_crypto::sign::verify(&self.writer, &transcript, &publication.signature).is_err()
+        {
+            return Err(refused(
+                ErrorCode::PermissionDenied,
+                "that record was not signed by the key that carried it",
+            ));
+        }
+        let descriptor = &publication.payload.descriptor;
+        let mut state = self.scripted();
+        let scripted = &mut *state;
+        if scripted.deleted.contains(&descriptor.archive_id) {
+            return Ok(ArchiveAnswer::CollectionDeleted);
+        }
+        let key = (descriptor.archive_id, descriptor.backup_generation);
+        let duplicate = match scripted.published.get(&key) {
+            Some(held) if held == publication => true,
+            Some(_) => {
+                return Err(refused(
+                    ErrorCode::PermissionDenied,
+                    "that generation is published with other content",
+                ));
+            }
+            None => {
+                scripted.published.insert(key, publication.clone());
+                false
+            }
+        };
+        Ok(ArchiveAnswer::Done(Published {
+            duplicate,
+            generation: GenerationSummary {
+                backup_generation: descriptor.backup_generation,
+                encrypted_manifest_hash: descriptor.encrypted_manifest.encrypted_object_hash,
+                descriptor_bytes: 0,
+                recipients: u32::try_from(descriptor.manifest_key_wraps.len()).expect("a count"),
+                published_at: "2026-09-25T17:00:00.000Z".to_owned(),
+            },
+            collection: collection(descriptor.archive_id),
+            dropped: Vec::new(),
+        }))
+    }
+
+    fn find_generation(
+        &self,
+        archive: ArchiveId,
+        generation: Option<BackupGeneration>,
+    ) -> kr_client::Result<Option<FetchedGeneration>> {
+        let state = self.scripted();
+        let found = match generation {
+            Some(generation) => state.published.get(&(archive, generation)).cloned(),
+            None => state
+                .published
+                .iter()
+                .rev()
+                .find(|((held, _), _)| *held == archive)
+                .map(|(_, held)| held.clone()),
+        };
+        Ok(found.map(|publication| FetchedGeneration {
+            publication,
+            published_at: "2026-09-25T17:00:00.000Z".to_owned(),
+            collection: collection(archive),
+            current_writer: WriterSummary {
+                writer_key_id: self.writer_key_id,
+                writer_revision: 1,
+                enrolled_at: "2026-09-25T16:00:00.000Z".to_owned(),
+            },
+        }))
+    }
+}
+
+impl StorageService for Web {
+    fn status(&self) -> ServiceFuture<'_, StorageStatus> {
+        Box::pin(async move {
+            let backup = {
+                let mut state = self.scripted();
+                state.asked.push(Asked::Status);
+                if state.backup_off {
+                    BackupState::Off
+                } else {
+                    BackupState::On
+                }
+            };
+            let nothing = StorageUsage {
+                objects: 0,
+                bytes: 0,
+            };
+            Ok(StorageStatus {
+                principal: account(),
+                backup,
+                retention_revision: 1,
+                retention: RetentionPolicy {
+                    daily_snapshots: 30,
+                    tombstone_days: 30,
+                    provider_recovery_days: 7,
+                },
+                stored: nothing,
+                tombstoned: nothing,
+                next_purge: None,
+                uploading: nothing,
+                reserved_bytes: 0,
+                allowance_bytes: None,
+                limits: StorageLimits {
+                    part_size_bytes: PART as u64,
+                    max_object_bytes: 1024 * 1024 * 1024,
+                    max_parts: 128,
+                    max_read_bytes: PART as u64,
+                    upload_lifetime_seconds: 3_600,
+                    outstanding_uploads: 16,
+                },
+            })
+        })
+    }
+
+    fn set_retention<'a>(
+        &'a self,
+        _change: &'a RetentionChange,
+    ) -> ServiceFuture<'a, RetentionSet> {
+        Box::pin(async { Err(not_scripted()) })
+    }
+
+    fn create_upload<'a>(
+        &'a self,
+        upload: &'a NewUpload,
+    ) -> ServiceFuture<'a, ArchiveAnswer<UploadCreated>> {
+        Box::pin(async move {
+            let fault = self.arriving(Kind::Create, Asked::Create(upload.object_id));
+            answered(fault, || self.take_create(upload))
+        })
+    }
+
+    fn upload_part<'a>(
+        &'a self,
+        upload_id: &'a UploadId,
+        part: UploadPart<'a>,
+    ) -> ServiceFuture<'a, ArchiveAnswer<PartStored>> {
+        Box::pin(async move {
+            if let Some(hook) = self.on_part.lock().expect("the hook").as_mut() {
+                hook(part.number);
+            }
+            let fault = self.arriving(
+                Kind::Part,
+                Asked::Part(upload_id.as_str().to_owned(), part.number),
+            );
+            answered(fault, || self.take_part(upload_id, part.number, part.bytes))
+        })
+    }
+
+    fn complete_upload<'a>(
+        &'a self,
+        upload_id: &'a UploadId,
+        table: &'a PartTable,
+    ) -> ServiceFuture<'a, ArchiveAnswer<UploadCompleted>> {
+        Box::pin(async move {
+            let fault = self.arriving(
+                Kind::Complete,
+                Asked::Complete(upload_id.as_str().to_owned()),
+            );
+            answered(fault, || self.take_completion(upload_id, table))
+        })
+    }
+
+    fn abort_upload<'a>(
+        &'a self,
+        upload_id: &'a UploadId,
+    ) -> ServiceFuture<'a, ArchiveAnswer<UploadAborted>> {
+        Box::pin(async move {
+            let fault = self.arriving(Kind::Abort, Asked::Abort(upload_id.as_str().to_owned()));
+            answered(fault, || self.take_abandonment(upload_id))
+        })
+    }
+
+    fn read_object(
+        &self,
+        _archive_id: ArchiveId,
+        _object_id: BackupObjectId,
+        _offset: u64,
+        _length: u64,
+    ) -> ServiceFuture<'_, ObjectRange> {
+        Box::pin(async { Err(not_scripted()) })
+    }
+
+    fn delete_object(
+        &self,
+        _archive_id: ArchiveId,
+        _object_id: BackupObjectId,
+    ) -> ServiceFuture<'_, ObjectDeleted> {
+        Box::pin(async { Err(not_scripted()) })
+    }
+}
+
+impl BackupManifestService for Web {
+    fn enrol<'a>(&'a self, _record: &'a BackupWriterRecord) -> ServiceFuture<'a, Enrolled> {
+        Box::pin(async { Err(not_scripted()) })
+    }
+
+    fn publish<'a>(
+        &'a self,
+        publication: &'a BackupGenerationPublication,
+    ) -> ServiceFuture<'a, ArchiveAnswer<Published>> {
+        Box::pin(async move {
+            let fault = self.arriving(
+                Kind::Publish,
+                Asked::Publish(publication.payload.descriptor.backup_generation),
+            );
+            answered(fault, || self.take_publication(publication))
+        })
+    }
+
+    fn fetch<'a>(
+        &'a self,
+        archive_id: ArchiveId,
+        generation: Option<BackupGeneration>,
+        _checkpoint: Option<&'a GenerationCheckpoint>,
+    ) -> ServiceFuture<'a, Option<FetchedGeneration>> {
+        Box::pin(async move {
+            let fault = self.arriving(Kind::Fetch, Asked::Fetch(generation.unwrap_or_default()));
+            answered(fault, || self.find_generation(archive_id, generation))
+        })
+    }
+}
+
+/// Seals one generation with an encrypted manifest object of its own, as a producer names each.
+fn seal_generation(
+    producer: &Producer,
+    generation: u64,
+    objects: &[StagedObject],
+) -> SealedArchive {
+    let mut recipients = ArchiveRecipients::new(CollectionKind::Owned);
+    assert!(recipients.add(*producer.device.public()));
+    seal_archive(
+        &producer.writer,
+        &producer.sender,
+        &recipients,
+        &ArchivePlan {
+            archive_id: archive_id(),
+            backup_generation: BackupGeneration::new(generation),
+            owner_device_id: owner_device(),
+            manifest_object_id: object_id(
+                0xe0 + u8::try_from(generation).expect("a small generation"),
+            ),
+            created_at_ms: TimestampMs::new(1_700_000_000_000),
+        },
+        objects,
+    )
+    .expect("a sealed archive")
+}
+
+/// The object identifier of one generation's member, by its place in the generation.
+fn member_of(generation: u64, index: usize) -> BackupObjectId {
+    object_id(u8::try_from(generation * 16 + index as u64).expect("a small generation"))
+}
+
+/// One host's backup service on the internal disk, the scripted service it uploads to, and the
+/// writer that publishes what it produces.
+struct Host {
+    service: Arc<BackupService>,
+    web: Arc<Web>,
+    producer: Producer,
+    state: std::path::PathBuf,
+    _root: tempfile::TempDir,
+}
+
+impl Host {
+    /// A host that has reconciled its store and enrolled its writer, as a daemon's is.
+    fn open() -> Self {
+        let (root, state) = state_directory();
+        let service = Arc::new(BackupService::open(&state).expect("a backup service"));
+        service
+            .reconcile(TimestampMs::new(4_000))
+            .expect("the startup reconciliation");
+        let producer = Producer::generate();
+        service
+            .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+            .expect("the writer is enrolled");
+        let web = Arc::new(Web::new(
+            *producer.writer.public(),
+            producer.writer.key_id(),
+        ));
+        Self {
+            service,
+            web,
+            producer,
+            state,
+            _root: root,
+        }
+    }
+
+    /// Admits one generation whose members are plaintexts of these sizes, and returns the attempt
+    /// that will upload it.
+    fn admit(&self, generation: u64, sizes: &[usize]) -> u64 {
+        self.try_admit(generation, sizes)
+            .expect("the generation is admitted")
+            .sequence
+    }
+
+    fn try_admit(&self, generation: u64, sizes: &[usize]) -> Result<Admitted, ControllerError> {
+        let objects: Vec<StagedObject> = sizes
+            .iter()
+            .enumerate()
+            .map(|(index, size)| {
+                let member = member_of(generation, index);
+                stage_object(
+                    &ObjectSource {
+                        object_id: member,
+                        filename: &format!("member-{index}.cbor"),
+                        plaintext: &vec![0x5a; *size],
+                    },
+                    KeyRotation::INITIAL,
+                )
+                .expect("a staged object")
+            })
+            .collect();
+        let sealed = seal_generation(&self.producer, generation, &objects);
+        self.service.admit(
+            &sealed,
+            &objects,
+            self.producer.writer.key_id(),
+            TimestampMs::new(5_000 + generation),
+        )
+    }
+
+    fn uploader(&self, now: u64) -> Uploader {
+        let storage: Arc<dyn StorageService> = self.web.clone();
+        let manifest: Arc<dyn BackupManifestService> = self.web.clone();
+        Uploader::new(
+            Arc::clone(&self.service),
+            storage,
+            manifest,
+            self.producer.writer.clone(),
+            TimestampMs::new(now),
+        )
+    }
+
+    /// Stops this host and starts it again as a daemon does: the store is opened again from disk,
+    /// whatever an earlier uploader held in memory is gone, publications that were on their way are
+    /// settled, and then the store is reconciled.
+    async fn restart(&mut self, now: u64) -> (Uploader, Vec<Stepped>) {
+        self.service = Arc::new(BackupService::open(&self.state).expect("the store opens again"));
+        let mut uploader = self.uploader(now);
+        let settled = uploader
+            .settle(TimestampMs::new(now))
+            .await
+            .expect("publications that were on their way are settled");
+        self.service
+            .reconcile(TimestampMs::new(now))
+            .expect("the startup reconciliation");
+        (uploader, settled)
+    }
+
+    fn generation(&self, generation: u64) -> GenerationRecord {
+        self.service
+            .generation(archive_id(), BackupGeneration::new(generation))
+            .expect("a read")
+            .expect("the generation")
+    }
+
+    fn outcome(&self, sequence: u64) -> Option<AttemptOutcome> {
+        self.service
+            .attempts()
+            .expect("a read")
+            .into_iter()
+            .find(|attempt| attempt.sequence == sequence)
+            .expect("the attempt")
+            .outcome
+    }
+}
+
+/// Runs passes at one instant until a pass moves nothing on, and returns every step they took.
+async fn passes(uploader: &mut Uploader, now: u64) -> Vec<Stepped> {
+    let mut steps = Vec::new();
+    for _ in 0..8 {
+        let report = uploader.pass(TimestampMs::new(now)).await.expect("a pass");
+        let moved = report
+            .steps
+            .iter()
+            .any(|step| !matches!(step, Stepped::Waiting { .. }));
+        steps.extend(report.steps);
+        if !moved {
+            break;
+        }
+    }
+    steps
+}
+
+/// Steps one at a time until a step of the kind `until` names, and returns the steps taken.
+async fn steps_until(uploader: &mut Uploader, now: u64, until: &str) -> Vec<Stepped> {
+    let mut steps = Vec::new();
+    loop {
+        let step = uploader
+            .step(TimestampMs::new(now))
+            .await
+            .expect("a step")
+            .unwrap_or_else(|| panic!("the uploader ran out of steps before one {until}"));
+        let reached = kind_of(&step) == until;
+        steps.push(step);
+        if reached {
+            return steps;
+        }
+    }
+}
+
+fn kind_of(step: &Stepped) -> &'static str {
+    match step {
+        Stepped::Dispatched { .. } => "dispatched",
+        Stepped::Created { .. } => "created",
+        Stepped::Sent { .. } => "sent",
+        Stepped::Stored { .. } => "stored",
+        Stepped::Accepted { .. } => "accepted",
+        Stepped::Published { .. } => "published",
+        Stepped::Settled { .. } => "settled",
+        Stepped::Abandoned { .. } => "abandoned",
+        Stepped::Forgotten { .. } => "forgotten",
+        Stepped::Unabandoned { .. } => "unabandoned",
+        Stepped::Stopped { .. } => "stopped",
+        Stepped::CollectionDeleted { .. } => "collection deleted",
+        Stepped::Waiting { .. } => "waiting",
+    }
+}
+
+fn kinds(steps: &[Stepped]) -> Vec<&'static str> {
+    steps.iter().map(kind_of).collect()
+}
+
+/// The uploader's work runs on whatever thread a daemon's runtime gives it.
+fn on_any_thread<T: Send>(work: T) -> T {
+    work
+}
+
+#[tokio::test]
+async fn a_generation_admitted_is_uploaded_part_by_part_and_published_once() {
+    let host = Host::open();
+    let upload = host.admit(1, &[TWO_PARTS, 64]);
+    let mut uploader = host.uploader(10_000);
+    let report = on_any_thread(uploader.pass(TimestampMs::new(10_000)))
+        .await
+        .expect("a pass");
+    assert_eq!(report.idle, None);
+    assert_eq!(
+        kinds(&report.steps),
+        [
+            "dispatched",
+            "created",
+            "sent",
+            "stored",
+            "created",
+            "sent",
+            "stored",
+            "created",
+            "sent",
+            "stored",
+            "accepted",
+            "dispatched",
+            "published",
+        ]
+    );
+    assert_eq!(
+        report.steps[2],
+        Stepped::Sent {
+            sequence: upload,
+            object_id: member_of(1, 0),
+            parts: 2,
+        },
+        "the first member goes in two parts"
+    );
+    assert_eq!(
+        report.describe().last().map(String::as_str),
+        Some("backup attempt 2 published its generation")
+    );
+
+    // The service holds exactly the ciphertext this host staged, each object once and each part
+    // once, and the publication it holds is the writer's, over the descriptor the generation was
+    // sealed with, at the instant it was admitted.
+    for object in host
+        .service
+        .objects(archive_id(), BackupGeneration::new(1))
+        .expect("a read")
+    {
+        assert!(object.is_acknowledged());
+        assert_eq!(
+            host.web.stored_bytes(object.object_id),
+            Some(std::fs::read(&object.staged_path).expect("the staged ciphertext"))
+        );
+    }
+    assert_eq!(host.web.stored_objects(), 3);
+    assert_eq!(host.web.parts_of("upload-1"), [1, 2]);
+    host.web.nothing_asked_twice();
+    let record = host.generation(1);
+    let publication = host
+        .web
+        .publication(1)
+        .expect("the generation is published");
+    assert_eq!(
+        Some(publication.payload.descriptor),
+        record
+            .descriptor
+            .as_deref()
+            .map(|bytes| ArchiveDescriptor::from_canonical_bytes(bytes).expect("a descriptor"))
+    );
+    assert_eq!(publication.payload.published_at_ms, record.created_at_ms);
+
+    // And the store says so: the generation is complete and published, every attempt was carried
+    // by this uploader and accepted, and no upload is left in progress.
+    assert_eq!(record.production, Production::Complete);
+    assert_eq!(record.remote, Remote::Published);
+    for attempt in host.service.attempts().expect("a read") {
+        assert_eq!(attempt.executor.as_deref(), Some(UPLOADER));
+        assert_eq!(attempt.outcome, Some(AttemptOutcome::Accepted));
+    }
+
+    // A pass with nothing to do asks the service nothing.
+    let asked = host.web.asked().len();
+    let idle = uploader
+        .pass(TimestampMs::new(11_000))
+        .await
+        .expect("a pass");
+    assert!(idle.steps.is_empty());
+    assert_eq!(host.web.asked().len(), asked);
+}
+
+/// A process can stop after any step. A restart settles what was on its way, reconciles, and goes
+/// on: every generation finishes once, and no request that was answered is sent again.
+#[tokio::test]
+async fn a_crash_after_any_step_and_a_restart_finish_the_generation_once_with_nothing_sent_twice() {
+    let uninterrupted = {
+        let host = Host::open();
+        host.admit(1, &[TWO_PARTS]);
+        let mut uploader = host.uploader(10_000);
+        let mut steps = Vec::new();
+        while let Some(step) = uploader
+            .step(TimestampMs::new(10_000))
+            .await
+            .expect("a step")
+        {
+            steps.push(step);
+        }
+        kinds(&steps)
+    };
+    assert_eq!(
+        uninterrupted,
+        [
+            "dispatched",
+            "created",
+            "sent",
+            "stored",
+            "created",
+            "sent",
+            "stored",
+            "accepted",
+            "dispatched",
+            "published",
+        ]
+    );
+
+    for stopped_after in 0..uninterrupted.len() {
+        let mut host = Host::open();
+        host.admit(1, &[TWO_PARTS]);
+        {
+            let mut uploader = host.uploader(10_000);
+            for _ in 0..stopped_after {
+                uploader
+                    .step(TimestampMs::new(10_000))
+                    .await
+                    .expect("a step")
+                    .expect("a step to take");
+            }
+        }
+        let (mut uploader, settled) = host.restart(20_000).await;
+        assert!(
+            settled.is_empty(),
+            "nothing was on its way after {stopped_after} steps"
+        );
+        passes(&mut uploader, 20_000).await;
+        let late = passes(&mut uploader, 20_000 + ADMISSIBLE_MS).await;
+
+        let record = host.generation(1);
+        if stopped_after == uninterrupted.len() - 1 {
+            // Stopped between the publication's dispatch and its send. Reconciliation wrote down an
+            // outcome this host cannot establish, and once nothing sent for it could land any more
+            // the attempt ended: nothing is published again.
+            assert_eq!(record.production, Production::Cancelled);
+            assert_eq!(record.remote, Remote::Unknown);
+            assert!(host.web.publication(1).is_none());
+            assert_eq!(kinds(&late), ["stopped"]);
+        } else {
+            assert_eq!(
+                record.production,
+                Production::Complete,
+                "stopped after {stopped_after} steps"
+            );
+            assert_eq!(
+                record.remote,
+                Remote::Published,
+                "stopped after {stopped_after} steps"
+            );
+            assert!(
+                late.is_empty(),
+                "stopped after {stopped_after} steps: {late:?}"
+            );
+        }
+        assert!(
+            host.service.outbox().expect("a read").is_empty(),
+            "every attempt ended after a stop after {stopped_after} steps"
+        );
+        assert_eq!(host.web.stored_objects(), 2);
+        host.web.nothing_asked_twice();
+    }
+}
+
+/// A process can also stop while an answer is on its way back. The request it had sent is asked
+/// for again, or found, and the service stores nothing twice.
+#[tokio::test]
+async fn an_answer_lost_before_a_crash_is_asked_for_again_and_nothing_is_stored_twice() {
+    for (kind, nth) in [
+        (Kind::Create, 1),
+        (Kind::Part, 2),
+        (Kind::Complete, 1),
+        (Kind::Publish, 1),
+    ] {
+        let mut host = Host::open();
+        host.admit(1, &[TWO_PARTS]);
+        host.web.fail(kind, nth, Fault::Lost);
+        {
+            let mut uploader = host.uploader(10_000);
+            steps_until(&mut uploader, 10_000, "waiting").await;
+        }
+        let (mut uploader, settled) = host.restart(20_000).await;
+        passes(&mut uploader, 20_000).await;
+        if kind == Kind::Create {
+            // The service holds the first upload open under an identity this host never learned,
+            // and takes no other upload of the object until that one's lifetime runs out.
+            assert_eq!(host.generation(1).remote, Remote::Nothing);
+            host.web.expire_uploads();
+            passes(&mut uploader, 30_000).await;
+        }
+
+        let record = host.generation(1);
+        assert_eq!(record.production, Production::Complete, "{kind:?}");
+        assert_eq!(record.remote, Remote::Published, "{kind:?}");
+        host.web.stored_once();
+        let member = member_of(1, 0);
+        match kind {
+            Kind::Create => {
+                assert_eq!(
+                    host.web.count(|asked| *asked == Asked::Create(member)),
+                    3,
+                    "the lost one, the one refused while it was open, and the one after"
+                );
+                assert!(host.web.parts_of("upload-1").is_empty());
+                assert_eq!(host.web.parts_of("upload-2"), [1, 2]);
+            }
+            Kind::Part => assert_eq!(
+                host.web.parts_of("upload-1"),
+                [1, 2, 2],
+                "the part whose answer was lost, and nothing before it"
+            ),
+            Kind::Complete => assert_eq!(
+                host.web
+                    .count(|asked| *asked == Asked::Complete("upload-1".to_owned())),
+                2
+            ),
+            _ => {
+                assert_eq!(kinds(&settled), ["settled"]);
+                assert_eq!(
+                    host.web.count(|asked| matches!(asked, Asked::Publish(_))),
+                    1,
+                    "a publication the service holds is not sent again"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn after_a_crash_an_upload_goes_on_at_the_part_after_the_last_one_acknowledged() {
+    let mut host = Host::open();
+    host.admit(1, &[THREE_PARTS]);
+    // The third part never arrives: the process stops while it is on its way.
+    host.web.fail(Kind::Part, 3, Fault::Dropped);
+    {
+        let mut uploader = host.uploader(10_000);
+        let report = uploader
+            .pass(TimestampMs::new(10_000))
+            .await
+            .expect("a pass");
+        assert_eq!(kinds(&report.steps), ["dispatched", "created", "waiting"]);
+    }
+    assert_eq!(host.web.parts_of("upload-1"), [1, 2]);
+
+    let (mut uploader, _) = host.restart(20_000).await;
+    let steps = passes(&mut uploader, 20_000).await;
+    assert_eq!(kinds(&steps)[..2], ["sent", "stored"]);
+    assert_eq!(
+        host.web.parts_of("upload-1"),
+        [1, 2, 3],
+        "the two acknowledged parts are not sent again"
+    );
+    assert_eq!(host.generation(1).remote, Remote::Published);
+    host.web.nothing_asked_twice();
+}
+
+#[tokio::test]
+async fn a_publication_that_may_have_left_is_fetched_and_sent_again_only_once_it_cannot_land() {
+    // The request never arrived.
+    let host = Host::open();
+    host.admit(1, &[64]);
+    host.web.fail(Kind::Publish, 1, Fault::Dropped);
+    let mut uploader = host.uploader(10_000);
+    let sent = uploader
+        .pass(TimestampMs::new(10_000))
+        .await
+        .expect("a pass");
+    assert_eq!(kinds(&sent.steps).last(), Some(&"waiting"));
+
+    // While a request sent for it could still be admitted, the uploader asks whether the service
+    // holds it, and sends nothing.
+    let within = uploader
+        .pass(TimestampMs::new(10_000 + ADMISSIBLE_MS - 1))
+        .await
+        .expect("a pass");
+    assert_eq!(kinds(&within.steps), ["waiting"]);
+    assert_eq!(
+        host.web.count(|asked| matches!(asked, Asked::Publish(_))),
+        0
+    );
+
+    // Once none can, nothing that was sent landed, and the same publication is sent again.
+    let after = uploader
+        .pass(TimestampMs::new(10_000 + ADMISSIBLE_MS))
+        .await
+        .expect("a pass");
+    assert_eq!(kinds(&after.steps), ["published"]);
+    assert_eq!(
+        host.web.count(|asked| matches!(asked, Asked::Publish(_))),
+        1
+    );
+    assert_eq!(host.generation(1).remote, Remote::Published);
+
+    // The request arrived and its answer was lost: the fetch finds it, and it is not sent again.
+    let host = Host::open();
+    host.admit(1, &[64]);
+    host.web.fail(Kind::Publish, 1, Fault::Lost);
+    let mut uploader = host.uploader(10_000);
+    uploader
+        .pass(TimestampMs::new(10_000))
+        .await
+        .expect("a pass");
+    let found = uploader
+        .pass(TimestampMs::new(10_060))
+        .await
+        .expect("a pass");
+    assert_eq!(kinds(&found.steps), ["published"]);
+    assert_eq!(
+        host.web.count(|asked| matches!(asked, Asked::Publish(_))),
+        1
+    );
+    assert_eq!(host.generation(1).production, Production::Complete);
+}
+
+#[tokio::test]
+async fn a_privacy_fence_raised_mid_upload_stops_everything_not_yet_sent() {
+    let host = Host::open();
+    let first = host.admit(1, &[THREE_PARTS]);
+    let second = host.admit(2, &[64]);
+    // Privacy mode is turned on while the first part is on its way.
+    let service = Arc::clone(&host.service);
+    host.web.when_a_part_arrives(move |number| {
+        if number == 1 {
+            let generation = PrivacyGeneration::new(1);
+            service
+                .raise_fence(generation, TimestampMs::new(11_000))
+                .expect("the fence is raised");
+            service
+                .cancel_undispatched_work(generation, TimestampMs::new(11_000))
+                .expect("undispatched work is taken back");
+        }
+    });
+
+    let mut uploader = host.uploader(10_000);
+    let steps = passes(&mut uploader, 12_000).await;
+    assert_eq!(
+        kinds(&steps),
+        ["dispatched", "created", "waiting", "abandoned", "stopped"]
+    );
+    let Stepped::Stopped { reason, .. } = &steps[4] else {
+        unreachable!("the kinds say so");
+    };
+    assert!(
+        reason.contains("privacy mode stopped backup production at privacy generation 1"),
+        "{reason}"
+    );
+
+    // The part in flight when the fence went up is the last thing that left: no further part, no
+    // completion, no other object and no publication, and nothing of the generation behind it.
+    let member = member_of(1, 0);
+    assert_eq!(
+        host.web.asked(),
+        [
+            Asked::Status,
+            Asked::Create(member),
+            Asked::Part("upload-1".to_owned(), 1),
+            Asked::Abort("upload-1".to_owned()),
+        ]
+    );
+    assert_eq!(host.outcome(first), Some(AttemptOutcome::Stopped));
+    assert_eq!(host.outcome(second), Some(AttemptOutcome::Cancelled));
+
+    // With the attempt ended, privacy mode's cleanup finishes.
+    host.service
+        .run_cleanup(PrivacyGeneration::new(1), TimestampMs::new(13_000))
+        .expect("the cleanup runs");
+    assert!(host.service.obligations().expect("a read").is_empty());
+    let subsystems: Vec<&dyn PrivacySubsystem> = vec![&*host.service];
+    assert!(PrivacyMode::reconcile(&subsystems).is_complete());
+}
+
+#[tokio::test]
+async fn a_deleted_collection_stops_the_attempt_and_says_to_enrol_a_new_one() {
+    // An upload meets it, with another generation of the archive queued behind.
+    let host = Host::open();
+    let first = host.admit(1, &[64]);
+    let second = host.admit(2, &[64]);
+    host.web.delete_collection(archive_id());
+    let mut uploader = host.uploader(10_000);
+    let steps = passes(&mut uploader, 10_000).await;
+    assert_eq!(kinds(&steps), ["dispatched", "collection deleted"]);
+    let said = steps[1].describe();
+    assert!(said.contains("deleted from the account console"), "{said}");
+    assert!(said.contains("enrol a new collection"), "{said}");
+    assert!(!said.to_lowercase().contains("update"), "{said}");
+
+    // Nothing more goes to a collection that takes nothing: the attempt stops, the generations
+    // still producing are cancelled with the reason, and the writer is retired for the archive, so
+    // no new generation of it is admitted.
+    assert_eq!(host.outcome(first), Some(AttemptOutcome::Stopped));
+    assert_eq!(host.outcome(second), Some(AttemptOutcome::Cancelled));
+    for generation in [1, 2] {
+        let record = host.generation(generation);
+        assert_eq!(record.production, Production::Cancelled);
+        assert!(
+            record
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("enrol a new collection")),
+            "{record:?}"
+        );
+    }
+    let refused = host.try_admit(3, &[64]);
+    assert!(
+        matches!(refused, Err(ControllerError::PermissionDenied { .. })),
+        "{refused:?}"
+    );
+    assert_eq!(
+        host.web.asked(),
+        [Asked::Status, Asked::Create(member_of(1, 0))]
+    );
+    assert!(passes(&mut uploader, 11_000).await.is_empty());
+
+    // An upload in progress meets it at its completion, and is abandoned at the service.
+    let host = Host::open();
+    host.admit(1, &[TWO_PARTS]);
+    let mut uploader = host.uploader(10_000);
+    steps_until(&mut uploader, 10_000, "sent").await;
+    host.web.delete_collection(archive_id());
+    let steps = passes(&mut uploader, 10_000).await;
+    assert_eq!(kinds(&steps), ["collection deleted", "abandoned"]);
+    assert_eq!(host.web.stored_objects(), 0);
+
+    // A publication meets it once every object is at the service.
+    let host = Host::open();
+    host.admit(1, &[64]);
+    let mut uploader = host.uploader(10_000);
+    steps_until(&mut uploader, 10_000, "accepted").await;
+    host.web.delete_collection(archive_id());
+    let steps = passes(&mut uploader, 10_000).await;
+    assert_eq!(kinds(&steps), ["dispatched", "collection deleted"]);
+    assert!(steps[1].describe().contains("enrol a new collection"));
+    assert!(host.web.publication(1).is_none());
+    assert_eq!(host.generation(1).production, Production::Cancelled);
+}
+
+#[tokio::test]
+async fn an_attempt_the_store_no_longer_holds_is_never_sent() {
+    // Ended by another hand between two steps: nothing of it is sent.
+    let host = Host::open();
+    let upload = host.admit(1, &[64]);
+    let mut uploader = host.uploader(10_000);
+    assert_eq!(
+        uploader
+            .step(TimestampMs::new(10_000))
+            .await
+            .expect("a step"),
+        Some(Stepped::Dispatched { sequence: upload })
+    );
+    host.service
+        .note_attempt_stopped(upload, TimestampMs::new(10_500))
+        .expect("the attempt is ended elsewhere");
+    let report = uploader
+        .pass(TimestampMs::new(11_000))
+        .await
+        .expect("a pass");
+    assert!(report.steps.is_empty(), "{report:?}");
+    assert!(
+        host.web.asked().iter().all(|asked| *asked == Asked::Status),
+        "{:?}",
+        host.web.asked()
+    );
+
+    // Ended while a part is on its way: that part lands, and nothing after it leaves.
+    let host = Host::open();
+    let upload = host.admit(1, &[THREE_PARTS]);
+    let service = Arc::clone(&host.service);
+    host.web.when_a_part_arrives(move |number| {
+        if number == 1 {
+            service
+                .note_attempt_stopped(upload, TimestampMs::new(10_500))
+                .expect("the attempt is ended elsewhere");
+        }
+    });
+    let mut uploader = host.uploader(10_000);
+    let steps = passes(&mut uploader, 11_000).await;
+    assert_eq!(kinds(&steps), ["dispatched", "created", "waiting"]);
+    assert_eq!(host.web.parts_of("upload-1"), [1]);
+    assert_eq!(
+        host.web
+            .count(|asked| matches!(asked, Asked::Complete(_) | Asked::Publish(_))),
+        0
+    );
+}
+
+#[tokio::test]
+async fn nothing_is_sent_while_backup_storage_is_off_or_before_the_store_is_reconciled() {
+    let mut host = Host::open();
+    let upload = host.admit(1, &[64]);
+    host.web.turn_backup_off();
+    {
+        let mut uploader = host.uploader(10_000);
+        let report = uploader
+            .pass(TimestampMs::new(10_000))
+            .await
+            .expect("a pass");
+        assert_eq!(report.idle, Some(Idle::BackupOff));
+        assert!(report.steps.is_empty());
+        assert_eq!(
+            report.describe(),
+            ["managed backup storage is off, so nothing is uploaded until it is turned on"]
+        );
+    }
+    assert_eq!(host.web.asked(), [Asked::Status]);
+    assert_eq!(host.outcome(upload), None, "the attempt is still queued");
+
+    // A host that has opened its store and not yet reconciled it sends nothing either.
+    host.service = Arc::new(BackupService::open(&host.state).expect("the store opens again"));
+    let mut uploader = host.uploader(20_000);
+    let report = uploader
+        .pass(TimestampMs::new(20_000))
+        .await
+        .expect("a pass");
+    assert!(
+        matches!(report.idle, Some(Idle::Unready { .. })),
+        "{report:?}"
+    );
+    assert_eq!(
+        uploader
+            .step(TimestampMs::new(20_000))
+            .await
+            .expect("a step"),
+        None
+    );
+    assert_eq!(host.web.asked(), [Asked::Status]);
+}
+
+#[tokio::test]
+async fn an_upload_refused_as_not_permitted_is_abandoned_and_uploaded_again_under_a_new_one() {
+    let host = Host::open();
+    host.admit(1, &[TWO_PARTS]);
+    host.web.fail(Kind::Part, 2, Fault::Forbidden);
+    let mut uploader = host.uploader(10_000);
+    let first = uploader
+        .pass(TimestampMs::new(10_000))
+        .await
+        .expect("a pass");
+    assert_eq!(
+        kinds(&first.steps),
+        ["dispatched", "created", "abandoned", "waiting"]
+    );
+    passes(&mut uploader, 11_000).await;
+    assert_eq!(host.generation(1).remote, Remote::Published);
+    assert_eq!(host.web.parts_of("upload-1"), [1, 2]);
+    assert_eq!(host.web.parts_of("upload-2"), [1, 2]);
+    assert_eq!(
+        host.web
+            .count(|asked| *asked == Asked::Abort("upload-1".to_owned())),
+        1
+    );
+    host.web.stored_once();
+
+    // An abandonment the service refuses too leaves the upload as it is, and the next pass goes on
+    // under the same identity.
+    let host = Host::open();
+    host.admit(1, &[TWO_PARTS]);
+    host.web.fail(Kind::Part, 2, Fault::Forbidden);
+    host.web.fail(Kind::Abort, 1, Fault::Forbidden);
+    let mut uploader = host.uploader(10_000);
+    let first = uploader
+        .pass(TimestampMs::new(10_000))
+        .await
+        .expect("a pass");
+    assert_eq!(kinds(&first.steps), ["dispatched", "created", "waiting"]);
+    passes(&mut uploader, 11_000).await;
+    assert_eq!(host.generation(1).remote, Remote::Published);
+    assert_eq!(host.web.parts_of("upload-1"), [1, 2, 2]);
+    assert_eq!(
+        host.web
+            .count(|asked| *asked == Asked::Create(member_of(1, 0))),
+        1
+    );
+    host.web.stored_once();
 }

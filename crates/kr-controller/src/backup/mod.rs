@@ -31,6 +31,7 @@
 
 mod statements;
 pub mod store;
+pub mod uploader;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
