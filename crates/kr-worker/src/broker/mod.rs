@@ -3405,26 +3405,43 @@ impl Broker {
 
     // -- registered actions -------------------------------------------------------------------
 
-    /// Records the actions one package registered.
+    /// Registers the actions one package declared, as its manifest declares them.
+    ///
+    /// A registration takes the package's declarations and nothing else, so every registered
+    /// action's grant, effect, capability, operation and decision parameter are what its declared
+    /// class and implementation derive ([`RegisteredAction::from_declaration`]). What an action
+    /// is called, or labelled, does not enter into it. The registered set replaces what the
+    /// binding held.
+    ///
+    /// A declaration this host does not register as an invocable action (decoding, which is a
+    /// grant; terminal input, which is the input lease's; an answer a component would prepare) is
+    /// left out, and returned with the reason, which names it.
     ///
     /// # Errors
     ///
     /// Returns [`BrokerError::UnknownSubject`] when this broker holds no such binding.
-    pub fn register_actions(
+    pub fn register_actions<'a>(
         &self,
         binding_id: BrokerBindingId,
-        actions: impl IntoIterator<Item = RegisteredAction>,
-    ) -> Result<()> {
+        declarations: impl IntoIterator<Item = &'a kr_plugin_sdk::effect::ActionDeclaration>,
+    ) -> Result<Vec<BrokerError>> {
+        let mut registered = BTreeMap::new();
+        let mut refused = Vec::new();
+        for declaration in declarations {
+            match RegisteredAction::from_declaration(declaration) {
+                Ok(action) => {
+                    registered.insert(action.name.clone(), action);
+                }
+                Err(refusal) => refused.push(refusal),
+            }
+        }
         let mut state = self.state();
         let binding = state
             .bindings
             .get_mut(&binding_id)
             .ok_or_else(|| unknown_binding(binding_id))?;
-        binding.actions = actions
-            .into_iter()
-            .map(|action| (action.name.clone(), action))
-            .collect();
-        Ok(())
+        binding.actions = registered;
+        Ok(refused)
     }
 
     /// Returns the binding one package holds against one instance.

@@ -708,17 +708,7 @@ async fn kr_req_12_18_a_channel_is_served_only_for_a_version_its_table_is_qualif
 /// Registers the package's own actions on its binding, as the installation's binder will.
 fn register_actions(broker: &Broker, package: &Package, number: u8) {
     broker
-        .register_actions(
-            binding(number),
-            package
-                .connector
-                .manifest()
-                .actions
-                .iter()
-                .filter_map(|declared| {
-                    kr_worker::broker::RegisteredAction::from_declaration(declared).ok()
-                }),
-        )
+        .register_actions(binding(number), &package.connector.manifest().actions)
         .expect("its actions are registered");
 }
 

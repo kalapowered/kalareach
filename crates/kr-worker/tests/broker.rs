@@ -1591,14 +1591,7 @@ fn component_decoded(connector: &InstalledConnector) -> (Broker, PendingResource
         )
         .expect("the package is bound with its trust");
     broker
-        .register_actions(
-            binding(9),
-            connector
-                .manifest()
-                .actions
-                .iter()
-                .filter_map(|declared| RegisteredAction::from_declaration(declared).ok()),
-        )
+        .register_actions(binding(9), &connector.manifest().actions)
         .expect("its actions are registered");
     let connection = open_channel(&broker, connector);
     let relayed = relay(&broker, connection, "abcde", 2);
@@ -1631,13 +1624,14 @@ fn component_decoded(connector: &InstalledConnector) -> (Broker, PendingResource
 /// on the write path whatever its own label says.
 #[test]
 fn kr_req_11_47_a_label_that_reads_as_a_read_registers_as_its_declared_class() {
-    let preview = RegisteredAction::from_declaration(&declaration(
+    let previewing = declaration(
         "prompt.preview",
         "Preview (read only)",
         "upstream.prompt",
         by_component(),
-    ))
-    .expect("an upstream.prompt declaration registers");
+    );
+    let preview = RegisteredAction::from_declaration(&previewing)
+        .expect("an upstream.prompt declaration registers");
     let send = RegisteredAction::from_declaration(&declaration(
         "prompt.send",
         "Send",
@@ -1675,16 +1669,23 @@ fn kr_req_11_47_a_label_that_reads_as_a_read_registers_as_its_declared_class() {
 
     let broker = broker_with(BrokerGrants::granted([BrokerGrant::Observation]), None);
     prompts_work(&broker);
-    let read = RegisteredAction::from_declaration(&declaration(
+    let reading = declaration(
         "conversation.read",
         "Send now",
         "observe",
         serde_json::json!({ "type": "presentation" }),
-    ))
-    .expect("an observe declaration registers");
-    broker
-        .register_actions(binding(9), [preview, read])
+    );
+    let refused = broker
+        .register_actions(binding(9), &[previewing, reading])
         .expect("the actions are registered");
+    assert!(refused.is_empty(), "{refused:?}");
+    assert_eq!(
+        broker
+            .registered_action(binding(9), &preview.name)
+            .expect("bound"),
+        Some(preview),
+        "registered as its declaration derives it"
+    );
     let refusal = broker
         .admit_plugin_action(
             &caller("device-1"),
@@ -1720,13 +1721,12 @@ fn kr_req_11_47_a_plan_whose_operation_is_another_class_is_refused_at_the_spend(
     broker
         .register_actions(
             binding(9),
-            [RegisteredAction::from_declaration(&declaration(
+            &[declaration(
                 "prompt.send",
                 "Send",
                 "upstream.prompt",
                 by_component(),
-            ))
-            .expect("an upstream.prompt declaration registers")],
+            )],
         )
         .expect("the action is registered");
     let plan = |class: EffectClass, operation: PreparedOperation| PreparedEffect {
@@ -1871,6 +1871,94 @@ fn kr_req_11_47_an_answer_to_a_component_decoded_request_needs_its_decoder_to_en
         );
         let _ = std::fs::remove_dir_all(&root);
     }
+}
+
+/// KR-REQ-11.47: a binding's actions are registered from its package's declarations and from
+/// nothing else, each as its declared class and implementation derive it. A declaration this host
+/// does not register as an invocable action (decoding, terminal input, an answer a component would
+/// prepare) is left out and returned with the reason, which names it, and a later registration
+/// replaces the set whole.
+#[test]
+fn kr_req_11_47_actions_register_only_from_their_declarations() {
+    let root = package_store();
+    let connector = claude_code(&root, true, &[]);
+    let broker = broker_with(
+        BrokerGrants::granted([
+            BrokerGrant::UpstreamAction,
+            BrokerGrant::ApprovalInterpreter,
+        ]),
+        Some(trust(&[permission_method()], true)),
+    );
+    let mut declarations = connector.manifest().actions.clone();
+    declarations.push(declaration(
+        "approval.inspect",
+        "Inspect",
+        "approval.decode",
+        by_component(),
+    ));
+    declarations.push(declaration(
+        "shell.type",
+        "Type it",
+        "terminal.input",
+        serde_json::json!({
+            "type": "terminal_text",
+            "template": [{ "type": "literal", "text": "ls" }],
+        }),
+    ));
+    declarations.push(declaration(
+        "approval.prepared",
+        "Allow",
+        "approval.respond",
+        by_component(),
+    ));
+    let refused: Vec<String> = broker
+        .register_actions(binding(9), &declarations)
+        .expect("the binding is bound")
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(refused.len(), 3, "{refused:?}");
+    for (name, why) in [
+        ("approval.inspect", "decoding"),
+        ("shell.type", "terminal"),
+        ("approval.prepared", "decision destination"),
+    ] {
+        assert!(
+            refused
+                .iter()
+                .any(|reason| reason.contains(name) && reason.contains(why)),
+            "{name} is refused for {why}: {refused:?}"
+        );
+        assert_eq!(
+            broker
+                .registered_action(binding(9), &ActionName::new(name).expect("valid"))
+                .expect("bound"),
+            None,
+            "{name} is not registered"
+        );
+    }
+    for declared in &connector.manifest().actions {
+        let name = ActionName::new(declared.id.as_str()).expect("valid");
+        assert_eq!(
+            broker.registered_action(binding(9), &name).expect("bound"),
+            Some(RegisteredAction::from_declaration(declared).expect("it derives")),
+            "{name} is registered as its declaration derives it"
+        );
+    }
+
+    let replaced = broker
+        .register_actions(binding(9), std::iter::empty())
+        .expect("the binding is bound");
+    assert!(replaced.is_empty());
+    for declared in &connector.manifest().actions {
+        let name = ActionName::new(declared.id.as_str()).expect("valid");
+        assert_eq!(
+            broker.registered_action(binding(9), &name).expect("bound"),
+            None,
+            "{name} went with the set it was registered in"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// KR-REQ-11.27: a transport that panics as it takes an answer, in a host that goes on running,

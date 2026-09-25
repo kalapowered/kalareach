@@ -1864,22 +1864,23 @@ async fn kr_req_11_37_a_receipt_fault_the_broker_never_saw_is_still_its_gap() {
     );
 }
 
-/// Registers the plugin action the resource tests below call, on the approval tests' binding.
+/// Registers the plugin action the resource tests below call, on the approval tests' binding: a
+/// component's `upstream.prompt` that names the pending resource it acts on.
 fn register_answer_action(host: &Host) {
+    let declared: kr_plugin_sdk::effect::ActionDeclaration =
+        serde_json::from_value(serde_json::json!({
+            "id": "approval.answer",
+            "label": "Answer",
+            "effect": "upstream.prompt",
+            "implementation": { "type": "component" },
+            "parameters": { "parameters": [] },
+            "description": "A prompt its component prepares",
+            "confirmation_required": false,
+        }))
+        .expect("a declaration the manifest format reads");
     host.service
         .broker()
-        .register_actions(
-            binding(),
-            [kr_worker::broker::RegisteredAction {
-                name: kr_protocol::broker::ActionName::new("approval.answer").expect("valid"),
-                grant: BrokerGrant::UpstreamAction,
-                effect: kr_protocol::authority::EffectClass::Write,
-                capability: Some(capability("agent.prompt")),
-                needs_draft: false,
-                operation: Some(kr_protocol::broker::PreparedOperation::UpstreamSubmit),
-                decision: None,
-            }],
-        )
+        .register_actions(binding(), &[declared])
         .expect("the action is registered");
 }
 
@@ -2123,12 +2124,7 @@ impl ServedChannel {
             )
             .expect("the package is bound");
         broker
-            .register_actions(
-                package_binding,
-                connector.manifest().actions.iter().filter_map(|declared| {
-                    kr_worker::broker::RegisteredAction::from_declaration(declared).ok()
-                }),
-            )
+            .register_actions(package_binding, &connector.manifest().actions)
             .expect("its actions are registered");
         let (ours, theirs) = tokio::io::duplex(64 * 1024);
         let (reader, writer) = tokio::io::split(theirs);
