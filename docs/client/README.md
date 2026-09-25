@@ -779,10 +779,11 @@ needs. `services::relay` is the relay-lease client, because a lease is the one
 managed resource a client cannot do without and still use a relay at all, and `services::voice` is
 the voice broker. `services::authority` carries the durable authority feed, where a remote owner
 publishes a signed revocation request and the host that owns the feed acknowledges what it applied,
-`services::mailbox` carries the encrypted mailbox, and `services::sync` carries settings sync. All
-three sign through `services::signed`, which is the one credential every method of the section 23
-`Services` group is proven by: the gateway origin, the method, a fresh nonce, the time and the
-digest of the canonical request body.
+`services::mailbox` carries the encrypted mailbox, `services::sync` carries settings sync,
+`services::storage` carries managed storage and `services::backup` the backup manifest. All five sign
+through `services::signed`, which is the one credential every method of the section 23 `Services`
+group is proven by: the gateway origin, the method, a fresh nonce, the time and the digest of the
+canonical request body.
 
 A request for something an account owns, rather than the key that asks, carries a second
 authorisation beside that credential. `signed::AccountAuthorisation` names a token source and the
@@ -1019,6 +1020,42 @@ number of pages its caller gives it, at least one, and names the cursor it stopp
 continues from there, handing back what it has, until the read reaches the end. That is what a member reads before
 it forgets an old epoch's key, and only a read that reached the end can show that nothing is sealed
 under one.
+
+`services::storage` is managed storage's client, `ManagedStorageService`, the `StorageService` this
+crate carries, and `services::backup` is the backup manifest's, `ManagedBackupManifestService`, its
+`BackupManifestService`. Backup storage belongs to an account, and an installation's own entitlement
+holds none, so every storage request and every publication carries the account token for
+`backup.write` beside its signature, and names the installation the signing key derives, which binds
+the two proofs to one caller. A client given no account sends none of them, and neither does one whose
+sign-in was not granted `backup.write`: its token source refuses, and nothing leaves the device. An
+enrolment and a fetch spend nothing and carry no token.
+
+- Backup storage is off until `set_retention` turns it on, decided against the revision a status read
+  names, and turning it off deletes nothing.
+- An upload is created before any content leaves, and it is answered with its part table: every part
+  8 MiB but the last, one table for one total, which this client holds to its own arithmetic. A part's
+  body is its ciphertext, and its signed request travels in the `kr-service-request` header beside
+  it, naming its length and SHA-256; a read is answered with the ciphertext itself. `upload_parts`
+  sends the parts after the last one acknowledged, in order, and tells its caller of each
+  acknowledgement before the next part leaves, so a transfer that stopped goes on at the next part and
+  sends no acknowledged part again. A part sent again after its answer was lost is answered as the part
+  it is, and a completion asked for again is answered with the result it already gave.
+- Two refusals are answers a caller acts on, `ArchiveAnswer`: `CollectionDeleted`, a collection its
+  owner deleted from the account console, which takes no upload and no publication again, so backing
+  up again means enrolling a new collection; and `UploadGone`, an upload that expired, was closed or is
+  not one the service holds for this caller, so the object is uploaded again under a new one. Where
+  `COLLECTION_DELETED` reaches a caller as an error it is a change of configuration, with a message
+  that says to enrol a new collection, and never an update. A service with no room for a part now,
+  `SERVICE_UNAVAILABLE`, is capacity to wait for, with the delay it names. An upload that would spend
+  an account's storage without the account's proof is answered `QUOTA_EXHAUSTED`, with a message that
+  says where backup storage comes from; the ledger's own `PAYMENT_REQUIRED` never reaches a client.
+- A publication is signed by the writer the collection's owner enrolled and carried by that writer's
+  own key, and an enrolment is carried by the owner's. The same publication sent again is answered as a
+  duplicate, and other content for a generation already published is refused. A fetch answers with the
+  publication exactly as it was published, or with nothing when the service holds no such generation,
+  or none as new as the checkpoint presented.
+- A read answers with up to 8 MiB of ciphertext, so `services::managed_response_limits` gives the read
+  path a bound of its own.
 
 A field left `None` is a service this client does not use, and nothing degrades. Direct connections,
 local sessions, drafts, plugins, local descriptions and user-operated alternatives need none of
@@ -1383,3 +1420,5 @@ not one of them, so an account password reset returns an account and nothing els
 | KR-REQ-20.17 | The table's answers: `the_material_table_refuses_a_reusable_key_and_a_revoked_grant` and `the_admitted_set_is_data_and_configuration_and_the_limits_still_require_owner_pairing` in `crates/kr-client/tests/recovery.rs`. The settings part, through the export and import paths that ask the table: `a_collection_key_is_neither_backed_up_nor_restored`, `a_restore_returns_settings_without_a_key_a_membership_or_a_sync_checkpoint` and `a_restored_device_joins_only_after_a_fresh_authorisation` in `crates/kr-client/tests/membership.rs`, which carry the settings through an archive only the recovery recipient opens. Producing and uploading the device's archive is the backup producer's; this library supplies what goes into it and takes back what comes out |
 | KR-REQ-20.18 | `a_migration_produces_an_updated_kit_and_a_verified_record` and `one_kit_serves_several_services` in `crates/kr-client/tests/recovery.rs`. The offline-export half is `the_encrypted_bundle_and_selected_archives_export_offline` in the same file, over the library's own `OfflineExport`: the encrypted bundle and the selected archives' ciphertext in one canonical document, which restores without a service. The bundle's path to a managed service: its locator and the claim a first write makes, the race between two writers and a lost write ended under a new token (`two_writers_of_one_account_race_and_one_is_told_the_bundle_moved_on`, `competing_first_claims_leave_one_owner_and_every_other_account_meets_an_absent_bundle`, `a_first_write_that_did_not_apply_claims_nothing`, `a_fence_made_before_the_claim_survives_it`, `a_lost_write_is_ended_under_a_new_token_and_after_a_restart`), and a write that never left (`a_write_refused_before_it_was_sent_leaves_the_store_as_it_was_and_the_next_write_goes_out`, `a_migration_refused_before_it_was_sent_leaves_both_locations_as_they_were`, `a_bundle_over_its_bound_is_refused_before_anything_is_recorded_or_sent`), all in `crates/kr-client/src/services/sync/tests/bundle.rs`, with `a_write_refused_before_it_was_sent_is_reported_so_and_leaves_the_store_as_it_was` and `a_record_the_disk_would_not_take_back_leaves_an_unsent_write_a_restart_ends` in `crates/kr-client/tests/recovery.rs` |
 | KR-REQ-20.19 | `service_access_alone_does_not_decrypt_the_bundle` and `substituting_the_origin_or_the_locator_fails_authentication` in `crates/kr-client/tests/recovery.rs`. Through the managed client: a device with only the kit reads the bundle through the access its policy gave it and reaches nothing without it (`a_device_with_only_the_kit_reads_the_bundle_through_the_access_its_policy_gives_it`), and a service put back without the bundle is refused as a bundle put back (`a_service_put_back_without_the_bundle_is_refused_as_a_bundle_put_back`), in `crates/kr-client/src/services/sync/tests/bundle.rs`; the restore's own authorisation holds a token for `backup.restore` and for no other resource (`a_restore_authorisation_holds_a_token_for_its_scope_and_for_no_other` in `crates/kr-client/src/services/account.rs`) |
+| KR-REQ-20.12 | The client's half of a generation's publication: the writer's signature over the descriptor, carried by the writer's own key with the account token beside it; the same publication sent again answered as a duplicate and other content for a generation already published refused; a fetch that answers with the publication exactly as it was published, and with nothing for a generation the service does not hold (`the_backup_manifest_enrols_publishes_and_fetches_as_the_service_answers` and `a_publication_sent_again_is_a_duplicate_and_other_content_for_it_is_refused` in `crates/kr-client/tests/storage.rs`) |
+| KR-REQ-20.22 | The client's part: backup storage is off until it is turned on, against the revision a status read names; a status read reports what is stored, what is deleted and not yet removed, what open uploads hold and the retention the service applies; and a deletion is a tombstone the service still charges until it removes the ciphertext (`each_storage_method_is_answered_as_the_service_answers_it` and `each_storage_method_meets_a_refusal_the_service_sends` in `crates/kr-client/tests/storage.rs`). The snapshots kept, the removal after seven days and the provider's bound are the service's |

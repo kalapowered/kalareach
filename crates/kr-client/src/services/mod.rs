@@ -6,7 +6,7 @@
 //! storage, relay bandwidth and operation, and a fork can point these traits at its own
 //! infrastructure without changing anything else in the client.
 //!
-//! The traits and one null implementation live here, and nine modules hold the managed
+//! The traits and one null implementation live here, and eleven modules hold the managed
 //! implementations this crate carries. [`account`] is the account sign-in: the request a system
 //! browser is handed, the checks on what comes back, and the grant a device keeps under one lock,
 //! with the account service's trait beside them. [`relay`] is the relay-lease client, because a lease is the
@@ -16,7 +16,10 @@
 //! owner publishes a signed revocation request and the host that owns the feed acknowledges what it
 //! applied. [`mailbox`] is the encrypted mailbox, where a device leaves a sealed item for a peer
 //! that is not connected and the peer reads its own. [`sync`] is settings sync, the
-//! compare-and-exchange service settings, a client's position and drafts are kept on. [`signed`] is
+//! compare-and-exchange service settings, a client's position and drafts are kept on. [`storage`] is
+//! managed storage, where an account's backup ciphertext is uploaded part by part and read back,
+//! and [`backup`] is the backup manifest, where a collection's writer is enrolled and each
+//! generation's descriptor is published and fetched. [`signed`] is
 //! the one signed call those of them that speak the section 23 `Services` group share, and [`http`]
 //! is the exchange underneath all of them: one gateway origin, finite deadlines, bounded answers
 //! and no retry of its own. [`json`] is the one reader of what any of them is answered, and it
@@ -60,11 +63,15 @@
 //! | [`sync::SyncHeldObject`] | A sealed object a collection holds | The object, its kind, where it stands, its key epoch |
 //! | [`sync::SyncHeldCopy`] | A sealed copy of a refused write | The copy, its object and kind, where the object stood, its key epoch |
 //! | [`SyncFetched`] | A sealed object one fetch found | Where the object stands, or the history that holds none |
+//! | [`storage::UploadPart`] | A part's ciphertext | Its number and length |
+//! | [`storage::ObjectRange`] | A range of stored ciphertext | Where it starts and its length |
+//! | [`backup::FetchedGeneration`] | A writer's publication: every wrapped manifest key and a signature | The archive and the generation |
+//! | `signed::Content` | What a read was answered with: ciphertext | Its length, or the refusal's code and status |
 //!
 //! A type that holds one of these only through one of these, as [`relay::RelayLeaseAnswer`] holds a
 //! grant, is safe to derive, because the rendering it composes is the redacted one.
 //!
-//! Eight tests are that rule's proof:
+//! Eleven tests are that rule's proof:
 //! `a_rendering_of_a_request_a_grant_or_a_token_carries_none_of_them` in [`account`],
 //! `a_rendering_of_a_request_a_credential_or_an_answer_carries_none_of_it` and
 //! `a_rendering_of_an_issued_lease_carries_neither_the_lease_nor_its_signature` in [`relay`],
@@ -73,8 +80,11 @@
 //! `a_rendering_of_a_request_or_an_answer_carries_neither_a_signature_nor_a_sealed_item` in
 //! [`authority`], and
 //! `a_rendering_of_a_request_an_item_or_a_page_carries_neither_a_claim_nor_a_sealed_item` in
-//! [`mailbox`], and
-//! `a_rendering_of_a_request_an_object_or_a_copy_carries_nothing_sealed` in [`sync`].
+//! [`mailbox`],
+//! `a_rendering_of_a_request_an_object_or_a_copy_carries_nothing_sealed` in [`sync`],
+//! `a_rendering_of_a_part_or_a_range_carries_its_length_and_never_its_ciphertext` in [`storage`],
+//! `a_rendering_of_a_fetched_generation_carries_neither_its_publication_nor_its_signature` in
+//! [`backup`], and `a_rendering_of_content_carries_its_length_and_never_its_bytes` in [`signed`].
 //! Each holds the type it covers to the exact fields above, in both `{:?}` and `{:#?}`, which is
 //! stronger than looking for a marker: a rendering that printed the bytes as decimals would pass a
 //! search for text and fail this. The enclosing types that only compose these, such as
@@ -97,18 +107,24 @@
 
 pub mod account;
 pub mod authority;
+pub mod backup;
 pub mod http;
 pub mod json;
 pub mod mailbox;
 pub mod relay;
 pub mod signed;
+pub mod storage;
 pub mod sync;
 pub mod voice;
 
 use std::future::Future;
 use std::pin::Pin;
 
-use kr_protocol::ids::{InstallationId, RelayLeaseId, SyncConflictId};
+use kr_protocol::archive::{BackupGenerationPublication, BackupWriterRecord};
+use kr_protocol::ids::{
+    ArchiveId, BackupGeneration, BackupObjectId, InstallationId, RelayLeaseId, SyncConflictId,
+};
+use kr_protocol::pairing::GenerationCheckpoint;
 use kr_protocol::scalars::{EndpointKey, Nullable, Uuid};
 use serde::{Deserialize, Serialize};
 
@@ -122,6 +138,10 @@ pub use authority::{
     AnnouncementOutcome, AnnouncementPlacement, AuthorityFeedClient, AuthorityFeedRecord,
     AuthorityFeedState, AuthorityFeedSummary, FeedAnnouncement, RejectionReason,
 };
+pub use backup::{
+    CollectionSummary, Enrolled, FetchedGeneration, GenerationSummary,
+    ManagedBackupManifestService, Published, WriterSummary,
+};
 pub use http::{HttpDeadlines, HttpService, ResponseLimits};
 pub use mailbox::{
     MailboxAcknowledgement, MailboxAnswer, MailboxChallenge, MailboxClaimAnswer,
@@ -132,6 +152,12 @@ pub use relay::{
     ManagedRelayLeaseService, RelayAllowance, RelayGraceRemainder, RelayLeaseAnswer,
     RelayLeaseEnding, RelayLeaseGrant, RelayLeaseRefusal, RelayWarning, ServiceHttp,
     ServiceHttpAnswer, ServiceSigner,
+};
+pub use storage::{
+    ArchiveAnswer, BackupState, ManagedStorageService, NewUpload, ObjectDeleted, ObjectRange,
+    PartStored, PartTable, RetentionChange, RetentionPolicy, RetentionSet, StorageLimits,
+    StoragePrincipal, StorageStatus, StorageUsage, StoredObject, UploadAborted, UploadCompleted,
+    UploadCreated, UploadId, UploadPart, UploadProgress, upload_parts,
 };
 pub use sync::{
     Inventory, InventoryCopy, InventoryObject, ManagedSyncService, MembershipListing,
@@ -165,6 +191,10 @@ pub fn managed_response_limits() -> ResponseLimits {
             mailbox::MAILBOX_ANSWER_LIMIT_BYTES,
         )
         .for_path(sync::SYNC_EXCHANGE_PATH, sync::SYNC_ANSWER_LIMIT_BYTES)
+        .for_path(
+            storage::STORAGE_READ_PATH,
+            storage::STORAGE_READ_ANSWER_LIMIT_BYTES,
+        )
 }
 
 /// How this module's rule about what is never rendered is checked.
@@ -995,6 +1025,116 @@ pub trait SyncBackupService: Send + Sync + std::fmt::Debug {
     ) -> ServiceFuture<'a, bool>;
 }
 
+/// Where an account's backup ciphertext is stored and read back: managed storage.
+///
+/// The service holds ciphertext under a key nobody outside it knows, charged to the account whose
+/// token the request carried, and it never hands out an address: every byte goes through it.
+///
+/// # What an implementation owes
+///
+/// 1. **Nothing is accepted before it is reserved.** An upload declares its maximum and its total
+///    and is answered with a part table before any content leaves, and the table is arithmetic: one
+///    total gives one table, every part the part size but the last.
+/// 2. **A part is idempotent.** The same part sent again is answered as the part it is, and
+///    nothing is written or counted twice, so a transfer that stopped goes on at the part after
+///    the last one acknowledged.
+/// 3. **Completion is the service's, and a repeat is answered the same.** A completion asked for
+///    again after its answer was lost gets the result the first one got.
+/// 4. **Two answers are about the work.** A collection deleted from the account console takes
+///    nothing again, and an upload that expired or was closed takes nothing more: each is an
+///    [`storage::ArchiveAnswer`] rather than an error, because a caller acts on it.
+/// 5. **Nothing is sent without the account's proof.** An installation alone holds no backup
+///    storage, so an implementation given no account sends no request.
+pub trait StorageService: Send + Sync + std::fmt::Debug {
+    /// What managed storage the caller's principal holds, whether backup storage is on, and the
+    /// revision a change of that is decided against.
+    fn status(&self) -> ServiceFuture<'_, storage::StorageStatus>;
+
+    /// Turns backup storage on or off, against the revision the change was decided at.
+    ///
+    /// Backup storage is off until this turns it on, and turning it off stops new uploads and
+    /// deletes nothing.
+    fn set_retention<'a>(
+        &'a self,
+        change: &'a storage::RetentionChange,
+    ) -> ServiceFuture<'a, storage::RetentionSet>;
+
+    /// Creates one object's upload: its reservation, its identity and its part table.
+    fn create_upload<'a>(
+        &'a self,
+        upload: &'a storage::NewUpload,
+    ) -> ServiceFuture<'a, storage::ArchiveAnswer<storage::UploadCreated>>;
+
+    /// Sends one part of an upload, whose bytes the service holds to the length and hash its
+    /// signed request declares.
+    fn upload_part<'a>(
+        &'a self,
+        upload_id: &'a storage::UploadId,
+        part: storage::UploadPart<'a>,
+    ) -> ServiceFuture<'a, storage::ArchiveAnswer<storage::PartStored>>;
+
+    /// Completes an upload whose parts the service holds, which stores the object.
+    fn complete_upload<'a>(
+        &'a self,
+        upload_id: &'a storage::UploadId,
+        table: &'a storage::PartTable,
+    ) -> ServiceFuture<'a, storage::ArchiveAnswer<storage::UploadCompleted>>;
+
+    /// Abandons an upload, which the service fences and then cleans up.
+    fn abort_upload<'a>(
+        &'a self,
+        upload_id: &'a storage::UploadId,
+    ) -> ServiceFuture<'a, storage::ArchiveAnswer<storage::UploadAborted>>;
+
+    /// Reads one range of a stored object's ciphertext.
+    fn read_object(
+        &self,
+        archive_id: ArchiveId,
+        object_id: BackupObjectId,
+        offset: u64,
+        length: u64,
+    ) -> ServiceFuture<'_, storage::ObjectRange>;
+
+    /// Deletes a stored object: a tombstone at once, and its ciphertext removed after the
+    /// published window, still charged until then.
+    fn delete_object(
+        &self,
+        archive_id: ArchiveId,
+        object_id: BackupObjectId,
+    ) -> ServiceFuture<'_, storage::ObjectDeleted>;
+}
+
+/// Where a backup collection's writer is enrolled and each generation's descriptor is published:
+/// the backup manifest.
+///
+/// The service holds the public half of a generation and never its content, and it holds it to
+/// the collection's enrolment: a publication not signed by the writer the owner enrolled, and
+/// carried by that writer's own key, is refused.
+pub trait BackupManifestService: Send + Sync + std::fmt::Debug {
+    /// Enrols, or replaces at a higher revision, the writer that may publish one collection.
+    fn enrol<'a>(&'a self, record: &'a BackupWriterRecord) -> ServiceFuture<'a, backup::Enrolled>;
+
+    /// Publishes one generation's descriptor under the enrolled writer's signature.
+    ///
+    /// The same publication sent again is answered as a duplicate, so a publisher that makes it
+    /// the same way every time can ask again after an answer was lost.
+    fn publish<'a>(
+        &'a self,
+        publication: &'a BackupGenerationPublication,
+    ) -> ServiceFuture<'a, storage::ArchiveAnswer<backup::Published>>;
+
+    /// Fetches one generation, or the newest, held to the checkpoint the caller already has.
+    ///
+    /// None when the service holds no such generation, or none as new as the checkpoint: a server
+    /// that cannot meet a checkpoint answers that rather than an older generation.
+    fn fetch<'a>(
+        &'a self,
+        archive_id: ArchiveId,
+        generation: Option<BackupGeneration>,
+        checkpoint: Option<&'a GenerationCheckpoint>,
+    ) -> ServiceFuture<'a, Option<backup::FetchedGeneration>>;
+}
+
 /// One managed service a client may hold an implementation of.
 ///
 /// The set is closed, and it is section 17's: account login, relay leases, push, encrypted sync and
@@ -1277,6 +1417,89 @@ impl SyncBackupService for NullService {
     }
 }
 
+impl StorageService for NullService {
+    fn status(&self) -> ServiceFuture<'_, storage::StorageStatus> {
+        unconfigured(ManagedService::SyncBackup.as_str())
+    }
+
+    fn set_retention<'a>(
+        &'a self,
+        _change: &'a storage::RetentionChange,
+    ) -> ServiceFuture<'a, storage::RetentionSet> {
+        unconfigured(ManagedService::SyncBackup.as_str())
+    }
+
+    fn create_upload<'a>(
+        &'a self,
+        _upload: &'a storage::NewUpload,
+    ) -> ServiceFuture<'a, storage::ArchiveAnswer<storage::UploadCreated>> {
+        unconfigured(ManagedService::SyncBackup.as_str())
+    }
+
+    fn upload_part<'a>(
+        &'a self,
+        _upload_id: &'a storage::UploadId,
+        _part: storage::UploadPart<'a>,
+    ) -> ServiceFuture<'a, storage::ArchiveAnswer<storage::PartStored>> {
+        unconfigured(ManagedService::SyncBackup.as_str())
+    }
+
+    fn complete_upload<'a>(
+        &'a self,
+        _upload_id: &'a storage::UploadId,
+        _table: &'a storage::PartTable,
+    ) -> ServiceFuture<'a, storage::ArchiveAnswer<storage::UploadCompleted>> {
+        unconfigured(ManagedService::SyncBackup.as_str())
+    }
+
+    fn abort_upload<'a>(
+        &'a self,
+        _upload_id: &'a storage::UploadId,
+    ) -> ServiceFuture<'a, storage::ArchiveAnswer<storage::UploadAborted>> {
+        unconfigured(ManagedService::SyncBackup.as_str())
+    }
+
+    fn read_object(
+        &self,
+        _archive_id: ArchiveId,
+        _object_id: BackupObjectId,
+        _offset: u64,
+        _length: u64,
+    ) -> ServiceFuture<'_, storage::ObjectRange> {
+        unconfigured(ManagedService::SyncBackup.as_str())
+    }
+
+    fn delete_object(
+        &self,
+        _archive_id: ArchiveId,
+        _object_id: BackupObjectId,
+    ) -> ServiceFuture<'_, storage::ObjectDeleted> {
+        unconfigured(ManagedService::SyncBackup.as_str())
+    }
+}
+
+impl BackupManifestService for NullService {
+    fn enrol<'a>(&'a self, _record: &'a BackupWriterRecord) -> ServiceFuture<'a, backup::Enrolled> {
+        unconfigured(ManagedService::SyncBackup.as_str())
+    }
+
+    fn publish<'a>(
+        &'a self,
+        _publication: &'a BackupGenerationPublication,
+    ) -> ServiceFuture<'a, storage::ArchiveAnswer<backup::Published>> {
+        unconfigured(ManagedService::SyncBackup.as_str())
+    }
+
+    fn fetch<'a>(
+        &'a self,
+        _archive_id: ArchiveId,
+        _generation: Option<BackupGeneration>,
+        _checkpoint: Option<&'a GenerationCheckpoint>,
+    ) -> ServiceFuture<'a, Option<backup::FetchedGeneration>> {
+        unconfigured(ManagedService::SyncBackup.as_str())
+    }
+}
+
 impl ManagedVoiceService for NullService {
     fn metadata(&self) -> ServiceFuture<'_, Option<voice::VoiceMetadata>> {
         unconfigured(ManagedService::ManagedInference.as_str())
@@ -1418,6 +1641,19 @@ mod tests {
             limits.of(sync::SYNC_EXCHANGE_PATH),
             sync::SYNC_ANSWER_LIMIT_BYTES,
             "every settings-sync member shares one path, so the path carries the largest answer"
+        );
+        assert_eq!(
+            limits.of(storage::STORAGE_READ_PATH),
+            storage::STORAGE_READ_ANSWER_LIMIT_BYTES,
+            "a read answers with up to a whole range of ciphertext"
+        );
+        const {
+            assert!(storage::STORAGE_READ_ANSWER_LIMIT_BYTES > storage::MAX_STORAGE_READ_BYTES);
+        }
+        assert_eq!(
+            limits.of(storage::STORAGE_UPLOAD_PART_PATH),
+            http::DEFAULT_RESPONSE_LIMIT_BYTES,
+            "a part answers with counts, not with content"
         );
     }
 }
