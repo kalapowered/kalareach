@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 
+use kr_protocol::root::FencePublication;
 use kr_shell_integration::contract::qualification::IntegrationLoss;
 use kr_shell_integration::contract::transport::{HandshakeOutcome, WorkerExpectation};
 use kr_shell_integration::host::endpoint::HostEndpoint;
@@ -290,10 +291,27 @@ async fn write_outbound(
                 holds.before_fence().await;
                 fence_frame = Some(frame);
                 writer
-                    .send_publication(kr_protocol::root::FencePublication::Published(*fence))
+                    .send_publication(FencePublication::Published(*fence))
                     .await
             }
-            Outbound::Publication(publication) => writer.send_publication(publication).await,
+            Outbound::Withheld { reason, state } => {
+                writer
+                    .send_publication(FencePublication::Withheld { reason, state })
+                    .await
+            }
+            Outbound::Invalidated {
+                fence_id,
+                reason,
+                state,
+            } => {
+                writer
+                    .send_publication(FencePublication::Invalidated {
+                        fence_id,
+                        reason,
+                        state,
+                    })
+                    .await
+            }
             Outbound::Revocation {
                 transaction,
                 reason,

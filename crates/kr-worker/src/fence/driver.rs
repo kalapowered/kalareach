@@ -12,11 +12,10 @@ use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{AttachmentId, InputLeaseEpoch, RequestId, SessionId};
 use kr_protocol::input::InterruptAction;
 use kr_protocol::root::{
-    AcceptedOrigin, EditorBusyEvent, EditorFence, EditorLeaveReason, FenceId, FencePublication,
-    FenceState, PromptGeneration, ReaderRevision, RootCommandAcceptedParams,
-    RootCommandAcceptedResult, RootEditorEnterParams, RootEditorEnterResult, RootEditorLeaveParams,
-    RootEditorLeaveResult, RootEofDetachParams, ShellLaunchParams, ShellLaunchResult,
-    WithheldReason,
+    AcceptedOrigin, EditorBusyEvent, EditorFence, EditorLeaveReason, FenceId, FenceState,
+    PromptGeneration, ReaderRevision, RootCommandAcceptedParams, RootCommandAcceptedResult,
+    RootEditorEnterParams, RootEditorEnterResult, RootEditorLeaveParams, RootEditorLeaveResult,
+    RootEofDetachParams, ShellLaunchParams, ShellLaunchResult, WithheldReason,
 };
 use kr_protocol::scalars::{Nullable, U64};
 use kr_shell_integration::contract::events::{BridgeEvent, ReaderIdle};
@@ -73,16 +72,32 @@ pub enum Outbound {
         result: Box<EventOutcome>,
     },
     /// A published fence, which the writer reports once it has written it.
+    ///
+    /// This is the only way a published fence reaches the bridge, and only
+    /// [`FenceDriver::publish`] can number one, so there is no fence the session's queue for the
+    /// terminal does not know to wait for.
     Published {
         /// The fence.
         fence: Box<EditorFence>,
         /// What the writer reports.
         frame: FenceFrame,
     },
-    /// That no fence was published, or that the one published has gone.
-    ///
-    /// A published fence travels as [`Outbound::Published`] instead, because keys wait for it.
-    Publication(FencePublication),
+    /// That no fence was published for the exchange.
+    Withheld {
+        /// Why.
+        reason: WithheldReason,
+        /// The state the editor is in.
+        state: FenceState,
+    },
+    /// That the fence published before has gone.
+    Invalidated {
+        /// The fence.
+        fence_id: FenceId,
+        /// Why.
+        reason: WithheldReason,
+        /// The state the editor is in.
+        state: FenceState,
+    },
     /// A launch transaction is over.
     Revocation {
         /// The transaction.
@@ -537,6 +552,7 @@ impl FenceDriver {
     /// returned when no connection is live, because there is then no reader for the fence to reach
     /// ahead of anything. A writer that has already ended still counts as handed the fence: its
     /// connection is over, and the loss that ends it is what lets the keys behind the fence go.
+    #[must_use]
     pub fn publish(&mut self, fence: EditorFence) -> Option<FenceFrame> {
         let outbound = self.outbound.as_ref()?;
         self.handed += 1;
@@ -1070,22 +1086,18 @@ impl FenceDriver {
                 effects.steps.push(Step::Publish(Box::new(fence.clone())));
             }
             Action::WithholdFence(reason) => {
-                effects.steps.push(Step::Send(Outbound::Publication(
-                    FencePublication::Withheld {
-                        reason: *reason,
-                        state,
-                    },
-                )));
+                effects.steps.push(Step::Send(Outbound::Withheld {
+                    reason: *reason,
+                    state,
+                }));
             }
             Action::InvalidateFence(reason) => {
                 if let Some(fence_id) = self.published.take() {
-                    effects.steps.push(Step::Send(Outbound::Publication(
-                        FencePublication::Invalidated {
-                            fence_id,
-                            reason: withheld_for(*reason),
-                            state,
-                        },
-                    )));
+                    effects.steps.push(Step::Send(Outbound::Invalidated {
+                        fence_id,
+                        reason: withheld_for(*reason),
+                        state,
+                    }));
                 }
             }
             Action::EmitEditorBusy(event) => effects
