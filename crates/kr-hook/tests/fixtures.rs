@@ -11,7 +11,7 @@
 //! The Gemini CLI connector package installs an extension, three files, into the user's own Gemini
 //! CLI directory: its manifest, its hooks and its install record. Their copies under
 //! `fixtures/bridges/gemini-cli/` are the bytes the package publishes (the plugins repository at
-//! `d8a5c3cad6ec09175fe8a7116932422961a552eb`, `plugins/kalareach/gemini-cli/bridge/`), pinned the
+//! `c3a3104d93740cef7302db471723646bb1e16803`, `plugins/kalareach/gemini-cli/bridge/`), pinned the
 //! same way.
 //!
 //! Qoder CLI reads its hooks from the settings its launch is given, so nothing is installed for it:
@@ -281,7 +281,7 @@ fn the_gemini_cli_bridge_files_are_the_bytes_the_package_publishes() {
         ),
         (
             "gemini-extension-install.json",
-            "3dcf39eedad95d7210e792a0bcfcc06506ccf3e01c1ab0cec320083948b3d081",
+            "ed5b5291f2e39bf679e945135210c5aee7863b8b8dbaa049dd53598507f172cb",
         ),
     ] {
         assert_eq!(sha256(&fixture("gemini-cli", name)), digest, "{name}");
@@ -293,9 +293,11 @@ fn the_gemini_cli_bridge_files_are_the_bytes_the_package_publishes() {
 /// notification (no matcher), in the order Gemini CLI chooses (no `sequential`), each as a command
 /// of plain words, which bash runs in its own process, and each with a timeout in milliseconds that
 /// the forwarder's deadline fits inside. The manifest names the extension and nothing it could load.
-/// The install record names the extension's own directory as a local source and nothing else: where
-/// a person's settings list allowed extensions, Gemini CLI refuses to start while an extension has
-/// no record, and tests the list's patterns against the source a record names.
+/// The install record names a local source nothing can exist under, `/dev/null/kalareach`, and
+/// nothing else: where a person's settings list allowed extensions, Gemini CLI refuses to start while
+/// an extension directory has no record and tests the list's patterns against the source a record
+/// names, and it reads a local extension's updates from that source, a relative one from the
+/// session's working directory, where a project could put a newer manifest.
 #[test]
 fn the_gemini_cli_extension_registers_its_three_events_as_plain_words() {
     let hooks = json("gemini-cli", "hooks.json");
@@ -370,7 +372,7 @@ fn the_gemini_cli_extension_registers_its_three_events_as_plain_words() {
     let record = json("gemini-cli", "gemini-extension-install.json");
     assert_eq!(
         record,
-        serde_json::json!({"source": "~/.gemini/extensions/kalareach", "type": "local"}),
-        "the install record names the extension's own directory as a local source"
+        serde_json::json!({"source": "/dev/null/kalareach", "type": "local"}),
+        "the install record names a local source nothing can exist under"
     );
 }

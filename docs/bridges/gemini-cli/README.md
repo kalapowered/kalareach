@@ -17,7 +17,7 @@ Three files under the user's own Gemini CLI directory, and no settings key:
 
 | File | What it holds |
 | --- | --- |
-| `extensions/kalareach/.gemini-extension-install.json` | The extension's install record: `~/.gemini/extensions/kalareach` as a `local` source |
+| `extensions/kalareach/.gemini-extension-install.json` | The extension's install record: `/dev/null/kalareach` as a `local` source |
 | `extensions/kalareach/gemini-extension.json` | The extension `kalareach`: a name, a version and a description, and nothing it could load |
 | `extensions/kalareach/hooks/hooks.json` | `kr-hook gemini-cli hook` for `SessionStart` and `Notification` with a timeout of 5000 milliseconds, and for `SessionEnd` with 1000 |
 
@@ -27,24 +27,32 @@ settings files, whether or not the person trusts the folder. A hook in a setting
 person's own included, runs only in a trusted folder, and a hooks key there would hold the person's
 own hooks for the same event; that is why the bridge is an extension.
 
-The install record matters only where the person's settings list allowed extensions in
-`security.allowedExtensions`. There Gemini CLI refuses to start at all while any extension has no
-record, and it loads an extension only when a listed pattern matches the source its record names.
-It does not expand the `~`: it tests the patterns against that path taken from the session's
-working directory, so a pattern that matches its end, such as `/\.gemini/extensions/kalareach$`,
-allows this extension. Without one, Gemini CLI skips the extension with a warning and the session
-runs without its hooks. The record is installed before the other two files and removed after them,
-so a recipe stopped part way never leaves the manifest without it.
+The install record matters where the person's settings list allowed extensions in
+`security.allowedExtensions`. There Gemini CLI refuses to start at all while any directory under
+`extensions/` has no record, and it loads an extension only when a listed pattern matches the source
+its record names. This record names `/dev/null/kalareach`, an absolute path nothing can exist under,
+so the patterns see the same string wherever the session runs: `^/dev/null/kalareach$` allows the
+extension, and without such a pattern Gemini CLI skips it with a warning and the session runs
+without its hooks. The path also closes an update route. Gemini CLI reads a local extension's
+updates from its recorded source, and it resolves a relative source, `~/...` included, from the
+session's working directory, so a project holding a newer manifest at
+`~/.gemini/extensions/kalareach/` inside itself would be offered as an update. Nothing can be read
+from `/dev/null/kalareach`, so Gemini CLI never offers one; KalaReach replaces the files itself.
 
-Removing the extension deletes the three files. Gemini CLI then warns at every start about the empty
-`extensions/kalareach/` directory, so whatever removes the files also removes the directories the
-installation created once they are empty.
+The record is installed before the other two files and removed after them. The recipe's removal
+deletes each file only while it still holds the installed bytes, and it can neither remove a
+directory nor keep a file on a condition, so whatever applies it owes two more things. It takes the
+record only once nothing else is left in `extensions/kalareach/`: beside a file of the person's, or
+one that changed since it was installed, the record stays, and Gemini CLI skips the directory with a
+warning rather than refusing to start. And it removes the directories the installation created once
+they are empty: an empty `extensions/kalareach/` is a directory with no record, which stops Gemini
+CLI from starting under an allow list and is warned about at every start without one.
 
 The core repository keeps a copy of all three files in `fixtures/bridges/gemini-cli/`, pinned by the
 SHA-256 digests the package's recipe records, and `crates/kr-hook/tests/fixtures.rs` checks that
 every hook starts the forwarder's `gemini-cli hook` invocation as a command of plain words, for
 exactly the events the forwarder reports, with a timeout its deadline fits inside, and that the
-record names the extension's own directory.
+record names `/dev/null/kalareach` and nothing else.
 
 ## How Gemini CLI starts the forwarder
 
@@ -101,6 +109,6 @@ about the hooks it ran; the worker's later reports of an ended thread change not
 
 These facts were read from Gemini CLI 0.60.0 with no account signed in and no model turn. A session
 starting and ending, the hooks' parent and their environment, and the install record with and
-without an allow list were checked on the binary; the notification and tool behaviour comes from
-the build's own code and the hook reference it ships. The host admits no bridge on Windows,
-because it writes a launch's credential file only on Unix.
+without an allow list and beside a planted update were checked on the binary; the notification and
+tool behaviour comes from the build's own code and the hook reference it ships. The host admits no
+bridge on Windows, because it writes a launch's credential file only on Unix.
