@@ -404,8 +404,14 @@ fn plain_message(code: &str, message: String) -> String {
 /// those become, classified by the status that carried them. A text that names one member twice,
 /// in the envelope or anywhere inside it, is one of them: [`super::json::read`] refuses it before
 /// any member is read.
+///
+/// So is an envelope that is not exactly the service's. It writes `ok` with `data`, or `ok` with
+/// `error`, and nothing else, so another member beside them, or a success and a refusal at once,
+/// says the answer is not the service's own. Inside `data` and `error` the members are each
+/// adapter's to read, and a member it does not read is one a newer service may add.
 fn answer_of(answer: &ServiceHttpAnswer) -> Result<Answer> {
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct Envelope {
         ok: bool,
         #[serde(default)]
@@ -432,12 +438,21 @@ fn answer_of(answer: &ServiceHttpAnswer) -> Result<Answer> {
     })?;
 
     if envelope.ok {
+        if envelope.error.is_some() {
+            return Err(unreadable(
+                answer.status,
+                "its answer is a success and a refusal at once",
+            ));
+        }
         return envelope
             .data
             .map(Answer::Data)
             .ok_or_else(|| unreadable(answer.status, "its answer carries no data"));
     }
 
+    if envelope.data.is_some() {
+        return Err(unreadable(answer.status, "its refusal carries data"));
+    }
     let Some(named) = envelope.error else {
         return Err(unreadable(answer.status, "its refusal names no error"));
     };
@@ -744,6 +759,62 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    /// KR-REQ-04.19: the envelope is `ok` with `data`, or `ok` with `error`, and nothing else. The
+    /// service writes no other member and never both, so an answer that carries another member, or
+    /// is a success and a refusal at once, is not its envelope, and the status decides what that
+    /// is, as it does for any answer this client cannot read.
+    #[test]
+    fn an_envelope_that_carries_any_other_member_is_not_one_this_client_reads() {
+        for (status, body, expected) in [
+            (
+                200,
+                r#"{"ok":true,"data":{"note":"x"},"extra":1}"#,
+                ErrorCode::OutcomeUnknown,
+            ),
+            (
+                200,
+                r#"{"ok":true,"data":{"note":"x"},"error":{"code":"FORBIDDEN","message":"no"}}"#,
+                ErrorCode::OutcomeUnknown,
+            ),
+            (
+                403,
+                r#"{"ok":false,"error":{"code":"FORBIDDEN","message":"no"},"retryAfterSeconds":5}"#,
+                ErrorCode::HostNotConfigured,
+            ),
+            (
+                403,
+                r#"{"ok":false,"error":{"code":"FORBIDDEN","message":"no"},"data":{"note":"x"}}"#,
+                ErrorCode::HostNotConfigured,
+            ),
+        ] {
+            let error = answer_of(&ServiceHttpAnswer {
+                status,
+                body: body.as_bytes().to_vec(),
+            })
+            .expect_err(body);
+            assert!(matches!(error, ClientError::Host(_)), "{body}");
+            assert_eq!(error.code(), expected, "{body}");
+        }
+
+        // The controls: the two envelopes the service writes are read as they always were, and the
+        // members a refusal carries beside its code stay the adapter's to read.
+        let answer = answer_of(&ServiceHttpAnswer {
+            status: 200,
+            body: br#"{"ok":true,"data":{"note":"x","more":1}}"#.to_vec(),
+        })
+        .expect("an answer");
+        assert!(matches!(answer, Answer::Data(_)), "{answer:?}");
+        let answer = answer_of(&ServiceHttpAnswer {
+            status: 409,
+            body: br#"{"ok":false,"error":{"code":"KEY_EPOCH_RETIRED","message":"retired","key_epoch":"1","missing":["x"]}}"#.to_vec(),
+        })
+        .expect("a refusal");
+        let Answer::Refused(refusal) = answer else {
+            panic!("a refusal: {answer:?}");
+        };
+        assert_eq!(refusal.code(), "KEY_EPOCH_RETIRED");
     }
 
     #[test]
