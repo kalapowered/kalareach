@@ -2,7 +2,11 @@
 
 This describes the shared interface layer: the canonical encoding, the framing, the message
 envelopes, the receipt contract, the error codes and the method authority table. It covers what
-this repository implements today. Transport, pairing cryptography and storage are separate.
+this repository implements. Transport, pairing cryptography and storage are separate.
+
+[methods.md](methods.md) lists every method in the registry, generated from it, with its effect,
+its ingress, its summary and the section that describes it where one does.
+[glossary.md](glossary.md) defines the terms the protocol relies on.
 
 Four pieces make it up:
 
@@ -454,7 +458,8 @@ voice `creation_unknown` are not error codes. They belong to their own result sc
 
 `crates/kr-protocol/src/method.rs` holds one exhaustive authority entry per method. The same table
 is generated as data to `packages/protocol/schema/method-authority.json` for consumers that are not
-written in Rust.
+written in Rust, and as [the method index](methods.md) for people: every method in the registry's
+groups, with its effect, its ingress, its summary and the section that describes it where one does.
 
 Anything not listed is denied. `decide(name, version, ingress)` returns a denial for an unknown
 name, a schema failure for a known method at an unsupported version, and a denial for an ingress
@@ -712,11 +717,13 @@ The gateway does hold the token itself, because FCM needs it to deliver and to r
 recovers one. It lives with the gateway's own secrets; the records that travel carry the digest.
 
 A signed request's body is a `PushRequest`: one type for the four signed methods, so there is one
-rule for what a service-request signature covers. `PushRequest::digest` is the `body_digest` the
-signature carries and `PushRequest::method` is the method it must name, which is what stops a body
-built for one method being presented under another. Delivery is not one of them: it carries the
-bearer credential the host was issued, and its digest is how the gateway recognises a request it has
-already handled.
+rule for what a service-request signature covers. `push.installation.register` and
+`push.sender.issue` are the installation's own decisions, signed on the device;
+`push.sender.renew` and `push.sender.revoke` are the host's, signed with the host key the
+installation named. `PushRequest::digest` is the `body_digest` the signature carries and
+`PushRequest::method` is the method it must name, which is what stops a body built for one method
+being presented under another. Delivery is not one of them: it carries the bearer credential the
+host was issued, and its digest is how the gateway recognises a request it has already handled.
 
 **Authorisation.** `PushSenderBinding` holds everything one authorisation fixes for its lifetime:
 the destination installation, the host's endpoint and signing keys, the gateway and the rate policy.
@@ -842,6 +849,8 @@ Rust types  ──generate──>  packages/protocol/schema/*.json  ──genera
             <──  check  ──                                  <──  check  ──
             ──generate──>  fixtures/service/*.json, fixtures/push/*.json
             <──  check  ──
+            ──generate──>  docs/protocol/methods.md
+            <──  check  ──
 ```
 
 ```bash
@@ -850,7 +859,8 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 
-# Regenerate the schema, the method table and the service and push vectors, then check them
+# Regenerate the schema, the method table, the service and push vectors and the method index,
+# then check them
 cargo run -p kr-protocol --bin kr-protocol-gen
 cargo run -p kr-protocol --bin kr-protocol-gen -- --check
 
@@ -861,9 +871,13 @@ pnpm -r test
 ```
 
 `kr-protocol-gen --check` compares the committed files with what the current Rust types produce and
-names the first differing line. `pnpm -C packages/protocol generate:check` does the same for the
-generated TypeScript, and the vitest suite runs it, so `pnpm -r test` fails when the types are
-stale.
+names the first differing line. It also names every method in the registry that no document under
+`docs/` mentions, and every link in the method index whose document or heading is no longer there.
+The generator's own tests make the same checks, so `cargo test --workspace` fails on them too.
+`pnpm -C packages/protocol generate:check` does the same for the generated TypeScript, and the
+vitest suite runs it, so `pnpm -r test` fails when the types are stale.
 
 Changing a wire type means: edit the Rust type, run the generator, run the TypeScript generator,
-and commit all four artefacts together.
+and commit everything they write together. Adding a method also means deciding which section
+describes it, in `described_in` in `crates/kr-protocol/src/bin/kr-protocol-gen/method_index.rs`; the
+match there covers every method, so the generator does not build until that is decided.
