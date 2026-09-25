@@ -540,6 +540,10 @@ fn a_process_that_spends_processor_time_is_read_as_spending_it() {
     }
     let _ = reader.join();
 
+    assert!(
+        ended,
+        "the spending process ends within {SPENDER_LIMIT:?} of its start"
+    );
     let said = said.expect("the spending process says what it spent");
     let spent = Duration::from_nanos(said).as_secs_f64();
     let read = read
