@@ -1798,13 +1798,22 @@ impl RealProbes {
     }
 }
 
-/// A path as one word of a POSIX shell line, whatever it holds.
+/// A path as one word of a POSIX shell line, whatever characters it holds.
 ///
 /// Inside single quotes every character stands for itself except the quote, which ends them, so a
-/// quote in the path is closed over, given as an escaped quote of its own, and reopened.
+/// quote in the path is closed over, given as an escaped quote of its own, and reopened. The line
+/// is text, as the session's environment and the keys typed into it are, so a path that is not
+/// UTF-8 is refused here rather than quoted as some other path that its lossy spelling would name.
 #[cfg(unix)]
 fn shell_quoted(path: &std::path::Path) -> String {
-    format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
+    let text = path.to_str().unwrap_or_else(|| {
+        panic!(
+            "{} is not UTF-8, and a shell line, the keys typed into a session and its \
+             environment are all text, so this case cannot put it in one",
+            path.display()
+        )
+    });
+    format!("'{}'", text.replace('\'', r"'\''"))
 }
 
 /// The recording program works where its directory's name holds an apostrophe: a held start
