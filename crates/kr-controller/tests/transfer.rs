@@ -1608,9 +1608,10 @@ fn start_daemon_with(program: &std::path::Path, host: &teardown::Tree, relative:
 /// that was given the right one until the kernel is asked.
 #[cfg(unix)]
 fn runs_where_this_test_put_it(daemon: &Daemon, host: &kr_ipc::testing::TempHost) {
-    let Some(child) = daemon.child.as_ref() else {
-        return;
-    };
+    let child = daemon
+        .child
+        .as_ref()
+        .expect("the daemon this test has just started");
     let expected = std::fs::canonicalize(host.root()).expect("this test's own directory exists");
     let workspace = workspace_root();
     assert!(
@@ -1618,12 +1619,7 @@ fn runs_where_this_test_put_it(daemon: &Daemon, host: &kr_ipc::testing::TempHost
         "this test's directories are not inside the workspace: {}",
         expected.display()
     );
-    let Some(actual) = working_directory_of(child.id()) else {
-        eprintln!(
-            "skipped: this platform does not report another process's working directory here"
-        );
-        return;
-    };
+    let actual = working_directory_of(child.id());
     assert_eq!(
         std::fs::canonicalize(&actual).unwrap_or(actual),
         expected,
@@ -1632,15 +1628,17 @@ fn runs_where_this_test_put_it(daemon: &Daemon, host: &kr_ipc::testing::TempHost
 }
 
 /// Returns the working directory the operating system gave a running process.
+///
+/// Linux and macOS answer that for another process, and a refusal to answer fails here. So does a
+/// platform this suite knows no way to ask, because a comparison that could not be made is not one
+/// that passed.
 #[cfg(unix)]
-fn working_directory_of(pid: u32) -> Option<std::path::PathBuf> {
+fn working_directory_of(pid: u32) -> std::path::PathBuf {
     #[cfg(target_os = "linux")]
     {
-        Some(
-            std::fs::read_link(format!("/proc/{pid}/cwd")).unwrap_or_else(|error| {
-                panic!("the working directory of process {pid} could not be read: {error}")
-            }),
-        )
+        std::fs::read_link(format!("/proc/{pid}/cwd")).unwrap_or_else(|error| {
+            panic!("the working directory of process {pid} could not be read: {error}")
+        })
     }
     #[cfg(target_os = "macos")]
     {
@@ -1648,19 +1646,19 @@ fn working_directory_of(pid: u32) -> Option<std::path::PathBuf> {
             .args(["-a", "-d", "cwd", "-p", &pid.to_string(), "-Fn"])
             .output()
             .unwrap_or_else(|error| panic!("the process table could not be read: {error}"));
-        Some(
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .find_map(|line| line.strip_prefix('n').map(std::path::PathBuf::from))
-                .unwrap_or_else(|| {
-                    panic!("the process table named no working directory for process {pid}")
-                }),
-        )
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|line| line.strip_prefix('n').map(std::path::PathBuf::from))
+            .unwrap_or_else(|| {
+                panic!("the process table named no working directory for process {pid}")
+            })
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = pid;
-        None
+        panic!(
+            "this suite knows no way to ask this platform for the working directory of process \
+             {pid}, so the check that the daemon runs where this test put it cannot run here"
+        )
     }
 }
 
