@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 use futures::StreamExt as _;
 use iroh::address_lookup::{AddressLookup as _, PkarrResolver};
 use iroh::endpoint::Connection;
-use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl};
+use iroh::endpoint::RelayStatus;
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, Watcher as _};
 use kr_transport::ALPN;
 use kr_transport::config::{DiscoveryConfig, EndpointConfig, PublishedAddresses, PublisherPolicy};
 use support::front::RelayFront;
@@ -73,13 +74,60 @@ async fn dial(side: &Side, peer: EndpointAddr) -> kr_transport::Result<Connectio
     .expect("the attempt ends by itself")
 }
 
+/// Whether `error`, or anything it wraps, is a connection the other side refused.
+fn refused_connection(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::ConnectionRefused)
+        {
+            return true;
+        }
+        current = error.source();
+    }
+    false
+}
+
+/// Waits until `side` is off its home relay `relay` and its latest attempt to reach the relay again
+/// ended at a refused connection, other than `seen`, and returns the status that said so.
+async fn until_refused_again(
+    side: &Side,
+    relay: &RelayUrl,
+    seen: Option<&RelayStatus>,
+) -> RelayStatus {
+    let deadline = Instant::now() + PATIENCE;
+    let mut statuses = side.endpoint.home_relay_status();
+    loop {
+        let refused = statuses.get().into_iter().find(|status| {
+            status.url() == relay
+                && !status.is_connected()
+                && status
+                    .last_error()
+                    .is_some_and(|error| refused_connection(error))
+                && Some(status) != seen
+        });
+        if let Some(status) = refused {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the relay status never recorded a refused connection: {:?}",
+            statuses.get()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// KR-REQ-10.02: a network that requires a proxy. A relay-only host and client each select the
-/// proxy, reach the relay through it and connect to each other. Every tunnel the proxy opened was
-/// to the relay's own address.
+/// proxy, reach the relay through it and connect to each other, and every tunnel the proxy opened
+/// was to the relay's own address. Both relay sessions ran through the proxy: stopping it takes
+/// each endpoint off the relay, and its next attempt to reach the relay is refused at the proxy's
+/// closed port.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_relay_only_pair_connects_through_the_proxy_it_selected() {
     let relay = LocalRelay::spawn().await;
-    let proxy = HttpProxy::forwarding();
+    let mut proxy = HttpProxy::forwarding();
     let config = EndpointConfig {
         proxy_url: Some(proxy.url.clone()),
         ..relay_only(&relay.url, &relay.ca_roots)
@@ -102,72 +150,76 @@ async fn a_relay_only_pair_connects_through_the_proxy_it_selected() {
     let relay_address = authority(&relay.url);
     let tunnels = proxy.tunnels();
     assert!(
-        tunnels
-            .iter()
-            .filter(|tunnel| **tunnel == relay_address)
-            .count()
-            >= 2,
-        "both endpoints tunnelled to the relay through the proxy: {tunnels:?}"
+        tunnels.contains(&relay_address),
+        "the proxy was asked for the relay: {tunnels:?}"
     );
     assert!(
         tunnels.iter().all(|tunnel| *tunnel == relay_address),
-        "and to nowhere else: {tunnels:?}"
+        "and for nothing else: {tunnels:?}"
     );
+
+    proxy.stop();
+    for side in [&host, &client] {
+        until_refused_again(side, &relay.url, None).await;
+    }
 
     drop(connection);
     client.endpoint.close().await;
     host.endpoint.close().await;
 }
 
-/// KR-REQ-10.02: a selected proxy is the only way to the relay. With the proxy stopped, a
-/// relay-only client's attempt to reach a host through the relay fails and nothing reaches the
-/// relay: the client does not go around its proxy. The same client without a proxy reaches the
-/// relay and the host, so the relay was there to be reached.
+/// KR-REQ-10.02: a selected proxy is the only way to the relay, and nothing falls back to a direct
+/// connection when it stops. A relay-only client reaches its relay through the proxy, and the
+/// proxy reaches the relay through a front that counts every connection, so a connection to the
+/// relay from anywhere is one the front counted. Once the proxy stops, the client's relay status
+/// records its connection to the proxy refused, attempt after attempt, and no connection reaches
+/// the front meanwhile: the client never goes around its proxy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_client_whose_proxy_is_stopped_never_reaches_the_relay() {
+async fn a_client_whose_proxy_stops_never_goes_around_it() {
     let relay = LocalRelay::spawn().await;
-    // The host is on the relay directly. The clients are given the front's address for it, so a
-    // connection that reaches the relay from a client is one the front counted.
     let front = RelayFront::passing(&relay);
     let host = support::side(&relay_only(&relay.url, &relay.ca_roots), 1, true).await;
     online(&host, "the host reaches its relay").await;
-    let route = EndpointAddr::new(host.endpoint.id()).with_relay_url(front.url.clone());
 
     let mut proxy = HttpProxy::forwarding();
-    let stopped = proxy.url.clone();
-    proxy.stop();
     let client = support::side(
         &EndpointConfig {
-            proxy_url: Some(stopped),
+            proxy_url: Some(proxy.url.clone()),
             ..relay_only(&front.url, &front.ca_roots)
         },
         2,
         false,
     )
     .await;
-    let outcome = dial(&client, route.clone()).await;
+    online(&client, "the client reaches its relay through the proxy").await;
+    let accepting = accept_one(&host);
+    let connection = dial(
+        &client,
+        EndpointAddr::new(host.endpoint.id()).with_relay_url(front.url.clone()),
+    )
+    .await
+    .expect("the relay carries the connection through the proxy");
+    let accepted = accepting.await.expect("the host task");
+    assert_eq!(accepted.remote_id(), client.endpoint.id());
     assert!(
-        outcome.is_err(),
-        "no path reaches the host while the proxy is stopped"
+        proxy.tunnels().contains(&authority(&front.url)),
+        "{:?}",
+        proxy.tunnels()
     );
+
+    proxy.stop();
+    let refused = until_refused_again(&client, &front.url, None).await;
+    let reached = front.accepted();
+    // The client keeps trying to reach its relay, each time at the proxy.
+    until_refused_again(&client, &front.url, Some(&refused)).await;
     assert_eq!(
         front.accepted(),
-        0,
-        "and the relay was never reached around the proxy"
+        reached,
+        "no connection reached the relay around the stopped proxy"
     );
-    client.endpoint.close().await;
-
-    let unproxied = support::side(&relay_only(&front.url, &front.ca_roots), 3, false).await;
-    let accepting = accept_one(&host);
-    let connection = dial(&unproxied, route)
-        .await
-        .expect("without a proxy the relay carries the connection");
-    let accepted = accepting.await.expect("the host task");
-    assert_eq!(accepted.remote_id(), unproxied.endpoint.id());
-    assert!(front.accepted() > 0, "through the front");
 
     drop(connection);
-    unproxied.endpoint.close().await;
+    client.endpoint.close().await;
     host.endpoint.close().await;
 }
 
@@ -362,6 +414,8 @@ async fn no_proxy_variable_moves_a_request_of_the_endpoint() {
             .env("ALL_PROXY", &proxy)
             .env_remove("NO_PROXY")
             .env_remove("no_proxy")
+            // With it set, as in a CGI program, every proxy variable is ignored.
+            .env_remove("REQUEST_METHOD")
             .current_dir(std::env::temp_dir())
             .output()
             .expect("the child")
