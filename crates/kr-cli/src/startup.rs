@@ -180,13 +180,18 @@ pub fn run(paths: &HostPaths, arguments: &StartupArguments, json: bool) -> Resul
         // A first use of the environment, on a host where no daemon has run yet, as an edit of
         // its document is: the record and the lock live in its state directory.
         environment.paths.create()?;
+        // One change at a time, from the definition to the document: held until the document is
+        // written, so no other change or start request sees one without the other. The document's
+        // own lock is taken inside, after this one, as everywhere.
+        let held = service_manager::lock(&environment.paths)?;
         if startup == Some(ControllerStartup::Service) {
-            notes = service_manager::install(&environment.paths)?.notes;
+            notes = service_manager::install(&environment.paths, &held)?.notes;
         } else {
-            removal = service_manager::remove(&environment.paths)?;
+            removal = service_manager::remove(&environment.paths, &held)?;
             notes.append(&mut removal.notes);
         }
         crate::doctor::configuration::apply(&environment.paths, &change)?;
+        drop(held);
     }
     let chosen = Chosen::read(&environment.paths);
     let inspected = service_manager::inspect(
