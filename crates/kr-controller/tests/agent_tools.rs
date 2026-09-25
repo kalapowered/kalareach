@@ -451,16 +451,17 @@ async fn the_skill_installs_reports_and_removes_at_both_scopes_by_its_removal_re
     assert!(project_configuration.contains("\"agent-tools\""));
     assert!(project_configuration.contains("# a comment somebody wrote"));
     assert!(project_configuration.contains("[mcp_servers.theirs]"));
-    // Each manifest names the skill directory its scope resolved to.
+    // Each manifest names the skill directory its scope resolved to. Compared as paths: Windows
+    // accepts both separators, and the daemon and this test spell the same directory with each.
     assert_eq!(installed_user.manifest.scope, InstallScope::User);
     assert_eq!(
-        installed_user.manifest.root,
-        user_skill.display().to_string()
+        std::path::Path::new(&installed_user.manifest.root),
+        user_skill.as_path()
     );
     assert_eq!(installed_project.manifest.scope, InstallScope::Project);
     assert_eq!(
-        installed_project.manifest.root,
-        project_skill.display().to_string()
+        std::path::Path::new(&installed_project.manifest.root),
+        project_skill.as_path()
     );
 
     // Each installation's record, read back as the removal it would run.
