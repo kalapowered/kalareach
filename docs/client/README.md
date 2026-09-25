@@ -575,8 +575,10 @@ runs the candidate's half over the transport a host serves. A front end builds o
 its parts (the device's keys, its attempt budget and clock, how it opens a room, how it reaches a
 host, and its records of paired hosts) and calls `pair_by_code`, `pair_directly` or `resume`.
 Progress arrives on a `watch` channel as `AttemptState`, and an attempt that fails ends as a
-`PairingFailure`. Neither carries a secret, a key, a transcript, a challenge or a proof, so a front
-end can hand them to a screen as they are.
+`PairingFailure`. The ending also says how the attempt was made and, for a code, which service it
+went through, so a front end names that service and asks for a direct invitation to be pasted again
+rather than for a code. Neither carries a secret, a key, a transcript, a challenge or a proof, so a
+front end can hand them to a screen as they are.
 
 A code goes through one room socket. The device sends the four locator characters, and nothing else,
 to the rendezvous service it is set to use, at `/api/pair/room/<locator>/candidate`, over TLS the
@@ -585,6 +587,13 @@ that cannot be reached still costs a try. The exchange then moves to iroh, to th
 host's authenticated bundle pinned, and `pair.finish` is sent only once the device has checked that
 the live peer is that endpoint. A direct invitation goes to `pair.redeem` under the same check, and
 no proof leaves the device for any other peer.
+
+Each host is reached through the relay and discovery services its own configuration names, with one
+dialling endpoint for each set of services. A key holds one endpoint on a relay at a time, so two
+configurations that share a relay are never open together, and binding one closes the other. An
+attempt holds its host's endpoint from its first dial to its end, and an owner's review holds its
+host's while it runs. Nothing else the device does closes a held endpoint, and a connection that
+would have to is refused until the hold ends.
 
 The verification value is computed here, from the transcript, and grouped `f3c1 46fd` by the
 function the host and the command line use. The device shows it only once the host's answer to
@@ -606,13 +615,21 @@ transport concluded about the connection. An attempt still waiting for its owner
 `paired`, and `resume` takes it up after a restart; a device the host committed while it was away
 finds its record and confirms that instead.
 
+While it waits for the owner, the device asks `pair.status` every three seconds. A host answers an
+unpaired connection four times in any ten seconds and sixteen times in all, so the device counts its
+questions the way the host does, waits when the window is full, and moves to a fresh connection
+before the one it has runs out. That move is not a lost connection, and the device does not show it
+as one. A host that turns a question away as too soon keeps the connection, and the device waits
+out the window and asks again.
+
 `owner` is the owner device's half. It reads `owner.confirmation.pending` over the device's
 authorised session, checks each challenge against what it would authorise, and describes it in one
 line: what, on which host, and for how long. A challenge whose display does not match its digest is
 marked as one this device cannot check, and nothing is signed for it. The platform's ceremony is a
 trait the application implements; it is asked with that line and the challenge's remaining
 lifetime, and only a confirmation inside that lifetime is signed, on `owner_device_presence`, and
-completed.
+completed. A host that takes the answer and says nothing for ten seconds ends the review as not
+confirmed.
 
 ## Managed services
 
@@ -1117,7 +1134,7 @@ not one of them, so an account password reset returns an account and nothing els
 | KR-REQ-04.23 | The local path is a socket and the remote path is iroh, behind one seam, so a caller chooses a host rather than a transport |
 | KR-REQ-10.23 | A code pairs through the product client and a room, with the budget on disk, and the committed device reads its own `pair.status` over its authorised connection (`a_device_pairs_by_code_through_the_product_client` in `crates/kr-controller/tests/pairing_client.rs`, and through a room behind TLS in `a_device_pairs_through_a_room_behind_tls`). A host's confirmation tag with one bit flipped ends the attempt ambiguous before anything is trusted (`a_host_tag_that_does_not_verify_ends_the_attempt_before_anything_is_trusted`) |
 | KR-REQ-10.27 | The candidate's room socket, its TLS verification and its frames (`crates/kr-client/tests/pairing_room.rs`), what each way a room can fail is called (`crates/kr-client/tests/pairing_failures.rs`), and `pair.finish` bound to the peer the connection authenticated (`the_finish_is_bound_to_the_endpoint_the_client_authenticated`) |
-| KR-REQ-10.36 | `a_device_pairs_directly_through_the_product_client`: a direct invitation redeemed over iroh and committed. In `a_direct_redemption_proves_nothing_to_the_wrong_host_and_shows_no_wrong_value`, a secret with one bit flipped is refused and locks nothing, and no proof goes to a host the invitation did not pin |
+| KR-REQ-10.36 | `a_device_pairs_directly_through_the_product_client`: a direct invitation redeemed over iroh and committed. In `a_direct_redemption_proves_nothing_to_the_wrong_host_and_shows_no_wrong_value`, a secret with one bit flipped is refused and locks nothing, and no proof goes to a host the invitation did not pin. `a_device_waits_inside_the_hosts_request_budget_for_an_owner_who_takes_their_time` waits nearly a minute for the owner inside the budget a host serves an unpaired connection by |
 | KR-REQ-10.37 | The value both devices show is computed on the device and shown grouped only when the host's answer agrees (`a_finish_answered_with_another_value_shows_no_value`, `a_direct_redemption_proves_nothing_to_the_wrong_host_and_shows_no_wrong_value`) |
 | KR-REQ-10.38 | One invitation format: what `pair.invite` issues reads back in this reader in both modes (`the_hosts_invitation_reads_back_in_the_companion_reader`), and `crates/kr-client/tests/pairing_invitation.rs` reads the payloads `fixtures/pairing/codes.json` publishes and refuses everything else |
 | KR-REQ-10.46 | `services::authority` carries the durable authority feed, and the seven legs in `tests/integration/sync/tests/authority.rs` hold a live deployment and this client's feed record to the retention, validation, revision, acknowledgement and staleness rules together |

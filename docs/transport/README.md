@@ -166,6 +166,11 @@ The first bidirectional stream carries four frames, in this order:
 4. `ConnectReply` — either `Accepted` with the host's proof over the same transcript and this
    connection's first action window, or `Refused`.
 
+A `Refused` reply, and an error answer on the unpaired pairing surface, reach the caller as
+`TransportError::Refused` with the peer's own protocol error, while `TransportError::Handshake` is
+this side's own conclusion, such as a reply that never came, a stream that ended or an answer to
+another request, and says nothing about what the peer decided.
+
 The host verifies the client's proof before sending its own, so a peer that cannot prove its
 authorisation key never obtains the host's signature over a transcript it chose.
 

@@ -92,24 +92,36 @@ native code does the rest with `kr-client`'s pairing module:
   choice is kept in `pairing-origin`.
 
 An invitation on the pasteboard is read by native code, not by the page. A code invitation that
-names a service other than this computer's raises the system's own alert before anything connects
-there, and declining it connects nowhere. Each change reaches the page as a view on the
-`kr://pairing` event.
+names a service other than this computer's raises the system's own alert, modal to the companion's
+window, before anything connects there. The alert names both services, and declining it connects
+nowhere. Each change reaches the page as a view on the `kr://pairing` event.
 
-`src-tauri/tests/pairing.rs` pairs this computer both ways against kr-controller's in-process host
-and answers a confirmation as its owner. It keeps every view and every command result the page was
-sent, and finds in none of them the invitation's text or secret, the code's secret characters, a
-challenge's nonce or identifier, a digest a confirmation covers, or a key.
+`src-tauri/tests/pairing.rs` pairs this computer both ways against kr-controller's in-process host,
+confirms one request as its owner and declines another. It calls the pairing commands the way the
+page does, through the invoke path on Tauri's mock runtime, and keeps every answer and every
+payload of the two events the application publishes. None of them carries an invitation's text or
+secret, the code's secret characters, a challenge's identifier, nonce or digest, the owner's proof,
+the transcript and bundle digests the owner approves, or a key of this computer, the owner or the
+host, and a secret planted in one event is found by the same scan. The same suite runs the watcher
+against two hosts that share a relay and against a host that answers nothing, and reads a code for
+another service through a stub alert that declines and then accepts it.
 
 ## An owner's confirmations
 
 On a computer that is one of a host's owner devices, `src-tauri/src/owner.rs` asks each such host
-every two seconds what it wants confirmed. The requests head Attention, and each row has its title,
+every two seconds what it wants confirmed. Each visit ends within ten seconds, so a host that takes
+the connection and answers nothing is out of contact until the next round and holds up no other
+host. The requests head Attention, and each row has its title,
 its description in one line, the time left, and a button named for this computer's ceremony:
 "Confirm with Touch ID", "Confirm with your password" on a Mac without Touch ID, or "Confirm with
 Windows Hello". A computer with no ceremony, Linux among them, shows no button and says where to
 confirm instead. A request whose description does not match what it would authorise says it could
 not be checked, and has no button either.
+
+A new request is announced once, on whichever screen is open, with "Review", which opens Attention
+and moves focus to the request. "Not now" sets a request aside until it expires, and it stays aside
+when the person leaves Attention and comes back. For a device being added, the row shows the value
+both devices should show, and a screen reader hears it spelled out one character at a time.
 
 The button sends native code a reference and nothing else. Native code finds the request it listed
 under that reference and asks the operating system, which draws the prompt and prints the
@@ -118,7 +130,9 @@ request's description in it:
 The prompt is bounded by the challenge's remaining lifetime. Only a confirmation inside it signs,
 with this computer's key, and completes the challenge; when the time runs out the prompt is
 dismissed and the answer is "not confirmed". Nothing on the page can answer the prompt, so a click
-that desktop automation synthesises can start a review and cannot finish one.
+that desktop automation synthesises can start a review and cannot finish one. While a review runs,
+the watcher does not connect to another host whose configuration shares the reviewed host's relay,
+because that connection would close the endpoint the answer goes over.
 
 ## The design system
 
@@ -173,7 +187,8 @@ cargo test -p companion-tauri      # the backend, including the boundary
 On Windows the same command runs `tests/windows_hello.rs`, which reads what Windows reports about
 Windows Hello and checks that the page is sent that ceremony or none. Its tests that raise Windows
 Hello's dialog are ignored: they need a signed-in desktop with Windows Hello set up, and the file
-says how to run them there.
+says how to run them there. They check that the dialog prints the exact message the review gave
+Windows Hello.
 
 The end-to-end run builds a second entry, `harness.html`, which is the same application against a
 host that answers without a machine behind it. The production build has one entry and does not carry
