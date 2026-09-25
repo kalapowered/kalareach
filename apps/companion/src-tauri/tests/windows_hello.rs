@@ -37,7 +37,7 @@ use companion_tauri::verify::hello::WindowsHello;
 use kr_client::pairing::BoxFuture;
 use kr_client::pairing::candidate::CandidateRoom;
 use kr_client::pairing::clock::DeviceClock;
-use kr_client::pairing::owner::{Ceremony as _, CeremonyKind, ReviewOutcome};
+use kr_client::pairing::owner::{Ceremony, CeremonyKind, CeremonyOutcome, ReviewOutcome};
 use kr_client::pairing::room::{RoomError, RoomSocket};
 use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::MemoryStore;
@@ -305,12 +305,33 @@ impl Automation {
     }
 }
 
+/// Windows Hello, recording each reason it is given: the message Windows prints in its dialog.
+struct Recorded {
+    hello: WindowsHello,
+    reasons: std::sync::Mutex<Vec<String>>,
+}
+
+impl Ceremony for Recorded {
+    fn kind(&self) -> CeremonyKind {
+        self.hello.kind()
+    }
+
+    fn verify<'a>(&'a self, reason: &'a str, within: Duration) -> BoxFuture<'a, CeremonyOutcome> {
+        self.reasons
+            .lock()
+            .expect("the record")
+            .push(reason.to_owned());
+        self.hello.verify(reason, within)
+    }
+}
+
 /// This computer as the owner device of an in-process host, reviewing with Windows Hello for a
 /// window of its own, with the request the host has just asked its owner to confirm listed.
 struct Asked {
     host: Host,
     client: LocalClient,
     owner: Arc<Owner>,
+    ceremony: Arc<Recorded>,
     request: RequestView,
     challenge: OwnerConfirmationRequest,
     _data: tempfile::TempDir,
@@ -323,7 +344,11 @@ impl Asked {
         let mut client = host.client().await;
         let data = tempfile::tempdir().expect("a directory");
         let device: Arc<Device> = support::owner_device(&host, &owner_keys, data.path());
-        let owner = Owner::new(device, Arc::new(window.ceremony()), || {});
+        let ceremony = Arc::new(Recorded {
+            hello: window.ceremony(),
+            reasons: std::sync::Mutex::new(Vec::new()),
+        });
+        let owner = Owner::new(device, ceremony.clone(), || {});
         owner.start();
         let challenge = calls::request(
             host.environment_id,
@@ -343,18 +368,23 @@ impl Asked {
             host,
             client,
             owner,
+            ceremony,
             request,
             challenge,
             _data: data,
         }
     }
 
-    /// The sentence the dialog prints: what the request would authorise, in one line.
-    fn sentence(&self) -> String {
-        self.request
-            .detail
-            .clone()
-            .expect("a request this computer checked has its sentence")
+    /// The message Windows Hello was given for the review, exactly: the one line its dialog
+    /// prints.
+    fn message(&self) -> String {
+        self.ceremony
+            .reasons
+            .lock()
+            .expect("the record")
+            .last()
+            .cloned()
+            .expect("the review asked Windows Hello")
     }
 
     /// Whether the host recorded an answer to its challenge.
@@ -419,12 +449,12 @@ async fn pressing_the_dialogs_buttons_without_a_credential_confirms_nothing() {
         "the dialog answered, not the time: {answered_in:?}"
     );
     assert!(record.contains("== dialog "), "the dialog was raised");
-    let sentence = asked.sentence();
+    let message = asked.message();
     assert!(
         record
             .lines()
-            .any(|line| line.starts_with("== text ") && line.contains(&sentence)),
-        "the dialog prints {sentence:?}"
+            .any(|line| line.starts_with("== text ") && line.contains(&message)),
+        "the dialog prints {message:?}"
     );
     assert!(
         record.contains("== pressed Cancel") || record.contains("== gone after "),
