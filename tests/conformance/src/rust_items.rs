@@ -486,11 +486,13 @@ impl Attribute {
         self.literal(name).map(|(value, _)| value)
     }
 
-    /// The value of `#[name = "value"]` where it is written with no escape and no line
-    /// continuation, which the reading decodes exactly as the compiler does.
+    /// The value of `#[name = "value"]` where it is printable ASCII written with no escape, which the
+    /// reading reads exactly as the compiler does: no escape to decode, and no line break or other
+    /// control character for the compiler to normalise.
     fn plain_value(&self, name: &str) -> Option<String> {
-        self.literal(name)
-            .and_then(|(value, escaped)| (!escaped).then_some(value))
+        self.literal(name).and_then(|(value, escaped)| {
+            (!escaped && value.chars().all(|c| (' '..='~').contains(&c))).then_some(value)
+        })
     }
 
     fn literal(&self, name: &str) -> Option<(String, bool)> {
@@ -668,7 +670,7 @@ fn parse_module(
                     children.push(Parsed::Warning(Warning {
                         file: context.relative.clone(),
                         line: token.line,
-                        what: "a `path` attribute whose value is written with an escape or is no plain string, which the reading does not decode as the compiler may".to_owned(),
+                        what: "a `path` attribute whose value is anything but a string of printable ASCII written without an escape, which the reading does not read as the compiler may".to_owned(),
                     }));
                 }
                 if module_entry
@@ -1717,21 +1719,36 @@ fn levels(tokens: &[Token]) -> Levels {
     Levels { module, enum_body }
 }
 
-/// Where each `enum`'s body opens: after `enum` and its name, the first `{` outside every group and
-/// every angle bracket of its generics and `where` clause (a `>` after `-` is an arrow's, and a `{`
-/// after `!` opens a macro's arguments).
+/// Where each `enum`'s body opens: after `enum` and its name (or a macro's metavariable for one),
+/// the first `{` outside every group and every angle bracket of its generics and `where` clause (a
+/// `>` after `-` is an arrow's, and a `{` after a name and `!` opens a macro's arguments).
 fn enum_bodies(tokens: &[Token]) -> BTreeSet<usize> {
     let mut found = BTreeSet::new();
     for (index, token) in tokens.iter().enumerate() {
-        if token.ident() != Some("enum") || tokens.get(index + 1).and_then(Token::ident).is_none() {
+        if token.ident() != Some("enum") {
             continue;
         }
+        // The enum's name, or a macro's metavariable that stands for one (`enum $name`).
+        let name = match tokens.get(index + 1) {
+            Some(next) if next.ident().is_some() => index + 1,
+            Some(next)
+                if next.is_punct('$') && tokens.get(index + 2).and_then(Token::ident).is_some() =>
+            {
+                index + 2
+            }
+            _ => continue,
+        };
         let mut groups = 0_usize;
         let mut angles = 0_usize;
-        for at in index + 2..tokens.len() {
+        for at in name + 1..tokens.len() {
             match tokens[at].tok {
-                // A macro's braces in the header (`ty!{}`) are a group, not the body.
-                Tok::Punct('{') if groups == 0 && angles == 0 && !tokens[at - 1].is_punct('!') => {
+                // A macro's braces in the header (`ty!{}`, a name and then `!`) are a group, not
+                // the body; a `!` after anything else is the never type (`-> !`).
+                Tok::Punct('{')
+                    if groups == 0
+                        && angles == 0
+                        && !(tokens[at - 1].is_punct('!') && tokens[at - 2].ident().is_some()) =>
+                {
                     found.insert(at);
                     break;
                 }
@@ -1991,17 +2008,19 @@ fn trusted_declaration(
     // Any other name in a `use` declaration, a segment of a path included (`use a::core::{self}`),
     // is held to what the declaration brings in by that name.
     let Some(declaration) = declaration else {
-        // A crate root is written only as a path's first name, a method or field, the crate an
-        // `extern crate` of its own name brings in, or an attribute's path; anywhere else it may
-        // be a binding, a type or a generic parameter, which a path starting at it would find.
-        let path = around.punct_after(1, ':') && around.punct_after(2, ':');
-        let method = around.punct_before(1, '.') && !around.punct_before(2, '.');
-        let extern_crate =
-            around.word_before(1) == Some("crate") && around.word_before(2) == Some("extern");
-        let attribute = around.punct_before(1, '[')
-            && (around.punct_before(2, '#') || around.punct_before(2, '!'));
-        return (root && !path && !method && !extern_crate && !attribute)
-            .then_some("a name a path starting at it may find instead of the crate");
+        // Besides an item (above) and a `use` (below), only a generic parameter declares a name a
+        // path's first name can be: a name after `<` or `,` and before `>`, `,`, `=` or the `:` of
+        // a bound (`core: Trait`, or `core: ::std::...`, three colons, but not `core::...`). A
+        // value, a field or a later name of a path declares nothing a path could start at.
+        let bound = around.punct_after(1, ':')
+            && !(around.punct_after(2, ':') && !around.punct_after(3, ':'));
+        let generic = (around.punct_before(1, '<') || around.punct_before(1, ','))
+            && (around.punct_after(1, '>')
+                || around.punct_after(1, ',')
+                || around.punct_after(1, '=')
+                || bound);
+        return (root && generic)
+            .then_some("a generic parameter, which a path starting at that name would find instead of the crate");
     };
     if around.word_after(1) == Some("as") {
         return None;
@@ -2416,6 +2435,8 @@ mod tests {
             "enum E<const N: usize = { 1 }> { shared() }",
             "enum E<F> where F: Fn() -> u8 { shared(F) }",
             "fn t() { enum E where ty!{}: Sized { shared() } }",
+            "fn t() { enum E<F> where F: Fn() -> fn() -> ! { shared(), Other(F) } }",
+            "macro_rules! m { ($name:ident) => { enum $name { shared() } }; }",
         ] {
             let found = breached(text);
             assert!(!found.is_empty(), "{text}");
@@ -2478,12 +2499,12 @@ mod tests {
             ("use x as rustfmt;", "rustfmt"),
             ("use foo::derive;", "derive"),
             ("use serde_derive::Serialize;", "Serialize"),
-            // A crate root written anywhere but at the start of a path, as a generic parameter, a
-            // binding or a field, may be what a path starting at it finds.
+            // A crate root declared as a generic parameter is what a path starting at it finds
+            // inside the item that declares it.
             ("fn other<core>() {}", "core"),
-            ("fn t() { let tokio = 1; }", "tokio"),
-            ("fn t(std: u8) {}", "std"),
-            ("struct S { alloc: u8 }", "alloc"),
+            ("fn other<core: ::std::marker::Sized>() {}", "core"),
+            ("impl<alloc> Trait for Type {}", "alloc"),
+            ("struct S<'a, tokio = u8>(&'a tokio);", "tokio"),
             // A definition written as text is one all the same: the check reads tokens.
             (
                 "const _: &str = stringify!(macro_rules! line { () => {} });",
@@ -2518,6 +2539,11 @@ mod tests {
             "#[derive(serde::Serialize)]\n#[serde(rename_all = \"camelCase\")]\nstruct S;",
             "#[tokio::test]\nasync fn t() { tokio::spawn(async {}); std::mem::drop(1); }",
             "fn t() { let _ = value.alloc(); let _ = ::core::mem::size_of::<u8>(); }",
+            // A value, a field or a path's later name declares nothing a path could start at.
+            "fn t() { let p = std::alloc::alloc(layout); let tokio = 1; }",
+            "fn t(std: u8) { let core: ::std::primitive::u8 = 0; }",
+            "struct S { alloc: ::std::alloc::Layout }",
+            "#[cfg_attr(any(), serde(rename_all = \"camelCase\"))]\nstruct S;",
         ] {
             assert_eq!(breached(text), [], "{text}");
         }
@@ -2715,7 +2741,7 @@ mod tests {
         };
         write(
             "root.rs",
-            "mod plain;\n#[path = \"sub/loaded.rs\"]\nmod loaded;\nmod inline {\n    #[path = \"named.rs\"]\n    mod named;\n}\n#[path = \"moved\"]\nmod shifted {\n    mod deep;\n}\n#[cfg_attr(unix, path = \"other.rs\")]\nmod chosen;\nmod inward {\n    #![path = \"turned\"]\n    mod bent;\n}\nmod unsure {\n    #![cfg_attr(unix, path = \"other\")]\n    mod kept;\n}\nmod carrier;\n",
+            "mod plain;\n#[path = \"sub/loaded.rs\"]\nmod loaded;\nmod inline {\n    #[path = \"named.rs\"]\n    mod named;\n}\n#[path = \"moved\"]\nmod shifted {\n    mod deep;\n}\n#[cfg_attr(unix, path = \"other.rs\")]\nmod chosen;\nmod inward {\n    #![path = \"turned\"]\n    mod bent;\n}\nmod unsure {\n    #![cfg_attr(unix, path = \"other\")]\n    mod kept;\n}\nmod carrier;\n#[path = \"ki\r\nd.rs\"]\nmod crlf;\n#[path = r\"tab\there.rs\"]\nmod tabbed;\n",
         );
         write(
             "plain.rs",
@@ -2778,7 +2804,13 @@ mod tests {
             .collect();
         assert_eq!(
             doubts,
-            [("root.rs", 13), ("root.rs", 18), ("carrier.rs", 1)],
+            [
+                ("root.rs", 13),
+                ("root.rs", 18),
+                ("carrier.rs", 1),
+                ("root.rs", 25),
+                ("root.rs", 27)
+            ],
             "{warnings:?}"
         );
         assert!(warnings[0].what.contains("cfg_attr"), "{warnings:?}");
@@ -2787,6 +2819,14 @@ mod tests {
             warnings[2].what.contains("`path` attribute inside"),
             "{warnings:?}"
         );
+        // A `path` value with a line break or a tab in it, written plainly or raw, is not followed:
+        // the compiler reads a carriage return and a line feed as a line feed alone.
+        for warning in &warnings[3..] {
+            assert!(
+                warning.what.contains("`path` attribute whose value"),
+                "{warnings:?}"
+            );
+        }
     }
 
     #[test]

@@ -159,21 +159,21 @@ compiles:
   (`Serialize`, `Deserialize`). No file declares one of them: no `mod`, `macro_rules!` or `macro`
   of that name, no `as` that gives the name to something else, and no `use` that brings in
   anything else by it. A `use` of the standard library's own item (`use std::fmt::Debug`), of
-  serde's derive from `serde`, or of one of the crates by itself (`use tokio;`) is fine. A crate
-  root (`std`, `core`, `alloc`, `serde`, `tokio`, `rustfmt`, `clippy`) is written only as the
-  first name of a path, a method or a field, an attribute's path, or the crate an `extern crate`
-  of its own name brings in: as a binding, a type or a generic parameter, a path starting at it
-  would find that instead. The package names no dependency `std`, `core` or `alloc`.
+  serde's derive from `serde`, or of one of the crates by itself (`use tokio;`) is fine. No item,
+  `use`, `extern crate ... as` or generic parameter declares a crate root (`std`, `core`, `alloc`,
+  `serde`, `tokio`, `rustfmt`, `clippy`): a path starting at that name would find it instead. A
+  value, a field or a later name of a path declares nothing such a path could start at. The
+  package names no dependency `std`, `core` or `alloc`.
 - Everything outside comments, literals and lifetimes is ASCII, identifiers included: the compiler
   compares identifiers once it has normalised them, and the report compares them as written.
 - The report reads every file the target compiles, as the compiler does: no module file is
   declared anywhere but among a module's items (inside a function, say, where the report does not
   follow it), no module's files are chosen by a `cfg_attr`, no module's own file carries a `path`
   attribute (or a `cfg_attr` that may set one) among its inner attributes, which moves where the
-  compiler looks for its modules, no `path` attribute's value is written with an escape or a line
-  continuation, no file's first line starts `#!` without `[` right after it (the compiler reads
-  such a line as a shebang or as an attribute by rules on whitespace and comments), and every
-  declared module has its file.
+  compiler looks for its modules, every `path` attribute's value is a string of printable ASCII
+  written without an escape, no file's first line starts `#!` without `[` right after it (the
+  compiler reads such a line as a shebang or as an attribute by rules on whitespace and comments),
+  and every declared module has its file.
 - The target is of the 2018 edition or later.
 
 The report checks the names on tokens, with no regard to what the compiler would make of them, so
@@ -226,9 +226,9 @@ harness names it. A `path` attribute is read from the directory of the file it i
 top level, and from the inline module's directory inside one; on an inline module, written before
 it or at the start of its body, it names the directory of the modules inside; and the file it names
 keeps its own modules beside it, as a `mod.rs` does. A module whose file is not there, whose files a
-`cfg_attr` may choose, whose `path` attribute is written with an escape, or whose own file carries
-a `path` attribute among its inner attributes is a warning, and in a target with a helper a
-problem.
+`cfg_attr` may choose, whose `path` attribute's value is anything but printable ASCII written
+without an escape (a line break the compiler would normalise included), or whose own file carries a
+`path` attribute among its inner attributes is a warning, and in a target with a helper a problem.
 
 ### Case tables kept as data
 
