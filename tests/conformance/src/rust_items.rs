@@ -57,6 +57,10 @@ pub struct Test {
     pub inside: Vec<Comment>,
     /// Every identifier its body uses, which is how a case table's consumers are found.
     pub uses: BTreeSet<String>,
+    /// Every function its body calls, as the path it is called by: `helper()` is `[helper]` and
+    /// `shellpkg::helper()` is `[shellpkg, helper]`. A method call, a macro and a name that is
+    /// not called are not calls.
+    pub calls: BTreeSet<Vec<String>>,
 }
 
 /// Any item that is not a test function.
@@ -633,12 +637,14 @@ fn classify(
                     .filter_map(|t| t.ident().map(str::to_owned))
                     .collect()
             });
+            let calls = body.map_or_else(BTreeSet::new, |(from, to)| calls(&tokens[from..to]));
             Classified::Test(Test {
                 name: name.unwrap_or_default(),
                 line: tokens[at].line,
                 attached,
                 inside: comments_in(body),
                 uses,
+                calls,
             })
         }
         "mod" => {
@@ -685,6 +691,76 @@ fn classify(
             })
         }
     }
+}
+
+/// Every function call in `tokens`, as the path it is called by.
+///
+/// A call is a name followed by an opening parenthesis, or by a turbofish and then one, with the
+/// `::`-joined names before it as its path. A name after a full stop is a method, and a name before
+/// `!` is a macro; neither is a call of a free function. A single name that a `let` in the same
+/// body binds is a local, a closure say, and calling it calls no function of the module.
+fn calls(tokens: &[Token]) -> BTreeSet<Vec<String>> {
+    let locals: BTreeSet<&str> = tokens
+        .windows(3)
+        .filter(|window| window[0].ident() == Some("let"))
+        .filter_map(|window| match window[1].ident() {
+            Some("mut") => window[2].ident(),
+            name => name,
+        })
+        .collect();
+    let mut found = BTreeSet::new();
+    for (index, token) in tokens.iter().enumerate() {
+        let Some(name) = token.ident() else {
+            continue;
+        };
+        if !called_after(tokens, index + 1) {
+            continue;
+        }
+        let mut path = vec![name.to_owned()];
+        let mut at = index;
+        // Walk back over `segment ::` pairs.
+        while at >= 3
+            && tokens[at - 1].is_punct(':')
+            && tokens[at - 2].is_punct(':')
+            && let Some(segment) = tokens[at - 3].ident()
+        {
+            path.insert(0, segment.to_owned());
+            at -= 3;
+        }
+        if at > 0 && tokens[at - 1].is_punct('.') {
+            continue;
+        }
+        if path.len() == 1 && locals.contains(name) {
+            continue;
+        }
+        found.insert(path);
+    }
+    found
+}
+
+/// Whether the tokens from `at` open a call's arguments: `(`, or a turbofish `::<...>` and then `(`.
+fn called_after(tokens: &[Token], at: usize) -> bool {
+    let is = |offset: usize, c: char| tokens.get(at + offset).is_some_and(|t| t.is_punct(c));
+    if is(0, '(') {
+        return true;
+    }
+    if !(is(0, ':') && is(1, ':') && is(2, '<')) {
+        return false;
+    }
+    let mut depth = 0usize;
+    for (offset, token) in tokens.iter().enumerate().skip(at + 2) {
+        if token.is_punct('<') {
+            depth += 1;
+        } else if token.is_punct('>') {
+            depth -= 1;
+            if depth == 0 {
+                return tokens.get(offset + 1).is_some_and(|t| t.is_punct('('));
+            }
+        } else if token.is_punct(';') || token.is_punct('{') {
+            return false;
+        }
+    }
+    false
 }
 
 /// Every `covers:` field in a case table's initialiser, with the strings its value holds.
@@ -807,6 +883,27 @@ mod tests {
         assert_eq!(item.covers.len(), 2);
         assert_eq!(item.covers[1].text, "KR-ACC-001 KR-REQ-08.21");
         assert_eq!(item.inside[0].text, " KR-REQ-08.21: queries.");
+    }
+
+    #[test]
+    fn a_test_records_the_functions_it_calls_by_their_paths() {
+        let modules = scan_text(
+            "#[test]\nfn caller() {\n    let shared = 3;\n    let mut local = || 1;\n    helper(shared);\n    local();\n    shellpkg::cases::other(1);\n    generic::<Vec<u8>>(2);\n    value.method(2);\n    println!(\"x\");\n    shared;\n}\n",
+            true,
+        );
+        let calls = &tests_of(&modules[0])[0].calls;
+        let expected: BTreeSet<Vec<String>> = [
+            vec!["helper".to_owned()],
+            vec![
+                "shellpkg".to_owned(),
+                "cases".to_owned(),
+                "other".to_owned(),
+            ],
+            vec!["generic".to_owned()],
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(calls, &expected);
     }
 
     #[test]

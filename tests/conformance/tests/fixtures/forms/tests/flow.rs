@@ -42,6 +42,45 @@ fn calls_the_shared_case() {
 }
 
 #[test]
+fn has_a_local_of_the_same_name() {
+    let shared = || 4;
+    assert_eq!(shared(), 4);
+}
+
+mod other {
+    /// A case of this module's own, which names no row.
+    fn shared() -> u8 {
+        5
+    }
+
+    #[test]
+    fn calls_its_own_case_of_the_same_name() {
+        assert_eq!(shared(), 5);
+    }
+
+    #[test]
+    fn calls_the_shared_case_by_its_path() {
+        assert_eq!(super::shared(), 3);
+    }
+}
+
+mod cases {
+    mod deep {
+        /// KR-REQ-03.08: the same case, written in a child module.
+        pub fn brought_up() -> u8 {
+            6
+        }
+    }
+
+    pub use deep::*;
+}
+
+#[test]
+fn calls_a_case_its_module_brings_up() {
+    assert_eq!(cases::brought_up(), 6);
+}
+
+#[test]
 fn reads_the_table() {
     assert!(!forms::CASES.is_empty());
 }
