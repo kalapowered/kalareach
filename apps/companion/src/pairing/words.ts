@@ -18,8 +18,41 @@ export type NextAction =
   | 'paste_again'
   | 'done'
 
-/** The words and the next action for one failure kind. `service` is the service's host name. */
+/** How an attempt was made. */
+export type AttemptMode = 'code' | 'direct'
+
+/**
+ * The words and the next action for one failure kind of an attempt made in `mode`. `service` is
+ * the host name of the service a code attempt went through.
+ */
 export function failureWords(
+  kind: FailureKind,
+  service: string,
+  mode: AttemptMode = 'code'
+): { readonly sentence: string; readonly action: NextAction } {
+  const words = codeWords(kind, service)
+  if (mode === 'code') return words
+  // A direct invitation reaches no service and holds no code, and native code lets it go once the
+  // attempt ends: it is tried again only by copying it from the host and pasting it again.
+  switch (kind) {
+    case 'not_authenticated':
+      return {
+        sentence: 'The invitation did not work. Ask the host for a new one.',
+        action: 'paste_again'
+      }
+    case 'did_not_finish':
+      return {
+        sentence:
+          'Pairing did not finish. Copy the invitation from the host again, or ask it for a new one.',
+        action: 'paste_again'
+      }
+    default:
+      return words.action === 'done' ? words : { sentence: words.sentence, action: 'paste_again' }
+  }
+}
+
+/** The words and the next action for one failure kind of a code attempt through `service`. */
+function codeWords(
   kind: FailureKind,
   service: string
 ): { readonly sentence: string; readonly action: NextAction } {
@@ -129,8 +162,12 @@ export function failureWords(
 }
 
 /** The whole sentence for a failure, with the tries line whenever the attempt was charged. */
-export function failureSentence(failure: PairingFailure, service: string): string {
-  const { sentence } = failureWords(failure.kind, service)
+export function failureSentence(
+  failure: PairingFailure,
+  service: string,
+  mode: AttemptMode = 'code'
+): string {
+  const { sentence } = failureWords(failure.kind, service, mode)
   if (failure.tries_left === null) return sentence
   const tries = failure.tries_left === 1 ? '1 try' : `${failure.tries_left} tries`
   return `${sentence} ${tries} left on this device.`

@@ -18,8 +18,9 @@ use futures_util::{SinkExt, StreamExt};
 use kr_client::pairing::candidate::{AttemptState, Candidate, Pairing};
 use kr_client::pairing::clock::DeviceClock;
 use kr_client::pairing::failure::FailureKind;
+use kr_client::pairing::invitation::origin_host;
 use kr_client::pairing::link::{EndpointPool, IrohLink};
-use kr_client::pairing::paired::PairedHosts;
+use kr_client::pairing::paired::{AttemptMode, PairedHosts};
 use kr_client::pairing::room::RoomConnector;
 use kr_crypto::keys::DeviceKeys;
 use kr_pairing::code::{CodeSecret, EnteredCode};
@@ -202,7 +203,7 @@ async fn ending(room: RoomConnector, origin: &RendezvousOrigin) -> AttemptState 
 }
 
 fn kind_of(state: &AttemptState) -> (FailureKind, Option<u32>) {
-    let AttemptState::Ended { failure } = state else {
+    let AttemptState::Ended { failure, .. } = state else {
         panic!("the attempt ended, and shows how: {state:?}");
     };
     (failure.kind, failure.tries_left)
@@ -216,9 +217,15 @@ async fn a_service_that_cannot_serve_now_is_unreachable() {
     let authority = Authority::new("rendezvous test authority");
     let untrusted = Authority::new("another authority");
     let origin = scripted(&untrusted, Script::Unknown).await;
+    let state = ending(authority.connector(), &origin).await;
+    assert_eq!(kind_of(&state), (FailureKind::ServiceUnreachable, Some(4)));
+    // The ending names the service this attempt went through, which the person chose for it.
+    let AttemptState::Ended { mode, service, .. } = &state else {
+        panic!("ended");
+    };
     assert_eq!(
-        kind_of(&ending(authority.connector(), &origin).await),
-        (FailureKind::ServiceUnreachable, Some(4))
+        (*mode, service.as_deref()),
+        (AttemptMode::Code, Some(origin_host(&origin)))
     );
     let origin = scripted(&authority, Script::Status(503, "<html>Later</html>")).await;
     assert_eq!(

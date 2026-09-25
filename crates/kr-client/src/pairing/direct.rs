@@ -14,7 +14,7 @@ use kr_protocol::preauth::{PairRedeemParams, PairRedeemResult};
 use tokio::sync::watch;
 
 use super::candidate::{
-    AttemptState, Pairing, RECOVERY_MARGIN_MS, Stage, Unpaired, WAIT_STEP, awaiting, within,
+    AttemptState, Pairing, RECOVERY_MARGIN_MS, Stage, Unpaired, WAIT_STEP, awaiting, ended, within,
 };
 use super::failure::{FailureKind, PairingFailure, refused_by_host};
 use super::link::{ConnectionPeer, LinkError};
@@ -35,12 +35,7 @@ impl Pairing {
         progress: &watch::Sender<AttemptState>,
     ) -> Result<PairedHost, PairingFailure> {
         let outcome = self.direct_attempt(payload, progress).await;
-        if let Err(failure) = &outcome {
-            progress.send_replace(AttemptState::Ended {
-                failure: failure.clone(),
-            });
-        }
-        outcome
+        ended(progress, outcome, AttemptMode::Direct, None)
     }
 
     async fn direct_attempt(

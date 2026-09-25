@@ -661,7 +661,7 @@ async fn this_computer_counts_its_tries_in_its_own_budget() {
     for attempt in 1..=5 {
         first.start_code(CODE).expect("started");
         let ended = reached(&first, |_| false).await;
-        let AttemptState::Ended { failure } = ended else {
+        let AttemptState::Ended { failure, .. } = ended else {
             panic!("the attempt ends");
         };
         assert_eq!(failure.kind, FailureKind::ServiceUnreachable, "{attempt}");
@@ -674,7 +674,7 @@ async fn this_computer_counts_its_tries_in_its_own_budget() {
         let device = Arc::clone(device);
         async move {
             device.start_code(CODE).expect("started");
-            let AttemptState::Ended { failure } = reached(&device, |_| false).await else {
+            let AttemptState::Ended { failure, .. } = reached(&device, |_| false).await else {
                 panic!("the attempt ends");
             };
             device.stop().await;
@@ -701,7 +701,7 @@ async fn this_computer_counts_its_tries_in_its_own_budget() {
         .set_origin("https://pair.example.org")
         .expect("another service");
     second.start_code(CODE).expect("started");
-    let AttemptState::Ended { failure } = reached(&second, |_| false).await else {
+    let AttemptState::Ended { failure, .. } = reached(&second, |_| false).await else {
         panic!("the attempt ends");
     };
     assert_eq!(failure.kind, FailureKind::ServiceUnreachable);
@@ -732,7 +732,7 @@ async fn this_computer_counts_its_tries_in_its_own_budget() {
         .set_origin("https://reach.kala.to")
         .expect("the default service again");
     third.start_code(ANOTHER).expect("started");
-    let AttemptState::Ended { failure } = reached(&third, |_| false).await else {
+    let AttemptState::Ended { failure, .. } = reached(&third, |_| false).await else {
         panic!("the attempt ends");
     };
     assert_eq!(failure.tries_left, Some(4));
@@ -747,7 +747,7 @@ async fn this_computer_counts_its_tries_in_its_own_budget() {
     let summary = third.hold(invitation);
     assert_eq!(summary.origin_host.as_deref(), Some("reach.kala.to"));
     third.start_held().expect("started");
-    let AttemptState::Ended { failure } = reached(&third, |_| false).await else {
+    let AttemptState::Ended { failure, .. } = reached(&third, |_| false).await else {
         panic!("the attempt ends");
     };
     assert_eq!(
@@ -772,7 +772,7 @@ async fn this_computer_counts_its_tries_in_its_own_budget() {
     );
     assert_eq!(refuses(&rebooted).await, FailureKind::DeviceTriesUsed);
     rebooted.start_code(ANOTHER).expect("started");
-    let AttemptState::Ended { failure } = reached(&rebooted, |_| false).await else {
+    let AttemptState::Ended { failure, .. } = reached(&rebooted, |_| false).await else {
         panic!("the attempt ends");
     };
     assert_eq!(

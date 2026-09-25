@@ -201,7 +201,14 @@ export type AttemptState =
       readonly expires_at_ms: number | null
     }
   | { readonly state: 'paired'; readonly host: PairedHostView }
-  | { readonly state: 'ended'; readonly failure: PairingFailure }
+  | {
+      readonly state: 'ended'
+      readonly failure: PairingFailure
+      /** How the attempt was made: a direct invitation is tried again only by pasting it again. */
+      readonly mode: 'code' | 'direct'
+      /** The service a code attempt went through, which its failures name, when known. */
+      readonly service: string | null
+    }
 
 /** What a person is shown of an invitation read from the pasteboard. */
 export interface InvitationSummary {

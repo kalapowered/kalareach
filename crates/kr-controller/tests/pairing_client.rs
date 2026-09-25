@@ -30,7 +30,7 @@ use kr_client::pairing::owner::{
     CannotCheck, Ceremony, CeremonyKind, CeremonyOutcome, Listed, OwnerChannel, OwnerConfirmations,
     ReviewOutcome, SessionChannel, Subject,
 };
-use kr_client::pairing::paired::{PairedHost, PairedHosts};
+use kr_client::pairing::paired::{AttemptMode, PairedHost, PairedHosts};
 use kr_client::pairing::room::{RoomError, RoomSocket};
 use kr_client::session::Session;
 use kr_crypto::keys::DeviceKeys;
@@ -1612,10 +1612,23 @@ async fn a_direct_redemption_proves_nothing_to_the_wrong_host_and_shows_no_wrong
         .to_text()
         .expect("the payload's text");
     let device = ProductDevice::new(Arc::new(host.room.clone()), |link| Arc::new(link));
-    let (attempt, _) = device.redeem(&flipped);
+    let (attempt, shown) = device.redeem(&flipped);
     assert_eq!(
         outcome(attempt).await.expect_err("refused").kind,
         FailureKind::NotAuthenticated
+    );
+    // The ending says the attempt was a direct invitation's, which reaches no service.
+    assert!(
+        matches!(
+            &*shown.borrow(),
+            AttemptState::Ended {
+                mode: AttemptMode::Direct,
+                service: None,
+                ..
+            }
+        ),
+        "{:?}",
+        *shown.borrow()
     );
     assert!(
         matches!(
