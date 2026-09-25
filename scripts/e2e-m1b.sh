@@ -22,9 +22,11 @@
 # report gathers those lines. Nothing here removes anything: each run keeps its own evidence
 # directory, with one log per leg.
 #
-# The origin is checked before anything is printed or built. It must name HTTPS and it must be a host
-# and an optional port and nothing else. A refusal says which rule the value broke and never repeats
-# the value, since this report is written to a log.
+# The origin is checked before anything is printed or sent: first here, before anything is built, for
+# what cannot be an origin at all, and then by the product's own parsers once the legs are built, which
+# refuse whatever a host would not reserve invitations at. It must name HTTPS and it must be a host and
+# an optional port and nothing else. A refusal says which rule the value broke and never repeats the
+# value, since this report is written to a log.
 #
 # The managed shell the terminal leg runs is the package KR_SHELL_PACKAGES, KR_SHELL_PREFIX or the
 # build script's default prefix names; scripts/build-shells.sh --zsh builds it from this tree, and a
@@ -82,9 +84,10 @@ case "$authority" in
     exit 2
     ;;
 esac
-# The whole origin, in the one canonical form a rendezvous origin has: a lower-case host name or a
-# bracketed IPv6 literal, then an optional port from 1 to 65535 with no leading zero, in at most 128
-# bytes. Anything else is refused here, before it reaches a build, a log line or a request.
+# The shape of a canonical origin: a lower-case host name or a bracketed IPv6 literal, then an optional
+# port from 1 to 65535 with no leading zero, in at most 128 bytes. What passes this can still be refused
+# by the product's own parsers below, which are the rule; this refuses what cannot be an origin before
+# anything is built.
 host_name='[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*'
 canonical="^https://(${host_name}|\\[[0-9a-f:]+\\])(:[1-9][0-9]{0,4})?\$"
 if [ "${#origin}" -gt 128 ] || ! [[ "$origin" =~ $canonical ]]; then
@@ -113,6 +116,34 @@ esac
 mkdir -p "$artefacts"
 evidence="$(mktemp -d "$artefacts/m1b-XXXXXX")"
 
+# Built once, before anything is sent, so a build failure is not reported as a leg that failed. The
+# legs launch these binaries from beside their own test binary.
+if ! cargo build --locked --quiet -p kr-cli -p kr-controller -p kr-worker --bins \
+  >"$evidence/build.log" 2>&1 ||
+  ! cargo build --locked --quiet -p "$suite" --bins >>"$evidence/build.log" 2>&1 ||
+  ! cargo test --locked --quiet -p "$suite" --no-run >>"$evidence/build.log" 2>&1; then
+  tail -20 "$evidence/build.log" >&2
+  echo "the legs did not build, so nothing was contacted" >&2
+  exit 1
+fi
+
+# The product's own reading of the origin: the parsers a host reserves its invitations with and a
+# service request is addressed with. It says which rule a refused value broke, never the value.
+checked=0
+rule="$(KR_M1B_ORIGIN="$origin" cargo run --locked --quiet -p "$suite" --bin kr-e2e-m1b-origin \
+  2>&1)" || checked=$?
+case "$checked" in
+  0) ;;
+  2)
+    echo "$rule" >&2
+    exit 2
+    ;;
+  *)
+    echo "the origin could not be checked, so nothing was contacted" >&2
+    exit 1
+    ;;
+esac
+
 echo "kalareach cross-boundary checkpoint"
 echo "  commit: $(git rev-parse HEAD 2>/dev/null || echo 'not a checkout')"
 echo "  host: $(uname -sr) $(uname -m)"
@@ -120,16 +151,6 @@ echo "  taken at: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 echo "  origin: $origin"
 echo "  evidence: $evidence"
 echo
-
-# Built once, before anything is sent, so a build failure is not reported as a leg that failed. The
-# legs launch these binaries from beside their own test binary.
-if ! cargo build --locked --quiet -p kr-cli -p kr-controller -p kr-worker --bins \
-  >"$evidence/build.log" 2>&1 ||
-  ! cargo test --locked --quiet -p "$suite" --no-run >>"$evidence/build.log" 2>&1; then
-  tail -20 "$evidence/build.log" >&2
-  echo "the legs did not build, so nothing was contacted" >&2
-  exit 1
-fi
 
 # Every test in the group is a leg this report names, and every leg it names is a test.
 listed=0

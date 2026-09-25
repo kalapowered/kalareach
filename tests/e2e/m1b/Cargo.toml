@@ -8,6 +8,11 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[[bin]]
+# The product's own reading of an origin, which the checkpoint's script asks before it runs a leg.
+name = "kr-e2e-m1b-origin"
+path = "src/bin/origin.rs"
+
 [dependencies]
 # The trust root a catalogue enrolment carries travels as base64.
 base64.workspace = true

@@ -97,6 +97,24 @@ pub const RELEASE_VARIABLE: &str = "KR_M1B_CATALOGUE_RELEASE";
 /// takes half a minute to answer is slow rather than broken.
 pub const LIVENESS: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// Reads `named` as the origin a checkpoint runs against, by the product's own parsers: a
+/// canonical HTTPS rendezvous origin, which is what a host reserves its invitations at, and an
+/// origin a service request travels to.
+///
+/// # Errors
+///
+/// Returns the rule the value broke, without the value: an address may carry a credential in
+/// front of its host.
+pub fn canonical_origin(named: &str) -> Result<(RendezvousOrigin, GatewayOrigin), String> {
+    let origin = RendezvousOrigin::new(named.to_owned()).map_err(|error| {
+        format!("what {ORIGIN_VARIABLE} names is not a canonical HTTPS origin: {error}")
+    })?;
+    let gateway = GatewayOrigin::new(named.to_owned()).map_err(|error| {
+        format!("what {ORIGIN_VARIABLE} names is not an origin a request travels to: {error}")
+    })?;
+    Ok((origin, gateway))
+}
+
 /// The checkpoint one leg runs in: the deployment it was given.
 #[derive(Clone, Debug)]
 pub struct Checkpoint {
@@ -125,12 +143,7 @@ impl Checkpoint {
             eprintln!("skipping the {leg} leg: {ORIGIN_VARIABLE} names no deployment");
             return None;
         }
-        let origin = RendezvousOrigin::new(named.clone()).unwrap_or_else(|error| {
-            panic!("what {ORIGIN_VARIABLE} names is not a canonical HTTPS origin: {error}")
-        });
-        let gateway = GatewayOrigin::new(named).unwrap_or_else(|error| {
-            panic!("what {ORIGIN_VARIABLE} names is not an origin a request travels to: {error}")
-        });
+        let (origin, gateway) = canonical_origin(&named).unwrap_or_else(|rule| panic!("{rule}"));
         Some(Self { origin, gateway })
     }
 
