@@ -337,6 +337,7 @@ mod tests {
                 format!("http://user:{secret}@proxy.example.com:99999"),
                 true,
             ),
+            (format!("http:///@{secret}.example.com:3128"), true),
             (format!("http://proxy.example.com:3128/{secret}"), false),
             (format!("socks5://{secret}.example.com:1080"), false),
             (format!("{secret}.example.com:3128"), false),
@@ -382,6 +383,8 @@ mod tests {
             "http://user@proxy.example.com:3128",
             "http://@proxy.example.com:3128",
             "http://:@proxy.example.com:3128",
+            "http:///@proxy.example.com:3128",
+            "http:///:@proxy.example.com:3128",
             "socks5://proxy.example.com:1080",
         ];
         let mut accepted = 0;

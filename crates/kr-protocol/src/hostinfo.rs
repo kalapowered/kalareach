@@ -3200,14 +3200,24 @@ pub mod configuration {
         value.len() <= MAX_HINT_LEN && path.is_empty() && is_canonical_authority(authority, implied)
     }
 
-    /// Whether `value` names a user or a password before its host, which is where a URL carries a
-    /// credential.
+    /// Whether `value` names a user or a password before its host, even an empty one, which is
+    /// where a URL carries a credential.
     ///
-    /// The authority is everything between the scheme's `//` and the first `/`, `?`, `#` or `\`
-    /// after it, whatever the scheme, so an `@` in a path or a query is not mistaken for one.
+    /// The authority is read as a URL parser reads it: after the scheme's colon and every `/` or
+    /// `\` that follows it, up to the next `/`, `\`, `?` or `#`, whatever the scheme. So an `@` in a
+    /// path or a query is not mistaken for one, and extra slashes do not hide one.
     fn carries_user_information(value: &str) -> bool {
-        let after_scheme = value.split_once("//").map_or(value, |(_, rest)| rest);
+        let after_scheme = value
+            .split_once(':')
+            .filter(|(scheme, _)| {
+                scheme.starts_with(|character: char| character.is_ascii_alphabetic())
+                    && scheme.chars().all(|character| {
+                        character.is_ascii_alphanumeric() || "+-.".contains(character)
+                    })
+            })
+            .map_or(value, |(_, rest)| rest);
         after_scheme
+            .trim_start_matches(['/', '\\'])
             .split(['/', '?', '#', '\\'])
             .next()
             .is_some_and(|authority| authority.contains('@'))
@@ -6986,6 +6996,9 @@ mod tests {
             format!("http://@{secret}.example.com"),
             format!("http://:@{secret}.example.com"),
             format!("http://user:{secret}@proxy.example.com:99999"),
+            format!("http:///@{secret}.example.com"),
+            format!("http:///:@{secret}.example.com"),
+            format!("https:\\\\user:{secret}@proxy.example.com"),
         ];
         let not_origins = [
             format!("socks5://{secret}.example.com:1080"),
