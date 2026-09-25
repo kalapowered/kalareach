@@ -27,8 +27,11 @@ use kr_shell_integration::host::startup::HomeLayout;
 
 fn main() -> ExitCode {
     // Whether the caller asked for machine-readable output has to be known before the arguments
-    // parse, because a usage mistake is one of the things a script has to be able to read.
-    let json = std::env::args().any(|argument| argument == "--json");
+    // parse, because a usage mistake is one of the things a script has to be able to read. A
+    // literal `--` ends the options, so a `--json` after it is an argument and asks for nothing.
+    let json = std::env::args()
+        .take_while(|argument| argument != "--")
+        .any(|argument| argument == "--json");
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => return usage(&error, json),

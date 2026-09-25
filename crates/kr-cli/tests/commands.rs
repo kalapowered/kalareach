@@ -567,3 +567,25 @@ fn a_refusal_exits_with_a_status_other_than_zero() {
         "kr exits rather than being killed"
     );
 }
+
+/// KR-REQ-07.47: a `--json` after a literal `--` is an argument, and asks for no document even when
+/// the line does not parse; one before it does.
+#[test]
+fn a_json_option_after_the_terminator_asks_for_nothing() {
+    let tree = Tree::new();
+    let output = tree.kr(&["attach", "--", "--json", "extra"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        output.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        !output.stderr.is_empty(),
+        "the usage mistake is said for a person"
+    );
+    let output = tree.kr(&["--json", "attach", "--", "--json", "extra"]);
+    assert_eq!(output.status.code(), Some(2));
+    let document: Value = serde_json::from_slice(&output.stdout).expect("a document");
+    assert_eq!(document["exit_code"], 2, "{document}");
+}
