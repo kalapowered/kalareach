@@ -1,0 +1,210 @@
+{
+  "lock_version": 1,
+  "description": "The applications the conformance matrix runs in a real session, each pinned to one release by URL and SHA-256. scripts/run-conformance.sh is the only thing that fetches them, into a cache outside the repository; the matrix reads the index it writes and never reaches the network itself. A program whose project publishes source only is built from that release's source, with the flags recorded here, against the system's own curses library. A release this host cannot fetch or build is recorded as not installed, with the reason, and is never taken from the system's package manager.",
+  "applications": [
+    {
+      "id": "libevent",
+      "name": "libevent",
+      "version": "2.1.13-stable",
+      "role": "library",
+      "sources": [
+        {
+          "platform": "unix",
+          "url": "https://github.com/libevent/libevent/releases/download/release-2.1.13-stable/libevent-2.1.13-stable.tar.gz",
+          "sha256": "f7e9383b8c0baa81b687e5b5eecc01beefaf1b19b64151d95ed61647fe7a315c",
+          "strip_components": 1,
+          "build": {
+            "configure": ["--disable-shared", "--enable-static", "--disable-openssl", "--disable-samples", "--disable-libevent-regress", "--disable-debug-mode"]
+          }
+        }
+      ]
+    },
+    {
+      "id": "neovim",
+      "name": "Neovim",
+      "version": "0.12.5",
+      "role": "program",
+      "sources": [
+        {
+          "platform": "aarch64-apple-darwin",
+          "url": "https://github.com/neovim/neovim/releases/download/v0.12.5/nvim-macos-arm64.tar.gz",
+          "sha256": "65fb000099e47ca1b762584c484cc833f40e30851a0ec450d4174e16317c1f9b",
+          "strip_components": 1,
+          "executable": "bin/nvim"
+        },
+        {
+          "platform": "x86_64-apple-darwin",
+          "url": "https://github.com/neovim/neovim/releases/download/v0.12.5/nvim-macos-x86_64.tar.gz",
+          "sha256": "81f4518622cb059b450ee2e498c6a1082a222f6bd89589de5bbcf0c6a68aa3fd",
+          "strip_components": 1,
+          "executable": "bin/nvim"
+        },
+        {
+          "platform": "x86_64-unknown-linux-gnu",
+          "url": "https://github.com/neovim/neovim/releases/download/v0.12.5/nvim-linux-x86_64.tar.gz",
+          "sha256": "bce0f56eda1f1b1db6eee8f4133d7a38813ea07933837dd1777411ca384c6875",
+          "strip_components": 1,
+          "executable": "bin/nvim"
+        },
+        {
+          "platform": "aarch64-unknown-linux-gnu",
+          "url": "https://github.com/neovim/neovim/releases/download/v0.12.5/nvim-linux-arm64.tar.gz",
+          "sha256": "1aa5ca085249580ae0f91eb14f27ec0919773ff2d99a163d03f3d6c21ac29725",
+          "strip_components": 1,
+          "executable": "bin/nvim"
+        }
+      ],
+      "not_run": {
+        "windows": "a console application on Windows is driven through the pseudo-console, which the Windows test machine qualifies"
+      }
+    },
+    {
+      "id": "htop",
+      "name": "htop",
+      "version": "3.5.3",
+      "role": "program",
+      "sources": [
+        {
+          "platform": "unix",
+          "url": "https://github.com/htop-dev/htop/releases/download/3.5.3/htop-3.5.3.tar.xz",
+          "sha256": "a8b164386494cb85bb255a415a3f5f80afe7a0c4491da5d113b3a0f951087e65",
+          "strip_components": 1,
+          "executable": "bin/htop",
+          "build": {
+            "configure": ["--disable-hwloc", "--disable-sensors", "--disable-capabilities", "--disable-delayacct", "--disable-unwind"]
+          }
+        }
+      ],
+      "not_run": {
+        "windows": "htop runs on Unix only; the project publishes no Windows build"
+      }
+    },
+    {
+      "id": "lazygit",
+      "name": "lazygit",
+      "version": "0.65.1",
+      "role": "program",
+      "sources": [
+        {
+          "platform": "aarch64-apple-darwin",
+          "url": "https://github.com/jesseduffield/lazygit/releases/download/v0.65.1/lazygit_0.65.1_darwin_arm64.tar.gz",
+          "sha256": "65a367c6ea9a88efebaaf7998a6835eedb987e04916cef677264ff9b31b1b13e",
+          "strip_components": 0,
+          "executable": "lazygit"
+        },
+        {
+          "platform": "x86_64-apple-darwin",
+          "url": "https://github.com/jesseduffield/lazygit/releases/download/v0.65.1/lazygit_0.65.1_darwin_x86_64.tar.gz",
+          "sha256": "fde13daf583511aa24c42ca154911643231a5af784c7cdd8117264b2fc035b33",
+          "strip_components": 0,
+          "executable": "lazygit"
+        },
+        {
+          "platform": "x86_64-unknown-linux-gnu",
+          "url": "https://github.com/jesseduffield/lazygit/releases/download/v0.65.1/lazygit_0.65.1_linux_x86_64.tar.gz",
+          "sha256": "02beacbcda0fa342e50ae3480ba8147307353af3fb28e1d5f790e02329c201a6",
+          "strip_components": 0,
+          "executable": "lazygit"
+        },
+        {
+          "platform": "aarch64-unknown-linux-gnu",
+          "url": "https://github.com/jesseduffield/lazygit/releases/download/v0.65.1/lazygit_0.65.1_linux_arm64.tar.gz",
+          "sha256": "49abecdf6adf4f2dfdb11bf7b9bfada267ea523612ed809d1c6d87f6c04000a7",
+          "strip_components": 0,
+          "executable": "lazygit"
+        }
+      ],
+      "not_run": {
+        "windows": "a console application on Windows is driven through the pseudo-console, which the Windows test machine qualifies"
+      }
+    },
+    {
+      "id": "fzf",
+      "name": "fzf",
+      "version": "0.74.4",
+      "role": "program",
+      "sources": [
+        {
+          "platform": "aarch64-apple-darwin",
+          "url": "https://github.com/junegunn/fzf/releases/download/v0.74.4/fzf-0.74.4-darwin_arm64.tar.gz",
+          "sha256": "4f6a113bfc0c7959e0005c78d566a51afc4fcefc956f43735c62a9deb19e92ae",
+          "strip_components": 0,
+          "executable": "fzf"
+        },
+        {
+          "platform": "x86_64-apple-darwin",
+          "url": "https://github.com/junegunn/fzf/releases/download/v0.74.4/fzf-0.74.4-darwin_amd64.tar.gz",
+          "sha256": "2d392b50be66e2ab104ccd52a6072df692b1f9b9c5b449a9c098de885f32c4c5",
+          "strip_components": 0,
+          "executable": "fzf"
+        },
+        {
+          "platform": "x86_64-unknown-linux-gnu",
+          "url": "https://github.com/junegunn/fzf/releases/download/v0.74.4/fzf-0.74.4-linux_amd64.tar.gz",
+          "sha256": "05e6813a337cc722c3ed07e54a764b75cc5d671e2e60459db0ba696ee5fa7504",
+          "strip_components": 0,
+          "executable": "fzf"
+        },
+        {
+          "platform": "aarch64-unknown-linux-gnu",
+          "url": "https://github.com/junegunn/fzf/releases/download/v0.74.4/fzf-0.74.4-linux_arm64.tar.gz",
+          "sha256": "5d673b849f494f0d64ec471d8640b153ca8849e3846a31da17abdcfce8df6b46",
+          "strip_components": 0,
+          "executable": "fzf"
+        }
+      ],
+      "not_run": {
+        "windows": "a console application on Windows is driven through the pseudo-console, which the Windows test machine qualifies"
+      }
+    },
+    {
+      "id": "tmux",
+      "name": "tmux",
+      "version": "3.7c",
+      "role": "program",
+      "sources": [
+        {
+          "platform": "unix",
+          "url": "https://github.com/tmux/tmux/releases/download/3.7c/tmux-3.7c.tar.gz",
+          "sha256": "7c60cae9a0e25288e2e24750aafc9e8800fc7fd4555e447e1b29ee4201cfb3bf",
+          "strip_components": 1,
+          "executable": "bin/tmux",
+          "build": {
+            "configure": ["--disable-utf8proc", "--disable-jemalloc"],
+            "libraries": ["libevent"],
+            "environment": {
+              "LIBEVENT_CFLAGS": "-I{libevent}/include",
+              "LIBEVENT_LIBS": "{libevent}/lib/libevent_core.a"
+            }
+          }
+        }
+      ],
+      "not_run": {
+        "windows": "tmux runs on Unix only; the project publishes no Windows build"
+      }
+    },
+    {
+      "id": "screen",
+      "name": "GNU screen",
+      "version": "5.0.2",
+      "role": "program",
+      "sources": [
+        {
+          "platform": "unix",
+          "url": "https://ftp.gnu.org/gnu/screen/screen-5.0.2.tar.gz",
+          "sha256": "ca9a2c7e240919bc7ac12124593ae4529bb4eb5f7349d8857829b7e3f0b3b332",
+          "strip_components": 1,
+          "executable": "bin/screen",
+          "build": {
+            "configure": ["--disable-socket-dir", "--disable-utmp"],
+            "configure_macos": ["--enable-pam"],
+            "configure_linux": ["--disable-pam"]
+          }
+        }
+      ],
+      "not_run": {
+        "windows": "GNU screen runs on Unix only; the project publishes no Windows build"
+      }
+    }
+  ]
+}
