@@ -1082,6 +1082,12 @@ person: it names the remedy, `launchctl bootout <domain>/<label>` or the drop-in
 the setup takes the definition once it has been applied. kr ends no daemon, so it never runs
 `launchctl bootout` itself.
 
+Such a failure says what differs in kr's own words and the manager's fixed names for load states,
+start types and settings. It never repeats what the manager printed, a file the manager names, a
+drop-in's name or what the drop-in holds, or a path read back from kr's record. Instead it names
+the command that shows them: `launchctl print <domain>/<label>` for a job, and `systemctl --user
+cat kr-controller-<environment>.service` for a unit and its drop-ins.
+
 | Platform | The definition | Where it is loaded |
 | --- | --- | --- |
 | macOS | a launchd job, `~/Library/LaunchAgents/kr-controller-<environment>.plist` | your graphical domain when the environment's sessions are desktop-bound by default, your background domain when they are headless |
