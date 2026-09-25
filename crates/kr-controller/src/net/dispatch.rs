@@ -3915,14 +3915,18 @@ mod write_boundary {
 
         for peer_stops_reading in [false, true] {
             let temp = kr_ipc::testing::TempHost::create();
-            let controller = super::super::tests::daemon(&temp).await;
+            // On clocks the test moves by hand: the grant runs out only at the reading the
+            // decision below is given, however long the runner takes between two steps.
+            let (_continuous, wall, clocks) = super::super::tests::manual_clocks();
+            let controller = super::super::tests::daemon_on(&temp, clocks).await;
             let stream = HeldStream::new(peer_stops_reading);
             let output = output(&controller, &stream);
             let frame = batch();
             if peer_stops_reading {
                 stream.writer.add_permits(1);
             }
-            let lapses_at_ms = kr_ipc::now_ms().get() + 60 * 60 * 1000;
+            let now = wall.load(Ordering::SeqCst);
+            let lapses_at_ms = now + 60 * 60 * 1000;
             let grant_id = a_paired_device(
                 &controller,
                 kr_protocol::grant::GrantExpiry::At {
@@ -3934,7 +3938,7 @@ mod write_boundary {
             // it is asked here, before storage is held, so the decision below waits only on the
             // floor's write.
             grants
-                .grant(grant_id, kr_ipc::now_ms().get())
+                .grant(grant_id, now)
                 .expect("the grant stands before it runs out");
 
             // Another writer holds storage, so the write that decision owes waits with the lock
