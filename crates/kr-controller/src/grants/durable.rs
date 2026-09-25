@@ -13,15 +13,18 @@
 //! * **The time floor.** The highest UTC reading this host has decided expiry from. A clock wound
 //!   back past a deadline therefore does not revive a grant this host has already refused.
 //! * **The host's restrictions.** The bounded offline-validity policy, whether this host is
-//!   exclusively organisation-managed, and which organisations it is enrolled in with which pinned
-//!   revisions.
+//!   exclusively organisation-managed, and which organisations it is enrolled in with the
+//!   policy-signing links it verified.
+//! * **The lease records.** For each member device, the newest lease this host installed and the
+//!   run that installed it, so a lease is installed at most once whatever either clock says.
 //! * **The feed's checkpoints.** The revision this host has accepted, its retained revocation
 //!   records, and which enrolled hosts have acknowledged each one.
 //!
 //! What is **not** written down is a membership lease. A lease lasts at most fifteen minutes and is
 //! refreshed every five; restoring one across a restart would be restoring a deadline the
 //! organisation may have withdrawn, and the safe direction is for a restarted host to hold none
-//! until the service gives it one.
+//! until the member's device presents a newer one. Its record is written down instead, and the
+//! record is what refuses the old lease after a restart.
 //!
 //! ## The limit this does not remove
 //!
@@ -35,9 +38,12 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use kr_protocol::ids::{AuthorityRevision, DeviceId, OrganisationId, PolicyKeyRevision};
+use kr_protocol::account::PolicyAuthorityLink;
+use kr_protocol::ids::{
+    AccountId, AuthorityRevision, ControllerGeneration, DeviceId, OrganisationId, PolicyKeyRevision,
+};
 use kr_protocol::pairing::RevocationRequest;
-use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs};
+use kr_protocol::scalars::{AuthorisationKey, CanonicalSet, Digest256, Nullable, TimestampMs};
 use kr_protocol::sharing::OfflineValidityPolicy;
 
 /// One organisation enrolment, as it is written down.
@@ -45,10 +51,35 @@ use kr_protocol::sharing::OfflineValidityPolicy;
 pub struct StoredEnrolment {
     /// The organisation.
     pub organisation_id: OrganisationId,
-    /// The policy-signing key revision this host pinned.
-    pub pinned_key_revision: PolicyKeyRevision,
-    /// The organisation policy revision this host pinned.
-    pub pinned_policy_revision: AuthorityRevision,
+    /// The first revision's link: the organisation's identity.
+    pub root: PolicyAuthorityLink,
+    /// The policy-signing links this host verified and keeps, oldest first. The last is the anchor
+    /// rotation is followed from.
+    pub links: Vec<PolicyAuthorityLink>,
+    /// The highest head revision this host has accepted.
+    pub accepted_head: PolicyKeyRevision,
+    /// The host authority revision in force when this host enrolled. An organisation grant's
+    /// requirement names it.
+    pub enrolment_revision: AuthorityRevision,
+}
+
+/// The newest lease this host installed for one member's device, as it is written down.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredLeaseRecord {
+    /// The organisation.
+    pub organisation_id: OrganisationId,
+    /// The member account.
+    pub account_id: AccountId,
+    /// The authorisation key of the device the lease is for.
+    pub device_key: AuthorisationKey,
+    /// When the lease was issued.
+    pub issued_at_ms: TimestampMs,
+    /// When it expires.
+    pub expires_at_ms: TimestampMs,
+    /// The SHA-256 digest of its signing input.
+    pub digest: Digest256,
+    /// The controller generation that installed it.
+    pub installed_in: ControllerGeneration,
 }
 
 /// This host's policy, as it is written down.
@@ -64,6 +95,8 @@ pub struct StoredPolicy {
     pub offline: Nullable<OfflineValidityPolicy>,
     /// The organisations this host is enrolled in.
     pub enrolments: Vec<StoredEnrolment>,
+    /// The newest lease this host installed for each member device. A withdrawal keeps them.
+    pub lease_records: Vec<StoredLeaseRecord>,
 }
 
 /// One retained revocation record, as it is written down.

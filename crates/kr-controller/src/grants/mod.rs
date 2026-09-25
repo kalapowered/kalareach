@@ -13,8 +13,9 @@
 //!   call site. It reads the method registry's own required-rights column, so a method added to
 //!   section 23 is decided by the table rather than by a `match` somebody forgot to extend.
 //! * **The policy.** [`policy`] holds what is true of the host rather than of one grant: the
-//!   revision in force, the organisation leases this host holds, the pinned policy revisions, and
+//!   revision in force, the organisations this host is enrolled in and the leases it holds, and
 //!   the optional bounded offline-validity policy an owner may choose for personal remote access.
+//!   [`organisation`] is how an enrolment and a lease are verified before either is stored.
 //! * **The vocabulary.** [`vocabulary`] is the method-to-right mapping of section 23, read out of
 //!   [`kr_protocol::method::REGISTRY`] rather than restated here, so there is one table.
 //! * **The feed.** [`feed`] is this host's half of the remote authority feed: the ordered
@@ -35,6 +36,7 @@
 
 pub mod durable;
 pub mod feed;
+pub mod organisation;
 pub mod policy;
 pub mod store;
 pub mod vocabulary;
@@ -50,7 +52,8 @@ use kr_protocol::sharing::MembershipRefusal;
 
 pub use durable::{StoredFeed, StoredPolicy};
 pub use feed::{AuthorityFeed, FeedRefusal, RetainedRevocation};
-pub use policy::{HostPolicy, LeaseRefused, PolicyIntersection};
+pub use organisation::LeaseRefused;
+pub use policy::{HostPolicy, PolicyIntersection};
 pub use store::{
     ActionClaim, ActionRecord, ClaimHold, GrantDirectory, GrantRecord, GrantRevocation,
 };

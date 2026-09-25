@@ -28,16 +28,22 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use kr_protocol::account::{MEMBERSHIP_LEASE_MAX_LIFETIME_MS, MembershipLease};
+use kr_protocol::account::{MEMBERSHIP_LEASE_MAX_LIFETIME_MS, MembershipLease, PolicyAuthority};
 use kr_protocol::actor::ActorIngress;
 use kr_protocol::grant::{Grant, GrantExpiry};
-use kr_protocol::ids::{AccountId, AuthorityRevision, OrganisationId, PolicyKeyRevision};
+use kr_protocol::ids::{AccountId, AuthorityRevision, OrganisationId};
 use kr_protocol::rights::ActionRight;
-use kr_protocol::scalars::CanonicalSet;
+use kr_protocol::scalars::{AuthorisationKey, CanonicalSet};
 use kr_protocol::sharing::{MembershipRefusal, OfflineValidityPolicy};
+use kr_transport::clock::ContinuousInstant;
 
-use super::durable::{StoredEnrolment, StoredPolicy};
+use super::durable::StoredPolicy;
+use super::organisation::{
+    self, ChainOutcome, ChainRefused, Enrolment, LeaseHolder, LeaseInstalled, LeasePresentation,
+    LeaseRecord, LeaseRefused, LeaseTime, VerifiedEnrolment,
+};
 use super::{AccessRequest, Refusal};
+use crate::service::net::devices::ObservedUtc;
 
 /// What the intersection of one grant with this host's policy produced.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,35 +52,6 @@ pub struct PolicyIntersection {
     pub rights: CanonicalSet<ActionRight>,
     /// The organisation whose lease narrowed them, when one did.
     pub organisation_id: Option<OrganisationId>,
-}
-
-/// One organisation this host has opted into.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Enrolment {
-    /// The policy-signing key revision this host has pinned. A lease signed under another one is
-    /// refused, which is what pinning the policy-signing authority means.
-    pub pinned_key_revision: PolicyKeyRevision,
-    /// The organisation policy revision this host has pinned. A grant that names a different one
-    /// is answering to a policy this host has not accepted.
-    pub pinned_policy_revision: AuthorityRevision,
-    /// The leases this host currently holds, one per member account.
-    ///
-    /// Per account rather than per organisation, because section 17 disables a member
-    /// individually: one valid member's lease must not sustain a disabled member's access.
-    pub leases: BTreeMap<AccountId, MembershipLease>,
-}
-
-/// Why a lease this host was offered was not installed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LeaseRefused {
-    /// This host is not enrolled in that organisation.
-    NotEnrolled,
-    /// The lease was signed under a policy-signing key revision this host has not pinned.
-    WrongKeyRevision,
-    /// The lease lasts longer than the 15 minutes section 17 permits.
-    TooLong,
-    /// The lease grants more than its own role's ceiling.
-    AboveRoleCeiling,
 }
 
 /// The highest UTC reading this host has decided anything from, and whether that reading is on
@@ -252,6 +229,8 @@ pub struct HostPolicy {
     /// put the revision back. This only ever rises.
     accepted_floor: AuthorityRevision,
     enrolments: BTreeMap<OrganisationId, Enrolment>,
+    /// The newest lease this host installed for each member device, kept across a withdrawal.
+    lease_records: BTreeMap<LeaseHolder, LeaseRecord>,
     /// True when this host was enrolled as exclusively organisation-managed, so personal local
     /// owner access stops with the organisation's.
     ///
@@ -273,6 +252,7 @@ impl HostPolicy {
             authority_revision,
             accepted_floor: authority_revision,
             enrolments: BTreeMap::new(),
+            lease_records: BTreeMap::new(),
             exclusively_managed: false,
             offline: None,
             revalidated_at_ms: 0,
@@ -359,28 +339,57 @@ impl HostPolicy {
         true
     }
 
-    /// Enrols this host in an organisation and pins the authority it will answer to.
+    /// Verifies a whole published chain for enrolling this host in its organisation.
+    ///
+    /// Everything [`organisation::verify_enrolment`] checks, at this host's reading of UTC. The
+    /// clock must be trusted, which is what a reading's presence says, and the floor that reading
+    /// raises must not be owed its record, since a head's currency is a bound that can pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns the rule the chain or the clock breaks, or [`ChainRefused::AlreadyEnrolled`] when
+    /// this host is enrolled in that organisation already.
+    pub fn verify_enrolment(
+        &self,
+        authority: &PolicyAuthority,
+        reading: Option<&ObservedUtc>,
+    ) -> std::result::Result<VerifiedEnrolment, ChainRefused> {
+        if self.enrolments.contains_key(&authority.organisation_id) {
+            return Err(ChainRefused::AlreadyEnrolled);
+        }
+        let settled_ms = self.head_reading(authority, reading)?;
+        organisation::verify_enrolment(authority, settled_ms)
+    }
+
+    /// Enrols this host in a verified organisation, at the authority revision in force.
     ///
     /// Enrolling says nothing about whether this host is exclusively organisation-managed. That is
     /// [`Self::set_exclusively_managed`], because it is a decision about the *host* and a second
     /// enrolment must not be able to undo it.
-    pub fn enrol(
-        &mut self,
-        organisation_id: OrganisationId,
-        pinned_key_revision: PolicyKeyRevision,
-        pinned_policy_revision: AuthorityRevision,
-    ) {
-        self.enrolments
-            .entry(organisation_id)
-            .and_modify(|enrolment| {
-                enrolment.pinned_key_revision = pinned_key_revision;
-                enrolment.pinned_policy_revision = pinned_policy_revision;
-            })
-            .or_insert_with(|| Enrolment {
-                pinned_key_revision,
-                pinned_policy_revision,
-                leases: BTreeMap::new(),
-            });
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChainRefused::AlreadyEnrolled`] when this host is enrolled in that organisation
+    /// already: an enrolment is replaced only by withdrawing it first.
+    pub fn enrol(&mut self, verified: VerifiedEnrolment) -> std::result::Result<(), ChainRefused> {
+        let organisation_id = verified.organisation_id();
+        if self.enrolments.contains_key(&organisation_id) {
+            return Err(ChainRefused::AlreadyEnrolled);
+        }
+        self.enrolments.insert(
+            organisation_id,
+            Enrolment::new(verified, self.authority_revision),
+        );
+        Ok(())
+    }
+
+    /// Withdraws this host from an organisation.
+    ///
+    /// The enrolment goes, and every lease installed under it ends with it. The lease records stay,
+    /// so a lease installed before is never installed again after a new enrolment. Returns whether
+    /// this host was enrolled.
+    pub fn withdraw(&mut self, organisation_id: OrganisationId) -> bool {
+        self.enrolments.remove(&organisation_id).is_some()
     }
 
     /// The enrolment this host holds for an organisation.
@@ -389,47 +398,140 @@ impl HostPolicy {
         self.enrolments.get(&organisation_id)
     }
 
-    /// Installs a signed membership lease for one member account.
+    /// Follows a published chain forward for an organisation this host is enrolled in.
     ///
-    /// The signature is verified where the lease arrives from the policy service. What is checked
-    /// here is everything section 17 states about a lease's *contents*, because a host that stored
-    /// whatever it was handed would be enforcing the sender's arithmetic: the organisation it is
-    /// enrolled in, the key revision it pinned, the 15-minute maximum lifetime, and the role's own
-    /// ceiling.
+    /// A head this host already accepted does no signature work and reads no clock, and an older
+    /// one is stale; either leaves everything as it was. A newer one is accepted only through links
+    /// the anchor's key signed ([`Enrolment`]), and then every installed lease is judged again.
     ///
     /// # Errors
     ///
-    /// Returns which of those it failed.
-    pub fn install_lease(
+    /// Returns the rule a newer head's chain, or the clock, breaks. Nothing changes then.
+    pub fn accept_chain(
         &mut self,
-        lease: MembershipLease,
-    ) -> std::result::Result<(), LeaseRefused> {
-        let organisation_id = lease.payload.organisation_id;
-        let Some(enrolment) = self.enrolments.get_mut(&organisation_id) else {
-            return Err(LeaseRefused::NotEnrolled);
-        };
-        if lease.payload.key_revision != enrolment.pinned_key_revision {
-            return Err(LeaseRefused::WrongKeyRevision);
+        authority: &PolicyAuthority,
+        reading: Option<&ObservedUtc>,
+    ) -> std::result::Result<ChainOutcome, ChainRefused> {
+        let accepted = self
+            .enrolments
+            .get(&authority.organisation_id)
+            .ok_or(ChainRefused::NotEnrolled)?
+            .accepted_head();
+        if authority.head.payload.key_revision.get() <= accepted.get() {
+            return Ok(if authority.head.payload.key_revision == accepted {
+                ChainOutcome::Unchanged
+            } else {
+                ChainOutcome::Stale { held: accepted }
+            });
         }
-        if !lease.payload.lifetime_within_maximum() {
-            return Err(LeaseRefused::TooLong);
-        }
-        if !lease.payload.grants_within_role() {
-            return Err(LeaseRefused::AboveRoleCeiling);
-        }
-        enrolment
-            .leases
-            .insert(lease.payload.account_id.clone(), lease);
-        Ok(())
+        let settled_ms = self.head_reading(authority, reading)?;
+        self.enrolments
+            .get_mut(&authority.organisation_id)
+            .ok_or(ChainRefused::NotEnrolled)?
+            .accept(authority, settled_ms)
     }
 
-    /// Drops the lease this host holds for one member account.
+    /// This host's reading of UTC for a head: trusted, through the floor, with nothing owed.
+    fn head_reading(
+        &self,
+        authority: &PolicyAuthority,
+        reading: Option<&ObservedUtc>,
+    ) -> std::result::Result<u64, ChainRefused> {
+        let reading = reading.ok_or(ChainRefused::ClockUntrusted)?;
+        let bound = self.utc_floor.bound(
+            GrantExpiry::At {
+                expires_at_ms: authority.head.payload.expires_at_ms,
+            },
+            reading.now.get(),
+        );
+        if bound.owed {
+            return Err(ChainRefused::FloorUnrecorded);
+        }
+        Ok(bound.at_ms)
+    }
+
+    /// Decides a presented membership lease and installs it when it is new.
     ///
-    /// A disabled SCIM member loses new leases immediately, and this is how the host stops using
-    /// the one it already had for that member without touching anybody else's.
-    pub fn drop_lease(&mut self, organisation_id: OrganisationId, account_id: &AccountId) {
-        if let Some(enrolment) = self.enrolments.get_mut(&organisation_id) {
-            enrolment.leases.remove(account_id);
+    /// Everything [`organisation`] states about a lease is checked here, on the raw lease and the
+    /// key the presenting connection proved, so there is no path that installs a lease it did not
+    /// verify, and nothing else inserts into the installed set. The time is this host's reading of
+    /// UTC through its floor, and only while the clock is trusted.
+    ///
+    /// The caller runs this on a copy of the policy and writes the copy down before it publishes
+    /// it, so the lease's record is on disk before the lease is installed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first rule the lease breaks. Nothing is installed or recorded then.
+    pub fn install_lease(
+        &mut self,
+        presentation: LeasePresentation<'_>,
+    ) -> std::result::Result<LeaseInstalled, LeaseRefused> {
+        let payload = &presentation.lease.payload;
+        let time = match presentation.reading {
+            None => LeaseTime::Untrusted,
+            Some(reading) => {
+                let bound = self.utc_floor.bound(
+                    GrantExpiry::At {
+                        expires_at_ms: payload.expires_at_ms,
+                    },
+                    reading.now.get(),
+                );
+                if bound.owed {
+                    LeaseTime::Unrecorded
+                } else {
+                    LeaseTime::At {
+                        settled_ms: bound.at_ms,
+                        expired: bound.passed,
+                    }
+                }
+            }
+        };
+        let enrolment = self
+            .enrolments
+            .get_mut(&payload.organisation_id)
+            .ok_or(LeaseRefused::NotEnrolled)?;
+        organisation::install(enrolment, &mut self.lease_records, presentation, time)
+    }
+
+    /// The lease recorded as the newest this host installed for one member's device.
+    #[must_use]
+    pub fn lease_record(
+        &self,
+        organisation_id: OrganisationId,
+        account_id: &AccountId,
+        device_key: &AuthorisationKey,
+    ) -> Option<&LeaseRecord> {
+        self.lease_records
+            .get(&(organisation_id, account_id.clone(), *device_key))
+    }
+
+    /// The lease installed for one member's device, when it is in force at both readings: before
+    /// its continuous deadline at `now`, and inside its signed window at `utc_ms`, this host's
+    /// reading of UTC through its floor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MembershipRefusal::NoLease`] when this host holds no lease for that device in that
+    /// organisation, and [`MembershipRefusal::LeaseExpired`] when the one it holds has ended on
+    /// either clock.
+    pub fn lease_in_force(
+        &self,
+        organisation_id: OrganisationId,
+        account_id: &AccountId,
+        device_key: &AuthorisationKey,
+        now: ContinuousInstant,
+        utc_ms: u64,
+    ) -> std::result::Result<&MembershipLease, MembershipRefusal> {
+        let installed = self
+            .enrolments
+            .get(&organisation_id)
+            .and_then(|enrolment| enrolment.installed(account_id, device_key))
+            .ok_or(MembershipRefusal::NoLease)?;
+        if installed.in_force(now, utc_ms) {
+            Ok(installed.lease())
+        } else {
+            Err(MembershipRefusal::LeaseExpired)
         }
     }
 
@@ -454,23 +556,22 @@ impl HostPolicy {
     ///
     /// The leases are deliberately not in it. A lease lasts at most fifteen minutes and is
     /// refreshed every five; restoring one across a restart would be restoring a deadline the
-    /// organisation may have withdrawn in the meantime.
+    /// organisation may have withdrawn in the meantime. Their records are, and a record is kept
+    /// until the floor written beside it shows every lease it could stand for has expired.
     #[must_use]
     pub fn snapshot(&self) -> StoredPolicy {
+        let floor_ms = self.utc_floor.get();
         StoredPolicy {
             accepted_floor: self.accepted_floor,
-            utc_floor_ms: kr_protocol::scalars::TimestampMs::new(self.utc_floor.get()),
+            utc_floor_ms: kr_protocol::scalars::TimestampMs::new(floor_ms),
             exclusively_managed: self.exclusively_managed,
             offline: kr_protocol::scalars::Nullable(self.offline),
             enrolments: self
                 .enrolments
                 .iter()
-                .map(|(organisation_id, enrolment)| StoredEnrolment {
-                    organisation_id: *organisation_id,
-                    pinned_key_revision: enrolment.pinned_key_revision,
-                    pinned_policy_revision: enrolment.pinned_policy_revision,
-                })
+                .map(|(organisation_id, enrolment)| enrolment.stored(*organisation_id))
                 .collect(),
+            lease_records: organisation::stored_records(&self.lease_records, floor_ms),
         }
     }
 
@@ -489,17 +590,9 @@ impl HostPolicy {
             enrolments: stored
                 .enrolments
                 .iter()
-                .map(|enrolment| {
-                    (
-                        enrolment.organisation_id,
-                        Enrolment {
-                            pinned_key_revision: enrolment.pinned_key_revision,
-                            pinned_policy_revision: enrolment.pinned_policy_revision,
-                            leases: BTreeMap::new(),
-                        },
-                    )
-                })
+                .map(|enrolment| (enrolment.organisation_id, Enrolment::restore(enrolment)))
                 .collect(),
+            lease_records: organisation::restored_records(&stored.lease_records),
             exclusively_managed: stored.exclusively_managed,
             offline: stored.offline.0,
             revalidated_at_ms: 0,
@@ -561,9 +654,9 @@ impl HostPolicy {
                         refusal: MembershipRefusal::NoLease,
                     });
                 };
-                // The grant names the policy revision it answers to. A grant issued under a policy
-                // this host has since replaced is not this host's to honour.
-                if requirement.policy_revision != enrolment.pinned_policy_revision {
+                // The grant names the enrolment revision it answers to. A grant issued under an
+                // enrolment this host has since withdrawn is not this host's to honour.
+                if requirement.policy_revision != enrolment.enrolment_revision() {
                     return Err(Refusal::MembershipUnusable {
                         refusal: MembershipRefusal::WrongAuthority,
                     });
@@ -574,22 +667,21 @@ impl HostPolicy {
                 let Some(account_id) = request.recipient_account.as_ref() else {
                     return Err(Refusal::MembershipUnattributed);
                 };
-                let Some(lease) = enrolment.leases.get(account_id) else {
+                // The clock decides, and nothing else does. An open transport is not a lease.
+                let mut installed = enrolment.installed_for(account_id).peekable();
+                if installed.peek().is_none() {
                     return Err(Refusal::MembershipUnusable {
                         refusal: MembershipRefusal::NoLease,
                     });
-                };
-                if lease.payload.key_revision != enrolment.pinned_key_revision {
-                    return Err(Refusal::MembershipUnusable {
-                        refusal: MembershipRefusal::WrongAuthority,
-                    });
                 }
-                // The clock decides, and nothing else does. An open transport is not a lease.
-                if !lease.payload.is_valid_at(now_ms) {
+                let Some(lease) = installed
+                    .map(super::organisation::InstalledLease::lease)
+                    .find(|lease| lease.payload.is_valid_at(now_ms))
+                else {
                     return Err(Refusal::MembershipUnusable {
                         refusal: MembershipRefusal::LeaseExpired,
                     });
-                }
+                };
                 let rights = grant
                     .actions
                     .iter()
@@ -655,15 +747,12 @@ impl HostPolicy {
         }
         let mut seen = None;
         for enrolment in self.enrolments.values() {
-            let Some(lease) = enrolment.leases.get(account_id) else {
+            let mut installed = enrolment.installed_for(account_id).peekable();
+            if installed.peek().is_none() {
                 seen = Some(MembershipRefusal::NoLease);
                 continue;
-            };
-            if lease.payload.key_revision != enrolment.pinned_key_revision {
-                seen = Some(MembershipRefusal::WrongAuthority);
-                continue;
             }
-            if !lease.payload.is_valid_at(now_ms) {
+            if !installed.any(|installed| installed.lease().payload.is_valid_at(now_ms)) {
                 seen = Some(MembershipRefusal::LeaseExpired);
                 continue;
             }

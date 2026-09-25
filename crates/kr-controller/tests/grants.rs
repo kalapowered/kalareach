@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod net_support;
+mod organisation_support;
 
 use kr_controller::grants::{
     AccessRequest, AuthorityFeed, FeedRefusal, GrantDirectory, GrantRecord, HostPolicy, Refusal,
@@ -35,7 +36,7 @@ use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
 use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::verify::ControllerIdentity;
-use kr_protocol::account::{MembershipLease, MembershipLeasePayload, TeamRole};
+use kr_protocol::account::MembershipLease;
 use kr_protocol::actor::ActorIngress;
 use kr_protocol::authority::{CapabilityRequirement, EffectClass};
 use kr_protocol::grant::{
@@ -43,12 +44,18 @@ use kr_protocol::grant::{
 };
 use kr_protocol::ids::{
     AccountId, AuthorityRevision, BuildId, DeviceId, EnvironmentId, GrantId, OrganisationId,
-    PolicyKeyRevision, RevocationRequestId, SessionId,
+    RevocationRequestId, SessionId,
 };
 use kr_protocol::method::{Method, lookup};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{CanonicalSet, Nullable, Signature64, TimestampMs, Uuid};
 use kr_protocol::sharing::{MembershipRefusal, OfflineValidityPolicy};
+use kr_transport::clock::{ContinuousClock as _, ManualClock};
+
+use organisation_support::{Organisation, T, presented};
+
+const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+const VIEW: &[ActionRight] = &[ActionRight::SessionView];
 
 // ---------------------------------------------------------------------------------------------
 // Fixtures
@@ -597,44 +604,51 @@ fn request(method: Method, now_ms: u64) -> AccessRequest {
     }
 }
 
-fn lease(
-    organisation_id: OrganisationId,
-    key_revision: PolicyKeyRevision,
-    expires_at_ms: u64,
-    maximum: &[ActionRight],
-) -> MembershipLease {
-    lease_for(
-        account(),
-        organisation_id,
-        key_revision,
-        expires_at_ms,
-        maximum,
-    )
+/// An organisation whose second revision took over a day before `T`, enrolled in `policy` at `T`.
+fn enrolled_organisation(policy: &mut HostPolicy, byte: u8) -> Organisation {
+    let mut organisation = Organisation::new(byte, T - 2 * DAY_MS);
+    organisation.rotate(T - DAY_MS);
+    organisation.enrol(policy, T);
+    organisation
 }
 
-fn lease_for(
-    account_id: AccountId,
+/// A grant held by the recipient device that requires membership of `organisation_id` under the
+/// enrolment revision `policy_revision`.
+fn organisation_grant(
     organisation_id: OrganisationId,
-    key_revision: PolicyKeyRevision,
-    expires_at_ms: u64,
-    maximum: &[ActionRight],
-) -> MembershipLease {
-    MembershipLease {
-        payload: MembershipLeasePayload {
+    policy_revision: u64,
+    rights: &[ActionRight],
+) -> Grant {
+    Grant {
+        organisation: Nullable::some(OrganisationRequirement {
             organisation_id,
-            account_id,
-            device_key: kr_protocol::scalars::AuthorisationKey::from_bytes([0x4d; 32]),
-            role: TeamRole::Controller,
-            maximum_grants: maximum.iter().copied().collect(),
-            issued_at_ms: TimestampMs::new(0),
-            expires_at_ms: TimestampMs::new(expires_at_ms),
-            key_revision,
-        },
-        // The signature is checked where a lease arrives from the policy service. What these tests
-        // exercise is what the host does with a lease it has already accepted, and the rule they
-        // are about is the clock rather than the key.
-        signature: Signature64::from_bytes([0; 64]),
+            policy_revision: AuthorityRevision::new(policy_revision),
+        }),
+        ..grant(1, None, rights, GrantExpiry::Never)
     }
+}
+
+/// Installs a fifteen-minute lease, issued at `issued_ms` by revision 2, for `account` on a device
+/// of its own.
+fn install_lease_for(
+    policy: &mut HostPolicy,
+    organisation: &Organisation,
+    account: &AccountId,
+    issued_ms: u64,
+    rights: &[ActionRight],
+) -> MembershipLease {
+    let device = organisation_support::device();
+    let lease = organisation.lease(2, account, *device.public(), issued_ms, rights);
+    policy
+        .install_lease(presented(
+            &lease,
+            device.public(),
+            issued_ms.max(T),
+            ManualClock::new().now(),
+            1,
+        ))
+        .expect("the lease is inside every rule section 17 states");
+    lease
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -687,33 +701,30 @@ fn the_host_intersects_the_grant_with_policy_on_every_request() {
         .issue(&stored, || Ok(()))
         .expect("the grant is written");
 
-    let organisation_id = OrganisationId::new(Uuid::from_bytes([0x21; 16]));
-    let key_revision = PolicyKeyRevision::new(4);
+    let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
+    let organisation = enrolled_organisation(&mut policy, 0x21);
     let organisation_grant = Grant {
         organisation: Nullable::some(OrganisationRequirement {
-            organisation_id,
-            policy_revision: AuthorityRevision::new(4),
+            organisation_id: organisation.organisation_id,
+            policy_revision: AuthorityRevision::new(1),
         }),
         ..held.clone()
     };
-    let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
-    policy.enrol(organisation_id, key_revision, AuthorityRevision::new(4));
-    // The organisation's maximum for this role does not include terminal input.
-    policy
-        .install_lease(lease(
-            organisation_id,
-            key_revision,
-            10_000,
-            &[ActionRight::SessionView],
-        ))
-        .expect("the lease is inside every rule section 17 states");
+    // The organisation's maximum for this member does not include terminal input.
+    install_lease_for(
+        &mut policy,
+        &organisation,
+        &account(),
+        T,
+        &[ActionRight::SessionView],
+    );
 
     // The same grant, decided twice: once on its own, once against the organisation's maximum.
     let permitted = decide(
         &held,
         &stored,
         &mut HostPolicy::personal(AuthorityRevision::new(1)),
-        request(Method::InputWrite, 5_000),
+        request(Method::InputWrite, T + 5_000),
     )
     .expect("the personal grant carries terminal input");
     assert!(permitted.rights.contains(&ActionRight::TerminalInput));
@@ -722,7 +733,7 @@ fn the_host_intersects_the_grant_with_policy_on_every_request() {
         &organisation_grant,
         &record(organisation_grant.clone()),
         &mut policy,
-        request(Method::InputWrite, 5_000),
+        request(Method::InputWrite, T + 5_000),
     )
     .expect_err("the organisation's maximum does not reach terminal input");
     assert_eq!(
@@ -1368,39 +1379,29 @@ fn an_expired_grant_is_refused_rather_than_downgraded_to_view_only() {
 
 #[test]
 fn an_expired_membership_blocks_organisation_mediated_work_on_a_live_transport() {
-    let organisation_id = OrganisationId::new(Uuid::from_bytes([0x21; 16]));
-    let key_revision = PolicyKeyRevision::new(4);
-    let held = Grant {
-        organisation: Nullable::some(OrganisationRequirement {
-            organisation_id,
-            policy_revision: AuthorityRevision::new(4),
-        }),
-        ..grant(
-            1,
-            None,
-            &[ActionRight::SessionView, ActionRight::TerminalInput],
-            GrantExpiry::Never,
-        )
-    };
-    let stored = record(held.clone());
-
     let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
-    policy.enrol(organisation_id, key_revision, AuthorityRevision::new(4));
-    policy
-        .install_lease(lease(
-            organisation_id,
-            key_revision,
-            10_000,
-            &[ActionRight::SessionView, ActionRight::TerminalInput],
-        ))
-        .expect("the lease is inside every rule section 17 states");
+    let organisation = enrolled_organisation(&mut policy, 0x21);
+    let held = organisation_grant(
+        organisation.organisation_id,
+        1,
+        &[ActionRight::SessionView, ActionRight::TerminalInput],
+    );
+    let stored = record(held.clone());
+    install_lease_for(
+        &mut policy,
+        &organisation,
+        &account(),
+        T,
+        &[ActionRight::SessionView, ActionRight::TerminalInput],
+    );
 
     // Nothing about the transport changes between these two. Only the clock does.
+    let ends = T + organisation_support::LEASE_MS;
     decide(
         &held,
         &stored,
         &mut policy,
-        request(Method::SessionRead, 9_999),
+        request(Method::SessionRead, ends - 1),
     )
     .expect("inside the lease");
     assert_eq!(
@@ -1408,7 +1409,7 @@ fn an_expired_membership_blocks_organisation_mediated_work_on_a_live_transport()
             &held,
             &stored,
             &mut policy,
-            request(Method::SessionRead, 10_000)
+            request(Method::SessionRead, ends)
         ),
         Err(Refusal::MembershipUnusable {
             refusal: MembershipRefusal::LeaseExpired
@@ -1420,7 +1421,7 @@ fn an_expired_membership_blocks_organisation_mediated_work_on_a_live_transport()
             &held,
             &stored,
             &mut policy,
-            request(Method::InputWrite, 10_000)
+            request(Method::InputWrite, ends)
         ),
         Err(Refusal::MembershipUnusable {
             refusal: MembershipRefusal::LeaseExpired
@@ -1428,28 +1429,32 @@ fn an_expired_membership_blocks_organisation_mediated_work_on_a_live_transport()
         "reads and mutations alike"
     );
 
-    // A lease signed under a policy-signing revision this host has not pinned is refused whatever
-    // the clock says.
-    let mut mismatched = HostPolicy::personal(AuthorityRevision::new(1));
-    mismatched.enrol(organisation_id, key_revision, AuthorityRevision::new(4));
+    // A lease signed by a revision this host has not authenticated is refused whatever the clock
+    // says: revision 1 signed it while it was signing, but this host pinned revision 2.
+    let mut other = HostPolicy::personal(AuthorityRevision::new(1));
+    let second = enrolled_organisation(&mut other, 0x22);
+    let device = organisation_support::device();
+    let unauthenticated = second.lease(1, &account(), *device.public(), T - 2 * DAY_MS, VIEW);
     assert_eq!(
-        mismatched.install_lease(lease(
-            organisation_id,
-            PolicyKeyRevision::new(5),
-            10_000,
-            &[ActionRight::SessionView],
+        other.install_lease(presented(
+            &unauthenticated,
+            device.public(),
+            T,
+            ManualClock::new().now(),
+            1,
         )),
-        Err(kr_controller::grants::LeaseRefused::WrongKeyRevision),
-        "a lease signed under a key revision this host has not pinned is not installed at all"
+        Err(kr_controller::grants::LeaseRefused::UnauthenticatedRevision),
+        "a lease by a revision this host has not authenticated is not installed at all"
     );
     // Because it was never installed, the decision finds no lease at all. That is the stronger
     // outcome: a host does not hold a lease it could not have accepted.
+    let held = organisation_grant(second.organisation_id, 1, VIEW);
     assert_eq!(
         decide(
             &held,
-            &stored,
-            &mut mismatched,
-            request(Method::SessionRead, 1_000)
+            &record(held.clone()),
+            &mut other,
+            request(Method::SessionRead, T + 1_000)
         ),
         Err(Refusal::MembershipUnusable {
             refusal: MembershipRefusal::NoLease
@@ -1459,8 +1464,6 @@ fn an_expired_membership_blocks_organisation_mediated_work_on_a_live_transport()
 
 #[test]
 fn personal_access_survives_an_organisation_outage_unless_the_host_is_exclusively_managed() {
-    let organisation_id = OrganisationId::new(Uuid::from_bytes([0x21; 16]));
-    let key_revision = PolicyKeyRevision::new(4);
     let personal = grant(
         1,
         None,
@@ -1468,43 +1471,30 @@ fn personal_access_survives_an_organisation_outage_unless_the_host_is_exclusivel
         GrantExpiry::Never,
     );
     let stored = record(personal.clone());
+    let after_the_lease = T + organisation_support::LEASE_MS;
 
     let mut ordinary = HostPolicy::personal(AuthorityRevision::new(1));
-    ordinary.enrol(organisation_id, key_revision, AuthorityRevision::new(4));
-    ordinary
-        .install_lease(lease(
-            organisation_id,
-            key_revision,
-            10_000,
-            &[ActionRight::SessionView],
-        ))
-        .expect("the lease is installed");
+    let organisation = enrolled_organisation(&mut ordinary, 0x21);
+    install_lease_for(&mut ordinary, &organisation, &account(), T, VIEW);
     decide(
         &personal,
         &stored,
         &mut ordinary,
-        request(Method::SessionRead, 900_000),
+        request(Method::SessionRead, after_the_lease),
     )
     .expect("a personal grant is untouched by an organisation outage");
 
     let mut exclusive = HostPolicy::personal(AuthorityRevision::new(1));
-    exclusive.enrol(organisation_id, key_revision, AuthorityRevision::new(4));
+    let organisation = enrolled_organisation(&mut exclusive, 0x21);
     exclusive.set_exclusively_managed(true);
-    exclusive
-        .install_lease(lease(
-            organisation_id,
-            key_revision,
-            10_000,
-            &[ActionRight::SessionView],
-        ))
-        .expect("the lease is installed");
+    install_lease_for(&mut exclusive, &organisation, &account(), T, VIEW);
     assert!(exclusive.is_exclusively_managed());
     assert_eq!(
         decide(
             &personal,
             &stored,
             &mut exclusive,
-            request(Method::SessionRead, 900_000)
+            request(Method::SessionRead, after_the_lease)
         ),
         Err(Refusal::MembershipUnusable {
             refusal: MembershipRefusal::LeaseExpired
@@ -1860,20 +1850,17 @@ async fn a_paired_device_refused_while_the_floor_is_owed_is_told_storage_is_unav
 #[test]
 fn a_stored_policy_is_read_back_with_its_restrictions_and_its_floors() {
     let directory = GrantDirectory::in_memory().expect("a grant store");
-    let organisation_id = OrganisationId::new(Uuid::from_bytes([0x21; 16]));
 
     let mut policy = HostPolicy::personal(AuthorityRevision::new(3));
     policy.set_exclusively_managed(true);
-    policy.enrol(
-        organisation_id,
-        PolicyKeyRevision::new(4),
-        AuthorityRevision::new(4),
-    );
+    let organisation = enrolled_organisation(&mut policy, 0x21);
+    let organisation_id = organisation.organisation_id;
+    install_lease_for(&mut policy, &organisation, &account(), T, VIEW);
     policy.set_offline_validity(Some(OfflineValidityPolicy {
         maximum_offline_ms: kr_protocol::scalars::DurationMs::new(60_000),
         last_synchronised_at_ms: Nullable::some(TimestampMs::new(100_000)),
     }));
-    policy.observe_utc(500_000);
+    policy.observe_utc(T + 500_000);
     policy.advance_authority_revision(AuthorityRevision::new(9));
     directory
         .store_policy(&policy.snapshot())
@@ -1893,7 +1880,7 @@ fn a_stored_policy_is_read_back_with_its_restrictions_and_its_floors() {
     assert!(restored.offline_validity().is_some());
     assert!(restored.enrolment(organisation_id).is_some());
     assert_eq!(restored.accepted_floor(), AuthorityRevision::new(9));
-    assert_eq!(restored.utc_floor_ms(), 500_000);
+    assert_eq!(restored.utc_floor_ms(), T + 500_000);
     assert!(
         !restored.accept_policy(AuthorityRevision::new(5)),
         "and a restored old policy still cannot revive authority"
@@ -1905,44 +1892,34 @@ fn a_stored_policy_is_read_back_with_its_restrictions_and_its_floors() {
         restored
             .enrolment(organisation_id)
             .expect("enrolled")
-            .leases
-            .is_empty()
+            .installed_for(&account())
+            .next()
+            .is_none()
     );
 }
 
 /// One member's lease does not answer for another member.
 #[test]
 fn one_members_lease_does_not_sustain_another_members_access() {
-    let organisation_id = OrganisationId::new(Uuid::from_bytes([0x21; 16]));
-    let key_revision = PolicyKeyRevision::new(4);
-    let held = Grant {
-        organisation: Nullable::some(OrganisationRequirement {
-            organisation_id,
-            policy_revision: AuthorityRevision::new(4),
-        }),
-        ..grant(1, None, &[ActionRight::SessionView], GrantExpiry::Never)
-    };
-    let stored = record(held.clone());
-
     let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
-    policy.enrol(organisation_id, key_revision, AuthorityRevision::new(4));
+    let organisation = enrolled_organisation(&mut policy, 0x21);
+    let held = organisation_grant(organisation.organisation_id, 1, VIEW);
+    let stored = record(held.clone());
     // A lease for somebody else entirely.
-    policy
-        .install_lease(lease_for(
-            AccountId::new("8f14e45f-ea1e-4b9e-9f3a-0a3a9b0d2f61").expect("an account"),
-            organisation_id,
-            key_revision,
-            10_000,
-            &[ActionRight::SessionView],
-        ))
-        .expect("the lease is installed");
+    install_lease_for(
+        &mut policy,
+        &organisation,
+        &AccountId::new("8f14e45f-ea1e-4b9e-9f3a-0a3a9b0d2f61").expect("an account"),
+        T,
+        VIEW,
+    );
 
     assert_eq!(
         decide(
             &held,
             &stored,
             &mut policy,
-            request(Method::SessionRead, 1_000)
+            request(Method::SessionRead, T + 1_000)
         ),
         Err(Refusal::MembershipUnusable {
             refusal: MembershipRefusal::NoLease
@@ -1950,40 +1927,38 @@ fn one_members_lease_does_not_sustain_another_members_access() {
         "a valid member's lease does not answer for a disabled one"
     );
 
-    // With this recipient's own lease it decides, and dropping that one lease stops it again
-    // without touching anybody else's.
-    policy
-        .install_lease(lease(
-            organisation_id,
-            key_revision,
-            10_000,
-            &[ActionRight::SessionView],
-        ))
-        .expect("the lease is installed");
+    // With this recipient's own lease it decides. Once that lease has run out it stops again,
+    // while the other member's lease still has time on it.
+    install_lease_for(
+        &mut policy,
+        &organisation,
+        &account(),
+        T - 5 * 60 * 1000,
+        VIEW,
+    );
     decide(
         &held,
         &stored,
         &mut policy,
-        request(Method::SessionRead, 1_000),
+        request(Method::SessionRead, T + 1_000),
     )
     .expect("this member's own lease answers");
-    policy.drop_lease(organisation_id, &account());
     assert_eq!(
         decide(
             &held,
             &stored,
             &mut policy,
-            request(Method::SessionRead, 1_000)
+            request(Method::SessionRead, T + 12 * 60 * 1000)
         ),
         Err(Refusal::MembershipUnusable {
-            refusal: MembershipRefusal::NoLease
+            refusal: MembershipRefusal::LeaseExpired
         })
     );
 
     // And a host that cannot name the account refuses rather than picking a lease.
     let unattributed = AccessRequest {
         recipient_account: None,
-        ..request(Method::SessionRead, 1_000)
+        ..request(Method::SessionRead, T + 1_000)
     };
     assert_eq!(
         decide(&held, &stored, &mut policy, unattributed),
@@ -1991,39 +1966,33 @@ fn one_members_lease_does_not_sustain_another_members_access() {
     );
 }
 
-/// A grant answering to a policy revision this host has not pinned is refused.
+/// A grant answering to an enrolment revision this host did not record is refused.
 #[test]
 fn a_grant_naming_another_policy_revision_is_refused() {
-    let organisation_id = OrganisationId::new(Uuid::from_bytes([0x21; 16]));
-    let key_revision = PolicyKeyRevision::new(4);
-    let held = Grant {
-        organisation: Nullable::some(OrganisationRequirement {
-            organisation_id,
-            policy_revision: AuthorityRevision::new(3),
-        }),
-        ..grant(1, None, &[ActionRight::SessionView], GrantExpiry::Never)
-    };
     let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
-    policy.enrol(organisation_id, key_revision, AuthorityRevision::new(4));
-    policy
-        .install_lease(lease(
-            organisation_id,
-            key_revision,
-            10_000,
-            &[ActionRight::SessionView],
-        ))
-        .expect("the lease is installed");
+    let organisation = enrolled_organisation(&mut policy, 0x21);
+    let held = organisation_grant(organisation.organisation_id, 3, VIEW);
+    install_lease_for(&mut policy, &organisation, &account(), T, VIEW);
     assert_eq!(
         decide(
             &held,
             &record(held.clone()),
             &mut policy,
-            request(Method::SessionRead, 1_000)
+            request(Method::SessionRead, T + 1_000)
         ),
         Err(Refusal::MembershipUnusable {
             refusal: MembershipRefusal::WrongAuthority
         })
     );
+    // The control: the grant naming the revision this host enrolled at decides.
+    let current = organisation_grant(organisation.organisation_id, 1, VIEW);
+    decide(
+        &current,
+        &record(current.clone()),
+        &mut policy,
+        request(Method::SessionRead, T + 1_000),
+    )
+    .expect("the enrolment's own revision answers");
 }
 
 /// Enrolling in a second organisation does not undo the exclusive-management restriction.
@@ -2031,59 +2000,115 @@ fn a_grant_naming_another_policy_revision_is_refused() {
 fn a_second_enrolment_does_not_undo_exclusive_management() {
     let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
     policy.set_exclusively_managed(true);
-    policy.enrol(
-        OrganisationId::new(Uuid::from_bytes([0x21; 16])),
-        PolicyKeyRevision::new(4),
-        AuthorityRevision::new(4),
-    );
-    policy.enrol(
-        OrganisationId::new(Uuid::from_bytes([0x22; 16])),
-        PolicyKeyRevision::new(5),
-        AuthorityRevision::new(5),
-    );
+    enrolled_organisation(&mut policy, 0x21);
+    enrolled_organisation(&mut policy, 0x22);
     assert!(policy.is_exclusively_managed());
 }
 
-/// A lease outside section 17's own rules is not installed at all.
+/// A lease outside section 17's own rules is not installed at all: not for an organisation this
+/// host is not enrolled in, not longer than fifteen minutes, not above its role's ceiling.
 #[test]
 fn a_lease_outside_its_own_rules_is_refused_before_it_is_stored() {
     use kr_controller::grants::LeaseRefused;
 
-    let organisation_id = OrganisationId::new(Uuid::from_bytes([0x21; 16]));
-    let key_revision = PolicyKeyRevision::new(4);
     let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
-
+    let device = organisation_support::device();
+    let now = ManualClock::new().now();
+    let mut elsewhere = Organisation::new(0x22, T - DAY_MS);
+    elsewhere.rotate(T - 60_000);
+    let unenrolled = elsewhere.lease(2, &account(), *device.public(), T, VIEW);
     assert_eq!(
-        policy.install_lease(lease(
-            organisation_id,
-            key_revision,
-            10_000,
-            &[ActionRight::SessionView]
-        )),
+        policy.install_lease(presented(&unenrolled, device.public(), T, now, 1)),
         Err(LeaseRefused::NotEnrolled)
     );
 
-    policy.enrol(organisation_id, key_revision, AuthorityRevision::new(4));
-    // Longer than the fifteen minutes section 17 permits.
+    let organisation = enrolled_organisation(&mut policy, 0x21);
     assert_eq!(
-        policy.install_lease(lease(
-            organisation_id,
-            key_revision,
+        policy.install_lease(presented(&unenrolled, device.public(), T, now, 1)),
+        Err(LeaseRefused::NotEnrolled),
+        "another organisation's lease, while this host is enrolled in one"
+    );
+    // Longer than the fifteen minutes section 17 permits.
+    let long = organisation.sign(
+        2,
+        organisation.payload(
+            2,
+            &account(),
+            *device.public(),
+            T,
             HostPolicy::maximum_lease_lifetime_ms() + 1,
-            &[ActionRight::SessionView]
-        )),
+            VIEW,
+        ),
+    );
+    assert_eq!(
+        policy.install_lease(presented(&long, device.public(), T, now, 1)),
         Err(LeaseRefused::TooLong)
     );
     // More than the role's own ceiling.
+    let wide = organisation.lease(2, &account(), *device.public(), T, ActionRight::ALL);
     assert_eq!(
-        policy.install_lease(lease(
-            organisation_id,
-            key_revision,
-            10_000,
-            ActionRight::ALL
-        )),
+        policy.install_lease(presented(&wide, device.public(), T, now, 1)),
         Err(LeaseRefused::AboveRoleCeiling)
     );
+    assert!(
+        policy
+            .lease_record(organisation.organisation_id, &account(), device.public())
+            .is_none(),
+        "nothing refused is recorded"
+    );
+
+    // The control: the conforming lease installs.
+    let conforming = organisation.lease(2, &account(), *device.public(), T, VIEW);
+    policy
+        .install_lease(presented(&conforming, device.public(), T, now, 1))
+        .expect("the conforming lease installs");
+}
+
+/// KR-REQ-17.53: a host that pinned an organisation's policy-signing authority installs only a
+/// lease that authority signed. A lease that names an authenticated revision and is inside every
+/// other rule, but whose signature that revision's key did not make, is refused before it is
+/// stored; the same payload signed by that key installs.
+#[test]
+fn a_lease_the_pinned_policy_signing_authority_did_not_sign_is_refused() {
+    use kr_controller::grants::LeaseRefused;
+
+    let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
+    let organisation = enrolled_organisation(&mut policy, 0x21);
+    let device = organisation_support::device();
+    let now = ManualClock::new().now();
+    let signed = organisation.lease(2, &account(), *device.public(), T, VIEW);
+
+    let mut unsigned = signed.clone();
+    unsigned.signature = Signature64::from_bytes([0; 64]);
+    assert_eq!(
+        policy.install_lease(presented(&unsigned, device.public(), T, now, 1)),
+        Err(LeaseRefused::BadSignature),
+        "a lease the pinned policy-signing authority did not sign is refused"
+    );
+    let forged = MembershipLease {
+        signature: organisation_support::sign(
+            &organisation_support::device(),
+            kr_protocol::account::MEMBERSHIP_LEASE_DOMAIN,
+            signed.payload.signing_input(),
+        ),
+        ..signed.clone()
+    };
+    assert_eq!(
+        policy.install_lease(presented(&forged, device.public(), T, now, 1)),
+        Err(LeaseRefused::BadSignature),
+        "nor one another key signed over the same payload"
+    );
+    assert!(
+        policy
+            .lease_record(organisation.organisation_id, &account(), device.public())
+            .is_none(),
+        "nothing is recorded"
+    );
+
+    // The control: the same payload signed by the pinned revision's key installs.
+    policy
+        .install_lease(presented(&signed, device.public(), T, now, 1))
+        .expect("the pinned authority's own signature installs");
 }
 
 // ---------------------------------------------------------------------------------------------

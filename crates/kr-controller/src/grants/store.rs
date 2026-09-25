@@ -307,6 +307,7 @@ impl GrantDirectory {
             )
             .map_err(ControllerError::registry)?;
         migrate_receipts(&connection)?;
+        migrate_policy(&connection)?;
         Ok(Self {
             connection: std::sync::Mutex::new(connection),
             live: Arc::new(LiveClaims::default()),
@@ -1646,6 +1647,88 @@ fn migrate_receipts(connection: &Connection) -> Result<()> {
     transaction.commit().map_err(ControllerError::registry)
 }
 
+/// Upgrades the stored policy row, once, from the shape earlier builds wrote.
+///
+/// Earlier builds wrote each enrolment as two numbers, a pinned key revision and a pinned policy
+/// revision, and kept no lease records. Inside one immediate transaction, so two processes opening
+/// one store change it once: a row that decodes as this build's shape, or no row, is left as it
+/// is; a row in the earlier shape is written again in this build's shape with its floors, its
+/// exclusive management and its offline bound unchanged, with no enrolment and no lease record; a
+/// row that is neither refuses the open, as an undecodable row always has. An earlier enrolment
+/// pinned no key, so nothing verified it: it is not carried, and its organisation's grants stay
+/// refused until the owner enrols again.
+///
+/// Remove this upgrade, with [`EarlierPolicy`], once no supported upgrade starts from a build that
+/// wrote the earlier shape.
+fn migrate_policy(connection: &Connection) -> Result<()> {
+    let transaction =
+        rusqlite::Transaction::new_unchecked(connection, rusqlite::TransactionBehavior::Immediate)
+            .map_err(ControllerError::registry)?;
+    let held: Option<Vec<u8>> = transaction
+        .query_row(
+            "SELECT value FROM host_authority WHERE key = 'policy'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(ControllerError::registry)?;
+    let Some(bytes) = held else {
+        return transaction.commit().map_err(ControllerError::registry);
+    };
+    if kr_cbor::from_canonical_slice::<StoredPolicy>(&bytes, &kr_cbor::Limits::DEFAULT).is_ok() {
+        return transaction.commit().map_err(ControllerError::registry);
+    }
+    let earlier: EarlierPolicy =
+        kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+    for enrolment in &earlier.enrolments {
+        eprintln!(
+            "kr-controller: the enrolment in organisation {} (key revision {}, policy revision {}) \
+             pinned no key, so it is not carried over; enrol this host again",
+            enrolment.organisation_id,
+            enrolment.pinned_key_revision.get(),
+            enrolment.pinned_policy_revision.get(),
+        );
+    }
+    let upgraded = StoredPolicy {
+        accepted_floor: earlier.accepted_floor,
+        utc_floor_ms: earlier.utc_floor_ms,
+        exclusively_managed: earlier.exclusively_managed,
+        offline: earlier.offline,
+        enrolments: Vec::new(),
+        lease_records: Vec::new(),
+    };
+    let encoded = kr_cbor::to_canonical_vec(&upgraded)
+        .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+    transaction
+        .execute(
+            "UPDATE host_authority SET value = ?1 WHERE key = 'policy'",
+            params![encoded],
+        )
+        .map_err(ControllerError::registry)?;
+    transaction.commit().map_err(ControllerError::registry)
+}
+
+/// The stored policy as earlier builds wrote it. It lives inside the upgrade and nowhere else.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EarlierPolicy {
+    accepted_floor: kr_protocol::ids::AuthorityRevision,
+    utc_floor_ms: TimestampMs,
+    exclusively_managed: bool,
+    offline: Nullable<kr_protocol::sharing::OfflineValidityPolicy>,
+    enrolments: Vec<EarlierEnrolment>,
+}
+
+/// One enrolment as earlier builds wrote it: two numbers and no key.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EarlierEnrolment {
+    organisation_id: kr_protocol::ids::OrganisationId,
+    pinned_key_revision: kr_protocol::ids::PolicyKeyRevision,
+    pinned_policy_revision: kr_protocol::ids::AuthorityRevision,
+}
+
 /// The refusal of an effect whose time bound this host cannot decide now, because the clock floor
 /// it would stand on is owed its record ([`UtcFloor::bound`]). It passes once the floor is written.
 fn unrecorded() -> ControllerError {
@@ -1799,4 +1882,135 @@ fn uuid_of(bytes: &[u8]) -> Option<kr_protocol::scalars::Uuid> {
     <[u8; 16]>::try_from(bytes)
         .ok()
         .map(kr_protocol::scalars::Uuid::from_bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kr_protocol::ids::{AuthorityRevision, OrganisationId, PolicyKeyRevision};
+    use kr_protocol::scalars::{DurationMs, Uuid};
+    use kr_protocol::sharing::OfflineValidityPolicy;
+
+    /// A policy row in the shape earlier builds wrote, with one enrolment.
+    fn earlier_bytes() -> Vec<u8> {
+        kr_cbor::to_canonical_vec(&EarlierPolicy {
+            accepted_floor: AuthorityRevision::new(7),
+            utc_floor_ms: TimestampMs::new(4_102_444_800_000),
+            exclusively_managed: true,
+            offline: Nullable::some(OfflineValidityPolicy {
+                maximum_offline_ms: DurationMs::new(86_400_000),
+                last_synchronised_at_ms: Nullable::some(TimestampMs::new(1_767_225_600_000)),
+            }),
+            enrolments: vec![EarlierEnrolment {
+                organisation_id: OrganisationId::new(Uuid::from_bytes([0x21; 16])),
+                pinned_key_revision: PolicyKeyRevision::new(4),
+                pinned_policy_revision: AuthorityRevision::new(4),
+            }],
+        })
+        .expect("the earlier shape encodes")
+    }
+
+    fn raw_policy(path: &Path) -> Option<Vec<u8>> {
+        Connection::open(path)
+            .expect("the store opens")
+            .query_row(
+                "SELECT value FROM host_authority WHERE key = 'policy'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .expect("the row reads")
+    }
+
+    fn write_raw_policy(path: &Path, bytes: &[u8]) {
+        Connection::open(path)
+            .expect("the store opens")
+            .execute(
+                "INSERT OR REPLACE INTO host_authority (key, value) VALUES ('policy', ?1)",
+                params![bytes],
+            )
+            .expect("the row is written");
+    }
+
+    /// KR-REQ-24.15: a policy row an earlier build wrote is upgraded once, when the store opens,
+    /// and keeps its floors, its exclusive management and its offline bound; its enrolment, which
+    /// pinned no key, is not carried. A second open writes nothing.
+    #[test]
+    fn an_existing_policy_row_is_upgraded_once_and_keeps_its_floors() {
+        let directory = tempfile::TempDir::new().expect("a directory on the internal disk");
+        let path = directory.path().join("registry.db");
+        drop(GrantDirectory::open(&path).expect("the store is created"));
+        write_raw_policy(&path, &earlier_bytes());
+
+        let opened = GrantDirectory::open(&path).expect("the store opens and upgrades the row");
+        let upgraded = opened
+            .stored_policy()
+            .expect("the row reads")
+            .expect("a policy row");
+        assert_eq!(upgraded.accepted_floor, AuthorityRevision::new(7));
+        assert_eq!(upgraded.utc_floor_ms, TimestampMs::new(4_102_444_800_000));
+        assert!(upgraded.exclusively_managed);
+        assert_eq!(
+            upgraded.offline,
+            Nullable::some(OfflineValidityPolicy {
+                maximum_offline_ms: DurationMs::new(86_400_000),
+                last_synchronised_at_ms: Nullable::some(TimestampMs::new(1_767_225_600_000)),
+            })
+        );
+        assert!(
+            upgraded.enrolments.is_empty(),
+            "an unverified enrolment is not carried"
+        );
+        assert!(upgraded.lease_records.is_empty());
+        drop(opened);
+
+        let once = raw_policy(&path).expect("the upgraded row");
+        drop(GrantDirectory::open(&path).expect("the store opens again"));
+        assert_eq!(
+            raw_policy(&path).expect("the row"),
+            once,
+            "a second open writes nothing"
+        );
+    }
+
+    /// The controls: this build's reader alone refuses the earlier shape, so no reader of it
+    /// remains outside the upgrade; and a row this build wrote opens with nothing upgraded.
+    #[test]
+    fn only_the_upgrade_reads_the_earlier_policy_shape() {
+        assert!(
+            kr_cbor::from_canonical_slice::<StoredPolicy>(
+                &earlier_bytes(),
+                &kr_cbor::Limits::DEFAULT
+            )
+            .is_err(),
+            "this build's reader refuses the earlier shape"
+        );
+
+        let directory = tempfile::TempDir::new().expect("a directory on the internal disk");
+        let path = directory.path().join("registry.db");
+        let store = GrantDirectory::open(&path).expect("the store is created");
+        let current = StoredPolicy {
+            accepted_floor: AuthorityRevision::new(3),
+            utc_floor_ms: TimestampMs::new(5),
+            exclusively_managed: false,
+            offline: Nullable::null(),
+            enrolments: Vec::new(),
+            lease_records: Vec::new(),
+        };
+        store.store_policy(&current).expect("the row is written");
+        drop(store);
+        let written = raw_policy(&path).expect("the row");
+        drop(GrantDirectory::open(&path).expect("the store opens again"));
+        assert_eq!(
+            raw_policy(&path).expect("the row"),
+            written,
+            "nothing is upgraded"
+        );
+
+        write_raw_policy(&path, b"not a policy");
+        assert!(
+            GrantDirectory::open(&path).is_err(),
+            "a row that is neither shape refuses the open"
+        );
+    }
 }
