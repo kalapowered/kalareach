@@ -636,13 +636,15 @@ finds its record and confirms that instead.
 
 While it waits for the owner, the device asks `pair.status` every three seconds. A host answers an
 unpaired connection four times in any ten seconds and sixteen times in all, so the device counts its
-questions the way the host does and waits when the window is full. With one question left it opens
-a fresh connection and asks there, and it keeps the old connection until the fresh one answers: a
-host that commits the device meanwhile serves it nothing on a new unpaired connection, so the old
-one is then the only place to learn what the device became. That change is not a lost connection,
-and the device does not show it as one. A host that turns a question away as too soon keeps the
-connection. It counts the questions it refuses as well, so the device waits twice as long after
-each refusal in a row before it asks again.
+questions the way the host does and waits when the window is full. From four questions before the
+end, it opens a fresh connection before each question, asks there, and changes to it once it has
+answered. A host that commits the device serves it nothing on a new unpaired connection, so the old
+connection is then the only place to learn what the device became. The device keeps its last
+question there while fresh connections fail, and asks it only after three in a row have failed,
+which is what such a host shows. A change of connection is not a lost connection, and the device
+does not show it as one. A host that turns a question away as too soon keeps the connection. It
+counts the questions it refuses as well, so the device waits twice as long after each refusal in a
+row, however long that grows, up to the attempt's own deadline.
 
 `owner` is the owner device's half. It reads `owner.confirmation.pending` over the device's
 authorised session, checks each challenge against what it would authorise, and describes it in one
@@ -651,9 +653,9 @@ marked as one this device cannot check, and nothing is signed for it. The platfo
 trait the application implements; it is asked with that line and the challenge's remaining
 lifetime, and only a confirmation inside that lifetime is signed, on `owner_device_presence`, and
 completed. Only the host's own refusal makes a review "not confirmed". A host that says nothing for
-ten seconds, or a connection that ends after the answer went, may still have taken it: the device
-asks what the host lists, and the review is "confirmed" when the challenge is listed as answered and
-"unknown" otherwise.
+ten seconds, one that replies that it does not know what came of the answer, or a connection that
+ends after the answer went, may still have taken it: the device asks what the host lists, and the
+review is "confirmed" when the challenge is listed as answered and "unknown" otherwise.
 
 ## Managed services
 
