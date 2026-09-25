@@ -2910,8 +2910,16 @@ fn a_manager_holding_anything_but_the_definition_kr_wrote_is_not_asked_to_start_
             .definition()
             .with_file_name(format!("{}.service.d", host.label()));
         assert!(
-            message.contains(&drop_ins.join("override.conf").display().to_string()),
-            "the setup names the drop-in and leaves it to the person: {message}"
+            message.contains("one of them sets ExecStart")
+                && message.contains(&format!(
+                    "systemctl --user cat {}.service shows",
+                    host.label()
+                )),
+            "the setup says what the drop-in sets and where the person sees it: {message}"
+        );
+        assert!(
+            !message.contains("override.conf") && !message.contains("/bin/true"),
+            "and repeats neither its name nor what it holds: {message}"
         );
         std::fs::remove_dir_all(drop_ins).expect("the person removes the drop-in");
     }
@@ -2975,8 +2983,13 @@ fn no_drop_in_anywhere_changes_the_command_the_user_manager_runs() {
         assert_eq!(failure["code"], "HOST_NOT_CONFIGURED", "{place}: {failure}");
         let message = failure["message"].as_str().unwrap_or_default();
         assert!(
-            message.contains("/usr/bin/touch"),
-            "{place}: the failure names the command the manager would run: {message}"
+            message.contains("one of them sets ExecStart")
+                && message.contains("ExecStartEx with a command kr did not write"),
+            "{place}: the failure says the manager would run another command: {message}"
+        );
+        assert!(
+            !message.contains("/usr/bin/touch") && !message.contains("zz-command.conf"),
+            "{place}: and repeats neither that command nor the drop-in's name: {message}"
         );
         assert!(
             message.contains("kr host startup --set service"),
@@ -3081,8 +3094,12 @@ fn the_user_manager_kr_checks_is_the_one_it_asks() {
     assert_eq!(failure["code"], "HOST_NOT_CONFIGURED", "{failure}");
     let message = failure["message"].as_str().unwrap_or_default();
     assert!(
-        message.contains(&other_unit.display().to_string()),
-        "the failure names what the other manager holds: {message}"
+        message.contains("from a file other than the definition kr wrote"),
+        "the failure says the other manager holds another file: {message}"
+    );
+    assert!(
+        !message.contains(&other_unit.display().to_string()),
+        "and does not repeat the file the other manager names: {message}"
     );
     assert!(
         !mark.exists(),
@@ -3151,8 +3168,12 @@ fn a_drop_in_that_resplits_the_command_is_refused_though_it_prints_the_same() {
         );
         let message = failure["message"].as_str().unwrap_or_default();
         assert!(
-            message.contains(&drop_in.display().to_string()) && message.contains("ExecStart"),
-            "{contents:?}: the failure names the drop-in and the key it sets: {message}"
+            message.contains("one of them sets ExecStart"),
+            "{contents:?}: the failure says what the drop-in sets: {message}"
+        );
+        assert!(
+            !message.contains("20-resplit.conf"),
+            "{contents:?}: and does not repeat the drop-in's name: {message}"
         );
         assert_eq!(host.daemon(), None, "{contents:?}: nothing was started");
         assert!(!host.answers(), "{contents:?}: nothing answers");

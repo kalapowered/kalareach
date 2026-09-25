@@ -49,7 +49,7 @@ pub fn load(paths: &EnvironmentPaths) -> configuration::Loaded {
 pub fn validate(paths: &EnvironmentPaths, change: &Change) -> Result<()> {
     configuration::edit(&load(paths), change)
         .map(|_| ())
-        .map_err(|refused| CliError::Usage(refused.to_string()))
+        .map_err(|refused| refusal(&refused))
 }
 
 /// Applies one validated change to this environment's configuration document.
