@@ -6580,16 +6580,17 @@ impl Drop for Answering {
     }
 }
 
-/// Every file of a repository read from disk, except any root after the first, which is asked of
-/// a service over HTTP through the repository transport a host builds.
+/// Every file of a repository read from disk, except any root after the first, which is asked for
+/// under `base` through the repository transport a host builds: a service over HTTP, or another
+/// directory on disk.
 #[derive(Clone, Debug)]
-struct LaterRootsOverHttp {
-    service: String,
-    http: RepositoryTransport,
+struct LaterRootsElsewhere {
+    base: url::Url,
+    transport: RepositoryTransport,
 }
 
 #[tough::async_trait]
-impl tough::Transport for LaterRootsOverHttp {
+impl tough::Transport for LaterRootsElsewhere {
     async fn fetch(&self, url: url::Url) -> Result<tough::TransportStream, tough::TransportError> {
         let name = url
             .path_segments()
@@ -6601,10 +6602,8 @@ impl tough::Transport for LaterRootsOverHttp {
             .and_then(|version| version.parse::<u64>().ok())
             .is_some_and(|version| version > 1);
         if later_root {
-            let asked = format!("{}/{name}", self.service)
-                .parse()
-                .expect("an address");
-            return self.http.fetch(asked).await;
+            let asked = self.base.join(&name).expect("an address");
+            return self.transport.fetch(asked).await;
         }
         tough::FilesystemTransport.fetch(url).await
     }
@@ -6631,15 +6630,68 @@ async fn a_service_that_fails_to_answer_for_the_next_root_fails_the_synchronisat
         )
         .await;
         let service = Answering::start(status);
-        catalogue.set_transport(Arc::new(LaterRootsOverHttp {
-            service: service.origin.clone(),
-            http: RepositoryTransport::over(reqwest::Client::builder().no_proxy()),
+        catalogue.set_transport(Arc::new(LaterRootsElsewhere {
+            base: format!("{}/", service.origin).parse().expect("an address"),
+            transport: RepositoryTransport::over(reqwest::Client::builder().no_proxy()),
         }));
         let synchronised = catalogue.sync(&repository()).await;
         assert_eq!(
             synchronised.is_ok(),
             synchronises,
             "a next root answered {status}: {synchronised:?}"
+        );
+    }
+}
+
+/// A next signed root that is on disk but cannot be read fails the synchronisation, and one that is
+/// not there ends the search for it.
+///
+/// This is the same rule as a service's answer: the repository transport reports what opening a
+/// file came to through the stream it returns, so the update client cannot read a file it was
+/// refused as a file that does not exist.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_next_root_that_cannot_be_read_fails_the_synchronisation() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    for (unreadable, synchronises) in [(false, true), (true, false)] {
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+        let mut catalogue = enrolled(
+            home.path(),
+            &generation,
+            RepositoryBudgets::defaults(),
+            CapabilityCeiling::default_ceiling(),
+        )
+        .await;
+        let elsewhere = home.path().join("later-roots");
+        std::fs::create_dir(&elsewhere).expect("a directory for later roots");
+        let next = elsewhere.join("2.root.json");
+        if unreadable {
+            std::fs::write(&next, b"{}").expect("a root file");
+            std::fs::set_permissions(&next, std::fs::Permissions::from_mode(0o000))
+                .expect("a file nobody may read");
+            if std::fs::File::open(&next).is_ok() {
+                eprintln!(
+                    "this process reads a file whatever its mode says, so no root is refused"
+                );
+                return;
+            }
+        }
+        catalogue.set_transport(Arc::new(LaterRootsElsewhere {
+            base: url::Url::from_directory_path(&elsewhere).expect("a directory address"),
+            transport: RepositoryTransport::local_only("this test fetches nothing over a network"),
+        }));
+        let synchronised = catalogue.sync(&repository()).await;
+        if unreadable {
+            std::fs::set_permissions(&next, std::fs::Permissions::from_mode(0o600))
+                .expect("a file that can be removed");
+        }
+        assert_eq!(
+            synchronised.is_ok(),
+            synchronises,
+            "a next root that is {}: {synchronised:?}",
+            if unreadable { "refused" } else { "not there" }
         );
     }
 }

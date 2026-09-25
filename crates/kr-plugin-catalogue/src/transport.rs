@@ -10,11 +10,12 @@
 //! service) is made again a few times, a little later each time. A fetch whose answer stops part way
 //! fails, and the next synchronisation fetches it again from the start.
 //!
-//! Every outcome of a request arrives through the stream a fetch returns, the file's absence
+//! A fetch always answers with a stream, and every outcome arrives through it, the file's absence
 //! included, as it does from the update client's own HTTP transport. The update client reads an
 //! error from the fetch itself as a file that is not there, and it looks for the next signed root
-//! by asking for it: a service that failed to answer that request must fail the synchronisation,
-//! not end the search for a newer root as though there were none.
+//! by asking for it: a service that failed to answer that request, or a file this host may not
+//! read, must fail the synchronisation, not end the search for a newer root as though there were
+//! none. Only a stream that ends with the file's absence ends that search.
 
 use std::time::Duration;
 
@@ -72,29 +73,23 @@ impl RepositoryTransport {
 #[tough::async_trait]
 impl Transport for RepositoryTransport {
     async fn fetch(&self, url: Url) -> Result<TransportStream, TransportError> {
-        match url.scheme() {
+        let opened = match url.scheme() {
             "file" => tough::FilesystemTransport.fetch(url).await,
-            "http" | "https" => {
-                let client = self.client.clone();
-                Ok(Box::pin(
-                    futures::stream::once(async move {
-                        match client {
-                            Ok(client) => answer(&client, url).await,
-                            Err(reason) => Err(TransportError::new_with_cause(
-                                TransportErrorKind::Other,
-                                url,
-                                reason,
-                            )),
-                        }
-                    })
-                    .try_flatten(),
-                ))
-            }
+            "http" | "https" => match &self.client {
+                Ok(client) => answer(client, url).await,
+                Err(reason) => Err(TransportError::new_with_cause(
+                    TransportErrorKind::Other,
+                    url,
+                    reason.clone(),
+                )),
+            },
             _ => Err(TransportError::new(
                 TransportErrorKind::UnsupportedUrlScheme,
                 url,
             )),
-        }
+        };
+        // Whatever opening the address came to, the update client reads it from the stream.
+        Ok(opened.unwrap_or_else(|error| Box::pin(futures::stream::iter([Err(error)]))))
     }
 }
 
