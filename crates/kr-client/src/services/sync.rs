@@ -56,13 +56,17 @@
 //! key-record reads return that as [`KeyRecords::Absent`] and [`RecordAt::Absent`]. A collection
 //! only its home writes answers neither, so for it both stay errors.
 //!
-//! A write to either kind of collection can meet a third. `SIGNED_BEFORE_CUTOFF` refuses an
-//! attempt signed before the collection's cutoff, which a service keeps so that a request whose
-//! receipt it has swept is never run as a first admission: the attempt ran nothing and recorded
-//! nothing, and no attempt signed then ever runs. An exchange returns it as
+//! Every request but a membership listing can meet a third. `SIGNED_BEFORE_CUTOFF` refuses a
+//! request signed before the collection's cutoff, which a service keeps so that a request whose
+//! receipt it has swept is never run as a first admission: nothing ran and nothing was recorded,
+//! and no attempt signed then ever runs. An exchange returns it as
 //! [`SyncExchanged::SignedBeforeCutoff`], an answer that ends the attempt, and a caller never
 //! presents the identity again, signed now or otherwise. Every other request is signed at the
-//! instant it is sent, so for them it stays the error the service named.
+//! instant it is sent, or, for a key-record offer, at the instant its caller recorded, which is
+//! sent only while it is fresh. The service checks freshness first, so for them the refusal says
+//! that the collection's cutoff runs ahead of the clocks. They are told `CLOCK_UNTRUSTED`, with
+//! the action to wait and a message that nothing ran and nothing was recorded, and nothing sends
+//! or signs them again by itself.
 //!
 //! # What it keeps
 //!

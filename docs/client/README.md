@@ -338,6 +338,15 @@ in one `sync::SyncStore`.
   backwards between two attempts produces, it could still be on its way, so the request stays
   counted and the next reconciliation fences it at once, whatever the generation; the account
   stays whatever that fence says. Publishing again is new work under an identity of its own.
+  Every other request, a comparison and so a fetch, a resolution, a status query, a fence, a read
+  of key records and the offer of one, is signed when it is sent, or, for an offer, at an instant
+  its caller recorded and sends only while it is fresh. The service checks freshness first, so the
+  refusal of one of these says that the collection's cutoff runs ahead of the clocks, which
+  nothing on this device can correct. The caller is told `CLOCK_UNTRUSTED` with the action to
+  wait, and a message that nothing ran and nothing was recorded. Nothing sends or signs the
+  request again by itself, and asking again can succeed only once the cutoff falls behind the
+  clocks. Its status and its fence settle an offer refused this way, as they settle any offer
+  whose answer never came.
 
 `sync::StorageFeature` names the three parts of what section 18 offers: encrypted settings sync,
 which is this module; history backups; and recovery material, which is what a restore without
@@ -382,10 +391,19 @@ that went back or forked.
   beside it, and nothing is submitted.
 - A read of several pages, a comparison, an inventory or the key records, holds every page to one
   history, and a read that meets a restore between its pages is declined and asked again.
-- One case is left open. A fetch of an object the restored collection does not hold is reported as
-  unknown, as before, and records nothing about the history; the next publication's refusal names
-  the history and moves the note. Until something does, a draft publication can still be attempted
-  under its identity in the history this device last read.
+- A fetch that finds the collection holding no object is an answer too, and it names the history
+  that holds none (`services::SyncFetched::Absent`). The store reads it under its lock as it reads
+  a refusal that names no place. In a new history, to a call that left in the current one, the
+  collection was put back without the object: the new history becomes current and the note goes,
+  so the next publication compares against nothing, and a draft publication attempted in the
+  replaced history is never attempted again. In the current history nothing moves. Either way the
+  caller is told the object is not held (`UNKNOWN_SESSION`). From a history the collection was put
+  back from, or from a new one answering a call that left before this device moved on, nothing
+  moves and the caller is told `SyncError::UnfollowedHistory`. An answer that arrives after
+  privacy mode moved past its generation writes nothing, the history included. The recovery bundle
+  store refuses a locator that holds no bundle in another history than the one it read the bundle
+  in, as it refuses a bundle put back (`RecoveryError::BundlePutBackEmpty`), before anything is
+  compared.
 
 ### The key a collection is sealed under
 
