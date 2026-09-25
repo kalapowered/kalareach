@@ -1110,15 +1110,21 @@ impl Uploader {
         match self.held(generation).await {
             Ok(true) => self.published(attempt, now),
             Ok(false) if now.get() >= since.saturating_add(WAITS_FOR_AN_ANSWER_MS) => {
-                self.unanswered.remove(&sequence);
-                self.stop(
+                // The note that it may have left goes only once the stop is written down: a stop
+                // the store refused leaves the attempt dispatched, and the next pass has to ask
+                // again rather than send.
+                let stopped = self.stop(
                     attempt,
                     "its publication was sent without an answer and the service does not hold \
                      it, so what the service will hold of it is not something this host can \
                      establish, and it is not sent again"
                         .to_owned(),
                     now,
-                )
+                )?;
+                if matches!(stopped, Stepped::Stopped { .. }) {
+                    self.unanswered.remove(&sequence);
+                }
+                Ok(stopped)
             }
             Ok(false) => Ok(Stepped::Waiting {
                 reason: format!(

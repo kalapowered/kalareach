@@ -6804,6 +6804,47 @@ async fn a_publication_cancelled_on_its_way_is_asked_about_and_never_sent_again(
     assert_eq!(host.generation(1).remote, Remote::Unknown);
 }
 
+/// A publication given up on only once its stop is written down: a store that refuses the stop
+/// leaves the attempt dispatched, and the next pass asks the service again rather than sending.
+#[tokio::test]
+async fn a_publication_whose_stop_the_store_refused_is_asked_about_again_and_never_sent() {
+    let host = Host::open();
+    host.admit(1, &[64]);
+    host.web.fail(Kind::Publish, 1, Fault::Dropped);
+    let mut uploader = host.uploader(10_000);
+    let sent = uploader
+        .pass(TimestampMs::new(10_000))
+        .await
+        .expect("a pass");
+    assert_eq!(kinds(&sent.steps).last(), Some(&"waiting"));
+
+    host.service
+        .set_query_only(true)
+        .expect("the store stops taking writes");
+    let refused = uploader
+        .pass(TimestampMs::new(10_000 + ADMISSIBLE_MS))
+        .await;
+    assert!(
+        refused.is_err(),
+        "the stop could not be written: {refused:?}"
+    );
+    host.service
+        .set_query_only(false)
+        .expect("the store takes writes again");
+
+    let after = uploader
+        .pass(TimestampMs::new(10_000 + ADMISSIBLE_MS))
+        .await
+        .expect("a pass");
+    assert_eq!(kinds(&after.steps), ["stopped"]);
+    assert_eq!(
+        host.web.count(|asked| matches!(asked, Asked::Publish(_))),
+        0,
+        "the publication that never arrived was not sent again"
+    );
+    assert_eq!(host.generation(1).remote, Remote::Unknown);
+}
+
 /// An upload the service completed, whose answer never reached this host, is not abandoned when
 /// privacy mode asks, and the report makes no promise about it: what the service holds of the
 /// object is written down as unknown.
