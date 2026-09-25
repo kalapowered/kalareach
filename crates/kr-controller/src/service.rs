@@ -331,39 +331,232 @@ pub(crate) enum Reach {
 /// and no barrier captures it, because its restriction is not in force yet. Every debt on disk is
 /// published when a daemon starts.
 ///
+/// A published debt is **covered** while the change that published it is on its way to its own
+/// barrier ([`OwnBarrier`]), and **left** to the debt pass otherwise: a start published it, its
+/// change raised no barrier of its own, or that barrier could not take its first step. The pass
+/// captures only what is left to it, so it never takes a debt from the change about to capture it.
+///
 /// A barrier moves what it captures to **retiring** until its rows are deleted, so no later
 /// barrier of this run captures them again; rows it could not delete stay retiring, and the next
 /// start raises one more barrier for them.
 #[derive(Debug, Default)]
 struct Debts {
     pending: BTreeMap<crate::grants::store::DebtId, Reach>,
-    published: BTreeMap<crate::grants::store::DebtId, Reach>,
+    published: BTreeMap<crate::grants::store::DebtId, Published>,
     retiring: std::collections::BTreeSet<crate::grants::store::DebtId>,
+}
+
+/// One published debt ([`Debts`]).
+#[derive(Clone, Copy, Debug)]
+struct Published {
+    /// How far the barrier that retires it fences connections.
+    reach: Reach,
+    /// Whether the change that published it is still on its way to its own barrier.
+    covered: bool,
+}
+
+/// A change's own barrier, on its way to the debts the change has just published.
+///
+/// A change publishes its debts the moment its restriction has been tried, and raises its own
+/// barrier at once ([`Controller::barrier`]). Until that barrier's first step the debts are
+/// covered, and the debt pass leaves them alone, so it never races the change to them. A change
+/// that never takes that step, because it returned early or its caller stopped waiting, drops this
+/// instead: whatever of its debts is still published is left to the pass, which is woken for it.
+#[must_use = "a change's debts wait for the debt pass unless its own barrier is raised"]
+pub(crate) struct OwnBarrier {
+    debts: Vec<crate::grants::store::DebtId>,
+    held: Arc<std::sync::Mutex<Debts>>,
+    pass: Arc<tokio::sync::Notify>,
+}
+
+impl OwnBarrier {
+    /// Covers the debts `other` covers as well, for a change that published in two steps.
+    pub(crate) fn and(mut self, mut other: Self) -> Self {
+        self.debts.append(&mut other.debts);
+        self
+    }
+}
+
+impl Drop for OwnBarrier {
+    fn drop(&mut self) {
+        let mut held = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut left = false;
+        for debt in &self.debts {
+            if let Some(published) = held.published.get_mut(debt) {
+                published.covered = false;
+                left = true;
+            }
+        }
+        drop(held);
+        if left {
+            self.pass.notify_one();
+        }
+    }
+}
+
+impl std::fmt::Debug for OwnBarrier {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OwnBarrier")
+            .field("debts", &self.debts)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Which published debts a barrier's first step captures ([`Controller::withdraw`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Capture {
+    /// Every one: a change's own barrier, which retires whatever else is owed with its own.
+    Every,
+    /// Only those left to the debt pass ([`Debts`]).
+    Left,
 }
 
 /// How often the daemon raises a barrier for debts no barrier has retired, and how soon after a
 /// barrier that could not be raised it tries again.
 pub const DEBT_PASS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How often a task that holds its daemon only while something else holds it too looks at whether
+/// it has become the daemon's last holder ([`while_held`]).
+const LAST_HOLDER_LOOK: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// When the debt pass looks again.
 #[derive(Debug)]
 enum PassSchedule {
-    /// Every interval.
-    Every(std::time::Duration),
+    /// At every tick of an interval, whatever the pass did between two of them.
+    Every(tokio::time::Interval),
     /// Whenever this host's own tests say, and never otherwise.
     #[cfg(test)]
     ByHand(tokio::sync::mpsc::UnboundedReceiver<()>),
 }
 
 impl PassSchedule {
+    /// Every `period`, from now.
+    fn every(period: std::time::Duration) -> Self {
+        let mut interval = tokio::time::interval(period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        Self::Every(interval)
+    }
+
     /// Waits for the next pass.
     async fn next(&mut self) {
         match self {
-            Self::Every(interval) => tokio::time::sleep(*interval).await,
+            Self::Every(interval) => {
+                interval.tick().await;
+            }
             #[cfg(test)]
             Self::ByHand(passes) => {
                 if passes.recv().await.is_none() {
                     std::future::pending::<()>().await;
+                }
+            }
+        }
+    }
+}
+
+/// The debt pass: it raises a barrier for every debt left to it ([`Debts`]) at each of `passes`,
+/// and at once whenever `woken` is notified, which a change that leaves it a debt does
+/// ([`OwnBarrier`]).
+///
+/// A pass captures at once, whatever an earlier barrier of the pass is still waiting for: each
+/// barrier's workers are told on a task of its own, one barrier's after another's, and the debts a
+/// pass captures while one is being told are told next. So while storage takes a barrier, a debt
+/// left to the pass stays published for no longer than one pass, and every admission and forward
+/// is refused meanwhile ([`Controller::check_fence`]).
+///
+/// The pass holds the daemon weakly, and strongly only through [`while_held`], so a daemon whose
+/// owner lets it go lets its environment go too, without waiting for a barrier the pass raised to
+/// reach its workers. Such a barrier is left as a stop would leave it: its rows stay on disk, and
+/// the next start raises one more barrier for them.
+async fn debt_pass(
+    daemon: std::sync::Weak<Controller>,
+    woken: Arc<tokio::sync::Notify>,
+    mut passes: PassSchedule,
+) {
+    // What the pass has captured and not yet told the workers about, and the telling under way.
+    let mut untold: Vec<crate::grants::store::DebtId> = Vec::new();
+    let mut telling: Option<tokio::task::JoinHandle<()>> = None;
+    loop {
+        let told = tokio::select! {
+            () = until_told(&mut telling) => true,
+            () = passes.next() => false,
+            () = woken.notified() => false,
+        };
+        if told {
+            telling = None;
+        } else {
+            match while_held(&daemon, async |controller: &Controller| {
+                controller.withdraw(Capture::Left).await
+            })
+            .await
+            {
+                // The daemon has gone, or goes now that this pass has let it go.
+                None => return,
+                Some(Ok(captured)) => untold.extend(captured.into_iter().flatten()),
+                Some(Err(error)) => eprintln!(
+                    "kr-controller: a barrier this host owes could not be raised yet, so nothing \
+                     is admitted or forwarded until it is: {error}"
+                ),
+            }
+        }
+        if telling.is_none() && !untold.is_empty() {
+            let captured = std::mem::take(&mut untold);
+            let daemon = daemon.clone();
+            telling = Some(tokio::spawn(async move {
+                let told = while_held(&daemon, async |controller: &Controller| {
+                    #[cfg(test)]
+                    controller.before_the_pass_tells.wait().await;
+                    controller.tell(&captured).await
+                })
+                .await;
+                if let Some(Err(error)) = told {
+                    eprintln!(
+                        "kr-controller: the workers could not all be told of a barrier this host \
+                         raised, so the next start raises one more for its debts: {error}"
+                    );
+                }
+            }));
+        }
+        if daemon.strong_count() == 0 {
+            return;
+        }
+    }
+}
+
+/// Waits for the telling under way to end, and for ever while there is none.
+async fn until_told(telling: &mut Option<tokio::task::JoinHandle<()>>) {
+    match telling {
+        // One that failed has ended all the same.
+        Some(handle) => drop(handle.await),
+        None => std::future::pending().await,
+    }
+}
+
+/// Runs `work` on the daemon `daemon` names while something besides this task holds the daemon
+/// too, and answers `None` once it has gone or this task has let it go.
+///
+/// The daemon's own tasks hold it weakly, so none of them is what keeps a daemon, and its
+/// environment lock, alive once its owner has let it go. A task that has to hold it across a wait
+/// it cannot bound itself, as a barrier waits for its workers, holds it through this: every
+/// [`LAST_HOLDER_LOOK`] it looks at whether it has become the daemon's last holder, and once it
+/// has, it abandons the work and lets the daemon go.
+async fn while_held<T>(
+    daemon: &std::sync::Weak<Controller>,
+    work: impl AsyncFnOnce(&Controller) -> T,
+) -> Option<T> {
+    let controller = daemon.upgrade()?;
+    let mut working = std::pin::pin!(work(&controller));
+    let mut looks = tokio::time::interval(LAST_HOLDER_LOOK);
+    looks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            done = &mut working => return Some(done),
+            _ = looks.tick() => {
+                if Arc::strong_count(&controller) == 1 {
+                    return None;
                 }
             }
         }
@@ -525,6 +718,8 @@ pub struct Controller {
     /// restriction whose barrier has not run stops every admission and forward rather than being
     /// reported and passed over ([`Self::check_fence`]).
     debts: Arc<std::sync::Mutex<Debts>>,
+    /// Wakes the debt pass for a debt left to it ([`OwnBarrier`]).
+    debt_pass: Arc<tokio::sync::Notify>,
     /// Where this host's own tests stop a lease presentation that has read the clock, before it
     /// waits for the policy's lock. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
@@ -787,7 +982,7 @@ impl Controller {
     }
 
     async fn start_with(setup: ControllerSetup, clocks: Clocks) -> Result<Arc<Self>> {
-        Self::start_passing(setup, clocks, PassSchedule::Every(DEBT_PASS_INTERVAL)).await
+        Self::start_passing(setup, clocks, PassSchedule::every(DEBT_PASS_INTERVAL)).await
     }
 
     /// The one start, with the schedule its debt pass keeps.
@@ -1073,6 +1268,7 @@ impl Controller {
             started,
             rights_ceiling: std::sync::Mutex::new(rights_ceiling),
             debts: Arc::new(std::sync::Mutex::new(Debts::default())),
+            debt_pass: Arc::new(tokio::sync::Notify::new()),
             #[cfg(feature = "testing")]
             before_presentation_lock: crate::attention::Pause::default(),
             #[cfg(test)]
@@ -1164,7 +1360,13 @@ impl Controller {
             let owed = controller.sharing.grants().fence_owed()?;
             let mut debts = controller.debts();
             for debt in owed {
-                debts.published.insert(debt, Reach::Host);
+                debts.published.insert(
+                    debt,
+                    Published {
+                        reach: Reach::Host,
+                        covered: false,
+                    },
+                );
             }
         }
         if let Err(error) = controller.raise_owed_barrier().await {
@@ -1886,10 +2088,10 @@ impl Controller {
     /// # Errors
     ///
     /// Returns an error when the registry cannot be written. The debt stays published then, every
-    /// admission and forward is refused, and the next pass raises the barrier.
+    /// admission and forward is refused, and the debt pass, woken for it, raises the barrier.
     pub async fn revoke_authority(&self) -> Result<RevocationBarrier> {
-        self.publish_debts(&[(crate::grants::store::DebtId::fresh(), Reach::Host)]);
-        self.barrier().await
+        let own = self.publish_debts(&[(crate::grants::store::DebtId::fresh(), Reach::Host)]);
+        self.barrier(own).await
     }
 
     /// Writes one restrictive change's fence debt before its restriction takes effect, and holds it
@@ -1912,40 +2114,45 @@ impl Controller {
         Ok(debt)
     }
 
-    /// Publishes the debts of changes that have just tried to take effect ([`Debts`]).
+    /// Publishes the debts of a change that has just tried to take effect ([`Debts`]), covered by
+    /// the barrier the change raises next, which it hands this answer to ([`Self::barrier`]).
     ///
     /// Called at once after the restriction, with nothing awaited in between, so a request that
     /// stops waiting after its restriction cannot leave a debt its change owes unpublished. From
     /// here a barrier owes them, and every admission and forward is refused until one retires them.
-    pub(crate) fn publish_debts(&self, debts: &[(crate::grants::store::DebtId, Reach)]) {
-        if debts.is_empty() {
-            return;
-        }
+    /// A change with nothing to publish passes no debts, and its barrier retires what others owe.
+    pub(crate) fn publish_debts(
+        &self,
+        debts: &[(crate::grants::store::DebtId, Reach)],
+    ) -> OwnBarrier {
         let mut held = self.debts();
         for (debt, reach) in debts {
             held.pending.remove(debt);
-            held.published.insert(*debt, *reach);
+            held.published.insert(
+                *debt,
+                Published {
+                    reach: *reach,
+                    covered: true,
+                },
+            );
+        }
+        drop(held);
+        OwnBarrier {
+            debts: debts.iter().map(|(debt, _)| *debt).collect(),
+            held: Arc::clone(&self.debts),
+            pass: Arc::clone(&self.debt_pass),
         }
     }
 
-    /// Publishes the debt of a change made where nothing can wait, and raises its barrier on a
-    /// task of its own.
+    /// Publishes the debt of a change made where nothing can wait, and leaves its barrier to the
+    /// debt pass, which this wakes.
     ///
     /// A voice revocation runs inside the voice coordinator's lock. A voice grant's withdrawal owes
     /// no fence, but its cascade can also withdraw a grant delegated from it that is not a voice
     /// grant, and that debt is published here the moment the store has committed, so every
     /// admission and forward is refused until the barrier retires it.
-    pub(crate) fn publish_and_fence(self: &Arc<Self>, debt: crate::grants::store::DebtId) {
-        self.publish_debts(&[(debt, Reach::Host)]);
-        let daemon = Arc::clone(self);
-        tokio::spawn(async move {
-            if let Err(error) = daemon.raise_owed_barrier().await {
-                eprintln!(
-                    "kr-controller: a barrier this host owes could not be raised yet, so nothing \
-                     is admitted or forwarded until it is: {error}"
-                );
-            }
-        });
+    pub(crate) fn publish_and_fence(&self, debt: crate::grants::store::DebtId) {
+        drop(self.publish_debts(&[(debt, Reach::Host)]));
     }
 
     fn debts(&self) -> std::sync::MutexGuard<'_, Debts> {
@@ -1954,15 +2161,13 @@ impl Controller {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Raises the one barrier every restrictive change on this host is retired by.
+    /// Raises the one barrier every restrictive change on this host is retired by, for a change
+    /// that has just published its debts under `own`.
     ///
-    /// Inside the registry critical section that advances the revision, the barrier captures every
-    /// published debt, and nothing else: memory is the one record of which debts a barrier may
-    /// take, so no row read from disk can be captured before its restriction, twice, or after an
-    /// earlier barrier captured it. A row on disk that no change of this run holds is published only
-    /// by a start, before anything is served. It advances the revision once for all of them and drops
-    /// them from memory; the connections admitted under what they withdrew are deregistered in the
-    /// same section. Their rows are deleted once the announcement has gone out. With nothing
+    /// Its first step ([`Self::withdraw`]) captures every published debt, the change's own and
+    /// whatever else is owed, and advances the revision once for all of them; `own` is let go
+    /// after it, so whatever of the change's debts that step could not capture is left to the debt
+    /// pass. Its second step ([`Self::tell`]) tells the workers and deletes the rows. With nothing
     /// captured it advances nothing and reports the barrier as it stands, which is how a debt that
     /// a concurrent barrier already retired is answered.
     ///
@@ -1974,23 +2179,41 @@ impl Controller {
     ///
     /// # Errors
     ///
-    /// Returns an error when the registry cannot be written or read. Every published debt stays
-    /// published then, so admission and forwarding stay refused until a later pass raises the
-    /// barrier.
-    pub(crate) async fn barrier(&self) -> Result<RevocationBarrier> {
-        match self.raise_barrier(true).await? {
-            Some(barrier) => Ok(barrier),
+    /// Returns an error when the registry cannot be written or read. A debt the first step could
+    /// not capture stays published then, so admission and forwarding stay refused until the debt
+    /// pass raises its barrier.
+    pub(crate) async fn barrier(&self, own: OwnBarrier) -> Result<RevocationBarrier> {
+        let withdrawn = self.withdraw(Capture::Every).await;
+        drop(own);
+        match withdrawn? {
+            Some(captured) => self.tell(&captured).await,
             None => self.announce_authority_revision().await,
         }
     }
 
-    /// The barrier itself. With nothing captured it advances nothing, and reports the barrier as
-    /// it stands only when `report_when_idle` asks it to: a pass that found nothing to retire
-    /// announces nothing, so it never speaks to a worker beside a barrier that is.
-    async fn raise_barrier(&self, report_when_idle: bool) -> Result<Option<RevocationBarrier>> {
+    /// A barrier's first step. Inside the registry critical section that advances the revision,
+    /// it captures the published debts `capture` names, and nothing else: memory is the one record
+    /// of which debts a barrier may take, so no row read from disk can be captured before its
+    /// restriction, twice, or after an earlier barrier captured it. A row on disk that no change
+    /// of this run holds is published only by a start, before anything is served. The revision
+    /// advances once for all of them and they move to retiring; the connections admitted under what
+    /// they withdrew are deregistered in the same section. Then the lease issuer and the host policy
+    /// follow the revision, and the network connections that lost their registration are closed.
+    ///
+    /// With nothing captured it advances nothing and answers `None`.
+    async fn withdraw(
+        &self,
+        capture: Capture,
+    ) -> Result<Option<Vec<crate::grants::store::DebtId>>> {
         let captured = {
             let mut registry = self.registry.lock().await;
-            let captured = self.debts().published.clone();
+            let captured: BTreeMap<crate::grants::store::DebtId, Reach> = self
+                .debts()
+                .published
+                .iter()
+                .filter(|(_, published)| capture == Capture::Every || !published.covered)
+                .map(|(debt, published)| (*debt, published.reach))
+                .collect();
             if captured.is_empty() {
                 None
             } else {
@@ -2032,16 +2255,8 @@ impl Controller {
             }
         };
         let Some((revision, captured, host_wide)) = captured else {
-            return if report_when_idle {
-                self.announce_authority_revision().await.map(Some)
-            } else {
-                Ok(None)
-            };
+            return Ok(None);
         };
-        #[cfg(test)]
-        if !report_when_idle {
-            self.before_the_pass_tells.wait().await;
-        }
         self.leases.revoke(revision);
         // The host policy decides a paired device's request against the revision in force, so it
         // follows this one. A grant issued from now on carries it, and a policy left at the
@@ -2055,6 +2270,14 @@ impl Controller {
             // waiting for its peer is stopped by its connection closing, not by the next check.
             self.fence_network_connections().await;
         }
+        Ok(Some(captured.into_keys().collect()))
+    }
+
+    /// A barrier's second step: every worker is told the revision in force, the policy and the
+    /// feed record it, and the rows of the debts the first step captured are deleted, last,
+    /// because that is the record that their barrier finished. A row this cannot delete stays on
+    /// disk, and the next start raises one more barrier for it.
+    async fn tell(&self, captured: &[crate::grants::store::DebtId]) -> Result<RevocationBarrier> {
         let barrier = self.announce_authority_revision().await?;
         self.update_policy(|policy| {
             policy.advance_authority_revision(barrier.authority_revision);
@@ -2066,13 +2289,10 @@ impl Controller {
             feed.note_revision(barrier.authority_revision);
             self.sharing.grants().store_feed(&feed.snapshot())?;
         }
-        // Last, because it is the record that these changes' barrier finished. A row this cannot
-        // delete stays on disk, and the next start raises one more barrier for it.
-        let retired: Vec<crate::grants::store::DebtId> = captured.keys().copied().collect();
-        match self.sharing.grants().fence_completed(&retired) {
+        match self.sharing.grants().fence_completed(captured) {
             Ok(()) => {
                 let mut debts = self.debts();
-                for debt in &retired {
+                for debt in captured {
                     debts.retiring.remove(debt);
                 }
             }
@@ -2081,63 +2301,31 @@ impl Controller {
                  the next start raises one more barrier for them: {error}"
             ),
         }
-        Ok(Some(barrier))
+        Ok(barrier)
     }
 
-    /// Raises a barrier when a published debt is still owed one: a barrier that could not be
-    /// raised, or the debts a start found on disk.
+    /// Raises a barrier for every debt left to the debt pass ([`Debts`]): the debts a start found
+    /// on disk, and those whose change raised no barrier of its own or whose barrier could not
+    /// take its first step.
     ///
     /// # Errors
     ///
-    /// Returns the barrier's error; the debts stay published.
+    /// Returns the barrier's error; a debt it could not capture stays published.
     pub(crate) async fn raise_owed_barrier(&self) -> Result<Option<RevocationBarrier>> {
-        if self.debts().published.is_empty() {
-            return Ok(None);
+        match self.withdraw(Capture::Left).await? {
+            Some(captured) => self.tell(&captured).await.map(Some),
+            None => Ok(None),
         }
-        self.raise_barrier(false).await
     }
 
-    /// Raises a barrier for every debt that stayed published across a whole
-    /// [`DEBT_PASS_INTERVAL`]: one whose own barrier failed, or one a start published.
-    ///
-    /// A change raises its own barrier the moment it publishes, and captures its debt within that
-    /// barrier's first step, so a debt still published an interval later has no barrier coming.
-    /// Waiting that long is what keeps the pass from racing a change to its own debt.
-    fn start_debt_pass(self: &Arc<Self>, mut passes: PassSchedule) {
-        // Weak, and taken only when a debt is owed, so the pass is never what keeps a daemon, and
-        // its environment lock, alive.
-        let daemon = Arc::downgrade(self);
-        let debts = Arc::clone(&self.debts);
-        tokio::spawn(async move {
-            let mut seen = std::collections::BTreeSet::new();
-            loop {
-                passes.next().await;
-                let published: std::collections::BTreeSet<crate::grants::store::DebtId> = debts
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .published
-                    .keys()
-                    .copied()
-                    .collect();
-                let stayed = published.intersection(&seen).next().is_some();
-                seen = published;
-                if daemon.strong_count() == 0 {
-                    return;
-                }
-                if !stayed {
-                    continue;
-                }
-                let Some(controller) = daemon.upgrade() else {
-                    return;
-                };
-                if let Err(error) = controller.raise_owed_barrier().await {
-                    eprintln!(
-                        "kr-controller: a barrier this host owes could not be raised yet, so \
-                         nothing is admitted or forwarded until it is: {error}"
-                    );
-                }
-            }
-        });
+    /// Starts the debt pass ([`debt_pass`]), which raises a barrier for every debt left to it at
+    /// each of `passes`, and at once whenever a change leaves it one.
+    fn start_debt_pass(self: &Arc<Self>, passes: PassSchedule) {
+        tokio::spawn(debt_pass(
+            Arc::downgrade(self),
+            Arc::clone(&self.debt_pass),
+            passes,
+        ));
     }
 
     /// The environment's grants and invitations.
@@ -2228,8 +2416,8 @@ impl Controller {
             }
             None => self.sharing.revoke(grant_id, now_ms, || Ok(()), claim)?,
         };
-        self.publish_debts(&Self::host_wide(revocation.debt));
-        self.complete_revocation(revocation.revoked.iter().copied().collect())
+        let own = self.publish_debts(&Self::host_wide(revocation.debt));
+        self.complete_revocation(revocation.revoked.iter().copied().collect(), own)
             .await
     }
 
@@ -2273,7 +2461,7 @@ impl Controller {
         // Every write this makes happens while the registry guard is held, and the guard goes
         // before the fence, which takes it again. The block is what drops it: nothing this holds
         // may be alive across the await below.
-        let (revocation, lapsed, owes) = {
+        let (revocation, lapsed, owes, own) = {
             let registry = match carried {
                 Some(carried) => {
                     let registry = self.registry.lock().await;
@@ -2289,7 +2477,7 @@ impl Controller {
                 claim,
             )?;
             // The transaction that revoked is the restriction, and it has committed.
-            self.publish_debts(&Self::host_wide(revocation.debt));
+            let own = self.publish_debts(&Self::host_wide(revocation.debt));
             // The device record is marked revoked before the revision advances, so nothing can be
             // authorised against it in between. The directory is a view on this daemon's own
             // registry database, which is the file the network half keeps its device records in.
@@ -2348,25 +2536,26 @@ impl Controller {
             };
             // The record's debt is published whether or not the record was marked: a barrier for
             // a restriction that did not land withdraws nothing more, and a debt left pending would
-            // never be retired.
-            self.publish_debts(&Self::host_wide(record_debt));
+            // never be retired. A record that could not be marked answers with its error, and what
+            // it published is left to the debt pass.
+            let own = own.and(self.publish_debts(&Self::host_wide(record_debt)));
             recorded?;
             if lapsed.is_none() {
                 self.unbind_device(device_id);
             }
             let owes = revocation.debt.is_some() || record_debt.is_some();
-            (revocation, lapsed, owes)
+            (revocation, lapsed, owes, own)
         };
         match lapsed {
             // Nothing was withdrawn and nothing is owed, so there is nothing to finish.
             Some(error) if !owes => Err(error),
             Some(error) => {
-                self.complete_revocation(revocation.revoked.iter().copied().collect())
+                self.complete_revocation(revocation.revoked.iter().copied().collect(), own)
                     .await?;
                 Err(error)
             }
             None => {
-                self.complete_revocation(revocation.revoked.iter().copied().collect())
+                self.complete_revocation(revocation.revoked.iter().copied().collect(), own)
                     .await
             }
         }
@@ -2400,9 +2589,9 @@ impl Controller {
                 .transfer_control(plan, confirmation, &PairingTime, revision, now_ms);
         self.settle_floor();
         let transfer = transfer?;
-        self.publish_debts(&Self::host_wide(transfer.revoked.debt));
+        let own = self.publish_debts(&Self::host_wide(transfer.revoked.debt));
         let completed = self
-            .complete_revocation(transfer.revoked.revoked.iter().copied().collect())
+            .complete_revocation(transfer.revoked.revoked.iter().copied().collect(), own)
             .await?;
         Ok((transfer, completed))
     }
@@ -2410,20 +2599,21 @@ impl Controller {
     /// Raises the one barrier after a revocation, and reports it.
     ///
     /// Shared by every revocation path so the order cannot drift between them. Each path publishes
-    /// its debts itself, once, the moment its restriction has been attempted; this captures them
-    /// with whatever else is owed. A revocation that found its work already done published none,
-    /// and its barrier captures whatever is still owed, which is how a retry of a revocation whose
-    /// barrier failed fences for it. Nothing newly withdrawn and nothing owed is answered with the
-    /// revision in force and the barrier as it stands.
+    /// its debts itself, once, the moment its restriction has been attempted, and hands `own` here;
+    /// this captures them with whatever else is owed. A revocation that found its work already done
+    /// published none, and its barrier captures whatever is still owed, which is how a retry of a
+    /// revocation whose barrier failed fences for it. Nothing newly withdrawn and nothing owed is
+    /// answered with the revision in force and the barrier as it stands.
     async fn complete_revocation(
         &self,
         revoked_grants: kr_protocol::scalars::CanonicalSet<kr_protocol::ids::GrantId>,
+        own: OwnBarrier,
     ) -> Result<kr_protocol::sharing::RevocationResult> {
         // Both come from the barrier: it reads the registry, which is where a revision is
         // allocated, and a second reading taken separately can be a different one. An answer that
         // named one revision and carried a barrier for another would be evidence of no single
         // moment.
-        let barrier = self.barrier().await?;
+        let barrier = self.barrier(own).await?;
         Ok(kr_protocol::sharing::RevocationResult {
             authority_revision: barrier.authority_revision,
             revoked_grants,
@@ -3384,14 +3574,18 @@ impl Controller {
     }
 
     /// Holds a published debt, or lets every one go, for this host's own tests of what refuses
-    /// while a barrier is owed.
+    /// while a barrier is owed. The debt is covered, so the debt pass leaves it to the test.
     #[cfg(test)]
     fn hold_fence(&self, held: bool) {
         let mut debts = self.debts();
         if held {
-            debts
-                .published
-                .insert(crate::grants::store::DebtId::fresh(), Reach::Host);
+            debts.published.insert(
+                crate::grants::store::DebtId::fresh(),
+                Published {
+                    reach: Reach::Host,
+                    covered: true,
+                },
+            );
         } else {
             debts.published.clear();
         }
@@ -6019,7 +6213,7 @@ impl Controller {
         };
         encode(
             &self
-                .complete_revocation(withdrawn.into_iter().collect())
+                .complete_revocation(withdrawn.into_iter().collect(), self.publish_debts(&[]))
                 .await?,
         )
     }
@@ -7277,7 +7471,7 @@ impl Controller {
         // what this environment accepted advances only once every effect landed.
         let mut ceiling_debt = None;
         let mut ceiling_failure = None;
-        let (rights, ceiling_moved) = {
+        let (rights, ceiling_moved, ceiling_barrier) = {
             let mut held = self
                 .rights_ceiling
                 .lock()
@@ -7308,9 +7502,9 @@ impl Controller {
                     }
                 }
             }
-            if let Some(debt) = ceiling_debt {
-                self.publish_debts(&[(debt, Reach::Host)]);
-            }
+            // Covered by the barrier below, which this acceptance raises once the ceiling has
+            // moved, whatever else it does first.
+            let own = ceiling_debt.map(|debt| self.publish_debts(&[(debt, Reach::Host)]));
             (
                 crate::config::EnforcedRights {
                     ceiling: held.clone(),
@@ -7319,6 +7513,7 @@ impl Controller {
                     from_document: decided.is_some() && ceiling_failure.is_none(),
                 },
                 moved,
+                own,
             )
         };
         // The fence answers for the ceiling in force as well as for the document last accepted.
@@ -7372,10 +7567,14 @@ impl Controller {
             // owed before the announcement travels and before any effect below runs. A fence owed
             // with no debt of this acceptance's own, for a document whose ceiling the one in force
             // already matched, is raised under a debt held in memory.
-            if owes_own && ceiling_debt.is_none() {
-                self.publish_debts(&[(crate::grants::store::DebtId::fresh(), Reach::Host)]);
-            }
-            match self.barrier().await {
+            let own = match ceiling_barrier {
+                Some(own) => own,
+                None if owes_own => {
+                    self.publish_debts(&[(crate::grants::store::DebtId::fresh(), Reach::Host)])
+                }
+                None => self.publish_debts(&[]),
+            };
+            match self.barrier(own).await {
                 Ok(raised) => {
                     barrier = Some(raised);
                 }
@@ -7383,7 +7582,7 @@ impl Controller {
                     // The debt stays published, so every admission and forward is refused before
                     // the report is read: work admitted under the ceiling this document withdrew is
                     // still dispatchable until the revision advances, and the revision is exactly
-                    // what did not advance. The next pass raises the barrier.
+                    // what did not advance. It is left to the debt pass, which is woken for it.
                     let fenced = Sentence::new()
                         .stated("dispatch could not be fenced: ")
                         .withheld(ContentClass::Message, &error.to_string());
@@ -14180,6 +14379,37 @@ mod a_floor_owed_its_record {
             .expect("the daemon starts")
     }
 
+    /// How long a test waits for the debt pass, or for a daemon to take the environment over.
+    pub(super) const WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Starts a daemon as [`daemon`] does, whose debt pass looks again only when the test sends
+    /// it a pass, or when a change leaves it a debt.
+    pub(super) async fn daemon_passing_by_hand(
+        temp: &kr_ipc::testing::TempHost,
+    ) -> (Arc<Controller>, tokio::sync::mpsc::UnboundedSender<()>) {
+        let (passes, schedule) = tokio::sync::mpsc::unbounded_channel();
+        let controller = Controller::start_passing(
+            setup(temp),
+            crate::service::Clocks::system(),
+            crate::service::PassSchedule::ByHand(schedule),
+        )
+        .await
+        .expect("the daemon starts");
+        (controller, passes)
+    }
+
+    /// Waits until `done` holds, and fails the test after [`WAIT`].
+    pub(super) async fn until(what: &str, mut done: impl AsyncFnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        while !done().await {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{what} did not happen within {WAIT:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
     /// What [`daemon`] starts a daemon with.
     pub(super) fn setup(temp: &kr_ipc::testing::TempHost) -> ControllerSetup {
         let environment = temp.environment();
@@ -14341,9 +14571,9 @@ mod one_fence_for_one_debt {
         let first = {
             let controller = Arc::clone(&controller);
             tokio::spawn(async move {
-                controller.publish_debts(&[(debt, super::Reach::Host)]);
+                let own = controller.publish_debts(&[(debt, super::Reach::Host)]);
                 controller
-                    .complete_revocation([withdrawn].into_iter().collect())
+                    .complete_revocation([withdrawn].into_iter().collect(), own)
                     .await
                     .map(|result| result.authority_revision)
             })
@@ -14352,7 +14582,7 @@ mod one_fence_for_one_debt {
             let controller = Arc::clone(&controller);
             tokio::spawn(async move {
                 controller
-                    .barrier()
+                    .barrier(controller.publish_debts(&[]))
                     .await
                     .map(|barrier| barrier.authority_revision)
             })
@@ -14446,7 +14676,10 @@ mod one_barrier_for_every_restriction {
         controller
             .check_fence()
             .expect("a pending debt refuses nothing");
-        controller.barrier().await.expect("a barrier");
+        controller
+            .barrier(controller.publish_debts(&[]))
+            .await
+            .expect("a barrier");
         assert_eq!(
             revision(&controller).await,
             before,
@@ -14454,8 +14687,8 @@ mod one_barrier_for_every_restriction {
         );
         assert_eq!(owed(&controller), vec![pending]);
 
-        controller.publish_debts(&[(pending, Reach::Host)]);
-        controller.barrier().await.expect("a barrier");
+        let own = controller.publish_debts(&[(pending, Reach::Host)]);
+        controller.barrier(own).await.expect("a barrier");
         assert_eq!(revision(&controller).await, before + 1);
         assert!(owed(&controller).is_empty(), "the row is retired");
         controller.check_fence().expect("and nothing refuses");
@@ -14464,11 +14697,11 @@ mod one_barrier_for_every_restriction {
         // revisions, and the first barrier left the second one's row owed.
         let first = controller.owe_debt("one", Reach::Host).expect("written");
         let second = controller.owe_debt("two", Reach::Host).expect("written");
-        controller.publish_debts(&[(first, Reach::Host)]);
-        controller.barrier().await.expect("a barrier");
+        let own = controller.publish_debts(&[(first, Reach::Host)]);
+        controller.barrier(own).await.expect("a barrier");
         assert_eq!(owed(&controller), vec![second]);
-        controller.publish_debts(&[(second, Reach::Host)]);
-        controller.barrier().await.expect("a barrier");
+        let own = controller.publish_debts(&[(second, Reach::Host)]);
+        controller.barrier(own).await.expect("a barrier");
         assert_eq!(revision(&controller).await, before + 3);
         assert!(owed(&controller).is_empty());
         drop(controller);
@@ -14487,7 +14720,10 @@ mod one_barrier_for_every_restriction {
             .grants()
             .owe_fence("a change this run does not hold", kr_ipc::now_ms().get())
             .expect("written");
-        controller.barrier().await.expect("a barrier");
+        controller
+            .barrier(controller.publish_debts(&[]))
+            .await
+            .expect("a barrier");
         assert_eq!(
             revision(&controller).await,
             before,
@@ -14507,11 +14743,12 @@ mod one_barrier_for_every_restriction {
     }
 
     /// A barrier that cannot advance the revision leaves its debt published: every admission and
-    /// forward is refused meanwhile, and the next pass raises it.
+    /// forward is refused meanwhile, and the debt pass raises it once a barrier can be raised.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_barrier_that_cannot_be_raised_keeps_its_debt_and_refuses_until_the_next_pass() {
         let temp = kr_ipc::testing::TempHost::create();
-        let controller = super::a_floor_owed_its_record::daemon(&temp).await;
+        let (controller, passes) =
+            super::a_floor_owed_its_record::daemon_passing_by_hand(&temp).await;
         let before = revision(&controller).await;
         let registry = beside(&temp);
         registry
@@ -14523,9 +14760,9 @@ mod one_barrier_for_every_restriction {
         let debt = controller
             .owe_debt("a narrowed ceiling", Reach::Host)
             .expect("written");
-        controller.publish_debts(&[(debt, Reach::Host)]);
+        let own = controller.publish_debts(&[(debt, Reach::Host)]);
         controller
-            .barrier()
+            .barrier(own)
             .await
             .expect_err("the revision cannot advance");
         controller
@@ -14537,14 +14774,12 @@ mod one_barrier_for_every_restriction {
         registry
             .execute_batch("DROP TRIGGER refuse_revision;")
             .expect("the fault is cleared");
-        controller
-            .raise_owed_barrier()
-            .await
-            .expect("the pass raises it")
-            .expect("a barrier was owed");
-        controller.check_fence().expect("nothing refuses");
+        passes.send(()).expect("the pass is running");
+        super::a_floor_owed_its_record::until("the pass raising the debt", async || {
+            controller.check_fence().is_ok() && owed(&controller).is_empty()
+        })
+        .await;
         assert_eq!(revision(&controller).await, before + 1);
-        assert!(owed(&controller).is_empty());
         drop(controller);
     }
 
@@ -14566,9 +14801,9 @@ mod one_barrier_for_every_restriction {
         let debt = controller
             .owe_debt("a revocation", Reach::Host)
             .expect("written");
-        controller.publish_debts(&[(debt, Reach::Host)]);
+        let own = controller.publish_debts(&[(debt, Reach::Host)]);
         controller
-            .barrier()
+            .barrier(own)
             .await
             .expect("the barrier completes, its rows undeleted");
         assert_eq!(revision(&controller).await, before + 1);
@@ -14601,8 +14836,8 @@ mod one_barrier_for_every_restriction {
         let normal = controller
             .owe_debt("another revocation", Reach::Host)
             .expect("written");
-        controller.publish_debts(&[(normal, Reach::Host)]);
-        controller.barrier().await.expect("a barrier");
+        let own = controller.publish_debts(&[(normal, Reach::Host)]);
+        controller.barrier(own).await.expect("a barrier");
         assert_eq!(revision(&controller).await, before + 3);
         let controller = restarted(controller, &temp).await;
         assert_eq!(revision(&controller).await, before + 3);
@@ -14638,9 +14873,9 @@ mod one_barrier_for_every_restriction {
                  BEGIN SELECT RAISE(ABORT, 'no room'); END;",
             )
             .expect("no debt can be written");
-        // Another change's debt, published and not yet captured.
+        // Another change's debt, published, its own barrier still to come.
         let other = crate::grants::store::DebtId::fresh();
-        controller.publish_debts(&[(other, Reach::Host)]);
+        let own = controller.publish_debts(&[(other, Reach::Host)]);
         let mut narrowed = ConfigurationDocument::empty();
         narrowed.revision = 3;
         narrowed.ceilings.grant_rights = kr_protocol::scalars::Nullable::some(vec![
@@ -14656,7 +14891,7 @@ mod one_barrier_for_every_restriction {
         let held = controller.registry.lock().await;
         let capture = tokio::spawn({
             let controller = Arc::clone(&controller);
-            async move { controller.raise_owed_barrier().await }
+            async move { controller.barrier(own).await }
         });
         tokio::task::yield_now().await;
         let acceptance = tokio::spawn({
@@ -14668,8 +14903,7 @@ mod one_barrier_for_every_restriction {
         let captured = capture
             .await
             .expect("the barrier runs")
-            .expect("it is raised")
-            .expect("it captured the other change's debt");
+            .expect("it is raised");
         let accepted = acceptance.await.expect("the acceptance runs");
 
         assert!(
@@ -14710,40 +14944,10 @@ mod the_debt_pass {
     use tokio::sync::oneshot;
     use tokio::time::Instant;
 
+    use super::a_floor_owed_its_record::{WAIT, daemon_passing_by_hand, until};
     use super::one_barrier_for_every_restriction::{beside, owed, revision};
-    use super::{Clocks, Controller, PassSchedule, Reach};
+    use super::{Controller, Reach};
     use crate::error::ControllerError;
-
-    /// How long a test waits for the pass, or for a daemon to take the environment over.
-    const WAIT: Duration = Duration::from_secs(30);
-
-    /// Starts a daemon whose pass looks again only when the test sends it a pass, or when it is
-    /// woken.
-    async fn daemon_passing_by_hand(
-        temp: &kr_ipc::testing::TempHost,
-    ) -> (Arc<Controller>, UnboundedSender<()>) {
-        let (passes, schedule) = tokio::sync::mpsc::unbounded_channel();
-        let controller = Controller::start_passing(
-            super::a_floor_owed_its_record::setup(temp),
-            Clocks::system(),
-            PassSchedule::ByHand(schedule),
-        )
-        .await
-        .expect("the daemon starts");
-        (controller, passes)
-    }
-
-    /// Waits until `done` holds, and fails the test after [`WAIT`].
-    async fn until(what: &str, mut done: impl AsyncFnMut() -> bool) {
-        let deadline = Instant::now() + WAIT;
-        while !done().await {
-            assert!(
-                Instant::now() < deadline,
-                "{what} did not happen within {WAIT:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    }
 
     /// A change that publishes its debt and stops waiting before its barrier's first step, as a
     /// request whose caller went away does. The registry is held meanwhile, so that barrier never

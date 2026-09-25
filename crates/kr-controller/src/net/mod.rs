@@ -618,11 +618,11 @@ impl NetworkHost {
         // revocation whose record did not change withdraws nothing more, and a failure is reported
         // with the fence standing rather than silently leaving it undone.
         let recorded = self.devices.revoke(device_id, kr_ipc::now_ms());
-        controller.publish_debts(&[(debt, crate::service::Reach::Device(device_id))]);
+        let own = controller.publish_debts(&[(debt, crate::service::Reach::Device(device_id))]);
         // The barrier withdraws this device's registrations and admits every other connection at
         // the revision it advances to: nobody else's authority was withdrawn, and a local terminal
         // losing its connection because a phone was revoked would be a fence on the wrong thing.
-        let barrier = controller.barrier().await;
+        let barrier = controller.barrier(own).await;
         recorded?;
         controller.unbind_device(device_id);
         barrier
