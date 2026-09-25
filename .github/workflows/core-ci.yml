@@ -1153,15 +1153,54 @@ jobs:
           volume="$RUNNER_TEMP/another-filesystem"
           log="$RUNNER_TEMP/another-filesystem.log"
           device=""
-          # The volume goes whatever the cases did. A volume that could not be deleted is said, and
-          # fails a step that would otherwise have passed; a step that failed keeps its own status.
+          # The volume goes whatever the cases did. Something can still hold it when they end: a
+          # disk image a case attached from a file on it is served by a diskimages-helper process
+          # for as long as the image stays attached, and a detach that did not take leaves it so.
+          # So the deletion is asked again, every two seconds for up to a minute, and each refusal
+          # says which process held the volume and what it is. An image that process still serves
+          # is detached here, with a warning that a case left it attached, because nothing else
+          # will detach it. A volume still held when the minute has passed is said, and fails a
+          # step that would otherwise have passed; a step that failed keeps its own status.
           take_it_away() {
             status=$?
-            if [ -n "$device" ] && ! sudo diskutil apfs deleteVolume "$device"; then
-              echo "the volume $device could not be deleted" >&2
-              if [ "$status" -eq 0 ]; then
-                status=1
-              fi
+            set +e
+            if [ -n "$device" ]; then
+              deadline=$((SECONDS + 60))
+              while :; do
+                refusal="$(sudo diskutil apfs deleteVolume "$device" 2>&1)"
+                deleted=$?
+                printf '%s\n' "$refusal"
+                if [ "$deleted" -eq 0 ]; then
+                  break
+                fi
+                holder="$(printf '%s\n' "$refusal" | sed -n -E 's/.*in use by process ([0-9]+).*/\1/p' | head -n 1)"
+                if [ -n "$holder" ]; then
+                  echo "process $holder holds the volume $device:"
+                  ps -o pid=,ppid=,etime=,command= -p "$holder" || echo "  and has ended since"
+                  # The image that process serves, if it still serves one: the whole device and
+                  # the file it was attached from, as hdiutil lists them.
+                  served="$(hdiutil info | awk -v pid="$holder" '
+                    /^=+$/ { path = ""; serves = 0; next }
+                    /^image-path/ { sub(/^image-path[ \t]*:[ \t]*/, ""); path = $0; next }
+                    /^process ID/ { serves = ($NF == pid); next }
+                    serves && /^\/dev\/disk/ { print $1 " " path; exit }
+                  ')"
+                  if [ -n "$served" ]; then
+                    image_device="${served%% *}"
+                    echo "::warning::process $holder still serves the disk image ${served#* } at $image_device, which a case attached and left attached; detaching it"
+                    sudo hdiutil detach -force "$image_device"
+                  fi
+                fi
+                if [ "$SECONDS" -ge "$deadline" ]; then
+                  echo "the volume $device could not be deleted within a minute" >&2
+                  if [ "$status" -eq 0 ]; then
+                    status=1
+                  fi
+                  break
+                fi
+                echo "asking again in two seconds"
+                sleep 2
+              done
             fi
             exit "$status"
           }
