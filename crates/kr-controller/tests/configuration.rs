@@ -1672,11 +1672,10 @@ async fn a_fence_no_worker_answered_survives_a_restart() {
     // The daemon ends without the worker ever answering. Nothing is written on the way out: the
     // debt was recorded by the write that advanced the revision, before the announcement travelled.
     drop(controller);
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert_eq!(
         fence_owed(&environment),
         Some(revision),
-        "and it is still recorded once the daemon that raised it is gone"
+        "and it is still recorded once the test has let go of the daemon that raised it"
     );
 
     let controller = start_controller(&environment, environment_id).await;
@@ -1949,7 +1948,6 @@ async fn a_document_written_and_never_applied_goes_through_acceptance() {
         .await
         .expect("and the same ceiling is in force once the worker is gone");
     drop(controller);
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let controller = start_controller(&environment, environment_id).await;
     assert_eq!(
@@ -1987,7 +1985,6 @@ async fn an_edit_that_keeps_the_revision_is_accepted_after_a_restart() {
     let document = kr_worker::config::document_path(&environment);
     let accepted = std::fs::read_to_string(&document).expect("the document this host wrote");
     drop(controller);
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // The same revision, a different meaning: the number a reader compares has not moved.
     let mut edited: serde_json::Value = serde_json::from_str(&accepted).expect("valid JSON");
@@ -2044,7 +2041,6 @@ async fn a_ceiling_removed_while_the_document_was_unreadable_is_still_fenced() {
     let accepted = std::fs::read_to_string(&document).expect("the document this host wrote");
     let fenced_once = authority_revision(&environment);
     drop(controller);
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // Damaged while this host was down: not JSON at all, so nothing can be decided from it.
     kr_ipc::paths::write_owner_only_file(&document, b"{ this is not a document").expect("damaged");
@@ -2061,7 +2057,6 @@ async fn a_ceiling_removed_while_the_document_was_unreadable_is_still_fenced() {
         "and it withdraws nothing, so it raises no fence of its own"
     );
     drop(controller);
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // Repaired, with the ceiling gone. This is the withdrawal, and it is owed a fence.
     let mut repaired: serde_json::Value = serde_json::from_str(&accepted).expect("valid JSON");
@@ -2448,36 +2443,56 @@ fn write_document_bytes(environment: &kr_ipc::paths::EnvironmentPaths, bytes: &[
     kr_ipc::paths::write_owner_only_file(&path, bytes).expect("the document");
 }
 
-/// Starts a daemon on an environment that may already hold one daemon's worth of state.
+/// How long a start is given to take over an environment a daemon before it held.
+///
+/// A daemon lets go of its environment once nothing of it is left, and its own tasks can still
+/// hold it for a moment after the test has let it go. A restart can therefore find the environment
+/// held. That is a liveness condition: what these tests assert is that the restart takes the
+/// environment over, not how soon the last reference goes.
+const ENVIRONMENT_HANDOVER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Starts a daemon on an environment that may already hold one daemon's worth of state, and starts
+/// it again while a daemon this test let go still holds the environment, until
+/// [`ENVIRONMENT_HANDOVER_DEADLINE`]. Any other failure fails the test.
 async fn start_controller(
     environment: &kr_ipc::paths::EnvironmentPaths,
     environment_id: kr_protocol::ids::EnvironmentId,
 ) -> std::sync::Arc<kr_controller::service::Controller> {
-    let secrets = environment.secrets_dir();
-    kr_controller::service::Controller::start(kr_controller::service::ControllerSetup {
-        paths: environment.clone(),
-        environment_id,
-        identity: Box::new(move || {
-            let store = kr_crypto::store::open_store_in(&secrets)
-                .expect("a secret store for the test environment");
-            Ok(kr_ipc::verify::ControllerIdentity::open(
-                store.store.as_ref(),
+    let begun = std::time::Instant::now();
+    loop {
+        let secrets = environment.secrets_dir();
+        let started =
+            kr_controller::service::Controller::start(kr_controller::service::ControllerSetup {
+                paths: environment.clone(),
                 environment_id,
-                false,
-            )
-            .expect("an identity"))
-        }),
-        secret_store: kr_crypto::store::StoreSelection::File,
-        boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-        supervisor: Box::new(net_support::RefusingSupervisor),
-        worker_program: std::path::PathBuf::from("/nonexistent/kr-worker"),
-        build_id: net_support::build(),
-        release: "0".to_owned(),
-        shell_packages: None,
-        terminal: Box::new(kr_controller::supervision::NoTerminal),
-    })
-    .await
-    .expect("the daemon starts")
+                identity: Box::new(move || {
+                    let store = kr_crypto::store::open_store_in(&secrets)
+                        .expect("a secret store for the test environment");
+                    Ok(kr_ipc::verify::ControllerIdentity::open(
+                        store.store.as_ref(),
+                        environment_id,
+                        false,
+                    )
+                    .expect("an identity"))
+                }),
+                secret_store: kr_crypto::store::StoreSelection::File,
+                boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+                supervisor: Box::new(net_support::RefusingSupervisor),
+                worker_program: std::path::PathBuf::from("/nonexistent/kr-worker"),
+                build_id: net_support::build(),
+                release: "0".to_owned(),
+                shell_packages: None,
+                terminal: Box::new(kr_controller::supervision::NoTerminal),
+            })
+            .await;
+        match started {
+            Ok(controller) => return controller,
+            Err(kr_controller::error::ControllerError::AlreadyRunning { .. })
+                if begun.elapsed() < ENVIRONMENT_HANDOVER_DEADLINE => {}
+            Err(error) => panic!("the daemon starts: {error}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 /// The fence this environment durably owes, read straight out of its registry.
