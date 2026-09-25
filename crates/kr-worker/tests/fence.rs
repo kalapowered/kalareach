@@ -1680,8 +1680,10 @@ struct RealProbes {
 #[cfg(unix)]
 impl RealProbes {
     fn new() -> Self {
+        // The directory's name holds an apostrophe, so every path below it is one a shell line has
+        // to quote properly, and a line that did not would not survive it.
         let directory = tempfile::Builder::new()
-            .prefix("kr-probes-")
+            .prefix("kr-probes-it's-")
             .tempdir()
             .expect("a directory on the internal disk");
         let root = std::fs::canonicalize(directory.path()).expect("the directory resolves");
@@ -1690,8 +1692,9 @@ impl RealProbes {
         // It records its arguments and every reserved variable it was started with, waits while
         // its first argument is `hold` and no release has been written, and prints a word it puts
         // together from two pieces.
+        let text = root.join("kr-probe.text");
         std::fs::write(
-            &program,
+            &text,
             format!(
                 "#!/bin/sh\n\
                  {{\n\
@@ -1701,45 +1704,22 @@ impl RealProbes {
                  case $line in KR_*) printf 'env %s\\n' \"$line\" ;; esac\n\
                  done\n\
                  printf 'end\\n'\n\
-                 }} >> '{record}'\n\
+                 }} >> {record}\n\
                  if [ \"$1\" = hold ]; then\n\
-                 while [ ! -e '{release}' ]; do sleep 0.05; done\n\
+                 while [ ! -e {release} ]; do sleep 0.05; done\n\
                  fi\n\
                  printf '%s%s\\n' 'probe-' 'ran'\n",
-                record = root.join("record").display(),
-                release = root.join("release").display(),
+                record = shell_quoted(&root.join("record")),
+                release = shell_quoted(&root.join("release")),
             ),
         )
-        .expect("the program");
-        std::fs::set_permissions(
-            &program,
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .expect("an executable program");
-        // Some systems check a program the first time anything starts it, and on a busy machine
-        // that check can outlast a wait. It is paid here, before the shell that is timed starts it.
-        // A process another test starts while the program is being written keeps a copy of its
-        // descriptor until it starts its own program, and until then Linux refuses to start this
-        // one as busy, so the start is tried again; once it has started, every later start is clear.
-        let mut attempted = 0;
-        let status = loop {
-            attempted += 1;
-            match std::process::Command::new(&program)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-            {
-                Ok(status) => break status,
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy
-                        && attempted < 100 =>
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(error) => panic!("the program starts, after {attempted} attempts: {error}"),
-            }
-        };
-        assert!(status.success(), "the program failed its first start");
+        .expect("the program's text");
+        // Placed by another process rather than written by this one, so no child another test
+        // starts can hold it open for writing when a shell starts it; and started once here, where
+        // nothing is timed, because some systems check a program the first time anything starts it
+        // and on a busy machine that check can outlast a wait.
+        kr_ipc::testing::place_and_start_once(&text, &program, &[]);
+        let _ = std::fs::remove_file(&text);
         let _ = std::fs::remove_file(root.join("record"));
         std::fs::write(root.join("script.sh"), "kr-probe from-a-script\n").expect("a script");
         Self {
@@ -1816,6 +1796,79 @@ impl RealProbes {
     fn trace(&self) -> String {
         std::fs::read_to_string(self.root.join("trace")).unwrap_or_default()
     }
+}
+
+/// A path as one word of a POSIX shell line, whatever it holds.
+///
+/// Inside single quotes every character stands for itself except the quote, which ends them, so a
+/// quote in the path is closed over, given as an escaped quote of its own, and reopened.
+#[cfg(unix)]
+fn shell_quoted(path: &std::path::Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
+}
+
+/// The recording program works where its directory's name holds an apostrophe: a held start
+/// records its words and variables, waits for its release and then answers, and a script sourced
+/// by its quoted path runs it.
+#[cfg(unix)]
+#[test]
+fn the_recording_program_works_where_its_directory_holds_an_apostrophe() {
+    let probes = RealProbes::new();
+    assert!(
+        probes.root.display().to_string().contains('\''),
+        "the recording program's directory is one whose name holds an apostrophe: {}",
+        probes.root.display()
+    );
+
+    let held = std::process::Command::new(probes.program())
+        .args(["hold", "two words"])
+        .env("KR_PROBE_CHECK", "set")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the recording program starts");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while probes.runs().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the held start recorded nothing"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    probes.release();
+    let answered = held.wait_with_output().expect("the held start ends");
+    assert!(
+        answered.status.success(),
+        "the held start failed: {}",
+        String::from_utf8_lossy(&answered.stderr)
+    );
+    assert_eq!(answered.stdout, b"probe-ran\n");
+    let (arguments, environment) = probes.runs().pop().expect("the held start was recorded");
+    assert_eq!(arguments, ["hold", "two words"]);
+    assert_eq!(
+        environment.get("KR_PROBE_CHECK").map(String::as_str),
+        Some("set")
+    );
+
+    let sourced = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!(". {}", shell_quoted(&probes.script())))
+        .envs(probes.variables())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("a shell starts");
+    assert!(
+        sourced.status.success(),
+        "the script sourced by its quoted path failed: {}",
+        String::from_utf8_lossy(&sourced.stderr)
+    );
+    assert_eq!(sourced.stdout, b"probe-ran\n");
+    let (arguments, _) = probes
+        .runs()
+        .pop()
+        .expect("the sourced script started the program");
+    assert_eq!(arguments, ["from-a-script"]);
 }
 
 /// KR-REQ-12.07, KR-REQ-07.45, KR-REQ-07.84, KR-REQ-25.05: a real package asks the real worker
@@ -1923,7 +1976,7 @@ async fn asks_the_real_worker_before_each_command(
         assert!(!environment.contains_key("KR_REGISTRATION"));
 
         // A sourced script and a script of its own ask nothing for what they run.
-        keys.type_line(&shell, &format!(". '{}'", probes.script().display()));
+        keys.type_line(&shell, &format!(". {}", shell_quoted(&probes.script())));
         printed += 1;
         shell.produced(b"probe-ran", printed).await;
         assert_eq!(probes.asked().len(), 1, "{}", probes.trace());
