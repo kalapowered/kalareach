@@ -108,6 +108,30 @@ fn calls_through_a_module_its_body_brings_in_under_another_name() {
     assert_eq!(cases::brought_up(), 8);
 }
 
+mod hidden {
+    /// KR-REQ-03.08: a case of the same name no glob outside this module can bring in.
+    #[allow(dead_code)]
+    fn check() {}
+}
+
+mod actual {
+    /// A case of this module's own, which names no row.
+    pub fn other() {}
+}
+
+mod facade {
+    pub use crate::actual::other as check;
+}
+
+#[allow(unused_imports)]
+use hidden::*;
+use facade::*;
+
+#[test]
+fn calls_the_name_a_glob_brings_in_for_another_case() {
+    check();
+}
+
 mod cases {
     mod deep {
         /// KR-REQ-03.08: the same case, written in a child module.
