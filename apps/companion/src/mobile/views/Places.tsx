@@ -5,12 +5,12 @@
  * so and says nothing more, because that is all this device knows about it.
  */
 
-import { useCallback, useEffect, useState, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 
 import type { EnvironmentListResult, SessionListResult } from '@kalareach/protocol'
 
 import { useApp } from '../../app/state'
-import { failureMessage } from '../../host/port'
+import { failureMessage, watch, type Watch } from '../../host/port'
 import { Banner } from '../../components/ui'
 import { accountName } from '../../views/account-name'
 import { ask } from '../model/call'
@@ -37,27 +37,34 @@ export function MobileSessions({
   const [error, setError] = useState<string | null>(null)
   const target = minimumTarget(surface)
 
-  const read = useCallback(() => {
-    ask(() => port.sessionList({}))
-      .then((answer) => {
-        const sessions = (answer satisfies SessionListResult).sessions ?? []
-        setRows(
-          sessions.map((session) => ({
-            id: session.session_id,
-            title: `Session ${session.display_number}`,
-            where: session.cwd,
-            detail: describeSessionState(session.state, session.attachment_count),
-            tone: session.state === 'live' ? 'success' : session.state === 'closed' ? 'muted' : 'warning'
-          }))
-        )
-        setError(null)
-      })
-      .catch((failure: unknown) => {
-        setError(failureMessage(failure))
-      })
+  // The list is read under a watch with no listeners, one for each port, so only the newest read's
+  // answer or failure is shown, and nothing once the list has gone.
+  useEffect(() => {
+    const reads: Watch = watch([], () => {
+      const current = reads.read()
+      if (current === null) return
+      ask(() => port.sessionList({}))
+        .then((answer) => {
+          if (!current()) return
+          const sessions = (answer satisfies SessionListResult).sessions ?? []
+          setRows(
+            sessions.map((session) => ({
+              id: session.session_id,
+              title: `Session ${session.display_number}`,
+              where: session.cwd,
+              detail: describeSessionState(session.state, session.attachment_count),
+              tone: session.state === 'live' ? 'success' : session.state === 'closed' ? 'muted' : 'warning'
+            }))
+          )
+          setError(null)
+        })
+        .catch((failure: unknown) => {
+          if (!current()) return
+          setError(failureMessage(failure))
+        })
+    })
+    return reads.stop
   }, [port])
-
-  useEffect(read, [read])
 
   return (
     <>
@@ -99,25 +106,33 @@ export function MobileHosts({ surface }: { readonly surface: Surface }): ReactNo
   const [error, setError] = useState<string | null>(null)
   const target = minimumTarget(surface)
 
+  // Read as the session list is: only the newest read shows, and nothing once the list has gone.
   useEffect(() => {
-    ask(() => port.environmentList())
-      .then((answer: EnvironmentListResult) => {
-        setRows(
-          answer.environments.map((environment) => ({
-            id: environment.environment_id,
-            title: environment.label,
-            where: `${environment.os} · ${environment.arch} · ${accountName(environment)}`,
-            // What this device knows is how many sessions the host reported. It knows nothing
-            // about a host it has not heard from, and says nothing about one.
-            detail: `${environment.live_sessions} live ${environment.live_sessions === '1' ? 'session' : 'sessions'}`,
-            tone: 'success' as const
-          }))
-        )
-        setError(null)
-      })
-      .catch((failure: unknown) => {
-        setError(failureMessage(failure))
-      })
+    const reads: Watch = watch([], () => {
+      const current = reads.read()
+      if (current === null) return
+      ask(() => port.environmentList())
+        .then((answer: EnvironmentListResult) => {
+          if (!current()) return
+          setRows(
+            answer.environments.map((environment) => ({
+              id: environment.environment_id,
+              title: environment.label,
+              where: `${environment.os} · ${environment.arch} · ${accountName(environment)}`,
+              // What this device knows is how many sessions the host reported. It knows nothing
+              // about a host it has not heard from, and says nothing about one.
+              detail: `${environment.live_sessions} live ${environment.live_sessions === '1' ? 'session' : 'sessions'}`,
+              tone: 'success' as const
+            }))
+          )
+          setError(null)
+        })
+        .catch((failure: unknown) => {
+          if (!current()) return
+          setError(failureMessage(failure))
+        })
+    })
+    return reads.stop
   }, [port])
 
   return (

@@ -7,15 +7,19 @@
  * for a session the screen has left.
  */
 
+import type { ReactNode } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { Terminal } from '@xterm/xterm'
 
+import type { EnvironmentListResult, SessionListResult } from '@kalareach/protocol'
+
 import { App } from '../src/App'
 import { AppProvider, type Place } from '../src/app/state'
 import { fakeHost, type HeldReads } from '../src/host/fake'
 import type { HostPort } from '../src/host/port'
+import { MobileHosts, MobileSessions } from '../src/mobile/views/Places'
 import { paint } from '../src/terminal/RawTerminal'
 
 function open(port: HostPort, initialPlace: Place): void {
@@ -565,5 +569,223 @@ describe('painting a screen', () => {
     paint(terminal, [])
     expect(await held(terminal)).toEqual([])
     terminal.dispose()
+  })
+})
+
+describe("the phone's lists show their newest read", () => {
+  // A phone list reads once for each port it is given. A list given a new port reads again, and
+  // the read through the port it replaced can still answer after that: the list shows the newer
+  // read's answer or failure, and takes nothing in from a read that answers once it has gone.
+
+  function sessionsThrough(port: HostPort): ReactNode {
+    return (
+      <AppProvider port={port}>
+        <MobileSessions surface="ios" onOpen={() => undefined} />
+      </AppProvider>
+    )
+  }
+
+  function hostsThrough(port: HostPort): ReactNode {
+    return (
+      <AppProvider port={port}>
+        <MobileHosts surface="android" />
+      </AppProvider>
+    )
+  }
+
+  /** The scripted host, whose session list answers only its first `count` sessions. */
+  function firstSessions(port: HostPort, count: number): HostPort {
+    return {
+      ...port,
+      sessionList: (params) =>
+        port.sessionList(params).then((list) => ({ ...list, sessions: list.sessions.slice(0, count) }))
+    }
+  }
+
+  /** The scripted host, whose environment list calls every environment `label`. */
+  function labelled(port: HostPort, label: string): HostPort {
+    return {
+      ...port,
+      environmentList: () =>
+        port.environmentList().then((list) => ({
+          environments: list.environments.map((each) => ({ ...each, label }))
+        }))
+    }
+  }
+
+  /** The titles of the rows the list shows, in order. */
+  const titles = () =>
+    Array.from(document.querySelectorAll('.m-row-title'), (title) => title.textContent)
+
+  /**
+   * A value that records whether anything read it. A promise asks what it settles with for `then`
+   * before any handler runs, so that one question is not counted.
+   */
+  function watched<T extends object>(value: T): { readonly value: T; readonly read: () => boolean } {
+    let read = false
+    const recording = new Proxy(value, {
+      get(target, key, receiver) {
+        if (key !== 'then') read = true
+        return Reflect.get(target, key, receiver) as unknown
+      }
+    })
+    return { value: recording, read: () => read }
+  }
+
+  /** A read the test settles by hand, and whether the list has asked for it yet. */
+  function settledByHand<T>(): {
+    readonly read: () => Promise<T>
+    readonly asked: () => boolean
+    readonly resolve: (value: T) => void
+    readonly reject: (failure: unknown) => void
+  } {
+    let resolve: ((value: T) => void) | null = null
+    let reject: ((failure: unknown) => void) | null = null
+    return {
+      read: () =>
+        new Promise<T>((settle, refuse) => {
+          resolve = settle
+          reject = refuse
+        }),
+      asked: () => resolve !== null,
+      resolve: (value) => {
+        resolve?.(value)
+      },
+      reject: (failure) => {
+        reject?.(failure)
+      }
+    }
+  }
+
+  /** Lets everything a settled read sets off run. */
+  async function settle(settling: () => void): Promise<void> {
+    await act(async () => {
+      settling()
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+  }
+
+  it('keeps the newer session list when two reads answer in reverse order', async () => {
+    const { port, controls } = fakeHost()
+    const held = controls.hold('sessionList')
+    const { rerender } = render(sessionsThrough(firstSessions(port, 3)))
+    await made(held, 1)
+    rerender(sessionsThrough(firstSessions(port, 1)))
+    await made(held, 2)
+
+    await answer(held, 1)
+    expect(titles()).toEqual(['Session 1'])
+    await answer(held, 0)
+    expect(titles()).toEqual(['Session 1'])
+  })
+
+  it('shows no failure of an older session read that answers after the newer list', async () => {
+    const { port, controls } = fakeHost()
+    const held = controls.hold('sessionList')
+    controls.setConnected(false)
+    const { rerender } = render(sessionsThrough(port))
+    await made(held, 1)
+    act(() => {
+      controls.setConnected(true)
+    })
+    rerender(sessionsThrough({ ...port }))
+    await made(held, 2)
+
+    await answer(held, 1)
+    await answer(held, 0)
+    expect(titles()).toEqual(['Session 1', 'Session 2', 'Session 3'])
+    expect(screen.queryByText('The sessions could not be read')).toBeNull()
+  })
+
+  it('takes nothing in from a session read that answers after the list has gone', async () => {
+    for (const ending of ['answer', 'failure'] as const) {
+      const { port } = fakeHost()
+      const late = settledByHand<SessionListResult>()
+      const { unmount } = render(sessionsThrough({ ...port, sessionList: late.read }))
+      await waitFor(() => {
+        expect(late.asked()).toBe(true)
+      })
+      unmount()
+
+      const answered = watched<SessionListResult>({ sessions: [] })
+      const refused = watched({ code: 'RESOURCE_UNAVAILABLE', message: 'Gone.', user_action: 'retry' })
+      await settle(() => {
+        if (ending === 'answer') late.resolve(answered.value)
+        else late.reject(refused.value)
+      })
+      expect(answered.read() || refused.read()).toBe(false)
+    }
+  })
+
+  it('shows the sessions it read when nothing overtook the read', async () => {
+    const { port } = fakeHost()
+    render(sessionsThrough(port))
+    await waitFor(() => {
+      expect(titles()).toEqual(['Session 1', 'Session 2', 'Session 3'])
+    })
+    expect(screen.getByText('Live · 2 views attached')).toBeInTheDocument()
+  })
+
+  it('keeps the newer host list when two reads answer in reverse order', async () => {
+    const { port, controls } = fakeHost()
+    const held = controls.hold('environmentList')
+    const { rerender } = render(hostsThrough(labelled(port, 'studio before')))
+    await made(held, 1)
+    rerender(hostsThrough(labelled(port, 'studio after')))
+    await made(held, 2)
+
+    await answer(held, 1)
+    expect(titles()).toEqual(['studio after'])
+    await answer(held, 0)
+    expect(titles()).toEqual(['studio after'])
+  })
+
+  it('shows no failure of an older host read that answers after the newer list', async () => {
+    const { port, controls } = fakeHost()
+    const held = controls.hold('environmentList')
+    controls.setConnected(false)
+    const { rerender } = render(hostsThrough(port))
+    await made(held, 1)
+    act(() => {
+      controls.setConnected(true)
+    })
+    rerender(hostsThrough({ ...port }))
+    await made(held, 2)
+
+    await answer(held, 1)
+    await answer(held, 0)
+    expect(titles()).toEqual(['studio · macOS'])
+    expect(screen.queryByText('The hosts could not be read')).toBeNull()
+  })
+
+  it('takes nothing in from a host read that answers after the list has gone', async () => {
+    for (const ending of ['answer', 'failure'] as const) {
+      const { port } = fakeHost()
+      const late = settledByHand<EnvironmentListResult>()
+      const { unmount } = render(hostsThrough({ ...port, environmentList: late.read }))
+      await waitFor(() => {
+        expect(late.asked()).toBe(true)
+      })
+      unmount()
+
+      const answered = watched<EnvironmentListResult>({ environments: [] })
+      const refused = watched({ code: 'RESOURCE_UNAVAILABLE', message: 'Gone.', user_action: 'retry' })
+      await settle(() => {
+        if (ending === 'answer') late.resolve(answered.value)
+        else late.reject(refused.value)
+      })
+      expect(answered.read() || refused.read()).toBe(false)
+    }
+  })
+
+  it('shows the hosts it read when nothing overtook the read', async () => {
+    const { port } = fakeHost()
+    render(hostsThrough(port))
+    await waitFor(() => {
+      expect(titles()).toEqual(['studio · macOS'])
+    })
+    expect(screen.getByText('3 live sessions')).toBeInTheDocument()
   })
 })
