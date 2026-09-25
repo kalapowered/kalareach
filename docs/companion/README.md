@@ -118,10 +118,12 @@ Windows Hello". A computer with no ceremony, Linux among them, shows no button a
 confirm instead. A request whose description does not match what it would authorise says it could
 not be checked, and has no button either.
 
-A new request is announced once, on whichever screen is open, with "Review", which opens Attention
-and moves focus to the request. "Not now" sets a request aside until it expires, and it stays aside
-when the person leaves Attention and comes back. For a device being added, the row shows the value
-both devices should show, and a screen reader hears it spelled out one character at a time.
+New requests are announced once, on whichever screen is open, in one message for all that arrive
+together, with "Review", which opens Attention and moves focus to the first of them. Requests that
+arrive while the message is showing join it in place, so whatever has focus in it keeps focus. "Not
+now" sets a request aside until it expires, and it stays aside when the person leaves Attention and
+comes back. For a device being added, the row shows the value both devices should show, and a screen
+reader hears it spelled out one character at a time.
 
 The button sends native code a reference and nothing else. Native code finds the request it listed
 under that reference and asks the operating system, which draws the prompt and prints the
