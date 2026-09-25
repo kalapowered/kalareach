@@ -224,7 +224,7 @@ export function Hosts(): ReactNode {
               <div className="spacer">
                 <strong>{environment.label}</strong>
                 <p className="muted small mono">
-                  {environment.os} · {environment.arch} · {accountName(environment.os_user)}
+                  {environment.os} · {environment.arch} · {accountName(environment)}
                 </p>
               </div>
               <span className="row">
