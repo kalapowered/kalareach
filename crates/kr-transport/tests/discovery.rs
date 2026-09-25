@@ -21,7 +21,7 @@ use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, TransportAddr};
 use kr_protocol::hello::ALPN;
 use kr_transport::clock::ManualClock;
-use kr_transport::config::{DiscoveryConfig, EndpointConfig, PublishedAddresses};
+use kr_transport::config::{DiscoveryConfig, EndpointConfig, PublishedAddresses, PublisherPolicy};
 use kr_transport::handshake::{self, Admitted};
 use support::pkarr::PkarrRelay;
 use support::{LocalRelay, OneDevice, Side, side, side_with};
@@ -298,6 +298,82 @@ async fn an_endpoint_reaches_exactly_the_relay_pkarr_and_dns_services_it_selecte
     reader.endpoint.close().await;
     peer.endpoint.close().await;
     host.endpoint.close().await;
+}
+
+/// KR-REQ-17.43: the selected Pkarr resolver believes only a record the endpoint it names signed.
+/// A Pkarr server that answers for one endpoint with another endpoint's signed record, or with more
+/// than a signed record can hold, is refused: the lookup fails and names no address. The record the
+/// server holds for the endpoint that signed it resolves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_record_its_endpoint_did_not_sign_is_refused() {
+    let pkarr = PkarrRelay::spawn();
+    let signer = side(
+        &EndpointConfig {
+            discovery: DiscoveryConfig {
+                pkarr_publisher_url: Some(pkarr.url.clone()),
+                publisher: PublisherPolicy {
+                    published_addresses: PublishedAddresses::RelayAndDirect,
+                    ..PublisherPolicy::default()
+                },
+                ..DiscoveryConfig::default()
+            },
+            bind_addr: loopback(),
+            ..EndpointConfig::default()
+        },
+        1,
+        false,
+    )
+    .await;
+    let signed = signer.endpoint.id();
+    eventually("the signer publishes its record", PATIENCE, || {
+        pkarr.publications(&signed) > 0
+    })
+    .await;
+    let reader = side(
+        &EndpointConfig {
+            discovery: DiscoveryConfig {
+                pkarr_resolver_url: Some(pkarr.url.clone()),
+                ..DiscoveryConfig::default()
+            },
+            bind_addr: loopback(),
+            ..EndpointConfig::default()
+        },
+        2,
+        false,
+    )
+    .await;
+    let (answers, failures) = resolve(&reader.endpoint, signed).await;
+    assert_eq!(
+        answers.len(),
+        1,
+        "the signer's own record resolves: {failures:?}"
+    );
+
+    // The only service fails, so the lookup as a whole reports that nothing answered, with the
+    // service's reason.
+    let other = iroh::SecretKey::generate().public();
+    pkarr.hold(&other, pkarr.record(&signed).expect("the signed record"));
+    let (answers, failures) = resolve(&reader.endpoint, other).await;
+    assert!(answers.is_empty(), "{answers:?}");
+    assert!(
+        failures
+            .iter()
+            .any(|failure| failure.contains("is not one the endpoint it names signed")),
+        "{failures:?}"
+    );
+
+    pkarr.hold(&other, vec![0; 2 * 1104]);
+    let (answers, failures) = resolve(&reader.endpoint, other).await;
+    assert!(answers.is_empty(), "{answers:?}");
+    assert!(
+        failures
+            .iter()
+            .any(|failure| failure.contains("more than a signed record can hold")),
+        "{failures:?}"
+    );
+
+    reader.endpoint.close().await;
+    signer.endpoint.close().await;
 }
 
 /// KR-REQ-17.45: a host's direct addresses stay out of its public record. The host has direct

@@ -29,7 +29,7 @@
 //!
 //! | Module | What it holds |
 //! | --- | --- |
-//! | [`config`] | The selected relay map, Pkarr publisher, Pkarr resolver and DNS origin |
+//! | [`config`] | The selected relay map, Pkarr publisher, Pkarr resolver, DNS origin and HTTP proxy |
 //! | [`endpoint`] | Endpoint construction from `presets::Minimal` and the ALPN |
 //! | [`codec`] | Length-delimited KR-CBOR-1 frames over a QUIC stream |
 //! | [`handshake`] | `hello` and the `kr-connect/1` mutual proof |
@@ -59,6 +59,7 @@ pub mod error;
 pub mod handshake;
 pub mod lease;
 pub mod listener;
+mod pkarr;
 pub mod preauth;
 pub mod random;
 pub mod reconnect;

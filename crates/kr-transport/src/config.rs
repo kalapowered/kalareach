@@ -152,7 +152,8 @@ pub struct EndpointConfig {
     ///
     /// It is this machine's own choice. A pairing invitation and a host bundle never carry it, and
     /// nothing reads it from the environment. `None` sends the relay connection and the Pkarr
-    /// requests directly.
+    /// requests directly; iroh's two relay probes then follow the environment's proxy variables,
+    /// which [`crate::endpoint`] explains.
     pub proxy_url: Option<ProxyUrl>,
 }
 

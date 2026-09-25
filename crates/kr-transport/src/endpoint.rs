@@ -6,6 +6,13 @@
 //! uses `presets::N0`, `RelayMode::Default` or `RelayMode::Staging`, so no public default can
 //! arrive by inheritance.
 //!
+//! The same holds for the way out. With a proxy named, the relay connection, iroh's relay latency
+//! probe and captive-portal check, and the Pkarr publisher and resolver all go through it. With
+//! none, the relay connection and the Pkarr requests go directly. The two relay probes are the
+//! exception: iroh builds their client with the environment's proxy settings when it is given no
+//! proxy, and offers no way to turn that off, so they follow `HTTP_PROXY`, `HTTPS_PROXY` and
+//! `ALL_PROXY` when those are set.
+//!
 //! [`connect`] is the dialling half: it opens a connection and, when a relay the connection needed
 //! turned this endpoint away, says so rather than reporting a peer that did not answer.
 
@@ -109,6 +116,13 @@ async fn bind(
             .iter()
             .map(|der| CertificateDer::from(der.clone()));
         builder = builder.ca_tls_config(CaTlsConfig::default().with_extra_roots(roots));
+    }
+    // The relay client tunnels through the proxy with CONNECT, and the net report sends its relay
+    // latency probe and captive-portal check through it. Nothing falls back to a direct connection
+    // when the proxy cannot be reached: the owner chose to go through it. `proxy_from_env` is never
+    // called, because the proxy is this configuration's to name.
+    if let Some(proxy) = &config.proxy_url {
+        builder = builder.proxy_url(proxy.as_url().clone());
     }
     builder = apply_discovery(builder, config)?;
 
@@ -477,15 +491,22 @@ fn published_addresses(config: &EndpointConfig) -> iroh::address_lookup::AddrFil
 fn apply_discovery(mut builder: Builder, config: &EndpointConfig) -> Result<Builder> {
     let discovery = &config.discovery;
 
+    // This crate's own Pkarr services rather than iroh's, whose HTTP client takes no proxy and
+    // follows the environment's instead: these take the configuration's proxy, or none.
     if let Some(url) = &discovery.pkarr_publisher_url {
-        let publisher = iroh::address_lookup::PkarrPublisher::builder(url.clone())
-            .ttl(discovery.publisher.ttl_seconds)
-            .republish_interval(discovery.publisher.republish_interval)
-            .addr_filter(published_addresses(config));
-        builder = builder.address_lookup(publisher);
+        builder = builder.address_lookup(crate::pkarr::Publisher {
+            server: url.clone(),
+            ttl_seconds: discovery.publisher.ttl_seconds,
+            republish_interval: discovery.publisher.republish_interval,
+            filter: published_addresses(config),
+            proxy: config.proxy_url.clone(),
+        });
     }
     if let Some(url) = &discovery.pkarr_resolver_url {
-        builder = builder.address_lookup(iroh::address_lookup::PkarrResolver::builder(url.clone()));
+        builder = builder.address_lookup(crate::pkarr::Resolver {
+            server: url.clone(),
+            proxy: config.proxy_url.clone(),
+        });
     }
     if let Some(origin) = &discovery.dns_origin {
         builder = builder.address_lookup(iroh::address_lookup::DnsAddressLookup::builder(

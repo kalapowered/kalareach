@@ -7,7 +7,9 @@
 #![allow(dead_code)]
 
 pub mod conditions;
+pub mod front;
 pub mod pkarr;
+pub mod proxy;
 
 use std::sync::Arc;
 
