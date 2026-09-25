@@ -61,6 +61,11 @@ const COMPLETION_TTL: DurationMs = DurationMs::new(60_000);
 /// The longest reason a ceremony is given. The platforms' dialogs show one short line.
 pub const MAX_REASON_CHARS: usize = 200;
 
+/// How long a host may take to take an answer. A host that holds its connection open and answers
+/// nothing ends the review not confirmed at this bound, rather than holding the review, and
+/// whatever waits on it, for as long as the connection stays open.
+pub const ANSWER_WITHIN: Duration = Duration::from_secs(10);
+
 /// How a device reaches its host's owner-confirmation methods.
 ///
 /// [`SessionChannel`] is the product's: the device's own authorised session. A test puts a layer
@@ -724,22 +729,20 @@ impl OwnerConfirmations {
         ) else {
             return ReviewOutcome::NotConfirmed;
         };
-        let sent = self
-            .channel
-            .complete(&OwnerConfirmationCompleteParams {
-                proof,
-                bootstrap_signer: Nullable::null(),
-            })
-            .await;
+        let params = OwnerConfirmationCompleteParams {
+            proof,
+            bootstrap_signer: Nullable::null(),
+        };
+        let sent = tokio::time::timeout(ANSWER_WITHIN, self.channel.complete(&params)).await;
         match sent {
-            Ok(()) => ReviewOutcome::Confirmed,
-            Err(ClientError::Host(error) | ClientError::Refused { error, .. })
+            Ok(Ok(())) => ReviewOutcome::Confirmed,
+            Ok(Err(ClientError::Host(error) | ClientError::Refused { error, .. }))
                 if error.code == ErrorCode::OwnerConfirmationRequired
                     && self.clock.wall_clock_ms() >= expires_at_ms =>
             {
                 ReviewOutcome::Expired
             }
-            Err(_) => ReviewOutcome::NotConfirmed,
+            Ok(Err(_)) | Err(_) => ReviewOutcome::NotConfirmed,
         }
     }
 }
@@ -936,6 +939,8 @@ mod tests {
     struct Listing {
         pending: Mutex<Vec<PendingConfirmation>>,
         completions: AtomicUsize,
+        /// Takes every answer and never says anything back.
+        silent: std::sync::atomic::AtomicBool,
     }
 
     impl OwnerChannel for Listing {
@@ -949,7 +954,13 @@ mod tests {
             _params: &'a OwnerConfirmationCompleteParams,
         ) -> BoxFuture<'a, Result<(), ClientError>> {
             self.completions.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { Ok(()) })
+            let silent = self.silent.load(Ordering::SeqCst);
+            Box::pin(async move {
+                if silent {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            })
         }
     }
 
@@ -1027,6 +1038,7 @@ mod tests {
                 answered: false,
             }]),
             completions: AtomicUsize::new(0),
+            silent: std::sync::atomic::AtomicBool::new(false),
         });
         let confirmations = OwnerConfirmations::new(
             host,
@@ -1093,5 +1105,32 @@ mod tests {
             assert!(asked.0.lock().expect("the record").is_empty(), "{value:?}");
             assert_eq!(listing.completions.load(Ordering::SeqCst), 0, "{value:?}");
         }
+    }
+
+    /// KR-REQ-10.06: a host that takes an answer and says nothing holds the review for
+    /// [`ANSWER_WITHIN`] and no longer. The answer was sent once; the review then ends not
+    /// confirmed, rather than holding its connection, and the page that asked, for as long as the
+    /// host keeps the connection open.
+    #[tokio::test(start_paused = true)]
+    async fn a_host_that_never_answers_a_completion_holds_the_review_for_a_bound() {
+        let (confirmations, listing) = listed_device(
+            candidate("Pixel 8"),
+            grant(&[ActionRight::SessionView], an_hour()),
+        );
+        listing.silent.store(true, Ordering::SeqCst);
+        let listed = confirmations.pending().await.expect("the listing");
+        let asked = Asked(Mutex::new(Vec::new()));
+        let started = tokio::time::Instant::now();
+        let outcome =
+            tokio::time::timeout(ANSWER_WITHIN * 3, confirmations.review(&listed[0], &asked))
+                .await
+                .expect("the review ends");
+        assert_eq!(outcome, ReviewOutcome::NotConfirmed);
+        let took = started.elapsed();
+        assert!(
+            took >= ANSWER_WITHIN && took < ANSWER_WITHIN + Duration::from_secs(1),
+            "{took:?}"
+        );
+        assert_eq!(listing.completions.load(Ordering::SeqCst), 1);
     }
 }

@@ -8,6 +8,13 @@
 //! proof or a key. A review runs in native code: kr-client checks what the challenge shows against
 //! what it would authorise, the platform's ceremony asks the person, and only then does native code
 //! sign and complete it.
+//!
+//! No host holds up another. Each visit, from connecting to the answer, ends within
+//! [`VISIT_WITHIN`], so a host that takes the connection and answers nothing is out of contact for
+//! that cycle and nothing more; and the record of open sessions is never locked across a wait on
+//! the network. A review holds the endpoint its host is reached through from the ceremony to the
+//! answer, so the watcher's visit to another host on the same relay waits for it rather than
+//! closing the connection the answer goes over.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -29,8 +36,9 @@ use crate::error::{CommandError, Result};
 /// How often each owned host is asked what it wants confirmed.
 pub const INTERVAL: Duration = Duration::from_secs(2);
 
-/// How long connecting to an owned host may take before it counts as out of contact.
-const CONNECT_WITHIN: Duration = Duration::from_secs(10);
+/// How long one visit to an owned host may take, from connecting to its answer. A host that has
+/// not answered by then is out of contact until the next cycle.
+pub const VISIT_WITHIN: Duration = Duration::from_secs(10);
 
 /// What the page is shown of the confirmations this computer's hosts ask for.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -80,7 +88,9 @@ struct Entry {
 pub struct Owner {
     device: Arc<Device>,
     ceremony: Arc<dyn Ceremony>,
-    sessions: tokio::sync::Mutex<BTreeMap<DeviceId, Arc<OwnerConfirmations>>>,
+    /// The open session to each owned host. It is looked up and changed under its lock, which is
+    /// never held across a wait on the network.
+    sessions: Mutex<BTreeMap<DeviceId, Arc<OwnerConfirmations>>>,
     entries: Mutex<Vec<Entry>>,
     changed: Box<dyn Fn() + Send + Sync>,
 }
@@ -111,7 +121,7 @@ impl Owner {
         Arc::new(Self {
             device,
             ceremony,
-            sessions: tokio::sync::Mutex::new(BTreeMap::new()),
+            sessions: Mutex::new(BTreeMap::new()),
             entries: Mutex::new(Vec::new()),
             changed: Box::new(changed),
         })
@@ -148,9 +158,10 @@ impl Owner {
     ///
     /// # Errors
     ///
-    /// Returns a refusal for a reference this computer is not showing.
+    /// Returns a refusal for a reference this computer is not showing, and an unavailable answer
+    /// when its host cannot be reached in time.
     pub async fn review(self: &Arc<Self>, reference: &str) -> Result<ReviewOutcome> {
-        let (host, listed) = {
+        let (host_id, listed) = {
             let entries = lock(&self.entries);
             let entry = entries
                 .iter()
@@ -158,63 +169,123 @@ impl Owner {
                 .ok_or_else(|| CommandError::refused("that request is not waiting here"))?;
             (entry.host, entry.listed.clone())
         };
-        let confirmations = self
-            .sessions
-            .lock()
-            .await
-            .get(&host)
-            .cloned()
-            .ok_or_else(|| CommandError::unavailable("the host is not in contact"))?;
-        let outcome = confirmations.review(&listed, &*self.ceremony).await;
-        self.cycle().await;
+        let host = self
+            .device
+            .owner_hosts()
+            .into_iter()
+            .find(|owned| owned.host_device_id == host_id)
+            .ok_or_else(|| CommandError::refused("that request is not waiting here"))?;
+        let out_of_contact = || CommandError::unavailable("the host is not in contact");
+        // From the ceremony to the answer, nothing this computer does for another host may close
+        // the endpoint the answer goes over.
+        let _held = tokio::time::timeout(
+            VISIT_WITHIN,
+            self.device.pairing().link.hold(&host.network_config),
+        )
+        .await
+        .ok()
+        .and_then(std::result::Result::ok)
+        .ok_or_else(out_of_contact)?;
+        // A session that answers now, and the challenge as the host holds it now: one the host
+        // no longer holds open cannot be confirmed any more.
+        let (confirmations, holding) = self.reach(&host).await.ok_or_else(out_of_contact)?;
+        let outcome = match holding
+            .iter()
+            .find(|held| held.request.confirmation_id == listed.request.confirmation_id)
+        {
+            Some(current) => confirmations.review(current, &*self.ceremony).await,
+            None => ReviewOutcome::Expired,
+        };
+        self.refresh(&host).await;
         Ok(outcome)
     }
 
-    /// Asks every owned host once what it wants confirmed.
+    /// Asks every owned host once what it wants confirmed, one after another.
     async fn cycle(&self) {
         let owned = self.device.owner_hosts();
         for host in &owned {
-            let listed = match self.confirmations(host).await {
-                Some(confirmations) => confirmations.pending().await.ok(),
-                None => None,
-            };
-            if listed.is_none() {
-                self.sessions.lock().await.remove(&host.host_device_id);
-            }
-            self.device
-                .set_contact(host.host_device_id, listed.is_some());
-            self.show(host, listed.unwrap_or_default());
+            self.refresh(host).await;
         }
+        let owns = |host: &DeviceId| owned.iter().any(|owned| owned.host_device_id == *host);
+        lock(&self.sessions).retain(|host, _| owns(host));
         let before = lock(&self.entries).len();
-        lock(&self.entries)
-            .retain(|entry| owned.iter().any(|host| host.host_device_id == entry.host));
+        lock(&self.entries).retain(|entry| owns(&entry.host));
         if lock(&self.entries).len() != before {
             (self.changed)();
         }
     }
 
-    /// The confirmations of `host`, over a session opened now if none is open.
-    async fn confirmations(&self, host: &PairedHost) -> Option<Arc<OwnerConfirmations>> {
-        let mut sessions = self.sessions.lock().await;
-        if let Some(confirmations) = sessions.get(&host.host_device_id) {
-            return Some(Arc::clone(confirmations));
+    /// Asks `host` what it wants confirmed, and shows its answer, or that it is out of contact.
+    async fn refresh(&self, host: &PairedHost) {
+        let listed = self.visit(host).await;
+        self.device
+            .set_contact(host.host_device_id, listed.is_some());
+        self.show(host, listed.unwrap_or_default());
+    }
+
+    /// One visit to `host`: what it holds open, or `None` when it could not be reached and asked
+    /// in time.
+    async fn visit(&self, host: &PairedHost) -> Option<Vec<Listed>> {
+        self.reach(host).await.map(|(_, listed)| listed)
+    }
+
+    /// A session to `host` that answers now, and what the host holds open, found within
+    /// [`VISIT_WITHIN`]: the open session is asked first, and one that no longer answers is let go
+    /// for a fresh one.
+    async fn reach(&self, host: &PairedHost) -> Option<(Arc<OwnerConfirmations>, Vec<Listed>)> {
+        let deadline = tokio::time::Instant::now() + VISIT_WITHIN;
+        if let Some(open) = self.session(host.host_device_id) {
+            match tokio::time::timeout_at(deadline, open.pending()).await {
+                Ok(Ok(listed)) => return Some((open, listed)),
+                _ => self.forget(host.host_device_id, &open),
+            }
         }
+        let opened = tokio::time::timeout_at(deadline, self.open(host))
+            .await
+            .ok()??;
+        let listed = tokio::time::timeout_at(deadline, opened.pending())
+            .await
+            .ok()?
+            .ok()?;
+        self.keep(host.host_device_id, &opened);
+        Some((opened, listed))
+    }
+
+    /// A session to `host`, opened now: connected as the device this computer is there, through
+    /// the host's own network configuration, and aimed at the host's environment.
+    async fn open(&self, host: &PairedHost) -> Option<Arc<OwnerConfirmations>> {
         let pairing = self.device.pairing();
         let identity = pairing.candidate.paired_identity(host.device_id);
-        let session =
-            tokio::time::timeout(CONNECT_WITHIN, pairing.link.connect_paired(host, &identity))
-                .await
-                .ok()?
-                .ok()?;
+        let session = pairing.link.connect_paired(host, &identity).await.ok()?;
         let channel = SessionChannel::open(Arc::new(session)).await.ok()?;
-        let confirmations = Arc::new(OwnerConfirmations::new(
+        Some(Arc::new(OwnerConfirmations::new(
             host.clone(),
             self.device.identity().keys.authorisation.clone(),
             Arc::new(channel),
             Arc::clone(&pairing.clock),
-        ));
-        sessions.insert(host.host_device_id, Arc::clone(&confirmations));
-        Some(confirmations)
+        )))
+    }
+
+    /// The open session to `host`, if there is one.
+    fn session(&self, host: DeviceId) -> Option<Arc<OwnerConfirmations>> {
+        lock(&self.sessions).get(&host).cloned()
+    }
+
+    /// Keeps `opened` as the open session to `host`.
+    fn keep(&self, host: DeviceId, opened: &Arc<OwnerConfirmations>) {
+        lock(&self.sessions).insert(host, Arc::clone(opened));
+    }
+
+    /// Lets go of `stale`, the session to `host` that stopped answering, unless another has
+    /// replaced it meanwhile.
+    fn forget(&self, host: DeviceId, stale: &Arc<OwnerConfirmations>) {
+        let mut sessions = lock(&self.sessions);
+        if sessions
+            .get(&host)
+            .is_some_and(|open| Arc::ptr_eq(open, stale))
+        {
+            sessions.remove(&host);
+        }
     }
 
     /// Replaces what is shown for `host` with `listed`, keeping each request's reference.
