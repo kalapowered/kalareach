@@ -17,7 +17,7 @@ use kr_protocol::ids::{ActionId, EnvironmentId};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, TimestampMs};
 
-use kr_controller::bridge::launch::CONTAINER_RUNTIME as RUNTIME;
+use kr_controller::bridge::launch::CONTAINER_RUNTIME;
 
 use crate::cli::{
     BridgeEnrolArguments, BridgeForgetArguments, BridgeListArguments, BridgeRefreshArguments,
@@ -153,7 +153,7 @@ pub async fn enrol(arguments: &BridgeEnrolArguments) -> Result<EnvironmentEnrolR
 /// is put to the runtime and the identifier it answers with is what the record keeps. A name that
 /// happens to be hexadecimal takes the same path as any other name.
 fn resolve_container_target(target: &str) -> Result<String> {
-    let output = std::process::Command::new(RUNTIME)
+    let output = std::process::Command::new(CONTAINER_RUNTIME)
         .args(["container", "inspect", "--format", "{{.Id}}", "--", target])
         .stdin(std::process::Stdio::null())
         .output()
@@ -161,7 +161,7 @@ fn resolve_container_target(target: &str) -> Result<String> {
             CliError::Usage(shown!(
                 "{} could not be run to resolve the target to a container identifier ({}); pass \
                  the identifier the runtime issued",
-                RUNTIME,
+                CONTAINER_RUNTIME,
                 Shown::io(&error)
             ))
         })?;
@@ -170,7 +170,7 @@ fn resolve_container_target(target: &str) -> Result<String> {
     if !output.status.success() {
         return Err(CliError::Usage(shown!(
             "{} knows no container by that name ({})",
-            RUNTIME,
+            CONTAINER_RUNTIME,
             output.status
         )));
     }
@@ -178,7 +178,7 @@ fn resolve_container_target(target: &str) -> Result<String> {
     if !kr_protocol::identity::is_container_identifier(&resolved) {
         return Err(CliError::Usage(shown!(
             "{} answered with something that is not the whole identifier a container carries",
-            RUNTIME
+            CONTAINER_RUNTIME
         )));
     }
     Ok(resolved)

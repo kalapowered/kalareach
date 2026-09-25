@@ -85,7 +85,7 @@ use kr_protocol::sync::{MAX_SYNC_CONFLICT_COPIES, SyncObjectKind};
 use serde::{Deserialize, Serialize};
 
 use super::SyncObject;
-use crate::drafts::{DraftStore, SyncCheckpoint as DraftCheckpoint};
+use crate::drafts::DraftStore;
 use crate::retry::UserAction;
 use crate::services::{SyncPosition, SyncRecoveryId, names_no_recovery};
 use crate::shown::{IoFault, Shown};
@@ -2580,7 +2580,7 @@ impl SyncStore {
                 drafts
                     .answered_checkpoint(
                         DraftId::new(held.object_id.get()),
-                        DraftCheckpoint {
+                        crate::drafts::SyncCheckpoint {
                             position,
                             published_revision: Nullable::some(revision),
                         },

@@ -37,7 +37,7 @@ use std::collections::BTreeMap;
 use kr_client::answers::{
     self, AnswerDraft, AnswerDrafts, AnswerError, Answered, QuestionHost, Reconciled, Retired,
 };
-use kr_client::error::{ClientError, refusal as refusal_of};
+use kr_client::error::ClientError;
 use kr_ipc::client::LocalClient;
 use kr_ipc::paths::HostPaths;
 use kr_protocol::envelope::ActionTarget;
@@ -271,7 +271,7 @@ fn still_kept_failure(workers: &Workers, question_id: QuestionId, error: AnswerE
     match error {
         AnswerError::Host(
             ClientError::Host(refusal) | ClientError::Refused { error: refusal, .. },
-        ) => CliError::Refused(refusal_of(
+        ) => CliError::Refused(kr_client::error::refusal(
             refusal.code,
             shown!(
                 "{}; {}",
@@ -431,7 +431,7 @@ fn ended_first(question_id: QuestionId, reason: Retired, copy: &KeptCopy) -> Cli
             *why
         ),
     };
-    CliError::Refused(refusal_of(
+    CliError::Refused(kr_client::error::refusal(
         AnswerError::Retired(reason).code(),
         shown!(
             "{}, so this command did not send this answer{}",
@@ -447,7 +447,7 @@ fn unkept(workers: &Workers, question_id: QuestionId, error: AnswerError) -> Cli
     let why = workers
         .failure()
         .map_or_else(|| shown!("{}", error), |failure| failure.why);
-    CliError::Refused(refusal_of(
+    CliError::Refused(kr_client::error::refusal(
         error.code(),
         shown!(
             "{}. The answer was not kept: `kr question show {}` says whether its question was \
@@ -547,7 +547,7 @@ fn answer_failure(error: AnswerError) -> CliError {
     let code = error.code();
     match error {
         AnswerError::Form(message) => CliError::Usage(message),
-        AnswerError::Retired(reason) => CliError::Refused(refusal_of(
+        AnswerError::Retired(reason) => CliError::Refused(kr_client::error::refusal(
             code,
             shown!(
                 "{}, so this command did not send the kept answer, which is no longer kept",
@@ -557,11 +557,14 @@ fn answer_failure(error: AnswerError) -> CliError {
         AnswerError::Host(
             ClientError::Host(refusal) | ClientError::Refused { error: refusal, .. },
         ) => CliError::Refused(refusal),
-        AnswerError::Host(ClientError::Ipc(failure)) => {
-            CliError::Refused(refusal_of(failure.code(), Shown::ipc(&failure)))
-        }
+        AnswerError::Host(ClientError::Ipc(failure)) => CliError::Refused(
+            kr_client::error::refusal(failure.code(), Shown::ipc(&failure)),
+        ),
         AnswerError::Host(other) => CliError::HostUnavailable(shown!("{}", other)),
-        AnswerError::Unlisted => CliError::Refused(refusal_of(code, Shown::said(UNLISTED_BECAUSE))),
+        AnswerError::Unlisted => CliError::Refused(kr_client::error::refusal(
+            code,
+            Shown::said(UNLISTED_BECAUSE),
+        )),
         AnswerError::Store { .. } | AnswerError::Unreadable { .. } => {
             CliError::Other(shown!("{}", error))
         }

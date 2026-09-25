@@ -51,8 +51,7 @@ pub use crate::recovery::bundle::{
     bundle_collection, fresh_locator,
 };
 pub use crate::recovery::kit::{
-    MAX_RECOVERY_KIT_BYTES, RECOVERY_KIT_FORMAT, parse as parse_kit, qr_payload,
-    render as render_kit,
+    MAX_RECOVERY_KIT_BYTES, RECOVERY_KIT_FORMAT, parse_kit, qr_payload, render_kit,
 };
 pub use crate::recovery::restore::{FreshRestore, RetrievalPolicy, ServiceAccess, TrustedMaterial};
 pub use crate::recovery::settings::{

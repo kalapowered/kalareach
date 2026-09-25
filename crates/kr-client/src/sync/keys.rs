@@ -89,15 +89,13 @@ fn no_key(collection: &str, epoch: u64) -> ClientError {
 /// * What was passed in. That is what is left, and it is the only thing [`ErrorCode::InvalidArgument`]
 ///   is for here.
 fn sealing_failed(error: &kr_crypto::CryptoError) -> ClientError {
-    use kr_crypto::CryptoError as Failure;
-
     let code = match error {
-        Failure::Authentication { .. } => ErrorCode::PermissionDenied,
-        Failure::SecretStore { .. }
-        | Failure::StoredSecretLength { .. }
-        | Failure::LibraryUnavailable { .. }
-        | Failure::Library { .. }
-        | Failure::LibraryMismatch { .. } => ErrorCode::StorageUnavailable,
+        kr_crypto::CryptoError::Authentication { .. } => ErrorCode::PermissionDenied,
+        kr_crypto::CryptoError::SecretStore { .. }
+        | kr_crypto::CryptoError::StoredSecretLength { .. }
+        | kr_crypto::CryptoError::LibraryUnavailable { .. }
+        | kr_crypto::CryptoError::Library { .. }
+        | kr_crypto::CryptoError::LibraryMismatch { .. } => ErrorCode::StorageUnavailable,
         _ => ErrorCode::InvalidArgument,
     };
     ClientError::refusal(code, Shown::crypto(error))

@@ -35,7 +35,7 @@ use rmcp::model::{
     CallToolResult, CancelledNotificationParam, RequestId, ServerCapabilities, ServerConfig,
 };
 use rmcp::service::{MaybeSendFuture, NotificationContext, RequestContext, RoleServer};
-use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
+use rmcp::{ErrorData, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -115,7 +115,7 @@ fn poll_within(asked: Option<DurationMs>, declared: Option<DurationMs>) -> Durat
 fn poll_duration(asked: Option<DurationMs>) -> DurationMs {
     poll_within(asked, declared_deadline())
 }
-use crate::error::{CliError, Result as CliResult};
+use crate::error::CliError;
 
 /// One choice an `ask_user` select offers.
 #[derive(Clone, Deserialize, Serialize, JsonSchema)]
@@ -498,7 +498,7 @@ impl Contact {
         &self,
         Parameters(params): Parameters<AskUserParams>,
         context: RequestContext<RoleServer>,
-    ) -> std::result::Result<CallToolResult, McpError> {
+    ) -> std::result::Result<CallToolResult, ErrorData> {
         let _running = self.calls.enter(context.id.clone());
         Ok(self
             .create(params, &context.ct, &context.id)
@@ -518,7 +518,7 @@ impl Contact {
         &self,
         Parameters(params): Parameters<WaitForAnswerParams>,
         context: RequestContext<RoleServer>,
-    ) -> std::result::Result<CallToolResult, McpError> {
+    ) -> std::result::Result<CallToolResult, ErrorData> {
         let _running = self.calls.enter(context.id.clone());
         Ok(self
             .wait(params, &context.ct, &context.id)
@@ -535,7 +535,7 @@ impl Contact {
     pub async fn cancel_question(
         &self,
         Parameters(params): Parameters<CancelQuestionParams>,
-    ) -> std::result::Result<CallToolResult, McpError> {
+    ) -> std::result::Result<CallToolResult, ErrorData> {
         Ok(self.withdraw(params).await.unwrap_or_else(refusal))
     }
 
@@ -548,7 +548,7 @@ impl Contact {
     pub async fn send_notification(
         &self,
         Parameters(params): Parameters<SendNotificationParams>,
-    ) -> std::result::Result<CallToolResult, McpError> {
+    ) -> std::result::Result<CallToolResult, ErrorData> {
         Ok(self.notify(params).await.unwrap_or_else(refusal))
     }
 
@@ -557,7 +557,7 @@ impl Contact {
         params: AskUserParams,
         cancelled: &CancellationToken,
         call: &RequestId,
-    ) -> CliResult<CallToolResult> {
+    ) -> crate::error::Result<CallToolResult> {
         // A call cancelled before anything was asked asks nothing. Creating the question and
         // cancelling it at once would still put it in front of the person for a moment.
         if cancelled.is_cancelled() {
@@ -649,7 +649,7 @@ impl Contact {
         params: WaitForAnswerParams,
         cancelled: &CancellationToken,
         call: &RequestId,
-    ) -> CliResult<CallToolResult> {
+    ) -> crate::error::Result<CallToolResult> {
         let bound = self.session().await?;
         let question_id = parse_question(&params.question_id)?;
         let token = decode_token(&params.caller_token)?;
@@ -665,7 +665,7 @@ impl Contact {
         Ok(CallToolResult::structured(question_value(&question)))
     }
 
-    async fn withdraw(&self, params: CancelQuestionParams) -> CliResult<CallToolResult> {
+    async fn withdraw(&self, params: CancelQuestionParams) -> crate::error::Result<CallToolResult> {
         let bound = self.session().await?;
         let question_id = parse_question(&params.question_id)?;
         let token = decode_token(&params.caller_token)?;
@@ -684,7 +684,7 @@ impl Contact {
         Ok(CallToolResult::structured(question_value(&result.question)))
     }
 
-    async fn notify(&self, params: SendNotificationParams) -> CliResult<CallToolResult> {
+    async fn notify(&self, params: SendNotificationParams) -> crate::error::Result<CallToolResult> {
         let bound = self.session().await?;
         let mut client = bind::open(&bound, self.build_id.clone()).await?;
         let result: AlertCreateResult = bind::mutate(
@@ -724,7 +724,7 @@ impl Contact {
         token: &CallerToken,
         wait: DurationMs,
         cancelled: &CancellationToken,
-    ) -> CliResult<Polled> {
+    ) -> crate::error::Result<Polled> {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(wait.get());
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -770,7 +770,7 @@ impl Contact {
         bound: &Bound,
         question_id: QuestionId,
         token: &CallerToken,
-    ) -> CliResult<Question> {
+    ) -> crate::error::Result<Question> {
         if self.cancelled_by_the_client(call) {
             return self.cancel_for_the_call(bound, question_id, token).await;
         }
@@ -803,9 +803,9 @@ impl Contact {
         bound: &Bound,
         question_id: QuestionId,
         token: &CallerToken,
-    ) -> CliResult<Question> {
+    ) -> crate::error::Result<Question> {
         let mut client = bind::open(bound, self.build_id.clone()).await?;
-        let cancelled: CliResult<QuestionOwnResult> = bind::mutate(
+        let cancelled: crate::error::Result<QuestionOwnResult> = bind::mutate(
             &mut client,
             Method::QuestionCancelOwn,
             bound.target(),
@@ -841,7 +841,7 @@ impl Contact {
         }
     }
 
-    async fn session(&self) -> CliResult<Bound> {
+    async fn session(&self) -> crate::error::Result<Bound> {
         let mut held = self.bound.lock().await;
         if let Some(bound) = held.as_ref() {
             return Ok(bound.clone());
@@ -880,7 +880,7 @@ impl ServerHandler for Contact {
 /// # Errors
 ///
 /// Returns an error when the transport fails.
-pub async fn run_stdio(build_id: BuildId) -> CliResult<()> {
+pub async fn run_stdio(build_id: BuildId) -> crate::error::Result<()> {
     let contact = Contact::new(build_id);
     let calls = Arc::clone(&contact.calls);
     let transport = ServedTransport {
@@ -983,7 +983,7 @@ fn seconds(value: u64) -> DurationMs {
     DurationMs::new(value.saturating_mul(1_000))
 }
 
-fn parse_question(text: &str) -> CliResult<QuestionId> {
+fn parse_question(text: &str) -> crate::error::Result<QuestionId> {
     text.parse()
         .map_err(|_| CliError::Usage(Shown::said("the text given is not a question identifier")))
 }
@@ -994,7 +994,7 @@ fn encode_token(token: &CallerToken) -> String {
 }
 
 /// Reads a caller token the agent presented.
-fn decode_token(text: &str) -> CliResult<CallerToken> {
+fn decode_token(text: &str) -> crate::error::Result<CallerToken> {
     let trimmed = text.trim();
     if !trimmed.len().is_multiple_of(2) {
         return Err(CliError::Usage(Shown::said("that is not a caller token")));

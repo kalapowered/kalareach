@@ -1221,7 +1221,7 @@ impl BundleStore {
             vec![destination.service_origin.clone()],
             destination.bundle_locator.clone(),
         );
-        drop(crate::recovery::kit::render(&updated_kit)?);
+        drop(crate::recovery::kit::render_kit(&updated_kit)?);
         Ok(updated_kit)
     }
 

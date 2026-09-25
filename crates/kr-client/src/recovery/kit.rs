@@ -60,7 +60,7 @@ pub const MAX_RECOVERY_KIT_BYTES: usize = 1024;
 /// [`RecoveryError::UnprintableKit`] when an origin or the locator carries a character a
 /// line-oriented document cannot hold, and [`RecoveryError::KitTooLarge`] when the document would
 /// not fit a scannable QR code.
-pub fn render(kit: &RecoveryKit) -> Result<Zeroizing<String>, RecoveryError> {
+pub fn render_kit(kit: &RecoveryKit) -> Result<Zeroizing<String>, RecoveryError> {
     if kit.profile_version.get() != RECOVERY_KIT_PROFILE_VERSION {
         return Err(RecoveryError::UnsupportedProfile {
             version: kit.profile_version.get(),
@@ -132,7 +132,7 @@ pub fn render(kit: &RecoveryKit) -> Result<Zeroizing<String>, RecoveryError> {
 ///
 /// See [`render`].
 pub fn qr_payload(kit: &RecoveryKit) -> Result<Zeroizing<Vec<u8>>, RecoveryError> {
-    Ok(Zeroizing::new(render(kit)?.as_bytes().to_vec()))
+    Ok(Zeroizing::new(render_kit(kit)?.as_bytes().to_vec()))
 }
 
 /// Reads a kit back from the printed or scanned document.
@@ -145,7 +145,7 @@ pub fn qr_payload(kit: &RecoveryKit) -> Result<Zeroizing<Vec<u8>>, RecoveryError
 /// Returns [`RecoveryError::MalformedKit`] when the document is not this format,
 /// [`RecoveryError::UnsupportedProfile`] for another profile, and
 /// [`RecoveryError::MistypedKit`] when the checksum does not match the seed.
-pub fn parse(document: &str) -> Result<RecoveryKit, RecoveryError> {
+pub fn parse_kit(document: &str) -> Result<RecoveryKit, RecoveryError> {
     if document.len() > MAX_RECOVERY_KIT_BYTES {
         return Err(RecoveryError::KitTooLarge {
             len: document.len(),

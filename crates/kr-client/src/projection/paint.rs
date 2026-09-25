@@ -28,8 +28,8 @@
 //! a space for each cell of it that is inside, which keeps every later cell on its own column.
 
 use kr_protocol::projection::{
-    CellBlink, CellColour, CellRendition, CellRendition as Pen, CellRun, CellUnderline,
-    CellVerticalAlign, ProjectedBuffer, ProjectedRow,
+    CellBlink, CellColour, CellRendition, CellRun, CellUnderline, CellVerticalAlign,
+    ProjectedBuffer, ProjectedRow,
 };
 use kr_term::unicode;
 
@@ -341,7 +341,7 @@ struct Writer<'a> {
     /// `None` until something sets it, because a writer that assumed the destination started plain
     /// would skip the first rendition when it happens to be the default one and leave a row drawn
     /// in whatever the destination already had.
-    pen: Option<Pen>,
+    pen: Option<CellRendition>,
     /// The hyperlink currently open, so a run does not reopen the one it is already inside.
     link: Option<String>,
     comparison: Comparison,
