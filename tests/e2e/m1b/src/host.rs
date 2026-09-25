@@ -383,15 +383,18 @@ impl<'r> Host<'r> {
         // A closed session's worker ends and the daemon then removes its job, so the daemon stays
         // up until the jobs it defined are gone.
         let started = Instant::now();
-        while started.elapsed() < RETIREMENT && !self.run.loaded_jobs().is_empty() {
+        while started.elapsed() < RETIREMENT
+            && !self.run.loaded_jobs().is_ok_and(|loaded| loaded.is_empty())
+        {
             std::thread::sleep(Duration::from_millis(500));
         }
-        let loaded = self.run.loaded_jobs();
-        if !loaded.is_empty() {
-            problems.push(format!(
+        match self.run.loaded_jobs() {
+            Ok(loaded) if loaded.is_empty() => {}
+            Ok(loaded) => problems.push(format!(
                 "the daemon had not removed these jobs within {RETIREMENT:?}: {}",
                 loaded.join(", ")
-            ));
+            )),
+            Err(why) => problems.push(why),
         }
         if let Err(problem) = self.stop_daemon() {
             problems.push(problem);
@@ -404,12 +407,8 @@ impl<'r> Host<'r> {
     }
 
     fn close_sessions(&self) -> Result<(), String> {
-        let Ok(output) = self.kr_within(&["list", "--json"], CLEANUP_COMMAND) else {
-            return Err("the daemon did not list its sessions".to_owned());
-        };
-        let listed = document(&output.stdout).unwrap_or(Value::Null);
         let mut problems = Vec::new();
-        for session in listed["sessions"].as_array().cloned().unwrap_or_default() {
+        for session in self.listed_sessions()? {
             let display = session["display_number"].to_string();
             let closed = self.kr_within(&["close", &display, "--json"], CLEANUP_COMMAND);
             if !closed.is_ok_and(|output| output.status.success()) {
@@ -417,13 +416,19 @@ impl<'r> Host<'r> {
             }
         }
         let started = Instant::now();
-        while started.elapsed() < LIVENESS {
-            let open = self
-                .kr_within(&["list", "--json"], CLEANUP_COMMAND)
-                .ok()
-                .and_then(|output| document(&output.stdout).ok())
-                .and_then(|listed| listed["sessions"].as_array().map(Vec::len));
-            if open == Some(0) {
+        loop {
+            let open = self.listed_sessions();
+            if open.as_ref().is_ok_and(Vec::is_empty) {
+                break;
+            }
+            if started.elapsed() >= LIVENESS {
+                problems.push(match open {
+                    Ok(open) => format!(
+                        "{} sessions were still open {LIVENESS:?} after they were closed",
+                        open.len()
+                    ),
+                    Err(why) => why,
+                });
                 break;
             }
             std::thread::sleep(Duration::from_millis(250));
@@ -433,6 +438,28 @@ impl<'r> Host<'r> {
         } else {
             Err(problems.join("; "))
         }
+    }
+
+    /// The sessions `kr list` names.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the list was not read: a `kr` that did not answer, failed or answered something
+    /// that is not a list of sessions has not said that there are none.
+    fn listed_sessions(&self) -> Result<Vec<Value>, String> {
+        let output = self
+            .kr_within(&["list", "--json"], CLEANUP_COMMAND)
+            .map_err(|why| format!("the daemon did not list its sessions: {why}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "the daemon did not list its sessions: kr list ended with {}",
+                output.status
+            ));
+        }
+        document(&output.stdout)
+            .ok()
+            .and_then(|listed| listed["sessions"].as_array().cloned())
+            .ok_or_else(|| "kr list answered something that is not a list of sessions".to_owned())
     }
 
     fn stop_daemon(&self) -> Result<(), String> {

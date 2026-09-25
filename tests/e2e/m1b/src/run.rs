@@ -257,8 +257,10 @@ impl Run {
             ),
             Err(why) => left.push(why),
         }
-        let jobs = self.loaded_jobs();
-        left.extend(jobs.iter().map(|job| format!("the launchd job {job}")));
+        match self.loaded_jobs() {
+            Ok(jobs) => left.extend(jobs.iter().map(|job| format!("the launchd job {job}"))),
+            Err(why) => left.push(why),
+        }
         left.extend(
             self.undiscovered
                 .lock()
@@ -282,15 +284,23 @@ impl Run {
     ///
     /// On macOS the daemon writes a definition for each worker's launchd job into its
     /// environment's jobs directory, and removes it once the job has gone. Every other supervisor
-    /// leaves no job of this kind behind, so elsewhere this is always empty.
-    #[must_use]
-    pub fn loaded_jobs(&self) -> Vec<String> {
+    /// leaves no job of this kind behind, so elsewhere this is always empty. A job `launchctl` gave
+    /// no clear answer about is listed as loaded, with the answer it gave.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the definitions could not be read, which says nothing about which jobs are
+    /// loaded.
+    pub fn loaded_jobs(&self) -> Result<Vec<String>, String> {
         if !cfg!(target_os = "macos") {
-            return Vec::new();
+            return Ok(Vec::new());
         }
+        let labels = self.defined_jobs().map_err(|why| {
+            format!("the jobs this run's daemon defined could not be listed: {why}")
+        })?;
         let uid = rustix::process::getuid().as_raw();
         let mut loaded = Vec::new();
-        for label in self.defined_jobs() {
+        for label in labels {
             for domain in [format!("gui/{uid}"), format!("user/{uid}")] {
                 let target = format!("{domain}/{label}");
                 let mut print = std::process::Command::new("/bin/launchctl");
@@ -307,7 +317,7 @@ impl Run {
                 }
             }
         }
-        loaded
+        Ok(loaded)
     }
 
     /// Removes every launchd job this run's daemon defined and still has loaded.
@@ -315,7 +325,11 @@ impl Run {
     /// For a run that failed part way: launchd ends whatever still runs inside a job it removes,
     /// and each job is named by the label this run's own daemon gave it.
     pub fn remove_loaded_jobs(&self) {
-        for target in self.loaded_jobs() {
+        let Ok(targets) = self.loaded_jobs() else {
+            // Which jobs to remove is not known; the closing check says why.
+            return;
+        };
+        for target in targets {
             let target = target.split(' ').next().unwrap_or_default().to_owned();
             let mut bootout = std::process::Command::new("/bin/launchctl");
             bootout.args(["bootout", &target]);
@@ -401,18 +415,39 @@ impl Run {
     }
 
     /// The labels of every job definition this run's daemon wrote.
-    fn defined_jobs(&self) -> Vec<String> {
+    ///
+    /// # Errors
+    ///
+    /// Returns why a directory of definitions could not be read. A directory the daemon never
+    /// made holds none; one that could not be read has not said which it holds.
+    fn defined_jobs(&self) -> Result<Vec<String>, String> {
+        let unread = |directory: &Path, error: std::io::Error| {
+            format!("{} could not be read: {error}", directory.display())
+        };
         let environments = self.root.join("s").join("environments");
-        let Ok(entries) = std::fs::read_dir(environments) else {
-            return Vec::new();
+        let entries = match std::fs::read_dir(&environments) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(unread(&environments, error)),
         };
         let mut labels = Vec::new();
-        for environment in entries.flatten() {
-            let Ok(jobs) = std::fs::read_dir(environment.path().join("jobs")) else {
+        for environment in entries {
+            let environment = environment.map_err(|error| unread(&environments, error))?;
+            let is_directory = environment
+                .file_type()
+                .map_err(|error| unread(&environment.path(), error))?
+                .is_dir();
+            if !is_directory {
                 continue;
+            }
+            let directory = environment.path().join("jobs");
+            let jobs = match std::fs::read_dir(&directory) {
+                Ok(jobs) => jobs,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(unread(&directory, error)),
             };
-            for job in jobs.flatten() {
-                let path = job.path();
+            for job in jobs {
+                let path = job.map_err(|error| unread(&directory, error))?.path();
                 if path
                     .extension()
                     .is_some_and(|extension| extension == "plist")
@@ -422,7 +457,7 @@ impl Run {
                 }
             }
         }
-        labels
+        Ok(labels)
     }
 }
 
