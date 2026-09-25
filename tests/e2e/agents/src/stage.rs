@@ -35,14 +35,21 @@ use kr_protocol::recovery::{EventsSnapshotParams, EventsSnapshotResult};
 use kr_protocol::scalars::{CanonicalSet, Nullable};
 
 use crate::build::Build;
+use crate::provenance::{PATH_FILE, Provenance};
 
 /// The prompt the run's own startup file sets, so a part knows the shell reads.
 pub const PROMPT: &str = "kr-agents$ ";
 
-/// The run's own startup file for the session's shell: a prompt, and nothing of anybody's own.
-/// `kr shell install` adds the marked entry that loads the package's integration after it.
-const ZSHRC: &str =
-    "PROMPT='kr-agents$ '\nRPROMPT=''\nHISTFILE=''\nsetopt no_beep\nunsetopt prompt_sp\n";
+/// The run's own startup file for the session's shell: a prompt, a hook that writes the PATH the
+/// shell searches to the run's home before each prompt, and nothing of anybody's own. `kr shell
+/// install` adds the marked entry that loads the package's integration after it.
+fn startup_file() -> String {
+    format!(
+        "PROMPT='kr-agents$ '\nRPROMPT=''\nHISTFILE=''\nsetopt no_beep\nunsetopt prompt_sp\n\
+         kr_agents_path() {{ print -r -- \"$PATH\" >| \"$ZDOTDIR/{PATH_FILE}\" }}\n\
+         precmd_functions+=(kr_agents_path)\n"
+    )
+}
 
 /// The catalogue the package is installed from, as this host names it.
 pub const CATALOGUE: &str = "development";
@@ -302,25 +309,46 @@ pub fn free_port() -> u16 {
     closed_port()
 }
 
+/// The directories a session searches, in order: the run's link to the installed build, the run's
+/// links to the runtimes the build needs, and the system's own.
+#[must_use]
+pub fn session_path(run: &Run) -> String {
+    let agent = run.root().join("agent");
+    [agent.join("current").join("bin"), agent.join("runtime")]
+        .iter()
+        .map(|directory| directory.display().to_string())
+        .chain(["/usr/bin".to_owned(), "/bin".to_owned()])
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
 /// The directory the session's PATH names first, `agent/current/bin` in the run's directory:
 /// `current` is a link to an installed build, so an upgrade is one atomic change of that link.
+/// Beside it, `agent/runtime` holds a link to each runtime the build needs and nothing else.
 #[derive(Clone, Debug)]
 pub struct Installation {
     current: PathBuf,
 }
 
 impl Installation {
-    /// Links `current` to the build installed at `prefix`.
+    /// Links `current` to the build installed at `prefix`, and each of `runtime`'s executables
+    /// into `agent/runtime` by its own name.
     ///
     /// # Panics
     ///
-    /// Panics when the link cannot be made.
+    /// Panics when a link cannot be made.
     #[must_use]
-    pub fn link(run: &Run, prefix: &Path) -> Self {
+    pub fn link(run: &Run, prefix: &Path, runtime: &[PathBuf]) -> Self {
         let directory = run.root().join("agent");
-        kr_ipc::paths::create_private_tree(run.root(), &directory).expect("the installation");
+        let runtimes = directory.join("runtime");
+        kr_ipc::paths::create_private_tree(run.root(), &runtimes).expect("the installation");
         let current = directory.join("current");
         std::os::unix::fs::symlink(prefix, &current).expect("links the installed build");
+        for executable in runtime {
+            let name = executable.file_name().expect("a runtime executable's name");
+            std::os::unix::fs::symlink(executable, runtimes.join(name))
+                .unwrap_or_else(|error| panic!("links {}: {error}", executable.display()));
+        }
         Self { current }
     }
 
@@ -344,16 +372,15 @@ impl Installation {
 }
 
 /// The environment a session is created with, and so the environment its shell and the agent
-/// run in: the host's own variables for `kr`, PATH naming the installation first, the run's home
-/// as the home and the startup directory, every proxy variable at a loopback port nothing listens
-/// on (loopback itself excepted, where a terminal route's own server listens), and the build's
-/// own switches.
+/// run in: the host's own variables for `kr`, the run's PATH ([`session_path`]), the run's home as
+/// the home and the startup directory, every proxy variable at a loopback port nothing listens on
+/// (loopback itself excepted, where a terminal route's own server listens), and the build's own
+/// switches.
 #[must_use]
 pub fn session_variables(
     host: &Host<'_>,
     shell: &ManagedShell,
     build: &Build,
-    installation: &Installation,
     closed: u16,
 ) -> Vec<(String, String)> {
     let home = host.run().home().display().to_string();
@@ -367,15 +394,7 @@ pub fn session_variables(
     // terminal it names, and an agent that turns an enhanced protocol on reads keys only from a
     // terminal that supplies it. The session's own TERM is the host's, whatever this names.
     variables.push(("TERM".to_owned(), Keyboard::PROFILE.to_owned()));
-    let mut path = vec![installation.bin().display().to_string()];
-    path.extend(
-        build
-            .runtime_path
-            .iter()
-            .map(|directory| directory.display().to_string()),
-    );
-    path.extend(["/usr/bin".to_owned(), "/bin".to_owned()]);
-    variables.push(("PATH".to_owned(), path.join(":")));
+    variables.push(("PATH".to_owned(), session_path(host.run())));
     variables.push(("ZDOTDIR".to_owned(), home));
     variables.push(("SHELL".to_owned(), shell.executable.display().to_string()));
     variables.push(("LANG".to_owned(), "en_US.UTF-8".to_owned()));
@@ -406,7 +425,7 @@ pub fn session_variables(
 /// Panics when either step fails.
 pub fn prepare_home(host: &Host<'_>, variables: &[(String, String)]) {
     let home = host.run().home();
-    std::fs::write(home.join(".zshrc"), ZSHRC).expect("writes the startup file");
+    std::fs::write(home.join(".zshrc"), startup_file()).expect("writes the startup file");
     let mut install = host.command(&["shell", "install", "--json"]);
     install.envs(variables.iter().cloned());
     let installed =
@@ -417,6 +436,71 @@ pub fn prepare_home(host: &Host<'_>, variables: &[(String, String)]) {
         String::from_utf8_lossy(&installed.stdout),
         String::from_utf8_lossy(&installed.stderr)
     );
+}
+
+/// Starts a session the way a person does, `kr new` at a terminal, with `home` as the session's
+/// home and no agent, reads the default keychain its shell sees with `security default-keychain`,
+/// which changes nothing, ends the session, and returns the line `security` printed.
+///
+/// The session's shell reads the run's own startup file, not the person's, so nothing of theirs
+/// runs; what the keychain search depends on, the home the session names, is theirs.
+///
+/// # Panics
+///
+/// Panics when the session does not start, or `security` prints no keychain.
+#[must_use]
+pub fn default_keychain_of_a_session(host: &Host<'_>, shell: &ManagedShell, home: &Path) -> String {
+    let run = host.run();
+    let mut variables: Vec<(String, String)> = host
+        .variables()
+        .into_iter()
+        .filter(|(name, _)| name != "TERM")
+        .collect();
+    variables.push(("TERM".to_owned(), Keyboard::PROFILE.to_owned()));
+    variables.push(("ZDOTDIR".to_owned(), run.home().display().to_string()));
+    variables.push(("SHELL".to_owned(), shell.executable.display().to_string()));
+    variables.push(("LANG".to_owned(), "en_US.UTF-8".to_owned()));
+    // The run's startup file and the package integration are installed with the run's home.
+    prepare_home(host, &variables);
+    for (name, value) in &mut variables {
+        if name == "HOME" {
+            *value = home.display().to_string();
+        }
+    }
+    let work = run.work().display().to_string();
+    let executable = shell.executable.display().to_string();
+    let mut window = Window::open(
+        run,
+        "a session with the person's own home",
+        &run.binary("kr"),
+        &[
+            "new",
+            "--attach",
+            "--headless",
+            "--shell",
+            &executable,
+            "--shell-mode",
+            "managed",
+            "--startup",
+            "interactive",
+            "--cwd",
+            &work,
+        ],
+        run.root(),
+        &variables,
+    );
+    answered(&window, window.answer_capability_queries(0));
+    let _ = window.wait_for_screen(PROMPT.trim_end(), "the managed shell reads at its terminal");
+    window.type_text(b"/usr/bin/security default-keychain\r");
+    let rows = window.wait_for_screen(".keychain", "security names the default keychain");
+    let named = rows
+        .iter()
+        .find(|row| row.contains(".keychain") && !row.contains("security default-keychain"))
+        .map(|row| row.trim().to_owned())
+        .expect("a keychain row");
+    window.type_text(b"exit\r");
+    let _ = window.exit_code(LIVENESS);
+    named
 }
 
 /// One managed session on a terminal of its own: `kr new --attach` in a window.
@@ -602,23 +686,33 @@ pub struct AgentProcess {
 /// the agent's execution: the program the shell started for the command, which is the root shell's
 /// own child whatever it calls itself, and every process beneath it that belongs to the build.
 ///
-/// A process belongs to the build when its command line names one of `marks`, or the file it
-/// executes lies in one of them: the build's own directory, its runtime's, and the run's link to
-/// the installation. A helper an agent starts from somewhere else, such as a probe it unpacks into
-/// its home and runs for a moment, is recorded with the run all the same, and ended with it, but it
-/// is not the execution a part watches.
+/// A process belongs to the build when its command line names one of the provenance's marks, or
+/// the file it executes lies in one of them: the build's own directory, its runtime's, and the
+/// run's link to the installation. A helper an agent starts from somewhere else, such as a probe it
+/// unpacks into its home and runs for a moment, is recorded with the run all the same, and ended
+/// with it, but it is not the execution a part watches.
+///
+/// Before the command is typed, the PATH the shell searches is checked, and once the agent draws
+/// its first screen the image every process beneath the shell runs is recorded and checked
+/// ([`Provenance`]).
 ///
 /// # Panics
 ///
-/// Panics when the agent does not draw `ready`, or nothing of the build runs beneath the shell.
+/// Panics when the agent does not draw `ready`, nothing of the build runs beneath the shell, or
+/// the session searched or ran anything but the build under test, its runtime, the run's own and
+/// the system's.
 #[must_use]
 pub fn launch(
     run: &Run,
     session: &Session,
     line: &str,
     ready: &str,
-    marks: &[PathBuf],
+    provenance: &Provenance,
 ) -> Vec<AgentProcess> {
+    let command = line.split_whitespace().next().expect("a command");
+    provenance
+        .check_path(command)
+        .unwrap_or_else(|why| panic!("{why}"));
     session.window.type_text(format!("{line}\r").as_bytes());
     let _ = session
         .window
@@ -626,11 +720,16 @@ pub fn launch(
     let started = Instant::now();
     let shell = u32::try_from(session.root_shell.pid.get()).expect("a process number");
     loop {
-        let found: Vec<AgentProcess> = beneath(run, &session.root_shell, "the agent")
-            .into_iter()
-            .filter(|process| process.parent == shell || belongs(process, marks))
+        let everything = beneath(run, &session.root_shell, "the agent");
+        let found: Vec<AgentProcess> = everything
+            .iter()
+            .filter(|process| process.parent == shell || belongs(process, provenance.marks()))
+            .cloned()
             .collect();
         if !found.is_empty() {
+            provenance
+                .record(&everything)
+                .unwrap_or_else(|why| panic!("{why}"));
             return found;
         }
         assert!(

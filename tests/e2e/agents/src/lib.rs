@@ -29,8 +29,14 @@
 //! # What an agent may do here
 //!
 //! It signs in nowhere and starts no turn. Its home and working directory are inside the run's own
-//! directory, every proxy variable names a loopback port nothing listens on, and the updater and
-//! telemetry switches its build entry names are set. Nothing it writes leaves that directory.
+//! directory, and the home holds a keychain of the run's own as its default one
+//! ([`keychain::RunKeychain`]), so a secret the agent writes stays there and nobody is asked to
+//! create a keychain. Every proxy variable names a loopback port nothing listens on, and the
+//! updater and telemetry switches its build entry names are set. Its shell searches only the
+//! run's link to the build, the run's links to the build's runtimes and the system's directories,
+//! and every executable image a process beneath its session runs is recorded with its digest and
+//! must lie in one of those places or the run's own directory ([`provenance::Provenance`]): a part
+//! whose session ran anything else did not test the pinned build, and says so.
 //!
 //! # Inputs
 //!
@@ -44,9 +50,13 @@
 #[cfg(unix)]
 pub mod build;
 #[cfg(unix)]
+pub mod keychain;
+#[cfg(unix)]
 pub mod observe;
 #[cfg(unix)]
 pub mod outcome;
+#[cfg(unix)]
+pub mod provenance;
 #[cfg(unix)]
 pub mod stage;
 

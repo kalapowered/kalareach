@@ -82,9 +82,11 @@ pub struct Build {
     /// The arguments typed after it, with `{port}` where a server's loopback port goes.
     #[serde(default)]
     pub arguments: Vec<String>,
-    /// Directories searched after the build's own `bin`, such as its runtime's.
+    /// The executables of the runtimes the build needs, such as `node`: each is linked into a
+    /// directory of the run's own that the session searches after the build's `bin`, so the
+    /// session's PATH names no directory another installation shares.
     #[serde(default)]
-    pub runtime_path: Vec<PathBuf>,
+    pub runtime: Vec<PathBuf>,
     /// Variables the build is started with: its updater and telemetry switches.
     #[serde(default)]
     pub environment: BTreeMap<String, String>,

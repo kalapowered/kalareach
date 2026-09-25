@@ -17,15 +17,19 @@ use std::time::Duration;
 
 use kr_client::cursors::StreamCursors;
 use kr_e2e_agents::build::{Build, Inputs, quote};
+use kr_e2e_agents::keychain::RunKeychain;
 use kr_e2e_agents::observe::{
     TYPED_PROMPT, announced, capability_states, live_bindings, typed_actions,
 };
 use kr_e2e_agents::outcome::Outcome;
+use kr_e2e_agents::provenance::Provenance;
 use kr_e2e_agents::stage::{
     AgentProcess, Installation, Installed, Keyboard, Owner, PROMPT, Replacement, Session,
-    closed_port, events_snapshot, free_port, inode_of, install, kill_daemon, launch, open_session,
-    place_forwarder, prepare_home, runtime, session_variables, text_image,
+    closed_port, default_keychain_of_a_session, events_snapshot, free_port, inode_of, install,
+    kill_daemon, launch, open_session, place_forwarder, prepare_home, runtime, session_variables,
+    text_image,
 };
+use kr_e2e_agents::{REQUIRE_VARIABLE, RESULT_VARIABLE};
 use kr_e2e_m1b::LIVENESS;
 use kr_e2e_m1b::ceremony;
 use kr_e2e_m1b::device::Device;
@@ -61,6 +65,7 @@ struct Stage<'a, 'r> {
     runtime: &'a tokio::runtime::Runtime,
     shell: &'a ManagedShell,
     installed: &'a Installed,
+    provenance: &'a Provenance,
 }
 
 /// What a part leaves for the stage to close.
@@ -98,6 +103,9 @@ fn on_stage(part: &str, body: impl FnOnce(&mut Stage<'_, '_>) -> Ending) {
     };
     let runtime = runtime();
     let run = Run::start(&format!("part {part}"));
+    // Before anything starts in the run's home: a keychain of its own, its default there.
+    let keychain = RunKeychain::create(&run.home());
+    let provenance = Provenance::new(&inputs.build, &run, &shell);
     place_forwarder(&run);
     let host = Host::start(
         &run,
@@ -122,6 +130,7 @@ fn on_stage(part: &str, body: impl FnOnce(&mut Stage<'_, '_>) -> Ending) {
             runtime: &runtime,
             shell: &shell,
             installed: &installed,
+            provenance: &provenance,
         };
         body(&mut stage)
     };
@@ -145,7 +154,12 @@ fn on_stage(part: &str, body: impl FnOnce(&mut Stage<'_, '_>) -> Ending) {
         .closing_check()
         .unwrap_or_else(|left| panic!("still running after part {part}: {left}"));
     println!("{checked}");
-    ending.outcome.append(&inputs.result);
+    drop(keychain);
+    let mut outcome = ending.outcome;
+    if let Some(evidence) = outcome.evidence.as_object_mut() {
+        evidence.insert("provenance".to_owned(), provenance.evidence());
+    }
+    outcome.append(&inputs.result);
 }
 
 /// The agent as a part runs it: its session, its processes, and the session its terminal route's
@@ -178,14 +192,8 @@ impl Agent {
 
 /// Links the build, prepares the run's home and returns the session environment.
 fn prepare(stage: &Stage<'_, '_>, prefix: &Path) -> (Installation, Vec<(String, String)>) {
-    let installation = Installation::link(stage.run, prefix);
-    let variables = session_variables(
-        stage.host,
-        stage.shell,
-        stage.build,
-        &installation,
-        closed_port(),
-    );
+    let installation = Installation::link(stage.run, prefix, &stage.build.runtime);
+    let variables = session_variables(stage.host, stage.shell, stage.build, closed_port());
     prepare_home(stage.host, &variables);
     let home = stage.run.home();
     for (relative, content) in &stage.build.home {
@@ -200,21 +208,6 @@ fn prepare(stage: &Stage<'_, '_>, prefix: &Path) -> (Installation, Vec<(String, 
         std::fs::write(&path, content).expect("writes the home file");
     }
     (installation, variables)
-}
-
-/// The directories whose presence in a process's command line or executable says it belongs to the
-/// build under test: the pinned build's and the newer one's, their runtimes', and the run's link to
-/// the installation, each as written and as resolved.
-fn marks(stage: &Stage<'_, '_>) -> Vec<PathBuf> {
-    let mut marks = vec![stage.build.prefix.clone(), stage.run.root().join("agent")];
-    marks.extend(stage.build.newer.iter().map(|newer| newer.prefix.clone()));
-    marks.extend(stage.build.runtime_path.iter().cloned());
-    let resolved: Vec<PathBuf> = marks
-        .iter()
-        .filter_map(|mark| std::fs::canonicalize(mark).ok())
-        .collect();
-    marks.extend(resolved);
-    marks
 }
 
 /// Starts the agent in a managed session of its own, and first its server where its terminal
@@ -242,7 +235,7 @@ fn start_agent(stage: &Stage<'_, '_>, variables: &[(String, String)], what: &str
             &session,
             &words.join(" "),
             &server.ready,
-            &marks(stage),
+            stage.provenance,
         );
         (session, processes)
     });
@@ -259,7 +252,7 @@ fn start_agent(stage: &Stage<'_, '_>, variables: &[(String, String)], what: &str
         &session,
         &stage.build.command_line(port),
         &stage.build.ready,
-        &marks(stage),
+        stage.provenance,
     );
     Agent {
         session,
@@ -710,7 +703,7 @@ fn a_running_agent_keeps_its_build_through_an_upgrade_and_the_newer_build_gets_t
             &second_session,
             &stage.build.command_line(free_port()),
             &newer.ready,
-            &marks(stage),
+            stage.provenance,
         );
         let newer_file =
             std::fs::canonicalize(newer.prefix.join(&newer.pinned)).expect("the newer file");
@@ -772,7 +765,7 @@ fn a_running_agent_keeps_its_build_through_an_upgrade_and_the_newer_build_gets_t
             &first.session,
             &stage.build.command_line(free_port()),
             &newer.ready,
-            &marks(stage),
+            stage.provenance,
         );
         let control = runs_its_build(&running_first, &pinned, pinned_inode);
         assert!(
@@ -1276,4 +1269,72 @@ fn a_path_typed_at_the_agent_is_terminal_input_that_reaches_its_composer() {
         });
         Ending::new(Outcome::passed("14.03a", TEST, evidence), agent.sessions())
     });
+}
+
+/// On macOS, a session a person starts with their own home keeps their own default keychain, the
+/// login keychain: the product's sessions leave the keychain search to the home the person gives
+/// them, and a keychain a program in a session looks for is found. This starts one with `kr new`,
+/// the home this test runs with and no agent, reads the default keychain its shell sees with
+/// `security default-keychain`, which changes nothing, and appends what it read to the result file.
+/// It is not a part of a case: it says whether a keychain request from a session can reach the
+/// person as a dialog through the product itself.
+#[test]
+fn a_session_started_with_a_persons_own_home_keeps_their_login_keychain_as_its_default() {
+    const TEST: &str =
+        "a_session_started_with_a_persons_own_home_keeps_their_login_keychain_as_its_default";
+    let required = std::env::var(REQUIRE_VARIABLE).is_ok_and(|value| value == "1");
+    let Some(result) = std::env::var_os(RESULT_VARIABLE)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    else {
+        assert!(
+            !required,
+            "{REQUIRE_VARIABLE}=1 and {RESULT_VARIABLE} names no file"
+        );
+        eprintln!("skipping: the own-home keychain check: {RESULT_VARIABLE} names no result file");
+        return;
+    };
+    if !cfg!(target_os = "macos") {
+        eprintln!("skipping: the own-home keychain check: keychains are macOS's");
+        return;
+    }
+    let home = PathBuf::from(std::env::var_os("HOME").expect("the person's home"));
+    let shell = match shells::managed_zsh() {
+        Ok(shell) => shell,
+        Err(why) if shells::required() => panic!("the own-home check's managed shell: {why}"),
+        Err(why) => {
+            eprintln!("skipping: the own-home keychain check: {why}");
+            return;
+        }
+    };
+    let run = Run::start("the person's own home");
+    let host = Host::start(
+        &run,
+        &HostOptions {
+            shell_packages: Some(shell.prefix.clone()),
+        },
+    );
+    let named = default_keychain_of_a_session(&host, &shell, &home);
+    host.stop()
+        .unwrap_or_else(|why| panic!("the host did not stop cleanly: {why}"));
+    let checked = run
+        .closing_check()
+        .unwrap_or_else(|left| panic!("still running after the own-home check: {left}"));
+    println!("{checked}");
+    let login = home
+        .join("Library")
+        .join("Keychains")
+        .join("login.keychain-db");
+    assert!(
+        named.contains(&login.display().to_string()),
+        "a session with the home {} names {named} as its default keychain, not {}",
+        home.display(),
+        login.display()
+    );
+    Outcome::passed(
+        "own-home",
+        TEST,
+        json!({ "home": home, "default_keychain": named }),
+    )
+    .append(&result);
 }
