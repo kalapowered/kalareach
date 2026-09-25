@@ -63,12 +63,15 @@ Every `cargo test` step that keeps each test's output captured runs with `--show
 prints what every passing test wrote under its name. A step that shows the output as it is written,
 with `--nocapture`, keeps its script's command. Before a step runs, its tests are built and listed
 by the step's own command, so the build and its features are the step's, with `kr-conformance` as
-Cargo's runner, which frames each binary's list with the binary's own path. Every test binary the
-build made then has to be run and read: a listing that fails, a binary the log never ran, and a log
-that cannot be read are each the step's error. A target whose manifest
-gives it a harness of its own (`harness = false`) is a program that prints neither a list nor
-verdicts: the runner does not run it while the tests are listed, it is run with the step, its exit
-status is the step's, and a comment on it is a reference.
+Cargo's runner, which frames each binary's list with the binary's own path. Cargo hands the same
+runner to rustdoc, and the programs rustdoc builds of a crate's documentation tests are none of the
+build's and are keyed nowhere, so the listing passes over them; a test binary whose list overlaps
+another program's cannot be read and is the step's error. Every test binary the build made then has
+to be run and read: a listing that fails, a binary the log never ran, and a log that cannot be read
+are each the step's error. A target whose manifest gives it a harness of its own
+(`harness = false`) is a program that prints neither a list nor verdicts: the runner does not run
+it while the tests are listed, it is run with the step, its exit status is the step's, and a
+comment on it is a reference.
 
 A test that no selected group runs on this platform is reported as not run, with the reason. It is
 never reported as passed.
