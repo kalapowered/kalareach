@@ -16,7 +16,9 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 /// Origins the product refuses, each with the rule it breaks.
 const REFUSED: &[(&str, &str)] = &[
@@ -74,6 +76,19 @@ printf '%s\n' "$1" >> "$STAND_IN_RECORD"
 exit 97
 "#;
 
+/// How many of the two tests that start the checker have ended. The companion that starts
+/// children beside them runs until both have.
+static ENDED: AtomicUsize = AtomicUsize::new(0);
+
+/// Counts its test as ended when it is dropped, whether the test returned or failed.
+struct Ending;
+
+impl Drop for Ending {
+    fn drop(&mut self) {
+        ENDED.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 /// A directory of one test's own on the internal disk, removed when the test ends.
 struct Scratch(PathBuf);
 
@@ -124,6 +139,7 @@ fn everything(output: &Output) -> String {
 
 #[test]
 fn the_checker_accepts_what_the_product_accepts_and_names_the_rule_a_refusal_breaks() {
+    let _ending = Ending;
     let scratch = Scratch::new("origin-checker");
     let checker = checker(&scratch.0);
     let check = |arguments: &[&str]| {
@@ -178,6 +194,7 @@ fn the_checker_accepts_what_the_product_accepts_and_names_the_rule_a_refusal_bre
 
 #[test]
 fn each_script_refuses_what_the_product_refuses_before_it_prints_builds_or_sends_it() {
+    let _ending = Ending;
     let scratch = Scratch::new("origin-scripts");
     let checker = checker(&scratch.0);
     let bin = scratch.0.join("bin");
@@ -263,4 +280,28 @@ fn each_script_refuses_what_the_product_refuses_before_it_prints_builds_or_sends
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Starts short-lived children, one after another, for as long as the two tests above run.
+///
+/// A child is handed a copy of every descriptor this process holds at the moment it starts, and
+/// keeps the copies until its own program takes over. A program another test of this process has
+/// just written can therefore still be held open for writing by a child that test never started,
+/// and the system refuses to start a program held open that way. This companion starts children
+/// all the time, so that the moment comes often rather than now and then. It is ignored by default
+/// and runs with `--include-ignored` and at least three test threads; run without the two tests
+/// beside it, it stops after a minute.
+#[test]
+#[ignore = "a load for the two tests beside it: run it with --include-ignored and three threads"]
+fn children_start_beside_the_tests_for_as_long_as_they_run() {
+    let bound = Instant::now() + Duration::from_secs(60);
+    while ENDED.load(Ordering::SeqCst) < 2 && Instant::now() < bound {
+        let status = Command::new("true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("a short-lived child starts");
+        assert!(status.success(), "a short-lived child ended with {status}");
+    }
 }
