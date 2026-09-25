@@ -516,11 +516,12 @@ pub fn to_base64url(bytes: &[u8]) -> String {
 ///
 /// # Errors
 ///
-/// Returns a message describing the first invalid character or length.
+/// Returns a message naming the rule the text broke and where, and never a symbol of the text:
+/// see [`decode_fault`].
 pub fn from_base64url(text: &str) -> Result<Vec<u8>, String> {
     URL_SAFE_NO_PAD
         .decode(text)
-        .map_err(|error| error.to_string())
+        .map_err(|error| decode_fault(&error))
 }
 
 /// Decodes unpadded base64url into a caller-supplied buffer.
@@ -531,12 +532,34 @@ pub fn from_base64url(text: &str) -> Result<Vec<u8>, String> {
 ///
 /// # Errors
 ///
-/// Returns a message describing the first invalid character or length. The buffer holds whatever
-/// was decoded before the failure.
+/// Returns a message naming the rule the text broke and where, and never a symbol of the text:
+/// see [`decode_fault`]. The buffer holds whatever was decoded before the failure.
 pub fn from_base64url_into(text: &str, buffer: &mut Vec<u8>) -> Result<(), String> {
     URL_SAFE_NO_PAD
         .decode_vec(text, buffer)
-        .map_err(|error| error.to_string())
+        .map_err(|error| decode_fault(&error))
+}
+
+/// What a failed decode says: which rule the text broke, and the offset or the length where it
+/// broke it.
+///
+/// Never the symbol the decoder refused. The text decoded here can carry a secret, a direct
+/// pairing invitation's among them, and a refused symbol is a symbol of that text, so a message
+/// that named it would print part of the secret. The offset is enough to find the fault in a text
+/// somebody holds.
+fn decode_fault(error: &base64::DecodeError) -> String {
+    match *error {
+        base64::DecodeError::InvalidByte(offset, _) => {
+            format!("the symbol at offset {offset} is not a base64url symbol")
+        }
+        base64::DecodeError::InvalidLength(length) => {
+            format!("{length} symbols is not the length of any base64url encoding")
+        }
+        base64::DecodeError::InvalidLastSymbol { offset, .. } => {
+            format!("the last symbol, at offset {offset}, sets bits past the last byte")
+        }
+        base64::DecodeError::InvalidPadding => "unpadded base64url carries no padding".to_owned(),
+    }
 }
 
 impl Serialize for Bytes {
@@ -1222,5 +1245,124 @@ impl<T: Ord + JsonSchema> JsonSchema for CanonicalSet<T> {
             "uniqueItems": true,
             "description": "A set encoded as a sequence in strictly ascending order. A sequence that is unsorted or repeats a member is rejected."
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The direct invitation the pairing fixture publishes, as the text a QR code carries. Its
+    /// canonical bytes hold the invitation's secret from byte 22 to byte 54, which is symbols 29
+    /// to 72 of the text.
+    fn direct_invitation() -> String {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../fixtures/pairing/codes.json"))
+                .expect("the pairing fixture");
+        fixture["qr"]["direct"]["text"]
+            .as_str()
+            .expect("a direct invitation")
+            .to_owned()
+    }
+
+    /// Everything a failure to read `text` says: both decoders' messages, and what reading it as
+    /// a QR payload reports through `Display` and `Debug`.
+    fn said_about(text: &str) -> Vec<String> {
+        let mut buffer = Vec::new();
+        let payload = crate::pairing::QrPayload::from_text(text).expect_err("not a payload");
+        vec![
+            from_base64url(text).expect_err("not base64url"),
+            from_base64url_into(text, &mut buffer).expect_err("not base64url"),
+            payload.to_string(),
+            format!("{payload:?}"),
+            format!("{payload:#?}"),
+        ]
+    }
+
+    /// Section 10: a direct invitation's text carries its secret, so a failure to decode it names
+    /// the rule and the offset and never a symbol it refused. Two different symbols planted at one
+    /// offset inside the secret are reported in the same words, and neither the marker nor any run
+    /// of the text is in them.
+    #[test]
+    fn a_decoding_failure_of_a_secret_bearing_payload_prints_no_symbol_of_it() {
+        let text = direct_invitation();
+        const OFFSET: usize = 40;
+        let planted = |symbol: char| {
+            let mut planted = text.clone();
+            planted.replace_range(OFFSET..=OFFSET, &symbol.to_string());
+            planted
+        };
+
+        let marked = said_about(&planted('~'));
+        assert_eq!(marked, said_about(&planted('%')));
+        for said in &marked {
+            assert!(!said.contains('~'), "{said}");
+            assert!(!said.contains("126") && !said.contains("0x7e"), "{said}");
+            assert!(said.contains(&format!("offset {OFFSET}")), "{said}");
+            for run in text.as_bytes().windows(8) {
+                let run = std::str::from_utf8(run).expect("base64url is ASCII");
+                assert!(!said.contains(run), "{said} carries {run}");
+            }
+        }
+    }
+
+    /// Section 10: a secret whose last symbol sets bits past its last byte is refused, in words
+    /// that name the offset and not the symbol, which is a symbol of the secret itself.
+    #[test]
+    fn a_secret_whose_last_symbol_sets_bits_past_its_last_byte_is_refused_without_that_symbol() {
+        let secret = to_base64url(&[0x7b; 32]);
+        assert!(secret.ends_with('s'), "the canonical last symbol");
+        let planted = |last: char| format!("{}{last}", &secret[..42]);
+
+        let marked = serde_json::from_str::<SecretBytes32>(&format!("\"{}\"", planted('t')))
+            .expect_err("bits past the last byte")
+            .to_string();
+        let other = serde_json::from_str::<SecretBytes32>(&format!("\"{}\"", planted('u')))
+            .expect_err("bits past the last byte")
+            .to_string();
+        assert_eq!(marked, other);
+        assert!(marked.contains("offset 42"), "{marked}");
+        assert!(
+            !marked.contains("'t'") && !marked.contains("0x74"),
+            "{marked}"
+        );
+
+        let decoded = from_base64url(&planted('t')).expect_err("bits past the last byte");
+        assert_eq!(
+            decoded,
+            from_base64url(&planted('u')).expect_err("bits past the last byte")
+        );
+        assert!(
+            !decoded.contains("'t'") && !decoded.contains("0x74"),
+            "{decoded}"
+        );
+
+        // The control: the canonical text is the secret.
+        assert_eq!(
+            serde_json::from_str::<SecretBytes32>(&format!("\"{secret}\""))
+                .expect("a secret")
+                .expose(),
+            &[0x7b; 32]
+        );
+    }
+
+    #[test]
+    fn a_decoding_failure_names_its_rule() {
+        for (text, rule) in [
+            ("AA*A", "offset 2 is not a base64url symbol"),
+            (
+                "AAAAA",
+                "5 symbols is not the length of any base64url encoding",
+            ),
+            (
+                "AB",
+                "the last symbol, at offset 1, sets bits past the last byte",
+            ),
+        ] {
+            let said = from_base64url(text).expect_err(text);
+            assert!(said.contains(rule), "{text}: {said}");
+        }
+        assert!(from_base64url("AA==").is_err());
+        assert_eq!(from_base64url("AA").expect("canonical"), [0]);
     }
 }
