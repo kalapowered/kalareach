@@ -20,27 +20,32 @@ import { RawTerminal } from '../terminal/RawTerminal'
 import { ask } from '../mobile/model/call'
 import { describeApplicationState, sessionDescription } from './Sessions'
 
-/** What the view has read of one session, and the prompt's generation as it knows it now. */
+/** What the view has read of one session. */
 interface SessionReading {
   readonly sessionId: string
-  readonly session: SessionReadResult | null
-  readonly surface: LaunchSurface | null
-  /** The one the surface was read at, or one heard since. */
-  readonly promptGeneration: string | null
+  readonly session: SessionReadResult
 }
 
-/** What `reading` holds for `sessionId`: nothing yet, when it holds another session's. */
-function readingOf(reading: SessionReading | null, sessionId: string): SessionReading {
-  return reading?.sessionId === sessionId
-    ? reading
-    : { sessionId, session: null, surface: null, promptGeneration: null }
-}
-
-/** What a watch that has every listener registered was started for. */
-interface Listening {
+/**
+ * A launch surface one watch read, and the prompt's generation as that watch knows it: the one
+ * the surface was read at, or one heard since.
+ *
+ * It belongs to that watch. It is offered only for the port, session and attempt the watch was
+ * started for, and it is gone once the watch ends, so the only surface ever offered is one read
+ * while the listeners that follow its prompt are registered.
+ */
+interface Launch {
+  readonly watch: Watch
   readonly port: HostPort
   readonly sessionId: string
   readonly attempt: number
+  readonly surface: LaunchSurface
+  readonly promptGeneration: string
+}
+
+/** `launch` with nothing from `watch` in it. */
+function without(launch: Launch | null, watch: Watch): Launch | null {
+  return launch?.watch === watch ? null : launch
 }
 
 /** The view of one session. */
@@ -53,28 +58,24 @@ export function Session({
 }): ReactNode {
   const { port, go, say, tabs, closeTab } = useApp()
   const [reading, setReading] = useState<SessionReading | null>(null)
+  const [launch, setLaunch] = useState<Launch | null>(null)
   const [connected, setConnected] = useState(true)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [closing, setClosing] = useState(false)
   // "Try again" registers the listeners again, and reads only once they are.
   const [attempt, setAttempt] = useState(0)
-  // The watch that has every listener registered, named by what it was started for. The launch
-  // surface is offered only while there is one, so no button is live while a change could go
-  // unheard.
-  const [listeningFor, setListeningFor] = useState<Listening | null>(null)
-  // The load of that watch, for a launch that asks the view to read again once it is done.
+  // The load of the watch that is listening now, for a launch that asks the view to read again.
   const reload = useRef<(() => void) | null>(null)
 
   // The session and its launch surface are read once the listeners are registered, and only
   // within that watch: a read it did not start, or an answer after it ended, is never shown.
   useEffect(() => {
-    // The changes heard in this watch, counted, so a read can tell whether one overtook it.
+    // The changes heard in this watch, counted, so a read can tell whether one overtook it, and
+    // the prompt generation it heard last.
     let connectionChanges = 0
     let generationChanges = 0
+    let heardGeneration: string | null = null
     let watching: Watch | null = null
-    const update = (change: (known: SessionReading) => SessionReading) => {
-      setReading((current) => change(readingOf(current, sessionId)))
-    }
     const load = () => {
       const current = watching?.read() ?? null
       if (current === null) return
@@ -83,7 +84,7 @@ export function Session({
       ask(() => port.sessionRead({ session_id: sessionId }))
         .then((result) => {
           if (!current()) return
-          update((known) => ({ ...known, session: result }))
+          setReading({ sessionId, session: result })
           // An answer says the host was reached when it was read; a change heard since is newer.
           if (connectionChanges === connectionAt) setConnected(true)
         })
@@ -92,20 +93,27 @@ export function Session({
         })
       ask(() => port.launchSurface({ session_id: sessionId }))
         .then((surface) => {
-          if (!current()) return
+          if (!current() || watching === null) return
           // A generation heard since this read was made is the prompt's, and the buttons drawn
           // from the read stay disabled until the person has looked at the prompt again.
           const overtaken = generationChanges !== generationAt
-          update((known) => ({
-            ...known,
+          setLaunch({
+            watch: watching,
+            port,
+            sessionId,
+            attempt,
             surface,
-            promptGeneration: overtaken ? known.promptGeneration : surface.prompt_generation
-          }))
+            promptGeneration: overtaken
+              ? (heardGeneration ?? surface.prompt_generation)
+              : surface.prompt_generation
+          })
         })
         .catch(() => {
           // Without a verified empty prompt there is no launch surface, which is the right answer
           // rather than a set of buttons drawn hopefully.
-          if (current()) update((known) => ({ ...known, surface: null }))
+          if (!current() || watching === null) return
+          const ended = watching
+          setLaunch((shown) => without(shown, ended))
         })
     }
     watching = watch(
@@ -119,26 +127,33 @@ export function Session({
           if (body.kind !== 'prompt_generation' || !body.prompt_generation) return
           // The launch surface is only valid at the generation it was read at. A generation that
           // moved disables the buttons rather than silently launching against the new prompt.
-          generationChanges += 1
           const generation = body.prompt_generation
-          update((known) => ({ ...known, promptGeneration: generation }))
+          generationChanges += 1
+          heardGeneration = generation
+          const hearing = watching
+          setLaunch((shown) =>
+            shown !== null && shown.watch === hearing
+              ? { ...shown, promptGeneration: generation }
+              : shown
+          )
         })
       ],
       () => {
         reload.current = load
-        setListeningFor({ port, sessionId, attempt })
         load()
       },
       () => {
         // A view that cannot follow the host says so and offers no launch. Its banner's "Try
         // again" registers the listeners again before it reads.
-        setListeningFor(null)
+        const failed = watching
+        if (failed !== null) setLaunch((shown) => without(shown, failed))
         setConnected(false)
       }
     )
     const started = watching
     return () => {
       started.stop()
+      setLaunch((shown) => without(shown, started))
       if (reload.current === load) reload.current = null
     }
   }, [port, sessionId, attempt])
@@ -147,14 +162,14 @@ export function Session({
     reload.current?.()
   }, [])
 
-  const known = reading?.sessionId === sessionId ? reading : null
-  const listening =
-    listeningFor !== null &&
-    listeningFor.port === port &&
-    listeningFor.sessionId === sessionId &&
-    listeningFor.attempt === attempt
-  const session = known?.session ?? null
-  const surface = listening ? (known?.surface ?? null) : null
+  const session = reading?.sessionId === sessionId ? reading.session : null
+  const offered =
+    launch !== null &&
+    launch.port === port &&
+    launch.sessionId === sessionId &&
+    launch.attempt === attempt
+      ? launch
+      : null
 
   const summary = session?.session
   const state = summary ? describeApplicationState(summary) : null
@@ -260,8 +275,8 @@ export function Session({
           subject={subject}
           connected={connected}
           launch={
-            surface
-              ? { surface, promptGeneration: known?.promptGeneration ?? surface.prompt_generation }
+            offered
+              ? { surface: offered.surface, promptGeneration: offered.promptGeneration }
               : null
           }
           onLaunched={readAgain}
