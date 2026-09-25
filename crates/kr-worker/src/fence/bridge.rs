@@ -133,13 +133,13 @@ impl BridgeServer {
                     observed,
                 ));
             }
-            let mut writing = tokio::spawn(write_outbound(
+            let mut writing = Writing(tokio::spawn(write_outbound(
                 writer,
                 receiving,
                 Arc::clone(&self.runtime),
                 self.holds.clone(),
-            ));
-            self.pump(&mut reader, &mut writing).await;
+            )));
+            self.pump(&mut reader, &mut writing.0).await;
             // The connection has ended. The driver stops queueing for it and the session hears that
             // its integration has gone, before the writer is waited on at all: a peer that has
             // stopped reading its own socket must not be able to hold up the loss that releases
@@ -151,7 +151,7 @@ impl BridgeServer {
                 driver.stop_sending();
                 driver.integration_lost(IntegrationLoss::BridgeDisconnected)
             });
-            writing.abort();
+            drop(writing);
             if self.runtime.state() == kr_protocol::session::SessionState::Closed {
                 return;
             }
@@ -263,7 +263,20 @@ impl Holds {
             None => {}
             Some(FenceHold::For(hold)) => tokio::time::sleep(*hold).await,
             Some(FenceHold::Gate(gate)) => {
-                let _ = gate.0.subscribe().wait_for(|closed| !*closed).await;
+                gate.0.arrived.send_modify(|arrived| *arrived += 1);
+                let _ = gate.0.closed.subscribe().wait_for(|closed| !*closed).await;
+            }
+        }
+    }
+
+    /// Notes, for a test that asked through a gate, what the session still kept behind a fence at
+    /// the moment a published fence reached the socket.
+    #[cfg(feature = "testing")]
+    fn after_fence(&self, runtime: &SessionRuntime) {
+        if let Some(FenceHold::Gate(gate)) = &self.fence {
+            let kept = runtime.session().waiting_for_fence();
+            if let Ok(mut written) = gate.0.written.lock() {
+                written.push(kept);
             }
         }
     }
@@ -283,27 +296,86 @@ pub enum FenceHold {
     Gate(FenceGate),
 }
 
-/// A gate a test opens and closes on published fences, for this host's own tests.
+/// A gate a test opens and closes on published fences, and what it saw of them, for this host's
+/// own tests.
+///
+/// It tells the test when a writer has come to it, so what the test reads next is read with the
+/// fence known to be unwritten; and it notes, the moment each fence reaches the socket, what the
+/// session still kept behind a fence, so a test can see that input went only after its fence did.
 #[cfg(feature = "testing")]
 #[derive(Clone, Debug)]
-pub struct FenceGate(Arc<tokio::sync::watch::Sender<bool>>);
+pub struct FenceGate(Arc<GateState>);
+
+/// What one gate holds.
+#[cfg(feature = "testing")]
+#[derive(Debug)]
+struct GateState {
+    /// Whether the gate is closed.
+    closed: tokio::sync::watch::Sender<bool>,
+    /// How many published fences writers have brought to the gate.
+    arrived: tokio::sync::watch::Sender<usize>,
+    /// For each published fence written through the gate, in order, how many batches the session
+    /// still kept behind a fence as it reached the socket.
+    written: std::sync::Mutex<Vec<usize>>,
+}
 
 #[cfg(feature = "testing")]
 impl FenceGate {
     /// Returns a gate that starts closed.
     #[must_use]
     pub fn closed() -> Self {
-        Self(Arc::new(tokio::sync::watch::Sender::new(true)))
+        Self(Arc::new(GateState {
+            closed: tokio::sync::watch::Sender::new(true),
+            arrived: tokio::sync::watch::Sender::new(0),
+            written: std::sync::Mutex::new(Vec::new()),
+        }))
     }
 
     /// Lets every fence that is waiting, and every later one, be written.
     pub fn open(&self) {
-        self.0.send_replace(false);
+        self.0.closed.send_replace(false);
     }
 
     /// Keeps the next fence the writer comes to waiting.
     pub fn close(&self) {
-        self.0.send_replace(true);
+        self.0.closed.send_replace(true);
+    }
+
+    /// Waits until writers have brought `count` published fences to the gate.
+    ///
+    /// A writer brings one only once it has taken it from its queue, and everything it would do
+    /// with the fence before writing it, it has done by then.
+    pub async fn arrived(&self, count: usize) {
+        let _ = self
+            .0
+            .arrived
+            .subscribe()
+            .wait_for(|arrived| *arrived >= count)
+            .await;
+    }
+
+    /// Returns, for each published fence written through the gate so far, how many batches the
+    /// session still kept behind a fence as it reached the socket.
+    #[must_use]
+    pub fn kept_as_written(&self) -> Vec<usize> {
+        self.0
+            .written
+            .lock()
+            .map(|written| written.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// The writer's task, ended with the loop that owns its connection, however that loop ends.
+///
+/// The writer holds the session's runtime and the driver holds the writer's queue, so a writer
+/// left running by a loop that was itself ended would keep both alive for as long as its
+/// connection lasted.
+struct Writing(tokio::task::JoinHandle<()>);
+
+impl Drop for Writing {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -330,9 +402,14 @@ async fn write_outbound(
                 #[cfg(feature = "testing")]
                 holds.before_fence().await;
                 fence_frame = Some(frame);
-                writer
+                let sent = writer
                     .send_publication(FencePublication::Published(*fence))
-                    .await
+                    .await;
+                #[cfg(feature = "testing")]
+                if sent.is_ok() {
+                    holds.after_fence(&runtime);
+                }
+                sent
             }
             Outbound::Withheld { reason, state } => {
                 writer

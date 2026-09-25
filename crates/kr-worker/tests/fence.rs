@@ -1004,8 +1004,9 @@ async fn held_keys_reach_the_shell_only_once_their_fence_is_written() {
     let mut wired = wired_holding_fences(&clock, Some(&gate)).await;
     let holder = wired.holder();
     let fence_id = fenced_with(&mut wired, holder, Some(b"held-keys\n")).await;
-    // The machine published the fence and let the keys go on one step. The writer is keeping the
-    // fence, so the session keeps the keys.
+    // The machine published the fence and let the keys go on one step. The writer has the fence
+    // and is keeping it, so the session keeps the keys.
+    gate.arrived(1).await;
     assert_eq!(
         waiting(&wired.runtime),
         1,
@@ -1022,6 +1023,11 @@ async fn held_keys_reach_the_shell_only_once_their_fence_is_written() {
     assert_eq!(fence.fence_id, fence_id);
     echoed(&wired.runtime, b"held-keys").await;
     assert_eq!(waiting(&wired.runtime), 0);
+    assert_eq!(
+        gate.kept_as_written(),
+        [1],
+        "the keys were still kept when the fence reached the socket"
+    );
     wired.close().await;
 }
 
@@ -1037,6 +1043,7 @@ async fn keys_typed_while_their_fence_is_on_its_way_wait_for_it() {
     let mut wired = wired_holding_fences(&clock, Some(&gate)).await;
     let holder = wired.holder();
     let _ = fenced_with(&mut wired, holder, None).await;
+    gate.arrived(1).await;
 
     type_keys(&wired, holder, 0, b"typed-keys\n");
     assert!(
@@ -1063,6 +1070,11 @@ async fn keys_typed_while_their_fence_is_on_its_way_wait_for_it() {
     gate.open();
     published(&mut wired).await;
     echoed(&wired.runtime, b"typed-keys").await;
+    assert_eq!(
+        gate.kept_as_written(),
+        [1],
+        "the keys were still kept when the fence reached the socket"
+    );
     wired.close().await;
 }
 
@@ -1081,6 +1093,7 @@ async fn keys_behind_a_fence_never_written_go_once_the_loss_is_recorded() {
     let mut wired = wired_holding_fences(&clock, Some(&gate)).await;
     let holder = wired.holder();
     let _ = fenced_with(&mut wired, holder, Some(b"stranded-keys\n")).await;
+    gate.arrived(1).await;
     assert_eq!(waiting(&wired.runtime), 1, "the keys wait for their fence");
     tokio::time::sleep(WHILE_HELD).await;
     assert!(
@@ -1135,6 +1148,7 @@ async fn a_fence_not_written_within_its_limit_ends_the_connection_and_lets_the_k
     let mut wired = wired_holding_fences(&clock, Some(&gate)).await;
     let holder = wired.holder();
     let _ = fenced_with(&mut wired, holder, Some(b"waiting-keys\n")).await;
+    gate.arrived(1).await;
     assert_eq!(waiting(&wired.runtime), 1, "the keys wait for their fence");
 
     clock.advance(kr_worker::fence::FENCE_WRITE_LIMIT);
@@ -1183,6 +1197,7 @@ async fn a_takeover_that_times_out_lets_its_keys_go_while_an_earlier_fence_is_un
     let mut wired = wired_holding_fences(&clock, Some(&gate)).await;
     let first = wired.holder();
     let _ = fenced_with(&mut wired, first, None).await;
+    gate.arrived(1).await;
 
     let second = wired.holder();
     type_keys(&wired, second, 0, b"second-keys\n");
@@ -1238,6 +1253,7 @@ async fn keys_waiting_for_a_fence_go_when_the_reader_leaves_the_prompt() {
     let mut wired = wired_holding_fences(&clock, Some(&gate)).await;
     let holder = wired.holder();
     let _ = fenced_with(&mut wired, holder, None).await;
+    gate.arrived(1).await;
     type_keys(&wired, holder, 0, b"leaving-keys\n");
     assert_eq!(waiting(&wired.runtime), 1, "the keys wait for their fence");
 
@@ -1261,6 +1277,103 @@ async fn keys_waiting_for_a_fence_go_when_the_reader_leaves_the_prompt() {
         assert_eq!(session.waiting_for_fence(), 0);
     }
     gate.open();
+    wired.close().await;
+}
+
+/// KR-REQ-07.83, KR-REQ-07.79: a launch whose hold ends while the fence it reserved is still
+/// unwritten gives up the connection, and the keys it held go at the end of the hold.
+///
+/// The fence is still the machine's, so the keys may not go ahead of it. A writer that has kept a
+/// frame for a launch's whole hold is not delivering, and the connection is given up at once rather
+/// than at the write limit: the loss drops the fence, the keys go unfenced at the time the 250 ms
+/// rule gives, and the caller is told nothing can say whether a command was installed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_launch_that_times_out_behind_an_unwritten_fence_gives_up_the_connection() {
+    let clock = Arc::new(kr_transport::clock::ManualClock::new());
+    let gate = FenceGate::closed();
+    let mut wired = wired_holding_fences(&clock, Some(&gate)).await;
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let holder = holder_over(&mut client, &wired).await;
+    let _ = fenced_with(&mut wired, holder, None).await;
+    gate.arrived(1).await;
+
+    // The launch reserves the fence, and its request waits on the writer behind it.
+    let params = ShellLaunchParams {
+        session_id: wired.session_id,
+        command: LaunchCommand::QuotedCommand("true".to_owned()),
+        expected_prompt_generation: PromptGeneration::new(1),
+        expected_buffer_revision: EditorBufferRevision::new(1),
+    };
+    let target = wired.target();
+    let calling = tokio::spawn(async move {
+        client
+            .mutate(
+                Method::ShellLaunch,
+                ActionId::new(kr_ipc::new_uuid()),
+                target,
+                &params,
+            )
+            .await
+    });
+    tokio::time::timeout(SOON, async {
+        while wired.runtime.session().fence().expect("a driver").state()
+            != FenceState::LaunchReserved
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the launch reserved the fence");
+    type_keys(&wired, holder, 0, b"launch-held-keys\n");
+    assert_eq!(
+        wired
+            .runtime
+            .session()
+            .fence()
+            .expect("a driver")
+            .held()
+            .len(),
+        1,
+        "the machine holds what arrives while a launch is in flight"
+    );
+
+    // The launch's hold ends on the machine's own clock.
+    clock.advance(Duration::from_millis(250));
+    wired
+        .runtime
+        .session()
+        .fence()
+        .expect("a driver")
+        .waker()
+        .notify_one();
+    echoed(&wired.runtime, b"launch-held-keys").await;
+    {
+        let session = wired.runtime.session();
+        let driver = session.fence().expect("a driver");
+        assert!(
+            driver.fence().is_none(),
+            "the fence went with the connection"
+        );
+        assert_eq!(
+            driver.phase().phase(),
+            kr_shell_integration::contract::qualification::IntegrationPhase::Degraded,
+            "the loss was recorded before the keys went"
+        );
+        assert_eq!(session.waiting_for_fence(), 0);
+    }
+    let error = tokio::time::timeout(SOON, calling)
+        .await
+        .expect("the caller was answered")
+        .expect("joins")
+        .expect("reaches the worker")
+        .expect_err("refused");
+    assert_eq!(
+        error.code,
+        ErrorCode::OutcomeUnknown,
+        "nothing can say whether the reader installed the command"
+    );
     wired.close().await;
 }
 

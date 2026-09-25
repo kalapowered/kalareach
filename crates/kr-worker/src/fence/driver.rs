@@ -327,7 +327,7 @@ pub struct FenceDriver {
     /// must not be able to hold the worker's input path or its one timer.
     outbound: Option<tokio::sync::mpsc::UnboundedSender<Outbound>>,
     /// The published fences the connection's writer has been handed and has not written, oldest
-    /// first, each with the fence it carries and the reading it was handed over at.
+    /// first, each with the fence it carries and the reading by which it has to be written.
     ///
     /// Only a fence the machine still holds is kept here. Input waits for one because a reader
     /// that met a key before the fence would accept the line without it; once the machine has
@@ -565,7 +565,9 @@ impl FenceDriver {
             fence: Box::new(fence),
             frame,
         });
-        self.unwritten.push_back((frame, fence_id, self.reading()));
+        let limit = u64::try_from(FENCE_WRITE_LIMIT.as_millis()).unwrap_or(u64::MAX);
+        self.unwritten
+            .push_back((frame, fence_id, self.reading().plus(limit)));
         // The connection's task times the write as well as the machine, so it looks again.
         self.waker.notify_one();
         Some(frame)
@@ -599,23 +601,18 @@ impl FenceDriver {
         self.unwritten.front().map(|(frame, _, _)| *frame)
     }
 
-    /// Returns how long the oldest fence input waits for may still wait for the writer, when there
-    /// is one.
+    /// Returns how long a fence input waits for may still wait for the writer, when there is one.
     ///
-    /// Zero once [`FENCE_WRITE_LIMIT`] has passed, and the connection's task then ends the
-    /// connection. It is read on the same clock as the machine's own deadline, and like that
-    /// deadline it is woken by the runtime's timer, which does not count a suspended machine's
-    /// sleep: across a suspend the connection ends at the first wake after the limit has passed,
-    /// and until then the input still waits.
+    /// Zero once [`FENCE_WRITE_LIMIT`] has passed, or once a launch's hold has ended behind the
+    /// fence, and the connection's task then ends the connection. It is read on the same clock as
+    /// the machine's own deadline, and like that deadline it is woken by the runtime's timer, which
+    /// does not count a suspended machine's sleep: across a suspend the connection ends at the first
+    /// wake after the limit has passed, and until then the input still waits.
     #[must_use]
     pub fn fence_write_deadline(&self) -> Option<Duration> {
-        let (_, _, handed) = self.unwritten.front()?;
-        let limit = u64::try_from(FENCE_WRITE_LIMIT.as_millis()).unwrap_or(u64::MAX);
+        let due = self.unwritten.iter().map(|(_, _, due)| *due).min()?;
         Some(Duration::from_millis(
-            handed
-                .plus(limit)
-                .get()
-                .saturating_sub(self.reading().get()),
+            due.get().saturating_sub(self.reading().get()),
         ))
     }
 
@@ -1158,6 +1155,22 @@ impl FenceDriver {
                 if self.live_launch == Some(*transaction) {
                     self.live_launch = None;
                 }
+                if *reason == LaunchRejectionReason::Timeout
+                    && let Some(fence_id) = self.published
+                {
+                    // The launch's hold has ended and the machine lets go of what it held, but the
+                    // fence the launch reserved has not reached the reader, which is still the
+                    // current fence: the input behind it may not go ahead of it. A writer that has
+                    // kept a frame for the whole of a launch's hold is not delivering, so the
+                    // connection is given up now rather than at the limit, and the loss that ends
+                    // it lets that input go at the time the 250 ms rule gives, unfenced.
+                    let now = self.reading();
+                    for (_, unwritten, due) in &mut self.unwritten {
+                        if *unwritten == fence_id {
+                            *due = now;
+                        }
+                    }
+                }
                 self.awaiting.push_back(*transaction);
                 effects.steps.push(Step::Send(Outbound::Revocation {
                     transaction: *transaction,
@@ -1612,5 +1625,45 @@ mod tests {
         assert_eq!(driver.unwritten_fence(), None);
         // With no connection there is no reader for a fence to reach ahead of anything.
         assert_eq!(driver.publish(fence), None);
+    }
+
+    #[test]
+    fn a_launch_whose_hold_ends_behind_an_unwritten_fence_makes_its_frame_due_now() {
+        let clock = Arc::new(ManualClock::new());
+        let mut driver = qualified(&clock);
+        let (outbound, _writer) = tokio::sync::mpsc::unbounded_channel();
+        driver.send_through(outbound);
+        let _ = acknowledged(&mut driver);
+        let fence = driver.fence().cloned().expect("a published fence");
+        let frame = driver.publish(fence.clone()).expect("taken");
+        assert_eq!(driver.fence_write_deadline(), Some(FENCE_WRITE_LIMIT));
+
+        let _ = driver.launch_requested(
+            ShellLaunchParams {
+                session_id: session(),
+                command: LaunchCommand::Arguments(vec!["true".to_owned()]),
+                expected_prompt_generation: PromptGeneration::new(1),
+                expected_buffer_revision: EditorBufferRevision::new(1),
+            },
+            lease().holder.expect("a holder"),
+            LaunchTransactionId::new(kr_ipc::new_uuid()),
+        );
+        assert_eq!(driver.state(), FenceState::LaunchReserved);
+        clock.advance(Duration::from_millis(250));
+        let _ = driver.expire();
+        assert_eq!(
+            driver.state(),
+            FenceState::Fenced,
+            "the launch is over and the fence stands"
+        );
+        assert!(
+            driver.holds_back(frame),
+            "the fence is still the machine's and still unwritten"
+        );
+        assert_eq!(
+            driver.fence_write_deadline(),
+            Some(Duration::ZERO),
+            "a writer that kept the frame through the launch's hold is given up now"
+        );
     }
 }
