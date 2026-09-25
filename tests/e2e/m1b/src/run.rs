@@ -47,6 +47,11 @@ pub struct Run {
     leg: String,
     root: PathBuf,
     owned: Mutex<Vec<Owned>>,
+    /// Why finding the processes a leg's host started could not be completed, when it could not.
+    ///
+    /// A closing check that did not look for everything has not shown that nothing is left, so
+    /// while this holds anything the check fails.
+    undiscovered: Mutex<Vec<String>>,
     /// Set once the closing check has passed, so the directory can go.
     passed: Mutex<bool>,
 }
@@ -86,6 +91,7 @@ impl Run {
             leg: leg.to_owned(),
             root,
             owned: Mutex::new(Vec::new()),
+            undiscovered: Mutex::new(Vec::new()),
             passed: Mutex::new(false),
         };
         for name in BINARIES {
@@ -210,6 +216,13 @@ impl Run {
         }
         let jobs = self.loaded_jobs();
         left.extend(jobs.iter().map(|job| format!("the launchd job {job}")));
+        left.extend(
+            self.undiscovered
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .map(|why| format!("not every process could be found: {why}")),
+        );
         if left.is_empty() {
             *self.passed.lock().unwrap_or_else(PoisonError::into_inner) = true;
             Ok(format!(
@@ -273,27 +286,70 @@ impl Run {
     /// A session's shell and what runs in it belong to the worker that started them, not to this
     /// run's own processes, and a command line may not name this run's directory at all. What makes
     /// them this run's is their place in the process table, below a process this run recorded.
-    pub fn record_descendants(&self, ancestor: &ProcessStartIdentity, what: &str) {
-        if !running(ancestor) {
-            return;
+    ///
+    /// A number the table lists can pass to another process before it is recorded, so each one is
+    /// checked where it is recorded: its start identity is read, then its parent is read again, then
+    /// the identity is read once more. Only a process that is the same start across the parent read,
+    /// whose parent is then the process recorded above it and still that process, is recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the process table could not be read. The failure is kept with the run too, so
+    /// its closing check does not pass on a search that did not finish.
+    pub fn record_descendants(
+        &self,
+        ancestor: &ProcessStartIdentity,
+        what: &str,
+    ) -> Result<(), String> {
+        let found = self.descend(ancestor, what);
+        if let Err(why) = &found {
+            self.undiscovered(why);
         }
-        let Ok(table) = process_table() else {
-            return;
-        };
-        let mut under = vec![ancestor.pid.get()];
+        found
+    }
+
+    fn descend(&self, ancestor: &ProcessStartIdentity, what: &str) -> Result<(), String> {
+        if !running(ancestor) {
+            return Ok(());
+        }
+        let table = process_table()?;
+        let mut under = vec![ancestor.clone()];
         while let Some(parent) = under.pop() {
-            for entry in table
-                .iter()
-                .filter(|entry| u64::from(entry.parent) == parent)
-            {
-                if self
-                    .record_pid(entry.pid, &format!("{what}: {}", entry.command))
-                    .is_some()
-                {
-                    under.push(u64::from(entry.pid));
+            let parent_pid = u32::try_from(parent.pid.get()).unwrap_or(0);
+            for entry in table.iter().filter(|entry| entry.parent == parent_pid) {
+                let Ok(identity) = process_start_identity(entry.pid) else {
+                    // It has gone since the table was read.
+                    continue;
+                };
+                let Some(parent_now) = parent_of(entry.pid)? else {
+                    continue;
+                };
+                let same = matches!(process_state(&identity), ProcessState::Running);
+                let parent_same = matches!(process_state(&parent), ProcessState::Running);
+                if !(same && parent_same && parent_now == parent_pid) {
+                    continue;
                 }
+                self.record(identity.clone(), &format!("{what}: {}", entry.command));
+                under.push(identity);
             }
         }
+        Ok(())
+    }
+
+    /// Keeps why finding a leg's processes could not be completed, which fails the closing check.
+    pub fn undiscovered(&self, why: &str) {
+        self.undiscovered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(why.to_owned());
+    }
+
+    /// Forgets the reasons earlier searches did not finish, once a later one has.
+    pub fn discovered(&self) {
+        self.undiscovered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
     }
 
     /// The labels of every job definition this run's daemon wrote.
@@ -429,6 +485,29 @@ pub fn process_table() -> Result<Vec<Entry>, String> {
             })
         })
         .collect())
+}
+
+/// The parent of one process, read now, or `None` when there is no such process any more.
+///
+/// # Errors
+///
+/// Returns why `ps` could not answer.
+pub fn parent_of(pid: u32) -> Result<Option<u32>, String> {
+    let mut ps = std::process::Command::new("/bin/ps");
+    ps.args(["-o", "ppid=", "-p", &pid.to_string()])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin");
+    let output = output_within(ps, SERVICE_MANAGER_BOUND)
+        .map_err(|why| format!("the parent of process {pid} could not be read: ps {why}"))?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let text = text.trim();
+    if !output.status.success() && text.is_empty() {
+        // `ps -p` answers a process that is not there with nothing and a failure.
+        return Ok(None);
+    }
+    text.parse()
+        .map(Some)
+        .map_err(|_| format!("ps named no parent for process {pid}: {text:?}"))
 }
 
 /// Every process whose command line names `root`, other than this one.

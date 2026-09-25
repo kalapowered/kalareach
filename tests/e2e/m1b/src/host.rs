@@ -35,6 +35,10 @@ const DAEMON_STOP: Duration = Duration::from_secs(20);
 /// ended, so it is kept running until that has happened.
 const RETIREMENT: Duration = Duration::from_secs(90);
 
+/// How long finding the processes a host started is tried for before the run is told it could
+/// not be completed.
+const DISCOVERY: Duration = Duration::from_secs(10);
+
 /// How long one `kr` command is given when a leg cleans up after itself.
 const CLEANUP_COMMAND: Duration = Duration::from_secs(20);
 
@@ -210,24 +214,43 @@ impl<'r> Host<'r> {
     /// The registry is where the host itself keeps each worker's identity, and it is readable
     /// whether or not the daemon still answers. So a leg that stops part way still reaches the
     /// sessions it made, their shells and what runs in them, through the record rather than by a
-    /// name.
+    /// name. A search that cannot finish is tried again within [`DISCOVERY`], and one that still
+    /// cannot is kept with the run, whose closing check then fails rather than report a search
+    /// that did not finish.
     pub fn record_workers(&self) {
-        let Ok(registry) = kr_controller::registry::Registry::open(
+        let started = Instant::now();
+        loop {
+            match self.discover_workers() {
+                Ok(()) => {
+                    self.run.discovered();
+                    return;
+                }
+                Err(why) if started.elapsed() >= DISCOVERY => {
+                    self.run.undiscovered(&why);
+                    return;
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(250)),
+            }
+        }
+    }
+
+    fn discover_workers(&self) -> Result<(), String> {
+        let registry = kr_controller::registry::Registry::open(
             self.environment.registry_database(),
             self.environment.environment_id(),
-        ) else {
-            return;
-        };
-        let Ok(workers) = registry.workers() else {
-            return;
-        };
+        )
+        .map_err(|error| format!("the host's registry could not be opened: {error}"))?;
+        let workers = registry
+            .workers()
+            .map_err(|error| format!("the host's registry could not be read: {error}"))?;
         drop(registry);
         for worker in workers {
             let what = format!("the worker of session {}", worker.session_id);
             self.run.record(worker.process_identity.clone(), &what);
             self.run
-                .record_descendants(&worker.process_identity, &format!("under {what}"));
+                .record_descendants(&worker.process_identity, &format!("under {what}"))?;
         }
+        Ok(())
     }
 
     /// The environment every `kr` this host runs is given, and nothing else.
