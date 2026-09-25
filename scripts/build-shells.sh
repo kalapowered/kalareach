@@ -104,6 +104,13 @@ digest() {
     fi
 }
 
+# A flag variable as one line of a package's inputs. Its words are what reach the compiler, where a
+# line break between two words is a space, so the inputs recorded beside the binary read back one
+# input to a line whatever the variable held.
+one_line() {
+    printf '%s' "$1" | tr '\n' ' '
+}
+
 digest_string() {
     if command -v sha256sum >/dev/null 2>&1; then
         printf '%s' "$1" | sha256sum | cut -d' ' -f1
@@ -347,8 +354,8 @@ manifest=$(digest "$package/manifest.json")
 script=$(digest "$root/scripts/build-shells.sh")
 upstream=$m_sha256 $m_archive
 cc=${CC:-cc} $toolchain
-cppflags=${CPPFLAGS:-}
-ldflags=${LDFLAGS:-}
+cppflags=$(one_line "${CPPFLAGS:-}")
+ldflags=$(one_line "${LDFLAGS:-}")
 "
     if [ "$m_build_system" = "cmake" ]; then
         # A shell whose own source is Rust is the compiler that produced it as much as the C one,
@@ -361,7 +368,7 @@ ldflags=${LDFLAGS:-}
         inputs="$inputs
 rustc=$(rustc --version 2>/dev/null)
 toolchain=$RUSTUP_TOOLCHAIN
-rustflags=${RUSTFLAGS:-}
+rustflags=$(one_line "${RUSTFLAGS:-}")
 env=$m_environment
 "
     fi
