@@ -21,9 +21,14 @@ export interface ConfirmationSnapshot {
 }
 
 /**
- * Announces `request` once, with `review`, which shows it in Attention and gives its row focus.
+ * Announces the requests that `arrived` together, once, while `waiting` requests are shown in all,
+ * with `review`, which shows the first of them in Attention and gives its row focus.
  */
-export type Announce = (request: ConfirmationRequest, review: () => void) => void
+export type Announce = (
+  arrived: readonly ConfirmationRequest[],
+  waiting: number,
+  review: () => void
+) => void
 
 export class ConfirmationStore {
   private view: OwnerView | null = null
@@ -121,11 +126,11 @@ export class ConfirmationStore {
     const arrived = next.requests.filter((request) => !this.announced.has(request.reference))
     for (const request of arrived) this.announced.set(request.reference, request.expires_at_ms)
     this.publish()
-    for (const request of arrived) {
-      this.announce(request, () => {
-        this.review(request.reference)
-      })
-    }
+    const [first] = arrived
+    if (first === undefined) return
+    this.announce(arrived, this.snapshot.shown.length, () => {
+      this.review(first.reference)
+    })
   }
 
   private publish(): void {

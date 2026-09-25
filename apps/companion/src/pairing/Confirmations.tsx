@@ -32,6 +32,14 @@ import { secondsLeft } from './words'
 /** How long a row that has gone stays on screen while it fades. */
 const LEAVING_MS = 120
 
+/**
+ * True when the last input came from the keyboard. Nothing animates after keyboard input, so a row
+ * that goes then is taken off at once rather than kept while an invisible fade runs.
+ */
+function afterKeyboard(): boolean {
+  return document.documentElement.dataset.input === 'keyboard'
+}
+
 /** The confirm button's name, for the ceremony this computer offers. */
 export function confirmLabel(ceremony: CeremonyKind): string | null {
   switch (ceremony) {
@@ -128,12 +136,15 @@ function useRows(shown: readonly ConfirmationRequest[]): readonly Row[] {
       if (leaving && removal === undefined) {
         pending.set(
           request.reference,
-          setTimeout(() => {
-            pending.delete(request.reference)
-            setRows((before) =>
-              before.filter((row) => !(row.leaving && row.request.reference === request.reference))
-            )
-          }, LEAVING_MS)
+          setTimeout(
+            () => {
+              pending.delete(request.reference)
+              setRows((before) =>
+                before.filter((row) => !(row.leaving && row.request.reference === request.reference))
+              )
+            },
+            afterKeyboard() ? 0 : LEAVING_MS
+          )
         )
       } else if (!leaving && removal !== undefined) {
         // It came back before it was taken off.

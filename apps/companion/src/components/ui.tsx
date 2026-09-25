@@ -345,6 +345,11 @@ export interface ToastMessage {
   readonly text: string
   readonly tone: 'success' | 'danger' | 'pending'
   readonly action?: ToastAction
+  /**
+   * What the message is about. A message on the topic of the one showing takes its place in place,
+   * keeping its identity, so the toast stays put and whatever has focus in it keeps focus.
+   */
+  readonly topic?: string
 }
 
 /**
@@ -377,7 +382,10 @@ function ToastBody({
   readonly message: ToastMessage
   readonly onDismiss: () => void
 }): ReactNode {
-  const [held, setHeld] = useState(false)
+  // The pointer and focus hold it apart: either one is enough.
+  const [pointer, setPointer] = useState(false)
+  const [focused, setFocused] = useState(false)
+  const held = pointer || focused
   useEffect(() => {
     if (held) return
     const handle = setTimeout(
@@ -396,16 +404,16 @@ function ToastBody({
       role="status"
       aria-live="polite"
       onPointerEnter={() => {
-        setHeld(true)
+        setPointer(true)
       }}
       onPointerLeave={() => {
-        setHeld(false)
+        setPointer(false)
       }}
       onFocus={() => {
-        setHeld(true)
+        setFocused(true)
       }}
       onBlur={(event) => {
-        if (!event.currentTarget.contains(event.relatedTarget)) setHeld(false)
+        if (!event.currentTarget.contains(event.relatedTarget)) setFocused(false)
       }}
     >
       <span
