@@ -15,31 +15,41 @@
 # What is checked is the commit, never a working tree: uncommitted changes play no part.
 #
 # The commit is cloned into an empty directory under the temporary directory. Every git command
-# and every step then runs with a home directory, a Cargo home, a pnpm store and a temporary
-# directory of its own, in an environment reduced to the variables `environment` lists below, so
-# no cache, build output, installed package or setting this machine has collected can stand in for
-# what the repository provides. The toolchains are the exception: rustup's own directory is used as
-# it is, and rust-toolchain.toml picks the toolchain from it.
+# and every step then runs in an environment reduced to the variables `inherited` lists below, with
+# a home directory, a Cargo home, a pnpm store and a temporary directory of its own, so no cache,
+# build output, installed package or setting this machine has collected can stand in for what the
+# repository provides. PATH holds the system directories and the directories the programs in
+# `tools` were found in, and the run starts by printing each program's path and SHA-256. The
+# toolchains are used as they are installed: rustup's own directory is kept, and
+# rust-toolchain.toml picks the toolchain from it. On macOS the fresh home directory gets a keychain
+# of its own as its default, removed with it, so nothing a step runs finds no keychain and asks the
+# person at the machine for one; the run fails if SecurityAgent opened a dialog while it ran.
 #
-# Before anything runs, the clone is refused when:
+# Before any step runs, the clone is refused when:
 #
 #   - a tracked file names a working record that is kept outside the repository: a task or a
-#     decision identifier, the file name of a task's notes, of a numbered review or of a dispatch,
-#     the specification, the ledger, the goal or the records directory by name, or a path on a
-#     named volume. A word the product uses in its own sense is not a record, so each pattern
-#     matches a record's own form and nothing wider;
+#     decision identifier, a numbered review, a record file by its name, the phrases that name the
+#     notes a task is dispatched with and the rulings made for it, the specification, the ledger,
+#     the goal or the records directory by name, or a path on a named volume. A word the product
+#     uses in its own sense is not a record, so each pattern matches a record's own form and
+#     nothing wider;
 #   - a commit in the range, which is the commit's whole history unless --commits names one, has a
-#     body or a trailer. A commit message here is one subject line;
-#   - a relative Markdown link in a tracked file names a path the tree does not have.
+#     message of more than one line: a body or a trailer, whether or not a blank line precedes it;
+#   - a relative link in a tracked Markdown file names a path the tree does not have. The rule is
+#     read from the text, not from rendered Markdown: every `](` followed by a destination, and
+#     every `[label]: destination` definition, is a link, in a code example as much as anywhere,
+#     so an example names a path that exists or uses an absolute URL.
 #
 # Each pattern in `record_patterns` is written so that its own text does not match it, which is
 # what lets this file pass its own check.
 #
 # Then the steps run. README.md gives them as fenced blocks, each after a line
-# `<!-- clean-checkout: <group> -->`; every line of a block is one step, and a line ending in a
-# backslash continues on the next. A step runs with bash in the clone's root, groups and steps in
-# README.md's order, and the run stops at the first step that fails unless --keep-going is given.
-# KR_CLEAN_CHECKOUT_ROOT names the run's directory to every step.
+# `<!-- clean-checkout: <group> -->`; every line of a block is one step, a line ending in a
+# backslash continues on the next, and a line that starts with `#` is a comment. A block that is
+# never closed, or that ends inside a continued line, is refused. A step runs with bash in the
+# clone's root, with nothing on its standard input, groups and steps in README.md's order, and the
+# run stops at the first step that fails unless --keep-going is given. KR_CLEAN_CHECKOUT_ROOT names
+# the run's directory to every step.
 #
 # The clone and everything the run wrote are removed at the end, unless --keep is given.
 set -euo pipefail
@@ -99,22 +109,31 @@ done
 record_patterns=(
   '(^|[^[:alnum:]])T-[0-9]{3}'
   '(^|[^[:alnum:]])D-[0-9]{3}'
+  '(^|[^[:alnum:]])[Rr]eview [0-9]+'
   '-hand[o]ff(-archive)?\.md'
   '-review-[0-9]+\.md'
   '-dispatch-[0-9]+\.md'
+  'dispatch[ ]note'
+  'lead[ ]ruling'
   'kalareach\.md'
   'kalareach-ledge[r]'
   'kalareach-goa[l]'
   'kalareach-artifact[s]'
-  '(^|[^[:alnum:]_./-])/Volume[s]/[[:alnum:]]'
+  "(^|[^[:alnum:]_./-])/Volume[s]/[^/[:space:]\"'*)\`]"
 )
 
-# The variables a step may inherit from the environment this script was started in. Everything
-# else is left behind. The Cargo ones change how much a build keeps and how many jobs it runs,
-# never what it builds.
-inherited=(PATH USER LOGNAME SHELL TERM LANG LC_ALL LC_CTYPE TZ XDG_RUNTIME_DIR DEVELOPER_DIR SDKROOT
+# The programs README.md's list runs. A step's PATH holds the directories these are found in, in
+# the order this script's PATH has them, and then the system directories.
+tools=(bash git python3 cargo rustup rustc node pnpm corepack cc c++ cmake make patch tar curl
+  pkg-config llvm-config msgfmt pwsh zsh fish podman)
+system_path=/usr/bin:/bin:/usr/sbin:/sbin
+
+# The variables a step inherits from the environment this script was started in. Everything else
+# is left behind. The Cargo ones change how much a build keeps and how many jobs it runs, and the
+# libclang ones where a binding generator finds its library, never what is built.
+inherited=(USER LOGNAME SHELL TERM LANG LC_ALL LC_CTYPE TZ XDG_RUNTIME_DIR DEVELOPER_DIR SDKROOT
   CARGO_BUILD_JOBS CARGO_INCREMENTAL CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG
-  CARGO_NET_GIT_FETCH_WITH_CLI)
+  CARGO_NET_GIT_FETCH_WITH_CLI LIBCLANG_PATH LLVM_CONFIG_PATH)
 
 rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
 
@@ -122,15 +141,34 @@ say() {
   printf 'check-clean-checkout: %s\n' "$*"
 }
 
+# Returns success when a word is one member of a comma-separated list.
+member() {
+  local word="$1" list="$2" item items=()
+  IFS=, read -r -a items <<< "$list"
+  for item in ${items[@]+"${items[@]}"}; do
+    if [ "$item" = "$word" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+sha256() {
+  if command -v shasum > /dev/null 2>&1; then
+    shasum -a 256 "$1" | cut -d' ' -f1
+  else
+    sha256sum "$1" | cut -d' ' -f1
+  fi
+}
+
 # ---------------------------------------------------------------------------------------------
 # The checks, on a clone that already exists.
 
 refuse_records() {
-  local clone="$1" arguments=() pattern hits
+  local clone="$1" arguments=() pattern hits rc=0
   for pattern in "${record_patterns[@]}"; do
     arguments+=(-e "$pattern")
   done
-  local rc=0
   hits="$(clean git -C "$clone" grep -n -I -E "${arguments[@]}")" || rc=$?
   case "$rc" in
     0)
@@ -149,31 +187,35 @@ refuse_messages() {
     say "refused: $range is not a range of commits in the clone"
     return 1
   fi
-  found="$(clean git -C "$clone" log --format='%H%x1f%s%x1f%b%x1e' "$range" | awk '
+  # The raw message, because a subject folds the first paragraph's lines into one and a body
+  # begins only after a blank line: a second line with no blank line before it is neither.
+  found="$(clean git -C "$clone" log --format='%H%x1f%B%x1e' "$range" | awk '
     BEGIN { RS = "\036"; FS = "\037"; bad = 0 }
     {
       sub(/^\n+/, "", $1)
-      body = $3
-      gsub(/^[ \t\n]+|[ \t\n]+$/, "", body)
-      if ($1 == "" || body == "") next
+      if ($1 == "") next
+      message = $2
+      sub(/[ \t\n]+$/, "", message)
+      count = split(message, lines, "\n")
+      if (count <= 1) next
       kind = "a trailer"
-      count = split(body, lines, "\n")
-      for (i = 1; i <= count; i++) {
+      for (i = 2; i <= count; i++) {
         if (lines[i] != "" && lines[i] !~ /^[A-Za-z0-9-]+: /) kind = "a body"
       }
-      printf "  %s %s: %s\n", substr($1, 1, 12), kind, $2
+      printf "  %s %s: %s\n", substr($1, 1, 12), kind, lines[1]
       bad = 1
     }
     END { exit bad }
   ')" || {
-    say "refused: commits in $range carry more than a subject line:"
+    say "refused: commits in $range carry more than one line:"
     printf '%s\n' "$found"
     return 1
   }
   say "every commit in $range is one subject line"
 }
 
-# Prints each relative Markdown link whose path the tree does not have, and fails when there is one.
+# Prints each relative link in a tracked Markdown file whose path the tree does not have, and
+# fails when there is one.
 broken_links() {
   clean python3 - "$1" <<'PYTHON'
 import os
@@ -194,51 +236,63 @@ for path in tracked:
         directories.add(parent)
         parent = os.path.dirname(parent)
 
-fence = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
-inline = re.compile(r"\]\(\s*(<[^>]*>|[^)\s]+)")
-reference = re.compile(r"^ {0,3}\[[^\]]+\]:\s*(<[^>]*>|\S+)")
-code_span = re.compile(r"(`+)(?:(?!\1).)*?\1")
 scheme = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+definition = re.compile(r"(?m)^ {0,3}\[[^\]\n]+\]:[ \t]*\n?[ \t]*(<[^>\n]*>|\S+)")
+
+
+def destination(text, index):
+    """Reads the destination that starts at index, delimited the way CommonMark delimits one."""
+    while index < len(text) and text[index] in " \t\n":
+        index += 1
+    if text.startswith("<", index):
+        end = text.find(">", index)
+        if end < 0 or "\n" in text[index:end]:
+            return None
+        return text[index + 1 : end]
+    start, depth = index, 0
+    while index < len(text):
+        character = text[index]
+        if character == "\\" and index + 1 < len(text):
+            index += 2
+            continue
+        if character.isspace() or ord(character) < 0x20:
+            break
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            if depth == 0:
+                break
+            depth -= 1
+        index += 1
+    return text[start:index]
+
 
 broken = 0
 for path in sorted(p for p in tracked if p.endswith(".md")):
-    open_fence = None
     with open(os.path.join(root, path), encoding="utf-8", errors="replace") as handle:
-        for number, line in enumerate(handle, 1):
-            line = line.rstrip("\n")
-            marker = fence.match(line)
-            if open_fence is not None:
-                if (
-                    marker
-                    and marker.group(1)[0] == open_fence[0]
-                    and len(marker.group(1)) >= len(open_fence)
-                    and not marker.group(2).strip()
-                ):
-                    open_fence = None
-                continue
-            if marker and not (marker.group(1)[0] == "`" and "`" in marker.group(2)):
-                open_fence = marker.group(1)
-                continue
-            text = code_span.sub("", line)
-            targets = [m.group(1) for m in inline.finditer(text)]
-            targets += [m.group(1) for m in reference.finditer(text)]
-            for target in targets:
-                target = target.strip("<>")
-                if not target or target.startswith("#") or target.startswith("//"):
-                    continue
-                if scheme.match(target):
-                    continue
-                named = urllib.parse.unquote(target.split("#", 1)[0].split("?", 1)[0])
-                if not named:
-                    continue
-                if named.startswith("/"):
-                    resolved = os.path.normpath(named.lstrip("/"))
-                else:
-                    resolved = os.path.normpath(os.path.join(os.path.dirname(path), named))
-                if resolved in tracked or resolved in directories or resolved == ".":
-                    continue
-                print(f"  {path}:{number}: {target}")
-                broken += 1
+        text = handle.read()
+    found = []
+    for match in re.finditer(r"\]\(", text):
+        target = destination(text, match.end())
+        if target is not None:
+            found.append((match.start(), target))
+    for match in definition.finditer(text):
+        found.append((match.start(), match.group(1).strip("<>")))
+    for offset, target in found:
+        if not target or target.startswith(("#", "//")) or scheme.match(target):
+            continue
+        named = target.split("#", 1)[0].split("?", 1)[0]
+        named = urllib.parse.unquote(re.sub(r"\\(.)", r"\1", named))
+        if not named:
+            continue
+        if named.startswith("/"):
+            resolved = os.path.normpath(named.lstrip("/"))
+        else:
+            resolved = os.path.normpath(os.path.join(os.path.dirname(path), named))
+        if resolved in tracked or resolved in directories or resolved == ".":
+            continue
+        print(f"  {path}:{text.count(chr(10), 0, offset) + 1}: {target}")
+        broken += 1
 sys.exit(1 if broken else 0)
 PYTHON
 }
@@ -268,34 +322,46 @@ while index < len(lines):
     index += 1
     if not named:
         continue
+    group = named.group(1)
     while index < len(lines) and not lines[index].strip():
         index += 1
     opened = fence.match(lines[index]) if index < len(lines) else None
     if not opened:
-        sys.exit(f"README.md: the group {named.group(1)} is not followed by a fenced block")
+        sys.exit(f"README.md: the group {group} is not followed by a fenced block")
+    character, length = opened.group(1)[0], len(opened.group(1))
     index += 1
     pending = ""
-    while index < len(lines) and not lines[index].startswith(opened.group(1)):
+    closed = False
+    while index < len(lines):
         line = lines[index].rstrip()
         index += 1
+        stripped = line.strip()
+        if len(stripped) >= length and set(stripped) == {character}:
+            closed = True
+            break
+        if not pending and stripped.startswith("#"):
+            continue
         if line.endswith("\\"):
             pending += line[:-1].rstrip() + " "
             continue
         command = (pending + line).strip()
         pending = ""
-        if command and not command.startswith("#"):
-            print(f"{named.group(1)}\t{command}")
-    index += 1
+        if command:
+            print(f"{group}\t{command}")
+    if not closed:
+        sys.exit(f"README.md: the group {group}'s block is not closed")
+    if pending:
+        sys.exit(f"README.md: the group {group}'s block ends inside a continued line")
 PYTHON
 }
 
 # Returns success when a group is selected by --only and --skip.
 selected() {
   local group="$1"
-  if [ -n "$only" ] && ! printf ',%s,' "$only" | grep -q ",$group,"; then
+  if [ -n "$only" ] && ! member "$group" "$only"; then
     return 1
   fi
-  if [ -n "$skip" ] && printf ',%s,' "$skip" | grep -q ",$group,"; then
+  if [ -n "$skip" ] && member "$group" "$skip"; then
     return 1
   fi
   return 0
@@ -311,8 +377,8 @@ fixture_git() {
     GIT_COMMITTER_EMAIL=fixture@example.invalid git "$@"
 }
 
-# Creates a fixture repository with a README whose steps check the environment they run in, a
-# document with sound links, and one commit.
+# Creates a fixture repository with a README whose steps check the environment they run in,
+# documents whose links are sound in every form the check reads, and one commit.
 make_fixture() {
   local directory="$1"
   mkdir -p "$directory/docs"
@@ -337,6 +403,7 @@ case "$TMPDIR" in /tmp/kr-clean.*) test -d "$TMPDIR" ;; *) false ;; esac
 test -z "${CARGO_TARGET_DIR:-}" && test -z "${RUSTUP_TOOLCHAIN:-}"
 test -z "${KR_CLEAN_SELF_TEST_LEAK:-}"
 test "$(pwd -P)" = "$(cd "$KR_CLEAN_CHECKOUT_ROOT/clone" && pwd -P)" && test -z "$(git status --porcelain)"
+# a note that ends with a backslash, which is still a note \
 test \
   -f README.md
 ```
@@ -344,16 +411,22 @@ EOF
   cat > "$directory/docs/guide.md" <<'EOF'
 # Guide
 
-Back to [the README](../README.md), and a [reference] link.
+Back to [the README](../README.md), a [reference] link, and a destination on the next line: [the
+README again](
+../README.md).
+
+A destination with parentheses: [a page](a(b).md). One in angle brackets: [a page](<with space.md>).
+One encoded: [a page](with%20space.md).
 
 ```text
-[inside a fence](missing.md)
+An example that links: [the guide](guide.md)
 ```
 
-`[inside code](missing.md)`
-
-[reference]: ../README.md
+[reference]:
+  ../README.md
 EOF
+  : > "$directory/docs/a(b).md"
+  : > "$directory/docs/with space.md"
   fixture_git -C "$directory" add -A
   fixture_git -C "$directory" commit -q -m "Start the fixture"
 }
@@ -361,7 +434,13 @@ EOF
 commit_fixture() {
   local directory="$1" message="$2"
   fixture_git -C "$directory" add -A
-  fixture_git -C "$directory" commit -q -m "$message"
+  fixture_git -C "$directory" commit -q --cleanup=verbatim -m "$message"
+}
+
+# Replaces a fixture's README with the given text and commits it.
+replace_readme() {
+  printf '%s\n' "$2" > "$1/README.md"
+  commit_fixture "$1" "Replace the README"
 }
 
 self_test() {
@@ -393,20 +472,50 @@ self_test() {
   directory="$work/clean"
   make_fixture "$directory"
   expect "a clean fixture passes" pass "== step check.4 exit 0"
+  expect "the run records each program it found" pass "tool git: /"
   expect "an unknown group is refused" refuse "names no group README.md lists" --only nosuch
+  expect "a group name is not a pattern" refuse "names no group README.md lists" --only 'check.*'
+  expect "a selection of nothing is refused" refuse "select no step" --skip setup,check
+
+  directory="$work/relative"
+  make_fixture "$directory"
+  expect "a relative repository path is cloned from where it points" pass "== step check.4 exit 0" \
+    --repo "$(cd "$work" && pwd)/relative/../relative"
+  (
+    cd "$work"
+    if bash "$script_path" --repo relative --no-steps > "$work/relative.log" 2>&1; then
+      echo "self-test: a path relative to the caller is resolved ok"
+    else
+      echo "self-test: a path relative to the caller is resolved FAILED"
+      sed 's/^/    /' "$work/relative.log"
+      exit 1
+    fi
+  ) || failures=$((failures + 1))
+
+  directory="$work/detached"
+  make_fixture "$directory"
+  echo "more" >> "$directory/docs/guide.md"
+  commit_fixture "$directory" "Extend the guide"
+  fixture_git -C "$directory" checkout -q --detach HEAD
+  fixture_git -C "$directory" branch -q -D main
+  expect "a commit that no branch holds is fetched" pass "== step check.4 exit 0"
 
   local name planted
   for planted in \
     "task=see T-""123 for the reason" \
     "decision=as D-""456 decided" \
+    "numbered-review=see review ""2 for the reason" \
     "notes=tasks/x-hand""off.md" \
-    "review=reviews/x-review-""2.md" \
-    "dispatch=tasks/x-claude-dispatch-""3.md" \
+    "review-file=reviews/x-review-""2.md" \
+    "dispatch-file=tasks/x-claude-dispatch-""3.md" \
+    "dispatch-note=the dispatch"" note says so" \
+    "ruling=as the lead"" ruling says" \
     "specification=the kalareach"".md specification" \
     "ledger=kalareach-""ledger.md" \
     "goal=kalareach-""goal.md" \
     "records=kalareach-""artifacts/logs/run.log" \
-    "volume=/Vol""umes/Work/notes.txt"; do
+    "volume=/Vol""umes/Work/notes.txt" \
+    "volume-underscore=/Vol""umes/_work/notes.txt"; do
     name="${planted%%=*}"
     directory="$work/record-$name"
     make_fixture "$directory"
@@ -421,6 +530,7 @@ self_test() {
     echo "The plugin service answers with a Handoff, and pending_hand""off is a column."
     echo "macOS keeps it on /System/Volumes/Data, and a path under \"/Volumes/\" is removable."
     echo "SHA-256, UTF-8, KR-PERF-001 and PORT""-123 are not records."
+    echo "Pre""view 3 is a screen, and a review of the diff is not numbered."
   } > "$directory/docs/words.md"
   commit_fixture "$directory" "Add the product's own words"
   expect "the product's own words pass" pass "no tracked file names a record"
@@ -443,11 +553,31 @@ Signed-off-by: fixture <fixture@example.invalid>"
   expect "a range without that commit passes" pass "every commit in HEAD~1" --no-steps \
     --commits HEAD~1
 
+  directory="$work/commit-second-line"
+  make_fixture "$directory"
+  echo "more" >> "$directory/docs/guide.md"
+  commit_fixture "$directory" "Extend the guide
+Signed-off-by: fixture <fixture@example.invalid>"
+  expect "a trailer with no blank line before it is refused" refuse "a trailer: Extend the guide" \
+    --no-steps
+  echo "more" >> "$directory/docs/guide.md"
+  commit_fixture "$directory" "Extend the guide again
+and say why on the next line"
+  expect "a second line with no blank line before it is refused" refuse \
+    "a body: Extend the guide again" --no-steps
+
   directory="$work/broken-link"
   make_fixture "$directory"
-  echo "See [the missing page](missing.md)." >> "$directory/docs/guide.md"
+  printf 'See [the missing page](\n  missing.md).\n' >> "$directory/docs/guide.md"
   commit_fixture "$directory" "Link a page that is not there"
-  expect "a relative link to a missing path is refused" refuse "docs/guide.md:12: missing.md"
+  expect "a relative link to a missing path is refused, across a line" refuse \
+    "docs/guide.md:16: missing.md"
+
+  directory="$work/example-link"
+  make_fixture "$directory"
+  printf '```text\n[an example](missing-example.md)\n```\n' >> "$directory/docs/guide.md"
+  commit_fixture "$directory" "Add an example that links nowhere"
+  expect "a link in a code example counts" refuse "missing-example.md"
 
   directory="$work/failing-step"
   make_fixture "$directory"
@@ -459,6 +589,34 @@ Signed-off-by: fixture <fixture@example.invalid>"
   expect "--skip leaves the failing group out" pass "== step setup.4 exit 0" --skip check
   expect "--only runs the named group alone" pass "== step setup.4 exit 0" --only setup
   expect "--list prints the steps and runs none" pass "check.4: false" --list
+
+  directory="$work/comment-backslash"
+  make_fixture "$directory"
+  replace_readme "$directory" '<!-- clean-checkout: check -->
+
+```bash
+# a note that ends with a backslash \
+false
+true
+```'
+  expect "a note ending in a backslash does not hide the next step" refuse "== step check.1 exit 1"
+
+  directory="$work/unclosed"
+  make_fixture "$directory"
+  replace_readme "$directory" '<!-- clean-checkout: check -->
+
+```bash
+true'
+  expect "a block that is never closed is refused" refuse "block is not closed"
+
+  directory="$work/dangling"
+  make_fixture "$directory"
+  replace_readme "$directory" '<!-- clean-checkout: check -->
+
+```bash
+true \
+```'
+  expect "a block that ends inside a continued line is refused" refuse "inside a continued line"
 
   directory="$work/no-steps"
   make_fixture "$directory"
@@ -484,6 +642,8 @@ fi
 
 if [ -z "$repo" ]; then
   repo="$(git -C "$script_directory" rev-parse --show-toplevel)"
+elif [ -e "$repo" ]; then
+  repo="$(cd "$repo" && pwd)"
 fi
 
 temporary="${TMPDIR:-/tmp}"
@@ -491,19 +651,40 @@ root="$(mktemp -d "${temporary%/}/kalareach-clean-checkout.XXXXXX")"
 # A Unix socket's address is at most 104 bytes on macOS and 108 on Linux, and the tests make their
 # runtime directories under the temporary directory, so the steps get a short one.
 step_tmp="$(mktemp -d /tmp/kr-clean.XXXXXX)"
-cleanup() {
-  if [ "$keep" -eq 1 ]; then
-    say "kept $root and $step_tmp"
-  else
-    chmod -R u+w "${root:?}" 2>/dev/null || true
-    rm -rf "${root:?}" "${step_tmp:?}"
-  fi
-}
-trap cleanup EXIT
 mkdir -p "$root/home" "$root/cargo" "$root/pnpm-store"
 clone="$root/clone"
+started_at="$(date '+%Y-%m-%d %H:%M:%S')"
 
-environment=("HOME=$root/home" "CARGO_HOME=$root/cargo" "TMPDIR=$step_tmp"
+step_path=""
+add_directory() {
+  case ":$step_path:" in
+    *":$1:"*) ;;
+    *) step_path="${step_path:+$step_path:}$1" ;;
+  esac
+}
+tool_directories=()
+for tool in "${tools[@]}"; do
+  found="$(command -v "$tool" 2>/dev/null || true)"
+  if [ "${found#/}" != "$found" ]; then
+    tool_directories+=("$(dirname "$found")")
+  fi
+done
+path_entries=()
+IFS=: read -r -a path_entries <<< "$PATH"
+for entry in ${path_entries[@]+"${path_entries[@]}"}; do
+  for directory in ${tool_directories[@]+"${tool_directories[@]}"}; do
+    if [ "$entry" = "$directory" ]; then
+      add_directory "$entry"
+    fi
+  done
+done
+system_entries=()
+IFS=: read -r -a system_entries <<< "$system_path"
+for entry in "${system_entries[@]}"; do
+  add_directory "$entry"
+done
+
+environment=("PATH=$step_path" "HOME=$root/home" "CARGO_HOME=$root/cargo" "TMPDIR=$step_tmp"
   "pnpm_config_store_dir=$root/pnpm-store" "COREPACK_ENABLE_DOWNLOAD_PROMPT=0"
   "KR_CLEAN_CHECKOUT_ROOT=$root")
 if [ -d "$rustup_home" ]; then
@@ -517,6 +698,70 @@ done
 
 clean() {
   env -i "${environment[@]}" "$@"
+}
+
+keychain=""
+cleanup() {
+  if [ "$keep" -eq 1 ]; then
+    say "kept $root and $step_tmp"
+    return
+  fi
+  if [ -n "$keychain" ]; then
+    clean security delete-keychain "$keychain" 2>/dev/null || true
+  fi
+  chmod -R u+w "${root:?}" 2>/dev/null || true
+  rm -rf "${root:?}" "${step_tmp:?}"
+}
+trap cleanup EXIT
+
+for tool in "${tools[@]}"; do
+  found="$(PATH="$step_path"; command -v "$tool" 2>/dev/null || true)"
+  if [ "${found#/}" != "$found" ]; then
+    say "tool $tool: $found sha256 $(sha256 "$found")"
+  else
+    say "tool $tool: not found"
+  fi
+done
+
+# The account's own keychain settings are read before and after, and a change to them stops the
+# run once they are put back: the fresh home directory's keychain is its own or it is nothing.
+if [ "$(uname -s)" = Darwin ]; then
+  own_default="$(security default-keychain -d user 2>/dev/null | tr -d ' "' || true)"
+  own_list="$(security list-keychains -d user 2>/dev/null | tr -d ' "' || true)"
+  keychain="$root/home/Library/Keychains/login.keychain-db"
+  mkdir -p "$root/home/Library/Keychains"
+  clean security create-keychain -p "" "$keychain"
+  clean security set-keychain-settings "$keychain"
+  clean security default-keychain -d user -s "$keychain"
+  clean security list-keychains -d user -s "$keychain"
+  if [ "$(security default-keychain -d user 2>/dev/null | tr -d ' "' || true)" != "$own_default" ] \
+    || [ "$(security list-keychains -d user 2>/dev/null | tr -d ' "' || true)" != "$own_list" ]; then
+    if [ -n "$own_default" ]; then
+      security default-keychain -d user -s "$own_default"
+    fi
+    # shellcheck disable=SC2086
+    security list-keychains -d user -s $own_list
+    say "refused: this account's own keychain settings changed when the fresh home directory's"
+    say "keychain was made its default; they have been put back"
+    exit 1
+  fi
+  say "the fresh home directory has a keychain of its own as its default"
+fi
+
+# macOS names every SecurityAgent dialog in its log, and a run that opened one fails.
+security_agent_opened() {
+  local entries
+  if [ "$(uname -s)" != Darwin ]; then
+    return 1
+  fi
+  entries="$(log show --start "$started_at" --predicate 'process == "SecurityAgent"' \
+    --style compact 2>/dev/null | grep -F SecurityAgent || true)"
+  if [ -n "$entries" ]; then
+    say "refused: SecurityAgent opened a dialog while this run ran:"
+    printf '%s\n' "$entries" | head -20 | sed 's/^/  /'
+    return 0
+  fi
+  return 1
 }
 
 # The commit is resolved where it names something, in the repository it comes from when that is
@@ -543,11 +788,15 @@ refuse_records "$clone" || refused=1
 refuse_messages "$clone" "${commits:-$commit}" || refused=1
 refuse_links "$clone" || refused=1
 if [ "$refused" -ne 0 ]; then
+  security_agent_opened || true
   say "refused $commit"
   exit 1
 fi
 
 if [ "$run_steps" -eq 0 ]; then
+  if security_agent_opened; then
+    exit 1
+  fi
   say "no step was asked for"
   exit 0
 fi
@@ -561,12 +810,29 @@ if [ -z "$steps" ]; then
   exit 1
 fi
 groups="$(printf '%s\n' "$steps" | cut -f1 | uniq | tr '\n' ',')"
-for group in $(printf '%s' "$only,$skip" | tr ',' ' '); do
-  if ! printf ',%s' "$groups" | grep -q ",$group,"; then
-    say "refused: --only or --skip names no group README.md lists: $group (README.md lists ${groups%,})"
-    exit 2
-  fi
+groups="${groups%,}"
+for list in "$only" "$skip"; do
+  names=()
+  IFS=, read -r -a names <<< "$list"
+  for group in ${names[@]+"${names[@]}"}; do
+    if ! member "$group" "$groups"; then
+      say "refused: --only or --skip names no group README.md lists: $group (README.md lists $groups)"
+      exit 2
+    fi
+  done
 done
+chosen=0
+while IFS="$(printf '\t')" read -r group command; do
+  if selected "$group"; then
+    chosen=$((chosen + 1))
+  fi
+done <<EOF
+$steps
+EOF
+if [ "$chosen" -eq 0 ]; then
+  say "refused: --only and --skip together select no step"
+  exit 2
+fi
 
 failed=0
 previous=""
@@ -600,7 +866,10 @@ done <<EOF
 $steps
 EOF
 
-if [ "$list_steps" -eq 1 ]; then
+if security_agent_opened; then
+  failed=1
+fi
+if [ "$list_steps" -eq 1 ] && [ "$failed" -eq 0 ]; then
   exit 0
 fi
 if [ "$failed" -ne 0 ]; then
