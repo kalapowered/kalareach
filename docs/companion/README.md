@@ -29,8 +29,9 @@ Native code tells the page about changes through listeners: the connection's sta
 events, where the account stands, pairing, owner confirmations and dropped files. The shell
 registers a listener asynchronously and drops whatever it publishes before then. Each listener
 therefore resolves only once it is registered, and a screen reads the state it follows only after
-that, so no change can fall between the two. A change that arrives before the read's answer is at
-least as new as that answer, and the screen keeps it. The phone's inbox reads again on each change
+that, so no change can fall between the two. Nor does a screen show an answer once its listeners
+have stopped, or when they could not be registered. A change that arrives before the read's answer
+is at least as new as that answer, and the screen keeps it. The phone's inbox reads again on each change
 and shows only the newest read's answer. In a session, when the launch surface was read at an older
 prompt generation than the view has heard since, its buttons start disabled.
 
