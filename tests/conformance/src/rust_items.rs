@@ -1622,6 +1622,7 @@ fn conventions(tokens: &[Token], helpers: &BTreeSet<String>) -> Vec<(usize, Stri
     let tokens = significant(tokens);
     let levels = levels(&tokens);
     let uses = use_declarations(&tokens, &levels.module);
+    let parameters = generic_parameters(&tokens);
     let mut found = Vec::new();
     for (index, token) in tokens.iter().enumerate() {
         let name = match &token.tok {
@@ -1664,7 +1665,7 @@ fn conventions(tokens: &[Token], helpers: &BTreeSet<String>) -> Vec<(usize, Stri
             ));
         }
         if let Some(meaning) = trusted_meaning(name)
-            && let Some(how) = trusted_declaration(&around, name, declaration)
+            && let Some(how) = trusted_declaration(&around, name, declaration, &parameters)
         {
             found.push((
                 token.line,
@@ -1958,6 +1959,63 @@ fn helper_occurrence(
     Some(around.written_as())
 }
 
+/// The indices of the names generic parameter lists declare. A list opens at the `<` after `impl` or
+/// `for`, or after an item's name that follows `fn`, `struct`, `enum`, `union`, `trait` or `type`;
+/// each parameter's name is the first name at the list's own depth after its start or a `,`, past
+/// its attributes and a `const`, a lifetime aside.
+fn generic_parameters(tokens: &[Token]) -> BTreeSet<usize> {
+    let mut found = BTreeSet::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if !token.is_punct('<') || index == 0 {
+            continue;
+        }
+        let opens = match tokens[index - 1].ident() {
+            Some("impl" | "for") => true,
+            Some(_) => {
+                index >= 2
+                    && matches!(
+                        tokens[index - 2].ident(),
+                        Some("fn" | "struct" | "enum" | "union" | "trait" | "type")
+                    )
+            }
+            None => false,
+        };
+        if !opens {
+            continue;
+        }
+        let mut angles = 1_usize;
+        let mut groups = 0_usize;
+        let mut expect = true;
+        for at in index + 1..tokens.len() {
+            let token = &tokens[at];
+            match &token.tok {
+                Tok::Punct('<') if groups == 0 => angles += 1,
+                Tok::Punct('>') if groups == 0 && !tokens[at - 1].is_punct('-') => {
+                    angles -= 1;
+                    if angles == 0 {
+                        break;
+                    }
+                }
+                Tok::Punct('(' | '[' | '{') => groups += 1,
+                Tok::Punct(')' | ']' | '}') => {
+                    if groups == 0 {
+                        break;
+                    }
+                    groups -= 1;
+                }
+                Tok::Punct(',') if groups == 0 && angles == 1 => expect = true,
+                Tok::Lifetime if groups == 0 && angles == 1 => expect = false,
+                Tok::Ident(name) if expect && groups == 0 && angles == 1 && name != "const" => {
+                    found.insert(at);
+                    expect = false;
+                }
+                _ => {}
+            }
+        }
+    }
+    found
+}
+
 /// What the reading trusts `name` to mean, when it trusts it at all.
 fn trusted_meaning(name: &str) -> Option<&'static str> {
     if STANDARD_ROOTS.contains(&name) {
@@ -1986,6 +2044,7 @@ fn trusted_declaration(
     around: &Around<'_>,
     name: &str,
     declaration: Option<&UseDeclaration>,
+    parameters: &BTreeSet<usize>,
 ) -> Option<&'static str> {
     let root = STANDARD_ROOTS.contains(&name) || TRUSTED_ROOTS.contains(&name);
     if around.word_before(1) == Some("mod") {
@@ -2009,17 +2068,9 @@ fn trusted_declaration(
     // is held to what the declaration brings in by that name.
     let Some(declaration) = declaration else {
         // Besides an item (above) and a `use` (below), only a generic parameter declares a name a
-        // path's first name can be: a name after `<` or `,` and before `>`, `,`, `=` or the `:` of
-        // a bound (`core: Trait`, or `core: ::std::...`, three colons, but not `core::...`). A
-        // value, a field or a later name of a path declares nothing a path could start at.
-        let bound = around.punct_after(1, ':')
-            && !(around.punct_after(2, ':') && !around.punct_after(3, ':'));
-        let generic = (around.punct_before(1, '<') || around.punct_before(1, ','))
-            && (around.punct_after(1, '>')
-                || around.punct_after(1, ',')
-                || around.punct_after(1, '=')
-                || bound);
-        return (root && generic)
+        // path's first name can be. A value, a field or a later name of a path declares nothing a
+        // path could start at.
+        return (root && parameters.contains(&around.index))
             .then_some("a generic parameter, which a path starting at that name would find instead of the crate");
     };
     if around.word_after(1) == Some("as") {
@@ -2505,6 +2556,8 @@ mod tests {
             ("fn other<core: ::std::marker::Sized>() {}", "core"),
             ("impl<alloc> Trait for Type {}", "alloc"),
             ("struct S<'a, tokio = u8>(&'a tokio);", "tokio"),
+            ("fn other<T, #[cfg(all())] core>() {}", "core"),
+            ("impl<const std: usize> Trait for Type<std> {}", "std"),
             // A definition written as text is one all the same: the check reads tokens.
             (
                 "const _: &str = stringify!(macro_rules! line { () => {} });",
@@ -2543,6 +2596,9 @@ mod tests {
             "fn t() { let p = std::alloc::alloc(layout); let tokio = 1; }",
             "fn t(std: u8) { let core: ::std::primitive::u8 = 0; }",
             "struct S { alloc: ::std::alloc::Layout }",
+            "struct S { name: String, alloc: u8, tokio: u8 }",
+            "fn t(a: u8, std: u8) { let _ = S { a: 1, core: 2 }; }",
+            "fn t<T>() where T: Into<Vec<u8>>, T: Clone {}",
             "#[cfg_attr(any(), serde(rename_all = \"camelCase\"))]\nstruct S;",
         ] {
             assert_eq!(breached(text), [], "{text}");
