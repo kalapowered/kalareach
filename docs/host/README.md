@@ -3816,13 +3816,13 @@ answered by the native client alone.
 A request belongs to the package whose table recorded it, and that package is kept with the
 request's source, so a connection that closes, or whose identifier is restored under another
 package's tables, changes nothing about whose request it is. Only a binding of that package, at the
-same bytes, interprets it, and an answer to it goes out only on a connection that reads that
+same bytes, interprets it, and a rich answer to it goes out only on a connection that reads that
 package's table.
 
 Narrowing an installation's grants narrows the record where it is written. `approval.respond`
 leaving takes the answer away and leaves the decoding; `approval.decode` leaving withdraws the
-interpreter grant and the record with it. What was already interpreted stays visible, and an answer
-to it is refused at the claim.
+interpreter grant and the record with it. What was already interpreted stays visible, and a rich
+answer to it is refused at the claim; the native client can still answer it.
 
 The ledger retains, for every request a decoder interpreted: the package and its publisher, the
 digest of its bytes, the upstream method and request identifier, the original source bytes whole,
