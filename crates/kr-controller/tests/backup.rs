@@ -5429,11 +5429,12 @@ fn as_version_6(state: &std::path::Path) {
              DROP TRIGGER an_upload_keeps_what_it_is;
              DROP TRIGGER an_acknowledged_part_is_never_withdrawn;
              DROP TABLE uploads;
-             DROP TRIGGER a_release_is_written_once;
-             DROP TRIGGER only_an_object_of_an_unknown_generation_is_released;
-             DROP TRIGGER an_object_a_held_generation_names_is_not_released;
-             DROP TRIGGER a_release_is_never_changed;
-             DROP TRIGGER a_release_is_never_taken_back;
+             DROP TRIGGER a_deletion_is_asked_for_once;
+             DROP TRIGGER only_an_object_of_an_unknown_generation_is_deleted;
+             DROP TRIGGER an_object_a_held_generation_names_is_not_deleted;
+             DROP TRIGGER a_deletion_asked_for_keeps_what_it_is;
+             DROP TRIGGER a_deletion_asked_for_is_never_taken_back;
+             DROP TRIGGER an_object_this_host_asked_to_delete_is_named_no_more;
              DROP TABLE releases;
              UPDATE schema_version SET version = 6;",
         )
@@ -5524,11 +5525,12 @@ fn a_version_6_store_holding_a_rule_this_build_never_wrote_is_refused_and_left_a
     assert_eq!(release_objects(&connection), 0);
 }
 
-/// That the service no longer holds an object is written down once, only for an object of a
-/// generation whose outcome is unknown, and only when no generation this host still holds names
-/// it. Once written it is never changed or taken back, and a restart reads it back.
+/// A deletion is written down before it is asked for, once, only for an object of a generation
+/// whose outcome is unknown, and only when no generation this host still holds names it; its
+/// answer is written once. Nothing changes or takes either back, no generation admitted afterwards
+/// names that object, and a restart reads both back.
 #[test]
-fn a_release_is_written_once_only_for_what_no_held_generation_names_and_never_unsaid() {
+fn a_deletion_is_asked_for_once_only_for_what_no_held_generation_names_and_never_unsaid() {
     let (_root, state) = state_directory();
     let producer = Producer::generate();
     // Two generations, each naming an object of its own and the same encrypted manifest.
@@ -5564,13 +5566,16 @@ fn a_release_is_written_once_only_for_what_no_held_generation_names_and_never_un
     let (own, shared) = (object_id(1), object_id(0xf0));
     let mut store = BackupStore::open(&state).expect("the backup store");
 
-    // A generation still producing releases nothing.
+    // A generation still producing has nothing deleted.
     let producing =
-        store.note_object_released(archive_id(), generation_one, own, TimestampMs::new(6_000));
-    assert!(producing.is_err(), "{producing:?}");
+        store.note_deletion_asked(archive_id(), generation_one, own, TimestampMs::new(6_000));
+    assert!(
+        matches!(producing, Err(ControllerError::InvalidArgument(_))),
+        "{producing:?}"
+    );
 
-    // The first generation ends with its outcome unknown: an object only it names is released, and
-    // the manifest name the second generation, still producing, names too is not.
+    // The first generation ends with its outcome unknown: an object only it names may be deleted,
+    // and the manifest the second generation, still producing, names too may not.
     store
         .note_attempt_stopped(one, TimestampMs::new(6_100))
         .expect("its upload stops");
@@ -5582,73 +5587,131 @@ fn a_release_is_written_once_only_for_what_no_held_generation_names_and_never_un
             TimestampMs::new(6_100),
         )
         .expect("its production ends");
+    let unasked =
+        store.note_object_released(archive_id(), generation_one, own, TimestampMs::new(6_500));
+    assert!(
+        matches!(unasked, Err(ControllerError::InvalidArgument(_))),
+        "an answer to a deletion never asked for: {unasked:?}"
+    );
     store
-        .note_object_released(archive_id(), generation_one, own, TimestampMs::new(7_000))
-        .expect("an object only it names is released");
-    let named = store.note_object_released(
+        .note_deletion_asked(archive_id(), generation_one, own, TimestampMs::new(7_000))
+        .expect("an object only it names may be deleted");
+    let named = store.note_deletion_asked(
         archive_id(),
         generation_one,
         shared,
         TimestampMs::new(7_000),
     );
-    assert!(named.is_err(), "{named:?}");
+    assert!(
+        matches!(named, Err(ControllerError::Refused { .. })),
+        "{named:?}"
+    );
 
-    // Once the second generation ends that way too, the name they share is released.
+    // Asked for once: asking again after an unanswered request writes nothing new.
     store
-        .note_attempt_stopped(two, TimestampMs::new(8_000))
+        .note_deletion_asked(archive_id(), generation_one, own, TimestampMs::new(8_000))
+        .expect("asked again");
+    store
+        .note_object_released(archive_id(), generation_one, own, TimestampMs::new(9_000))
+        .expect("the answer is written down");
+    store
+        .note_object_released(archive_id(), generation_one, own, TimestampMs::new(10_000))
+        .expect("the same answer again changes nothing");
+
+    // Once the second generation ends that way too, the manifest they share may be deleted.
+    store
+        .note_attempt_stopped(two, TimestampMs::new(11_000))
         .expect("its upload stops");
     store
         .cancel_production(
             archive_id(),
             generation_two,
             "given up",
-            TimestampMs::new(8_000),
+            TimestampMs::new(11_000),
         )
         .expect("its production ends");
     store
-        .note_object_released(
+        .note_deletion_asked(
             archive_id(),
             generation_one,
             shared,
-            TimestampMs::new(9_000),
+            TimestampMs::new(12_000),
         )
-        .expect("the shared name is released");
+        .expect("the shared manifest may be deleted");
 
-    // Written once: the same answer again is taken and changes nothing.
-    store
-        .note_object_released(archive_id(), generation_one, own, TimestampMs::new(10_000))
-        .expect("taken again");
-    let released = |store: &BackupStore| -> Vec<(BackupObjectId, Option<TimestampMs>)> {
-        store
-            .objects(archive_id(), generation_one)
-            .expect("a read")
-            .into_iter()
-            .map(|object| (object.object_id, object.released_at_ms))
-            .collect()
-    };
+    let deletions =
+        |store: &BackupStore| -> Vec<(BackupObjectId, Option<TimestampMs>, Option<TimestampMs>)> {
+            store
+                .objects(archive_id(), generation_one)
+                .expect("a read")
+                .into_iter()
+                .map(|object| {
+                    (
+                        object.object_id,
+                        object.deletion_asked_at_ms,
+                        object.released_at_ms,
+                    )
+                })
+                .collect()
+        };
     let expected = vec![
-        (own, Some(TimestampMs::new(7_000))),
-        (shared, Some(TimestampMs::new(9_000))),
+        (
+            own,
+            Some(TimestampMs::new(7_000)),
+            Some(TimestampMs::new(9_000)),
+        ),
+        (shared, Some(TimestampMs::new(12_000)), None),
     ];
-    assert_eq!(released(&store), expected);
+    assert_eq!(deletions(&store), expected);
     drop(store);
 
-    // Nothing that writes to the database changes one or takes one back.
+    // No generation admitted afterwards names an object this host asked to delete.
+    {
+        let service = BackupService::open(&state).expect("the service opens again");
+        service
+            .reconcile(TimestampMs::new(13_000))
+            .expect("the startup reconciliation");
+        let again = [stage(1, "a.cbor", b"one again")];
+        let reused = service.admit(
+            &producer.seal(3, &again),
+            &again,
+            producer.writer.key_id(),
+            TimestampMs::new(13_000),
+        );
+        assert!(
+            matches!(reused, Err(ControllerError::InvalidArgument(_))),
+            "{reused:?}"
+        );
+        assert!(
+            service
+                .generation(archive_id(), BackupGeneration::new(3))
+                .expect("a read")
+                .is_none()
+        );
+    }
+
+    // Nothing that writes to the database changes or takes back a deletion, or names its object.
     let connection =
         rusqlite::Connection::open(state.join("backup.sqlite")).expect("the backup store");
     for statement in [
+        "UPDATE releases SET asked_at_ms = 1",
         "UPDATE releases SET released_at_ms = 1",
+        "UPDATE releases SET released_at_ms = NULL",
         "DELETE FROM releases",
-        "INSERT INTO releases (archive_id, backup_generation, object_id, released_at_ms)
+        "INSERT INTO releases (archive_id, backup_generation, object_id, asked_at_ms)
          SELECT archive_id, backup_generation, object_id, 1 FROM releases",
+        "INSERT INTO objects (archive_id, backup_generation, object_id, encrypted_hash,
+                              encrypted_len, staged_path, local_state)
+         SELECT archive_id, 2, object_id, encrypted_hash, encrypted_len, 'x', 'present'
+           FROM objects WHERE object_id = X'01010101010101010101010101010101'",
     ] {
         assert!(connection.execute_batch(statement).is_err(), "{statement}");
     }
     drop(connection);
 
-    // A restart reads it back.
+    // A restart reads both back.
     let store = BackupStore::open(&state).expect("the store opens again");
-    assert_eq!(released(&store), expected);
+    assert_eq!(deletions(&store), expected);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -5704,8 +5767,8 @@ enum Fault {
     /// It arrives and is never answered, and nothing is done: the caller waits for as long as it
     /// is willing to.
     Hang,
-    /// A publication on its way that has not reached the service: the caller waits for as long as
-    /// it is willing to, and the request arrives only when [`Web::deliver_late`] delivers it.
+    /// A publication or a deletion on its way that has not reached the service: the caller waits
+    /// for as long as it is willing to, and the request arrives only when the test delivers it.
     Delayed,
 }
 
@@ -5742,6 +5805,8 @@ struct Scripted {
     published: BTreeMap<(ArchiveId, BackupGeneration), BackupGenerationPublication>,
     /// Publications on their way that have not reached the service.
     in_flight: Vec<BackupGenerationPublication>,
+    /// Deletions on their way that have not reached the service.
+    deletions_in_flight: Vec<(ArchiveId, BackupObjectId)>,
     asked: Vec<Asked>,
     faults: Vec<(Kind, usize, Fault)>,
     sent: BTreeMap<Kind, usize>,
@@ -5750,6 +5815,9 @@ struct Scripted {
 
 /// What the scripted service runs when a part reaches it, before it takes the part.
 type PartHook = Box<dyn FnMut(u32) + Send>;
+
+/// What the scripted service runs when any request reaches it, before it takes the request.
+type AskedHook = Box<dyn FnMut(&Asked) + Send>;
 
 /// Managed storage and the backup manifest, answering as the service does, held in memory.
 ///
@@ -5766,6 +5834,7 @@ struct Web {
     writer_key_id: KeyId,
     state: Mutex<Scripted>,
     on_part: Mutex<Option<PartHook>>,
+    on_asked: Mutex<Option<AskedHook>>,
 }
 
 impl std::fmt::Debug for Web {
@@ -5822,7 +5891,7 @@ fn answered<T>(
             let _ = take();
             Err(unanswered())
         }
-        // A publication told to hang or to be delayed never gets here: it waits first.
+        // A request told to hang or to be delayed never gets here: it waits first.
         Some(Fault::Hang | Fault::Delayed) | None => take(),
     }
 }
@@ -5834,6 +5903,7 @@ impl Web {
             writer_key_id,
             state: Mutex::default(),
             on_part: Mutex::new(None),
+            on_asked: Mutex::new(None),
         }
     }
 
@@ -5848,6 +5918,11 @@ impl Web {
 
     fn when_a_part_arrives(&self, hook: impl FnMut(u32) + Send + 'static) {
         *self.on_part.lock().expect("the hook") = Some(Box::new(hook));
+    }
+
+    /// Runs `hook` as each request reaches the service, before the service takes it.
+    fn when_asked(&self, hook: impl FnMut(&Asked) + Send + 'static) {
+        *self.on_asked.lock().expect("the hook") = Some(Box::new(hook));
     }
 
     fn turn_backup_off(&self) {
@@ -5941,6 +6016,9 @@ impl Web {
     /// Counts one request of `kind`, notes it unless it has not arrived, and returns the fault
     /// scripted for it.
     fn arriving(&self, kind: Kind, asked: Asked) -> Option<Fault> {
+        if let Some(hook) = self.on_asked.lock().expect("the hook").as_mut() {
+            hook(&asked);
+        }
         let mut state = self.scripted();
         let scripted = &mut *state;
         let sent = scripted.sent.entry(kind).or_default();
@@ -5967,6 +6045,18 @@ impl Web {
                     publication.payload.descriptor.backup_generation,
                 ));
                 self.take_publication(publication)
+            })
+            .collect()
+    }
+
+    /// The deletions on their way reach the service now, in the order they were sent, and each is
+    /// answered as the service answers it then: by the object's name.
+    fn deliver_late_deletions(&self) -> Vec<kr_client::Result<ObjectDeleted>> {
+        let late = std::mem::take(&mut self.scripted().deletions_in_flight);
+        late.iter()
+            .map(|(archive, object)| {
+                self.scripted().asked.push(Asked::Delete(*object));
+                self.take_deletion(*archive, *object)
             })
             .collect()
     }
@@ -6419,6 +6509,12 @@ impl StorageService for Web {
     ) -> ServiceFuture<'_, ObjectDeleted> {
         Box::pin(async move {
             let fault = self.arriving(Kind::Delete, Asked::Delete(object_id));
+            if fault == Some(Fault::Delayed) {
+                self.scripted()
+                    .deletions_in_flight
+                    .push((archive_id, object_id));
+                std::future::pending::<()>().await;
+            }
             answered(fault, || self.take_deletion(archive_id, object_id))
         })
     }
@@ -7266,6 +7362,135 @@ async fn a_deletion_whose_answer_was_lost_is_asked_again_in_the_next_pass() {
         "the lost deletion and the one after it"
     );
     assert_eq!(deletions(&host), objects.len() + 1);
+}
+
+/// A deletion delayed on its way reaches no object admitted after it. Once a deletion has been asked
+/// for, no generation this host admits names that object again, so the request that answers first
+/// and the one that lands later both find only the object they were about.
+#[tokio::test]
+async fn a_deletion_delayed_on_its_way_reaches_no_object_admitted_after_it() {
+    let member = member_of(1, 0);
+    let (host, mut uploader) = a_host_with_an_unknown_generation(&[(member, 64)]).await;
+    host.admit(2, &[64]);
+    steps_until(&mut uploader, 30_000, "published").await;
+    // The first deletion is delayed on its way, and the pass is given up while it is.
+    host.web.fail(Kind::Delete, 1, Fault::Delayed);
+    let stopped = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        uploader.pass(TimestampMs::new(31_000)),
+    )
+    .await;
+    assert!(stopped.is_err(), "the deletion is on its way");
+
+    // The next pass asks again, and the service answers.
+    passes(&mut uploader, 32_000).await;
+    for object in host
+        .service
+        .objects(archive_id(), BackupGeneration::new(1))
+        .expect("a read")
+    {
+        assert!(object.released_at_ms.is_some(), "{object:?}");
+        assert!(
+            host.web.stored_bytes(object.object_id).is_none(),
+            "{object:?}"
+        );
+    }
+
+    // A generation naming that object again is refused, so nothing can take its name.
+    let reused = host.try_admit_objects(3, &[(member, 64)]);
+    assert!(
+        matches!(reused, Err(ControllerError::InvalidArgument(_))),
+        "{reused:?}"
+    );
+    host.admit(3, &[64]);
+    passes(&mut uploader, 33_000).await;
+    assert_eq!(host.generation(3).remote, Remote::Published);
+
+    // The delayed deletion lands last. It finds the object it was about, already a tombstone, and
+    // every object a published generation names is still held.
+    let late = host.web.deliver_late_deletions();
+    assert!(
+        matches!(late.as_slice(), [Ok(ObjectDeleted { already: true, .. })]),
+        "{late:?}"
+    );
+    for generation in [2, 3] {
+        for object in host
+            .service
+            .objects(archive_id(), BackupGeneration::new(generation))
+            .expect("a read")
+        {
+            assert!(
+                host.web.stored_bytes(object.object_id).is_some(),
+                "{object:?}"
+            );
+        }
+    }
+}
+
+/// No generation admitted while a deletion is on its way names that object. The deletion is written
+/// down before it leaves, and admission refuses the name from then on, so a generation offered in
+/// between is refused rather than having its object deleted from under it.
+#[tokio::test]
+async fn no_generation_admitted_while_a_deletion_is_on_its_way_names_that_object() {
+    let member = member_of(1, 0);
+    let (host, mut uploader) = a_host_with_an_unknown_generation(&[(member, 64)]).await;
+    host.admit(2, &[64]);
+    steps_until(&mut uploader, 30_000, "published").await;
+
+    // A generation naming that member, offered for admission as the deletion of it reaches the
+    // service.
+    let objects = [stage_object(
+        &ObjectSource {
+            object_id: member,
+            filename: "member-0.cbor",
+            plaintext: &[0x5a; 64],
+        },
+        KeyRotation::INITIAL,
+    )
+    .expect("a staged object")];
+    let sealed = seal_generation(&host.producer, 3, &objects);
+    let service = Arc::clone(&host.service);
+    let writer = host.producer.writer.key_id();
+    let outcome: Arc<Mutex<Option<Result<Admitted, ControllerError>>>> = Arc::default();
+    let seen = Arc::clone(&outcome);
+    let mut offered = Some((sealed, objects));
+    host.web.when_asked(move |asked| {
+        if *asked == Asked::Delete(member)
+            && let Some((sealed, objects)) = offered.take()
+        {
+            let admitted = service.admit(&sealed, &objects, writer, TimestampMs::new(31_500));
+            *seen.lock().expect("the outcome") = Some(admitted);
+        }
+    });
+    passes(&mut uploader, 31_000).await;
+
+    let admitted = outcome
+        .lock()
+        .expect("the outcome")
+        .take()
+        .expect("a generation was offered while the deletion was on its way");
+    assert!(
+        matches!(admitted, Err(ControllerError::InvalidArgument(_))),
+        "{admitted:?}"
+    );
+    assert!(
+        host.service
+            .generation(archive_id(), BackupGeneration::new(3))
+            .expect("a read")
+            .is_none(),
+        "nothing of it was admitted"
+    );
+    assert!(host.web.stored_bytes(member).is_none());
+    for object in host
+        .service
+        .objects(archive_id(), BackupGeneration::new(2))
+        .expect("a read")
+    {
+        assert!(
+            host.web.stored_bytes(object.object_id).is_some(),
+            "{object:?}"
+        );
+    }
 }
 
 /// An object is deleted only when no generation this host still holds names it. This host's store

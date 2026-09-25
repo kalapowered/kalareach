@@ -1,6 +1,5 @@
 //! `backup.sqlite`: the generations this host has produced, their objects, their upload state, the
-//! outbox that carries them to the service, and the objects the service no longer holds after this
-//! host asked for their deletion.
+//! outbox that carries them to the service, and each deletion this host asked the service for.
 //!
 //! # One transaction per state transition
 //!
@@ -526,8 +525,15 @@ pub struct ObjectRecord {
     /// It never decreases, and it is never touched by a removal: what a service holds and where
     /// the ciphertext is are two facts, and each is recorded on its own terms.
     pub acknowledged_bytes: u64,
+    /// When this host asked the service to delete this object, because no publication can name
+    /// it.
+    ///
+    /// Written before the request leaves, and never taken back. From then on no generation this
+    /// host admits names the object again, so neither the request nor any later one can reach
+    /// anything but this object.
+    pub deletion_asked_at_ms: Option<TimestampMs>,
     /// When the service said it no longer holds this object, after this host asked for its
-    /// deletion because no publication can name it.
+    /// deletion.
     ///
     /// Written once and never taken back. What was acknowledged stays as it was: the service did
     /// hold the object, and this says that it holds it no longer.
@@ -903,15 +909,19 @@ macro_rules! uploads_definition {
     };
 }
 
-/// Each object the storage service no longer holds after this host asked for its deletion, and
-/// when the service said so.
+/// Each object this host asked the storage service to delete, when it asked, and when the service
+/// said it no longer holds it.
 ///
 /// It is the record that lets the storage of a generation no publication can name be given back
-/// once, and never asked for again. Its rules: a release is written once and is never changed or
-/// taken back; only an object of a generation whose production ended with its outcome unknown is
-/// released; and an object is released only when every generation this host records that names it
-/// ended that way too. So no object that a producing, complete or published generation names is
-/// ever written down as gone. It holds identities and an instant, as the rest of the store does.
+/// once, and never asked for again. A deletion is written down before its request leaves, and the
+/// store decides in that write whether it may be asked for at all. Its rules: a deletion is asked
+/// for once, only for an object of a generation whose production ended with its outcome unknown,
+/// and only when every generation this host records that names the object ended that way too;
+/// what was asked for is never changed or taken back, and the answer is written once; and no
+/// generation admitted afterwards names an object this host asked to delete. So no object that a
+/// producing, complete or published generation names is ever asked for, and a request, or a later
+/// one for the same object, can never reach an object admitted after it. It holds identities and
+/// instants, as the rest of the store does.
 ///
 /// One text, in [`DEFINITION`] and in the step that brings a version-6 store to this schema, so the
 /// two cannot write these objects differently.
@@ -922,22 +932,22 @@ macro_rules! releases_definition {
                      archive_id        BLOB NOT NULL,
                      backup_generation INTEGER NOT NULL,
                      object_id         BLOB NOT NULL,
-                     released_at_ms    INTEGER NOT NULL,
+                     asked_at_ms       INTEGER NOT NULL,
+                     released_at_ms    INTEGER,
                      PRIMARY KEY (archive_id, backup_generation, object_id),
                      FOREIGN KEY (archive_id, backup_generation, object_id)
                          REFERENCES objects (archive_id, backup_generation, object_id)
                  );
-                 CREATE TRIGGER IF NOT EXISTS a_release_is_written_once
+                 CREATE TRIGGER IF NOT EXISTS a_deletion_is_asked_for_once
                  BEFORE INSERT ON releases
                  WHEN EXISTS (SELECT 1 FROM releases
                                WHERE archive_id = NEW.archive_id
                                  AND backup_generation = NEW.backup_generation
                                  AND object_id = NEW.object_id)
                  BEGIN
-                     SELECT RAISE(ABORT, 'that the service no longer holds an object is written \
-                                          down once');
+                     SELECT RAISE(ABORT, 'a deletion of an object is asked for once');
                  END;
-                 CREATE TRIGGER IF NOT EXISTS only_an_object_of_an_unknown_generation_is_released
+                 CREATE TRIGGER IF NOT EXISTS only_an_object_of_an_unknown_generation_is_deleted
                  BEFORE INSERT ON releases
                  WHEN NOT EXISTS (SELECT 1 FROM generations
                                    WHERE archive_id = NEW.archive_id
@@ -946,9 +956,9 @@ macro_rules! releases_definition {
                                      AND remote = 'unknown')
                  BEGIN
                      SELECT RAISE(ABORT, 'only an object of a generation whose production ended \
-                                          with its outcome unknown is released');
+                                          with its outcome unknown is deleted');
                  END;
-                 CREATE TRIGGER IF NOT EXISTS an_object_a_held_generation_names_is_not_released
+                 CREATE TRIGGER IF NOT EXISTS an_object_a_held_generation_names_is_not_deleted
                  BEFORE INSERT ON releases
                  WHEN EXISTS (SELECT 1 FROM objects
                                 JOIN generations
@@ -960,19 +970,33 @@ macro_rules! releases_definition {
                                           AND generations.remote = 'unknown'))
                  BEGIN
                      SELECT RAISE(ABORT, 'an object named by a generation this host still holds \
-                                          is not released');
+                                          is not deleted');
                  END;
-                 CREATE TRIGGER IF NOT EXISTS a_release_is_never_changed
+                 CREATE TRIGGER IF NOT EXISTS a_deletion_asked_for_keeps_what_it_is
                  BEFORE UPDATE ON releases
+                 WHEN NEW.archive_id <> OLD.archive_id
+                   OR NEW.backup_generation <> OLD.backup_generation
+                   OR NEW.object_id <> OLD.object_id
+                   OR NEW.asked_at_ms <> OLD.asked_at_ms
+                   OR OLD.released_at_ms IS NOT NULL
+                   OR NEW.released_at_ms IS NULL
                  BEGIN
-                     SELECT RAISE(ABORT, 'that the service no longer holds an object is never \
-                                          changed');
+                     SELECT RAISE(ABORT, 'a deletion asked for keeps what it was asked for, and its \
+                                          answer is written once');
                  END;
-                 CREATE TRIGGER IF NOT EXISTS a_release_is_never_taken_back
+                 CREATE TRIGGER IF NOT EXISTS a_deletion_asked_for_is_never_taken_back
                  BEFORE DELETE ON releases
                  BEGIN
-                     SELECT RAISE(ABORT, 'that the service no longer holds an object is never \
-                                          unsaid');
+                     SELECT RAISE(ABORT, 'a deletion this host asked for is never unsaid');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS an_object_this_host_asked_to_delete_is_named_no_more
+                 BEFORE INSERT ON objects
+                 WHEN EXISTS (SELECT 1 FROM releases
+                               WHERE archive_id = NEW.archive_id
+                                 AND object_id = NEW.object_id)
+                 BEGIN
+                     SELECT RAISE(ABORT, 'an object this host asked the service to delete is never \
+                                          named by another generation');
                  END;"
     };
 }
@@ -1521,6 +1545,22 @@ impl BackupStore {
             )
             .map_err(ControllerError::registry)?;
         for object in objects {
+            // An object this host asked the service to delete is named by nothing new: a request
+            // for its deletion, or a later one, must never reach an object admitted after it.
+            let deleted: i64 = transaction
+                .read_one(
+                    sql!("SELECT COUNT(*) FROM releases WHERE archive_id = ?1 AND object_id = ?2"),
+                    params![archive, object.object_id.get().as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .map_err(ControllerError::registry)?;
+            if deleted > 0 {
+                return Err(ControllerError::InvalidArgument(format!(
+                    "object {} was asked to be deleted at the service, so no new backup \
+                     generation names it",
+                    object.object_id
+                )));
+            }
             transaction
                 .run(
                     sql!(
@@ -2295,7 +2335,7 @@ impl BackupStore {
             .prepared(sql!(
                 "SELECT objects.archive_id, objects.backup_generation, objects.object_id,
                         encrypted_hash, encrypted_len, staged_path, local_state,
-                        acknowledged_bytes, releases.released_at_ms
+                        acknowledged_bytes, releases.asked_at_ms, releases.released_at_ms
                  FROM objects
                  LEFT JOIN releases
                    ON releases.archive_id = objects.archive_id
@@ -2462,17 +2502,116 @@ impl BackupStore {
         Ok(forgotten > 0)
     }
 
-    /// Records that the service no longer holds one object, which this host asked it to delete.
+    /// Writes down that this host is about to ask the service to delete one object, before the
+    /// request leaves.
     ///
-    /// The service answered the deletion, or answered that it holds no object under that identity;
-    /// either way nothing of it is charged beyond the service's tombstone window. A release already
-    /// written is left as it is, so an answer recorded twice records it once. The store's rules
-    /// refuse a release for an object whose generation did not end with its outcome unknown, and for
-    /// one a generation this host still holds names.
+    /// The store decides here whether it may be asked for at all, in the transaction that writes
+    /// it down: the object's generation ended with its outcome unknown, and every generation this
+    /// host records that names the object ended that way too. From then on no generation this host
+    /// admits names the object, so the request, and any later one for the same object, can only
+    /// ever reach this object. A deletion already written down is left as it is, so asking again
+    /// after an unanswered request writes nothing new.
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
+    /// Returns [`ControllerError::InvalidArgument`] when the object's generation did not end with
+    /// its outcome unknown, [`ControllerError::Refused`] when a generation this host still holds
+    /// names the object, and [`ControllerError::RegistryUnavailable`] when the store refuses the
+    /// write.
+    pub fn note_deletion_asked(
+        &mut self,
+        archive_id: ArchiveId,
+        backup_generation: BackupGeneration,
+        object_id: BackupObjectId,
+        now_ms: TimestampMs,
+    ) -> Result<()> {
+        let archive = archive_id.get().as_bytes().to_vec();
+        let generation = i64::try_from(backup_generation.get()).unwrap_or(i64::MAX);
+        let object = object_id.get().as_bytes().to_vec();
+        let transaction = self
+            .connection
+            .writing()
+            .map_err(ControllerError::registry)?;
+        let asked: i64 = transaction
+            .read_one(
+                sql!(
+                    "SELECT COUNT(*) FROM releases
+                  WHERE archive_id = ?1 AND backup_generation = ?2 AND object_id = ?3"
+                ),
+                params![archive, generation, object],
+                |row| row.get(0),
+            )
+            .map_err(ControllerError::registry)?;
+        if asked > 0 {
+            return Ok(());
+        }
+        let unknown: i64 = transaction
+            .read_one(
+                sql!(
+                    "SELECT COUNT(*) FROM objects
+                   JOIN generations
+                     ON generations.archive_id = objects.archive_id
+                    AND generations.backup_generation = objects.backup_generation
+                  WHERE objects.archive_id = ?1 AND objects.backup_generation = ?2
+                    AND objects.object_id = ?3
+                    AND generations.production = 'cancelled'
+                    AND generations.remote = 'unknown'"
+                ),
+                params![archive, generation, object],
+                |row| row.get(0),
+            )
+            .map_err(ControllerError::registry)?;
+        if unknown == 0 {
+            return Err(ControllerError::InvalidArgument(
+                "only an object of a backup generation whose production ended with its outcome \
+                 unknown is deleted"
+                    .to_owned(),
+            ));
+        }
+        let held: i64 = transaction
+            .read_one(
+                sql!(
+                    "SELECT COUNT(*) FROM objects
+                   JOIN generations
+                     ON generations.archive_id = objects.archive_id
+                    AND generations.backup_generation = objects.backup_generation
+                  WHERE objects.archive_id = ?1 AND objects.object_id = ?2
+                    AND NOT (generations.production = 'cancelled'
+                             AND generations.remote = 'unknown')"
+                ),
+                params![archive, object],
+                |row| row.get(0),
+            )
+            .map_err(ControllerError::registry)?;
+        if held > 0 {
+            return Err(ControllerError::Refused {
+                code: kr_protocol::error::ErrorCode::PermissionDenied,
+                detail: "a backup generation this host still holds names that object".to_owned(),
+            });
+        }
+        transaction
+            .run(
+                sql!(
+                    "INSERT INTO releases
+                     (archive_id, backup_generation, object_id, asked_at_ms, released_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, NULL)"
+                ),
+                params![archive, generation, object, millis(now_ms)],
+            )
+            .map_err(ControllerError::registry)?;
+        transaction.commit().map_err(ControllerError::registry)
+    }
+
+    /// Records that the service no longer holds one object this host asked it to delete.
+    ///
+    /// The service answered the deletion, or answered that it holds no object under that identity;
+    /// either way nothing of it is charged beyond the service's tombstone window. An answer already
+    /// written down is left as it is, so an answer recorded twice records it once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::InvalidArgument`] when no deletion of that object was written
+    /// down, and [`ControllerError::RegistryUnavailable`] when the store refuses the write.
     pub fn note_object_released(
         &mut self,
         archive_id: ArchiveId,
@@ -2487,28 +2626,36 @@ impl BackupStore {
             .connection
             .writing()
             .map_err(ControllerError::registry)?;
-        let written: i64 = transaction
+        let answered: Option<Option<i64>> = transaction
             .read_one(
                 sql!(
-                    "SELECT COUNT(*) FROM releases
+                    "SELECT released_at_ms FROM releases
                   WHERE archive_id = ?1 AND backup_generation = ?2 AND object_id = ?3"
                 ),
                 params![archive, generation, object],
                 |row| row.get(0),
             )
+            .optional()
             .map_err(ControllerError::registry)?;
-        if written == 0 {
-            transaction
-                .run(
-                    sql!(
-                        "INSERT INTO releases
-                         (archive_id, backup_generation, object_id, released_at_ms)
-                     VALUES (?1, ?2, ?3, ?4)"
-                    ),
-                    params![archive, generation, object, millis(now_ms)],
-                )
-                .map_err(ControllerError::registry)?;
+        match answered {
+            None => {
+                return Err(ControllerError::InvalidArgument(
+                    "no deletion of that backup object was asked for".to_owned(),
+                ));
+            }
+            Some(Some(_)) => return Ok(()),
+            Some(None) => {}
         }
+        transaction
+            .run(
+                sql!(
+                    "UPDATE releases SET released_at_ms = ?4
+                  WHERE archive_id = ?1 AND backup_generation = ?2 AND object_id = ?3
+                    AND released_at_ms IS NULL"
+                ),
+                params![archive, generation, object, millis(now_ms)],
+            )
+            .map_err(ControllerError::registry)?;
         transaction.commit().map_err(ControllerError::registry)
     }
 
@@ -4335,7 +4482,8 @@ fn read_object(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<ObjectRecord>
     let path: String = row.get(5)?;
     let local_state: String = row.get(6)?;
     let acknowledged: i64 = row.get(7)?;
-    let released: Option<i64> = row.get(8)?;
+    let asked: Option<i64> = row.get(8)?;
+    let released: Option<i64> = row.get(9)?;
     Ok((|| {
         Ok(ObjectRecord {
             archive_id: ArchiveId::new(uuid(&archive, "an archive identifier")?),
@@ -4350,6 +4498,8 @@ fn read_object(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<ObjectRecord>
             staged_path: PathBuf::from(path),
             local_state: LocalState::parse(&local_state)?,
             acknowledged_bytes: u64::try_from(acknowledged).unwrap_or(0),
+            deletion_asked_at_ms: asked
+                .map(|value| TimestampMs::new(u64::try_from(value).unwrap_or(0))),
             released_at_ms: released
                 .map(|value| TimestampMs::new(u64::try_from(value).unwrap_or(0))),
         })

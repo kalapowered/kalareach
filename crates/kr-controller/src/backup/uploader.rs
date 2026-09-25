@@ -82,7 +82,10 @@
 //! published and keeps everything. Otherwise it never will, and each of its objects is deleted
 //! once and the answer written down, and the service gives the storage back after its tombstone
 //! window. An object another generation this host still holds also names is kept, because the
-//! service holds one object under one name. Nothing is deleted under privacy mode's line, whose
+//! service holds one object under one name. A deletion is written down before its request leaves,
+//! in a write the store refuses for such an object, and from then on no generation this host
+//! admits names that object, so neither that request, a later one, nor one delayed on its way can
+//! reach an object admitted after it. Nothing is deleted under privacy mode's line, whose
 //! retained artifacts go only by the person's own action, nor from a collection deleted from the
 //! account console, which the service empties itself.
 //!
@@ -1598,9 +1601,12 @@ impl Uploader {
 
     /// Deletes one object of a generation no publication can name, and writes the answer down.
     ///
-    /// A deletion the service answered and one it answered by holding no object of that name
-    /// both end with nothing of it charged beyond the service's tombstone window. Any other answer
-    /// leaves it for the next pass.
+    /// The deletion is written down before the request leaves, and the store decides in that write
+    /// whether it may be asked for: from then on no generation this host admits names the object,
+    /// so this request, a later one for it, or one delayed on its way can only reach this object.
+    /// A deletion the service answered and one it answered by holding no object of that name both
+    /// end with nothing of it charged beyond the service's tombstone window. Any other answer
+    /// leaves it for the next pass, which asks again.
     async fn release(
         &mut self,
         generation: &GenerationRecord,
@@ -1608,6 +1614,17 @@ impl Uploader {
         now: TimestampMs,
         turn: &mut Turn,
     ) -> Result<Stepped> {
+        let asked = self.backup.store().note_deletion_asked(
+            generation.archive_id,
+            generation.backup_generation,
+            object.object_id,
+            now,
+        );
+        if let Err(error) = asked {
+            let stepped = waiting_on(error)?;
+            turn.unreclaimed.insert(generation_key(generation));
+            return Ok(stepped);
+        }
         let deleted = match self
             .storage
             .delete_object(generation.archive_id, object.object_id)
