@@ -28,6 +28,9 @@ use tokio_websockets::{ClientBuilder, Limits, Message, WebSocketStream};
 /// How long opening a room socket may take: the name, the connection, TLS and the upgrade.
 pub const OPEN_DEADLINE: Duration = Duration::from_secs(15);
 
+/// How long closing a room socket from this side may take.
+pub const CLOSE_DEADLINE: Duration = Duration::from_secs(2);
+
 /// How long a candidate waits for the room's next frame.
 ///
 /// The room ends every candidate socket ten seconds after it opened, so a frame that has not come
@@ -161,9 +164,9 @@ impl CandidateSocket {
         }
     }
 
-    /// Closes the socket from this side.
+    /// Closes the socket from this side, within [`CLOSE_DEADLINE`].
     pub async fn close(mut self) {
-        let _ = tokio::time::timeout(Duration::from_secs(2), self.socket.close()).await;
+        let _ = tokio::time::timeout(CLOSE_DEADLINE, self.socket.close()).await;
     }
 }
 
@@ -216,11 +219,13 @@ fn host_and_port(authority: &str) -> Result<(&str, u16), String> {
 
 /// Asks the room of `locator` again until a new candidate is served no record, and returns how long
 /// after the first question the question that found it serving none concluded; `None` when the room
-/// still served the record to every question that could conclude within `within`.
+/// still served the record to every question that concluded within `within`.
 ///
 /// Each question is [`serves_record`] with `probe`: a served candidate learns so at once, and one
-/// that is served nothing learns it only when `probe` has passed, so a question is started only
-/// while it can conclude inside `within`.
+/// that is served nothing learns it only when `probe` has passed. A question is started only while
+/// all of it can end inside `within`: opening the socket, the probe and closing the socket. None
+/// runs past `within` whatever happens: one still running then is cut short, and it answers
+/// nothing.
 ///
 /// # Errors
 ///
@@ -232,14 +237,20 @@ pub async fn stops_serving(
     within: Duration,
 ) -> Result<Option<Duration>, String> {
     let started = tokio::time::Instant::now();
+    let deadline = started + within;
+    let question = OPEN_DEADLINE + probe + CLOSE_DEADLINE;
     loop {
-        if !serves_record(origin, locator, probe).await? {
-            return Ok(Some(started.elapsed()));
-        }
-        let pause = Duration::from_secs(1);
-        if started.elapsed() + pause + probe + OPEN_DEADLINE > within {
+        if started.elapsed() + question > within {
             return Ok(None);
         }
-        tokio::time::sleep(pause).await;
+        match tokio::time::timeout_at(deadline, serves_record(origin, locator, probe)).await {
+            Err(_) => return Ok(None),
+            Ok(served) => {
+                if !served? {
+                    return Ok(Some(started.elapsed()));
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }

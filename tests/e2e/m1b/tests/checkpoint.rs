@@ -23,8 +23,8 @@ const PROBE: Duration = Duration::from_secs(5);
 ///
 /// The host releases the locator before it answers the call that ended the invitation, so a room
 /// that still serves the record this long afterwards is one the release did not reach; the record
-/// then lasts until the invitation's own expiry. Only a question that can conclude inside this is
-/// asked.
+/// then lasts until the invitation's own expiry. Only a question that can end inside this is asked,
+/// and none runs past it.
 const RELEASE_WAIT: Duration = Duration::from_secs(40);
 
 /// What the command line of an agent's tool server holds: `kr agent-tools`, which the agent starts
@@ -81,9 +81,9 @@ fn room_after(
             u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
         });
     format!(
-        "the room of locator {} still served its record to every question asked within \
-         {RELEASE_WAIT:?} after {ended}; the host's release is a best effort, and the record \
-         is due to end with the invitation in about {} s",
+        "the room of locator {} still served its record to every question that concluded \
+         within {RELEASE_WAIT:?} after {ended}; the host's release is a best effort, and the \
+         record is due to end with the invitation in about {} s",
         locator.as_str(),
         expires_at_ms.saturating_sub(now_ms) / 1000
     )
