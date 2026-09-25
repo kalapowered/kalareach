@@ -271,6 +271,11 @@ async fn each_kind_of_refusal_ends_a_relay_only_attempt_at_once_as_itself() {
 /// refusal while a direct path could still open. With nothing but the refusing relay to reach the
 /// host by, its attempt runs to its own end and then fails as the refusal, offering the direct
 /// alternatives as well as the relay ones.
+///
+/// The refusal is the reason only while the status shows it. By the end of the attempt iroh dials
+/// the refusing relay again only after five seconds or more, and each dial shows no refusal for the
+/// few milliseconds it takes, so an attempt that ends inside one is a timeout. The device then
+/// dials once more.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_device_with_a_direct_transport_is_told_of_the_refusal_when_its_attempt_ends() {
     const SPENT: &str = "allowance_spent: the reserved bytes for this endpoint are spent";
@@ -279,11 +284,12 @@ async fn a_device_with_a_direct_transport_is_told_of_the_refusal_when_its_attemp
     let device = refused_device(&with_direct(&relay), &relay, SPENT).await;
     until_refused(&device, &relay.url, SPENT).await;
 
-    let (took, outcome) = dial(
-        &device,
-        EndpointAddr::new(host.endpoint.id()).with_relay_url(relay.url.clone()),
-    )
-    .await;
+    let route = EndpointAddr::new(host.endpoint.id()).with_relay_url(relay.url.clone());
+    let (mut took, mut outcome) = dial(&device, route.clone()).await;
+    if took >= AT_ONCE && matches!(outcome, Err(TransportError::Connect(_))) {
+        eprintln!("the attempt ended while the relay was being dialled again; dialling once more");
+        (took, outcome) = dial(&device, route).await;
+    }
     let error = outcome.expect_err("the host can be reached only through the refusing relay");
     let TransportError::RelayRefused(refusal) = &error else {
         panic!("the failure is the relay's refusal, not a peer that did not answer: {error}");

@@ -186,27 +186,32 @@ and its separator is kept whole and shown as it is, with no kind of its own.
 
 A refusal counts only when the relay that gave it is on the route: a relay the dialled address
 names, or one the endpoint already holds for the peer, both of which iroh tries. iroh keeps a
-relay's reason only for the endpoint's own home relay, and only as the latest thing that relay
-said, so the status is followed for the whole attempt: every value it delivers is taken in as it is
-delivered, and it is read again whenever a decision rests on it. A refusal stands while iroh dials
-the relay again, and ends when the relay admits the endpoint, when the latest attempt to reach it
-failed for another cause, or when it is no longer a home relay, since nothing it says afterwards is
-reported. A refusal by a home relay that is not on the route
-says nothing about the connection. A route relay that is not the endpoint's home relay leaves no
-reason to read, and a failure through it is reported as `TransportError::Connect`.
+relay's reason only for the endpoint's own home relay, and only until it dials that relay again,
+so the status is followed for the whole attempt and read again whenever a decision rests on it.
+
+A refusal counts only while the status shows it, which is the rule a refused upgrade follows too.
+The status reports the latest state and can pass over the states between two readings: a relay
+seen refusing and then seen being dialled again may have admitted the endpoint in between, so what
+it said before is not reported as the reason. A refusal ends when iroh dials the relay again, when
+the relay admits the endpoint, when the latest attempt to reach it failed for another cause, and
+when it is no longer a home relay. A refusal by a home relay that is not on the route says nothing
+about the connection. A route relay that is not the endpoint's home relay leaves no reason to read,
+and a failure through it is reported as `TransportError::Connect`.
 
 A refusal is reported only for an attempt that was made and then timed out before any connection
 was established. A request that could not be made at all, a peer that answered and refused, and an
 endpoint that was closing are each their own reason and are reported as `TransportError::Connect`,
 whatever a relay said at the time. The timeout alone does not prove the refusal caused it: a peer
 that began the handshake and then fell silent times out the same way. What the failure reports is
-that a relay on the route had turned this endpoint away when the attempt ran out.
+that the status showed a relay on the route turning this endpoint away when the attempt ran out.
 
 An endpoint with no IP transport, one built with `relay_only`, has nothing but relays to try, so
-once every relay on its route has refused it the attempt ends at once rather than at its 30-second
-deadline. An endpoint that can take a direct path lets the attempt run, because an address hint or
-local discovery can still open one; if none does, it fails as the refusal. Connections already
-established on a direct path are not affected by a relay's refusal at all.
+once the status shows every relay on its route refusing it the attempt ends at once rather than at
+its 30-second deadline. An endpoint that can take a direct path lets the attempt run, because an
+address hint or local discovery can still open one; if none does, it fails as the refusal when the
+status still shows it. iroh dials a refusing relay again after a backoff that grows to seconds, and
+an attempt that ends during one of those dials fails as a timeout. Connections already established
+on a direct path are not affected by a relay's refusal at all.
 
 What may still work is named by kind, because which of them a person can use depends on
 configuration the failure does not carry:

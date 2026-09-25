@@ -69,14 +69,17 @@ the identifier again, and inventing a new one would submit the same intent twice
 
 A connection that a relay stood in the way of is not reported as a host that did not answer.
 `NetworkTransport::connect` returns `ClientError::Transport` holding
-`TransportError::RelayRefused` when the attempt timed out without a connection while a relay on the
-route had turned this device away, or when the device had nothing but refusing relays to try: it
-names the relay, carries what the relay said, and lists the kinds of path that may still work. Its code comes from the kind token the relay's reason starts with: a spent
+`TransportError::RelayRefused` when the attempt timed out without a connection while the relay
+status showed a relay on the route turning this device away, or when the device had nothing but
+refusing relays to try: it names the relay, carries what the relay said, and lists the kinds of path
+that may still work. Its code comes from the kind token the relay's reason starts with: a spent
 allowance is `QUOTA_EXCEEDED`, a relay that is stopping is `SERVICE_CAPACITY`, and a reason with no
 known token is `RESOURCE_UNAVAILABLE`, like any other connection that could not be made. A device
 whose only path is the relay learns this as soon as the relay refuses it; one that can take a direct
-path learns it when its attempt ends without one. The transport reference has the token grammar and
-the alternatives.
+path learns it when its attempt ends without one, if the status still shows the refusal then. A
+refusal counts only while the status shows it, because a relay that is being dialled again may have
+admitted the device since. The transport reference has the rule, the token grammar and the
+alternatives.
 
 Two refusers know more than a code can carry. A managed service answers `PERMISSION_DENIED` both for
 a caller that is not signed in and for an account that may not do this, so it classifies its own
