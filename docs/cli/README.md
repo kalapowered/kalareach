@@ -1072,28 +1072,32 @@ the file, and says to run `kr host startup --set service`. The command never wri
 same goes for a definition in the domain the environment's default execution profile no longer
 implies, which the setup, run again, rewrites; and for a manager that would run anything but that
 definition. On macOS that is a job launchd holds under the definition's label from another file or
-in an earlier form. On Linux it is a unit the user manager loads from another file, or whose
-commands are not exactly the one the definition names, whichever file or drop-in they come from:
-kr compares the manager's own record of every command, program, arguments and flags, word for word.
-A drop-in that leaves the command alone and sets the daemon's environment, limits or timeouts is
-the host's or yours, and the manager applies it; `--set service` names each drop-in the manager
-reads for the unit. kr leaves what a manager holds to the person: it names the remedy, `launchctl
-bootout <domain>/<label>` or the drop-ins to look in, and the setup takes the definition once it
-has been applied. kr ends no daemon, so it never runs `launchctl bootout` itself.
+in an earlier form. On Linux it is a unit the user manager loads from another file or has not
+reloaded since it changed; a drop-in for the unit, wherever it is, with a line that sets a key
+starting with `Exec` or the key `Type`; or a command the manager prints other than the
+definition's. So the daemon's command comes from kr's file alone. A drop-in that sets the daemon's
+environment, limits or timeouts is the host's or yours, and the manager applies it; `--set
+service` names each drop-in the manager reads for the unit. kr leaves what a manager holds to the
+person: it names the remedy, `launchctl bootout <domain>/<label>` or the drop-ins to look in, and
+the setup takes the definition once it has been applied. kr ends no daemon, so it never runs
+`launchctl bootout` itself.
 
 | Platform | The definition | Where it is loaded |
 | --- | --- | --- |
 | macOS | a launchd job, `~/Library/LaunchAgents/kr-controller-<environment>.plist` | your graphical domain when the environment's sessions are desktop-bound by default, your background domain when they are headless |
 | Linux | a systemd user unit, `kr-controller-<environment>.service` in `$XDG_CONFIG_HOME/systemd/user`, `~/.config/systemd/user` by default | the user manager, with no `[Install]` section, so nothing enables it |
 
-On Linux, kr reads what the user manager holds over the manager's own socket,
-`$XDG_RUNTIME_DIR/systemd/private`, which `systemctl --user` also connects to first. A host whose
-user manager does not answer there has no service start.
+On Linux, kr asks the user manager everything through `systemctl --user`, with the runtime
+directory set for it, so every question and every request reaches the same manager. A host whose
+user manager does not answer has no service start.
 
-The daemon is the `kr-controller` installed beside `kr`, told this installation's runtime and state
-roots, working in the environment's state directory and writing to its `controller.log`. The
-manager starts it only when a command asks, never at login, and never again after it ends. It runs
-in the manager's environment rather than the command's, as every service the manager starts does.
+kr's definition runs the `kr-controller` installed beside `kr`, told this installation's runtime
+and state roots, working in the environment's state directory and writing to its `controller.log`,
+and has the manager start it only when a command asks: never at login, and not again after it ends.
+Those are the definition's settings. On Linux a drop-in you or the host add can change the working
+directory, where output goes and whether the daemon is restarted; kr checks the command and how it
+is started, not those. The daemon runs in the manager's environment rather than the command's, as
+every service the manager starts does.
 A launchd domain is a login context, so the daemon of a desktop host runs in the graphical login,
 keychain and all, and ends with it; a headless host's daemon runs outside that login and outlives
 it. `--set service` refuses a definition already under that label that kr did not write, or one
