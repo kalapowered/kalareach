@@ -90,9 +90,9 @@ pub fn import(url: &str, fetcher: &dyn Fetcher) -> Result<Imported> {
 
 /// The fetcher this application actually uses.
 ///
-/// One request, no redirects it did not check, no cookies, no cache and a hard read limit. A
-/// redirect is followed only while it stays on `https`, because a redirect to another scheme is
-/// the same escape the approved-scheme list exists to prevent.
+/// One request, no redirects it did not check, no cookies, no cache, no proxy and a hard read
+/// limit. A redirect is followed only while it stays on `https`, because a redirect to another
+/// scheme is the same escape the approved-scheme list exists to prevent.
 #[derive(Debug)]
 pub struct HttpsFetcher {
     agent: ureq::Agent,
@@ -108,6 +108,9 @@ impl HttpsFetcher {
             // Every request in the chain, not just the first: a redirect to http is refused before
             // it is made rather than noticed after the bytes have already gone somewhere.
             .https_only(true)
+            // The library's own default reads a proxy from the environment. An image a person
+            // chose to import goes to its own address, whatever the environment names.
+            .proxy(None)
             .redirect_auth_headers(ureq::config::RedirectAuthHeaders::Never)
             .user_agent("KalaReach")
             .build();
