@@ -6515,3 +6515,131 @@ async fn install_example(
         )
         .await
 }
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-11.07, KR-REQ-26.14: the repository transport and the search for a newer root
+// ---------------------------------------------------------------------------------------------
+
+/// A service on loopback that answers every request with one status and nothing else, until it is
+/// stopped.
+struct Answering {
+    origin: String,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Answering {
+    fn start(status: u16) -> Self {
+        use std::io::{Read as _, Write as _};
+        use std::sync::atomic::Ordering;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        listener
+            .set_nonblocking(true)
+            .expect("a listener that polls");
+        let origin = format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().expect("an address").port()
+        );
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
+        let thread = std::thread::spawn(move || {
+            while !stopped.load(Ordering::SeqCst) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                };
+                let _ = stream.set_nonblocking(false);
+                let mut head = Vec::new();
+                let mut byte = [0_u8];
+                while !head.ends_with(b"\r\n\r\n") && stream.read_exact(&mut byte).is_ok() {
+                    head.push(byte[0]);
+                }
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 {status} Answer\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        Self {
+            origin,
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for Answering {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Every file of a repository read from disk, except any root after the first, which is asked of
+/// a service over HTTP through the repository transport a host builds.
+#[derive(Clone, Debug)]
+struct LaterRootsOverHttp {
+    service: String,
+    http: RepositoryTransport,
+}
+
+#[tough::async_trait]
+impl tough::Transport for LaterRootsOverHttp {
+    async fn fetch(&self, url: url::Url) -> Result<tough::TransportStream, tough::TransportError> {
+        let name = url
+            .path_segments()
+            .and_then(Iterator::last)
+            .unwrap_or_default()
+            .to_owned();
+        let later_root = name
+            .strip_suffix(".root.json")
+            .and_then(|version| version.parse::<u64>().ok())
+            .is_some_and(|version| version > 1);
+        if later_root {
+            let asked = format!("{}/{name}", self.service)
+                .parse()
+                .expect("an address");
+            return self.http.fetch(asked).await;
+        }
+        tough::FilesystemTransport.fetch(url).await
+    }
+}
+
+/// A service that fails to answer for the next signed root fails the synchronisation, and one that
+/// says there is no next root ends the search for it.
+///
+/// The update client asks for each newer root in turn and stops at the first one that is not
+/// there, and it reads an error from the fetch itself as not there. So the repository transport
+/// reports what a request came to through the stream it returns, as the client's own HTTP
+/// transport does, and a 503 cannot pass for a repository with no newer root.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_service_that_fails_to_answer_for_the_next_root_fails_the_synchronisation() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    for (status, synchronises) in [(503, false), (404, true), (403, true), (410, true)] {
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+        let mut catalogue = enrolled(
+            home.path(),
+            &generation,
+            RepositoryBudgets::defaults(),
+            CapabilityCeiling::default_ceiling(),
+        )
+        .await;
+        let service = Answering::start(status);
+        catalogue.set_transport(Arc::new(LaterRootsOverHttp {
+            service: service.origin.clone(),
+            http: RepositoryTransport::over(reqwest::Client::builder().no_proxy()),
+        }));
+        let synchronised = catalogue.sync(&repository()).await;
+        assert_eq!(
+            synchronised.is_ok(),
+            synchronises,
+            "a next root answered {status}: {synchronised:?}"
+        );
+    }
+}

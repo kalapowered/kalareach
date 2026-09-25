@@ -9,6 +9,12 @@
 //! that failed before any byte of its answer arrived (the connection, a deadline, or a 5xx from the
 //! service) is made again a few times, a little later each time. A fetch whose answer stops part way
 //! fails, and the next synchronisation fetches it again from the start.
+//!
+//! Every outcome of a request arrives through the stream a fetch returns, the file's absence
+//! included, as it does from the update client's own HTTP transport. The update client reads an
+//! error from the fetch itself as a file that is not there, and it looks for the next signed root
+//! by asking for it: a service that failed to answer that request must fail the synchronisation,
+//! not end the search for a newer root as though there were none.
 
 use std::time::Duration;
 
@@ -68,14 +74,22 @@ impl Transport for RepositoryTransport {
     async fn fetch(&self, url: Url) -> Result<TransportStream, TransportError> {
         match url.scheme() {
             "file" => tough::FilesystemTransport.fetch(url).await,
-            "http" | "https" => match &self.client {
-                Ok(client) => fetch(client, url).await,
-                Err(reason) => Err(TransportError::new_with_cause(
-                    TransportErrorKind::Other,
-                    url,
-                    reason.clone(),
-                )),
-            },
+            "http" | "https" => {
+                let client = self.client.clone();
+                Ok(Box::pin(
+                    futures::stream::once(async move {
+                        match client {
+                            Ok(client) => answer(&client, url).await,
+                            Err(reason) => Err(TransportError::new_with_cause(
+                                TransportErrorKind::Other,
+                                url,
+                                reason,
+                            )),
+                        }
+                    })
+                    .try_flatten(),
+                ))
+            }
             _ => Err(TransportError::new(
                 TransportErrorKind::UnsupportedUrlScheme,
                 url,
@@ -84,8 +98,8 @@ impl Transport for RepositoryTransport {
     }
 }
 
-/// Fetches one address: its answer as a stream, or why there is none.
-async fn fetch(client: &reqwest::Client, url: Url) -> Result<TransportStream, TransportError> {
+/// Asks for one address: its answer as a stream, or why there is none.
+async fn answer(client: &reqwest::Client, url: Url) -> Result<TransportStream, TransportError> {
     let mut wait = FIRST_WAIT;
     let mut tried = 1;
     loop {

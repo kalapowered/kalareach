@@ -46,6 +46,8 @@ rustix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 aws-lc-rs.workspace = true
+# The TLS provider a test's own repository client is built on; a host's comes with its trust.
+rustls.workspace = true
 tempfile.workspace = true
 
 [lints]

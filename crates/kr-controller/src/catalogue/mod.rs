@@ -1596,13 +1596,17 @@ mod tests {
                 .parse()
                 .expect("a proxy address"),
         ));
-        let fetched = tough::Transport::fetch(
+        let Ok(stream) = tough::Transport::fetch(
             &transport,
             format!("https://{repository}/1.root.json")
                 .parse()
                 .expect("an address"),
         )
-        .await;
+        .await
+        else {
+            panic!("the fetch answered without a stream");
+        };
+        let fetched = futures_util::TryStreamExt::try_collect::<Vec<tough::Bytes>>(stream).await;
         proxy.abort();
         assert!(fetched.is_err(), "the proxy refused every tunnel");
         let asked = asked
@@ -1660,15 +1664,22 @@ mod tests {
         (origin, asked, serving)
     }
 
-    /// Fetches `address` through the transport a host with no proxy selected builds.
+    /// Fetches `address` through the transport a host with no proxy selected builds, and reads
+    /// what arrives.
+    ///
+    /// The fetch itself always answers with a stream, and what the request came to arrives
+    /// through it: the update client reads an error from the fetch as the file not being there.
     async fn fetched(address: &str) -> Result<Vec<u8>, tough::TransportError> {
         use futures_util::TryStreamExt as _;
 
-        let stream = tough::Transport::fetch(
+        let Ok(stream) = tough::Transport::fetch(
             &repository_transport(None),
             address.parse().expect("an address"),
         )
-        .await?;
+        .await
+        else {
+            panic!("the fetch of {address} answered without a stream");
+        };
         let chunks: Vec<tough::Bytes> = stream.try_collect().await?;
         Ok(chunks.concat())
     }
@@ -1740,7 +1751,7 @@ mod tests {
         .await
         .expect("its bytes");
         assert_eq!(read.concat(), b"{}");
-        let Err(refused) = tough::Transport::fetch(
+        let Ok(stream) = tough::Transport::fetch(
             &transport,
             "https://plugins.example/1.root.json"
                 .parse()
@@ -1748,8 +1759,12 @@ mod tests {
         )
         .await
         else {
-            panic!("a host that cannot verify fetched a repository");
+            panic!("the fetch answered without a stream");
         };
+        let refused = stream
+            .try_collect::<Vec<tough::Bytes>>()
+            .await
+            .expect_err("nothing is fetched");
         assert!(
             std::error::Error::source(&refused)
                 .is_some_and(|cause| cause.to_string() == "no certificate store"),
