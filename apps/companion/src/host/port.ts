@@ -456,6 +456,12 @@ export interface DroppedFile {
 export interface HostPort {
   /** Whether a host connection is live, and why not when it is not. */
   connectionState(): Promise<ConnectionState>
+  /**
+   * Calls `listener` with the connection's state each time native code publishes it. Resolves once
+   * the listener is registered, with the function that stops it: a state read after that cannot
+   * miss a change.
+   */
+  onConnection(listener: (state: ConnectionState) => void): Promise<() => void>
 
   hostInfo(): Promise<HostInfoResult>
   environmentList(): Promise<EnvironmentListResult>

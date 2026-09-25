@@ -108,6 +108,7 @@ export function tauriPort(): HostPort {
 
   return {
     connectionState: () => call<ConnectionState>('connection_state', {}),
+    onConnection: (listener) => listening<ConnectionState>(CONNECTION_EVENT, listener),
 
     hostInfo: () => call('host_info', {}),
     environmentList: () => call('environment_list', {}),
