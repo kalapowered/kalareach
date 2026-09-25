@@ -91,10 +91,12 @@ export function MobileApp({
   const [place, setPlace] = useState<Place>(() =>
     placeFromAddress(typeof window === 'undefined' ? '' : window.location.search)
   )
-  const [connection, setConnection] = useState<{ connected: boolean; reason: string | null }>({
-    connected: false,
-    reason: null
-  })
+  // Where the connection stands, as the shell's first answer or a change since said it: null until
+  // then, so neither the bar nor a session claims contact or its loss before anything has answered.
+  const [connection, setConnection] = useState<{
+    readonly connected: boolean
+    readonly reason: string | null
+  } | null>(null)
   const [actionable, setActionable] = useState(0)
   const lifecycle = useLifecycle(storage)
   useKeyboardInset()
@@ -208,7 +210,7 @@ export function MobileApp({
             sessionId={place.sessionId}
             surface={resolved}
             lifecycle={lifecycle}
-            connected={connection.connected}
+            connected={connection?.connected ?? null}
           />
         ) : null}
         {place.tab === 'hosts' ? <MobileHosts surface={resolved} /> : null}

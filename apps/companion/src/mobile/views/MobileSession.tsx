@@ -87,7 +87,8 @@ export function MobileSession({
   readonly sessionId: string
   readonly surface: Surface
   readonly lifecycle: Lifecycle
-  readonly connected: boolean
+  /** Whether the host is in contact, or null before the shell's first answer. */
+  readonly connected: boolean | null
 }): ReactNode {
   const { port, say } = useApp()
   const [pane, setPane] = useState<Pane>('semantic')

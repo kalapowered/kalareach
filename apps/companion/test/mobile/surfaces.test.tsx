@@ -669,3 +669,97 @@ describe('the shell and the inbox read once they are listening (KR-REQ-13.02)', 
     for (const id of ['a-1', 'a-2', 'a-3', 'a-4']) expect(shows(id)).toBe(true)
   })
 })
+
+describe('the phone claims no contact before its first answer (KR-REQ-13.02)', () => {
+  const MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+  const LOST = 'Not in contact with this host'
+
+  /** What the bar along the top says about the connection, and whether it shows a dot. */
+  const topBar = () => document.querySelector('.m-connection')?.textContent ?? ''
+  const topBarDot = () => document.querySelector('.m-connection .status-dot')
+
+  /** Opens the phone on one session, as a person tapping a notification about it does. */
+  function openFromNotification(port: HostPort): void {
+    window.history.replaceState(null, '', `/?session=${MAIN}`)
+    try {
+      render(
+        <AppProvider port={port}>
+          <MobileApp surface="ios" storage={null} />
+        </AppProvider>
+      )
+    } finally {
+      window.history.replaceState(null, '', '/')
+    }
+  }
+
+  it('says neither contact nor its loss, in the bar or the session, until the shell answers', async () => {
+    const { port, controls } = fakeHost()
+    const held = controls.hold('connectionState')
+    openFromNotification(port)
+    await waitFor(() => {
+      expect(held.count).toBe(1)
+    })
+    await screen.findByLabelText('Message this session')
+
+    expect(topBar()).toBe('Checking the connection…')
+    expect(topBarDot()).toBeNull()
+    expect(screen.queryByText(LOST)).toBeNull()
+
+    await act(async () => {
+      held.release()
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+    expect(topBar()).toBe('In contact with this host')
+    expect(topBarDot()).not.toBeNull()
+    expect(screen.queryByText(LOST)).toBeNull()
+  })
+
+  it('shows the loss of contact once the shell has answered with it', async () => {
+    const { port, controls } = fakeHost()
+    const held = controls.hold('connectionState')
+    controls.setConnected(false)
+    openFromNotification(port)
+    await waitFor(() => {
+      expect(held.count).toBe(1)
+    })
+    expect(screen.queryByText(LOST)).toBeNull()
+
+    await act(async () => {
+      held.release()
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+    expect(topBar()).toBe('this host cannot be contacted right now')
+    expect(await screen.findByText(LOST)).toBeInTheDocument()
+  })
+
+  it('shows a first read that failed as a failure, in its own words', async () => {
+    const { port } = fakeHost()
+    openFromNotification({
+      ...port,
+      connectionState: () =>
+        Promise.reject({
+          code: 'INTERNAL',
+          message: 'The backend did not answer.',
+          user_action: 'retry'
+        })
+    })
+    await waitFor(() => {
+      expect(topBar()).toBe('The backend did not answer.')
+    })
+    expect(topBarDot()?.classList.contains('offline')).toBe(true)
+  })
+
+  it('shows the contact it read when nothing was held', async () => {
+    const { port } = fakeHost()
+    openFromNotification(port)
+    await waitFor(() => {
+      expect(topBar()).toBe('In contact with this host')
+    })
+    expect(screen.queryByText(LOST)).toBeNull()
+  })
+})
+

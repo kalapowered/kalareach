@@ -18,7 +18,7 @@ import { Pairing } from './views/Pairing'
 import { Plugins } from './views/Plugins'
 import { Session } from './views/Session'
 import { Setup } from './setup/Setup'
-import { failureMessage, type ConnectionState } from './host/port'
+import { failureMessage, follow } from './host/port'
 import { useConfirmations } from './pairing/Confirmations'
 
 const NAVIGATION: readonly { readonly place: Place; readonly label: string }[] = [
@@ -34,8 +34,12 @@ export function App(): ReactNode {
   const { place, go, toast, dismissToast, port, say } = useApp()
   const confirmations = useConfirmations()
   const waiting = confirmations?.requests.length ?? 0
-  const [connected, setConnected] = useState(true)
-  const [reason, setReason] = useState<string | null>(null)
+  // Where the connection stands, as its first answer or a change since said it: null until then,
+  // so the bar claims neither contact nor its loss before anything has answered.
+  const [connection, setConnection] = useState<{
+    readonly connected: boolean
+    readonly reason: string | null
+  } | null>(null)
   const account = useAccount(port)
   const [accountOpen, setAccountOpen] = useState(false)
 
@@ -50,44 +54,23 @@ export function App(): ReactNode {
     }
   }, [account.view, accountOpen, say])
 
-  useEffect(() => {
-    let watching = true
-    let stop: (() => void) | null = null
-    // The state is read once the listener is registered, so no change can fall between the two.
-    // A change heard before the read answers is at least as new, so the read is let go then.
-    let heard = false
-    const show = (state: ConnectionState) => {
-      setConnected(state.connected)
-      setReason(state.reason)
-    }
-    // A failure to answer is itself an answer: the window says it is not connected, and says why,
-    // rather than leaving a rejected promise for nobody.
-    const failed = (failure: unknown) => {
-      if (!watching || heard) return
-      setConnected(false)
-      setReason(failureMessage(failure))
-    }
-    port
-      .onConnection((state) => {
-        if (!watching) return
-        heard = true
-        show(state)
-      })
-      .then(async (unlisten) => {
-        if (!watching) {
-          unlisten()
-          return
+  // The state is read once the listener is registered, so no change can fall between the two, and
+  // a change heard before the read answers is at least as new as it.
+  useEffect(
+    () =>
+      follow(
+        (listener) => port.onConnection(listener),
+        () => port.connectionState(),
+        (state) => {
+          setConnection({ connected: state.connected, reason: state.reason })
+        },
+        // A failure to answer is itself an answer: the window says it is not connected, and why.
+        (failure) => {
+          setConnection({ connected: false, reason: failureMessage(failure) })
         }
-        stop = unlisten
-        const state = await port.connectionState()
-        if (watching && !heard) show(state)
-      })
-      .catch(failed)
-    return () => {
-      watching = false
-      stop?.()
-    }
-  }, [port])
+      ),
+    [port]
+  )
 
   // The last input device decides whether anything animates. A keyboard-driven change is instant;
   // a pointer-driven one gets its transition back.
@@ -175,8 +158,16 @@ export function App(): ReactNode {
         <header className="topbar">
           <span className="row">
             <span className="connection">
-              <span className={`status-dot${connected ? '' : ' offline'}`} />
-              {connected ? 'Connected to this machine' : (reason ?? 'Not in contact')}
+              {connection === null ? (
+                'Checking the connection…'
+              ) : (
+                <>
+                  <span className={`status-dot${connection.connected ? '' : ' offline'}`} />
+                  {connection.connected
+                    ? 'Connected to this machine'
+                    : (connection.reason ?? 'Not in contact')}
+                </>
+              )}
             </span>
           </span>
         </header>

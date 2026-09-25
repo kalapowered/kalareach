@@ -263,7 +263,9 @@ test.describe('reading once it is listening', () => {
     await page.goto('/harness.html?surface=ios')
     const connection = page.locator('.m-connection')
 
-    await expect(connection).toHaveText('Not in contact')
+    // Neither contact nor its loss: the bar says it is checking, with no dot to colour.
+    await expect(connection).toHaveText('Checking the connection…')
+    await expect(connection.locator('.status-dot')).toHaveCount(0)
     await expect(page.getByText('Reading the inbox…')).toBeVisible()
     await page.screenshot({ path: shotFor('phone-13.02-before-answer'), fullPage: true })
     await page.getByRole('button', { name: /^Account/ }).click()
@@ -279,6 +281,80 @@ test.describe('reading once it is listening', () => {
     await page.getByRole('button', { name: /^Attention/ }).click()
     await expect(page.locator('[data-attention="a-2"]')).toBeVisible()
     await page.screenshot({ path: shotFor('phone-13.02-after-answer'), fullPage: true })
+  })
+})
+
+test.describe('nothing claimed before the first answer', () => {
+  /** Where a screenshot for this browser goes, so each engine keeps its own. */
+  const shotFor = (name: string): string => shot(`${name}-${test.info().project.name}`)
+
+  /**
+   * Holds the shell's first connection read from the moment the scripted host exists, before the
+   * page has asked anything, and keeps the held read where the test can answer it.
+   */
+  async function holdFirstConnectionRead(page: Page): Promise<void> {
+    await page.addInitScript(() => {
+      let host: unknown
+      Object.defineProperty(window, 'krTestHost', {
+        configurable: true,
+        get: () => host,
+        set: (controls: { hold: (read: string) => unknown }) => {
+          host = controls
+          ;(window as unknown as { krHeldConnection: unknown }).krHeldConnection =
+            controls.hold('connectionState')
+        }
+      })
+    })
+  }
+
+  /** Answers the held connection read. */
+  async function answerConnection(page: Page): Promise<void> {
+    await page.evaluate(() => {
+      ;(window as unknown as { krHeldConnection: { release: () => void } }).krHeldConnection.release()
+    })
+  }
+
+  for (const [label, size] of [
+    ['desktop', { width: 1280, height: 800 }],
+    ['phone-width', { width: 390, height: 844 }]
+  ] as const) {
+    // KR-REQ-13.02: the desktop bar says neither "connected" nor "not in contact" before the shell
+    // has answered; it says it is checking, with no dot.
+    test(`the desktop bar claims nothing before its first answer, at ${label} width`, async ({ page }) => {
+      await page.setViewportSize(size)
+      await holdFirstConnectionRead(page)
+      await open(page)
+      const connection = page.locator('.topbar .connection')
+
+      await expect(connection).toHaveText('Checking the connection…')
+      await expect(connection.locator('.status-dot')).toHaveCount(0)
+      await page.screenshot({ path: shotFor(`desktop-13.02-before-answer-${label}`), fullPage: true })
+
+      await answerConnection(page)
+      await expect(connection).toHaveText('Connected to this machine')
+      await expect(connection.locator('.status-dot')).toHaveCount(1)
+    })
+  }
+
+  // KR-REQ-13.02: a phone session opened from a notification claims no loss of contact before the
+  // shell has answered, and neither does the bar above it.
+  test('a phone session opened from a notification claims nothing before its first answer', async ({
+    page
+  }) => {
+    await page.setViewportSize({ width: 390, height: 844 })
+    await holdFirstConnectionRead(page)
+    await page.goto('/harness.html?surface=ios&session=8a7b6c50-22bb-4c3d-8e4f-000000000101')
+    await expect(page.getByLabel('Message this session')).toBeVisible()
+    const connection = page.locator('.m-connection')
+
+    await expect(connection).toHaveText('Checking the connection…')
+    await expect(connection.locator('.status-dot')).toHaveCount(0)
+    await expect(page.getByText('Not in contact with this host')).toHaveCount(0)
+    await page.screenshot({ path: shotFor('phone-session-13.02-before-answer'), fullPage: true })
+
+    await answerConnection(page)
+    await expect(connection).toHaveText('In contact with this host')
+    await expect(page.getByText('Not in contact with this host')).toHaveCount(0)
   })
 })
 

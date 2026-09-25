@@ -178,7 +178,9 @@ export function Hosts(): ReactNode {
   const { port } = useApp()
   const [info, setInfo] = useState<HostInfoResult | null>(null)
   const [environments, setEnvironments] = useState<EnvironmentListResult | null>(null)
-  const [reachable, setReachable] = useState(true)
+  // Whether the newest read reached the host, or null before any read has answered: the screen
+  // claims neither contact nor its loss before then.
+  const [reachable, setReachable] = useState<boolean | null>(null)
   const [failure, setFailure] = useState<string | null>(null)
   // Every read, on opening, on a refresh and on a retry, is made under one watch with no listeners,
   // so only the newest read's answer is shown, and none once the screen closes.
@@ -224,7 +226,7 @@ export function Hosts(): ReactNode {
         </div>
       </header>
 
-      {!reachable ? (
+      {reachable === false ? (
         <Banner
           tone="warning"
           title="Disconnected"
@@ -238,13 +240,15 @@ export function Hosts(): ReactNode {
           <div className="spacer">
             <h2>{environments?.environments[0]?.label ?? 'This machine'}</h2>
             <p className="muted small">
-              {reachable ? 'Connected' : 'Not in contact'}
+              {reachable === null ? 'Reading this host…' : reachable ? 'Connected' : 'Not in contact'}
               {info ? ` · build ${info.build_id}` : ''}
             </p>
           </div>
-          <Badge tone={reachable ? 'success' : 'neutral'}>
-            {reachable ? 'Connected' : 'Disconnected'}
-          </Badge>
+          {reachable === null ? null : (
+            <Badge tone={reachable ? 'success' : 'neutral'}>
+              {reachable ? 'Connected' : 'Disconnected'}
+            </Badge>
+          )}
         </div>
         <div className="card-body">
           {(environments?.environments ?? []).map((environment) => (

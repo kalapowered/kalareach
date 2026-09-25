@@ -247,6 +247,12 @@ describe('what the person sent', () => {
 
     expect(reconnectBanner(true, [])).toBeNull()
   })
+
+  it('says nothing about contact before anything has answered whether there is any', () => {
+    const pending = [sent(queued('s1', 'hello', 0), 'a1')]
+    expect(reconnectBanner(null, pending)).toBeNull()
+    expect(reconnectBanner(null, [])).toBeNull()
+  })
 })
 
 describe('drafts', () => {
