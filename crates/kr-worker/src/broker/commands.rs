@@ -336,6 +336,9 @@ pub struct CommandBackends {
     /// host's own tests.
     #[cfg(feature = "testing")]
     directory_pause: Mutex<Option<DirectoryPause>>,
+    /// Where the next close stops before it retires a backend, for this host's own tests.
+    #[cfg(feature = "testing")]
+    retire_pause: Mutex<Option<DirectoryPause>>,
 }
 
 /// The two ends of one armed pause: what says the launch arrived there, and what lets it go on.
@@ -411,6 +414,8 @@ impl CommandBackends {
             confirm_pause: Arc::new(Mutex::new(None)),
             #[cfg(feature = "testing")]
             directory_pause: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            retire_pause: Mutex::new(None),
         }
     }
 
@@ -466,6 +471,25 @@ impl CommandBackends {
         let (release, go) = std::sync::mpsc::channel();
         *self
             .directory_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
+        (watch, release)
+    }
+
+    /// Stops the next close before it retires its first backend, for this host's own tests: a
+    /// launch can then commit between the close starting and the retirement.
+    ///
+    /// Returns the end that says the close has arrived there and the end that lets it go on;
+    /// unreleased, it goes on by itself after [`DIRECTORY_PAUSE_LIMIT`]. It is compiled away in
+    /// every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_retiring(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (arrived, watch) = std::sync::mpsc::channel();
+        let (release, go) = std::sync::mpsc::channel();
+        *self
+            .retire_pause
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
         (watch, release)
@@ -593,12 +617,24 @@ impl CommandBackends {
         );
         let mut ended = Vec::new();
         for backend in backends {
-            let committed = matches!(
-                *backend.lifecycle.state.borrow(),
-                BackendState::Committed(_)
-            );
+            #[cfg(feature = "testing")]
+            {
+                let armed = self
+                    .retire_pause
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some((arrived, go)) = armed {
+                    let _ = arrived.send(());
+                    let _ = go.recv_timeout(DIRECTORY_PAUSE_LIMIT);
+                }
+            }
+            // Retired first, under its lifecycle lock, so no launch commits under it afterwards;
+            // then whatever instance it registered is ended, whichever state the launch had
+            // reached: a committed one is the session's to end, and one a launch still holds is
+            // given back by that launch's guard, for which an ended instance is nothing to undo.
             backend.retire();
-            ended.extend(backend.end_at_close(&self.broker, committed));
+            ended.extend(backend.end_at_close(&self.broker));
         }
         #[cfg(unix)]
         if let Some(adoptions) = self.adoptions.as_ref() {
@@ -899,23 +935,20 @@ impl Backend {
         }
     }
 
-    /// Ends the instance of a launch this backend committed, because its session is closing, and
-    /// returns what the session is to announce.
+    /// Ends this retired backend's instance, because its session is closing, and returns what the
+    /// session is to announce.
     ///
-    /// Called with the session's lock held. Nothing here stops the program, which the session's
-    /// own closure ends; what ends here is the instance, its grant and what the views were told,
-    /// so no list the session keeps names a program it is ending.
+    /// Called with the session's lock held, after the retirement. Nothing here stops the program,
+    /// which the session's own closure ends; what ends here is the instance, its grant and what the
+    /// views were told, so no list the session keeps names a program it is ending.
     fn end_at_close(
         &self,
         broker: &Broker,
-        committed: bool,
     ) -> Option<kr_protocol::projection::AgentInstanceSummary> {
-        if committed {
-            let _ = broker.end(
-                self.application_instance_id,
-                crate::broker::InstanceEnding::NativeExit,
-            );
-        }
+        let _ = broker.end(
+            self.application_instance_id,
+            crate::broker::InstanceEnding::NativeExit,
+        );
         self.announced
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

@@ -2083,3 +2083,128 @@ fn kr_req_12_07_a_session_that_closes_ends_its_launches_and_tells_its_views() {
         "the program's own exit announces nothing more"
     );
 }
+
+/// KR-REQ-12.07, KR-REQ-12.16: a session that closes leaves no instance of its launches behind,
+/// whatever stage a launch had reached: one committed and not yet confirmed to its launcher, and
+/// one admitted and not yet going. Each backend is retired before its instance is ended, so no
+/// commit can follow the close, and nothing the close finds decides whether the instance ends.
+#[test]
+fn kr_req_12_07_a_session_that_closes_mid_launch_leaves_no_instance() {
+    // Committed, and paused before the launcher is told.
+    let shell = Shell::with_source(fixture::reading, true);
+    let view = shell.view.as_ref().expect("a view");
+    let project = shell.placed.host.root().join("committed");
+    std::fs::create_dir_all(&project).expect("a project directory");
+    let (arrived, release) = shell.backends.pause_before_confirming();
+    let answer = shell.establish_in(&project);
+    let child = shell.launch_from(&answer, "committed", &[], &project);
+    shell
+        .runtime
+        .block_on(async { tokio::time::timeout(LIVENESS, arrived).await })
+        .expect("the launch is committed")
+        .expect("and paused before the launcher is told");
+    let instance = Shell::registered_instance(&answer);
+    assert!(shell.broker.binding_state(instance).is_ok());
+    let _ = view
+        .runtime
+        .session()
+        .begin_close(kr_protocol::session::ClosureReason::CloseRequested);
+    assert!(
+        shell.broker.binding_state(instance).is_err(),
+        "the committed launch's instance ends with its session"
+    );
+    assert!(shell.broker.host_files(instance).is_none(), "and its grant");
+    assert!(
+        view.runtime
+            .session()
+            .agent_instances()
+            .instances
+            .is_empty(),
+        "and the session lists nothing"
+    );
+    let _ = release.send(());
+    let _ = finish(child);
+    assert_typed(
+        &shell.report("committed"),
+        "a launch whose session closed before it was confirmed",
+    );
+
+    // Admitted, and holding before it says it is going.
+    let shell = Shell::with_source(fixture::reading, true);
+    let view = shell.view.as_ref().expect("a view");
+    let answer = shell.establish();
+    let registration = Shell::registration(&answer);
+    let mut held = shell.launcher(&shell.executable, &Shell::answered(), Some(3000));
+    shell.prepare(&mut held, Some(&answer), "admitted", &[]);
+    let held = held.spawn().expect("the launcher starts");
+    eventually("the launch is admitted", || registration.exists());
+    let instance = Shell::registered_instance(&answer);
+    let _ = view
+        .runtime
+        .session()
+        .begin_close(kr_protocol::session::ClosureReason::CloseRequested);
+    assert!(
+        shell.broker.binding_state(instance).is_err(),
+        "an admitted launch's instance ends with its session too"
+    );
+    assert!(
+        view.runtime
+            .session()
+            .agent_instances()
+            .instances
+            .is_empty()
+    );
+    let _ = finish(held);
+    assert_typed(
+        &shell.report("admitted"),
+        "a launch whose session closed before it went",
+    );
+}
+
+/// KR-REQ-12.07, KR-REQ-12.16: a launch that commits after its session has started to close, and
+/// before the close retires its backend, ends with the session too: the close reads nothing of the
+/// launch before the retirement, so whatever the launch did in between, its instance and its grant
+/// end, and its launcher, never told, runs what was typed.
+#[test]
+fn kr_req_12_07_a_launch_committed_while_its_session_closes_leaves_no_instance() {
+    let shell = Shell::reading();
+    let project = shell.placed.host.root().join("raced");
+    std::fs::create_dir_all(&project).expect("a project directory");
+    let answer = shell.establish_in(&project);
+    let (retiring, go_on) = shell.backends.pause_before_retiring();
+    let (committed, confirm) = shell.backends.pause_before_confirming();
+    let mut held = shell.launcher(&shell.executable, &Shell::answered(), Some(1000));
+    shell.prepare(&mut held, Some(&answer), "raced", &[]);
+    held.current_dir(&project);
+    let held = held.spawn().expect("the launcher starts");
+    let registration = Shell::registration(&answer);
+    eventually("the launch is admitted", || registration.exists());
+    let instance = Shell::registered_instance(&answer);
+
+    // The session starts to close while the launcher holds before it says it is going, and the
+    // close stops before it retires the backend.
+    let backends = Arc::clone(&shell.backends);
+    let closing = std::thread::spawn(move || backends.close());
+    retiring
+        .recv_timeout(LIVENESS)
+        .expect("the close reaches the backend");
+    // The launch commits in between.
+    shell.at_the_confirmation(committed);
+    assert!(shell.broker.binding_state(instance).is_ok(), "committed");
+    go_on.send(()).expect("the close goes on");
+    let _ = closing.join().expect("the close finishes");
+    assert!(
+        shell.broker.binding_state(instance).is_err(),
+        "a launch that committed while its session closed ends with it"
+    );
+    assert!(
+        shell.broker.host_files(instance).is_none(),
+        "and so does its grant"
+    );
+    let _ = confirm.send(());
+    let _ = finish(held);
+    assert_typed(
+        &shell.report("raced"),
+        "a launch committed while its session closed",
+    );
+}
