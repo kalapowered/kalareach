@@ -495,12 +495,19 @@ struct Refusals(BTreeMap<RelayUrl, Refusal>);
 impl Refusals {
     /// Takes in the relay status as it stands now, which is every relay iroh reports on.
     ///
-    /// A refusal stands while the endpoint dials the relay again, because nothing newer has been
-    /// said. It ends when the relay admits the endpoint, when the latest attempt failed for another
-    /// cause, since then the refusal is no longer why the relay cannot be reached, and when the
-    /// relay leaves the status, since nothing said about that relay afterwards is reported and what
-    /// was said last can no longer be known to be current. A relay's own refusal is kept over a
-    /// refused upgrade in the same status, because the relay answered.
+    /// A relay's refusal stands while the endpoint dials the relay again, because the relay has said
+    /// nothing newer. It ends when the relay admits the endpoint, when the latest attempt failed
+    /// for another cause, since then the refusal is no longer why the relay cannot be reached, and
+    /// when the relay leaves the status, since nothing said about that relay afterwards is reported
+    /// and what was said last can no longer be known to be current. A relay's own refusal is kept
+    /// over a refused upgrade in the same status, because the relay answered.
+    ///
+    /// A refused upgrade counts only while the status shows it. The status reports the latest
+    /// state and can pass over the states between two readings, so a relay seen refusing the
+    /// upgrade and then seen being dialled again may have been reached in between. That is true of
+    /// a relay's own refusal as well, but a relay's refusal is its lasting answer to the
+    /// credentials iroh presents again on every attempt, while a network that refused one upgrade
+    /// can let the next one through.
     fn observe(&mut self, snapshot: impl IntoIterator<Item = RelayObservation>) {
         let mut reported = BTreeSet::new();
         for observation in snapshot {
@@ -517,7 +524,11 @@ impl Refusals {
                 None if observation.connected || observation.failed => {
                     self.0.remove(&observation.relay);
                 }
-                None => {}
+                None => {
+                    if matches!(self.0.get(&observation.relay), Some(Refusal::Upgrade(_))) {
+                        self.0.remove(&observation.relay);
+                    }
+                }
             }
         }
         self.0.retain(|relay, _| reported.contains(relay));
@@ -924,12 +935,13 @@ mod tests {
         );
     }
 
-    /// KR-REQ-10.02: a refused upgrade lasts as a refusal does. It stands while the relay is
-    /// dialled again, and ends when the relay admits the endpoint or the latest attempt failed for
-    /// another cause. A relay that cannot be upgraded to is still waited for while another relay
-    /// on the route might carry the attempt.
+    /// KR-REQ-10.02: a refused upgrade counts only while the status shows it. It ends when the
+    /// relay is dialled again, when the relay admits the endpoint and when the latest attempt
+    /// failed for another cause, where a relay's own refusal stands while the relay is dialled
+    /// again. A relay that cannot be upgraded to is still waited for while another relay on the
+    /// route might carry the attempt.
     #[test]
-    fn a_refused_upgrade_lasts_until_the_relay_is_reached_or_fails_otherwise() {
+    fn a_refused_upgrade_counts_only_while_the_status_shows_it() {
         let only = relays(&["relay-1"]);
         let upgrade = Refusal::Upgrade(403);
         let mut refusals = Refusals::default();
@@ -938,8 +950,9 @@ mod tests {
         assert_eq!(refusals.throughout(&relays(&["relay-1", "relay-2"])), None);
 
         refusals.observe([redialling("relay-1")]);
-        assert_eq!(refusals.on(&only), Some((&relay("relay-1"), &upgrade)));
+        assert_eq!(refusals.on(&only), None, "the relay is being dialled again");
 
+        refusals.observe([blocked("relay-1", 403)]);
         refusals.observe([RelayObservation {
             upgrade_refused: None,
             ..blocked("relay-1", 403)
@@ -949,6 +962,63 @@ mod tests {
         refusals.observe([blocked("relay-1", 403)]);
         refusals.observe([admitted("relay-1")]);
         assert_eq!(refusals.on(&only), None, "the relay was reached");
+
+        refusals.observe([refusing("relay-1", "allowance_spent: spent")]);
+        refusals.observe([redialling("relay-1")]);
+        assert_eq!(
+            refusals.on(&only),
+            Some((&relay("relay-1"), &spent())),
+            "a relay's own refusal stands while it is dialled again"
+        );
+    }
+
+    /// KR-REQ-10.02: a refused upgrade the status has moved past is not the reason an attempt
+    /// failed. The status can pass over a successful attempt and the failure after it, so a relay
+    /// seen refused and then seen being dialled again is not reported as refusing when the
+    /// attempt times out.
+    #[tokio::test]
+    async fn a_refused_upgrade_the_status_moved_past_is_not_the_reason() {
+        let status = Scripted::default();
+        status.set(vec![blocked("relay-1", 403)]);
+        let setter = status.clone();
+        let error = through_relays(
+            async move {
+                setter.set(vec![redialling("relay-1")]);
+                tokio::task::yield_now().await;
+                Err::<(), _>(timed_out())
+            },
+            status.reader(),
+            true,
+            || async { relays(&["relay-1"]) },
+        )
+        .await
+        .expect_err("the attempt failed");
+        assert!(
+            matches!(&error, TransportError::Connect(message) if !message.contains("upgrade")),
+            "{error}"
+        );
+    }
+
+    /// KR-REQ-10.02: an endpoint that can take a direct path is not cut off by a refused upgrade.
+    /// Its attempt runs on while every relay on the route refuses the upgrade, and a connection it
+    /// makes, as a direct path makes one, is a connection.
+    #[tokio::test]
+    async fn a_refused_upgrade_leaves_an_endpoint_with_a_direct_path_trying() {
+        let status = Scripted::default();
+        status.set(vec![blocked("relay-1", 403)]);
+        let connected = through_relays(
+            async {
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+                Ok::<_, ConnectingError>("a connection")
+            },
+            status.reader(),
+            true,
+            || async { relays(&["relay-1"]) },
+        )
+        .await;
+        assert_eq!(connected.ok(), Some("a connection"));
     }
 
     /// KR-REQ-17.40: a refusal is a connection's reason only when the relay that gave it is on

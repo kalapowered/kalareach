@@ -83,12 +83,31 @@ async fn dial(side: &Side, peer: EndpointAddr) -> kr_transport::Result<Connectio
 
 /// Whether `error`, or anything it wraps, is a connection the other side refused.
 fn refused_connection(error: &(dyn std::error::Error + 'static)) -> bool {
-    let mut current = Some(error);
-    while let Some(error) = current {
-        if error
+    wraps(error, |error| {
+        error
             .downcast_ref::<std::io::Error>()
             .is_some_and(|io| io.kind() == std::io::ErrorKind::ConnectionRefused)
-        {
+    })
+}
+
+/// Whether `error`, or anything it wraps, is a WebSocket upgrade refused with `status`.
+fn refused_upgrade(error: &(dyn std::error::Error + 'static), status: u16) -> bool {
+    wraps(error, |error| {
+        matches!(
+            error.downcast_ref::<tokio_websockets::upgrade::Error>(),
+            Some(tokio_websockets::upgrade::Error::DidNotSwitchProtocols(code)) if *code == status
+        )
+    })
+}
+
+/// Whether `error` or anything in the chain it wraps is what `wanted` looks for.
+fn wraps(
+    error: &(dyn std::error::Error + 'static),
+    wanted: impl Fn(&(dyn std::error::Error + 'static)) -> bool,
+) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if wanted(error) {
             return true;
         }
         current = error.source();
@@ -96,30 +115,30 @@ fn refused_connection(error: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
-/// Waits until `side` is off its home relay `relay` and its latest attempt to reach the relay again
-/// ended at a refused connection, other than `seen`, and returns the status that said so.
-async fn until_refused_again(
+/// Waits until `side` is off its home relay `relay` and its latest attempt to reach the relay
+/// ended in an error `failed_as` recognises, other than `seen`, and returns the status that said
+/// so.
+async fn until_failed(
     side: &Side,
     relay: &RelayUrl,
     seen: Option<&RelayStatus>,
+    failed_as: impl Fn(&(dyn std::error::Error + 'static)) -> bool,
 ) -> RelayStatus {
     let deadline = Instant::now() + PATIENCE;
     let mut statuses = side.endpoint.home_relay_status();
     loop {
-        let refused = statuses.get().into_iter().find(|status| {
+        let failed = statuses.get().into_iter().find(|status| {
             status.url() == relay
                 && !status.is_connected()
-                && status
-                    .last_error()
-                    .is_some_and(|error| refused_connection(error))
+                && status.last_error().is_some_and(|error| failed_as(error))
                 && Some(status) != seen
         });
-        if let Some(status) = refused {
+        if let Some(status) = failed {
             return status;
         }
         assert!(
             Instant::now() < deadline,
-            "the relay status never recorded a refused connection: {:?}",
+            "the relay status never recorded the failure: {:?}",
             statuses.get()
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -167,7 +186,7 @@ async fn a_relay_only_pair_connects_through_the_proxy_it_selected() {
 
     proxy.stop();
     for side in [&host, &client] {
-        until_refused_again(side, &relay.url, None).await;
+        until_failed(side, &relay.url, None, refused_connection).await;
     }
 
     drop(connection);
@@ -215,10 +234,10 @@ async fn a_client_whose_proxy_stops_never_goes_around_it() {
     );
 
     proxy.stop();
-    let refused = until_refused_again(&client, &front.url, None).await;
+    let refused = until_failed(&client, &front.url, None, refused_connection).await;
     let reached = front.accepted();
     // The client keeps trying to reach its relay, each time at the proxy.
-    until_refused_again(&client, &front.url, Some(&refused)).await;
+    until_failed(&client, &front.url, Some(&refused), refused_connection).await;
     assert_eq!(
         front.accepted(),
         reached,
@@ -232,8 +251,8 @@ async fn a_client_whose_proxy_stops_never_goes_around_it() {
 
 /// KR-REQ-10.02: a network that blocks the WebSocket upgrade does not stand in the way of a direct
 /// path. The relay's front passes ordinary requests to the relay and answers the relay connection's
-/// upgrade with 403, so neither endpoint gets onto the relay; the client still reaches the host at
-/// the host's direct address.
+/// upgrade with 403, so neither endpoint gets onto the relay. Once the client's own relay status
+/// says its upgrade was refused, it still reaches the host at the host's direct address.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_blocked_upgrade_leaves_a_direct_path_open() {
     let relay = LocalRelay::spawn().await;
@@ -246,8 +265,10 @@ async fn a_blocked_upgrade_leaves_a_direct_path_open() {
     };
     let host = support::side(&config, 1, true).await;
     let client = support::side(&config, 2, false).await;
-    eventually("the relay connection's upgrade is refused", || {
-        front.refused_upgrades() > 0
+    // The client itself has met the refusal before it dials, so its attempt is made knowing that
+    // the relay cannot be used.
+    until_failed(&client, &front.url, None, |error| {
+        refused_upgrade(error, 403)
     })
     .await;
 
