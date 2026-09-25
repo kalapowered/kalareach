@@ -797,6 +797,14 @@ cannot read included. An authorisation made for one purpose asks for that purpos
 names, so a device restoring from a recovery kit asks for `backup.restore` and nothing else, while
 `AuthorisationRequest::new` is the application's own sign-in and asks for what it always has.
 
+A relay lease request whose answer went missing is `OUTCOME_UNKNOWN`: a success `services::relay`
+cannot read, and a 502 or 504 with no envelope of the service's, because the service may have
+issued and installed the lease before a gateway in front of it lost the answer. Nothing asks again
+by itself. A caller finds out before it asks for anything else, by asking again for the same pair
+with the same cumulative ceiling: the service answers a pair that already holds a lease with that
+lease rather than a second one, and the caller then uses it or ends it. A revocation whose answer
+went missing is asked again as it was.
+
 A mailbox is addressed by the identifier of the recipient's stored-envelope public key, and every
 paired peer of that recipient knows that key, because it is what they seal to. So possession of the
 private half is what distinguishes the recipient: the first read of an unclaimed mailbox is

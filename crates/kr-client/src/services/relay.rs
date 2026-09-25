@@ -17,6 +17,20 @@
 //! What this module owns is everything between: the exact bytes the credential covers, the exact
 //! bytes the body digest covers, the request shape and what each answer means.
 //!
+//! # An answer that went missing
+//!
+//! A lease request that reached the service may have reserved bytes, issued a lease and installed
+//! it on a relay, whatever came back. When this client cannot tell, it reports `OUTCOME_UNKNOWN`:
+//! for a success status whose body it cannot read, and for a 502 or 504 with no envelope of the
+//! service's, which is a gateway in front of it saying the service's answer never reached it.
+//! Nothing asks again by itself. A caller finds out before it asks for anything else, by asking
+//! again for the same pair with the same cumulative ceiling. The service answers a pair that
+//! already holds a lease with that lease rather than a second one, and holds no more bytes than the
+//! ceiling names, so the answer is the lease the first request issued, or a new one when it issued
+//! none. The caller then uses that lease or ends it with a revocation. A revocation whose answer
+//! went missing is simply asked again, because a repeated revocation finishes whatever the first
+//! did not and answers with the settlement as it stands.
+//!
 //! # One body, two representations
 //!
 //! The request travels as JSON and its digest is taken over canonical KR-CBOR-1, so both come from
@@ -89,17 +103,18 @@ pub const RELAY_LEASE_REVOKE_PATH: &str = "/api/relay/lease/revoke";
 /// - never send again a request that may have reached the service. Asking again for a pair that
 ///   already holds a lease revises that lease, and a request that was delivered and not answered
 ///   may have issued one, so whether to ask again is the caller's decision. An exchange that failed
-///   after the request left is an error; this client reports an answer it cannot read as an unknown
-///   outcome for the same reason. Carrying a request of which no byte was written on another
-///   connection is not sending it again: nothing arrived to be repeated.
+///   after the request left is an error; this client reports a success it cannot read, and a
+///   gateway's 502 or 504, as an unknown outcome for the same reason. Carrying a request of which
+///   no byte was written on another connection is not sending it again: nothing arrived to be
+///   repeated.
 pub trait ServiceHttp: Send + Sync + std::fmt::Debug {
     /// Posts a JSON body and returns what came back.
     ///
     /// `headers` are the request headers beside `content-type`, lower-cased, in the order this
-    /// client built them. A signed managed-service request carries none, because its credential is
-    /// inside the body; a request authorised by an account token carries that token's
-    /// `authorization` header, and an implementation sends the values it is given without
-    /// recording them.
+    /// client built them. A signed managed-service request's credential is inside the body, so the
+    /// credential needs no header. A request for something an account owns also carries that
+    /// account's token as its `authorization` header, beside the credential when the request is
+    /// signed, and an implementation sends the values it is given without recording them.
     fn post_json<'a>(
         &'a self,
         url: &'a str,
@@ -815,13 +830,15 @@ fn classify(code: &str, status: u16) -> (ErrorCode, UserAction) {
 /// An answer this client could not read, classified by the status that carried it.
 ///
 /// What a caller may do about it turns on one question: whether the request may have been carried
-/// out. A success status with an unreadable body is the dangerous case, because a lease may now
-/// exist, a reservation may be held and a relay may be carrying it, so it is reported as an unknown
-/// outcome and never retried automatically. A fault or a rate limit is transient. Anything else
-/// without an envelope never reached this service's own routes, which is a configuration between
-/// here and it rather than a value this caller chose.
+/// out. Two answers say it may, and both are reported as an unknown outcome and never retried
+/// automatically, because a lease may now exist, a reservation may be held and a relay may be
+/// carrying it. One is a success status with an unreadable body. The other is a 502 or 504 with no
+/// envelope: a gateway in front of the service saying that the service's answer did not reach it,
+/// which it can say after passing the request on. Any other fault or a rate limit is transient.
+/// Anything else without an envelope never reached this service's own routes, which is a
+/// configuration between here and it rather than a value this caller chose.
 fn unreadable(status: u16, what: impl Into<Shown>) -> ClientError {
-    let code = if (200..300).contains(&status) {
+    let code = if (200..300).contains(&status) || status == 502 || status == 504 {
         ErrorCode::OutcomeUnknown
     } else if status >= 500 || status == 408 || status == 429 {
         ErrorCode::UpstreamUnavailable
