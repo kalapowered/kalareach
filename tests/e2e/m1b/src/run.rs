@@ -200,11 +200,14 @@ impl Run {
             .filter(|owned| running(&owned.identity))
             .map(|owned| format!("{} (process {})", owned.what, owned.identity.pid.get()))
             .collect();
-        left.extend(
-            processes_under(&self.root)
-                .into_iter()
-                .map(|(pid, command)| format!("process {pid} running {command}")),
-        );
+        match processes_under(&self.root) {
+            Ok(found) => left.extend(
+                found
+                    .into_iter()
+                    .map(|(pid, command)| format!("process {pid} running {command}")),
+            ),
+            Err(why) => left.push(why),
+        }
         let jobs = self.loaded_jobs();
         left.extend(jobs.iter().map(|job| format!("the launchd job {job}")));
         if left.is_empty() {
@@ -234,17 +237,17 @@ impl Run {
         for label in self.defined_jobs() {
             for domain in [format!("gui/{uid}"), format!("user/{uid}")] {
                 let target = format!("{domain}/{label}");
-                let answer = std::process::Command::new("/bin/launchctl")
-                    .args(["print", &target])
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status();
-                match answer.map(|status| status.code()) {
+                let mut print = std::process::Command::new("/bin/launchctl");
+                print.args(["print", &target]);
+                let answer = output_within(print, SERVICE_MANAGER_BOUND);
+                match answer.as_ref().map(|output| output.status.code()) {
                     // 112 is a domain that is not there and 113 a job the domain does not have.
                     Ok(Some(112 | 113)) => {}
                     Ok(Some(0)) => loaded.push(target),
-                    other => loaded.push(format!("{target} (launchctl print answered {other:?})")),
+                    Ok(other) => {
+                        loaded.push(format!("{target} (launchctl print answered {other:?})"))
+                    }
+                    Err(why) => loaded.push(format!("{target} (launchctl print {why})")),
                 }
             }
         }
@@ -258,12 +261,38 @@ impl Run {
     pub fn remove_loaded_jobs(&self) {
         for target in self.loaded_jobs() {
             let target = target.split(' ').next().unwrap_or_default().to_owned();
-            let _ = std::process::Command::new("/bin/launchctl")
-                .args(["bootout", &target])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+            let mut bootout = std::process::Command::new("/bin/launchctl");
+            bootout.args(["bootout", &target]);
+            let _ = output_within(bootout, SERVICE_MANAGER_BOUND);
+        }
+    }
+
+    /// Records every process that runs beneath `ancestor` now, by its start identity, so the
+    /// closing check and an ending of a failed leg reach them however they were started.
+    ///
+    /// A session's shell and what runs in it belong to the worker that started them, not to this
+    /// run's own processes, and a command line may not name this run's directory at all. What makes
+    /// them this run's is their place in the process table, below a process this run recorded.
+    pub fn record_descendants(&self, ancestor: &ProcessStartIdentity, what: &str) {
+        if !running(ancestor) {
+            return;
+        }
+        let Ok(table) = process_table() else {
+            return;
+        };
+        let mut under = vec![ancestor.pid.get()];
+        while let Some(parent) = under.pop() {
+            for entry in table
+                .iter()
+                .filter(|entry| u64::from(entry.parent) == parent)
+            {
+                if self
+                    .record_pid(entry.pid, &format!("{what}: {}", entry.command))
+                    .is_some()
+                {
+                    under.push(u64::from(entry.pid));
+                }
+            }
         }
     }
 
@@ -356,31 +385,142 @@ pub fn ended_within(identity: &ProcessStartIdentity, within: Duration) -> bool {
     }
 }
 
+/// One row of the process table.
+#[derive(Clone, Debug)]
+pub struct Entry {
+    /// The process.
+    pub pid: u32,
+    /// Its parent.
+    pub parent: u32,
+    /// Its command line.
+    pub command: String,
+}
+
+/// The process table, as `ps` reports it.
+///
+/// # Errors
+///
+/// Returns why it could not be read. A `ps` that did not succeed has said nothing about which
+/// processes run, so its empty answer is never read as "none".
+pub fn process_table() -> Result<Vec<Entry>, String> {
+    let mut ps = std::process::Command::new("/bin/ps");
+    ps.args(["-A", "-ww", "-o", "pid=,ppid=,command="])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin");
+    let output = output_within(ps, SERVICE_MANAGER_BOUND)
+        .map_err(|why| format!("the process table could not be read: ps {why}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "the process table could not be read: ps ended with {}",
+            output.status
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let parent = fields.next()?.parse().ok()?;
+            let command = fields.collect::<Vec<_>>().join(" ");
+            Some(Entry {
+                pid,
+                parent,
+                command,
+            })
+        })
+        .collect())
+}
+
 /// Every process whose command line names `root`, other than this one.
 ///
 /// Every binary a leg launches is a copy inside its directory and every path it hands a process is
 /// inside it, so a process still running out of it is one the leg started, whoever its parent is.
-#[must_use]
-pub fn processes_under(root: &Path) -> Vec<(u32, String)> {
+///
+/// # Errors
+///
+/// Returns why the process table could not be read.
+pub fn processes_under(root: &Path) -> Result<Vec<(u32, String)>, String> {
     let needle = root.display().to_string();
-    let Ok(output) = std::process::Command::new("ps")
-        .args(["-A", "-ww", "-o", "pid=,command="])
-        .env("PATH", "/usr/bin:/bin")
-        .stdin(std::process::Stdio::null())
-        .output()
-    else {
-        return vec![(0, "the process table could not be read".to_owned())];
-    };
     let own = std::process::id();
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim_start();
-            let (pid, command) = line.split_once(' ')?;
-            let pid: u32 = pid.parse().ok()?;
-            (pid != own && command.contains(&needle)).then(|| (pid, command.trim().to_owned()))
-        })
-        .collect()
+    Ok(process_table()?
+        .into_iter()
+        .filter(|entry| entry.pid != own && entry.command.contains(&needle))
+        .map(|entry| (entry.pid, entry.command))
+        .collect())
+}
+
+/// How long a command a leg runs to ask the operating system something is given.
+pub const SERVICE_MANAGER_BOUND: Duration = Duration::from_secs(20);
+
+/// How long a command's output is waited for once the command has exited.
+///
+/// Its pipes close when it exits, unless something it started holds them open; this is the bound
+/// on that.
+const OUTPUT_HANDOVER: Duration = Duration::from_secs(5);
+
+/// Runs `command` with nothing on its input and waits at most `within` for it to exit, then at
+/// most [`OUTPUT_HANDOVER`] for its output.
+///
+/// What it prints is read by threads of its own, so a command that prints more than a pipe holds
+/// cannot stall. One still running at `within` is killed and collected; it is this run's own
+/// child, named by the handle that started it. Output a descendant keeps open past the handover
+/// is a failure rather than a wait.
+///
+/// # Errors
+///
+/// Returns why it did not finish.
+pub fn output_within(
+    mut command: std::process::Command,
+    within: Duration,
+) -> Result<std::process::Output, String> {
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("could not start: {error}"))?;
+    let stdout = read_all(child.stdout.take());
+    let stderr = read_all(child.stderr.take());
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < within => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("did not finish within {within:?}"));
+            }
+            Err(error) => return Err(format!("could not be waited for: {error}")),
+        }
+    };
+    let handover = Instant::now() + OUTPUT_HANDOVER;
+    let collect = |pipe: std::sync::mpsc::Receiver<Vec<u8>>| {
+        pipe.recv_timeout(handover.saturating_duration_since(Instant::now()))
+            .map_err(|_| format!("exited, and its output was held open past {OUTPUT_HANDOVER:?}"))
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: collect(stdout)?,
+        stderr: collect(stderr)?,
+    })
+}
+
+fn read_all<R: std::io::Read + Send + 'static>(
+    source: Option<R>,
+) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut source) = source {
+            let _ = source.read_to_end(&mut bytes);
+        }
+        let _ = send.send(bytes);
+    });
+    receive
 }
 
 /// The directory this build put its binaries in, beside this test's own.

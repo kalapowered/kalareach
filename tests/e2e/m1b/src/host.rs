@@ -13,7 +13,6 @@
 //! daemon, the workers end, the daemon removes their jobs, and only then is the daemon asked to
 //! stop, with the interrupt it answers.
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, PoisonError};
@@ -25,7 +24,7 @@ use kr_protocol::ids::EnvironmentId;
 use serde_json::Value;
 
 use crate::LIVENESS;
-use crate::run::{Run, ended_within, running, signal};
+use crate::run::{Run, ended_within, output_within, running, signal};
 
 /// How long the daemon is given to stop once it has been interrupted.
 const DAEMON_STOP: Duration = Duration::from_secs(20);
@@ -205,6 +204,32 @@ impl<'r> Host<'r> {
         lines[start..].join("\n")
     }
 
+    /// Records every worker this host's registry names, with everything that runs beneath it, by
+    /// start identity.
+    ///
+    /// The registry is where the host itself keeps each worker's identity, and it is readable
+    /// whether or not the daemon still answers. So a leg that stops part way still reaches the
+    /// sessions it made, their shells and what runs in them, through the record rather than by a
+    /// name.
+    pub fn record_workers(&self) {
+        let Ok(registry) = kr_controller::registry::Registry::open(
+            self.environment.registry_database(),
+            self.environment.environment_id(),
+        ) else {
+            return;
+        };
+        let Ok(workers) = registry.workers() else {
+            return;
+        };
+        drop(registry);
+        for worker in workers {
+            let what = format!("the worker of session {}", worker.session_id);
+            self.run.record(worker.process_identity.clone(), &what);
+            self.run
+                .record_descendants(&worker.process_identity, &format!("under {what}"));
+        }
+    }
+
     /// The environment every `kr` this host runs is given, and nothing else.
     ///
     /// It names the managed shell packages when the host has them, so `kr shell` sees the
@@ -326,6 +351,7 @@ impl<'r> Host<'r> {
     ///
     /// Returns what did not end as it should. The daemon is stopped whatever happened before.
     pub fn stop(&self) -> Result<(), String> {
+        self.record_workers();
         let mut problems = Vec::new();
         if let Err(problem) = self.close_sessions() {
             problems.push(problem);
@@ -423,8 +449,11 @@ impl Drop for Host<'_> {
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
             .is_some_and(|daemon| running(&daemon.identity));
+        // A leg that failed before it stopped its host. Whatever the host started is recorded
+        // first, from its registry, so the run can end it even when the daemon no longer answers;
+        // then the same order as a clean stop, bounded.
+        self.record_workers();
         if running {
-            // A leg that failed before it stopped its host: the same order, bounded.
             let _ = self.close_sessions();
             let _ = self.stop_daemon();
         }
@@ -468,58 +497,6 @@ pub fn document(bytes: &[u8]) -> Result<Value, String> {
                 .take(2000)
                 .collect::<String>()
         )
-    })
-}
-
-/// Runs `command` with nothing on its input and waits at most `within` for it to exit.
-///
-/// What it prints is read by threads of its own, so a command that prints more than a pipe holds
-/// cannot stall. One still running at `within` is killed and collected.
-///
-/// # Errors
-///
-/// Returns why it did not finish.
-pub fn output_within(mut command: Command, within: Duration) -> Result<Output, String> {
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("could not start: {error}"))?;
-    let stdout = read_all(child.stdout.take());
-    let stderr = read_all(child.stderr.take());
-    let started = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() < within => {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("did not finish within {within:?}"));
-            }
-            Err(error) => return Err(format!("could not be waited for: {error}")),
-        }
-    };
-    let stdout = stdout.join().unwrap_or_default();
-    let stderr = stderr.join().unwrap_or_default();
-    Ok(Output {
-        status,
-        stdout,
-        stderr,
-    })
-}
-
-fn read_all<R: Read + Send + 'static>(source: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
-    std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        if let Some(mut source) = source {
-            let _ = source.read_to_end(&mut bytes);
-        }
-        bytes
     })
 }
 

@@ -76,6 +76,9 @@ impl Collected {
 /// One window.
 pub struct Window {
     what: String,
+    /// Whether what the window was sent stays out of failure messages, because it carries an
+    /// invitation's secret.
+    withheld: bool,
     pair: portable_pty::PtyPair,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     collected: Collected,
@@ -135,10 +138,32 @@ impl Window {
         let keys = Arc::new(Mutex::new(pair.master.take_writer().expect("a writer")));
         Self {
             what: what.to_owned(),
+            withheld: false,
             pair,
             child,
             collected,
             keys,
+        }
+    }
+
+    /// Keeps what this window is sent out of every failure message, for a window that shows an
+    /// invitation's secret.
+    #[must_use]
+    pub const fn withholding_output(mut self) -> Self {
+        self.withheld = true;
+        self
+    }
+
+    /// What a failure message may say about what the window was sent since `mark`.
+    fn shown(&self, mark: usize) -> String {
+        let since = self.collected.since(mark);
+        if self.withheld {
+            format!(
+                "{} bytes, withheld because they carry an invitation",
+                since.len()
+            )
+        } else {
+            String::from_utf8_lossy(&since).escape_debug().to_string()
         }
     }
 
@@ -184,7 +209,7 @@ impl Window {
                 self.what,
                 started.elapsed(),
                 String::from_utf8_lossy(needle),
-                String::from_utf8_lossy(&since).escape_debug()
+                self.shown(mark)
             );
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -221,7 +246,11 @@ impl Window {
                 "{why}: {} waited {:?} for {needle:?}, and its screen is:\n{}",
                 self.what,
                 started.elapsed(),
-                rows.join("\n")
+                if self.withheld {
+                    self.shown(0)
+                } else {
+                    rows.join("\n")
+                }
             );
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -265,7 +294,7 @@ impl Window {
                 started.elapsed() < within,
                 "{} did not exit within {within:?}: {}",
                 self.what,
-                String::from_utf8_lossy(&self.collected.since(0)).escape_debug()
+                self.shown(0)
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -327,6 +356,6 @@ pub fn answered(window: &Window, queries: std::thread::JoinHandle<bool>) {
         "{}: kr never asked this terminal what it is, or the answer could not be typed; the \
          terminal was sent: {}",
         window.what,
-        String::from_utf8_lossy(&window.collected.since(0)).escape_debug()
+        window.shown(0)
     );
 }

@@ -71,6 +71,52 @@ pub const LIFETIME: DurationMs = DurationMs::new(120_000);
 /// How long a device waits for the owner's challenge it is to answer to appear.
 pub const CHALLENGE_WAIT: Duration = Duration::from_secs(60);
 
+/// How long one exchange a device makes with the host is given: a connection, a handshake, or one
+/// request and its answer.
+///
+/// A host that keeps a connection open and never answers must not hold a leg for ever.
+pub const REQUEST: Duration = Duration::from_secs(60);
+
+/// Waits for `exchange` within [`REQUEST`], and says which exchange did not finish when it does
+/// not.
+pub(crate) async fn bounded<T>(
+    what: &str,
+    exchange: impl std::future::Future<Output = T>,
+) -> Result<T, String> {
+    tokio::time::timeout(REQUEST, exchange)
+        .await
+        .map_err(|_| format!("{what} was not answered within {REQUEST:?}"))
+}
+
+/// Why a request over the paired connection produced no result.
+#[derive(Debug)]
+pub enum RequestError {
+    /// The host or the connection answered with a failure.
+    Client(ClientError),
+    /// Nothing answered within [`REQUEST`].
+    Unanswered(String),
+}
+
+impl RequestError {
+    /// The code the host refused with, when it was the host that refused.
+    #[must_use]
+    pub const fn refusal(&self) -> Option<ErrorCode> {
+        match self {
+            Self::Client(ClientError::Host(error)) => Some(error.code),
+            Self::Client(_) | Self::Unanswered(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Client(error) => write!(formatter, "{error}"),
+            Self::Unanswered(why) => formatter.write_str(why),
+        }
+    }
+}
+
 /// The build this device reports.
 fn build() -> BuildId {
     BuildId::new(concat!("kr-e2e-m1b/", env!("CARGO_PKG_VERSION"))).expect("a build identifier")
@@ -355,14 +401,18 @@ impl Device {
     /// Returns why the host could not be reached or refused the binding.
     pub async fn finish(&self, exchange: &mut CodeExchange) -> Result<Candidate, String> {
         let address = address_of(&exchange.host.endpoint_id, &exchange.host.network_config);
-        let connection = self
-            .endpoint
-            .connect(address, kr_protocol::hello::ALPN)
-            .await
-            .map_err(|error| format!("the pinned host could not be reached: {error}"))?;
-        let mut unpaired = handshake::connect_unpaired(&connection, &self.unpaired)
-            .await
-            .map_err(|error| format!("the host did not answer an unpaired device: {error}"))?;
+        let connection = bounded(
+            "the connection to the pinned host",
+            self.endpoint.connect(address, kr_protocol::hello::ALPN),
+        )
+        .await?
+        .map_err(|error| format!("the pinned host could not be reached: {error}"))?;
+        let mut unpaired = bounded(
+            "the unpaired handshake",
+            handshake::connect_unpaired(&connection, &self.unpaired),
+        )
+        .await?
+        .map_err(|error| format!("the host did not answer an unpaired device: {error}"))?;
         let request = exchange
             .client
             .finish_request(
@@ -371,14 +421,24 @@ impl Device {
                 &self.clock,
             )
             .map_err(|error| format!("no finish request: {error}"))?;
-        let _: PairFinishResult = unpaired
-            .call(Method::PairFinish, &request)
-            .await
-            .map_err(|error| format!("pair.finish: {error}"))?;
+        let finished: PairFinishResult =
+            bounded("pair.finish", unpaired.call(Method::PairFinish, &request))
+                .await?
+                .map_err(|error| format!("pair.finish: {error}"))?;
+        // The value this device displays is its own, from the transcript it holds. The host's is
+        // compared with it rather than taken in its place.
         let verification_value = exchange
             .client
             .verification_value()
             .map_err(|error| format!("no verification value: {error}"))?;
+        if !kr_pairing::direct::verification_values_match(
+            &verification_value,
+            &finished.verification_value,
+        ) {
+            return Err(
+                "the host's verification value is not the one this device derives".to_owned(),
+            );
+        }
         let host = &exchange.host;
         Ok(Candidate {
             connection,
@@ -408,27 +468,34 @@ impl Device {
         };
         let payload: DirectQrPayload = *payload;
         let address = address_of(&payload.endpoint_id, &payload.network_config);
-        let connection = self
-            .endpoint
-            .connect(address.clone(), kr_protocol::hello::ALPN)
-            .await
-            .map_err(|error| format!("the pinned host could not be reached: {error}"))?;
-        let mut unpaired = handshake::connect_unpaired(&connection, &self.unpaired)
-            .await
-            .map_err(|error| format!("the host did not answer an unpaired device: {error}"))?;
-        let challenge: PairRedeemResult = unpaired
-            .call(
+        let connection = bounded(
+            "the connection to the pinned host",
+            self.endpoint
+                .connect(address.clone(), kr_protocol::hello::ALPN),
+        )
+        .await?
+        .map_err(|error| format!("the pinned host could not be reached: {error}"))?;
+        let mut unpaired = bounded(
+            "the unpaired handshake",
+            handshake::connect_unpaired(&connection, &self.unpaired),
+        )
+        .await?
+        .map_err(|error| format!("the host did not answer an unpaired device: {error}"))?;
+        let challenge: PairRedeemResult = bounded(
+            "the redemption's challenge",
+            unpaired.call(
                 Method::PairRedeem,
                 &PairRedeemParams::Challenge {
                     invitation_id: payload.invitation_id,
                 },
-            )
-            .await
-            .map_err(|error| format!("the challenge: {error}"))?;
+            ),
+        )
+        .await?
+        .map_err(|error| format!("the challenge: {error}"))?;
         let PairRedeemResult::Challenge(challenge) = challenge else {
             return Err("the first redemption step did not answer with a challenge".to_owned());
         };
-        let (proof, _) = redeem_proof(
+        let (proof, transcript) = redeem_proof(
             &payload,
             &challenge,
             &self.keys.authorisation,
@@ -436,19 +503,30 @@ impl Device {
             &Pinned(challenge.endpoint_id),
         )
         .map_err(|error| format!("no redemption proof: {error}"))?;
-        let locked: PairRedeemResult = unpaired
-            .call(
+        // The value this device displays is its own, from the transcript it signed. The host's is
+        // compared with it rather than taken in its place.
+        let verification_value = kr_protocol::pairing::direct_verification_value(&transcript);
+        let locked: PairRedeemResult = bounded(
+            "the redemption",
+            unpaired.call(
                 Method::PairRedeem,
                 &PairRedeemParams::Direct(Box::new(proof)),
-            )
-            .await
-            .map_err(|error| format!("the redemption: {error}"))?;
+            ),
+        )
+        .await?
+        .map_err(|error| format!("the redemption: {error}"))?;
         let PairRedeemResult::Locked {
-            verification_value, ..
+            verification_value: shown,
+            ..
         } = locked
         else {
             return Err("the redemption did not lock the invitation".to_owned());
         };
+        if !kr_pairing::direct::verification_values_match(&verification_value, &shown) {
+            return Err(
+                "the host's verification value is not the one this device derives".to_owned(),
+            );
+        }
         // The host's own identity comes from the connection pinned to the endpoint the QR named,
         // and its keys from the challenge on that connection. The paired connection then checks
         // the host's proof against both.
@@ -497,21 +575,23 @@ impl Device {
             self.keys.authorisation.clone(),
             build(),
         );
-        let transport = NetworkTransport::connect(
-            &self.endpoint,
-            paired.address.clone(),
-            &identity,
-            &paired.record,
-            SendLimits::default(),
+        let transport = bounded(
+            "the paired connection",
+            NetworkTransport::connect(
+                &self.endpoint,
+                paired.address.clone(),
+                &identity,
+                &paired.record,
+                SendLimits::default(),
+            ),
         )
-        .await
+        .await?
         .map_err(|error| format!("the paired connection: {error}"))?;
         let connection_id = kr_client::transport::ControlTransport::connection_id(&transport);
         let session = Session::resume(Arc::new(transport), cursors)
             .map_err(|error| format!("a session on the connection: {error}"))?;
-        let info: HostInfoResult = session
-            .read(Method::HostInfo, &())
-            .await
+        let info: HostInfoResult = bounded("host.info", session.read(Method::HostInfo, &()))
+            .await?
             .map_err(|error| format!("host.info over the paired connection: {error}"))?;
         Ok(Remote {
             session,
@@ -574,16 +654,17 @@ impl Candidate {
     pub async fn committed(mut self, within: Duration) -> Result<PairedHost, String> {
         let deadline = tokio::time::Instant::now() + within;
         loop {
-            let status: PairStatusResult = self
-                .unpaired
-                .call(
+            let status: PairStatusResult = bounded(
+                "pair.status",
+                self.unpaired.call(
                     Method::PairStatus,
                     &PairStatusParams {
                         invitation_id: self.invitation_id,
                     },
-                )
-                .await
-                .map_err(|error| format!("pair.status: {error}"))?;
+                ),
+            )
+            .await?
+            .map_err(|error| format!("pair.status: {error}"))?;
             if let PairStatus::Committed {
                 device_id,
                 grant_id,
@@ -649,12 +730,15 @@ impl Remote {
     /// # Errors
     ///
     /// Returns the host's refusal or the connection's failure.
-    pub async fn read<P, R>(&self, method: Method, params: &P) -> Result<R, ClientError>
+    pub async fn read<P, R>(&self, method: Method, params: &P) -> Result<R, RequestError>
     where
         P: serde::Serialize + ?Sized,
         R: kr_protocol::wire::WireMessage,
     {
-        self.session.read(method, params).await
+        bounded(method.as_str(), self.session.read(method, params))
+            .await
+            .map_err(RequestError::Unanswered)?
+            .map_err(RequestError::Client)
     }
 
     /// Submits a mutation about `target` and parses the result it settled with.
@@ -667,22 +751,26 @@ impl Remote {
         method: Method,
         target: ActionTarget,
         params: &P,
-    ) -> Result<R, ClientError>
+    ) -> Result<R, RequestError>
     where
         P: serde::Serialize + ?Sized,
         R: kr_protocol::wire::WireMessage,
     {
-        self.session
-            .mutate(
+        bounded(
+            method.as_str(),
+            self.session.mutate(
                 method,
                 target,
                 None,
                 &ParamsValue::empty(),
                 params,
                 LIFETIME,
-            )
-            .await?
-            .to_typed()
+            ),
+        )
+        .await
+        .map_err(RequestError::Unanswered)?
+        .and_then(|settled| settled.to_typed())
+        .map_err(RequestError::Client)
     }
 
     /// Submits a mutation about this host's environment.
@@ -694,7 +782,7 @@ impl Remote {
         &self,
         method: Method,
         params: &P,
-    ) -> Result<R, ClientError>
+    ) -> Result<R, RequestError>
     where
         P: serde::Serialize + ?Sized,
         R: kr_protocol::wire::WireMessage,

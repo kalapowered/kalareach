@@ -36,7 +36,7 @@ use kr_protocol::recovery::{EventStream, EventsSubscribeResult, OutputEvent};
 use kr_protocol::scalars::{Bytes, CanonicalSet, Nullable};
 use kr_protocol::session::{ClosureRecord, Dimensions, SESSION_CLOSED_EVENT};
 
-use crate::device::Remote;
+use crate::device::{Remote, bounded};
 use crate::screen::{Terminal, projection_rows};
 
 /// The terminal profile a device's attachment declares.
@@ -132,11 +132,12 @@ impl View {
             .subscribe_params(session_id, attachment_id, &[EventStream::Output])
             .map_err(|error| format!("the restoration's order: {error:?}"))?;
         params.streams.insert(EventStream::SessionState);
-        let subscribed: EventsSubscribeResult = remote
-            .session()
-            .subscribe_events(&params)
-            .await
-            .map_err(|error| format!("events.subscribe: {error}"))?;
+        let subscribed: EventsSubscribeResult = bounded(
+            "events.subscribe",
+            remote.session().subscribe_events(&params),
+        )
+        .await?
+        .map_err(|error| format!("events.subscribe: {error}"))?;
         restoration
             .subscribed()
             .map_err(|error| format!("the restoration's order: {error:?}"))?;
@@ -279,16 +280,18 @@ impl View {
         let mut streams = CanonicalSet::new();
         streams.insert(EventStream::Output);
         streams.insert(EventStream::SessionState);
-        self.subscribed = remote
-            .session()
-            .subscribe_events(&kr_protocol::recovery::EventsSubscribeParams {
-                session_id: self.session_id,
-                attachment_id: self.attachment_id,
-                streams,
-                from_cursor: Nullable::null(),
-            })
-            .await
-            .map_err(|error| format!("events.subscribe again: {error}"))?;
+        let params = kr_protocol::recovery::EventsSubscribeParams {
+            session_id: self.session_id,
+            attachment_id: self.attachment_id,
+            streams,
+            from_cursor: Nullable::null(),
+        };
+        self.subscribed = bounded(
+            "events.subscribe",
+            remote.session().subscribe_events(&params),
+        )
+        .await?
+        .map_err(|error| format!("events.subscribe again: {error}"))?;
         Ok(())
     }
 
@@ -393,16 +396,15 @@ impl View {
         text: &str,
     ) -> Result<InputWriteResult, String> {
         let (epoch, sequence) = self.lease.ok_or("this attachment holds no input lease")?;
-        let written = remote
-            .session()
-            .write_input(&InputWriteParams {
-                session_id: self.session_id,
-                attachment_id: self.attachment_id,
-                epoch,
-                sequence: InputSequence::new(sequence),
-                bytes: Bytes::new(text.as_bytes().to_vec()),
-            })
-            .await
+        let params = InputWriteParams {
+            session_id: self.session_id,
+            attachment_id: self.attachment_id,
+            epoch,
+            sequence: InputSequence::new(sequence),
+            bytes: Bytes::new(text.as_bytes().to_vec()),
+        };
+        let written = bounded("input.write", remote.session().write_input(&params))
+            .await?
             .map_err(|error| format!("input.write: {error}"))?;
         let length = u64::try_from(text.len()).unwrap_or(u64::MAX);
         if written.sequence.get() != sequence || written.forwarded_bytes.get() != length {

@@ -77,20 +77,21 @@ fn the_site_answers_and_a_host_reserves_its_invitations_there() {
         (refused.exit, refused.refusal()),
         (8, Some("RENDEZVOUS_CONFIG_ERROR")),
         "an origin that serves no rendezvous is a configuration error: {}",
-        refused.document
+        refused.withheld()
     );
 
     let invited = ceremony::issue_first(&host, &["--owner", "--origin", origin.as_str()]);
     assert_eq!(
-        invited.exit, 0,
+        invited.exit,
+        0,
         "the host issues a code invitation at the deployment: {}",
-        invited.document
+        invited.withheld()
     );
     assert_eq!(
         invited.document["rendezvous_origin"],
         origin.as_str(),
         "the invitation names the deployment as its rendezvous: {}",
-        invited.document
+        invited.withheld()
     );
     let code = invited.document["code"]
         .as_str()
@@ -109,10 +110,11 @@ fn the_site_answers_and_a_host_reserves_its_invitations_there() {
     let QrPayload::Code(qr) = qr else {
         panic!("a code invitation's QR is a code-mode QR");
     };
-    assert_eq!(
-        (qr.rendezvous_origin.as_str(), qr.code.as_str()),
-        (origin.as_str(), code.as_str()),
-        "the QR names the deployment and the code"
+    // Compared without being printed: the code's last six characters are the invitation's
+    // secret, and a failure message is written to the leg's log.
+    assert!(
+        qr.rendezvous_origin.as_str() == origin.as_str() && qr.code.as_str() == code,
+        "the QR names the deployment and the code the invitation shows"
     );
     let locator = Locator::new(&code[..4]).expect("the code's first four characters");
     checkpoint.left(
@@ -202,7 +204,7 @@ fn a_device_pairs_by_code_through_the_site_and_by_direct_qr_over_loopback() {
 
     // The host's first owner invitation, offered through the deployment.
     let invited = ceremony::issue_first(&host, &["--owner", "--origin", origin.as_str()]);
-    assert_eq!(invited.exit, 0, "the invitation: {}", invited.document);
+    assert_eq!(invited.exit, 0, "the invitation: {}", invited.withheld());
     let code = invited.document["code"]
         .as_str()
         .expect("a code invitation shows its code")
@@ -295,7 +297,12 @@ fn a_device_pairs_by_code_through_the_site_and_by_direct_qr_over_loopback() {
         }))
         .unwrap_or_else(|why| panic!("the owner device confirms issuing: {why}"));
     let issued = ceremony::finished(issuing, "kr pair invite --direct");
-    assert_eq!(issued.exit, 0, "the direct invitation: {}", issued.document);
+    assert_eq!(
+        issued.exit,
+        0,
+        "the direct invitation: {}",
+        issued.withheld()
+    );
     let direct_id = issued.document["invitation_id"]
         .as_str()
         .expect("an invitation identifier")
@@ -399,6 +406,7 @@ fn worker_of(run: &Run, session_id: &str) -> kr_protocol::identity::ProcessStart
     let started = std::time::Instant::now();
     loop {
         if let Some((pid, _)) = kr_e2e_m1b::run::processes_under(run.root())
+            .unwrap_or_default()
             .into_iter()
             .find(|(_, command)| {
                 command.contains("kr-worker")
@@ -562,7 +570,7 @@ fn a_device_uses_an_agent_in_a_managed_shell_and_reattaches_to_the_screen_kr_att
     variables.push(("SHELL".to_owned(), shell.executable.display().to_string()));
     let mut install = host.command(&["shell", "install", "--json"]);
     install.envs(variables.iter().cloned());
-    let installed = kr_e2e_m1b::host::output_within(install, LIVENESS)
+    let installed = kr_e2e_m1b::run::output_within(install, LIVENESS)
         .unwrap_or_else(|why| panic!("kr shell install: {why}"));
     assert!(
         installed.status.success(),
@@ -1075,7 +1083,7 @@ fn the_host_installs_the_published_catalogue_release_byte_for_byte_the_bundled_c
         .arg(workspace().join("scripts/sync-bundled-plugins.sh"))
         .arg("--verify")
         .current_dir(workspace());
-    let verified = kr_e2e_m1b::host::output_within(verify, LIVENESS)
+    let verified = kr_e2e_m1b::run::output_within(verify, LIVENESS)
         .unwrap_or_else(|why| panic!("scripts/sync-bundled-plugins.sh --verify: {why}"));
     assert!(
         verified.status.success(),
@@ -1324,10 +1332,13 @@ fn the_installed_package_is_bound_into_the_session_and_acts_through_its_broker()
         session_target(&watching, session_id),
         &invoke,
     ));
-    assert!(
-        refused.is_err(),
-        "the action is refused to a device whose grant does not carry its rights"
-    );
+    match refused {
+        Err(error) if error.refusal() == Some(kr_protocol::error::ErrorCode::PermissionDenied) => {}
+        other => panic!(
+            "the action is refused to a device whose grant does not carry its rights, with \
+             PERMISSION_DENIED: {other:?}"
+        ),
+    }
     let applied: PluginActionInvokeResult = runtime
         .block_on(remote.mutate(
             Method::PluginActionInvoke,

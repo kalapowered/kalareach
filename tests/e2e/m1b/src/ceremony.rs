@@ -12,7 +12,8 @@ use std::thread::JoinHandle;
 use serde_json::Value;
 
 use crate::LIVENESS;
-use crate::host::{Host, output_within};
+use crate::host::Host;
+use crate::run::output_within;
 use crate::window::Window;
 
 /// What the person types to issue a host's first owner invitation.
@@ -34,6 +35,21 @@ pub struct Answered {
 }
 
 impl Answered {
+    /// The document, with the code and the QR text withheld, for a failure message.
+    ///
+    /// A code's last six characters and a direct QR's secret are an invitation's secret, and a
+    /// failure message is written to the leg's log.
+    #[must_use]
+    pub fn withheld(&self) -> String {
+        let mut shown = self.document.clone();
+        for secret in ["code", "qr_text"] {
+            if let Some(value) = shown.get_mut(secret) {
+                *value = Value::String("(withheld)".to_owned());
+            }
+        }
+        shown.to_string()
+    }
+
     /// The code a refusal carries, when this is one.
     #[must_use]
     pub fn refusal(&self) -> Option<&str> {
@@ -108,10 +124,11 @@ pub fn finished(waiting: JoinHandle<Result<Output, String>>, what: &str) -> Answ
         .join()
         .unwrap_or_else(|_| panic!("{what}: the thread running it failed"))
         .unwrap_or_else(|error| panic!("{what}: {error}"));
+    // What it printed is not repeated: it may carry an invitation's secret.
     let document = first_document(&output.stdout).unwrap_or_else(|| {
         panic!(
-            "{what} printed no document: {}{}",
-            String::from_utf8_lossy(&output.stdout),
+            "{what} printed no document ({} bytes) and said: {}",
+            output.stdout.len(),
             String::from_utf8_lossy(&output.stderr)
         )
     });
@@ -140,7 +157,8 @@ fn at_terminal(
         arguments,
         run.root(),
         &host.variables(),
-    );
+    )
+    .withholding_output();
     let _ = window.wait_for(0, prompt, "the owner's ceremony asks at the terminal");
     let mark = window.mark();
     let mut line = typed.to_vec();
@@ -150,8 +168,8 @@ fn at_terminal(
     let printed = window.collected().since(mark);
     let document = first_document(&printed).unwrap_or_else(|| {
         panic!(
-            "{what} printed no document after the ceremony: {}",
-            String::from_utf8_lossy(&printed).escape_debug()
+            "{what} printed no document after the ceremony ({} bytes)",
+            printed.len()
         )
     });
     Answered { exit, document }
@@ -186,9 +204,10 @@ pub fn pair_first_owner(
 ) -> (crate::device::PairedHost, crate::device::Remote) {
     let invited = issue_first(host, &["--owner", "--direct"]);
     assert_eq!(
-        invited.exit, 0,
+        invited.exit,
+        0,
         "the owner invitation: {}",
-        invited.document
+        invited.withheld()
     );
     let candidate = runtime
         .block_on(device.redeem(invited.document["qr_text"].as_str().expect("a QR text")))

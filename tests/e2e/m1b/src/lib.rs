@@ -24,9 +24,11 @@
 //! binaries, the host's runtime and state directories, the session's working directory, the home
 //! every process is given and everything an agent writes. Nothing a leg launches opens this
 //! workspace, which may be on a removable volume. Each process a leg starts, or learns the identity
-//! of, is recorded, and a process is ended only through that record. A leg closes what it opened
-//! and then checks, in the process table and in the service manager, that nothing it started is
-//! still running.
+//! of, is recorded by its start identity, and so is every worker the host's registry names and
+//! everything beneath it. A process is ended only through what the run holds for it: the handle of
+//! a child it started, the start identity it recorded, or the label its daemon gave a launchd job,
+//! and never by a name or a pattern. A leg closes what it opened and then checks, in the process
+//! table and in the service manager, that nothing it started is still running.
 //!
 //! On the deployment a leg uses fresh keys, one invitation and one rendezvous room per pairing,
 //! and says in its last line what it left there.
