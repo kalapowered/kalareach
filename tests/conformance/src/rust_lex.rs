@@ -24,8 +24,9 @@ pub enum Tok {
     Ident(String),
     /// A lifetime or a loop label.
     Lifetime,
-    /// A string literal of any kind, with its value where it could be decoded.
-    Str(String),
+    /// A string literal of any kind: its value where it could be decoded, and whether it was
+    /// written with an escape or a line continuation.
+    Str(String, bool),
     /// A character or byte literal.
     Char,
     /// A numeric literal.
@@ -117,7 +118,14 @@ impl Lexer<'_> {
             let fourth = self.peek(at + 3);
             match (self.peek(at), self.peek(at + 1)) {
                 (Some('['), _) => return true,
-                (Some(c), _) if c.is_whitespace() => at += 1,
+                // The whitespace the compiler skips between tokens.
+                (
+                    Some(
+                        '\t' | '\n' | '\u{b}' | '\u{c}' | '\r' | ' ' | '\u{85}' | '\u{200e}'
+                        | '\u{200f}' | '\u{2028}' | '\u{2029}',
+                    ),
+                    _,
+                ) => at += 1,
                 // `//`, but not `///` (unless `////`) and not `//!`.
                 (Some('/'), Some('/'))
                     if !matches!(third, Some('/' | '!'))
@@ -340,6 +348,7 @@ impl Lexer<'_> {
 
     fn string(&mut self, line: usize, prefix: usize) -> Result<(), LexError> {
         let raw = (0..prefix).any(|i| self.peek(i) == Some('r'));
+        let mut escaped = false;
         self.at += prefix;
         let unterminated = LexError {
             line,
@@ -368,15 +377,20 @@ impl Lexer<'_> {
                 match c {
                     '"' => break,
                     '\\' => {
-                        let escaped = self.bump().ok_or_else(|| unterminated.clone())?;
-                        match escaped {
+                        escaped = true;
+                        let after = self.bump().ok_or_else(|| unterminated.clone())?;
+                        match after {
                             'n' => value.push('\n'),
                             't' => value.push('\t'),
                             'r' => value.push('\r'),
                             '0' => value.push('\0'),
-                            '\n' => {
-                                // A line continuation skips the whitespace that starts the next line.
-                                while self.peek(0).is_some_and(char::is_whitespace) {
+                            // A line continuation, after a line feed or a carriage return and one,
+                            // skips the ASCII whitespace that starts the next line.
+                            '\n' | '\r' if after == '\n' || self.peek(0) == Some('\n') => {
+                                while self
+                                    .peek(0)
+                                    .is_some_and(|c| matches!(c, ' ' | '\t' | '\n' | '\r'))
+                                {
                                     self.bump();
                                 }
                             }
@@ -386,7 +400,7 @@ impl Lexer<'_> {
                                     if d == '}' {
                                         break;
                                     }
-                                    if d != '{' {
+                                    if d != '{' && d != '_' {
                                         digits.push(d);
                                     }
                                 }
@@ -412,7 +426,7 @@ impl Lexer<'_> {
                 }
             }
         }
-        self.push(Tok::Str(value), line);
+        self.push(Tok::Str(value, escaped), line);
         Ok(())
     }
 
@@ -500,8 +514,8 @@ mod tests {
             !tokens.iter().any(|t| matches!(t, Tok::Comment(..))),
             "{tokens:?}"
         );
-        assert!(tokens.contains(&Tok::Str("// not a comment".into())));
-        assert!(tokens.contains(&Tok::Str("/* nor \"this\" */".into())));
+        assert!(tokens.contains(&Tok::Str("// not a comment".into(), false)));
+        assert!(tokens.contains(&Tok::Str("/* nor \"this\" */".into(), false)));
     }
 
     #[test]
@@ -518,7 +532,19 @@ mod tests {
     #[test]
     fn a_string_value_is_decoded_across_a_line_continuation() {
         let tokens = kinds("\"KR-REQ-08.16 \\\n     row text\\u{21}\"");
-        assert_eq!(tokens, [Tok::Str("KR-REQ-08.16 row text!".into())]);
+        assert_eq!(tokens, [Tok::Str("KR-REQ-08.16 row text!".into(), true)]);
+    }
+
+    #[test]
+    fn a_string_is_decoded_as_the_compiler_decodes_it() {
+        // Underscores may stand among a Unicode escape's digits, and a line continuation after a
+        // carriage return and a line feed skips the ASCII whitespace that starts the next line.
+        let decoded = |source: &str| match &lex(source).expect("lexes")[0].tok {
+            Tok::Str(value, _) => value.clone(),
+            other => panic!("a string: {other:?}"),
+        };
+        assert_eq!(decoded("\"ki\\u{6_4}.rs\""), "kid.rs");
+        assert_eq!(decoded("\"a\\\r\n   b\""), "ab");
     }
 
     #[test]
