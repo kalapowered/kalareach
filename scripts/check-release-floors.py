@@ -405,6 +405,18 @@ SYNTHETIC = [
         True,
     ),
     (
+        "a Mach-O stating its floor the older way, at 13.0",
+        "x86_64-apple-darwin",
+        synthetic_macho(CPU_TYPE_X86_64, [version_min_command((13, 0, 0))]),
+        False,
+    ),
+    (
+        "a Mach-O stating its floor the older way, at 15.0",
+        "x86_64-apple-darwin",
+        synthetic_macho(CPU_TYPE_X86_64, [version_min_command((15, 0, 0))]),
+        False,
+    ),
+    (
         "a Mach-O built for iOS",
         "aarch64-apple-darwin",
         synthetic_macho(CPU_TYPE_ARM64, [build_version_command(2, (14, 0, 0))]),
@@ -442,6 +454,27 @@ SYNTHETIC = [
             ]
         ),
         True,
+    ),
+    (
+        "a universal Mach-O whose Intel image is at 15.0, checked as Apple Silicon",
+        "aarch64-apple-darwin",
+        synthetic_fat(
+            [
+                (
+                    CPU_TYPE_X86_64,
+                    synthetic_macho(
+                        CPU_TYPE_X86_64, [build_version_command(PLATFORM_MACOS, (15, 0, 0))]
+                    ),
+                ),
+                (
+                    CPU_TYPE_ARM64,
+                    synthetic_macho(
+                        CPU_TYPE_ARM64, [build_version_command(PLATFORM_MACOS, (14, 0, 0))]
+                    ),
+                ),
+            ]
+        ),
+        False,
     ),
     (
         "an ELF needing glibc 2.34",
