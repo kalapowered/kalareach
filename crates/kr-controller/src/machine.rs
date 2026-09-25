@@ -493,9 +493,13 @@ impl MachineStore {
 
     /// Takes this process's writer lock.
     fn writer(&self) -> std::sync::MutexGuard<'static, ()> {
-        // A test learns here that a caller has come to the lock, whether or not it has to wait.
+        // A test learns here that a caller has come to the lock, and whether somebody else holds
+        // it. A lock that is free is taken and let go at once by the look; a poisoned one is free.
         #[cfg(test)]
-        seam::locking(&self.record);
+        seam::locking(
+            &self.record,
+            matches!(WRITER.try_lock(), Err(std::sync::TryLockError::WouldBlock)),
+        );
         WRITER
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -585,8 +589,9 @@ mod seam {
 
     static REGISTERED: Mutex<Registered> = Mutex::new(Vec::new());
 
-    /// Callers waiting to hear that a store of their record has come to the writer lock.
-    static LOCKING: Mutex<Vec<(PathBuf, Sender<()>)>> = Mutex::new(Vec::new());
+    /// Callers waiting to hear that a store of their record has come to the writer lock, and
+    /// whether it found the lock held by somebody else.
+    static LOCKING: Mutex<Vec<(PathBuf, Sender<bool>)>> = Mutex::new(Vec::new());
 
     /// Registers one interruption of the next publication of `record` to reach `boundary`.
     pub(super) fn register(record: &Path, boundary: Boundary, interruption: Interruption) {
@@ -596,16 +601,18 @@ mod seam {
             .push((record.to_path_buf(), boundary, interruption));
     }
 
-    /// Asks to be told, once, when a store of `record` next comes to the writer lock.
-    pub(super) fn watch_lock(record: &Path, told: Sender<()>) {
+    /// Asks to be told, once, when a store of `record` next comes to the writer lock, and whether
+    /// it found the lock held.
+    pub(super) fn watch_lock(record: &Path, told: Sender<bool>) {
         LOCKING
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push((record.to_path_buf(), told));
     }
 
-    /// Tells whoever asked that a store of `record` has come to the writer lock.
-    pub(super) fn locking(record: &Path) {
+    /// Tells whoever asked that a store of `record` has come to the writer lock, and whether it
+    /// found the lock held by somebody else.
+    pub(super) fn locking(record: &Path, held: bool) {
         let watcher = {
             let mut watching = LOCKING.lock().unwrap_or_else(PoisonError::into_inner);
             watching
@@ -614,7 +621,7 @@ mod seam {
                 .map(|index| watching.remove(index))
         };
         if let Some((_, told)) = watcher {
-            let _ = told.send(());
+            let _ = told.send(held);
         }
     }
 
@@ -1353,8 +1360,8 @@ mod tests {
 
     /// KR-REQ-03.07: opening the store while a step is publishing waits for the writer lock the
     /// step holds, so it never removes the temporary file the step is about to publish. The step is
-    /// held just before its rename; the opener says when it has come to the lock, and cannot have
-    /// finished by then.
+    /// held just before its rename; the opener says when it has come to the lock and that it found
+    /// the lock held, and it cannot have finished by then.
     #[test]
     fn opening_waits_for_a_publication_in_progress() {
         let environment = Environment::create();
@@ -1396,9 +1403,13 @@ mod tests {
                 let _ = opened.send(());
                 read
             });
-            locking
+            let held = locking
                 .recv_timeout(WAIT)
                 .expect("the opener came to the writer lock");
+            assert!(
+                held,
+                "the opener found the writer lock free while a step was publishing"
+            );
             assert!(
                 opening.try_recv().is_err(),
                 "an open finished while a step was publishing"
