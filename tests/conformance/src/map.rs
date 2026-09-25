@@ -256,7 +256,7 @@ struct Helper {
 }
 
 /// A test and what its body names: the functions it calls, the names its own `use` declarations
-/// bring in, and the case tables it reads.
+/// bring in, the case tables it reads, and the macro and attribute names its reading took on trust.
 struct Use {
     target: TargetId,
     name: String,
@@ -264,6 +264,7 @@ struct Use {
     uses: BTreeSet<String>,
     calls: BTreeSet<Vec<String>>,
     imports: Vec<Import>,
+    assumes: BTreeSet<String>,
 }
 
 fn rust_package(map: &mut Map, sources: &mut Sources, root: &Path, package: &Package) {
@@ -336,9 +337,13 @@ fn rust_package(map: &mut Map, sources: &mut Sources, root: &Path, package: &Pac
         }
         // A keyed function of test code keys the tests of this target that call it: a case a
         // family of thin tests shares, one per shell or per platform, is keyed where it is written.
+        // A test's calls prove nothing where the target may give a macro or attribute its reading
+        // took on trust another meaning.
+        let (claimed, unlisted) = claimed_names(&modules, &scope);
         for helper in helpers {
             let callers: Vec<String> = uses[first_use..]
                 .iter()
+                .filter(|test| !unlisted && test.assumes.is_disjoint(&claimed))
                 .filter(|test| {
                     test.calls
                         .iter()
@@ -621,6 +626,53 @@ impl Scope {
     }
 }
 
+/// The names a target binds for itself that a macro or attribute name taken on trust could be: a
+/// macro its source defines, a name a `use` brings in other than a standard library item under its
+/// own name, and a module (as `name::`, a path's first name); and whether it brings in names its
+/// source does not list, through `#[macro_use]`, an `extern crate`, or a glob from outside the
+/// crate and the standard library. Macros are looked up by name through a crate's own definitions
+/// and imports before the standard library's prelude, so while none of these can give a trusted
+/// name another meaning, each such name is the one the reading took it for.
+fn claimed_names(modules: &[Module], scope: &Scope) -> (BTreeSet<String>, bool) {
+    let standard = |root: &str| matches!(root, "std" | "core" | "alloc");
+    let mut claimed = BTreeSet::new();
+    let mut unlisted = false;
+    for module in modules {
+        claimed.extend(module.macros.iter().cloned());
+        unlisted |= module.unlisted_names;
+        if let Some(name) = module.path.last() {
+            claimed.insert(format!("{name}::"));
+        }
+        let imports = module.entries.iter().flat_map(|entry| match entry {
+            Entry::Item(item) => item.imports.as_slice(),
+            Entry::Test(test) => test.imports.as_slice(),
+            Entry::Section(_) => &[],
+        });
+        for import in imports {
+            match import {
+                Import::Name { name, path } => {
+                    let own = path.first().is_some_and(|root| standard(root))
+                        && path.last() == Some(name);
+                    if !own {
+                        claimed.insert(name.clone());
+                        claimed.insert(format!("{name}::"));
+                    }
+                }
+                Import::Glob { path } => {
+                    let root = path.first().map_or("", String::as_str);
+                    let mut child = module.path.clone();
+                    child.push(root.to_owned());
+                    let inside = matches!(root, "crate" | "self" | "super")
+                        || standard(root)
+                        || scope.modules.contains(&child);
+                    unlisted |= !inside;
+                }
+            }
+        }
+    }
+    (claimed, unlisted)
+}
+
 /// Whether a call written in the module `from` by `path` reaches `helper`.
 ///
 /// A call keys a helper only when the reading proves, from the target's own source, that the
@@ -774,8 +826,14 @@ fn rust_module(
                     name,
                     module: module.path.clone(),
                     uses: test.uses.clone(),
-                    calls: test.calls.clone(),
+                    // An attribute macro on its module may rewrite any call in it.
+                    calls: if module.rewritable {
+                        BTreeSet::new()
+                    } else {
+                        test.calls.clone()
+                    },
                     imports: test.imports.clone(),
+                    assumes: test.assumes.clone(),
                 });
             }
             Entry::Item(item) => {
@@ -807,12 +865,25 @@ fn rust_module(
                         });
                     }
                 } else if module.test_code && item.kind == "fn" && !found.is_empty() {
-                    helpers.push(Helper {
-                        name: item.name.clone().unwrap_or_default(),
-                        file: module.file.clone(),
-                        module: module.path.clone(),
-                        mentions: found,
-                    });
+                    let name = item.name.clone().unwrap_or_default();
+                    if module.rewritable || item.rewritable {
+                        // An attribute macro may rename or replace it, so no call can be proved
+                        // to reach it.
+                        let context = format!(
+                            "a comment on fn {name} in {}, which an attribute may rewrite",
+                            module.file
+                        );
+                        for (identifier, source) in found {
+                            map.reference(identifier, source, &context);
+                        }
+                    } else {
+                        helpers.push(Helper {
+                            name,
+                            file: module.file.clone(),
+                            module: module.path.clone(),
+                            mentions: found,
+                        });
+                    }
                 } else {
                     let context = format!(
                         "a comment on {} {}, which is not a test",
