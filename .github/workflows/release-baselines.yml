@@ -1,0 +1,185 @@
+name: release-baselines
+
+# Section 3's release baselines, checked on the executables the host ships. Every one of them is
+# built for every release target, each target on a standard hosted runner of its own platform, and
+# then each executable's own headers are read for the oldest system it says it runs on. A floor that
+# does not match its baseline fails the job: a macOS executable that is not built for 14.0, a Linux
+# one that needs a newer glibc than Ubuntu 22.04's, or a Windows one that asks for a newer Windows
+# than 11. Each executable is then started where it was built, and the Linux ones are also started
+# in the distributions the release supports.
+#
+# `scripts/check-release-floors.py` reads the floors, and `docs/releases/platforms.md` says what each
+# baseline is and why. This runs by hand and every night; the landing gate is core-ci, which builds
+# the workspace for its tests rather than the release's own executables.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Every night, away from the hour, when the hosted runners are busiest.
+    - cron: '41 2 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-baselines-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Each build starts from nothing, so incremental artefacts would only take disk.
+  CARGO_INCREMENTAL: "0"
+  # The release's macOS floor. Rust's own default is older (11.0 on Apple Silicon), and the C that
+  # the build compiles reads the same variable, so every object in an executable targets 14.0.
+  # Nothing reads it on the other platforms.
+  MACOSX_DEPLOYMENT_TARGET: "14.0"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  floors:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    strategy:
+      # One target's failure says nothing about another's, and each is worth seeing.
+      fail-fast: false
+      matrix:
+        include:
+          # The oldest Ubuntu the release supports, so the glibc the build links against is
+          # never newer than the baseline's.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            python: python3
+            exe: ''
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            python: python3
+            exe: ''
+          # macOS 14 itself, so the floor is started on the baseline it names.
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            python: python3
+            exe: ''
+          # The Intel runners start at macOS 15, so the Intel executables are started there.
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            python: python3
+            exe: ''
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2025
+            python: python
+            exe: .exe
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+            python: python
+            exe: .exe
+    env:
+      TARGET: ${{ matrix.target }}
+      PYTHON: ${{ matrix.python }}
+      EXE: ${{ matrix.exe }}
+      # Every executable the host ships, as the package that builds it and its name.
+      EXECUTABLES: >-
+        kr-cli/kr
+        kr-cli/kr-attach-guard
+        kr-worker/kr-worker
+        kr-controller/kr-controller
+        kr-hook/kr-hook
+        kr-plugin-host/kr-plugin-host
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: What this runner is
+        run: |
+          uname -a
+          case "$RUNNER_OS" in
+            macOS) sw_vers ;;
+            Linux) cat /etc/os-release ;;
+            Windows) cmd //c ver ;;
+          esac
+
+      # Some runner images carry no Rust at all. The installer is rustup's own, and it installs
+      # no toolchain: the next step installs the one this repository pins.
+      - name: Install rustup where the image has none
+        if: runner.os != 'Windows'
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 --silent --show-error --fail https://sh.rustup.rs |
+              sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Install rustup where the image has none
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
+            $architecture = if ($env:RUNNER_ARCH -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
+            $installer = Join-Path $env:RUNNER_TEMP 'rustup-init.exe'
+            Invoke-WebRequest -Uri "https://static.rust-lang.org/rustup/dist/$architecture-pc-windows-msvc/rustup-init.exe" -OutFile $installer
+            & $installer -y --no-modify-path --profile minimal --default-toolchain none
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $env:USERPROFILE '.cargo\bin')
+          }
+
+      # rust-toolchain.toml pins the exact toolchain; rustup installs it on first use.
+      - name: Install the pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add "$TARGET"
+          rustc --version
+          cargo --version
+
+      # The check is put through binaries whose floors are known before it is trusted with the
+      # release's. On macOS that includes a program built at Rust's default target, which it has to
+      # refuse, and one built at 14.0, which it has to pass.
+      - name: Test the floor check
+        run: '"$PYTHON" scripts/check-release-floors.py self-test'
+
+      # Each executable is built by a command of its own, as the Windows release builds them, so
+      # each one's dependencies are resolved exactly as they are for the release.
+      - name: Build the host executables
+        run: |
+          for executable in $EXECUTABLES; do
+            cargo build --locked --release --target "$TARGET" -p "${executable%/*}" --bin "${executable#*/}"
+          done
+
+      - name: Read each floor back
+        run: |
+          built=()
+          for executable in $EXECUTABLES; do
+            built+=("target/$TARGET/release/${executable#*/}$EXE")
+          done
+          {
+            echo "### $TARGET on $RUNNER_OS $RUNNER_ARCH"
+            echo '```'
+            "$PYTHON" scripts/check-release-floors.py check --target "$TARGET" "${built[@]}"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Start each on this runner
+        run: |
+          for executable in $EXECUTABLES; do
+            "target/$TARGET/release/${executable#*/}$EXE" --version
+          done
+
+      # A clean image of each distribution, so what starts is the executable against that
+      # distribution's own libraries and nothing the runner image added.
+      - name: Start each on the Linux distributions the release supports
+        if: runner.os == 'Linux'
+        run: |
+          release="$PWD/target/$TARGET/release"
+          names=()
+          for executable in $EXECUTABLES; do
+            names+=("${executable#*/}")
+          done
+          for image in ubuntu:22.04 ubuntu:24.04 debian:12 debian:13; do
+            echo "== $image"
+            docker run --rm --volume "$release:/kr:ro" "public.ecr.aws/docker/library/$image" \
+              sh -c 'set -e; grep PRETTY_NAME /etc/os-release; for name in "$@"; do /kr/"$name" --version; done' \
+              sh "${names[@]}"
+            echo "- $TARGET starts on $image" >> "$GITHUB_STEP_SUMMARY"
+          done
