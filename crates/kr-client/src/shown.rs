@@ -738,9 +738,11 @@ fn assemble(mut said: String, pieces: &[Piece<'_>], separator: &str) -> String {
     let mut separated = said.is_empty() || said.ends_with(separator);
     for piece in pieces {
         match piece {
+            // A drive's prefix and a name after it with no root between are a path relative to
+            // that drive, so no separator goes between them.
             Piece::Prefix(prefix) => {
                 said.push_str(prefix);
-                separated = false;
+                separated = true;
             }
             Piece::Root => {
                 said.push_str(separator);
@@ -1450,6 +1452,15 @@ mod tests {
                 "/"
             ),
             "/configured/root/sessions"
+        );
+        // A drive-relative path stays relative to its drive.
+        assert_eq!(
+            assemble(
+                String::new(),
+                &[Piece::Prefix("C:".to_owned()), Piece::Name("sessions")],
+                "\\"
+            ),
+            "C:sessions"
         );
     }
 
