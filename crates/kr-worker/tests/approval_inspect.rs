@@ -1,0 +1,911 @@
+//! A person reads what an approval's decoder read and what it offered: `agent.approval.inspect`.
+//!
+//! Section 11 makes an installed decoder part of the trust boundary. Wire provenance proves which
+//! connection supplied a request, and nothing proves that the decoder read it correctly, so the
+//! approval ledger keeps the decoder's package and publisher, the original source, the native
+//! request identifier, the offered decisions, the deadline and where the request stands, open to
+//! inspection. These tests read that record on the worker's own socket, through the client
+//! library's typed read where a person's client would use it, and hold the answer to what the test
+//! itself gave the broker rather than to what the broker says about itself.
+//!
+//! | Row | What proves it |
+//! | --- | --- |
+//! | KR-REQ-11.26 | `kr_req_11_26_a_local_caller_reads_what_the_decoder_read_and_offered`, `kr_req_11_26_the_record_says_where_the_request_stands_once_answered`, `kr_req_11_26_another_instances_resource_and_one_never_decoded_answer_unknown` |
+
+use std::sync::Arc;
+
+use kr_client::ipc::IpcTransport;
+use kr_ipc::client::LocalClient;
+use kr_ipc::endpoint::Listener;
+use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
+use kr_protocol::actor::{ActorEnvelope, ActorIngress};
+use kr_protocol::agent::{
+    AgentApprovalInspectParams, AgentApprovalInspectResult, AgentApprovalRespondParams,
+    AgentCapabilitiesParams, AgentMutationTarget, AgentSnapshotParams, AgentSubject,
+};
+use kr_protocol::broker::{
+    BrokerGrant, BrokerGrants, DecodedProjection, DecodingTrust, IntegrationMode, OfferedDecision,
+};
+use kr_protocol::envelope::{
+    ActionTarget, ControlFrame, MutationRequest, Outcome, ParamsValue, Request,
+};
+use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::gateway::{
+    DeclarativeEntry, DeclarativeTable, NativeFraming, NativeMethodClass, PendingState,
+    RichMethodTable,
+};
+use kr_protocol::hello::PROTOCOL_VERSION;
+use kr_protocol::identity::{
+    DesktopBinding, ProcessStartIdentity, ProcessStartSource, WorkerProfile,
+};
+use kr_protocol::ids::{
+    ActionId, ActorId, AgentBindingRevision, ApplicationInstanceId, AuthorityRevision,
+    BrokerBindingId, BuildId, CapabilityId, CapabilityRevision, ConnectionId, ControllerGeneration,
+    DeviceId, GatewayConnectionId, GrantId, MethodTableVersion, PendingResourceId, PluginId,
+    PublisherId, RequestId, SessionEpoch, SessionId, UpstreamMethod, UpstreamRequestId,
+};
+use kr_protocol::local::{ForwardedRequest, LocalClientKind};
+use kr_protocol::method::{Method, MethodVersion};
+use kr_protocol::rights::ActionRight;
+use kr_protocol::scalars::{Digest256, DurationMs, Nullable, TimestampMs, U64, Uuid};
+use kr_protocol::session::{Dimensions, DisplayNumber, ShellMode};
+use kr_worker::broker::{
+    BrokerError, BrokerTransport, Credential, ManagedProcess, PendingTransmission, TransportHandle,
+    UpstreamDispatch, UpstreamOutcome, UpstreamRequest, subject,
+};
+use kr_worker::runtime::SessionRuntime;
+use kr_worker::service::{ServiceBinding, WorkerService};
+use kr_worker::session::{Session as TerminalSession, SessionConfig};
+
+/// When the upstream's request arrived, which is when the broker recorded its source frame.
+const RECORDED_AT: TimestampMs = TimestampMs::new(2);
+
+/// When the decoder's interpretation was written, a moment after the request arrived.
+const DECODED_AT: TimestampMs = TimestampMs::new(3);
+
+/// The deadline the upstream put on its request: far enough ahead that answering it is possible.
+const DEADLINE: TimestampMs = TimestampMs::new(4_102_444_800_000);
+
+fn build() -> BuildId {
+    BuildId::new("kr-test/0").expect("a build identifier")
+}
+
+fn instance() -> ApplicationInstanceId {
+    ApplicationInstanceId::new(Uuid::from_bytes([2; 16]))
+}
+
+/// A second instance in the same session, running the same package under its own binding.
+fn other_instance() -> ApplicationInstanceId {
+    ApplicationInstanceId::new(Uuid::from_bytes([3; 16]))
+}
+
+fn binding() -> BrokerBindingId {
+    BrokerBindingId::new(Uuid::from_bytes([9; 16]))
+}
+
+fn plugin() -> PluginId {
+    PluginId::new("kalareach.codex").expect("a plugin")
+}
+
+fn publisher() -> PublisherId {
+    PublisherId::new("kalareach").expect("a publisher")
+}
+
+fn package_digest() -> Digest256 {
+    Digest256::from_bytes([5; 32])
+}
+
+fn permission() -> UpstreamMethod {
+    UpstreamMethod::new("session/request_permission").expect("a method")
+}
+
+/// The decisions the decoder offers, in the order the upstream offered them.
+fn offered() -> Vec<OfferedDecision> {
+    vec![
+        OfferedDecision {
+            option_id: "allow".to_owned(),
+            label: "Allow this once".to_owned(),
+        },
+        OfferedDecision {
+            option_id: "reject".to_owned(),
+            label: "Reject".to_owned(),
+        },
+    ]
+}
+
+fn projection() -> DecodedProjection {
+    DecodedProjection {
+        schema_version: "kr-approval/1".to_owned(),
+        summary: "the agent wants to write /srv/notes.txt".to_owned(),
+        decisions: offered(),
+    }
+}
+
+/// One native request, exactly as the upstream wrote it.
+fn request_frame(id: u64, padding: usize) -> Vec<u8> {
+    format!(
+        r#"{{"id":{id},"method":"session/request_permission","params":{{"path":"/srv/notes.txt","note":"{}","options":[{{"optionId":"allow","name":"Allow this once"}},{{"optionId":"reject","name":"Reject"}}]}}}}"#,
+        "n".repeat(padding)
+    )
+    .into_bytes()
+}
+
+struct Host {
+    _temp: kr_ipc::testing::TempHost,
+    service: Arc<WorkerService>,
+    session_id: SessionId,
+    endpoint: kr_ipc::paths::Endpoint,
+    environment_id: kr_protocol::ids::EnvironmentId,
+    /// The control daemon's identity, to forward a paired device's read as the daemon does.
+    controller: Arc<ControllerIdentity>,
+    /// The boot the daemon proves its generation against.
+    boot: kr_protocol::identity::BootIdentity,
+    /// The native connection the approvals arrive on.
+    connection: GatewayConnectionId,
+    /// What carries an answer out.
+    upstream: Arc<CountingUpstream>,
+}
+
+/// A transport that answers at once and counts what it was asked to carry.
+#[derive(Debug, Default)]
+struct CountingUpstream {
+    carried: std::sync::atomic::AtomicUsize,
+}
+
+impl UpstreamDispatch for CountingUpstream {
+    fn admit(&self, _request: &UpstreamRequest) -> Result<(), BrokerError> {
+        Ok(())
+    }
+
+    fn submit(&self, request: &UpstreamRequest) -> Result<PendingTransmission, BrokerError> {
+        self.carried
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(PendingTransmission::settled(Ok(UpstreamOutcome {
+            upstream_request_id: None,
+            turn_id: request.turn_id.clone(),
+            provenance: kr_protocol::broker::ActionProvenance::UpstreamTypedRpc,
+        })))
+    }
+}
+
+fn process(pid: u64) -> ProcessStartIdentity {
+    ProcessStartIdentity::new(pid, ProcessStartSource::MacosProcBsdInfo, 900)
+}
+
+fn managed(instance: ApplicationInstanceId, pid: u64) -> ManagedProcess {
+    ManagedProcess::new(
+        instance,
+        process(pid),
+        TransportHandle {
+            transport: BrokerTransport::PrivateSocket,
+            application_instance_id: instance,
+            executable_digest: Digest256::from_bytes([3; 32]),
+            process: process(pid),
+        },
+        Credential::from_bytes([9; 32]),
+        true,
+        TimestampMs::new(1),
+    )
+}
+
+fn approval_table() -> DeclarativeTable {
+    let mut table = DeclarativeTable {
+        plugin_id: plugin(),
+        publisher_id: publisher(),
+        table_version: MethodTableVersion::new(1),
+        upstream_protocol_version: "1".to_owned(),
+        digest: Digest256::from_bytes([1; 32]),
+        framing: NativeFraming::JsonLines,
+        request_id_field: "id".to_owned(),
+        response_id_field: "id".to_owned(),
+        method_field: "method".to_owned(),
+        params_field: "params".to_owned(),
+        result_field: "result".to_owned(),
+        error_field: "error".to_owned(),
+        entries: vec![DeclarativeEntry {
+            method: permission(),
+            class: NativeMethodClass::Mutation,
+            expects_response: true,
+            approval_option_field: Nullable::some("option_id".to_owned()),
+            reverse: Nullable::null(),
+        }],
+    };
+    table.digest = table.canonical_digest().expect("encodable");
+    table
+}
+
+/// Starts a worker serving one session, with one instance whose package's decoder may interpret
+/// and answer approval requests, and the authenticated native connection its requests arrive on.
+async fn host() -> Host {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let environment_id = temp.environment_id();
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
+    let current = kr_ipc::identity::current_process_start_identity().expect("a process identity");
+    let identity = Arc::new(
+        WorkerIdentity::generate(
+            session_id,
+            SessionEpoch::V1,
+            boot.clone(),
+            current,
+            PROTOCOL_VERSION,
+        )
+        .expect("a session key"),
+    );
+    let store =
+        kr_crypto::store::open_store_in(&environment.secrets_dir()).expect("a secret store");
+    let controller = Arc::new(
+        ControllerIdentity::initialise(store.store.as_ref(), environment_id)
+            .expect("a controller identity"),
+    );
+    let config = SessionConfig {
+        session_id,
+        session_epoch: SessionEpoch::V1,
+        environment_id,
+        display_number: DisplayNumber::new(1),
+        shell: kr_worker::testing::posix_script("sleep 30"),
+        shell_mode: ShellMode::NativeCompat,
+        worker_profile: WorkerProfile::HeadlessUser,
+        desktop: DesktopBinding::none(),
+        dimensions: Dimensions::new(80, 24),
+        journal_path: Some(environment.journal_database(session_id)),
+        spool_directory: Some(environment.session_spool(session_id)),
+        worker_endpoint: None,
+        send_queue_bytes: 1024 * 1024,
+        resident_bytes: 64 * 1024,
+        time: kr_worker::action::time::TimeSources::system(),
+        launch_profile: kr_protocol::session::LaunchProfile::default(),
+    };
+    let journal_path = config.journal_path.clone().expect("the harness journals");
+    if let Some(parent) = journal_path.parent() {
+        std::fs::create_dir_all(parent).expect("the journal directory");
+    }
+    let mut session = TerminalSession::open(config).expect("opens the session");
+    session.launch().expect("launches the shell");
+    let runtime = Arc::new(
+        SessionRuntime::start(session, Arc::new(kr_ipc::clock::SystemSharedClock))
+            .expect("starts the runtime"),
+    );
+    let endpoint = environment
+        .worker_endpoint(DisplayNumber::new(1))
+        .expect("an endpoint");
+    let listener = Listener::bind(&endpoint).expect("binds the endpoint");
+    let service = Arc::new(
+        WorkerService::new(
+            Arc::clone(&runtime),
+            identity,
+            endpoint.clone(),
+            ServiceBinding {
+                environment_id,
+                boot_identity: boot.clone(),
+                controller_public_key: *controller.public_key(),
+                controller_generation: ControllerGeneration::new(1),
+                journal_path: Some(journal_path),
+                build_id: build(),
+            },
+        )
+        .expect("a worker service"),
+    );
+    tokio::spawn(Arc::clone(&service).serve(listener));
+
+    let broker = service.broker();
+    broker
+        .register_instance(
+            instance(),
+            IntegrationMode::Gateway,
+            None,
+            Some(managed(instance(), 41)),
+        )
+        .expect("the instance is registered");
+    broker
+        .bind(
+            binding(),
+            instance(),
+            plugin(),
+            publisher(),
+            package_digest(),
+            BrokerGrants::granted([
+                BrokerGrant::UpstreamAction,
+                BrokerGrant::ApprovalInterpreter,
+            ]),
+            Some(DecodingTrust {
+                plugin_id: plugin(),
+                publisher_id: publisher(),
+                package_digest: package_digest(),
+                methods: [permission()].into_iter().collect(),
+                schema_versions: ["kr-approval/1".to_owned()].into_iter().collect(),
+                max_decisions: U64::new(4),
+                may_encode_response: true,
+                granted_at: TimestampMs::new(1),
+            }),
+            TimestampMs::new(1),
+        )
+        .expect("the binding carries the interpreter grant");
+    broker
+        .record_capability(kr_protocol::broker::InstanceCapabilityRecord {
+            capability_id: CapabilityId::new("agent.approval").expect("a capability"),
+            capability_version: "1".to_owned(),
+            application_instance_id: instance(),
+            identity: kr_protocol::broker::InstanceCapabilityIdentity::default(),
+            revision: CapabilityRevision::new(1),
+            state: kr_protocol::broker::InstanceCapabilityState::QualifiedAvailable,
+            source: kr_protocol::broker::InstanceEvidenceSource::HostProbe,
+            invalidated_by: [kr_protocol::broker::InstanceInvalidation::BindingChanged]
+                .into_iter()
+                .collect(),
+            disabled_reason: Nullable::null(),
+            observed_at: TimestampMs::new(1),
+        })
+        .expect("the evidence is recorded");
+    broker
+        .pin_table(
+            instance(),
+            kr_worker::broker::PackageIdentity {
+                plugin_id: plugin(),
+                publisher_id: publisher(),
+                package_digest: package_digest(),
+            },
+            approval_table(),
+            RichMethodTable {
+                table_version: MethodTableVersion::new(1),
+                upstream_protocol_version: "1".to_owned(),
+                entries: vec![kr_protocol::gateway::RichMethodEntry {
+                    method: UpstreamMethod::new("session/cancel").expect("a method"),
+                    class: NativeMethodClass::Mutation,
+                    required_right: ActionRight::AgentCancel,
+                    operation: Nullable::some(kr_protocol::gateway::RichOperation::TurnCancel),
+                    provenance: kr_protocol::broker::ActionProvenance::UpstreamTypedRpc,
+                }],
+            },
+        )
+        .expect("the installed tables are pinned");
+    let connection = broker
+        .open_native_connection(instance(), &[9; 32], &process(41), &plugin(), "1")
+        .expect("the native connection is authenticated");
+    let upstream = Arc::new(CountingUpstream::default());
+    broker.bind_connection_dispatch(
+        connection,
+        Arc::clone(&upstream) as Arc<dyn UpstreamDispatch>,
+    );
+    Host {
+        _temp: temp,
+        service,
+        session_id,
+        endpoint,
+        environment_id,
+        controller,
+        boot,
+        connection,
+        upstream,
+    }
+}
+
+/// Records one native request, as it arrives, without interpreting it.
+fn arrive(host: &Host, frame: &[u8]) -> PendingResourceId {
+    host.service
+        .broker()
+        .forward_native(host.connection, frame, RECORDED_AT)
+        .expect("forwarded")
+        .1
+        .expect("it expects a response")
+        .resource_id
+}
+
+/// Records one native request and has the package's decoder interpret it.
+fn offer(host: &Host, frame: &[u8]) -> PendingResourceId {
+    let resource_id = arrive(host, frame);
+    host.service
+        .broker()
+        .interpret(
+            binding(),
+            resource_id,
+            projection(),
+            Some(DEADLINE),
+            DECODED_AT,
+        )
+        .expect("interpreted")
+        .resource_id
+}
+
+fn params(
+    host: &Host,
+    instance: ApplicationInstanceId,
+    resource_id: PendingResourceId,
+) -> AgentApprovalInspectParams {
+    AgentApprovalInspectParams {
+        subject: subject(host.session_id, instance),
+        resource_id,
+    }
+}
+
+/// The client library a person's client uses, on this worker's own socket.
+async fn client(host: &Host) -> kr_client::Session {
+    let transport = IpcTransport::connect(&host.endpoint, build())
+        .await
+        .expect("a local connection");
+    kr_client::Session::start(transport.shared()).expect("a session")
+}
+
+/// Reads the record through the client library, and returns the host's refusal as it arrives.
+async fn inspect(
+    client: &kr_client::Session,
+    params: &AgentApprovalInspectParams,
+) -> Result<AgentApprovalInspectResult, ProtocolError> {
+    match client.inspect_approval(params).await {
+        Ok(record) => Ok(record),
+        Err(kr_client::ClientError::Host(error)) => Err(error),
+        Err(other) => panic!("the host answers the read: {other}"),
+    }
+}
+
+/// Connects as the control daemon and proves the generation this worker accepts.
+async fn daemon(host: &Host) -> LocalClient {
+    let mut daemon = LocalClient::connect(&host.endpoint, LocalClientKind::Controller, build())
+        .await
+        .expect("connects as the daemon");
+    let identity = Arc::clone(&host.controller);
+    let boot = host.boot.clone();
+    daemon
+        .present_generation(move |nonce| {
+            identity
+                .generation_token(ControllerGeneration::new(1), &boot, nonce)
+                .map_err(kr_ipc::IpcError::from)
+        })
+        .await
+        .expect("the worker accepts the generation");
+    daemon
+}
+
+/// Writes one frame and returns the worker's answer to it.
+async fn exchange(client: &mut LocalClient, frame: ControlFrame) -> Outcome {
+    client
+        .writer()
+        .write_message(&frame)
+        .await
+        .expect("writes the frame");
+    loop {
+        match client.recv().await.expect("the worker answers") {
+            ControlFrame::Response(response) => return response.outcome,
+            ControlFrame::Notification(_) | ControlFrame::Event(_) => {}
+            other => panic!("the worker answered {other:?}"),
+        }
+    }
+}
+
+/// One read, forwarded by the control daemon for a paired device acting under a grant.
+fn forwarded<T: serde::Serialize>(method: Method, params: &T, request_id: u64) -> ControlFrame {
+    ControlFrame::ForwardedRead(Box::new(ForwardedRequest {
+        request: Request {
+            request_id: RequestId::new(request_id),
+            method: method.into(),
+            method_version: MethodVersion::V1,
+            params: ParamsValue::from_typed(params).expect("encodes"),
+        },
+        actor: ActorEnvelope {
+            actor_id: ActorId::new("device:a-test-phone").expect("an actor"),
+            ingress: ActorIngress::PairedDevice,
+            device_id: Nullable::some(DeviceId::new(Uuid::from_bytes([9; 16]))),
+            grant_id: Nullable::some(GrantId::new(Uuid::from_bytes([8; 16]))),
+            grant_revision: Nullable::some(AuthorityRevision::new(1)),
+            controller_generation: ControllerGeneration::new(1),
+            connection_id: ConnectionId::new(Uuid::from_bytes([7; 16])),
+        },
+        authority_deadline_boot_ms: Nullable::some(U64::new(
+            kr_ipc::clock::boot_elapsed_ms() + 30_000,
+        )),
+    }))
+}
+
+/// Replaces the identifiers a refusal names with placeholders, leaving what it says about them.
+fn shape(error: &ProtocolError, resource_id: PendingResourceId, host: &Host) -> String {
+    error
+        .message
+        .replace(&resource_id.to_string(), "<resource>")
+        .replace(&instance().to_string(), "<instance>")
+        .replace(&other_instance().to_string(), "<instance>")
+        .replace(&host.session_id.to_string(), "<session>")
+}
+
+/// KR-REQ-11.26: the local owner reads, on the worker's own socket, exactly what the decoder was
+/// given and what it offered: the original bytes and their digest, the native request identifier
+/// and method, the decisions in the upstream's order, the deadline, and whose package's decoder it
+/// was. The record is placed at the moment the request arrived, not at the later moment it was
+/// interpreted, and a request still waiting for an answer says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_26_a_local_caller_reads_what_the_decoder_read_and_offered() {
+    let host = host().await;
+    let frame = request_frame(11, 0);
+    let resource_id = offer(&host, &frame);
+    let client = client(&host).await;
+
+    let record = inspect(&client, &params(&host, instance(), resource_id))
+        .await
+        .expect("the owner reads the record");
+
+    assert_eq!(record.resource_id, resource_id);
+    assert_eq!(record.state, PendingState::Pending);
+    assert_eq!(
+        record.recorded_at, RECORDED_AT,
+        "the record belongs to the moment the request arrived"
+    );
+    let decoding = &record.decoding;
+    assert_eq!(decoding.source_bytes.as_slice(), frame.as_slice());
+    assert_eq!(
+        decoding.source_digest,
+        Digest256::from_bytes(kr_cbor::sha256(&frame))
+    );
+    assert_eq!(decoding.method, permission());
+    assert_eq!(
+        decoding.upstream_request_id,
+        UpstreamRequestId::new("11").expect("the identifier's JSON form")
+    );
+    assert_eq!(decoding.projection, projection());
+    assert_eq!(
+        decoding.projection.decisions,
+        offered(),
+        "the decisions the decoder offered, in the order the upstream offered them"
+    );
+    assert_eq!(decoding.plugin_id, plugin());
+    assert_eq!(decoding.publisher_id, publisher());
+    assert_eq!(decoding.package_digest, package_digest());
+    assert_eq!(decoding.binding_id, binding());
+    assert_eq!(decoding.deadline_ms, Nullable::some(DEADLINE));
+    assert_eq!(decoding.decoded_at, DECODED_AT);
+    assert_eq!(
+        Some(decoding),
+        host.service
+            .broker()
+            .decoding(resource_id)
+            .expect("the ledger reads")
+            .as_ref(),
+        "and it is the ledger's own record, whole"
+    );
+
+    client.close();
+}
+
+/// KR-REQ-11.26: a resource of another instance, one no decoder interpreted and one this host does
+/// not hold are one refusal with one text, so the answer does not say which it was and carries
+/// nothing of another instance's record. Named with its own instance, the same resource is read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_26_another_instances_resource_and_one_never_decoded_answer_unknown() {
+    let host = host().await;
+    host.service
+        .broker()
+        .register_instance(
+            other_instance(),
+            IntegrationMode::Gateway,
+            None,
+            Some(managed(other_instance(), 42)),
+        )
+        .expect("a second instance of the session");
+    let decoded = offer(&host, &request_frame(11, 0));
+    let opaque = arrive(&host, &request_frame(12, 0));
+    let absent = PendingResourceId::new(Uuid::from_bytes([0xab; 16]));
+    let client = client(&host).await;
+
+    let mut shapes = Vec::new();
+    for (case, subject_instance, resource_id) in [
+        ("another instance's resource", other_instance(), decoded),
+        ("a resource no decoder interpreted", instance(), opaque),
+        ("a resource this host does not hold", instance(), absent),
+    ] {
+        let error = inspect(&client, &params(&host, subject_instance, resource_id))
+            .await
+            .expect_err(case);
+        assert_eq!(error.code, ErrorCode::StaleSession, "{case}");
+        for withheld in ["kalareach.codex", "session/request_permission", "allow"] {
+            assert!(
+                !error.message.contains(withheld),
+                "{case}: the refusal carries nothing of the record: {}",
+                error.message
+            );
+        }
+        shapes.push(shape(&error, resource_id, &host));
+    }
+    assert!(
+        shapes.windows(2).all(|pair| pair[0] == pair[1]),
+        "one refusal with one text: {shapes:?}"
+    );
+
+    // A session this worker does not serve is refused as the other agent reads refuse it.
+    let elsewhere = AgentApprovalInspectParams {
+        subject: AgentSubject {
+            session_id: SessionId::new(Uuid::from_bytes([0xcd; 16])),
+            application_instance_id: instance(),
+        },
+        resource_id: decoded,
+    };
+    let error = inspect(&client, &elsewhere)
+        .await
+        .expect_err("another session");
+    assert_eq!(error.code, ErrorCode::StaleSession);
+
+    // The control: the same resource, named with the instance it belongs to, is read.
+    let record = inspect(&client, &params(&host, instance(), decoded))
+        .await
+        .expect("its own instance reads it");
+    assert_eq!(record.resource_id, decoded);
+
+    client.close();
+}
+
+/// KR-REQ-11.26: the record says where the request stands, and the answer path is the one it was.
+/// An owner who reads the record and then answers the approval finds it resolved on the next read,
+/// with the same bytes and the same offered decisions, and the transport carried the answer once.
+/// A local `agent.snapshot` is answered as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_26_the_record_says_where_the_request_stands_once_answered() {
+    let host = host().await;
+    let resource_id = offer(&host, &request_frame(11, 0));
+    let reader = client(&host).await;
+    let before = inspect(&reader, &params(&host, instance(), resource_id))
+        .await
+        .expect("the record before the answer");
+    assert_eq!(before.state, PendingState::Pending);
+
+    let mut owner = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let answer = MutationRequest {
+        request_id: RequestId::new(21),
+        method: Method::AgentApprovalRespond.into(),
+        method_version: MethodVersion::V1,
+        action_id: ActionId::new(kr_ipc::new_uuid()),
+        grant_id: Nullable::null(),
+        target: ActionTarget {
+            environment_id: host.environment_id,
+            session_id: Nullable::some(host.session_id),
+            session_epoch: Nullable::some(SessionEpoch::V1),
+            application_instance_id: Nullable::some(instance()),
+            agent_binding_revision: Nullable::some(AgentBindingRevision::new(1)),
+        },
+        expected: ParamsValue::empty(),
+        action_window_id: owner.action_window().action_window_id.clone(),
+        requested_ttl_ms: DurationMs::new(60_000),
+        params: ParamsValue::from_typed(&AgentApprovalRespondParams {
+            target: AgentMutationTarget {
+                subject: subject(host.session_id, instance()),
+                binding_revision: AgentBindingRevision::new(1),
+            },
+            resource_id,
+            option_id: "allow".to_owned(),
+        })
+        .expect("encodes"),
+    };
+    let outcome = exchange(&mut owner, ControlFrame::Mutation(Box::new(answer))).await;
+    assert!(
+        matches!(outcome, Outcome::Ok(_)),
+        "the approval is answered as before: {outcome:?}"
+    );
+    assert_eq!(
+        host.upstream
+            .carried
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the transport carried the answer once"
+    );
+
+    let after = inspect(&reader, &params(&host, instance(), resource_id))
+        .await
+        .expect("the record after the answer");
+    assert_eq!(after.state, PendingState::Resolved);
+    assert_eq!(after.recorded_at, before.recorded_at);
+    assert_eq!(
+        after.decoding, before.decoding,
+        "answering changes where the request stands, not what the decoder read or offered"
+    );
+
+    let snapshot = exchange(
+        &mut owner,
+        ControlFrame::Request(Request {
+            request_id: RequestId::new(22),
+            method: Method::AgentSnapshot.into(),
+            method_version: MethodVersion::V1,
+            params: ParamsValue::from_typed(&AgentSnapshotParams {
+                subject: subject(host.session_id, instance()),
+                from_node: Nullable::null(),
+            })
+            .expect("encodes"),
+        }),
+    )
+    .await;
+    assert!(
+        matches!(snapshot, Outcome::Ok(_)),
+        "a local snapshot is answered as before: {snapshot:?}"
+    );
+
+    reader.close();
+}
+
+/// A read the control daemon forwards for a paired device does not reach the record: the method
+/// is served on the local socket only, so the worker refuses it through the method table before
+/// anything is read, and the refusal carries nothing of the record. The controls are the two agent
+/// reads the table admits for a device through the same frame: `agent.capabilities` is served, and
+/// `agent.snapshot` is refused by name as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forwarded_read_is_refused_and_carries_nothing_of_the_record() {
+    let host = host().await;
+    let resource_id = offer(&host, &request_frame(11, 0));
+    let mut daemon = daemon(&host).await;
+
+    let refused = exchange(
+        &mut daemon,
+        forwarded(
+            Method::AgentApprovalInspect,
+            &params(&host, instance(), resource_id),
+            31,
+        ),
+    )
+    .await;
+    let Outcome::Error(error) = refused else {
+        panic!("a forwarded read of the record is refused: {refused:?}");
+    };
+    assert_eq!(error.code, ErrorCode::PermissionDenied);
+    for withheld in ["kalareach.codex", "session/request_permission", "allow"] {
+        assert!(
+            !error.message.contains(withheld),
+            "the refusal carries nothing of the record: {}",
+            error.message
+        );
+    }
+
+    let capabilities = exchange(
+        &mut daemon,
+        forwarded(
+            Method::AgentCapabilities,
+            &AgentCapabilitiesParams {
+                subject: subject(host.session_id, instance()),
+            },
+            32,
+        ),
+    )
+    .await;
+    assert!(
+        matches!(capabilities, Outcome::Ok(_)),
+        "the same frame carries a read the table admits for a device: {capabilities:?}"
+    );
+
+    let snapshot = exchange(
+        &mut daemon,
+        forwarded(
+            Method::AgentSnapshot,
+            &AgentSnapshotParams {
+                subject: subject(host.session_id, instance()),
+                from_node: Nullable::null(),
+            },
+            33,
+        ),
+    )
+    .await;
+    let Outcome::Error(error) = snapshot else {
+        panic!("a forwarded snapshot is refused as before: {snapshot:?}");
+    };
+    assert_eq!(error.code, ErrorCode::UnsupportedCapability);
+}
+
+/// The host's one intersection of a grant with a request holds this method to the right its entry
+/// names: a grant without `session.view` is refused for it, whatever else it carries, and one with
+/// it passes that rule. A paired device does not reach the method at all, and the refusal names it.
+#[test]
+fn a_grant_without_session_view_is_refused_by_the_methods_rights() {
+    use kr_controller::grants::{AccessRequest, GrantRecord, HostPolicy, Refusal, decide};
+    use kr_protocol::grant::{
+        EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector,
+    };
+    use kr_protocol::scalars::CanonicalSet;
+    use kr_transport::clock::{ContinuousClock as _, ManualClock};
+
+    let session_id = SessionId::new(Uuid::from_bytes([4; 16]));
+    let environment_id = kr_protocol::ids::EnvironmentId::new(Uuid::from_bytes([5; 16]));
+    let grant = |actions: &[ActionRight]| Grant {
+        grant_id: GrantId::new(Uuid::from_bytes([1; 16])),
+        parent_grant_id: Nullable::null(),
+        issuer_device_id: DeviceId::new(Uuid::from_bytes([2; 16])),
+        recipient_device_id: DeviceId::new(Uuid::from_bytes([3; 16])),
+        authority_revision: AuthorityRevision::new(1),
+        environment_selector: EnvironmentSelector::Any,
+        session_selector: SessionSelector::Any,
+        actions: actions.iter().copied().collect(),
+        history: HistoryScope {
+            lower_bound_ms: Nullable::some(TimestampMs::new(0)),
+            include_live_screen: true,
+            named_questions: CanonicalSet::new(),
+            named_approvals: CanonicalSet::new(),
+        },
+        expiry: GrantExpiry::Never,
+        organisation: Nullable::null(),
+    };
+    let decision = |grant: &Grant, ingress: ActorIngress| {
+        let record = GrantRecord {
+            grant: grant.clone(),
+            session_id: None,
+            issued_at_ms: 1_000,
+            activated_at_ms: Some(1_000),
+            revoked_at_ms: None,
+            revoked_by_parent: None,
+        };
+        decide(
+            grant,
+            &record,
+            &mut HostPolicy::personal(AuthorityRevision::new(1)),
+            AccessRequest {
+                method: Method::AgentApprovalInspect,
+                ingress,
+                environment_id,
+                session_id: Some(session_id),
+                claims_geometry: false,
+                own_subject: None,
+                now_ms: 5_000,
+                continuous_now: ManualClock::new().now(),
+            },
+        )
+    };
+
+    let without = grant(&[
+        ActionRight::AgentApprovalRespond,
+        ActionRight::AgentPrompt,
+        ActionRight::FilesRead,
+    ]);
+    assert_eq!(
+        decision(&without, ActorIngress::LocalIpc).expect_err("no session.view"),
+        Refusal::MissingRight {
+            right: ActionRight::SessionView
+        }
+    );
+    let with = grant(&[ActionRight::SessionView]);
+    assert!(
+        decision(&with, ActorIngress::LocalIpc).is_ok(),
+        "session.view is the right the entry names"
+    );
+    assert_eq!(
+        decision(&with, ActorIngress::PairedDevice).expect_err("not a device's read"),
+        Refusal::MethodNotReachable {
+            method: "agent.approval.inspect"
+        }
+    );
+}
+
+/// A peer that said it can receive less than the record is refused with the sizes, rather than
+/// sent a frame it would have to discard, and the same connection reads a record that fits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_record_larger_than_the_peers_frame_is_refused_with_its_size() {
+    let host = host().await;
+    let large = offer(&host, &request_frame(11, 100 * 1024));
+    let small = offer(&host, &request_frame(12, 0));
+    let limits = kr_protocol::hello::ReceiveLimits {
+        max_control_frame_len: U64::new(64 * 1024),
+        ..kr_protocol::hello::ReceiveLimits::default()
+    };
+    let mut peer =
+        LocalClient::connect_receiving(&host.endpoint, LocalClientKind::Cli, build(), limits)
+            .await
+            .expect("connects");
+
+    let refused = peer
+        .request(
+            Method::AgentApprovalInspect,
+            &params(&host, instance(), large),
+        )
+        .await
+        .expect("the worker answers");
+    let error = refused.expect_err("a record past the peer's frame is refused");
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+    assert!(
+        error.message.contains(&(64 * 1024).to_string()),
+        "the refusal says what the peer can receive: {}",
+        error.message
+    );
+
+    let read = peer
+        .request(
+            Method::AgentApprovalInspect,
+            &params(&host, instance(), small),
+        )
+        .await
+        .expect("the worker answers")
+        .expect("a record that fits is read on the same connection");
+    let record: AgentApprovalInspectResult = read.to_typed().expect("the record decodes");
+    assert_eq!(record.resource_id, small);
+}
