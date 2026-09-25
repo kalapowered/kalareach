@@ -40,6 +40,7 @@ use kr_crypto::backup::{
     GenerationExpectation, Material, RestoreAdmissions, RestoreGeneration, SealedArchive,
     StagedObject, admit_for_restore,
 };
+use kr_ipc::paths::{NameKind, flush_directory};
 use kr_protocol::archive::{
     ArchiveCheckpoint, BackupGenerationPublication, BackupWriterRecord, BackupWriterRecordPayload,
 };
@@ -766,11 +767,10 @@ impl BackupService {
                     continue;
                 }
             }
-            // The name is gone from the directory; on platforms that can, the directory entry is
-            // flushed so losing power cannot bring it back. A flush this host could not make is
-            // not a removal it may report: losing power could return the name, and the obligation
-            // that would find it again would be gone. On Windows the flush is a stated no-op, so
-            // there is nothing to fail there.
+            // The name is gone from the directory, and the directory entry is flushed so losing
+            // power cannot bring it back. A flush this host could not make is not a removal it may
+            // report: losing power could return the name, and the obligation that would find it
+            // again would be gone.
             if let Err(error) = sync_directory(&path) {
                 store.note_obligation_failed(obligation.id, &error.to_string(), now_ms)?;
                 continue;
@@ -1450,32 +1450,20 @@ fn write_staged(path: &PathBuf, bytes: &[u8]) -> Result<()> {
 ///
 /// A file flushed into a directory that was itself created and never flushed is a file whose name
 /// losing power can take away, so the walk goes up to the staging root rather than stopping at the
-/// immediate parent.
-///
-/// On Windows it does nothing and says so. There is no portable way to flush a directory entry
-/// there, and opening a directory as a file fails outright: a staging write that tried would fail
-/// after the ciphertext was already on the disk. The contents are written and flushed on every
-/// platform, so a reader never sees a file half written; what a Windows host does not get is the
-/// guarantee that a name survives losing power, and `docs/host/README.md` says so.
+/// immediate parent. The directory holding the file is flushed for a file's name and each one above
+/// it for a directory's, which is the right the flush's handle asks for on Windows.
 fn sync_directory(path: &Path) -> Result<()> {
-    #[cfg(windows)]
-    {
-        let _ = path;
-        Ok(())
-    }
-    #[cfg(not(windows))]
-    {
-        let mut directory = path.parent();
-        while let Some(current) = directory {
-            let handle = std::fs::File::open(current).map_err(ControllerError::registry)?;
-            handle.sync_all().map_err(ControllerError::registry)?;
-            if current.file_name().is_some_and(|name| name == "backup") {
-                break;
-            }
-            directory = current.parent();
+    let mut directory = path.parent();
+    let mut kind = NameKind::File;
+    while let Some(current) = directory {
+        flush_directory(current, kind).map_err(ControllerError::registry)?;
+        if current.file_name().is_some_and(|name| name == "backup") {
+            break;
         }
-        Ok(())
+        kind = NameKind::Directory;
+        directory = current.parent();
     }
+    Ok(())
 }
 
 /// Builds the transcript one writer enrolment is signed over.
