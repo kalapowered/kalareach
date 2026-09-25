@@ -39,33 +39,40 @@
 //! returns, so an ordinary test run of this workspace stays offline. [`REQUIRE_VARIABLE`] set to
 //! `1` turns that absence into a failure, which is how the script makes sure a checkpoint it
 //! reports on actually ran.
+//!
+//! # Without the legs
+//!
+//! The legs and everything they drive are the `legs` feature, on by default. Built without it, the
+//! package is [`canonical_origin`] and the `kr-e2e-m1b-origin` program over it, which depend on
+//! the protocol crate alone: the scripts that check a deployment ask that program about their
+//! origin before they build anything else.
 
 use kr_protocol::pairing::RendezvousOrigin;
 use kr_protocol::service::GatewayOrigin;
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "legs"))]
 pub mod agent;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "legs"))]
 pub mod catalogue;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "legs"))]
 pub mod ceremony;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "legs"))]
 pub mod device;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "legs"))]
 pub mod host;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "legs"))]
 pub mod room;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "legs"))]
 pub mod run;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "legs"))]
 pub mod screen;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "legs"))]
 pub mod shells;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "legs"))]
 pub mod site;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "legs"))]
 pub mod view;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "legs"))]
 pub mod window;
 
 /// The variable naming the deployed origin the checkpoint runs against.
