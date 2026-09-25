@@ -2154,6 +2154,24 @@ async fn a_ceiling_whose_fence_debt_cannot_be_written_does_not_change() {
         "{problem}"
     );
     assert!(!problem.contains("no room"), "{problem}");
+    // The ceiling in force is the one kept, and the report does not name this document as its
+    // source.
+    let rights = effective
+        .ceilings
+        .iter()
+        .find(|ceiling| ceiling.key.contains("grant_rights"))
+        .expect("the rights ceiling is reported");
+    assert!(
+        rights.origin.0.is_none(),
+        "the kept ceiling is not the document's: {rights:?}"
+    );
+    assert!(
+        rights
+            .value
+            .as_str()
+            .contains(ActionRight::SessionRename.as_str()),
+        "the kept ceiling still carries what the document would have removed: {rights:?}"
+    );
     assert_eq!(
         registry
             .authority_revision()

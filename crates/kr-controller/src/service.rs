@@ -7086,7 +7086,9 @@ impl Controller {
             (
                 crate::config::EnforcedRights {
                     ceiling: held.clone(),
-                    from_document: decided.is_some(),
+                    // A ceiling kept because its change could not be written down is not the one
+                    // this document names.
+                    from_document: decided.is_some() && ceiling_failure.is_none(),
                 },
                 moved,
             )
@@ -7102,11 +7104,15 @@ impl Controller {
         // Nothing else settles it: once the ceiling it answered for is in force, no reading moves
         // anything, and a reading that let the debt go would leave the work admitted under the
         // withdrawn ceiling admitted.
-        owed.fences_dispatch |= ceiling_moved || !self.debts().published.is_empty();
-        // A ceiling that did not move withdrew nothing, so it owes no fence of its own; a debt an
-        // earlier barrier left published is still raised.
-        let fence_now = (owed.fences_dispatch && ceiling_failure.is_none())
-            || !self.debts().published.is_empty();
+        // A fence this acceptance owes for its own change: its ceiling moved, or the document it
+        // reads withdrew something the ceiling in force already matched. A ceiling that could not
+        // move withdrew nothing, so it owes none. A debt an earlier barrier left published is
+        // raised too, and its own debt is never created for it: if another barrier captures that
+        // debt first, this one captures nothing and reports the barrier as it stands.
+        let owes_own = (owed.fences_dispatch || ceiling_moved) && ceiling_failure.is_none();
+        let owed_elsewhere = !self.debts().published.is_empty();
+        owed.fences_dispatch = owes_own || owed_elsewhere;
+        let fence_now = owed.fences_dispatch;
         let (sessions, mut failure) = self.apply_session_limit(&resolver, &state).await;
         if let Some(problem) = ceiling_failure {
             failure = Some(match failure {
@@ -7138,7 +7144,7 @@ impl Controller {
             // owed before the announcement travels and before any effect below runs. A fence owed
             // with no debt of this acceptance's own, for a document whose ceiling the one in force
             // already matched, is raised under a debt held in memory.
-            if ceiling_debt.is_none() && self.debts().published.is_empty() {
+            if owes_own && ceiling_debt.is_none() {
                 self.publish_debts(&[(crate::grants::store::DebtId::fresh(), Reach::Host)]);
             }
             match self.barrier().await {
