@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use kr_client::services::authority::AuthorityFeedClient;
+use kr_client::services::authority::{AuthorityFeedClient, AuthorityFeedState};
 use kr_client::services::mailbox::MailboxClient;
 use kr_client::services::relay::{ServiceHttp, ServiceSigner};
 use kr_client::services::{HttpDeadlines, HttpService, managed_response_limits};
@@ -245,6 +245,53 @@ pub fn proved(leg: &str, deployment: &Deployment, what: &str) {
     println!("{leg}: {what} ({})", deployment.origin().as_str());
 }
 
+/// The words the deployment checkpoint finds a leg's leftovers by.
+///
+/// `scripts/e2e-deployment.sh` collects every line of a leg's output that holds them and names what
+/// follows as something the leg left on the deployment.
+pub const GIVE_BACK: &str = "give back what it took";
+
+/// What one authority-feed leg's cleanup left, one line for each part that did not finish.
+///
+/// The cleanup removes the leg's host from the feed, which ends the retention of every record the
+/// host had not applied, and acknowledges any announcement the leg placed in the host's mailbox.
+/// The removal has finished only when the feed says the host is removed and retains nothing for it.
+/// Every part that did not finish is its own line, in [`GIVE_BACK`]'s words, so the checkpoint names
+/// each of them and a second failure is never hidden behind the first. Nothing is left when the
+/// list is empty. A leg reports these lines whether its own work passed or failed.
+#[must_use]
+pub fn authority_feed_left(
+    removed: &kr_client::Result<AuthorityFeedState>,
+    emptied: &Result<(), String>,
+) -> Vec<String> {
+    let mut left = Vec::new();
+    match removed {
+        Ok(state) => {
+            if !state.summary.removed {
+                left.push(not_given_back("the feed does not report the host removed"));
+            }
+            let outstanding = state.summary.outstanding.get();
+            if outstanding != 0 {
+                left.push(not_given_back(&format!(
+                    "the feed still retains {outstanding} records the host had not applied"
+                )));
+            }
+        }
+        Err(error) => left.push(not_given_back(&format!(
+            "the host could not remove itself from the feed: {error}"
+        ))),
+    }
+    if let Err(what) = emptied {
+        left.push(not_given_back(what));
+    }
+    left
+}
+
+/// One line of what a leg left, as the checkpoint reads it.
+fn not_given_back(what: &str) -> String {
+    format!("this leg could not {GIVE_BACK}: {what}")
+}
+
 /// A service that answers nothing, for the legs that prove what an unavailable feed means.
 ///
 /// It holds a loopback port of its own for as long as the leg holds this, so nothing else can be
@@ -299,5 +346,121 @@ impl SilentService {
 impl Drop for SilentService {
     fn drop(&mut self) {
         self.accepting.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kr_client::services::authority::AuthorityFeedSummary;
+    use kr_protocol::error::{ErrorCode, ProtocolError};
+    use kr_protocol::scalars::{Nullable, U64};
+
+    use super::*;
+
+    /// What a feed answers a removal with.
+    fn answered(removed: bool, outstanding: u64) -> kr_client::Result<AuthorityFeedState> {
+        Ok(AuthorityFeedState {
+            host_key_id: KeyId::from_bytes([1; 32]),
+            host_device_id: Nullable::null(),
+            records: Vec::new(),
+            next_after_sequence: U64::new(0),
+            more: false,
+            summary: AuthorityFeedSummary {
+                authority_revision: Nullable::null(),
+                revised_at: Nullable::null(),
+                last_acknowledgement: Nullable::null(),
+                acknowledged_at: Nullable::null(),
+                outstanding: U64::new(outstanding),
+                removed,
+                removal_keys: Vec::new(),
+                poll_interval_seconds: 60,
+            },
+            announced: None,
+        })
+    }
+
+    /// A removal the feed never answered.
+    fn unanswered() -> kr_client::Result<AuthorityFeedState> {
+        Err(kr_client::ClientError::Host(ProtocolError::new(
+            ErrorCode::UpstreamUnavailable,
+            "the feed could not be reached",
+        )))
+    }
+
+    /// Every line reads the way the checkpoint collects it: its words, then what was left.
+    fn what_the_checkpoint_names(left: &[String]) -> Vec<String> {
+        left.iter()
+            .map(|line| {
+                let (_, what) = line
+                    .split_once(&format!("{GIVE_BACK}: "))
+                    .expect("the line holds the checkpoint's words");
+                what.to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_cleanup_that_finished_leaves_nothing_to_name() {
+        assert!(authority_feed_left(&answered(true, 0), &Ok(())).is_empty());
+    }
+
+    #[test]
+    fn a_removal_that_did_not_finish_is_named_on_its_own() {
+        let unreached = authority_feed_left(&unanswered(), &Ok(()));
+        assert_eq!(unreached.len(), 1, "{unreached:?}");
+        assert!(
+            what_the_checkpoint_names(&unreached)[0]
+                .starts_with("the host could not remove itself from the feed: "),
+            "{unreached:?}"
+        );
+
+        let kept = authority_feed_left(&answered(false, 0), &Ok(()));
+        assert_eq!(
+            what_the_checkpoint_names(&kept),
+            vec!["the feed does not report the host removed".to_owned()]
+        );
+
+        let retained = authority_feed_left(&answered(true, 2), &Ok(()));
+        assert_eq!(
+            what_the_checkpoint_names(&retained),
+            vec!["the feed still retains 2 records the host had not applied".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_mailbox_that_was_not_emptied_is_named_on_its_own() {
+        let left = authority_feed_left(
+            &answered(true, 0),
+            &Err("the announcement mailbox could not be read: refused".to_owned()),
+        );
+        assert_eq!(
+            what_the_checkpoint_names(&left),
+            vec!["the announcement mailbox could not be read: refused".to_owned()]
+        );
+    }
+
+    /// The case the report exists for: two parts failed, and the second is not hidden behind the
+    /// first.
+    #[test]
+    fn two_parts_that_did_not_finish_are_both_named() {
+        let left = authority_feed_left(
+            &answered(false, 3),
+            &Err("the announcement mailbox could not be acknowledged: refused".to_owned()),
+        );
+        assert_eq!(
+            what_the_checkpoint_names(&left),
+            vec![
+                "the feed does not report the host removed".to_owned(),
+                "the feed still retains 3 records the host had not applied".to_owned(),
+                "the announcement mailbox could not be acknowledged: refused".to_owned(),
+            ]
+        );
+
+        let left = authority_feed_left(
+            &unanswered(),
+            &Err("the announcement mailbox could not be read: refused".to_owned()),
+        );
+        assert_eq!(left.len(), 2, "{left:?}");
+        assert!(left.iter().all(|line| line.contains(GIVE_BACK)), "{left:?}");
     }
 }
