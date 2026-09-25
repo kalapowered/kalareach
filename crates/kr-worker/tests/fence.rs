@@ -1756,6 +1756,15 @@ impl RealProbes {
         std::fs::write(self.root.join("release"), "").expect("the release");
     }
 
+    /// Takes a release back, so the next start that is told to hold waits again.
+    fn hold(&self) {
+        match std::fs::remove_file(self.root.join("release")) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("the release is taken back: {error}"),
+        }
+    }
+
     /// Every start of the program: its arguments after its own name, and its reserved variables.
     fn runs(&self) -> Vec<(Vec<String>, std::collections::BTreeMap<String, String>)> {
         let text = std::fs::read_to_string(self.root.join("record")).unwrap_or_default();
@@ -2008,30 +2017,72 @@ async fn asks_the_real_worker_before_each_command(
 
         // The line's capability reaches the command, and the worker resolves it to the
         // attachment that typed the line while the line runs. A capability is minted only for a
-        // line whose keys went through the reader's fence, so the line is typed at the prompt:
-        // keys typed while the sourced script's line is still finishing are typeahead, which the
-        // worker cannot attribute to anyone.
-        back_at_the_prompt(&shell, &probes, &sourced).await;
-        keys.type_line(&shell, "kr-probe hold");
-        let token = tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                if let Some((arguments, environment)) = probes.runs().last()
-                    && arguments.first().map(String::as_str) == Some("hold")
-                {
-                    return environment.get("KR_DETACH_TOKEN").cloned();
+        // line the reader accepted behind the fence the worker published for its prompt, so the
+        // line is typed at the prompt: keys typed while the sourced script's line is still
+        // finishing are typeahead, which the worker cannot attribute to anyone. Even at the
+        // prompt, the publication travels on the bridge's socket and the keys on the terminal, and
+        // nothing orders the two, so a line typed as the fence is published can still be accepted
+        // ahead of it. What the worker recorded for the line says which happened: a line it
+        // recorded as fenced must carry its capability, and one accepted ahead of the fence is let
+        // finish and typed again at the next prompt, a bounded number of times.
+        const ATTEMPTS: usize = 5;
+        let mut previous = sourced;
+        let mut attempt = 0;
+        let token = loop {
+            attempt += 1;
+            back_at_the_prompt(&shell, &probes, &previous).await;
+            probes.hold();
+            let before = probes.runs().len();
+            keys.type_line(&shell, "kr-probe hold");
+            let token = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let runs = probes.runs();
+                    if runs.len() > before
+                        && let Some((arguments, environment)) = runs.last()
+                        && arguments.first().map(String::as_str) == Some("hold")
+                    {
+                        return environment.get("KR_DETACH_TOKEN").cloned();
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the held command started ({:?}, {bypass}, attempt {attempt}): {}",
+                    package.kind(),
+                    probes.trace()
+                )
+            });
+            let fenced = shell
+                .runtime
+                .session()
+                .fence()
+                .expect("a driver")
+                .detach_target()
+                == DetachTarget::Attachment(keys.attachment_id);
+            match token {
+                Some(token) => break token,
+                None if !fenced && attempt < ATTEMPTS => {
+                    eprintln!(
+                        "the {:?} package's held line was accepted ahead of its fence on attempt \
+                         {attempt}, so it is typed again at the next prompt",
+                        package.kind()
+                    );
+                    probes.release();
+                    printed += 1;
+                    shell.produced(b"probe-ran", printed).await;
+                    previous = "kr-probe hold".to_owned();
+                }
+                None => panic!(
+                    "the {:?} package started the command with its line's capability ({bypass}, \
+                     attempt {attempt}, the line {} through the fence): {}",
+                    package.kind(),
+                    if fenced { "went" } else { "did not go" },
+                    probes.trace()
+                ),
             }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("the held command started: {}", probes.trace()));
-        let token = token.unwrap_or_else(|| {
-            panic!(
-                "the {:?} package started the command with its line's capability ({bypass}): {}",
-                package.kind(),
-                probes.trace()
-            )
-        });
+        };
         assert_eq!(
             shell
                 .runtime
