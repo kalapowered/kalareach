@@ -295,14 +295,7 @@ fn rust_package(map: &mut Map, sources: &mut Sources, root: &Path, package: &Pac
         }
         map.rust_tests.entry(target.id.clone()).or_default();
         for module in &modules {
-            rust_module(
-                map,
-                &target.id,
-                module,
-                &mut tables,
-                &mut helpers,
-                &mut uses,
-            );
+            rust_module(map, target, module, &mut tables, &mut helpers, &mut uses);
             scope.modules.insert(module.path.clone());
             scope
                 .functions
@@ -464,12 +457,13 @@ fn reaches(path: &[String], from: &[String], scope: &Scope, helper: &Helper) -> 
 
 fn rust_module(
     map: &mut Map,
-    target: &TargetId,
+    whole: &workspace::Target,
     module: &Module,
     tables: &mut Vec<Table>,
     helpers: &mut Vec<Helper>,
     uses: &mut Vec<Use>,
 ) {
+    let target = &whole.id;
     let prefix = module.path.join("::");
     let full = |name: &str| {
         if prefix.is_empty() {
@@ -480,7 +474,15 @@ fn rust_module(
     };
     for comment in &module.docs {
         for (identifier, source) in map.mentions(&comment.text, &module.file, comment.line) {
-            if module.test_code {
+            if !whole.harness {
+                // A target with a harness of its own reports no test by name, so there is no
+                // outcome of its to key.
+                map.reference(
+                    identifier,
+                    source,
+                    "the documentation of a target with a harness of its own, whose outcomes the report cannot read",
+                );
+            } else if module.test_code {
                 map.key(
                     identifier,
                     Place::RustModule {

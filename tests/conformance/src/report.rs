@@ -618,10 +618,14 @@ pub fn assemble(
         .filter(|(_, step)| {
             step.error.is_some()
                 || step.exit != Some(0)
-                || step
-                    .binaries
-                    .iter()
-                    .any(|(target, binary)| target.is_some() && !binary.readable)
+                || step.binaries.iter().any(|(target, binary)| {
+                    // A binary with a harness of its own prints nothing to read; its exit status is
+                    // the step's.
+                    target
+                        .as_ref()
+                        .is_some_and(|target| run::has_harness(&map.packages, target))
+                        && !binary.readable
+                })
         })
         .map(|(index, _)| index + 1)
         .collect();
@@ -812,6 +816,21 @@ impl<'a> Resolver<'a> {
     }
 
     fn rust(&self, target: &TargetId, name: &str, key: &map::Key) -> TestRecord {
+        if !run::has_harness(&self.map.packages, target) {
+            return TestRecord {
+                test: format!("{target} {name}"),
+                source: key.source.clone(),
+                keyed_by: key.binding,
+                outcome: Outcome::NotRun,
+                reason: Some(
+                    "a target with a harness of its own, which reports no test by name".to_owned(),
+                ),
+                runs: Vec::new(),
+                command: None,
+                needs: Vec::new(),
+                known_differences: Vec::new(),
+            };
+        }
         let mut runs = Vec::new();
         for (index, binary) in self.ran.get(target).into_iter().flatten() {
             let step = &self.executed[*index].step;
