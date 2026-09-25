@@ -18,6 +18,18 @@ use serde_json::{Value, json};
 
 use crate::error::CliError;
 
+/// How a command finished.
+///
+/// A command whose own result describes the failure reports it here rather than returning it, so
+/// exactly one result reaches the caller and the exit status still says what happened.
+#[derive(Debug)]
+pub enum Completion {
+    /// The command succeeded.
+    Done,
+    /// The command failed and has already written the result that says so.
+    Reported(CliError),
+}
+
 /// Renders a failure as machine-readable output.
 #[must_use]
 pub fn failure(error: &CliError) -> Value {
@@ -46,6 +58,23 @@ pub fn answer<T: serde::Serialize>(answer: &T) -> Result<Value, CliError> {
         }
         None => Ok(json!({ "ok": true, "answer": document })),
     }
+}
+
+/// Renders a host's answer that is also a failure: the answer exactly as the host sent it, with the
+/// failure's code, message and exit status beside it and `ok` false.
+///
+/// # Errors
+///
+/// Returns [`CliError::Other`] when the answer cannot be written as JSON.
+pub fn answer_that_failed<T: serde::Serialize>(
+    answer: &T,
+    error: &CliError,
+) -> Result<Value, CliError> {
+    let mut document = self::answer(answer)?;
+    if let (Some(object), Value::Object(failed)) = (document.as_object_mut(), failure(error)) {
+        object.extend(failed);
+    }
+    Ok(document)
 }
 
 /// Returns the name a value of one of the protocol's named sets goes by on the wire, which is the

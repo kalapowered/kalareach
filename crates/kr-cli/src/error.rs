@@ -46,6 +46,16 @@ pub enum CliError {
     /// the general failure, and the sentence carries what the closure record says.
     #[error("{0}")]
     SessionClosed(String),
+    /// The host acted and did not finish what was asked, such as an apply that wrote part of a
+    /// change or one whose result it cannot establish. The command's own output carries what the
+    /// host reported.
+    #[error("{message}")]
+    Unfinished {
+        /// The stable code the failure carries.
+        code: kr_protocol::error::ErrorCode,
+        /// What did not finish, for a person.
+        message: String,
+    },
     /// Local IPC failed.
     #[error("{0}")]
     Ipc(#[from] kr_ipc::IpcError),
@@ -68,7 +78,7 @@ impl CliError {
             Self::TerminalUnavailable(_) => 7,
             Self::Refused(_) => 8,
             Self::Ipc(_) => 3,
-            Self::SessionClosed(_) | Self::Other(_) => 1,
+            Self::SessionClosed(_) | Self::Unfinished { .. } | Self::Other(_) => 1,
         }
     }
 
@@ -110,6 +120,7 @@ impl CliError {
             Self::SessionClosed(_) => kr_protocol::error::ErrorCode::SessionClosed
                 .as_str()
                 .to_owned(),
+            Self::Unfinished { code, .. } => code.as_str().to_owned(),
             Self::Other(_) => kr_protocol::error::ErrorCode::ResourceUnavailable
                 .as_str()
                 .to_owned(),

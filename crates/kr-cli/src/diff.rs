@@ -16,26 +16,37 @@ use kr_protocol::changeset::{
     AffectedVersion, ApplyOutcomeClass, DestinationClass, DiffApplyParams, DiffApplyResult,
     DiffEntry, DiffReadParams, DiffReadResult, ExpectedReference,
 };
+use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{ChangeSetVersion, WorkspaceId};
 use kr_protocol::method::Method;
+use kr_protocol::project::ChangeKind;
 use kr_protocol::scalars::{Digest256, Nullable};
 
 use crate::cli::{DestinationArgument, DiffApplyArguments, DiffCommand, DiffReadArguments};
 use crate::daemon::{Daemon, identifier};
 use crate::error::{CliError, Result};
-use crate::report;
+use crate::report::{self, Completion};
 
 /// What `--expect` and `--reference-at` take for a path or a reference that does not exist.
 const ABSENT: &str = "absent";
 
+/// What a read shows for a path whose content it has no digest for and does not know to be absent:
+/// a link, something that is not a file, or a file the host could not read.
+const UNAVAILABLE: &str = "unavailable";
+
 /// Runs one `kr diff` command and prints its result.
+///
+/// An apply or a revert the host began and did not finish is reported with everything the host
+/// said about it, and the command then fails with that outcome.
 ///
 /// # Errors
 ///
 /// Returns a usage mistake, the daemon's refusal, or a transport failure.
-pub async fn run(paths: &HostPaths, command: DiffCommand, json: bool) -> Result<()> {
+pub async fn run(paths: &HostPaths, command: DiffCommand, json: bool) -> Result<Completion> {
     match command {
-        DiffCommand::Read(arguments) => read(paths, &arguments, json).await,
+        DiffCommand::Read(arguments) => read(paths, &arguments, json)
+            .await
+            .map(|()| Completion::Done),
         DiffCommand::Apply(arguments) => apply(paths, &arguments, false, json).await,
         DiffCommand::Revert(arguments) => apply(paths, &arguments, true, json).await,
     }
@@ -107,7 +118,7 @@ async fn apply(
     arguments: &DiffApplyArguments,
     revert: bool,
     json: bool,
-) -> Result<()> {
+) -> Result<Completion> {
     let change_set = crate::changeset::change_set_identifier(&arguments.change_set)?;
     let workspace: Option<WorkspaceId> = arguments
         .workspace
@@ -152,12 +163,52 @@ async fn apply(
             },
         )
         .await?;
-    if json {
-        report::print_json(&report::answer(&applied)?);
-    } else {
-        print!("{}", outcome(&applied, revert));
+    let unfinished = unfinished(&applied, revert);
+    match (&unfinished, json) {
+        (None, true) => report::print_json(&report::answer(&applied)?),
+        (Some(error), true) => report::print_json(&report::answer_that_failed(&applied, error)?),
+        (None, false) => print!("{}", outcome(&applied, revert)),
+        (Some(error), false) => {
+            print!("{}", outcome(&applied, revert));
+            eprintln!("kr: {error}");
+        }
     }
-    Ok(())
+    Ok(unfinished.map_or(Completion::Done, Completion::Reported))
+}
+
+/// The failure an apply or a revert that did not finish is reported as, or none when it finished.
+///
+/// A preflight that found the destination as expected ran nothing and is no failure. Every class
+/// but an applied change is one: the destination is not what the request asked for, whether
+/// nothing, some or an unknown part of the change reached it.
+fn unfinished(applied: &DiffApplyResult, revert: bool) -> Option<CliError> {
+    let (code, what) = match applied.outcome.as_ref()? {
+        ApplyOutcomeClass::Applied => return None,
+        ApplyOutcomeClass::PreflightConflict => (
+            ErrorCode::DraftConflict,
+            "the destination was not what the request expected, and nothing was written",
+        ),
+        ApplyOutcomeClass::ConflictAfterPartialWrites => (
+            ErrorCode::DraftConflict,
+            "some paths were written, and then the destination stopped being what the request \
+             expected",
+        ),
+        ApplyOutcomeClass::InterruptedApply => (
+            ErrorCode::OutcomeUnknown,
+            "some paths were written, and then the host stopped before it finished",
+        ),
+        ApplyOutcomeClass::UncertainOutcome => (
+            ErrorCode::OutcomeUnknown,
+            "the host cannot say what the destination holds",
+        ),
+    };
+    Some(CliError::Unfinished {
+        code,
+        message: format!(
+            "the {} did not finish: {what}; the result names each path and what to recover from",
+            if revert { "revert" } else { "apply" }
+        ),
+    })
 }
 
 const fn destination(argument: DestinationArgument) -> DestinationClass {
@@ -266,6 +317,37 @@ fn outcome(applied: &DiffApplyResult, revert: bool) -> String {
             conflict.path, conflict.detail
         ));
     }
+    for progress in &applied.progress {
+        text.push_str(&format!(
+            "{:<10} {}{}\n",
+            progress.state.as_str(),
+            progress.path,
+            if progress.detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", progress.detail)
+            }
+        ));
+    }
+    let recovery = &applied.recovery;
+    for (what, version) in [
+        ("before", recovery.before_version.as_ref()),
+        ("after", recovery.after_version.as_ref()),
+    ] {
+        if let Some(version) = version {
+            text.push_str(&format!(
+                "the destination {what} it: version {} of change set {}\n",
+                version.version.get(),
+                version.change_set_id
+            ));
+        }
+    }
+    if let Some(staged) = recovery.staged_path.as_ref() {
+        text.push_str(&format!("staged at: {staged}\n"));
+    }
+    for leftover in &recovery.staged_leftovers {
+        text.push_str(&format!("left beside a destination path: {leftover}\n"));
+    }
     for limitation in &applied.limitations {
         text.push_str(&format!("note: {limitation}\n"));
     }
@@ -273,11 +355,17 @@ fn outcome(applied: &DiffApplyResult, revert: bool) -> String {
 }
 
 /// One path of a read as a line for a person, with the digest `--expect` takes for it.
+///
+/// A path with no digest is `absent` only when the read says the path was deleted. Anything else
+/// the host could not digest, a link, something that is not a file or a file it could not read, is
+/// `unavailable`, which `--expect` does not take, because saying such a path is absent would be
+/// an expectation nobody established.
 fn entry_line(entry: &DiffEntry) -> String {
-    let digest = entry
-        .content_digest
-        .as_ref()
-        .map_or_else(|| ABSENT.to_owned(), report::wire_name);
+    let digest = match (entry.content_digest.as_ref(), entry.change) {
+        (Some(digest), _) => report::wire_name(digest),
+        (None, ChangeKind::Deleted) => ABSENT.to_owned(),
+        (None, ChangeKind::Present | ChangeKind::Unmerged) => UNAVAILABLE.to_owned(),
+    };
     format!(
         "{:<18} {:<8} {digest}  {}",
         entry.class.as_str(),
@@ -293,7 +381,117 @@ fn named(reference: Option<&String>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use kr_protocol::changeset::{PathClass, RecoveryObjects, VersionRef};
+    use kr_protocol::ids::{ActionId, ChangeSetId};
+    use kr_protocol::project::ContentClass;
+    use kr_protocol::scalars::{TimestampMs, Uuid};
+
     use super::*;
+
+    fn version(number: u64) -> VersionRef {
+        VersionRef {
+            change_set_id: ChangeSetId::new(Uuid::from_bytes([5; 16])),
+            version: ChangeSetVersion::new(number),
+        }
+    }
+
+    fn result(outcome: Option<ApplyOutcomeClass>) -> DiffApplyResult {
+        DiffApplyResult {
+            action_id: ActionId::new(Uuid::from_bytes([6; 16])),
+            outcome: Nullable(outcome),
+            destination: DestinationClass::SharedExisting,
+            applied_version: version(1),
+            proposal_version: Nullable::null(),
+            reference: Nullable::null(),
+            changed_paths: vec!["README.md".to_owned()],
+            unresolved_paths: vec!["notes.txt".to_owned()],
+            conflicts: Vec::new(),
+            progress: Vec::new(),
+            recovery: RecoveryObjects {
+                before_version: Nullable::some(version(2)),
+                after_version: Nullable::null(),
+                applied_version: Nullable::some(version(1)),
+                staged_path: Nullable::null(),
+                staged_leftovers: Vec::new(),
+                detail: String::new(),
+            },
+            limitations: Vec::new(),
+            detail: "the host stopped".to_owned(),
+            decided_at_ms: TimestampMs::new(1),
+        }
+    }
+
+    #[test]
+    fn only_a_change_that_landed_whole_or_a_clean_preflight_is_a_success() {
+        assert!(unfinished(&result(Some(ApplyOutcomeClass::Applied)), false).is_none());
+        assert!(
+            unfinished(&result(None), false).is_none(),
+            "a clean preflight"
+        );
+        for (outcome, code) in [
+            (ApplyOutcomeClass::PreflightConflict, "DRAFT_CONFLICT"),
+            (
+                ApplyOutcomeClass::ConflictAfterPartialWrites,
+                "DRAFT_CONFLICT",
+            ),
+            (ApplyOutcomeClass::InterruptedApply, "OUTCOME_UNKNOWN"),
+            (ApplyOutcomeClass::UncertainOutcome, "OUTCOME_UNKNOWN"),
+        ] {
+            let error = unfinished(&result(Some(outcome)), true).expect("a failure");
+            assert_eq!(error.code(), code, "{outcome:?}");
+            assert_ne!(error.exit_code(), 0, "{outcome:?}");
+            assert!(
+                error.to_string().starts_with("the revert did not finish"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unfinished_apply_says_what_landed_and_what_to_recover_from() {
+        let applied = result(Some(ApplyOutcomeClass::InterruptedApply));
+        let text = outcome(&applied, false);
+        assert!(text.contains("changed: README.md"), "{text}");
+        assert!(text.contains("not established: notes.txt"), "{text}");
+        assert!(
+            text.contains("the destination before it: version 2"),
+            "{text}"
+        );
+        let error = unfinished(&applied, false).expect("a failure");
+        let document = report::answer_that_failed(&applied, &error).expect("a document");
+        assert_eq!(document["ok"], serde_json::Value::Bool(false));
+        assert_eq!(document["code"], "OUTCOME_UNKNOWN");
+        assert_eq!(document["exit_code"], 1);
+        assert_eq!(document["outcome"], "interrupted_apply");
+        assert!(
+            document["recovery"]["before_version"].is_object(),
+            "the recovery objects are kept: {document}"
+        );
+    }
+
+    fn entry(change: ChangeKind, digest: Option<Digest256>) -> DiffEntry {
+        DiffEntry {
+            path: "link".to_owned(),
+            class: PathClass::UntrackedFile,
+            change,
+            content: ContentClass::Unknown,
+            byte_len: Nullable::null(),
+            base_object_id: Nullable::null(),
+            content_digest: Nullable(digest),
+        }
+    }
+
+    #[test]
+    fn a_path_with_no_digest_is_absent_only_when_it_was_deleted() {
+        assert!(entry_line(&entry(ChangeKind::Deleted, None)).contains(" absent  link"));
+        assert!(entry_line(&entry(ChangeKind::Present, None)).contains(" unavailable  link"));
+        assert!(entry_line(&entry(ChangeKind::Unmerged, None)).contains(" unavailable  link"));
+        let digest = Digest256::from_bytes([1; 32]);
+        assert!(
+            entry_line(&entry(ChangeKind::Present, Some(digest)))
+                .contains(&report::wire_name(&digest))
+        );
+    }
 
     #[test]
     fn an_expectation_names_a_path_and_what_it_holds() {

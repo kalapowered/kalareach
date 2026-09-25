@@ -7,6 +7,7 @@ use kr_cli::cli::{
     AccountCommand, AccountTokenCommand, Cli, Command, HostCommand, ShellArguments, ShellCommand,
 };
 use kr_cli::error::{CliError, Result};
+use kr_cli::report::Completion;
 use kr_cli::resolve::{SessionSelector, find, open_controller, open_worker};
 use kr_cli::session::AttachOptions;
 use kr_cli::terminal::ControllingTerminal;
@@ -61,17 +62,6 @@ fn main() -> ExitCode {
             ExitCode::from(error.exit_code())
         }
     }
-}
-
-/// How a command finished.
-///
-/// A command whose own result describes the failure reports it here rather than returning it, so
-/// exactly one result reaches the caller and the exit status still says what happened.
-enum Completion {
-    /// The command succeeded.
-    Done,
-    /// The command failed and has already written the result that says so.
-    Reported(CliError),
 }
 
 /// Reports a usage mistake, in the form the caller asked for.
@@ -585,10 +575,7 @@ async fn run(cli: Cli) -> Result<Completion> {
             kr_cli::changeset::run(&paths, command, cli.json).await?;
             Ok(Completion::Done)
         }
-        Command::Diff(command) => {
-            kr_cli::diff::run(&paths, command, cli.json).await?;
-            Ok(Completion::Done)
-        }
+        Command::Diff(command) => kr_cli::diff::run(&paths, command, cli.json).await,
         Command::Device(command) => {
             kr_cli::device::run(&paths, command, cli.json).await?;
             Ok(Completion::Done)

@@ -445,6 +445,42 @@ async fn repositories_workspaces_change_sets_and_diffs_are_managed_through_the_d
         "a proposal writes to no working tree"
     );
 
+    // A preflight of the working tree that finds it as expected writes nothing and succeeds.
+    let checked = host.kr_json(&[
+        "diff",
+        "apply",
+        &change_set,
+        "1",
+        "--to",
+        "working-tree",
+        "--workspace",
+        &workspace,
+        "--expect",
+        &expectation,
+        "--preflight",
+    ]);
+    assert!(checked["outcome"].is_null(), "nothing ran: {checked}");
+    assert_eq!(checked["destination"], "shared_existing", "{checked}");
+
+    // A link has no content digest, and a read does not call it absent: `--expect` could then be
+    // given an expectation nobody established.
+    std::os::unix::fs::symlink("README.md", Path::new(&review).join("link"))
+        .expect("a link in the working copy");
+    let live = host.kr_json(&["diff", "read", "--workspace", &workspace]);
+    let link = live["untracked"]
+        .as_array()
+        .and_then(|entries| entries.iter().find(|entry| entry["path"] == "link"))
+        .unwrap_or_else(|| panic!("the link is read: {live}"));
+    assert!(link["content_digest"].is_null(), "{link}");
+    let shown = host.kr(&["diff", "read", "--workspace", &workspace]);
+    let shown = String::from_utf8_lossy(&shown.stdout);
+    let line = shown
+        .lines()
+        .find(|line| line.ends_with("  link"))
+        .unwrap_or_else(|| panic!("a line for the link: {shown}"));
+    assert!(line.contains(" unavailable "), "{line}");
+    std::fs::remove_file(Path::new(&review).join("link")).expect("the link goes again");
+
     // A removal keeps what the workspace holds until the person says otherwise.
     let kept = host.kr_json(&["workspace", "remove", &workspace]);
     assert_eq!(kept["workspace"]["state"], "removal_pending", "{kept}");
@@ -805,5 +841,92 @@ async fn an_installation_that_needs_the_owners_confirmation_is_sent_to_an_owner_
     assert_eq!(status, Some(0), "{document}");
     assert_eq!(document["plugin"]["plugin_id"], PACKAGE, "{document}");
     assert_eq!(*asked.lock().expect("the record"), ["plugin.install"]);
+    serving.abort();
+}
+
+/// KR-REQ-07.47: an apply the daemon began and did not finish is not a success. The command exits
+/// with a status other than zero and prints the daemon's whole result, the recovery objects among
+/// it, beside the failure. A real daemon reaches this only when something changes the destination
+/// part way through a write, so a scripted one answers here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_apply_the_daemon_did_not_finish_is_a_failure_with_its_whole_result() {
+    use kr_protocol::changeset::{
+        ApplyOutcomeClass, DestinationClass, DiffApplyResult, RecoveryObjects, VersionRef,
+    };
+    use kr_protocol::ids::{ActionId, ChangeSetId, ChangeSetVersion};
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let change_set = ChangeSetId::new(kr_ipc::new_uuid());
+    let version = |number| VersionRef {
+        change_set_id: change_set,
+        version: ChangeSetVersion::new(number),
+    };
+    let interrupted = DiffApplyResult {
+        action_id: ActionId::new(kr_ipc::new_uuid()),
+        outcome: Nullable::some(ApplyOutcomeClass::InterruptedApply),
+        destination: DestinationClass::SharedExisting,
+        applied_version: version(1),
+        proposal_version: Nullable::null(),
+        reference: Nullable::null(),
+        changed_paths: vec!["README.md".to_owned()],
+        unresolved_paths: vec!["notes.txt".to_owned()],
+        conflicts: Vec::new(),
+        progress: Vec::new(),
+        recovery: RecoveryObjects {
+            before_version: Nullable::some(version(2)),
+            after_version: Nullable::null(),
+            applied_version: Nullable::some(version(1)),
+            staged_path: Nullable::null(),
+            staged_leftovers: Vec::new(),
+            detail: "the tree before the apply is version 2".to_owned(),
+        },
+        limitations: Vec::new(),
+        detail: "the host stopped after the first path".to_owned(),
+        decided_at_ms: TimestampMs::new(kr_ipc::now_ms().get()),
+    };
+    let (asked, serving) = scripted_daemon(
+        &temp,
+        Ok(ParamsValue::from_typed(&interrupted).expect("a result")),
+    );
+    let change_set = change_set.to_string();
+    let line = [
+        "diff",
+        "apply",
+        change_set.as_str(),
+        "1",
+        "--to",
+        "working-tree",
+        "--workspace",
+        NOBODY,
+        "--expect",
+        "README.md=absent",
+    ];
+    let (status, document) = json(&temp, &line);
+    assert_eq!(status, Some(1), "{document}");
+    assert_eq!(document["ok"], Value::Bool(false), "{document}");
+    assert_eq!(document["code"], "OUTCOME_UNKNOWN", "{document}");
+    assert_eq!(document["exit_code"], 1, "{document}");
+    assert_eq!(document["outcome"], "interrupted_apply", "{document}");
+    assert_eq!(
+        document["recovery"]["before_version"]["version"], "2",
+        "the recovery objects are kept: {document}"
+    );
+    let output = run_kr(&temp, &line);
+    assert_eq!(output.status.code(), Some(1));
+    let said = String::from_utf8_lossy(&output.stdout);
+    assert!(said.contains("changed: README.md"), "{said}");
+    assert!(
+        said.contains("the destination before it: version 2"),
+        "{said}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("did not finish"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        *asked.lock().expect("the record"),
+        ["diff.apply", "diff.apply"]
+    );
     serving.abort();
 }

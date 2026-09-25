@@ -889,6 +889,16 @@ limits the apply to some of the version's paths and `--preflight` checks without
 to a working tree is refused until you pass back each limitation the host states for it, with
 `--acknowledge`.
 
+`kr diff read` shows `absent` only for a path the change deletes. A path it has no digest for
+otherwise, such as a link or a file the host could not read, shows `unavailable`, which `--expect`
+does not take.
+
+An apply or a revert that began and did not finish exits with 1: `DRAFT_CONFLICT` when the
+destination stopped being what the request expected part way, `OUTCOME_UNKNOWN` when the host
+stopped before it finished or cannot say what the destination holds. The text names each path
+that changed or could not be established and the versions to recover from, and the `--json`
+document is the host's whole result with the failure's code and status beside it.
+
 ## `kr device`
 
 `kr device list [--include-revoked]` lists the devices paired with this host: each one's
