@@ -1,0 +1,25 @@
+[package]
+name = "kr-backup-integration"
+description = "The recovery bundle against real services, and settings sync across a deployment restored from its export"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+kr-client.workspace = true
+kr-crypto.workspace = true
+kr-protocol.workspace = true
+# The deployment, the silent service and the run's own identifiers and clock that the settings-sync
+# legs already use, so both suites reach a service the same way.
+kr-sync-integration = { path = "../sync" }
+# Reading the raw answers a transport carries, and writing what a leg hands the next phase.
+serde_json.workspace = true
+# Where a leg's devices keep their stores when the leg runs in one process.
+tempfile.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
