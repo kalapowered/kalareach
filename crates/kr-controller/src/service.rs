@@ -15028,12 +15028,13 @@ mod the_debt_pass {
             .expect("the fault is cleared");
 
         passes.send(()).expect("the pass is running");
-        until("the first pass raising the debt", async || {
-            controller.check_fence().is_ok()
-        })
+        // Its row is deleted once the workers are told, which the pass does on a task of its own.
+        until(
+            "the first pass raising the debt and retiring its row",
+            async || controller.check_fence().is_ok() && owed(&controller).is_empty(),
+        )
         .await;
         assert_eq!(revision(&controller).await, before + 1, "one barrier");
-        assert!(owed(&controller).is_empty(), "its row is retired");
         drop(controller);
     }
 
