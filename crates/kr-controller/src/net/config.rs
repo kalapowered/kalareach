@@ -11,8 +11,8 @@
 //! `kr doctor` with its source. The daemon reads it once, when it starts, because that is when its
 //! endpoint is built. No environment variable reaches any of it: section 26 keeps provider origins
 //! and trust decisions out of reach of whatever a process happened to inherit. That includes the
-//! HTTP proxy the endpoint reaches its relays and discovery servers through, which is this
-//! machine's own choice and travels in no invitation.
+//! HTTP proxy the endpoint reaches its relays and Pkarr servers through, which is this machine's own
+//! choice and travels in no invitation.
 //!
 //! A daemon that selects nothing serves its local endpoint alone. That is a supported deployment,
 //! not a degraded one: a host on the same machine as its clients needs no network at all.

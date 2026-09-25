@@ -170,7 +170,7 @@ an older build read joins nothing because of them.
 | `network.relay_only` | every packet through the relay, and no direct path | `true` or `false`; `true` needs at least one relay |
 | `network.local_discovery` | discovery of peers on the local network | `true` or `false` |
 | `network.mainline_dht` | the public Mainline DHT, which carries no KalaReach service guarantee | `true` or `false` |
-| `network.proxy_url` | the HTTP proxy the endpoint reaches its relays and discovery servers through; absent reaches them directly | an absolute `http` or `https` origin, with no user information, no path and no trailing slash |
+| `network.proxy_url` | the HTTP proxy the endpoint reaches its relays and Pkarr servers through; the DNS lookup does not use it, and absent reaches them directly | an absolute `http` or `https` origin, with no user information, no path and no trailing slash |
 | `voice.broker_origin` | the managed broker a device's voice session talks to | an absolute `https` or `http` origin in lower case, with no path and no port its scheme already implies |
 
 A field the document does not write selects nothing, because there is no public relay or discovery
@@ -187,7 +187,7 @@ the document accepts is therefore one the endpoint accepts. A value outside thes
 whole document invalid, as it would in any other section: the host keeps its product defaults,
 `kr doctor` names the key and withholds the value, and an edit to another section is refused until
 the document is fixed. The proxy is this machine's own choice, and no invitation or host bundle
-carries it. Without one, the endpoint reaches its relays and discovery servers directly, apart from
+carries it. Without one, the endpoint reaches its relays and Pkarr servers directly, apart from
 iroh's relay latency probe and captive-portal check, which then follow `HTTP_PROXY`, `HTTPS_PROXY`
 and `ALL_PROXY` when those are set.
 

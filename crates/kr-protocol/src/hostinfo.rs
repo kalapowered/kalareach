@@ -1760,10 +1760,11 @@ pub mod configuration {
         /// The public Mainline DHT for discovery. It publishes to a public network and carries no
         /// KalaReach service guarantee, which is why it is never on unless chosen.
         pub mainline_dht: Nullable<bool>,
-        /// The HTTP proxy the endpoint reaches its relays and discovery servers through, as an
-        /// absolute `http` or `https` origin such as `http://proxy.example.com:3128`. It is this
-        /// machine's own choice: no invitation or host bundle carries it. It names no user and no
-        /// password, because a proxy that needs credentials is not supported.
+        /// The HTTP proxy the endpoint reaches its relays and Pkarr servers through, as an absolute
+        /// `http` or `https` origin such as `http://proxy.example.com:3128`. The DNS lookup does
+        /// not use it. It is this machine's own choice: no invitation or host bundle carries it.
+        /// It names no user and no password, because a proxy that needs credentials is not
+        /// supported.
         pub proxy_url: Nullable<String>,
     }
 
@@ -1828,8 +1829,8 @@ pub mod configuration {
             self.mainline_dht.0.unwrap_or(false)
         }
 
-        /// The HTTP proxy the endpoint reaches its relays and discovery servers through, when one
-        /// is selected.
+        /// The HTTP proxy the endpoint reaches its relays and Pkarr servers through, when one is
+        /// selected.
         #[must_use]
         pub fn proxy_url(&self) -> Option<&str> {
             self.proxy_url.as_ref().map(String::as_str)
@@ -3048,11 +3049,10 @@ pub mod configuration {
         about: "whether this host uses the public Mainline DHT for discovery",
     };
 
-    /// The HTTP proxy the endpoint reaches its relays and discovery servers through.
+    /// The HTTP proxy the endpoint reaches its relays and Pkarr servers through.
     pub const NETWORK_PROXY_URL: Selection = Selection {
         key: "network.proxy_url",
-        about: "the HTTP proxy the network endpoint reaches its relays and discovery servers \
-                through",
+        about: "the HTTP proxy the network endpoint reaches its relays and Pkarr servers through",
     };
 
     /// The managed voice broker this host names to its devices.

@@ -17693,7 +17693,7 @@
             }
           ],
           "default": null,
-          "description": "The HTTP proxy the endpoint reaches its relays and discovery servers through, as an\nabsolute `http` or `https` origin such as `http://proxy.example.com:3128`. It is this\nmachine's own choice: no invitation or host bundle carries it. It names no user and no\npassword, because a proxy that needs credentials is not supported."
+          "description": "The HTTP proxy the endpoint reaches its relays and Pkarr servers through, as an absolute\n`http` or `https` origin such as `http://proxy.example.com:3128`. The DNS lookup does\nnot use it. It is this machine's own choice: no invitation or host bundle carries it.\nIt names no user and no password, because a proxy that needs credentials is not\nsupported."
         },
         "relay_only": {
           "anyOf": [

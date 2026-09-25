@@ -147,8 +147,9 @@ pub struct EndpointConfig {
     /// authority pins that authority here; the public anchors stay in force alongside it, so this
     /// adds trust rather than replacing it. An empty list is the ordinary case.
     pub relay_ca_roots: Vec<Vec<u8>>,
-    /// The HTTP proxy this endpoint's own web requests go through: the relay connection, the
-    /// relay latency probe and captive-portal check, and the Pkarr publisher and resolver.
+    /// The HTTP proxy this endpoint reaches its relays and Pkarr servers through: the relay
+    /// connection, the relay latency probe and captive-portal check, and the Pkarr publisher and
+    /// resolver. Nothing else the endpoint sends uses it.
     ///
     /// It is this machine's own choice. A pairing invitation and a host bundle never carry it, and
     /// nothing reads it from the environment. `None` sends the relay connection and the Pkarr
@@ -157,7 +158,7 @@ pub struct EndpointConfig {
     pub proxy_url: Option<ProxyUrl>,
 }
 
-/// The HTTP proxy an endpoint's own web requests go through, named by its origin.
+/// The HTTP proxy an endpoint reaches its relays and Pkarr servers through, named by its origin.
 ///
 /// An `http` or `https` scheme, a host and an optional port, and nothing after them. A proxy URL
 /// that names a user or a password cannot be built: a proxy that needs credentials is not

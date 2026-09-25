@@ -56,7 +56,7 @@ used:
 | `relay_only` | Removes the IP transports, so every packet goes through the selected relay. |
 | `relay_ca_roots` | Extra trust anchors for a relay whose certificate comes from a private authority. |
 | `bind_addr` | The local socket. |
-| `proxy_url` | The HTTP proxy the endpoint's own web requests go through: the relay connection, the relay latency probe and captive-portal check, and the Pkarr publisher and resolver. A `ProxyUrl` is an `http` or `https` origin and never names a credential. |
+| `proxy_url` | The HTTP proxy the endpoint reaches its relays and Pkarr servers through: the relay connection, the relay latency probe and captive-portal check, and the Pkarr publisher and resolver. A `ProxyUrl` is an `http` or `https` origin and never names a credential. |
 
 Publication rules, which are the defaults of `PublisherPolicy`:
 
@@ -80,14 +80,15 @@ record stays relay-only while a selected mDNS service publishes what a local net
 
 ### Proxies, blocked upgrades and intercepted TLS
 
-`proxy_url` is the one way out for the endpoint's HTTP and HTTPS traffic. With it set, the relay
-client opens a `CONNECT` tunnel to each relay through the proxy, iroh's net report sends its relay
-latency probe and captive-portal check through it, and the Pkarr publisher and resolver send their
-requests through it. Nothing goes around it: when the proxy cannot be reached, neither can the
-relays. The endpoint's QUIC traffic is UDP and does not go through an HTTP proxy, so direct paths
-and iroh's QUIC address discovery reach their addresses as they would without one. A network that
-requires a proxy usually blocks them, which leaves the relay's HTTPS path; a relay-only endpoint
-has that path alone.
+`proxy_url` is the way the endpoint reaches its relays and its Pkarr servers. With it set, the
+relay client opens a `CONNECT` tunnel to each relay through the proxy, iroh's net report sends its
+relay latency probe and captive-portal check through it, and the Pkarr publisher and resolver send
+their requests through it. None of these goes around the proxy: when it cannot be reached, neither
+can the relays or the Pkarr servers. The rest of the endpoint's traffic does not use it. Direct
+paths and iroh's QUIC address discovery are UDP, the DNS lookup asks the system's name servers, and
+the port mapper talks to the local gateway, each as it would without a proxy. A network that
+requires a proxy usually blocks the first two, which leaves the relay's HTTPS path; a relay-only
+endpoint has that path alone.
 
 The proxy is each machine's own choice. A pairing invitation and a host bundle carry the relays and
 discovery services a device dials with, never the proxy the inviting machine goes through. Nothing
