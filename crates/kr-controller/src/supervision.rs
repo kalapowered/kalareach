@@ -1125,6 +1125,24 @@ fn detached_command(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     let child = command.spawn().map_err(|error| {
+        // The one refusal that is about where this daemon runs rather than about the worker: a
+        // start that asked to break away from its job is refused with access denied when the daemon
+        // is itself inside a job object that does not permit breakaway, such as the one a test
+        // runner or `cargo test` places its processes in. A worker must outlive the daemon, so it
+        // cannot join that job; naming the cause and the setup, rather than the bare "access is
+        // denied", is what a person can act on. The start fails here at once and never waits.
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        if error.raw_os_error() == Some(ERROR_ACCESS_DENIED) {
+            return ControllerError::supervision(format!(
+                "could not start a worker as a process independent of this daemon: the start asked \
+                 to break away from this daemon's job and was refused, which is what Windows does \
+                 when the daemon runs inside a job object that does not permit breakaway. A worker \
+                 must outlive the daemon, so it cannot run inside that job. Run the control daemon \
+                 outside such a job, through its per-user service, so a worker can start as an \
+                 independent process ({})",
+                program.display()
+            ));
+        }
         ControllerError::supervision(format!("start {}: {error}", program.display()))
     })?;
     Ok(child.id())

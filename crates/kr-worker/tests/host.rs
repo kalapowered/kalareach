@@ -1614,3 +1614,37 @@ async fn close(client: &mut LocalClient, host: &Host, session_id: SessionId) -> 
         started.elapsed()
     );
 }
+
+/// KR-REQ-07.58: a Windows worker must be a process independent of the daemon, outside the
+/// daemon's kill-on-close job, so the start asks to break away from that job. Inside a job that
+/// does not permit breakaway, such as the one `cargo` runs its tests in, the start is refused, and
+/// the daemon names the cause and the setup rather than the bare access denial, and fails at once
+/// rather than waiting.
+#[cfg(windows)]
+#[test]
+fn a_worker_start_that_must_break_away_is_refused_inside_a_job_that_forbids_it() {
+    let temp = teardown::Tree::create();
+    let jobs = temp.root().join("jobs");
+    std::fs::create_dir_all(&jobs).expect("a jobs directory");
+    let launch = ServiceLaunch {
+        label: "kr-breakaway-probe".to_owned(),
+        program: std::path::PathBuf::from(
+            std::env::var_os("COMSPEC").expect("a command shell on PATH"),
+        ),
+        // If the start were somehow admitted, this exits at once and leaves nothing behind.
+        arguments: vec!["/c".to_owned(), "exit".to_owned()],
+        jobs_directory: jobs,
+        working_directory: temp.root().to_path_buf(),
+    };
+    match DetachedSupervisor::new().start_service(&launch) {
+        LaunchOutcome::NotStarted { detail } => {
+            assert!(
+                detail.contains("break away") && detail.contains("per-user service"),
+                "the failure names the job that forbids breakaway and the setup: {detail}"
+            );
+        }
+        other => {
+            panic!("a start that must break away should be refused inside this job, got {other:?}")
+        }
+    }
+}
