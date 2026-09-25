@@ -439,10 +439,10 @@ fn recorded(
 /// the host shows.
 ///
 /// A device reads the questions it may answer with `question.read`. Where the host refuses that
-/// read, the refusal is recorded in `defects` and the question is taken from the device's own
-/// screen instead, where the agent printed its identity, at the revision a new question starts
-/// at, so the rest of the workflow is still exercised and the leg fails at its end, naming the
-/// refusal.
+/// read, the refusal is recorded in `defects` as a defect of the host, and the question is taken
+/// from the device's own screen instead, where the agent printed its identity, at the revision a
+/// new question starts at. That records what the rest of the leg can still check; it never makes
+/// the leg pass, which fails at its end naming the refusal.
 fn question_to_answer(
     runtime: &tokio::runtime::Runtime,
     remote: &kr_e2e_m1b::device::Remote,
@@ -468,7 +468,10 @@ fn question_to_answer(
             }
             Err(refusal) => {
                 let defect = format!(
-                    "the host refuses a paired device the questions it may answer ({refusal})"
+                    "the host's network read routing (crates/kr-controller/src/net/dispatch.rs) \
+                     refuses question.read to a paired device, although the method table \
+                     (crates/kr-protocol/src/method.rs) admits a paired device to it, so no \
+                     device can read the questions it may answer ({refusal})"
                 );
                 if !defects.contains(&defect) {
                     defects.push(defect);
@@ -976,7 +979,7 @@ fn a_device_uses_an_agent_in_a_managed_shell_and_reattaches_to_the_screen_kr_att
     println!("{closing}");
     assert!(
         defects.is_empty(),
-        "every step of the workflow ran, and the host fell short in these: {}",
+        "every step of the workflow ran, and the host fell short in: {}",
         defects.join("; ")
     );
     checkpoint.proved(
