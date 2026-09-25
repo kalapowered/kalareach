@@ -11,8 +11,15 @@
 
 use kr_ipc::client::LocalClient;
 use kr_ipc::paths::{EnvironmentPaths, HostPaths};
+use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{BuildId, EnvironmentId, SessionId};
 use kr_protocol::local::LocalClientKind;
+use kr_protocol::method::Method;
+use kr_protocol::scalars::Nullable;
+use kr_protocol::session::{
+    ClosureRecord, SessionListParams, SessionListResult, SessionReadParams, SessionReadResult,
+    SessionState,
+};
 use kr_protocol::worker::WorkerDescriptor;
 
 use crate::error::{CliError, Result};
@@ -215,6 +222,128 @@ pub async fn open_controller(paths: &EnvironmentPaths, build_id: BuildId) -> Res
                  daemon, kr-controller, for it"
             ))
         })
+}
+
+/// Resolves a selector that names no live descriptor, through what the environment's daemon
+/// retains.
+///
+/// An identifier is its own answer. A display number belongs to its environment for good, so a
+/// session that has closed still answers to the number it was listed under, and the daemon's list
+/// with closed sessions in it says which session that is.
+///
+/// # Errors
+///
+/// Returns [`CliError::UnknownSession`] for a number the daemon never gave out, and the daemon's
+/// refusal or a transport failure otherwise.
+pub async fn retained_session(
+    client: &mut LocalClient,
+    selector: &SessionSelector,
+) -> Result<SessionId> {
+    let number = match selector {
+        SessionSelector::Identifier(session_id) => return Ok(*session_id),
+        SessionSelector::Display(number) => *number,
+    };
+    let outcome = client
+        .request(
+            Method::SessionList,
+            &SessionListParams {
+                environment_id: Nullable::null(),
+                include_closed: true,
+            },
+        )
+        .await?;
+    let listed: SessionListResult =
+        outcome
+            .map_err(CliError::Refused)?
+            .to_typed()
+            .map_err(|error| {
+                CliError::Other(format!("the host's answer could not be read: {error}"))
+            })?;
+    listed
+        .sessions
+        .iter()
+        .find(|summary| summary.display_number.get() == number)
+        .map(|summary| summary.session_id)
+        .ok_or_else(|| CliError::UnknownSession(selector.to_string()))
+}
+
+/// What the environment's daemon holds for a session that no descriptor names.
+#[derive(Debug)]
+pub enum Registered {
+    /// The session has closed.
+    Closed {
+        /// The session.
+        session_id: SessionId,
+        /// The closure record the daemon keeps, when its answer carried it.
+        record: Option<ClosureRecord>,
+    },
+    /// The daemon holds the session, it has not closed, and it has not published a descriptor to
+    /// attach through yet.
+    Unpublished {
+        /// The session.
+        session_id: SessionId,
+        /// The state the daemon reports it in.
+        state: SessionState,
+    },
+}
+
+/// Asks the environment's daemon about a session that no descriptor names.
+///
+/// A descriptor goes when its session closes, so a session without one has closed, has not
+/// published one yet, or was never here. Only the daemon's registry can say which: the closure it
+/// records outlives the session, and nothing left on disk is evidence of one. A daemon that cannot
+/// be reached has said nothing, and the caller is told exactly that, never that the session closed.
+///
+/// The environment is the one `environment` names, or this installation's own, as `kr close` and
+/// `kr status` ask.
+///
+/// # Errors
+///
+/// Returns [`CliError::UnknownSession`] when the registry never held the session,
+/// [`CliError::HostUnavailable`] when no daemon answers for the environment, and the daemon's
+/// refusal otherwise.
+pub async fn registered(
+    paths: &HostPaths,
+    selector: &SessionSelector,
+    environment: Option<&str>,
+) -> Result<Registered> {
+    let environment = select(paths, environment)?;
+    let mut client = open_controller(&environment.paths, crate::build_id()).await?;
+    let session_id = retained_session(&mut client, selector).await?;
+    let outcome = client
+        .request(Method::SessionRead, &SessionReadParams { session_id })
+        .await?;
+    match outcome {
+        Ok(value) => {
+            let read: SessionReadResult = value.to_typed().map_err(|error| {
+                CliError::Other(format!("the host's answer could not be read: {error}"))
+            })?;
+            let summary = read.session;
+            Ok(match summary.closure.0 {
+                Some(record) => Registered::Closed {
+                    session_id,
+                    record: Some(record),
+                },
+                None if summary.state == SessionState::Closed => Registered::Closed {
+                    session_id,
+                    record: None,
+                },
+                None => Registered::Unpublished {
+                    session_id,
+                    state: summary.state,
+                },
+            })
+        }
+        // The daemon may answer the read with the closure itself.
+        Err(refusal) if refusal.code == ErrorCode::SessionClosed => Ok(Registered::Closed {
+            session_id,
+            record: None,
+        }),
+        Err(refusal) if refusal.code == ErrorCode::UnknownSession => {
+            Err(CliError::UnknownSession(selector.to_string()))
+        }
+        Err(refusal) => Err(CliError::Refused(refusal)),
+    }
 }
 
 /// The environment variable that names the session a command is running inside.

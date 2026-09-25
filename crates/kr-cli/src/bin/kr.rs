@@ -295,7 +295,21 @@ async fn run(cli: Cli) -> Result<Completion> {
         Command::Attach(arguments) => {
             let selector = SessionSelector::parse(&arguments.session)?;
             let wanted = parse_environment(arguments.environment.as_deref())?;
-            let (_, descriptor) = find(&paths, &selector, wanted)?;
+            let descriptor = match find(&paths, &selector, wanted) {
+                Ok((_, descriptor)) => descriptor,
+                // No descriptor names it, so it has closed, has not published one yet, or was
+                // never here, and the daemon's registry says which. Attaching never starts one.
+                Err(CliError::UnknownSession(_)) => {
+                    return attach_unpublished(
+                        &paths,
+                        &selector,
+                        arguments.environment.as_deref(),
+                        cli.json,
+                    )
+                    .await;
+                }
+                Err(error) => return Err(error),
+            };
             let (outcome, session_id) = kr_cli::session::run(
                 &descriptor,
                 kr_cli::session::UndeliveredTyping::new(0),
@@ -422,7 +436,8 @@ async fn run(cli: Cli) -> Result<Completion> {
                 // which, and it resolves a display number through the reservations it retains.
                 None => {
                     let mut client = open_controller(&environment.paths, build_id()).await?;
-                    let session_id = resolve_closed(&mut client, &selector).await?;
+                    let session_id =
+                        kr_cli::resolve::retained_session(&mut client, &selector).await?;
                     let outcome = client
                         .mutate(
                             Method::SessionClose,
@@ -501,7 +516,8 @@ async fn run(cli: Cli) -> Result<Completion> {
                 }
                 Err(CliError::UnknownSession(_)) => {
                     let mut client = open_controller(&environment.paths, build_id()).await?;
-                    let session_id = resolve_closed(&mut client, &selector).await?;
+                    let session_id =
+                        kr_cli::resolve::retained_session(&mut client, &selector).await?;
                     let summary = read_from_controller(&mut client, session_id).await?;
                     (summary, environment.paths)
                 }
@@ -1074,35 +1090,47 @@ async fn present(
     }
 }
 
-/// Resolves a selector that names no live descriptor, through what the daemon retains.
-async fn resolve_closed(
-    client: &mut kr_ipc::client::LocalClient,
+/// Answers `kr attach` for a session that no descriptor names, and starts nothing.
+///
+/// A closed session is refused with `SESSION_CLOSED` and the closure record the daemon keeps, in
+/// one document; one the registry never held is `UNKNOWN_SESSION`; and one it holds that has not
+/// published a descriptor yet is not attached to, because the descriptor is how the worker is
+/// found and proved.
+async fn attach_unpublished(
+    paths: &HostPaths,
     selector: &SessionSelector,
-) -> Result<SessionId> {
-    if let SessionSelector::Identifier(session_id) = selector {
-        return Ok(*session_id);
+    environment: Option<&str>,
+    json: bool,
+) -> Result<Completion> {
+    match kr_cli::resolve::registered(paths, selector, environment).await? {
+        kr_cli::resolve::Registered::Closed { session_id, record } => {
+            let how = record.as_ref().map_or_else(
+                || "the host did not send its record".to_owned(),
+                kr_cli::session::how_it_closed,
+            );
+            let error = CliError::Refused(kr_protocol::error::ProtocolError::new(
+                kr_protocol::error::ErrorCode::SessionClosed,
+                format!("session {session_id} has closed: {how}; attaching to it starts nothing"),
+            ));
+            if json {
+                let mut document = report::failure(&error);
+                document["session_id"] = serde_json::json!(session_id.to_string());
+                document["closure"] = record
+                    .as_ref()
+                    .map_or(serde_json::Value::Null, report::closure);
+                print_json(&document);
+            } else {
+                eprintln!("kr: {error}");
+            }
+            Ok(Completion::Reported(error))
+        }
+        kr_cli::resolve::Registered::Unpublished { session_id, state } => {
+            Err(CliError::HostUnavailable(format!(
+                "session {session_id} is {state} and has not published where to attach to it; \
+                 try again once it is live"
+            )))
+        }
     }
-    // A display number belongs to the environment for good, so a closed session still answers to
-    // the number it was listed under.
-    let outcome = client
-        .request(
-            Method::SessionList,
-            &SessionListParams {
-                environment_id: Nullable::null(),
-                include_closed: true,
-            },
-        )
-        .await?;
-    let listed: SessionListResult = typed(outcome)?;
-    let SessionSelector::Display(number) = selector else {
-        unreachable!("an identifier was answered above");
-    };
-    listed
-        .sessions
-        .iter()
-        .find(|summary| summary.display_number.get() == *number)
-        .map(|summary| summary.session_id)
-        .ok_or_else(|| CliError::UnknownSession(selector.to_string()))
 }
 
 async fn read_from_controller(

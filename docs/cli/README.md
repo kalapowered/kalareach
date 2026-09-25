@@ -144,6 +144,13 @@ whether a fenced launch is admitted at all.
 Attaching reads the published descriptor and challenges the worker itself, so it works while the
 control daemon is restarting.
 
+A session's descriptor goes when the session closes. With no descriptor to read, `kr attach` asks
+the environment's control daemon, whose registry keeps each closure, and starts nothing either way.
+A session that has closed is refused with `SESSION_CLOSED` and exit code 8, naming how it closed,
+and `--json` carries its closure record as `closure` beside `session_id`. A session the registry
+never held is `UNKNOWN_SESSION`. When no daemon is running for the environment, the command says
+so and exits with 3: what cannot be asked is never reported as a closure.
+
 Direct mode puts the outer terminal into raw mode and writes what the host sends it, in order.
 Nothing is decoded into text and re-encoded, nothing is normalised and no status bar is installed.
 When an application turns mouse reporting on, the outer terminal produces those events and they are

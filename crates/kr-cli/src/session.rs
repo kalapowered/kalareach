@@ -153,8 +153,10 @@ pub fn closed_cleanly(record: &ClosureRecord) -> bool {
     }
 }
 
-/// Says how a session closed, in the words a person is shown.
-fn how_it_closed(record: &ClosureRecord) -> String {
+/// Says how a session closed, in the words a person is shown: what an attachment says when the
+/// session closes under it, and what an attach to a session that has already closed says.
+#[must_use]
+pub fn how_it_closed(record: &ClosureRecord) -> String {
     match record.reason {
         ClosureReason::RootExit => record.root_exit_code.as_ref().map_or_else(
             || "its shell exited".to_owned(),

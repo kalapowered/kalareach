@@ -2247,8 +2247,9 @@ fn a_session_made_by_kr_new_carries_a_question_outlives_its_terminal_and_ends_wi
     first.wait_until_put_back("the reattached window's terminal came back");
     second.wait_until_put_back("the watching window's terminal came back");
 
-    // KR-REQ-07.52: and nothing starts it again. Attaching to it by the number it was listed under
-    // is refused as a session that does not exist, rather than answered with a new one.
+    // KR-REQ-07.52 and KR-REQ-05.05: and nothing starts it again. Attaching to it by the number it
+    // was listed under is refused as a session that has closed, with how it closed, rather than
+    // answered with a new one.
     host.nothing_restarts(&[session_id]);
     let refused = Window::open(
         &host,
@@ -2259,15 +2260,14 @@ fn a_session_made_by_kr_new_carries_a_question_outlives_its_terminal_and_ends_wi
     );
     refused.wait_for(
         0,
-        b"refused-attach-4",
-        "an attach to the closed session ended as one to an unknown session",
+        b"refused-attach-8",
+        "an attach to the closed session ended as one to a closed session",
     );
+    let said = refused.screen.since(0);
     assert!(
-        refused
-            .screen
-            .contains_since(0, format!("no session {display}").as_bytes()),
+        contains(&said, b"SESSION_CLOSED") && contains(&said, b"has closed"),
         "and said so: {}",
-        String::from_utf8_lossy(&refused.screen.since(0)).escape_debug()
+        String::from_utf8_lossy(&said).escape_debug()
     );
     assert!(
         host.running_workers().is_empty(),
