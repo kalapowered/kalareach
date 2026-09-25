@@ -572,8 +572,11 @@ export interface HostPort {
   pairingStartRead(): Promise<void>
   /** Ends the attempt on this computer, or drops a pasted invitation. */
   pairingStop(): Promise<void>
-  /** Tells `listener` each time the pairing screen's state changes. Returns the unsubscribe. */
-  onPairing(listener: (view: PairingView) => void): () => void
+  /**
+   * Tells `listener` each time the pairing screen's state changes. Resolves, with the function
+   * that stops it, once the listener is registered: nothing published before then reaches it.
+   */
+  onPairing(listener: (view: PairingView) => void): Promise<() => void>
 
   /** The confirmations this computer's hosts ask for. */
   ownerConfirmations(): Promise<OwnerView>
@@ -582,8 +585,11 @@ export interface HostPort {
    * and only a confirmed ceremony signs it. The page names the reference and nothing else.
    */
   ownerConfirmationReview(reference: string): Promise<ReviewOutcome>
-  /** Tells `listener` each time the confirmations change. Returns the unsubscribe. */
-  onConfirmations(listener: (view: OwnerView) => void): () => void
+  /**
+   * Tells `listener` each time the confirmations change. Resolves, with the function that stops
+   * it, once the listener is registered: nothing published before then reaches it.
+   */
+  onConfirmations(listener: (view: OwnerView) => void): Promise<() => void>
 
   openExternal(url: string): Promise<ApprovedLink>
   importRemoteImage(url: string): Promise<ImportedImage>

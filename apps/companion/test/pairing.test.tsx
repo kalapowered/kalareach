@@ -249,6 +249,24 @@ describe('pairing with a host', () => {
     expect(list.textContent).toContain('Can view sessions')
   })
 
+  it('reads the state once it is listening, so a change while it registers is not lost', async () => {
+    const { port, controls } = fakeHost()
+    const complete = controls.holdRegistrations()
+    render(
+      <AppProvider port={port} initialPlace={{ view: 'pairing' }}>
+        <App />
+      </AppProvider>
+    )
+    act(() => {
+      controls.setPairing({ state: { state: 'working', stage: 'checking_code' } })
+    })
+    await act(async () => {
+      complete()
+      await Promise.resolve()
+    })
+    expect((await screen.findByTestId('pairing-status')).textContent).toBe('Checking the code')
+  })
+
   it('changes the service codes go through', async () => {
     start()
     await userEvent.click(await screen.findByTestId('change-service'))
@@ -337,6 +355,24 @@ describe("the owner's confirmations", () => {
       expect(screen.queryByTestId('confirmation-row')).toBeNull()
     })
     expect(controls.reviewed).toEqual([])
+  })
+
+  it('reads the requests once it is listening, so one asked while it registers is shown', async () => {
+    const { port, controls } = fakeHost()
+    const complete = controls.holdRegistrations()
+    render(
+      <AppProvider port={port} initialPlace={{ view: 'attention' }}>
+        <App />
+      </AppProvider>
+    )
+    act(() => {
+      controls.setConfirmations({ ceremony: 'touch_id', requests: [request()] })
+    })
+    await act(async () => {
+      complete()
+      await Promise.resolve()
+    })
+    expect(await screen.findByTestId('confirmation-row')).toBeInTheDocument()
   })
 
   it('counts waiting confirmations beside Attention', async () => {

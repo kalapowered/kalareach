@@ -56,20 +56,15 @@ export const PAIRING_EVENT = 'kr://pairing'
 /** The event the backend publishes the owner confirmations on. */
 export const CONFIRMATIONS_EVENT = 'kr://confirmations'
 
-/** Listens for one backend event until the returned function is called. */
-function listening<T>(event: string, listener: (payload: T) => void): () => void {
-  let stop: (() => void) | null = null
-  let cancelled = false
-  void listen<T>(event, (published) => {
+/**
+ * Listens for one backend event. Resolves, with the function that stops listening, once the
+ * listener is registered: the shell registers it asynchronously, and drops what it publishes
+ * before then.
+ */
+function listening<T>(event: string, listener: (payload: T) => void): Promise<() => void> {
+  return listen<T>(event, (published) => {
     listener(published.payload)
-  }).then((unlisten) => {
-    if (cancelled) unlisten()
-    else stop = unlisten
   })
-  return () => {
-    cancelled = true
-    stop?.()
-  }
 }
 
 /**

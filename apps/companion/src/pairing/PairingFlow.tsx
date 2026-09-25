@@ -81,23 +81,30 @@ export function PairingFlow(): ReactNode {
 
   useEffect(() => {
     let watching = true
-    // An event is newer than the first read, so a read that answers after one is let go.
+    let stop: (() => void) | null = null
+    // The state is read once the listener is registered, so no change can fall between the two.
+    // An event heard before the read answers is at least as new, so the read is let go then.
     let heard = false
     port
-      .pairingView()
-      .then((current) => {
+      .onPairing((next) => {
+        heard = true
+        if (watching) setView(next)
+      })
+      .then(async (unlisten) => {
+        if (!watching) {
+          unlisten()
+          return
+        }
+        stop = unlisten
+        const current = await port.pairingView()
         if (watching && !heard) setView(current)
       })
       .catch((error: unknown) => {
         if (watching) setFailure(failureMessage(error))
       })
-    const stop = port.onPairing((next) => {
-      heard = true
-      setView(next)
-    })
     return () => {
       watching = false
-      stop()
+      stop?.()
     }
   }, [port])
 
