@@ -1466,4 +1466,171 @@ mod tests {
             r#"AccountAuthorisation{scope:"backup.write",..}"#,
         );
     }
+
+    /* ---------------------------------------------------------------------- */
+    /* What a failure says of a request and its answer                          */
+    /* ---------------------------------------------------------------------- */
+
+    /// A refusal a service names becomes an error that says the service's message, through the
+    /// door kept for words a service writes to be shown to a person, and nothing else its answer
+    /// carried: the marker planted in each other member, name and value of the answer in turn is
+    /// in no rendering of what comes back. A refusal whose code says more than its words is said in
+    /// this program's words, whatever the service wrote.
+    #[test]
+    fn a_service_refusal_says_its_own_message_and_nothing_else_it_carried() {
+        use crate::shown::marker::{
+            MARKER, NEUTRAL, assert_unmarked, failure_renderings, json_plantings,
+        };
+
+        let refusal = |code: &str, message: &str| {
+            serde_json::json!({
+                "ok": false,
+                "error": {
+                    "code": code,
+                    "message": message,
+                    "retryAfterSeconds": 5,
+                    "detail": { "note": "a note", "items": ["an item", 7] },
+                },
+            })
+        };
+        let read = |document: &serde_json::Value| {
+            answer_of(&ServiceHttpAnswer {
+                status: 403,
+                body: serde_json::to_vec(document).expect("an answer"),
+            })
+            .and_then(Answer::data)
+            .expect_err("a refusal, or an answer this client cannot read")
+        };
+
+        // The neutral control: the code as this client classifies it, the service's message and
+        // the delay it asked for.
+        assert_eq!(
+            read(&refusal("FORBIDDEN", NEUTRAL)).to_string(),
+            "PERMISSION_DENIED: neutral-value (retry after 5s)"
+        );
+        // The negative control: the message is the one member said whole.
+        let said = read(&refusal("FORBIDDEN", MARKER)).to_string();
+        assert!(said.contains(MARKER), "{said}");
+
+        let mut plantings = 0;
+        for planted in json_plantings(&refusal("FORBIDDEN", "the service's own words"), MARKER) {
+            if planted.at == "Text at /error/message" {
+                continue;
+            }
+            plantings += 1;
+            assert_unmarked(&planted.at, &failure_renderings(read(&planted.input)));
+        }
+        assert!(plantings > 10, "{plantings} plantings");
+
+        let cutoff = read(&refusal("SIGNED_BEFORE_CUTOFF", MARKER));
+        assert!(
+            cutoff
+                .to_string()
+                .starts_with("CLOCK_UNTRUSTED: nothing ran and nothing was recorded"),
+            "{cutoff}"
+        );
+        assert_unmarked(
+            "a refusal signed before a cutoff",
+            &failure_renderings(cutoff),
+        );
+    }
+
+    /// A request that went unanswered says why in this program's words, and nothing it carried:
+    /// not the account token beside it, not a body whose writer failed, which is said by the kind
+    /// of fault, and not a body past its method's bound, which is said by its length. What an
+    /// answer this client cannot read held is said by its kind too.
+    #[tokio::test]
+    async fn an_unanswered_request_says_nothing_of_its_body_or_its_account_token() {
+        use crate::shown::marker::{MARKER, NEUTRAL, assert_unmarked, failure_renderings};
+
+        /// A body whose writer fails with the words it is given.
+        struct Unwritable(&'static str);
+
+        impl Serialize for Unwritable {
+            fn serialize<S: serde::Serializer>(
+                &self,
+                _serializer: S,
+            ) -> std::result::Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom(self.0))
+            }
+        }
+
+        let account = presenting(&Tokens::holding(Some(MARKER)));
+        let wire = Wire::data();
+        let client = service(&wire);
+
+        for planted in [MARKER, NEUTRAL] {
+            // The negative control: the writer's own failure says the words it was given.
+            let own = serde_json::to_value(Unwritable(planted)).expect_err("the writer fails");
+            assert!(own.to_string().contains(planted), "{own}");
+            let refused = client
+                .dispatch(
+                    "/api/sync/exchange",
+                    Method::SyncCompareExchange,
+                    &Unwritable(planted),
+                    256 * 1024,
+                    None,
+                    Some(&account),
+                )
+                .await;
+            let Err(Unanswered::NotSent(error)) = refused else {
+                panic!("a body its writer cannot write is not sent: {refused:?}");
+            };
+            // The neutral control: the class of the fault and where it is.
+            assert_eq!(
+                error.to_string(),
+                "INVALID_ARGUMENT: a request could not be written: it is not the shape this client \
+                 reads at line 0 column 0"
+            );
+            assert_unmarked("a body its writer cannot write", &failure_renderings(error));
+        }
+
+        let document = serde_json::json!({ "note": MARKER.repeat(8) });
+        let refused = client
+            .dispatch(
+                "/api/sync/exchange",
+                Method::SyncCompareExchange,
+                &document,
+                64,
+                None,
+                Some(&account),
+            )
+            .await;
+        let Err(Unanswered::NotSent(error)) = refused else {
+            panic!("a request past its bound is not sent: {refused:?}");
+        };
+        let said = error.to_string();
+        assert!(
+            said.starts_with(
+                "INVALID_ARGUMENT: a sync.compare_exchange request is at most 64 bytes and this one \
+                 is "
+            ),
+            "{said}"
+        );
+        assert_unmarked("a request past its bound", &failure_renderings(error));
+        assert_eq!(wire.requests(), 0, "nothing reached the transport");
+
+        for answer in [
+            Err(ErrorCode::UpstreamUnavailable),
+            Ok(ServiceHttpAnswer {
+                status: 200,
+                body: MARKER.as_bytes().to_vec(),
+            }),
+        ] {
+            let wire = Wire::answering(answer);
+            let unanswered = send(&service(&wire), Some(&account)).await;
+            let Err(Unanswered::Sent(error)) = unanswered else {
+                panic!("a request the transport was given may have run: {unanswered:?}");
+            };
+            // The negative control: the token travelled beside the request.
+            assert_eq!(
+                wire.headers(),
+                [vec![(
+                    "authorization".to_owned(),
+                    format!("Bearer {MARKER}")
+                )]]
+            );
+            assert_unmarked("a request that may have run", &failure_renderings(error));
+        }
+    }
 }
