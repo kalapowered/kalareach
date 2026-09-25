@@ -189,8 +189,12 @@ impl Host {
         command.cwd(self.system_drive_root());
         let child = pty.slave.spawn_command(command).expect("starts kr");
         drop(pty.slave);
-        let output = ConsoleOutput::collect(pty.master.try_clone_reader().expect("a reader"));
-        let writer = pty.master.take_writer().expect("a writer");
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> =
+            Arc::new(Mutex::new(pty.master.take_writer().expect("a writer")));
+        let output = ConsoleOutput::collect(
+            pty.master.try_clone_reader().expect("a reader"),
+            Arc::clone(&writer),
+        );
         OnConsole {
             child,
             output,
@@ -253,15 +257,19 @@ async fn the_first_owner_is_not_confirmed_without_a_terminal() {
 struct OnConsole {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     output: ConsoleOutput,
-    writer: Box<dyn Write + Send>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     _master: Box<dyn portable_pty::MasterPty + Send>,
 }
 
 impl OnConsole {
     /// Types some bytes at the console.
     fn type_in(&mut self, bytes: &[u8]) {
-        self.writer.write_all(bytes).expect("typed");
-        self.writer.flush().expect("flushed");
+        let mut writer = self
+            .writer
+            .lock()
+            .expect("the console writer is not poisoned");
+        writer.write_all(bytes).expect("typed");
+        writer.flush().expect("flushed");
     }
 
     /// Waits for the command to end, and returns whether it succeeded and what it printed.
@@ -289,17 +297,41 @@ struct ConsoleOutput {
 }
 
 impl ConsoleOutput {
-    fn collect(mut reader: Box<dyn Read + Send>) -> Self {
+    fn collect(
+        mut reader: Box<dyn Read + Send>,
+        writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    ) -> Self {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let collected = Arc::clone(&seen);
         std::thread::spawn(move || {
+            // A real terminal answers a cursor-position report request (`ESC[6n`) with the cursor's
+            // position (`ESC[row;colR`). `kr` asks for it while it sets up the terminal and reads the
+            // answer before it does anything else, so a console that never answers holds it there and
+            // nothing it would go on to do - refuse, or ask to pair - is ever reached. This stand-in
+            // answers a fixed position, which is all that setup needs to carry on.
+            const QUERY: &[u8] = b"\x1b[6n";
+            const REPLY: &[u8] = b"\x1b[1;1R";
+            let mut answered = 0_usize;
             let mut buffer = [0_u8; 4096];
             while let Ok(read) = reader.read(&mut buffer) {
                 if read == 0 {
                     break;
                 }
-                if let Ok(mut seen) = collected.lock() {
-                    seen.extend_from_slice(&buffer[..read]);
+                let asked = match collected.lock() {
+                    Ok(mut seen) => {
+                        seen.extend_from_slice(&buffer[..read]);
+                        seen.windows(QUERY.len())
+                            .filter(|window| *window == QUERY)
+                            .count()
+                    }
+                    Err(_) => answered,
+                };
+                while answered < asked {
+                    if let Ok(mut writer) = writer.lock() {
+                        let _ = writer.write_all(REPLY);
+                        let _ = writer.flush();
+                    }
+                    answered += 1;
                 }
             }
         });
