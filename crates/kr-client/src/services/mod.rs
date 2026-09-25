@@ -84,13 +84,14 @@
 //! The same rule covers what a failure says. `serde_json`'s own message quotes the value it
 //! rejected (`invalid type: string "..."`), so an error that carried that text would print
 //! through [`std::fmt::Display`] the very thing the Debug rule keeps out of `{:?}`. Nothing here
-//! formats a JSON error into a message: [`json_fault`] is what a caller is told instead, and
-//! [`json::Unreadable`] about an answer, and both carry the class and the position and nothing that
-//! was in the document.
+//! formats a JSON error into a message: [`crate::shown::Shown::json`] is what a caller is told
+//! instead, and [`json::Unreadable`] about an answer, and both carry the class and the position and
+//! nothing that was in the document.
 //!
 //! One thing is deliberately not covered by it. A refusal the service sent carries the service's
 //! own message, which is written to be shown to a person, and that message is in the error this
-//! client returns. What is never in it is anything else of the answer. The one refusal whose words
+//! client returns, through [`crate::shown::Shown::service`], whose one input only this module's
+//! refusal readers can make. What is never in it is anything else of the answer. The one refusal whose words
 //! are this client's is settings sync's `SIGNED_BEFORE_CUTOFF` outside an exchange, because the
 //! service words it for a write and what the person needs is what it means for their request.
 
@@ -144,17 +145,6 @@ pub use voice::{
 
 /// A boxed future, so every service client stays usable behind a trait object.
 pub type ServiceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
-
-/// What a JSON failure says, with none of the document it was about.
-///
-/// `serde_json` names the value it rejected in its own message, and that value is a request body,
-/// an answer or a stored token. So this is what every failure of this kind in this module says
-/// instead: which kind of failure it was, and where in the document it happened. Both are useful
-/// to somebody diagnosing a mismatch and neither is anything that travelled. It is the words
-/// [`json::Unreadable`] uses for an answer, so a failure reads the same wherever it arose.
-pub(crate) fn json_fault(error: &serde_json::Error) -> String {
-    json::Unreadable::from(error).to_string()
-}
 
 /// The bounds a transport carrying this crate's managed-service clients reads answers under.
 ///
@@ -384,11 +374,13 @@ impl SyncRevision {
     }
 }
 
-impl std::fmt::Display for SyncRevision {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.0, formatter)
+impl crate::shown::Said for SyncRevision {
+    fn said(&self) -> crate::shown::Shown {
+        crate::shown!("{}", self.0)
     }
 }
+
+crate::display_as_said!(SyncRevision);
 
 /// The identity of one restore of a synchronisation service: the history a collection answers from.
 ///
@@ -420,11 +412,13 @@ impl SyncRecoveryId {
     }
 }
 
-impl std::fmt::Display for SyncRecoveryId {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.0, formatter)
+impl crate::shown::Said for SyncRecoveryId {
+    fn said(&self) -> crate::shown::Shown {
+        crate::shown!("{}", self.0)
     }
 }
+
+crate::display_as_said!(SyncRecoveryId);
 
 /// Whether a stored record's recovery names none, in which case the record leaves the member out.
 ///
@@ -522,18 +516,20 @@ impl SyncPosition {
     }
 }
 
-impl std::fmt::Display for SyncPosition {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.revision.as_ref() {
-            Some(revision) => write!(formatter, "write {} ({revision})", self.write_sequence)?,
-            None => write!(formatter, "write {} (removed)", self.write_sequence)?,
-        }
+impl crate::shown::Said for SyncPosition {
+    fn said(&self) -> crate::shown::Shown {
+        let place = match self.revision.as_ref() {
+            Some(revision) => crate::shown!("write {} ({})", self.write_sequence, *revision),
+            None => crate::shown!("write {} (removed)", self.write_sequence),
+        };
         match self.recovery() {
-            Some(recovery) => write!(formatter, " after recovery {recovery}"),
-            None => Ok(()),
+            Some(recovery) => crate::shown!("{} after recovery {}", place, recovery),
+            None => place,
         }
     }
 }
+
+crate::display_as_said!(SyncPosition);
 
 /// What a synchronisation service did with one exchange.
 ///
@@ -756,11 +752,11 @@ impl std::fmt::Debug for SyncFetched {
 /// the service. A caller reports it only once it has read the absence against the history of the
 /// collection, because an absence in another history says something else.
 #[must_use]
-pub fn nothing_held(what: &str) -> ClientError {
-    ClientError::Host(kr_protocol::error::ProtocolError::new(
+pub fn nothing_held(what: impl Into<crate::shown::Shown>) -> ClientError {
+    ClientError::refusal(
         kr_protocol::error::ErrorCode::UnknownSession,
-        format!("the service holds no {what} in that collection"),
-    ))
+        crate::shown!("the service holds no {} in that collection", what.into()),
+    )
 }
 
 /// What became of one exchange, for a caller that has to know whether a request that went
@@ -1378,7 +1374,7 @@ mod tests {
         // The control: serde's own message really does quote what it rejected, so the assertion
         // below is about what this module says rather than about a message that never had it.
         assert!(rejected.to_string().contains(NEVER_RENDERED), "{rejected}");
-        let said = json_fault(&rejected);
+        let said = crate::shown::Shown::json(&rejected).into_string();
         assert!(!said.contains(NEVER_RENDERED), "{said}");
         assert!(
             said.contains("is not the shape this client reads"),
@@ -1387,7 +1383,11 @@ mod tests {
         assert!(said.contains("line 1"), "{said}");
 
         let broken = serde_json::from_str::<Shape>("{").expect_err("that is not JSON");
-        assert!(json_fault(&broken).contains("ended early"));
+        assert!(
+            crate::shown::Shown::json(&broken)
+                .as_str()
+                .contains("ended early")
+        );
     }
 
     #[test]

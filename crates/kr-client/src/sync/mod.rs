@@ -205,7 +205,7 @@ impl SyncBody {
 /// authority is that nothing here reads a setting as authority and the client holds no handle to an
 /// authority store: section 20 gives host grants and revocation state one host authority, and there
 /// is no kind, no body variant and no code path here that reaches it.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SyncSettings {
     /// The settings, by their stable names.
@@ -218,11 +218,22 @@ pub struct SyncSettings {
     pub pinned_labels: BTreeSet<String>,
 }
 
+impl std::fmt::Debug for SyncSettings {
+    /// How many settings and labels there are, never what they say.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SyncSettings")
+            .field("values", &self.values.len())
+            .field("pinned_labels", &self.pinned_labels.len())
+            .finish()
+    }
+}
+
 /// One setting's value.
 ///
 /// The set is closed. A person's preference is one of these three things, and a shape that admitted
 /// anything else would be a shape a restore could smuggle something through.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum SettingValue {
     /// Text the person chose or typed.
@@ -231,6 +242,20 @@ pub enum SettingValue {
     Number(U64),
     /// A switch.
     Flag(bool),
+}
+
+impl std::fmt::Debug for SettingValue {
+    /// What kind of value it is, never the value: a setting is what a person chose.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Text(text) => formatter
+                .debug_struct("Text")
+                .field("bytes", &text.len())
+                .finish(),
+            Self::Number(_) => formatter.write_str("Number"),
+            Self::Flag(_) => formatter.write_str("Flag"),
+        }
+    }
 }
 
 /// Where a client was looking.
@@ -272,26 +297,6 @@ pub(crate) struct Zeroising(pub Vec<u8>);
 impl Drop for Zeroising {
     fn drop(&mut self) {
         kr_crypto::zeroise(&mut self.0);
-    }
-}
-
-/// What a stored record's encoding failure says, with none of the record in it.
-///
-/// A KR-CBOR-1 failure names what it rejected: a map key, a value, a serde message quoting the
-/// field it was reading. A stored synchronised record is a person's settings and drafts, so what a
-/// caller is told is the kind of fault and where in the bytes it was, which is what somebody
-/// diagnosing a damaged file needs, and none of what the file held.
-pub(crate) fn cbor_fault(error: &kr_cbor::CborError) -> String {
-    use kr_cbor::CborError as Fault;
-
-    match error {
-        Fault::EmptyInput => "it holds no record at all".to_owned(),
-        Fault::UnexpectedEnd { offset } => format!("it ends inside the record, at byte {offset}"),
-        Fault::TrailingBytes { count } => format!("{count} bytes follow the record"),
-        Fault::InputTooLarge { len, limit } => {
-            format!("it is {len} bytes against the {limit} a record may be")
-        }
-        _ => "it is not a record written in this encoding".to_owned(),
     }
 }
 

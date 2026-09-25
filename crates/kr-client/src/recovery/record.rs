@@ -44,6 +44,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::recovery::{RecoveryError, Result};
 use crate::services::SyncPosition;
+use crate::shown::{IoFault, Shown};
 
 /// The most a stored record may take, in bytes.
 ///
@@ -66,7 +67,7 @@ const LOCK_EXTENSION: &str = "bundle-lock";
 /// compared against. Neither the bundle nor its ciphertext is here: a write the service says it
 /// applied is read back from the locator, so nothing that settles a lost write needs the bundle's
 /// bytes.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct WriteRecord {
     /// Where the bundle is stored: the service origin and the locator.
@@ -91,6 +92,20 @@ pub(super) struct WriteRecord {
     pub(super) sent: Digest256,
     /// What is known of what became of it.
     pub(super) known: Known,
+}
+
+impl std::fmt::Debug for WriteRecord {
+    /// The origin as a diagnostic names one and the write's place; never the locator.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WriteRecord")
+            .field(
+                "service_origin",
+                &Shown::address(&self.context.service_origin),
+            )
+            .field("expected", &self.expected)
+            .finish_non_exhaustive()
+    }
 }
 
 /// What a store knows of what became of its last write.
@@ -147,13 +162,17 @@ impl RecordFile {
             .create(true)
             .truncate(false)
             .open(&lock_path)
-            .map_err(|source| storage(&lock_path, source))?;
+            .map_err(|source| storage(Shown::stored(&lock_path, &[]), source))?;
         match lock.try_lock() {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => {
-                return Err(RecoveryError::BundleStoreInUse { path: lock_path });
+                return Err(RecoveryError::BundleStoreInUse {
+                    path: Shown::stored(&lock_path, &[]),
+                });
             }
-            Err(std::fs::TryLockError::Error(source)) => return Err(storage(&lock_path, source)),
+            Err(std::fs::TryLockError::Error(source)) => {
+                return Err(storage(Shown::stored(&lock_path, &[]), source));
+            }
         }
         let file = Self {
             directory: directory.to_path_buf(),
@@ -164,7 +183,7 @@ impl RecordFile {
         match std::fs::remove_file(&file.partial) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => return Err(storage(&file.partial, source)),
+            Err(source) => return Err(storage(Shown::stored(&file.partial, &[]), source)),
         }
         let record = file.read(context)?;
         Ok((file, record))
@@ -175,10 +194,10 @@ impl RecordFile {
         let bytes = match std::fs::read(&self.path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(source) => return Err(storage(&self.path, source)),
+            Err(source) => return Err(storage(Shown::stored(&self.path, &[]), source)),
         };
         let unreadable = || RecoveryError::UnreadableWriteRecord {
-            path: self.path.clone(),
+            path: Shown::stored(&self.path, &[]),
         };
         // A record this build cannot read is refused rather than ignored: it may be the only
         // account of a write that can still land, and a store that dropped it would write again
@@ -204,7 +223,7 @@ impl RecordFile {
         let bytes = kr_cbor::to_canonical_vec(record)?;
         if bytes.len() > MAX_RECORD_BYTES {
             return Err(RecoveryError::UnreadableWriteRecord {
-                path: self.path.clone(),
+                path: Shown::stored(&self.path, &[]),
             });
         }
         // A partial file an earlier failure in this process could not remove is not a record, and
@@ -213,17 +232,18 @@ impl RecordFile {
         match std::fs::remove_file(&self.partial) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => return Err(storage(&self.partial, source)),
+            Err(source) => return Err(storage(Shown::stored(&self.partial, &[]), source)),
         }
-        write_whole(&self.partial, &bytes).map_err(|source| storage(&self.partial, source))?;
+        write_whole(&self.partial, &bytes)
+            .map_err(|source| storage(Shown::stored(&self.partial, &[]), source))?;
         // A rename within one directory replaces the name in one step, so a reader finds the old
         // record or the new one and never a record half written.
         if let Err(source) = std::fs::rename(&self.partial, &self.path) {
             let _ = std::fs::remove_file(&self.partial);
-            return Err(storage(&self.path, source));
+            return Err(storage(Shown::stored(&self.path, &[]), source));
         }
         kr_ipc::paths::flush_directory(&self.directory, kr_ipc::paths::NameKind::File)
-            .map_err(|source| storage(&self.directory, source))
+            .map_err(|source| storage(Shown::root(&self.directory), source))
     }
 
     /// Puts back the record a write that never left replaced: `previous`, or no record at all
@@ -243,17 +263,17 @@ impl RecordFile {
         match std::fs::remove_file(&self.path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => return Err(storage(&self.path, source)),
+            Err(source) => return Err(storage(Shown::stored(&self.path, &[]), source)),
         }
         kr_ipc::paths::flush_directory(&self.directory, kr_ipc::paths::NameKind::File)
-            .map_err(|source| storage(&self.directory, source))
+            .map_err(|source| storage(Shown::root(&self.directory), source))
     }
 }
 
-fn storage(path: &Path, source: std::io::Error) -> RecoveryError {
+fn storage(path: Shown, source: std::io::Error) -> RecoveryError {
     RecoveryError::Storage {
-        path: path.to_path_buf(),
-        source,
+        path,
+        fault: IoFault::from(source),
     }
 }
 

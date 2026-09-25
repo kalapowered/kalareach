@@ -44,12 +44,26 @@ use crate::transport::ControlTransport;
 pub const EVENT_BUFFER: usize = 1024;
 
 /// What the host answered one request with.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 enum Answer {
     /// A read's response.
     Response(Response),
     /// A mutation's receipt.
     Receipt(Box<Receipt>),
+}
+
+impl std::fmt::Debug for Answer {
+    /// Which kind of answer it is and, for a receipt, the action and its state; never a result.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Response(_) => formatter.write_str("Response(..)"),
+            Self::Receipt(receipt) => formatter
+                .debug_struct("Receipt")
+                .field("action_id", &receipt.action_id)
+                .field("state", &receipt.state)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 /// How the host settled one mutation.
@@ -60,12 +74,26 @@ enum Answer {
 /// receipt carries the action's durable execution state, which is what a caller asks about when it
 /// does not know whether its action happened. A host sends whichever it has; this names which
 /// arrived rather than making a caller guess.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum Settled {
     /// The host answered with the method's own result.
     Result(ParamsValue),
     /// The host answered with a receipt for the action.
     Receipt(Box<Receipt>),
+}
+
+impl std::fmt::Debug for Settled {
+    /// Which kind of settlement it is and, for a receipt, the action and its state; never a result.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Result(_) => formatter.write_str("Result(..)"),
+            Self::Receipt(receipt) => formatter
+                .debug_struct("Receipt")
+                .field("action_id", &receipt.action_id)
+                .field("state", &receipt.state)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 impl Settled {
@@ -100,16 +128,14 @@ impl Settled {
     {
         match self {
             Self::Result(value) => Ok(value.to_typed()?),
-            Self::Receipt(receipt) => {
-                Err(ClientError::Host(kr_protocol::error::ProtocolError::new(
-                    kr_protocol::error::ErrorCode::OutcomeUnknown,
-                    format!(
-                        "action {} is {} and has no result yet",
-                        receipt.action_id,
-                        receipt.state.as_str()
-                    ),
-                )))
-            }
+            Self::Receipt(receipt) => Err(ClientError::refusal(
+                kr_protocol::error::ErrorCode::OutcomeUnknown,
+                crate::shown!(
+                    "action {} is {} and has no result yet",
+                    receipt.action_id,
+                    receipt.state.as_str()
+                ),
+            )),
         }
     }
 }
@@ -207,11 +233,13 @@ impl Outcomes {
         let unknown = self.submitted.contains_key(&action_id);
         let receipted = self.receipts.get(&action_id).is_some();
         if unknown || receipted {
-            return Err(ClientError::Host(kr_protocol::error::ProtocolError::new(
+            return Err(ClientError::refusal(
                 kr_protocol::error::ErrorCode::InvalidArgument,
-                "that action is one this client is still accounting for, so it cannot carry \
+                crate::shown::Shown::said(
+                    "that action is one this client is still accounting for, so it cannot carry \
                  another request",
-            )));
+                ),
+            ));
         }
         Ok(())
     }
@@ -495,10 +523,10 @@ impl Session {
                 Outcome::Ok(value) => Ok(Ok(value)),
                 Outcome::Error(error) => Ok(Err(error)),
             },
-            Answer::Receipt(_) => Err(ClientError::Host(kr_protocol::error::ProtocolError::new(
+            Answer::Receipt(_) => Err(ClientError::refusal(
                 kr_protocol::error::ErrorCode::InvalidArgument,
-                "a read was answered with a receipt",
-            ))),
+                crate::shown::Shown::said("a read was answered with a receipt"),
+            )),
         }
     }
 
@@ -790,10 +818,10 @@ impl Session {
                 Outcome::Ok(value) => Ok(value.to_typed()?),
                 Outcome::Error(error) => Err(ClientError::from(error)),
             },
-            Answer::Receipt(_) => Err(ClientError::Host(kr_protocol::error::ProtocolError::new(
+            Answer::Receipt(_) => Err(ClientError::refusal(
                 kr_protocol::error::ErrorCode::InvalidArgument,
-                "raw input is an ordered stream and receives no receipt",
-            ))),
+                crate::shown::Shown::said("raw input is an ordered stream and receives no receipt"),
+            )),
         }
     }
 

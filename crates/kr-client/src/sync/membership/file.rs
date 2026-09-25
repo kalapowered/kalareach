@@ -19,6 +19,7 @@ use kr_ipc::paths::{NameKind, flush_directory, flush_path_names};
 
 use super::MembershipError;
 use super::facts::{Facts, Kinds};
+use crate::shown::{IoFault, Shown};
 use crate::sync::store::{Lock, private_directory, write_whole};
 
 /// The name of the file the facts are kept in.
@@ -59,8 +60,8 @@ impl MembershipFile {
     /// is left to the next opening: a partial file is never read as the file.
     pub(crate) fn open(directory: impl Into<PathBuf>) -> Result<Self, MembershipError> {
         let directory = directory.into();
-        private_directory(&directory).map_err(|source| storage(&directory, source))?;
-        flush_path_names(&directory).map_err(|source| storage(&directory, source))?;
+        private_directory(&directory).map_err(|source| storage(Shown::root(&directory), source))?;
+        flush_path_names(&directory).map_err(|source| storage(Shown::root(&directory), source))?;
         let file = Self { directory };
         match file.lock() {
             Ok(guard) => {
@@ -89,12 +90,12 @@ impl MembershipFile {
         match Lock::try_take(&path) {
             Ok(Some(lock)) => Ok(FileLock { _lock: lock }),
             Ok(None) => Err(MembershipError::Busy),
-            Err(crate::sync::SyncError::Storage { path, source }) => {
-                Err(MembershipError::Storage { path, source })
+            Err(crate::sync::SyncError::Storage { path, fault }) => {
+                Err(MembershipError::Storage { path, fault })
             }
             Err(error) => Err(MembershipError::Storage {
-                path,
-                source: std::io::Error::other(error.to_string()),
+                path: stored(&path),
+                fault: IoFault::from(std::io::Error::other(crate::shown!("{}", error))),
             }),
         }
     }
@@ -105,12 +106,12 @@ impl MembershipFile {
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => crate::sync::Zeroising(bytes),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(storage(&path, error)),
+            Err(error) => return Err(storage(stored(&path), error)),
         };
         let facts = kr_cbor::from_canonical_slice(&bytes.0, &LIMITS).map_err(|error| {
             MembershipError::Corrupt {
-                path: path.clone(),
-                reason: crate::sync::cbor_fault(&error),
+                path: stored(&path),
+                reason: Shown::cbor(&error),
             }
         })?;
         Ok(Some(facts))
@@ -126,40 +127,46 @@ impl MembershipFile {
             kr_transport::random::fresh_uuid_v4()
                 .map_err(|error| MembershipError::Service(error.into()))?
         ));
-        write_whole(&partial, &bytes.0).map_err(|source| storage(&partial, source))?;
+        write_whole(&partial, &bytes.0).map_err(|source| storage(stored(&partial), source))?;
         if let Err(source) = std::fs::rename(&partial, &path) {
             let _ = std::fs::remove_file(&partial);
-            return Err(storage(&path, source));
+            return Err(storage(stored(&path), source));
         }
         flush_directory(&self.directory, NameKind::File)
-            .map_err(|source| storage(&self.directory, source))
+            .map_err(|source| storage(Shown::root(&self.directory), source))
     }
 
     /// Removes every partial file. The caller holds the lock.
     fn sweep_partials(&self) -> Result<(), MembershipError> {
         let entries = std::fs::read_dir(&self.directory)
-            .map_err(|source| storage(&self.directory, source))?;
+            .map_err(|source| storage(Shown::root(&self.directory), source))?;
         for entry in entries {
-            let entry = entry.map_err(|source| storage(&self.directory, source))?;
+            let entry = entry.map_err(|source| storage(Shown::root(&self.directory), source))?;
             let path = entry.path();
             if path.extension().and_then(|extension| extension.to_str()) == Some(PARTIAL_EXTENSION)
             {
                 match std::fs::remove_file(&path) {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(storage(&path, error)),
+                    Err(error) => return Err(storage(stored(&path), error)),
                 }
             }
         }
         flush_directory(&self.directory, NameKind::File)
-            .map_err(|source| storage(&self.directory, source))
+            .map_err(|source| storage(Shown::root(&self.directory), source))
     }
 }
 
 /// Says which path could not be used.
-fn storage(path: &Path, source: std::io::Error) -> MembershipError {
+fn storage(path: Shown, source: std::io::Error) -> MembershipError {
     MembershipError::Storage {
-        path: path.to_path_buf(),
-        source,
+        path,
+        fault: IoFault::from(source),
     }
+}
+
+/// A file of the membership store's own, as a failure may name it: whole when the store wrote its
+/// name.
+fn stored(path: &Path) -> Shown {
+    Shown::stored(path, &[FACTS_NAME, LOCK_NAME])
 }

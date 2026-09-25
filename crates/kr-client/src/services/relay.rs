@@ -40,7 +40,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use kr_cbor::{CborError, sha256, signing_value};
-use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{RelayInstanceId, RelayLeaseId, RelayRegion, RelayReservationId};
 use kr_protocol::relay::{RelayLeaseAck, SignedRelayLease};
 use kr_protocol::scalars::{
@@ -53,6 +53,7 @@ use super::ServiceFuture;
 use super::{LeaseEndReason, LeasePayer, LeaseRequest, RelayDirection, RelayLeaseService};
 use crate::error::{ClientError, Result};
 use crate::retry::UserAction;
+use crate::shown::{ServiceMessage, Shown};
 
 /// The domain a lease request's body digest covers.
 pub const RELAY_LEASE_REQUEST_DOMAIN: &str = "kr-relay-lease-request/1";
@@ -644,9 +645,9 @@ impl ManagedRelayLeaseService {
 
         let request =
             serde_json::to_vec(&SignedRelayRequest { body, signature }).map_err(|error| {
-                malformed(format!(
+                malformed(crate::shown!(
                     "a request could not be written: {}",
-                    super::json_fault(&error)
+                    Shown::json(&error)
                 ))
             })?;
         let url = format!("{}{path}", self.origin.as_str());
@@ -674,9 +675,9 @@ impl RelayLeaseService for ManagedRelayLeaseService {
                 // client cannot do is say which answer it was, and a caller must not retry blindly.
                 unreadable(
                     200,
-                    &format!(
+                    crate::shown!(
                         "this client cannot read its lease answer: {}",
-                        super::json_fault(&error)
+                        Shown::json(&error)
                     ),
                 )
             })?;
@@ -705,9 +706,9 @@ impl RelayLeaseService for ManagedRelayLeaseService {
                 // is why a revocation is idempotent, but this client cannot say what happened.
                 unreadable(
                     200,
-                    &format!(
+                    crate::shown!(
                         "this client cannot read its revocation answer: {}",
-                        super::json_fault(&error)
+                        Shown::json(&error)
                     ),
                 )
             })
@@ -748,7 +749,7 @@ fn data_of(answer: &ServiceHttpAnswer) -> Result<serde_json::Value> {
     let envelope = super::json::read::<Envelope>(&answer.body).map_err(|fault| {
         unreadable(
             answer.status,
-            &format!("its answer is not one this client reads: {fault}"),
+            crate::shown!("its answer is not one this client reads: {}", fault),
         )
     })?;
 
@@ -763,7 +764,10 @@ fn data_of(answer: &ServiceHttpAnswer) -> Result<serde_json::Value> {
     };
 
     let (code, action) = classify(&refusal.code, answer.status);
-    let error = ProtocolError::new(code, refusal.message);
+    let error = crate::error::refusal(
+        code,
+        Shown::service(&ServiceMessage::from_refusal(refusal.message)),
+    );
 
     // Always the service's own variant, with or without a delay. What a person is told about a
     // refusal turns on who refused and why, and the service's own code says more than the protocol
@@ -816,7 +820,7 @@ fn classify(code: &str, status: u16) -> (ErrorCode, UserAction) {
 /// outcome and never retried automatically. A fault or a rate limit is transient. Anything else
 /// without an envelope never reached this service's own routes, which is a configuration between
 /// here and it rather than a value this caller chose.
-fn unreadable(status: u16, what: &str) -> ClientError {
+fn unreadable(status: u16, what: impl Into<Shown>) -> ClientError {
     let code = if (200..300).contains(&status) {
         ErrorCode::OutcomeUnknown
     } else if status >= 500 || status == 408 || status == 429 {
@@ -825,15 +829,15 @@ fn unreadable(status: u16, what: &str) -> ClientError {
         ErrorCode::HostNotConfigured
     };
 
-    ClientError::Host(ProtocolError::new(
+    ClientError::refusal(
         code,
-        format!("the service answered {status} and {what}"),
-    ))
+        crate::shown!("the service answered {} and {}", status, what.into()),
+    )
 }
 
 /// A request this client could not build, which is a local fault rather than an answer.
-fn malformed(message: String) -> ClientError {
-    ClientError::Host(ProtocolError::new(ErrorCode::InvalidArgument, message))
+fn malformed(message: impl Into<Shown>) -> ClientError {
+    ClientError::refusal(ErrorCode::InvalidArgument, message.into())
 }
 
 /// This machine's clock, in UTC milliseconds.
@@ -848,8 +852,12 @@ fn now_ms() -> u64 {
 /// A fresh nonce from the operating system's generator.
 fn fresh_nonce() -> Result<[u8; 32]> {
     let mut nonce = [0u8; 32];
-    kr_crypto::random_bytes(&mut nonce)
-        .map_err(|error| malformed(format!("a nonce could not be drawn: {error}")))?;
+    kr_crypto::random_bytes(&mut nonce).map_err(|error| {
+        malformed(crate::shown!(
+            "a nonce could not be drawn: {}",
+            Shown::crypto(&error)
+        ))
+    })?;
     Ok(nonce)
 }
 

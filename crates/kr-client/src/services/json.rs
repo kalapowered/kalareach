@@ -58,7 +58,7 @@ pub fn read<T: DeserializeOwned>(text: &[u8]) -> Result<T, Unreadable> {
 ///
 /// Which rule the text broke, and the line and column it was found at. Both help somebody
 /// diagnosing a mismatch, and neither is anything that travelled. It is also what this crate says
-/// about any other JSON failure, through [`super::json_fault`].
+/// about any other JSON failure, through [`crate::shown::Shown::json`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Unreadable {
     fault: Fault,

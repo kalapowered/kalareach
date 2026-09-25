@@ -65,7 +65,7 @@ use kr_protocol::archive::{
     ArchiveCheckpoint, RECOVERY_BUNDLE_SCHEMA_VERSION, RecoveryBundle, RecoveryContext,
     RecoveryKit, TrustedProducer, TrustedWriter,
 };
-use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::SyncConflictId;
 use kr_protocol::scalars::{
     Bytes, Digest256, KeyId, Nullable, StoredEnvelopeKey, TimestampMs, U64,
@@ -188,8 +188,10 @@ impl std::fmt::Debug for BundleStore {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("BundleStore")
-            .field("service_origin", &self.context.service_origin)
-            .field("bundle_locator", &self.context.bundle_locator)
+            .field(
+                "service_origin",
+                &crate::shown::Shown::address(&self.context.service_origin),
+            )
             .field("position", &self.position())
             .field("lost_write", &self.lost_write())
             .finish_non_exhaustive()
@@ -723,10 +725,12 @@ impl BundleStore {
             Ok(SyncDispatch::Answered(SyncExchanged::SignedBeforeCutoff)) => {
                 Err(RecoveryError::BundleOutcomeUnknown {
                     sent,
-                    source: Box::new(ClientError::Host(ProtocolError::new(
+                    source: Box::new(ClientError::refusal(
                         ErrorCode::PermissionDenied,
-                        "the service refused the write as signed before its cutoff, and ran nothing",
-                    ))),
+                        crate::shown::Shown::said(
+                            "the service refused the write as signed before its cutoff, and ran nothing",
+                        ),
+                    )),
                 })
             }
             // Anything else stopped the exchange from being answered at all, and an exchange that
@@ -1271,12 +1275,29 @@ impl BundleStore {
 ///
 /// It is returned by [`BundleStore::enable_writer`] and built nowhere else, so holding one is
 /// holding the ordering section 20 requires.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct WriterEnabled {
     writer_key_id: KeyId,
     context: RecoveryContext,
     bundle_revision: u64,
     bundle_position: SyncPosition,
+}
+
+impl std::fmt::Debug for WriterEnabled {
+    /// The writer, the origin as a diagnostic names one, and where the bundle stands; never the
+    /// locator.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WriterEnabled")
+            .field("writer_key_id", &self.writer_key_id)
+            .field(
+                "service_origin",
+                &crate::shown::Shown::address(&self.context.service_origin),
+            )
+            .field("bundle_revision", &self.bundle_revision)
+            .field("bundle_position", &self.bundle_position)
+            .finish_non_exhaustive()
+    }
 }
 
 impl WriterEnabled {
@@ -1313,7 +1334,7 @@ impl WriterEnabled {
 ///
 /// It names both locations, because after a migration both hold bytes: the new one holds the
 /// bundle and the old one holds the copy it superseded, until the service removes it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct MigrationRecord {
     /// Where the bundle was.
     pub from: RecoveryContext,
@@ -1327,26 +1348,58 @@ pub struct MigrationRecord {
     pub verified_at_ms: TimestampMs,
 }
 
+impl std::fmt::Debug for MigrationRecord {
+    /// Both origins as a diagnostic names one and where the bundle stands; never a locator.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MigrationRecord")
+            .field(
+                "from",
+                &crate::shown::Shown::address(&self.from.service_origin),
+            )
+            .field("to", &crate::shown::Shown::address(&self.to.service_origin))
+            .field("bundle_revision", &self.bundle_revision)
+            .field("bundle_position", &self.bundle_position)
+            .field("verified_at_ms", &self.verified_at_ms)
+            .finish_non_exhaustive()
+    }
+}
+
 impl MigrationRecord {
     /// The sentence an owner is shown, which says what to do with the kit they were holding.
     #[must_use]
-    pub fn describe(&self) -> String {
-        format!(
+    pub fn describe(&self) -> crate::shown::Shown {
+        crate::shown!(
             "Your recovery bundle is now at {} under a new locator, and it was read back and \
              authenticated there. Keep the updated kit and destroy the old one: the old kit still \
              opens the copy left at {}, which is the bundle as it was before this move.",
-            self.to.service_origin, self.from.service_origin
+            crate::shown::Shown::address(&self.to.service_origin),
+            crate::shown::Shown::address(&self.from.service_origin)
         )
     }
 }
 
 /// A migration and the kit it obsoletes the old one with.
-#[derive(Debug)]
 pub struct Migrated {
     /// The verified record of the move.
     pub record: MigrationRecord,
     /// The kit a person keeps from now on. The old one points at a location the bundle has left.
     pub updated_kit: RecoveryKit,
+}
+
+impl std::fmt::Debug for Migrated {
+    /// The record, and how many origins the updated kit names; never the kit's origins, locator or
+    /// seed.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Migrated")
+            .field("record", &self.record)
+            .field(
+                "updated_kit_origins",
+                &self.updated_kit.service_origins.len(),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 /// One offline export: the encrypted bundle and the selected archives' own ciphertext.

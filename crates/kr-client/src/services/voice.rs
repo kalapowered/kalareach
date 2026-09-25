@@ -41,14 +41,15 @@
 use std::fmt;
 use std::sync::Arc;
 
-use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::error::ErrorCode;
 use serde::{Deserialize, Serialize};
 
 use super::ServiceFuture;
-use super::account::{AccountToken, AccountTokenSource};
+use super::account::{AccountToken, AccountTokenSource, scope_shown, scope_summary};
 pub use super::{ServiceHttp, ServiceHttpAnswer};
 use crate::error::{ClientError, Result};
 use crate::retry::UserAction;
+use crate::shown::{ServiceMessage, Shown};
 
 /// The scope an account token needs before it can start or control a managed call.
 ///
@@ -447,11 +448,13 @@ impl VoiceRefusalReason {
     }
 }
 
-impl fmt::Display for VoiceRefusalReason {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
+impl crate::shown::Said for VoiceRefusalReason {
+    fn said(&self) -> crate::shown::Shown {
+        crate::shown::Shown::said(self.as_str())
     }
 }
+
+crate::display_as_said!(VoiceRefusalReason);
 
 /// A refusal, as this client reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -617,11 +620,13 @@ impl VoiceCommand {
     }
 }
 
-impl fmt::Display for VoiceCommand {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
+impl crate::shown::Said for VoiceCommand {
+    fn said(&self) -> crate::shown::Shown {
+        crate::shown::Shown::said(self.as_str())
     }
 }
+
+crate::display_as_said!(VoiceCommand);
 
 /// One bounded context request, as it travels on the control socket.
 #[derive(Clone, PartialEq, Eq, Serialize)]
@@ -1015,11 +1020,22 @@ mod origin_tests {
 }
 
 /// The managed voice broker client.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ManagedVoiceBroker {
     origin: String,
     http: Arc<dyn ServiceHttp>,
     tokens: Arc<dyn AccountTokenSource>,
+}
+
+impl fmt::Debug for ManagedVoiceBroker {
+    /// The origin as a diagnostic names one: an address may carry a user name and a password in
+    /// front of its host.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ManagedVoiceBroker")
+            .field("origin", &Shown::address(&self.origin))
+            .finish_non_exhaustive()
+    }
 }
 
 impl ManagedVoiceBroker {
@@ -1115,9 +1131,9 @@ impl ManagedVoiceService for ManagedVoiceBroker {
     fn start<'a>(&'a self, request: &'a VoiceSessionRequest) -> ServiceFuture<'a, VoiceStart> {
         Box::pin(async move {
             let body = serde_json::to_vec(&request.body()?).map_err(|error| {
-                local(&format!(
+                local(crate::shown!(
                     "a request could not be written: {}",
-                    super::json_fault(&error)
+                    Shown::json(&error)
                 ))
             })?;
             // Read rather than classified into an error: a creation has three outcomes and two of
@@ -1136,9 +1152,9 @@ impl ManagedVoiceService for ManagedVoiceBroker {
             serde_json::from_value(data).map_err(|error| {
                 unreadable(
                     200,
-                    &format!(
+                    crate::shown!(
                         "this client cannot read its closure answer: {}",
-                        super::json_fault(&error)
+                        Shown::json(&error)
                     ),
                 )
             })
@@ -1155,10 +1171,7 @@ fn read_metadata(data: serde_json::Value) -> Result<VoiceMetadata> {
     let metadata: VoiceMetadata = serde_json::from_value(data).map_err(|error| {
         unreadable(
             200,
-            &format!(
-                "this client cannot read its terms: {}",
-                super::json_fault(&error)
-            ),
+            crate::shown!("this client cannot read its terms: {}", Shown::json(&error)),
         )
     })?;
     if !metadata.rate.readable() {
@@ -1197,7 +1210,7 @@ fn data_of(answer: &ServiceHttpAnswer) -> Result<serde_json::Value> {
     let envelope = super::json::read::<Envelope>(&answer.body).map_err(|fault| {
         unreadable(
             answer.status,
-            &format!("its answer is not one this client reads: {fault}"),
+            crate::shown!("its answer is not one this client reads: {}", fault),
         )
     })?;
 
@@ -1212,9 +1225,9 @@ fn data_of(answer: &ServiceHttpAnswer) -> Result<serde_json::Value> {
     };
 
     Err(ClientError::Refused {
-        error: ProtocolError::new(
+        error: crate::error::refusal(
             classify(&refusal.code, refusal.reason, answer.status),
-            refusal.message,
+            Shown::service(&ServiceMessage::from_refusal(refusal.message)),
         ),
         retry_after_seconds: None,
         action: action_for(refusal.reason),
@@ -1370,7 +1383,7 @@ fn action_for(reason: Option<VoiceRefusalReason>) -> UserAction {
 }
 
 /// An answer this client could not read, classified by the status that carried it.
-fn unreadable(status: u16, what: &str) -> ClientError {
+fn unreadable(status: u16, what: impl Into<Shown>) -> ClientError {
     let code = if (200..300).contains(&status) {
         ErrorCode::OutcomeUnknown
     } else if status >= 500 || status == 408 || status == 429 {
@@ -1378,18 +1391,19 @@ fn unreadable(status: u16, what: &str) -> ClientError {
     } else {
         ErrorCode::HostNotConfigured
     };
-    ClientError::Host(ProtocolError::new(
+    ClientError::refusal(
         code,
-        format!("the managed service answered {status} and {what}"),
-    ))
+        crate::shown!(
+            "the managed service answered {} and {}",
+            status,
+            what.into()
+        ),
+    )
 }
 
 /// A request this client could not build, which is a local fault rather than an answer.
-fn local(message: &str) -> ClientError {
-    ClientError::Host(ProtocolError::new(
-        ErrorCode::InvalidArgument,
-        message.to_owned(),
-    ))
+fn local(message: impl Into<Shown>) -> ClientError {
+    ClientError::refusal(ErrorCode::InvalidArgument, message.into())
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1430,29 +1444,10 @@ impl fmt::Debug for StoredAccountToken {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("StoredAccountToken")
-            .field("origin", &addressed(&self.origin))
-            .field("scopes", &self.scopes)
+            .field("origin", &Shown::address(&self.origin))
+            .field("scopes", &scope_summary(&self.scopes))
             .field("expires_at_ms", &self.expires_at_ms)
             .finish_non_exhaustive()
-    }
-}
-
-/// One address as a rendering may show it: the scheme, the host and the port, and nothing in
-/// front of the host.
-///
-/// An address is allowed to carry a user name and a password before the host, and one that does is
-/// carrying a credential in a field that reads like configuration. An address that cannot be
-/// parsed is not rendered at all, because what cannot be taken apart cannot be shown to be safe.
-fn addressed(origin: &str) -> String {
-    match url::Url::parse(origin) {
-        Ok(address) if address.username().is_empty() && address.password().is_none() => {
-            match (address.host_str(), address.port()) {
-                (Some(host), Some(port)) => format!("{}://{host}:{port}", address.scheme()),
-                (Some(host), None) => format!("{}://{host}", address.scheme()),
-                (None, _) => "<not an address>".to_owned(),
-            }
-        }
-        Ok(_) | Err(_) => "<not printed>".to_owned(),
     }
 }
 
@@ -1479,7 +1474,7 @@ impl StoredAccountToken {
         let document: TokenDocument = serde_json::from_slice(bytes).map_err(|error| {
             // Only the position, never the message: a serde message for a string field can quote
             // what it was reading, and what it was reading may be the token.
-            local(&format!(
+            local(crate::shown!(
                 "that is not an account token document: it stops making sense at line {}, \
                  column {}",
                 error.line(),
@@ -1490,7 +1485,8 @@ impl StoredAccountToken {
             || document.origin.ends_with('/')
         {
             return Err(local(
-                "an account token names the origin it belongs to, as an absolute address with no                  trailing slash",
+                "an account token names the origin it belongs to, as an absolute address with no \
+                 trailing slash",
             ));
         }
         Ok(Self {
@@ -1514,9 +1510,9 @@ impl StoredAccountToken {
             expires_at_ms: self.expires_at_ms,
         };
         let mut bytes = serde_json::to_vec_pretty(&document).map_err(|error| {
-            local(&format!(
+            local(crate::shown!(
                 "the token could not be written: {}",
-                super::json_fault(&error)
+                Shown::json(&error)
             ))
         })?;
         bytes.push(b'\n');
@@ -1534,23 +1530,21 @@ impl StoredAccountToken {
     /// The origin, the scopes and the expiry, which is everything an operator needs to see that
     /// the right thing was imported. The value is not here and cannot be derived from what is.
     #[must_use]
-    pub fn description(&self) -> String {
-        let scopes = if self.scopes.is_empty() {
-            "no scopes".to_owned()
-        } else {
-            self.scopes.join(", ")
-        };
-        // The origin as a rendering names one. A description is written to be shown, and an
-        // address may carry a user name and a password in front of the host.
+    pub fn description(&self) -> Shown {
+        // The origin as a rendering names one, and the scopes as this build knows them. A
+        // description is written to be shown, an address may carry a user name and a password in
+        // front of the host, and a scope is whatever the file said.
         match self.expires_at_ms {
-            Some(expires_at_ms) => format!(
-                "an account token for {} carrying {scopes}, until {expires_at_ms} in UTC \
-                 milliseconds",
-                addressed(&self.origin)
+            Some(expires_at_ms) => crate::shown!(
+                "an account token for {} carrying {}, until {} in UTC milliseconds",
+                Shown::address(&self.origin),
+                scope_summary(&self.scopes),
+                expires_at_ms
             ),
-            None => format!(
-                "an account token for {} carrying {scopes}, with no stated expiry",
-                addressed(&self.origin)
+            None => crate::shown!(
+                "an account token for {} carrying {}, with no stated expiry",
+                Shown::address(&self.origin),
+                scope_summary(&self.scopes)
             ),
         }
     }
@@ -1577,7 +1571,7 @@ impl fmt::Debug for AccountTokenFile {
         formatter
             .debug_struct("AccountTokenFile")
             .field("path", &self.path)
-            .field("origin", &self.origin.as_deref().map(addressed))
+            .field("origin", &self.origin.as_deref().map(Shown::address))
             .finish()
     }
 }
@@ -1617,20 +1611,23 @@ impl AccountTokenFile {
     pub fn stored(&self) -> Result<StoredAccountToken> {
         let bytes = kr_ipc::paths::read_owner_only_file(&self.path, ACCOUNT_TOKEN_FILE_LIMIT)
             .map_err(|error| {
-                ClientError::Host(ProtocolError::new(
+                ClientError::refusal(
                     ErrorCode::HostNotConfigured,
-                    format!("the account token could not be read: {error}"),
-                ))
+                    crate::shown!(
+                        "the account token could not be read: {}",
+                        Shown::ipc(&error)
+                    ),
+                )
             })?
             .ok_or_else(|| {
-                ClientError::Host(ProtocolError::new(
+                ClientError::refusal(
                     ErrorCode::HostNotConfigured,
-                    format!(
+                    crate::shown!(
                         "no account token has been imported. Write one with `kr account token \
                          import <path>`; it is read from {}.",
-                        self.path.display()
+                        Shown::root(&self.path)
                     ),
-                ))
+                )
             })?;
         StoredAccountToken::read(&bytes)
     }
@@ -1647,21 +1644,24 @@ impl AccountTokenSource for AccountTokenFile {
                 // not issued for. Both origins are named the way a rendering names one: an address
                 // may carry a user name and a password in front of the host, and the token is not
                 // the only credential this refusal could otherwise print.
-                return Err(ClientError::Host(ProtocolError::new(
+                return Err(ClientError::refusal(
                     ErrorCode::HostNotConfigured,
-                    format!(
+                    crate::shown!(
                         "the imported account token belongs to {} and this host is configured to \
                          reach {}",
-                        addressed(&stored.origin),
-                        addressed(origin)
+                        Shown::address(&stored.origin),
+                        Shown::address(origin)
                     ),
-                )));
+                ));
             }
             if !stored.carries(scope) {
-                return Err(ClientError::Host(ProtocolError::new(
+                return Err(ClientError::refusal(
                     ErrorCode::PermissionDenied,
-                    format!("the imported account token was not issued with the {scope} scope"),
-                )));
+                    crate::shown!(
+                        "the imported account token was not issued with the {} scope",
+                        scope_shown(scope)
+                    ),
+                ));
             }
             Ok(stored.access_token)
         })
@@ -2043,7 +2043,7 @@ mod tests {
         )
         .expect("a token document");
         assert!(stored.carries(VOICE_SCOPE));
-        let described = stored.description();
+        let described = stored.description().into_string();
         assert!(!described.contains("a-secret-value"), "{described}");
         assert!(described.contains("reach.example"));
         assert!(!format!("{stored:?}").contains("a-secret-value"));

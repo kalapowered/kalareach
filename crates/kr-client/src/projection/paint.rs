@@ -174,12 +174,23 @@ impl Comparison {
 }
 
 /// One painted frame.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Painted {
     /// The bytes to write to the destination.
     pub bytes: Vec<u8>,
     /// What the frame could not carry.
     pub comparison: Comparison,
+}
+
+impl std::fmt::Debug for Painted {
+    /// How much was painted and what changed, never the bytes.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Painted")
+            .field("bytes", &self.bytes.len())
+            .field("comparison", &self.comparison)
+            .finish()
+    }
 }
 
 /// Which of this destination's keyboard protocols may be changed, and why.

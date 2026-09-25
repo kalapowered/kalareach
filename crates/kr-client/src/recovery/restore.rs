@@ -52,7 +52,7 @@ impl RetrievalPolicy {
 /// It carries no key, and that half *is* structural. Holding one means a restore can *fetch*
 /// ciphertext; opening that ciphertext needs the seed the kit carries, and section 20 says so in
 /// as many words: service login alone does not decrypt the bundle.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ServiceAccess {
     policy: RetrievalPolicy,
     service_origin: String,
@@ -87,12 +87,27 @@ impl ServiceAccess {
     }
 }
 
+impl std::fmt::Debug for ServiceAccess {
+    /// The policy and the origin as a diagnostic names one: an address may carry a user name and
+    /// a password in front of its host.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServiceAccess")
+            .field("policy", &self.policy)
+            .field(
+                "service_origin",
+                &crate::shown::Shown::address(&self.service_origin),
+            )
+            .finish()
+    }
+}
+
 /// What the authenticated bundle gives a restore.
 ///
 /// Every writer key a restore will ever trust is in here, and it came out of a bundle that
 /// authenticated under a key only the seed derives. Nothing in a restore reads a writer key from
 /// an archive descriptor, so there is no path by which one could be added.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct TrustedMaterial {
     /// Where the bundle was read from.
     pub context: RecoveryContext,
@@ -110,6 +125,25 @@ pub struct TrustedMaterial {
     pub checkpoints: Vec<ArchiveCheckpoint>,
     /// The bundle revision this came from.
     pub bundle_revision: u64,
+}
+
+impl std::fmt::Debug for TrustedMaterial {
+    /// Where it was read, as a diagnostic names an origin, how much it holds and its revision. The
+    /// locator is not shown: it is what reaches the bundle.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TrustedMaterial")
+            .field(
+                "service_origin",
+                &crate::shown::Shown::address(&self.context.service_origin),
+            )
+            .field("trusted_writers", &self.trusted_writers.len())
+            .field("trusted_producers", &self.trusted_producers.len())
+            .field("collections", &self.collections.len())
+            .field("checkpoints", &self.checkpoints.len())
+            .field("bundle_revision", &self.bundle_revision)
+            .finish_non_exhaustive()
+    }
 }
 
 impl TrustedMaterial {
@@ -134,11 +168,23 @@ impl TrustedMaterial {
 }
 
 /// A restore on a device that holds nothing but the kit.
-#[derive(Debug)]
 pub struct FreshRestore {
     kit: RecoveryKit,
     policy: RetrievalPolicy,
     access: Option<ServiceAccess>,
+}
+
+impl std::fmt::Debug for FreshRestore {
+    /// The policy, how many origins the kit names and whether access was obtained; never the kit's
+    /// origins, its locator or its seed.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FreshRestore")
+            .field("kit_origins", &self.kit.service_origins.len())
+            .field("policy", &self.policy)
+            .field("access", &self.access)
+            .finish_non_exhaustive()
+    }
 }
 
 impl FreshRestore {

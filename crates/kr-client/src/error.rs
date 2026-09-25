@@ -4,19 +4,23 @@ use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::method::{Method, MethodVersion};
 
 use crate::retry::{Decision, Failure, RequestClass, UserAction};
+use crate::shown::{Said, Shown};
 
 /// A client failure.
-#[derive(Debug, thiserror::Error)]
+///
+/// What it says is a [`Shown`], so no rendering of it carries what a host, a service or a file
+/// sent: [`Said`] is its `Display` and its `Debug`. Four variants hold another crate's value,
+/// because other crates build them and match on what is inside ([`Self::Transport`],
+/// [`Self::Ipc`], [`Self::Host`] and [`Self::Refused`]); each is rendered through its reducer or
+/// door and none is this error's `source()`, so a logger that walks a source chain meets only what
+/// this rendering says.
 #[non_exhaustive]
 pub enum ClientError {
     /// The transport failed.
-    #[error("{0}")]
-    Transport(#[from] kr_transport::TransportError),
+    Transport(kr_transport::TransportError),
     /// The local socket or named pipe failed.
-    #[error("{0}")]
-    Ipc(#[from] kr_ipc::IpcError),
+    Ipc(kr_ipc::IpcError),
     /// The host answered with an error.
-    #[error("{}: {}", .0.code.as_str(), .0.message)]
     Host(ProtocolError),
     /// A managed service refused the request.
     ///
@@ -28,7 +32,6 @@ pub enum ClientError {
     /// `PERMISSION_DENIED`, and a service uses it both for a caller that is not signed in and for
     /// an account that may not do this, so it says which by carrying the action. A service refusal
     /// is therefore this variant whether or not it named a delay.
-    #[error("{}: {}{}", .error.code.as_str(), .error.message, delay_note(.retry_after_seconds))]
     Refused {
         /// What the service said was wrong.
         error: ProtocolError,
@@ -43,10 +46,11 @@ pub enum ClientError {
         action: UserAction,
     },
     /// A value could not be encoded or decoded as KR-CBOR-1.
-    #[error("the message was not canonical: {0}")]
-    Cbor(#[from] kr_cbor::CborError),
+    ///
+    /// It holds what [`Shown::cbor`] says of the failure, which is how every KR-CBOR-1 failure
+    /// becomes this: the conversion reduces it, so `?` cannot carry a decoder's own words.
+    Cbor(Shown),
     /// The method's registry entry forbids this call shape.
-    #[error("{method} is a {expected} and cannot be called as a {actual}")]
     WrongEffect {
         /// The method that was called.
         method: Method,
@@ -56,7 +60,6 @@ pub enum ClientError {
         actual: &'static str,
     },
     /// This build does not implement the method at that version.
-    #[error("{method} is version {supported}, not {requested}")]
     UnsupportedVersion {
         /// The method that was called.
         method: Method,
@@ -66,7 +69,6 @@ pub enum ClientError {
         requested: MethodVersion,
     },
     /// The connection already has as many outstanding mutations as it is allowed.
-    #[error("{limit} mutations are already outstanding")]
     TooManyOutstandingMutations {
         /// The negotiated bound.
         limit: usize,
@@ -75,38 +77,31 @@ pub enum ClientError {
     ///
     /// An unresolved action is never forgotten, so a client that cannot reach its host eventually
     /// stops submitting rather than accumulating uncertainty without bound.
-    #[error("{limit} actions are already unresolved")]
     TooManyUnresolvedActions {
         /// The bound.
         limit: usize,
     },
     /// The host has not issued an action window for this connection.
-    #[error("no action window is current")]
     NoActionWindow,
     /// The connection ended before the request was answered.
-    #[error("the connection ended before the request was answered")]
     ConnectionEnded,
     /// The connection ended after a mutation was sent, so its outcome is unknown.
     ///
     /// The action identifier is named because section 9 forbids dispatching it again: the client
     /// asks the host what became of this action, and shows the user that the outcome is uncertain.
     /// It never submits the same intent under a new identifier to find out.
-    #[error("the outcome of action {action_id} is unknown: the connection ended after it was sent")]
     SubmissionUncertain {
         /// The action whose outcome is unknown.
         action_id: kr_protocol::ids::ActionId,
     },
     /// The host requires a fresh snapshot before it will serve this stream again.
-    #[error("the host requires a resynchronisation")]
     ResyncRequired,
     /// No implementation of a managed service is configured.
-    #[error("no managed service is configured for {0}")]
     ServiceNotConfigured(&'static str),
     /// This device's draft store refused.
     ///
     /// Boxed because it carries a path and an operating-system failure, which would otherwise make
     /// every client failure as large as the largest one.
-    #[error("{0}")]
     Draft(Box<crate::drafts::DraftError>),
 }
 
@@ -186,9 +181,106 @@ impl From<ProtocolError> for ClientError {
     }
 }
 
-/// Renders the delay a service asked for, when it asked for one.
-fn delay_note(retry_after_seconds: &Option<u64>) -> String {
-    retry_after_seconds.map_or_else(String::new, |seconds| format!(" (retry after {seconds}s)"))
+impl From<kr_transport::TransportError> for ClientError {
+    fn from(error: kr_transport::TransportError) -> Self {
+        Self::Transport(error)
+    }
+}
+
+impl From<kr_ipc::IpcError> for ClientError {
+    fn from(error: kr_ipc::IpcError) -> Self {
+        Self::Ipc(error)
+    }
+}
+
+/// A KR-CBOR-1 failure becomes what [`Shown::cbor`] says of it, and nothing else of it is kept.
+impl From<kr_cbor::CborError> for ClientError {
+    fn from(error: kr_cbor::CborError) -> Self {
+        Self::Cbor(Shown::cbor(&error))
+    }
+}
+
+impl Said for ClientError {
+    fn said(&self) -> Shown {
+        match self {
+            Self::Transport(error) => Shown::transport(error),
+            Self::Ipc(error) => Shown::ipc(error),
+            Self::Host(error) => crate::shown!("{}: {}", error.code, Shown::protocol(error)),
+            Self::Refused {
+                error,
+                retry_after_seconds,
+                ..
+            } => match retry_after_seconds {
+                Some(seconds) => crate::shown!(
+                    "{}: {} (retry after {}s)",
+                    error.code,
+                    Shown::protocol(error),
+                    *seconds
+                ),
+                None => crate::shown!("{}: {}", error.code, Shown::protocol(error)),
+            },
+            Self::Cbor(fault) => crate::shown!("the message was not canonical: {}", *fault),
+            Self::WrongEffect {
+                method,
+                expected,
+                actual,
+            } => crate::shown!(
+                "{} is a {} and cannot be called as a {}",
+                *method,
+                *expected,
+                *actual
+            ),
+            Self::UnsupportedVersion {
+                method,
+                supported,
+                requested,
+            } => crate::shown!("{} is version {}, not {}", *method, *supported, *requested),
+            Self::TooManyOutstandingMutations { limit } => {
+                crate::shown!("{} mutations are already outstanding", *limit)
+            }
+            Self::TooManyUnresolvedActions { limit } => {
+                crate::shown!("{} actions are already unresolved", *limit)
+            }
+            Self::NoActionWindow => Shown::said("no action window is current"),
+            Self::ConnectionEnded => {
+                Shown::said("the connection ended before the request was answered")
+            }
+            Self::SubmissionUncertain { action_id } => crate::shown!(
+                "the outcome of action {} is unknown: the connection ended after it was sent",
+                *action_id
+            ),
+            Self::ResyncRequired => Shown::said("the host requires a resynchronisation"),
+            Self::ServiceNotConfigured(what) => {
+                crate::shown!("no managed service is configured for {}", *what)
+            }
+            Self::Draft(error) => crate::shown!("{}", **error),
+        }
+    }
+}
+
+crate::display_as_said!(ClientError);
+crate::debug_as_display!(ClientError);
+
+/// No variant is this error's `source()`: what each says is in its own rendering, and the values
+/// three of them hold are another crate's, whose own rendering is what this one exists to keep
+/// out of a log.
+impl std::error::Error for ClientError {}
+
+/// A refusal this library makes itself, with the code a caller reacts to and what it says.
+///
+/// The one place a protocol error is built from text in this library and the command line, so the
+/// message of every refusal either crate makes is a [`Shown`].
+#[must_use]
+pub fn refusal(code: ErrorCode, message: Shown) -> ProtocolError {
+    ProtocolError::new(code, message.into_string())
+}
+
+impl ClientError {
+    /// A refusal this library makes itself, as a client failure.
+    #[must_use]
+    pub fn refusal(code: ErrorCode, message: Shown) -> Self {
+        Self::Host(refusal(code, message))
+    }
 }
 
 /// The result of a client operation.

@@ -70,7 +70,7 @@ use kr_protocol::sync::SyncObjectKind;
 use super::store::{
     Across, Basis, Claimed, ConflictCopy, Crossing, Dispatch, End, InGeneration, Outcome,
     PrivacyRecord, RequestRecord, RequestState, Result, Settled, Settlement, Standing,
-    SyncCheckpoint, SyncError, SyncStore, collection_of,
+    SyncCheckpoint, SyncError, SyncStore,
 };
 use super::{SyncBody, SyncObject, SyncSettings, Zeroising, sync_collection};
 use crate::drafts::DraftSealer;
@@ -78,6 +78,7 @@ use crate::services::{
     SyncBackupService, SyncExchanged, SyncFetched, SyncPosition, SyncRecoveryId, SyncRequestFence,
     SyncRequestStatus, nothing_held,
 };
+use crate::shown::{Said as _, Shown};
 
 /// What became of a publication.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -551,7 +552,7 @@ impl SyncClient {
             .revision
             .object()
             .ok_or_else(|| SyncError::DraftElsewhere {
-                collection: collection.clone(),
+                collection: crate::sync::store::shown_collection(staged.kind, staged.object_id),
             })?;
         let (position, other, basis) = match self
             .fetch_current(
@@ -735,7 +736,7 @@ impl SyncClient {
                     .apply_absence(produced_under, object_id, basis, recovery)?
                 {
                     InGeneration::Applied(()) => {
-                        Err(nothing_held(&format!("{kind} object")).into())
+                        Err(nothing_held(crate::shown!("{} object", kind)).into())
                     }
                     InGeneration::Discarded {
                         produced_under,
@@ -749,7 +750,7 @@ impl SyncClient {
             }
         };
         diagnose(object_id, note.map(|note| note.position), position)?;
-        let object = self.open_object(collection, object_id, &ciphertext)?;
+        let object = self.open_object(kind, collection, object_id, &ciphertext)?;
         Ok(Current::Held {
             position,
             object,
@@ -794,7 +795,7 @@ impl SyncClient {
         // to write a draft. The refusal names the collection the draft is actually kept in.
         if kind == SyncObjectKind::Draft {
             return Err(SyncError::DraftElsewhere {
-                collection: collection_of(kind, object_id),
+                collection: crate::sync::store::shown_collection(kind, object_id),
             });
         }
         let collection = sync_collection(kind, object_id);
@@ -902,8 +903,8 @@ impl SyncClient {
     ) -> Result<ConflictCopy> {
         Ok(ConflictCopy {
             conflict_id: SyncConflictId::new(fresh_uuid().map_err(|error| SyncError::Corrupt {
-                path: self.store.directory().to_path_buf(),
-                reason: error.to_string(),
+                path: Shown::root(self.store.directory()),
+                reason: error.said(),
             })?),
             object_id,
             offered_revision,
@@ -922,6 +923,7 @@ impl SyncClient {
     /// collection that was asked for.
     fn open_object(
         &self,
+        kind: SyncObjectKind,
         collection: &str,
         object_id: SyncObjectId,
         ciphertext: &[u8],
@@ -937,7 +939,7 @@ impl SyncClient {
         if object.object_id != object_id || collection != sync_collection(object.kind(), object_id)
         {
             return Err(SyncError::NotThatObject {
-                collection: collection.to_owned(),
+                collection: crate::sync::store::shown_collection(kind, object_id),
                 found: object.object_id,
                 expected: object_id,
             });

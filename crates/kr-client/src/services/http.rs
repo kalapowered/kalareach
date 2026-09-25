@@ -77,7 +77,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::error::ErrorCode;
 use kr_protocol::service::GatewayOrigin;
 use kr_transport::config::ProxyUrl;
 use rustls::client::danger::ServerCertVerifier;
@@ -89,6 +89,7 @@ use super::ServiceFuture;
 use super::account::AccountHttp;
 use super::relay::{ServiceHttp, ServiceHttpAnswer};
 use crate::error::{ClientError, Result};
+use crate::shown::Shown;
 
 /// How long a connection may take to establish.
 pub const DEFAULT_CONNECT_DEADLINE: Duration = Duration::from_secs(5);
@@ -429,9 +430,9 @@ impl HttpService {
             ));
         }
         if !same_origin(&self.address, &requested) {
-            return Err(refused(format!(
+            return Err(refused(crate::shown!(
                 "this client is configured for {} and was asked to call another origin",
-                self.origin.as_str()
+                self.origin.clone()
             )));
         }
         Ok(requested)
@@ -448,7 +449,7 @@ impl HttpService {
         headers: &[(&str, &str)],
     ) -> Result<ServiceHttpAnswer> {
         let limit = self.limits.of(target.path());
-        let named = format!("{}{}", self.origin.as_str(), target.path());
+        let named = crate::shown!("{}{}", self.origin.clone(), Shown::route(target.path()));
 
         let mut request = self.client.request(method, target);
         if let Some((content_type, bytes)) = body {
@@ -631,10 +632,8 @@ fn builder_trusting(
     extra_roots: &[CertificateDer<'static>],
 ) -> Result<reqwest::ClientBuilder> {
     install_crypto_provider();
-    let mut tls = platform_tls(extra_roots).map_err(|error| {
-        refused(format!(
-            "this client could not set up the platform's certificate verification: {error}"
-        ))
+    let mut tls = platform_tls(extra_roots).map_err(|_| {
+        refused("this client could not set up the platform's certificate verification")
     })?;
     // HTTP/1.1 is the one protocol these clients speak, so it is the one they offer.
     tls.alpn_protocols = vec![b"http/1.1".to_vec()];
@@ -785,34 +784,37 @@ mod system_store {
 }
 
 /// A request this client would not send. Nothing left this device.
-fn refused(what: impl Into<String>) -> ClientError {
-    ClientError::Host(ProtocolError::new(ErrorCode::InvalidArgument, what.into()))
+fn refused(what: impl Into<Shown>) -> ClientError {
+    ClientError::refusal(ErrorCode::InvalidArgument, what.into())
 }
 
 /// The service was never reached, so the request was not carried out.
-fn unreachable(named: &str, why: &str) -> ClientError {
-    ClientError::Host(ProtocolError::new(
+fn unreachable(named: &Shown, why: Shown) -> ClientError {
+    ClientError::refusal(
         ErrorCode::UpstreamUnavailable,
-        format!("{named} could not be reached: {why}"),
-    ))
+        crate::shown!("{} could not be reached: {}", *named, why),
+    )
 }
 
 /// The request may have been carried out and this client cannot see whether it was.
-fn uncertain(named: &str, why: &str) -> ClientError {
-    ClientError::Host(ProtocolError::new(
+fn uncertain(named: &Shown, why: Shown) -> ClientError {
+    ClientError::refusal(
         ErrorCode::OutcomeUnknown,
-        format!("{named}: {why}"),
-    ))
+        crate::shown!("{}: {}", *named, why),
+    )
 }
 
 /// An answer past the bound its operation is read under.
 ///
 /// It is an unknown outcome rather than a plain failure: the request reached the service and the
 /// service answered, so whatever it did is done, and what this client lacks is the answer.
-fn too_large(named: &str, limit: u64) -> ClientError {
+fn too_large(named: &Shown, limit: u64) -> ClientError {
     uncertain(
         named,
-        &format!("its answer is larger than the {limit} bytes this client reads"),
+        crate::shown!(
+            "its answer is larger than the {} bytes this client reads",
+            limit
+        ),
     )
 }
 
@@ -835,7 +837,7 @@ fn phase_of(error: &reqwest::Error) -> ExchangePhase {
 /// inside the connector happened before any request byte was written, so the request was not
 /// carried out. Everything else may have been: a deadline, a connection that ended and an answer
 /// that could not be read all leave a request that the service may have acted on.
-fn failure(named: &str, phase: ExchangePhase, error: &reqwest::Error) -> ClientError {
+fn failure(named: &Shown, phase: ExchangePhase, error: &reqwest::Error) -> ClientError {
     let cause = if error.is_timeout() {
         "this client's deadline ran out"
     } else if error.is_decode() {
@@ -843,11 +845,11 @@ fn failure(named: &str, phase: ExchangePhase, error: &reqwest::Error) -> ClientE
     } else {
         "the exchange ended"
     };
-    let why = format!("{cause} {}", phase.as_str());
+    let why = crate::shown!("{} {}", cause, phase.as_str());
 
     match phase {
-        ExchangePhase::Connect => unreachable(named, &why),
-        ExchangePhase::Request | ExchangePhase::Answer => uncertain(named, &why),
+        ExchangePhase::Connect => unreachable(named, why),
+        ExchangePhase::Request | ExchangePhase::Answer => uncertain(named, why),
     }
 }
 
@@ -2835,10 +2837,11 @@ mod tests {
         // make one phase unreadable.
         for phase in ExchangePhase::ALL {
             for cause in CAUSES {
-                let why = format!("{cause} {}", phase.as_str());
+                let why = crate::shown!("{} {}", cause, phase.as_str());
+                let named = Shown::said(NAMED);
                 let error = match phase {
-                    ExchangePhase::Connect => unreachable(NAMED, &why),
-                    ExchangePhase::Request | ExchangePhase::Answer => uncertain(NAMED, &why),
+                    ExchangePhase::Connect => unreachable(&named, why),
+                    ExchangePhase::Request | ExchangePhase::Answer => uncertain(&named, why),
                 };
                 assert_eq!(ExchangePhase::of(&error), Some(phase), "{error}");
             }
@@ -2855,7 +2858,7 @@ mod tests {
             ExchangePhase::of(&refused("a request address carries no credentials")),
             None
         );
-        assert_eq!(ExchangePhase::of(&too_large(NAMED, 64)), None);
+        assert_eq!(ExchangePhase::of(&too_large(&Shown::said(NAMED), 64)), None);
     }
 
     /* ---------------------------------------------------------------------- */

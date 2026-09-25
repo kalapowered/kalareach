@@ -4513,7 +4513,7 @@ async fn a_migration_produces_an_updated_kit_and_a_verified_record() {
         superseded.bundle_revision < material.bundle_revision,
         "what the old kit opens is the bundle as it was before the move"
     );
-    let sentence = migrated.record.describe();
+    let sentence = migrated.record.describe().into_string();
     assert!(sentence.contains("destroy the old one"));
     assert!(sentence.contains(ORIGIN));
     assert!(sentence.contains(OTHER_ORIGIN));

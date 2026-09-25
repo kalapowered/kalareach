@@ -480,10 +480,10 @@ impl ServiceHttp for Web {
                 body: b"<html>Bad Gateway</html>".to_vec(),
             })
         } else if is_exchange && self.lose_the_next_answer.swap(false, Ordering::SeqCst) {
-            Err(ClientError::Host(ProtocolError::new(
+            Err(ClientError::refusal(
                 ErrorCode::UpstreamUnavailable,
-                "the answer never came back",
-            )))
+                Shown::said("the answer never came back"),
+            ))
         } else {
             Ok(answer)
         };
@@ -551,10 +551,10 @@ impl AccountTokenSource for SignIn {
     fn token<'a>(&'a self, _scope: &'a str) -> ServiceFuture<'a, AccountToken> {
         let token = match self.token.lock().expect("the token").clone() {
             Some(token) => AccountToken::new(token),
-            None => Err(ClientError::Host(ProtocolError::new(
+            None => Err(ClientError::refusal(
                 ErrorCode::HostNotConfigured,
-                "no account is signed in on this device",
-            ))),
+                Shown::said("no account is signed in on this device"),
+            )),
         };
         Box::pin(async move { token })
     }

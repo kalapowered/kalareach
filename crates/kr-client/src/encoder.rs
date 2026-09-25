@@ -94,7 +94,7 @@ impl Modifiers {
 }
 
 /// A logical key, before anything decides how to spell it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Key {
     /// A printable character, as the keyboard layout produced it.
     Char(char),
@@ -122,6 +122,28 @@ pub enum Key {
     Delete,
     /// A function key, numbered from one.
     Function(u8),
+}
+
+impl std::fmt::Debug for Key {
+    /// Which key it is, and for a character only that it is one: a typed character is part of
+    /// whatever a person typed, a password included.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Char(_) => formatter.write_str("Char(..)"),
+            Self::Enter => formatter.write_str("Enter"),
+            Self::Tab => formatter.write_str("Tab"),
+            Self::Backspace => formatter.write_str("Backspace"),
+            Self::Escape => formatter.write_str("Escape"),
+            Self::Arrow(arrow) => formatter.debug_tuple("Arrow").field(arrow).finish(),
+            Self::Home => formatter.write_str("Home"),
+            Self::End => formatter.write_str("End"),
+            Self::PageUp => formatter.write_str("PageUp"),
+            Self::PageDown => formatter.write_str("PageDown"),
+            Self::Insert => formatter.write_str("Insert"),
+            Self::Delete => formatter.write_str("Delete"),
+            Self::Function(number) => formatter.debug_tuple("Function").field(number).finish(),
+        }
+    }
 }
 
 /// Which arrow.
@@ -162,7 +184,7 @@ pub enum KeyEventKind {
 }
 
 /// One key event a client observed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct KeyEvent {
     /// The logical key, as the keyboard layout produced it.
     pub key: Key,
@@ -178,6 +200,19 @@ pub struct KeyEvent {
     pub modifiers: Modifiers,
     /// What happened to it.
     pub kind: KeyEventKind,
+}
+
+impl std::fmt::Debug for KeyEvent {
+    /// The key, the modifiers and the kind, and whether a base character was reported, never it.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("KeyEvent")
+            .field("key", &self.key)
+            .field("base", &self.base.map(|_| ".."))
+            .field("modifiers", &self.modifiers)
+            .field("kind", &self.kind)
+            .finish()
+    }
 }
 
 impl KeyEvent {
@@ -277,7 +312,7 @@ impl KeyboardEncoding {
 }
 
 /// Why the encoder would not produce bytes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Unsupported {
     /// The event carries information the negotiated encoding cannot express, and inventing a
     /// spelling for it would tell the application something that did not happen.
@@ -289,17 +324,22 @@ pub enum Unsupported {
     UnknownKey,
 }
 
-impl std::fmt::Display for Unsupported {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl crate::shown::Said for Unsupported {
+    fn said(&self) -> crate::shown::Shown {
         match self {
-            Self::NotExpressible { what } => write!(
-                formatter,
-                "the negotiated encoding cannot express {what}, and this encoder does not invent one"
+            Self::NotExpressible { what } => crate::shown!(
+                "the negotiated encoding cannot express {}, and this encoder does not invent one",
+                *what
             ),
-            Self::UnknownKey => formatter.write_str("this encoder has no spelling for that key"),
+            Self::UnknownKey => {
+                crate::shown::Shown::said("this encoder has no spelling for that key")
+            }
         }
     }
 }
+
+crate::display_as_said!(Unsupported);
+crate::debug_as_display!(Unsupported);
 
 impl std::error::Error for Unsupported {}
 

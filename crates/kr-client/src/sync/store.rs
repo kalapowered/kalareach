@@ -88,6 +88,7 @@ use super::SyncObject;
 use crate::drafts::{DraftStore, SyncCheckpoint as DraftCheckpoint};
 use crate::retry::UserAction;
 use crate::services::{SyncPosition, SyncRecoveryId, names_no_recovery};
+use crate::shown::{IoFault, Shown};
 
 /// The extension of a stored object this device holds.
 const OBJECT_EXTENSION: &str = "object";
@@ -361,14 +362,16 @@ impl RequestRevision {
     }
 }
 
-impl std::fmt::Display for RequestRevision {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl crate::shown::Said for RequestRevision {
+    fn said(&self) -> Shown {
         match self {
-            Self::Object(revision) => std::fmt::Display::fmt(revision, formatter),
-            Self::Draft(revision) => std::fmt::Display::fmt(revision, formatter),
+            Self::Object(revision) => crate::shown!("{}", *revision),
+            Self::Draft(revision) => crate::shown!("{}", *revision),
         }
     }
 }
+
+crate::display_as_said!(RequestRevision);
 
 /// Returns the collection one object is published in.
 ///
@@ -866,7 +869,7 @@ pub enum Settlement {
 ///
 /// Section 24 retains a pinned label locally unless it is explicitly cleared, and excludes it from
 /// subsequent sync while privacy mode is on.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PinnedLabel {
     /// The label.
@@ -875,17 +878,28 @@ pub struct PinnedLabel {
     pub pinned_at_ms: TimestampMs,
 }
 
+impl std::fmt::Debug for PinnedLabel {
+    /// When it was pinned and how long it is, never the label.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PinnedLabel")
+            .field("label_bytes", &self.label.len())
+            .field("pinned_at_ms", &self.pinned_at_ms)
+            .finish()
+    }
+}
+
 /// Why a synchronisation store refused.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum SyncError {
     /// The directory, the lock or a stored file could not be read or written.
-    #[error("the sync store at {path} could not be used: {source}")]
+    #[error("the sync store at {path} could not be used: {fault}")]
     Storage {
         /// What was being read or written.
-        path: PathBuf,
+        path: Shown,
         /// The underlying failure.
-        source: std::io::Error,
+        fault: IoFault,
     },
     /// No object with that identity is stored here.
     #[error("no synchronised object {object_id} is stored")]
@@ -908,9 +922,9 @@ pub enum SyncError {
     #[error("the stored file at {path} could not be read: {reason}")]
     Corrupt {
         /// Which file.
-        path: PathBuf,
-        /// What was wrong with it.
-        reason: String,
+        path: Shown,
+        /// What was wrong with it: the class and the place of the fault, never what it held.
+        reason: Shown,
     },
     /// The object is larger than the contract carries.
     #[error("the object encodes to {len} bytes; the limit is {limit}")]
@@ -924,7 +938,7 @@ pub enum SyncError {
     #[error("collection {collection} holds object {found}, not {expected}")]
     NotThatObject {
         /// The collection that was read.
-        collection: String,
+        collection: Shown,
         /// The object it turned out to hold.
         found: SyncObjectId,
         /// The object that was asked for.
@@ -968,7 +982,7 @@ pub enum SyncError {
     #[error("collection {collection} holds a draft; drafts are synchronised by the draft store")]
     DraftElsewhere {
         /// The collection that was read.
-        collection: String,
+        collection: Shown,
     },
     /// Sync production is fenced, because privacy mode is on.
     #[error("sync production is fenced at privacy generation {generation}")]
@@ -1074,11 +1088,30 @@ pub enum SyncError {
     #[error("{0}")]
     Client(#[from] Box<crate::ClientError>),
     /// A value could not be encoded or decoded as KR-CBOR-1.
+    ///
+    /// It holds what [`Shown::cbor`] says of the failure: the conversion reduces it, so `?` cannot
+    /// carry a decoder's own words, which quote what it was reading.
     #[error("the stored value was not canonical: {0}")]
-    Encoding(#[from] kr_cbor::CborError),
+    Encoding(Shown),
     /// The sealing or opening of an object failed.
+    ///
+    /// It holds what [`Shown::crypto`] says of the failure.
     #[error("{0}")]
-    Crypto(#[from] kr_crypto::CryptoError),
+    Crypto(Shown),
+}
+
+crate::debug_as_display!(SyncError);
+
+impl From<kr_cbor::CborError> for SyncError {
+    fn from(error: kr_cbor::CborError) -> Self {
+        Self::Encoding(Shown::cbor(&error))
+    }
+}
+
+impl From<kr_crypto::CryptoError> for SyncError {
+    fn from(error: kr_crypto::CryptoError) -> Self {
+        Self::Crypto(Shown::crypto(&error))
+    }
 }
 
 impl From<crate::ClientError> for SyncError {
@@ -1221,13 +1254,13 @@ impl SyncStore {
     /// read.
     pub fn open(directory: impl Into<PathBuf>) -> Result<Self> {
         let directory = directory.into();
-        private_directory(&directory).map_err(|source| storage(&directory, source))?;
+        private_directory(&directory).map_err(|source| storage(Shown::root(&directory), source))?;
         // Every name on the way here, not only the levels this call created. Another opener may
         // have created one a moment ago and not yet flushed it, and a store that returned success
         // under such a name would be a store whose own path a crash could lose. A failure is
         // reported rather than ignored: a store that cannot open the directories its path is made
         // of cannot establish that the path survives a crash.
-        flush_path_names(&directory).map_err(|source| storage(&directory, source))?;
+        flush_path_names(&directory).map_err(|source| storage(Shown::root(&directory), source))?;
         let store = Self { directory };
         let guard = store.lock()?;
         let swept = store.sweep_partials();
@@ -1288,8 +1321,8 @@ impl SyncStore {
         };
         if object.object_id != object_id {
             return Err(SyncError::Corrupt {
-                path,
-                reason: format!("it holds object {}, not {object_id}", object.object_id),
+                path: stored(&path),
+                reason: crate::shown!("it holds object {}, not {}", object.object_id, object_id),
             });
         }
         Ok(Some(object))
@@ -2541,7 +2574,7 @@ impl SyncStore {
             RequestRevision::Draft(revision) => {
                 let Some(drafts) = drafts else {
                     return Err(SyncError::DraftElsewhere {
-                        collection: held.collection(),
+                        collection: shown_collection(held.kind, held.object_id),
                     });
                 };
                 drafts
@@ -3257,8 +3290,8 @@ impl SyncStore {
     /// Returns a fresh identity for a record this store is about to write.
     fn fresh_id(&self) -> Result<Uuid> {
         kr_transport::random::fresh_uuid_v4().map_err(|error| SyncError::Corrupt {
-            path: self.directory.clone(),
-            reason: error.to_string(),
+            path: Shown::root(&self.directory),
+            reason: Shown::transport(&error),
         })
     }
 
@@ -3404,12 +3437,12 @@ impl SyncStore {
             // scope rather than dropped as an ordinary vector.
             Ok(bytes) => super::Zeroising(bytes),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(storage(path, error)),
+            Err(error) => return Err(storage(stored(path), error)),
         };
         let value = kr_cbor::from_canonical_slice(&bytes.0, &kr_cbor::Limits::DEFAULT).map_err(
             |error| SyncError::Corrupt {
-                path: path.to_path_buf(),
-                reason: super::cbor_fault(&error),
+                path: stored(path),
+                reason: Shown::cbor(&error),
             },
         )?;
         Ok(Some(value))
@@ -3421,10 +3454,10 @@ impl SyncStore {
     fn paths_with(&self, extension: &str) -> Result<Vec<PathBuf>> {
         let suffix = format!(".{extension}");
         let mut paths = Vec::new();
-        for entry in
-            std::fs::read_dir(&self.directory).map_err(|source| storage(&self.directory, source))?
+        for entry in std::fs::read_dir(&self.directory)
+            .map_err(|source| storage(Shown::root(&self.directory), source))?
         {
-            let entry = entry.map_err(|source| storage(&self.directory, source))?;
+            let entry = entry.map_err(|source| storage(Shown::root(&self.directory), source))?;
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             if name.ends_with(&suffix) {
@@ -3481,17 +3514,17 @@ impl SyncStore {
         let partial = self.directory.join(format!(
             "{}.{PARTIAL_EXTENSION}",
             kr_transport::random::fresh_uuid_v4().map_err(|error| SyncError::Corrupt {
-                path: path.to_path_buf(),
-                reason: error.to_string(),
+                path: stored(path),
+                reason: Shown::transport(&error),
             })?
         ));
-        write_whole(&partial, bytes).map_err(|source| storage(&partial, source))?;
+        write_whole(&partial, bytes).map_err(|source| storage(stored(&partial), source))?;
         if let Err(source) = std::fs::rename(&partial, path) {
             let _ = std::fs::remove_file(&partial);
-            return Err(storage(path, source));
+            return Err(storage(stored(path), source));
         }
         flush_directory(&self.directory, NameKind::File)
-            .map_err(|source| storage(&self.directory, source))?;
+            .map_err(|source| storage(Shown::root(&self.directory), source))?;
         Ok(())
     }
 
@@ -3502,10 +3535,10 @@ impl SyncStore {
         match std::fs::remove_file(path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(storage(path, error)),
+            Err(error) => return Err(storage(stored(path), error)),
         }
         flush_directory(&self.directory, NameKind::File)
-            .map_err(|source| storage(&self.directory, source))?;
+            .map_err(|source| storage(Shown::root(&self.directory), source))?;
         Ok(())
     }
 
@@ -3558,7 +3591,8 @@ impl Drop for Lock {
 impl Lock {
     pub(super) fn take(path: &Path) -> Result<Self> {
         let file = Self::open(path)?;
-        file.lock().map_err(|source| storage(path, source))?;
+        file.lock()
+            .map_err(|source| storage(Shown::root(path), source))?;
         Ok(Self { file })
     }
 
@@ -3568,7 +3602,7 @@ impl Lock {
         match file.try_lock() {
             Ok(()) => Ok(Some(Self { file })),
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-            Err(std::fs::TryLockError::Error(source)) => Err(storage(path, source)),
+            Err(std::fs::TryLockError::Error(source)) => Err(storage(Shown::root(path), source)),
         }
     }
 
@@ -3579,7 +3613,7 @@ impl Lock {
             .create(true)
             .truncate(false)
             .open(path)
-            .map_err(|source| storage(path, source))
+            .map_err(|source| storage(Shown::root(path), source))
     }
 }
 
@@ -3808,10 +3842,29 @@ fn not_past(replaced: Option<SyncPosition>, landed: SyncPosition) -> Option<Sync
     })
 }
 
-fn storage(path: &Path, source: std::io::Error) -> SyncError {
+fn storage(path: Shown, source: std::io::Error) -> SyncError {
     SyncError::Storage {
-        path: path.to_path_buf(),
-        source,
+        path,
+        fault: IoFault::from(source),
+    }
+}
+
+/// A file of the store's own, as a failure may name it: whole when the store wrote its name.
+fn stored(path: &Path) -> Shown {
+    Shown::stored(path, &[LOCK_NAME, LABELS_NAME, PRIVACY_NAME])
+}
+
+/// The collection one object is published in, as a failure names it.
+///
+/// The same name [`collection_of`] gives, built from the two values it is built from.
+pub(crate) fn shown_collection(kind: SyncObjectKind, object_id: SyncObjectId) -> Shown {
+    match kind {
+        SyncObjectKind::Draft => {
+            crate::shown!("drafts/{}", DraftId::new(object_id.get()))
+        }
+        SyncObjectKind::Settings
+        | SyncObjectKind::ClientSelection
+        | SyncObjectKind::RecoveryBundle => crate::shown!("{}/{}", kind, object_id),
     }
 }
 

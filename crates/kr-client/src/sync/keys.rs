@@ -43,11 +43,12 @@ use std::sync::{Arc, Mutex};
 use kr_crypto::envelope::{open_sync_object, seal_sync_object};
 use kr_crypto::secret::{Secret, SymmetricKey};
 use kr_crypto::store::{OpenedStore, SecretName, SecretStore, StoreSelection};
-use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::error::ErrorCode;
 use kr_protocol::sync::SealedSyncObject;
 
 use crate::drafts::DraftSealer;
 use crate::error::{ClientError, Result};
+use crate::shown::Shown;
 
 /// Where the key one synchronised collection is sealed under comes from.
 ///
@@ -65,12 +66,14 @@ pub trait CollectionKeys: Send + Sync + std::fmt::Debug {
 
 /// Says that this device does not hold a key, without saying anything about the key.
 fn no_key(collection: &str, epoch: u64) -> ClientError {
-    ClientError::Host(ProtocolError::new(
+    ClientError::refusal(
         ErrorCode::HostNotConfigured,
-        format!(
-            "this device does not hold the key for collection {collection} at epoch {epoch}, so it can neither read nor write it"
+        crate::shown!(
+            "this device does not hold the key for collection {} at epoch {}, so it can neither read nor write it",
+            Shown::identifier(collection),
+            epoch
         ),
-    ))
+    )
 }
 
 /// Turns a sealing or opening failure into something a caller can act on.
@@ -97,7 +100,7 @@ fn sealing_failed(error: &kr_crypto::CryptoError) -> ClientError {
         | Failure::LibraryMismatch { .. } => ErrorCode::StorageUnavailable,
         _ => ErrorCode::InvalidArgument,
     };
-    ClientError::Host(ProtocolError::new(code, error.to_string()))
+    ClientError::refusal(code, Shown::crypto(error))
 }
 
 /// Says that what the store holds under this name is not a key.
@@ -106,12 +109,14 @@ fn sealing_failed(error: &kr_crypto::CryptoError) -> ClientError {
 /// came back, so this is the device's storage rather than the caller's request. The bytes
 /// themselves reach nothing: a stored value that is not a key is still a stored value.
 fn corrupt_stored_key(collection: &str, epoch: u64) -> ClientError {
-    ClientError::Host(ProtocolError::new(
+    ClientError::refusal(
         ErrorCode::StorageUnavailable,
-        format!(
-            "what this device holds for collection {collection} at epoch {epoch} is not a key of the length one has"
+        crate::shown!(
+            "what this device holds for collection {} at epoch {} is not a key of the length one has",
+            Shown::identifier(collection),
+            epoch
         ),
-    ))
+    )
 }
 
 /// Collection keys held for the length of a process.
@@ -179,10 +184,10 @@ impl CollectionKeys for MemoryCollectionKeys {
 
 /// Says that the held keys cannot be reached, which is a fault rather than a missing key.
 fn poisoned() -> ClientError {
-    ClientError::Host(ProtocolError::new(
+    ClientError::refusal(
         ErrorCode::StorageUnavailable,
-        "this device's collection keys cannot be reached".to_owned(),
-    ))
+        crate::shown::Shown::said("this device's collection keys cannot be reached"),
+    )
 }
 
 /// Collection keys in the device's own secret store.
@@ -283,10 +288,7 @@ impl StoredCollectionKeys {
     /// two identifiers that mapped to one name would be one key for two collections.
     fn name(&self, collection: &str, epoch: u64) -> Result<SecretName> {
         SecretName::collection_key(&self.scope, collection, epoch).map_err(|error| {
-            ClientError::Host(ProtocolError::new(
-                ErrorCode::InvalidArgument,
-                error.to_string(),
-            ))
+            ClientError::refusal(ErrorCode::InvalidArgument, Shown::crypto(&error))
         })
     }
 }

@@ -95,7 +95,7 @@ pub fn decode(
 }
 
 /// the two are kept apart: [`Screen::rows`] is what exists, [`Screen::viewport`] is what is shown.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Screen {
     /// The generation this screen belongs to.
     pub generation: u64,
@@ -150,6 +150,24 @@ pub struct Screen {
     /// cell whose combining marks were dropped at the per-cell bound from a cell the application
     /// wrote that way.
     pub degraded: bool,
+}
+
+impl std::fmt::Debug for Screen {
+    /// Its shape and where it stands, never a cell, a title or a link: a screen is what a terminal
+    /// showed.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Screen")
+            .field("generation", &self.generation)
+            .field("cursor_at", &self.cursor_at)
+            .field("active_buffer", &self.active_buffer)
+            .field("dimensions", &self.dimensions)
+            .field("rows", &self.rows.len())
+            .field("oldest_retained_row", &self.oldest_retained_row)
+            .field("evicted", &self.evicted)
+            .field("degraded", &self.degraded)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Which spelling a tracked mode has, in a form a map can be keyed by.
@@ -271,17 +289,18 @@ pub enum Refusal {
     NoScreen,
 }
 
-impl std::fmt::Display for Refusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let detail = match self {
+impl crate::shown::Said for Refusal {
+    fn said(&self) -> crate::shown::Shown {
+        crate::shown::Shown::said(match self {
             Self::BaseMismatch => "the update continues from a screen this client does not hold",
             Self::WrongGeneration => "the update belongs to another projection generation",
             Self::UnexpectedPage => "a page arrived for a snapshot that is not being installed",
             Self::NoScreen => "an update arrived before a snapshot completed",
-        };
-        formatter.write_str(detail)
+        })
     }
 }
+
+crate::display_as_said!(Refusal);
 
 /// A snapshot whose pages are still arriving.
 #[derive(Clone, Debug)]

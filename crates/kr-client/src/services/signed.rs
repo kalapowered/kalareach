@@ -48,7 +48,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::error::ErrorCode;
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{AuthorisationKey, Nonce256, TimestampMs};
 use kr_protocol::service::{
@@ -62,6 +62,7 @@ use super::json::Unreadable;
 use super::relay::{ServiceHttp, ServiceHttpAnswer, ServiceSigner};
 use crate::error::{ClientError, Result};
 use crate::retry::UserAction;
+use crate::shown::{ServiceMessage, Shown};
 
 /// A request's second authorisation: the account token for one scope.
 ///
@@ -291,9 +292,9 @@ impl SignedService {
         account: Option<&AccountAuthorisation>,
     ) -> std::result::Result<Answer, Unanswered> {
         let document = serde_json::to_value(body).map_err(|error| {
-            Unanswered::NotSent(malformed(format!(
+            Unanswered::NotSent(malformed(crate::shown!(
                 "a request could not be written: {}",
-                super::json_fault(&error)
+                Shown::json(&error)
             )))
         })?;
         let authorisation = match account {
@@ -311,8 +312,10 @@ impl SignedService {
             .signed(method, document, signed_at_ms.unwrap_or_else(now_ms))
             .map_err(Unanswered::NotSent)?;
         if request.len() > request_limit {
-            return Err(Unanswered::NotSent(malformed(format!(
-                "a {method} request is at most {request_limit} bytes and this one is {}",
+            return Err(Unanswered::NotSent(malformed(crate::shown!(
+                "a {} request is at most {} bytes and this one is {}",
+                method,
+                request_limit,
                 request.len()
             ))));
         }
@@ -358,8 +361,9 @@ impl SignedService {
         // surface. A credential for a host method would be a credential aimed at something no
         // service holds the authority to run.
         if !payload.names_a_service_method() {
-            return Err(malformed(format!(
-                "{method} is not a method a managed service serves"
+            return Err(malformed(crate::shown!(
+                "{} is not a method a managed service serves",
+                method
             )));
         }
         // The service's own rule for when a signature may be admitted, applied against this
@@ -367,12 +371,14 @@ impl SignedService {
         // the reading it was compared with, because that reading is this device's and says
         // nothing the caller can act on that the instant does not.
         if !payload.is_fresh_at(now_ms()) {
-            return Err(ClientError::Host(ProtocolError::new(
+            return Err(ClientError::refusal(
                 ErrorCode::ClockUntrusted,
-                format!(
-                    "an attempt signed at {signed_at_ms} is outside the {SERVICE_REQUEST_FRESHNESS_MS} ms a service admits a signature in, by this device's clock"
+                crate::shown!(
+                    "an attempt signed at {} is outside the {} ms a service admits a signature in, by this device's clock",
+                    signed_at_ms,
+                    SERVICE_REQUEST_FRESHNESS_MS
                 ),
-            )));
+            ));
         }
 
         let signer = self.signer.signer();
@@ -388,9 +394,9 @@ impl SignedService {
             signature,
         })
         .map_err(|error| {
-            malformed(format!(
+            malformed(crate::shown!(
                 "a request could not be written: {}",
-                super::json_fault(&error)
+                Shown::json(&error)
             ))
         })
     }
@@ -459,7 +465,7 @@ impl Answer {
 pub(crate) struct Refusal {
     status: u16,
     code: String,
-    message: String,
+    message: ServiceMessage,
     retry_after_seconds: Option<u64>,
     /// The whole answer the refusal arrived in, which [`Self::members`] reads again.
     answer: Vec<u8>,
@@ -487,7 +493,7 @@ impl Refusal {
     /// # Errors
     ///
     /// Returns an unknown outcome when the refusal does not carry them in that shape.
-    pub(crate) fn members<T: for<'de> Deserialize<'de>>(&self, what: &str) -> Result<T> {
+    pub(crate) fn members<T: for<'de> Deserialize<'de>>(&self, what: &'static str) -> Result<T> {
         #[derive(Deserialize)]
         struct Carried<T> {
             error: T,
@@ -501,7 +507,7 @@ impl Refusal {
     pub(crate) fn into_error(self) -> ClientError {
         let (code, action) = classify(&self.code, self.status);
         ClientError::Refused {
-            error: ProtocolError::new(code, plain_message(&self.code, self.message)),
+            error: crate::error::refusal(code, plain_message(&self.code, &self.message)),
             retry_after_seconds: self.retry_after_seconds,
             action,
         }
@@ -516,13 +522,14 @@ impl Refusal {
 /// request reaches it as an error, and for those what matters is what the refusal means: nothing
 /// ran, nothing was recorded, and asking again can succeed only once the service's cutoff falls
 /// behind the clocks.
-fn plain_message(code: &str, message: String) -> String {
+fn plain_message(code: &str, message: &ServiceMessage) -> Shown {
     match code {
-        "SIGNED_BEFORE_CUTOFF" => "nothing ran and nothing was recorded: the service holds this \
-             request as signed before its collection's cutoff, which runs ahead of the clocks, and \
-             asking again can succeed only once the cutoff falls behind them"
-            .to_owned(),
-        _ => message,
+        "SIGNED_BEFORE_CUTOFF" => Shown::said(
+            "nothing ran and nothing was recorded: the service holds this request as signed \
+             before its collection's cutoff, which runs ahead of the clocks, and asking again can \
+             succeed only once the cutoff falls behind them",
+        ),
+        _ => Shown::service(message),
     }
 }
 
@@ -576,7 +583,7 @@ fn answer_of(answer: &ServiceHttpAnswer) -> Result<Answer> {
     let envelope = super::json::read::<Envelope>(&answer.body).map_err(|fault| {
         unreadable(
             answer.status,
-            &format!("its answer is not one this client reads: {fault}"),
+            crate::shown!("its answer is not one this client reads: {}", fault),
         )
     })?;
 
@@ -603,7 +610,7 @@ fn answer_of(answer: &ServiceHttpAnswer) -> Result<Answer> {
     Ok(Answer::Refused(Refusal {
         status: answer.status,
         code: named.code,
-        message: named.message,
+        message: ServiceMessage::from_refusal(named.message),
         retry_after_seconds: named.retry_after_seconds,
         answer: answer.body.clone(),
     }))
@@ -676,7 +683,7 @@ fn classify(code: &str, status: u16) -> (ErrorCode, UserAction) {
 /// and this client cannot see what it did, so it is an unknown outcome and never retried
 /// automatically. A fault or a rate limit is transient. Anything else without an envelope never
 /// reached this service's own routes, which is a configuration between here and it.
-fn unreadable(status: u16, what: &str) -> ClientError {
+fn unreadable(status: u16, what: impl Into<Shown>) -> ClientError {
     let code = if (200..300).contains(&status) {
         ErrorCode::OutcomeUnknown
     } else if status >= 500 || status == 408 || status == 429 {
@@ -685,10 +692,10 @@ fn unreadable(status: u16, what: &str) -> ClientError {
         ErrorCode::HostNotConfigured
     };
 
-    ClientError::Host(ProtocolError::new(
+    ClientError::refusal(
         code,
-        format!("the service answered {status} and {what}"),
-    ))
+        crate::shown!("the service answered {} and {}", status, what.into()),
+    )
 }
 
 /// An answer that was read and is not the shape this client expected.
@@ -698,19 +705,20 @@ fn unreadable(status: u16, what: &str) -> ClientError {
 ///
 /// What it says about the answer is [`super::json::Unreadable`] and nothing else: an answer
 /// carries whatever answered, and `serde_json`'s own message would quote the part it rejected.
-pub(crate) fn unreadable_answer(what: &str, fault: impl Into<Unreadable>) -> ClientError {
-    ClientError::Host(ProtocolError::new(
+pub(crate) fn unreadable_answer(
+    what: impl Into<Shown>,
+    fault: impl Into<Unreadable>,
+) -> ClientError {
+    let fault: Unreadable = fault.into();
+    ClientError::refusal(
         ErrorCode::OutcomeUnknown,
-        format!("this client cannot read {what}: {}", fault.into()),
-    ))
+        crate::shown!("this client cannot read {}: {}", what.into(), fault),
+    )
 }
 
 /// A request this client would not send. Nothing left this device.
-pub(crate) fn malformed(message: impl Into<String>) -> ClientError {
-    ClientError::Host(ProtocolError::new(
-        ErrorCode::InvalidArgument,
-        message.into(),
-    ))
+pub(crate) fn malformed(message: impl Into<Shown>) -> ClientError {
+    ClientError::refusal(ErrorCode::InvalidArgument, message.into())
 }
 
 /// This machine's clock, in UTC milliseconds.
@@ -725,8 +733,12 @@ fn now_ms() -> u64 {
 /// A fresh nonce from the operating system's generator.
 fn fresh_nonce() -> Result<[u8; 32]> {
     let mut nonce = [0u8; 32];
-    kr_crypto::random_bytes(&mut nonce)
-        .map_err(|error| malformed(format!("a nonce could not be drawn: {error}")))?;
+    kr_crypto::random_bytes(&mut nonce).map_err(|error| {
+        malformed(crate::shown!(
+            "a nonce could not be drawn: {}",
+            Shown::crypto(&error)
+        ))
+    })?;
     Ok(nonce)
 }
 
@@ -1069,12 +1081,10 @@ mod tests {
                     .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
                     .collect(),
             });
-            let answer = self.answer.clone().map_err(|code| {
-                ClientError::Host(ProtocolError::new(
-                    code,
-                    "the connection dropped".to_owned(),
-                ))
-            });
+            let answer = self
+                .answer
+                .clone()
+                .map_err(|code| ClientError::refusal(code, Shown::said("the connection dropped")));
             Box::pin(async move { answer })
         }
     }
@@ -1131,10 +1141,10 @@ mod tests {
                 .push(scope.to_owned());
             let token = match self.token {
                 Some(token) => AccountToken::new(token),
-                None => Err(ClientError::Host(ProtocolError::new(
+                None => Err(ClientError::refusal(
                     ErrorCode::HostNotConfigured,
-                    "no account is signed in on this device".to_owned(),
-                ))),
+                    Shown::said("no account is signed in on this device"),
+                )),
             };
             Box::pin(async move { token })
         }

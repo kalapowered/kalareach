@@ -53,7 +53,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use base64::Engine as _;
 use kr_crypto::store::{SecretName, SecretStore};
-use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::error::ErrorCode;
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 use subtle::ConstantTimeEq as _;
@@ -62,6 +62,7 @@ use url::Url;
 use super::json::Unreadable;
 use super::{ServiceFuture, ServiceHttpAnswer};
 use crate::error::{ClientError, Result};
+use crate::shown::Shown;
 
 /* -------------------------------------------------------------------------- */
 /* What is pinned                                                              */
@@ -110,6 +111,50 @@ pub const BACKUP_RESTORE_SCOPE: &str = "backup.restore";
 /// The identity claims, which the ID token an exchange is checked by carries and the identity read
 /// returns, and a refresh token that survives a restart, which the kept grant is renewed with.
 pub const IDENTITY_SCOPES: [&str; 4] = ["openid", "profile", "email", "offline_access"];
+
+/// The scopes this build knows by name: the ones an application sign-in asks for.
+const KNOWN_SCOPES: [&str; 8] = REQUESTED_SCOPES;
+
+/// One scope as a diagnostic names it: by name when this build knows it.
+///
+/// A scope is text a service or a stored file supplied, so one this build does not know is not
+/// repeated: it is counted, which is what an operator checking an import needs.
+#[must_use]
+pub fn scope_shown(scope: &str) -> Shown {
+    KNOWN_SCOPES
+        .iter()
+        .find(|known| **known == scope)
+        .map_or(Shown::said("a scope this build does not know"), |known| {
+            Shown::said(known)
+        })
+}
+
+/// What a set of stored scopes says: the ones this build knows, by name and in the order they
+/// were stored, and how many others there are.
+///
+/// Every rendering of stored scopes uses this, the command line's as well. The scopes themselves
+/// are kept whole for what they are for: a request presents them and a check reads them.
+#[must_use]
+pub fn scope_summary(scopes: &[String]) -> Shown {
+    let mut known = Vec::new();
+    let mut unknown = 0_usize;
+    for scope in scopes {
+        match KNOWN_SCOPES.iter().find(|name| **name == scope.as_str()) {
+            Some(name) if !known.contains(name) => known.push(*name),
+            Some(_) => {}
+            None => unknown += 1,
+        }
+    }
+    let named = Shown::joined(known.iter().copied().map(Shown::said), ", ");
+    match (known.is_empty(), unknown) {
+        (true, 0) => Shown::said("no scopes"),
+        (false, 0) => named,
+        (true, count) => crate::shown!("{} scope(s) this build does not know", count),
+        (false, count) => {
+            crate::shown!("{} and {} scope(s) this build does not know", named, count)
+        }
+    }
+}
 
 /// Every scope an application sign-in asks for, in the order the request states them.
 ///
@@ -232,19 +277,20 @@ impl Client {
 /* -------------------------------------------------------------------------- */
 
 /// Checks a bearer value: not empty, at most 8192 bytes, and printable ASCII.
-fn bearer_value(value: &str, what: &str) -> Result<()> {
+fn bearer_value(value: &str, what: &'static str) -> Result<()> {
     if value.is_empty() {
-        return Err(local(&format!("{what} is not empty")));
+        return Err(local(crate::shown!("{} is not empty", what)));
     }
     if value.len() > 8192 {
-        return Err(local(&format!("{what} is at most 8192 bytes")));
+        return Err(local(crate::shown!("{} is at most 8192 bytes", what)));
     }
     if !value
         .bytes()
         .all(|byte| (0x21..=0x7e).contains(&byte) || byte == b' ')
     {
-        return Err(local(&format!(
-            "{what} is printable ASCII, as an authorisation header value is"
+        return Err(local(crate::shown!(
+            "{} is printable ASCII, as an authorisation header value is",
+            what
         )));
     }
     Ok(())
@@ -338,10 +384,13 @@ pub trait AccountTokenSource: Send + Sync + fmt::Debug {
 fn fresh_secret() -> Result<String> {
     let mut bytes = [0_u8; 32];
     kr_crypto::random_bytes(&mut bytes).map_err(|error| {
-        ClientError::Host(ProtocolError::new(
+        ClientError::refusal(
             ErrorCode::ResourceUnavailable,
-            format!("this device could not produce random bytes: {error}"),
-        ))
+            crate::shown!(
+                "this device could not produce random bytes: {}",
+                Shown::crypto(&error)
+            ),
+        )
     })?;
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
@@ -366,10 +415,13 @@ impl AttemptId {
     pub fn fresh() -> Result<Self> {
         let mut bytes = [0_u8; 8];
         kr_crypto::random_bytes(&mut bytes).map_err(|error| {
-            ClientError::Host(ProtocolError::new(
+            ClientError::refusal(
                 ErrorCode::ResourceUnavailable,
-                format!("this device could not produce random bytes: {error}"),
-            ))
+                crate::shown!(
+                    "this device could not produce random bytes: {}",
+                    Shown::crypto(&error)
+                ),
+            )
         })?;
         Ok(Self(u64::from_le_bytes(bytes)))
     }
@@ -387,11 +439,13 @@ impl AttemptId {
     }
 }
 
-impl fmt::Display for AttemptId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{:016x}", self.0)
+impl crate::shown::Said for AttemptId {
+    fn said(&self) -> crate::shown::Shown {
+        crate::shown::Shown::hexadecimal(self.0)
     }
 }
+
+crate::display_as_said!(AttemptId);
 
 impl fmt::Debug for AttemptId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -457,7 +511,7 @@ impl AuthorisationRequest {
     /// produce random bytes.
     pub fn asking(client: Client, redirect: Redirect, resources: &[&str]) -> Result<Self> {
         if !client.owns(redirect) {
-            return Err(local(&format!(
+            return Err(local(crate::shown!(
                 "{} is not a redirect registered for {}",
                 redirect.uri(),
                 client.id()
@@ -811,7 +865,7 @@ impl fmt::Debug for IssuedGrant {
         formatter
             .debug_struct("IssuedGrant")
             .field("expires_in_seconds", &self.expires_in_seconds)
-            .field("scopes", &self.scopes)
+            .field("scopes", &scope_summary(&self.scopes))
             .finish_non_exhaustive()
     }
 }
@@ -1186,19 +1240,27 @@ fn form(pairs: &[(&str, &str)]) -> Vec<u8> {
 }
 
 /// A service that could not be reached or answered in a way this client cannot read.
-fn upstream(what: &str, status: u16) -> ClientError {
-    ClientError::Host(ProtocolError::new(
+fn upstream(what: &'static str, status: u16) -> ClientError {
+    ClientError::refusal(
         ErrorCode::UpstreamUnavailable,
-        format!("the account service answered {what} with status {status}"),
-    ))
+        crate::shown!(
+            "the account service answered {} with status {}",
+            what,
+            status
+        ),
+    )
 }
 
 /// A success this client cannot read, with what was wrong with it and where, and nothing it held.
-fn unreadable(what: &str, fault: Unreadable) -> ClientError {
-    ClientError::Host(ProtocolError::new(
+fn unreadable(what: &'static str, fault: Unreadable) -> ClientError {
+    ClientError::refusal(
         ErrorCode::UpstreamUnavailable,
-        format!("the account service answered {what} with status 200, and {fault}"),
-    ))
+        crate::shown!(
+            "the account service answered {} with status 200, and {}",
+            what,
+            fault
+        ),
+    )
 }
 
 impl AccountService for ManagedAccountService {
@@ -1390,10 +1452,10 @@ impl fmt::Debug for StoredGrant {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("StoredGrant")
-            .field("grant_id", &self.grant_id)
+            .field("grant_id", &Shown::identifier(&self.grant_id))
             .field("revision", &self.revision)
             .field("client", &self.client)
-            .field("scopes", &self.scopes)
+            .field("scopes", &scope_summary(&self.scopes))
             .finish_non_exhaustive()
     }
 }
@@ -1519,9 +1581,9 @@ impl StoredGrant {
 
     fn read(bytes: &[u8]) -> Result<Self> {
         let document: GrantDocument = serde_json::from_slice(bytes).map_err(|error| {
-            storage(&format!(
+            storage(crate::shown!(
                 "the stored sign-in could not be read: {}",
-                super::json_fault(&error)
+                Shown::json(&error)
             ))
         })?;
         if document.issuer != ISSUER {
@@ -1560,9 +1622,9 @@ impl StoredGrant {
             scopes: self.scopes.clone(),
         };
         serde_json::to_vec(&document).map_err(|error| {
-            storage(&format!(
+            storage(crate::shown!(
                 "the sign-in could not be written: {}",
-                super::json_fault(&error)
+                Shown::json(&error)
             ))
         })
     }
@@ -1591,19 +1653,13 @@ struct PendingEntry {
 }
 
 /// A store failure, which a caller reports as this device being unable to keep the sign-in.
-fn storage(message: &str) -> ClientError {
-    ClientError::Host(ProtocolError::new(
-        ErrorCode::StorageUnavailable,
-        message.to_owned(),
-    ))
+fn storage(message: impl Into<Shown>) -> ClientError {
+    ClientError::refusal(ErrorCode::StorageUnavailable, message.into())
 }
 
 /// A request this client would not make.
-fn local(message: &str) -> ClientError {
-    ClientError::Host(ProtocolError::new(
-        ErrorCode::InvalidArgument,
-        message.to_owned(),
-    ))
+fn local(message: impl Into<Shown>) -> ClientError {
+    ClientError::refusal(ErrorCode::InvalidArgument, message.into())
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1646,7 +1702,7 @@ impl fmt::Debug for AccountStatus {
                 .debug_struct("SignedIn")
                 .field("email", &email.as_ref().map(|_| "<present>"))
                 .field("name", &name.as_ref().map(|_| "<present>"))
-                .field("scopes", scopes)
+                .field("scopes", &scope_summary(scopes))
                 .field("generation", generation)
                 .finish(),
         }
@@ -1712,18 +1768,18 @@ impl Drop for Held<'_> {
 
 /// The error a caller gets when no account is signed in.
 fn signed_out() -> ClientError {
-    ClientError::Host(ProtocolError::new(
+    ClientError::refusal(
         ErrorCode::HostNotConfigured,
-        "no account is signed in on this device".to_owned(),
-    ))
+        crate::shown::Shown::said("no account is signed in on this device"),
+    )
 }
 
 /// The error a caller gets when the sign-in has ended.
 fn ended() -> ClientError {
-    ClientError::Host(ProtocolError::new(
+    ClientError::refusal(
         ErrorCode::PermissionDenied,
-        "the sign-in on this device has ended; sign in again".to_owned(),
-    ))
+        crate::shown::Shown::said("the sign-in on this device has ended; sign in again"),
+    )
 }
 
 impl SignedInAccount {
@@ -1824,7 +1880,10 @@ impl SignedInAccount {
                     .await
                     .map_err(|_| storage("the account lock could not be taken"))?
                     .map_err(|error| {
-                        storage(&format!("the account lock could not be taken: {error}"))
+                        storage(crate::shown!(
+                            "the account lock could not be taken: {}",
+                            Shown::io(&error)
+                        ))
                     })?;
                 Some(taken)
             }
@@ -1836,14 +1895,19 @@ impl SignedInAccount {
     }
 
     fn name(item: &str) -> Result<SecretName> {
-        SecretName::new(item).map_err(|error| storage(&error.to_string()))
+        SecretName::new(item).map_err(|error| storage(Shown::crypto(&error)))
     }
 
     fn read_grant(&self) -> Result<Option<StoredGrant>> {
         let bytes = self
             .store
             .get(&Self::name(SESSION_ITEM)?)
-            .map_err(|error| storage(&format!("the sign-in could not be read: {error}")))?;
+            .map_err(|error| {
+                storage(crate::shown!(
+                    "the sign-in could not be read: {}",
+                    Shown::crypto(&error)
+                ))
+            })?;
         bytes
             .map(|bytes| StoredGrant::read(bytes.expose()))
             .transpose()
@@ -1852,13 +1916,23 @@ impl SignedInAccount {
     fn write_grant(&self, grant: &StoredGrant) -> Result<()> {
         self.store
             .set(&Self::name(SESSION_ITEM)?, &grant.write()?)
-            .map_err(|error| storage(&format!("the sign-in could not be kept: {error}")))
+            .map_err(|error| {
+                storage(crate::shown!(
+                    "the sign-in could not be kept: {}",
+                    Shown::crypto(&error)
+                ))
+            })
     }
 
     fn delete_grant(&self) -> Result<()> {
         self.store
             .delete(&Self::name(SESSION_ITEM)?)
-            .map_err(|error| storage(&format!("the sign-in could not be removed: {error}")))
+            .map_err(|error| {
+                storage(crate::shown!(
+                    "the sign-in could not be removed: {}",
+                    Shown::crypto(&error)
+                ))
+            })
     }
 
     fn read_pending(&self) -> Result<Vec<PendingRevocation>> {
@@ -1866,8 +1940,9 @@ impl SignedInAccount {
             .store
             .get(&Self::name(PENDING_ITEM)?)
             .map_err(|error| {
-                storage(&format!(
-                    "the pending revocations could not be read: {error}"
+                storage(crate::shown!(
+                    "the pending revocations could not be read: {}",
+                    Shown::crypto(&error)
                 ))
             })?
         else {
@@ -1875,9 +1950,9 @@ impl SignedInAccount {
         };
         let document: PendingDocument =
             serde_json::from_slice(bytes.expose()).map_err(|error| {
-                storage(&format!(
+                storage(crate::shown!(
                     "the pending revocations could not be read: {}",
-                    super::json_fault(&error)
+                    Shown::json(&error)
                 ))
             })?;
         document
@@ -1897,8 +1972,9 @@ impl SignedInAccount {
         let name = Self::name(PENDING_ITEM)?;
         if entries.is_empty() {
             return self.store.delete(&name).map_err(|error| {
-                storage(&format!(
-                    "the pending revocations could not be removed: {error}"
+                storage(crate::shown!(
+                    "the pending revocations could not be removed: {}",
+                    Shown::crypto(&error)
                 ))
             });
         }
@@ -1913,14 +1989,15 @@ impl SignedInAccount {
                 .collect(),
         };
         let bytes = serde_json::to_vec(&document).map_err(|error| {
-            storage(&format!(
+            storage(crate::shown!(
                 "the pending revocations could not be written: {}",
-                super::json_fault(&error)
+                Shown::json(&error)
             ))
         })?;
         self.store.set(&name, &bytes).map_err(|error| {
-            storage(&format!(
-                "the pending revocations could not be kept: {error}"
+            storage(crate::shown!(
+                "the pending revocations could not be kept: {}",
+                Shown::crypto(&error)
             ))
         })
     }
@@ -2121,10 +2198,12 @@ impl SignedInAccount {
                             generation(&current)
                         }
                         Some(_) | None => {
-                            return Err(ClientError::Host(ProtocolError::new(
+                            return Err(ClientError::refusal(
                                 ErrorCode::OutcomeUnknown,
-                                "the sign-in changed while its usage was being read".to_owned(),
-                            )));
+                                crate::shown::Shown::said(
+                                    "the sign-in changed while its usage was being read",
+                                ),
+                            ));
                         }
                     }
                 };
@@ -2156,10 +2235,13 @@ fn generation(grant: &StoredGrant) -> String {
 
 /// The refusal for a scope this sign-in does not carry.
 fn not_granted(scope: &str) -> ClientError {
-    ClientError::Host(ProtocolError::new(
+    ClientError::refusal(
         ErrorCode::PermissionDenied,
-        format!("this sign-in was not granted the {scope} scope"),
-    ))
+        crate::shown!(
+            "this sign-in was not granted the {} scope",
+            scope_shown(scope)
+        ),
+    )
 }
 
 impl AccountTokenSource for SignedInAccount {
@@ -2281,7 +2363,7 @@ mod tests {
         let tokens = issued(NEVER_RENDERED);
         renders_only(
             &tokens,
-            "IssuedGrant{expires_in_seconds:600,scopes:[\"openid\",\"billing.read\"],..}",
+            "IssuedGrant{expires_in_seconds:600,scopes:\"openid,billing.read\",..}",
         );
 
         let mut stored =
@@ -2292,7 +2374,7 @@ mod tests {
         stored.subject = NEVER_RENDERED.to_owned();
         renders_only(
             &stored,
-            "StoredGrant{grant_id:\"a-grant\",revision:0,client:Mobile,scopes:[\"openid\",\"billing.read\"],..}",
+            "StoredGrant{grant_id:\"a-grant\",revision:0,client:Mobile,scopes:\"openid,billing.read\",..}",
         );
 
         renders_only(

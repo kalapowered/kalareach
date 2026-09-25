@@ -120,7 +120,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use kr_protocol::collection_keys::CollectionKeyRecord;
-use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{DraftId, InstallationId, SyncCollectionId, SyncConflictId, SyncObjectId};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, U64, Uuid};
@@ -138,6 +138,7 @@ use super::{
     SyncPosition, SyncRecoveryId, SyncRequestFence, SyncRequestStatus, SyncRevision,
 };
 use crate::error::{ClientError, Result};
+use crate::shown::Shown;
 use crate::sync::membership::{
     CollectionRef, KeyRecordService, KeyRecords, MembershipStatus, RecordAt, RekeyAnswer,
     RekeyFence, RekeyStatus,
@@ -1216,8 +1217,9 @@ impl ManagedSyncService {
         after: Option<u64>,
     ) -> Result<Option<SyncComparison>> {
         if known.len() > MAX_KNOWN_REVISIONS {
-            return Err(malformed(format!(
-                "a comparison names at most {MAX_KNOWN_REVISIONS} objects the reader holds"
+            return Err(malformed(crate::shown!(
+                "a comparison names at most {} objects the reader holds",
+                MAX_KNOWN_REVISIONS
             )));
         }
         let mut fold = ObjectFold::holding(known);
@@ -1650,10 +1652,12 @@ impl ManagedSyncService {
         signed_at_ms: Option<u64>,
     ) -> std::result::Result<Answer, Unanswered> {
         let Some(account) = &self.account else {
-            return Err(Unanswered::NotSent(ClientError::Host(ProtocolError::new(
+            return Err(Unanswered::NotSent(ClientError::refusal(
                 ErrorCode::HostNotConfigured,
-                "a recovery bundle is reached with an account token, and this client presents no account",
-            ))));
+                Shown::said(
+                    "a recovery bundle is reached with an account token, and this client presents no account",
+                ),
+            )));
         };
         self.dispatch(request, signed_at_ms, Some(account)).await
     }
@@ -2021,8 +2025,9 @@ impl ManagedSyncService {
             ));
         }
         record.check_structure().map_err(|rule| {
-            malformed(format!(
-                "that key record is not one a service admits: {rule}"
+            malformed(crate::shown!(
+                "that key record is not one a service admits: {}",
+                rule
             ))
         })?;
         a_counter("a key record revision", record.payload.revision.get())?;
@@ -2337,7 +2342,7 @@ fn retired_head(refusal: &Refusal) -> Result<KeyHead> {
 }
 
 /// Reads one answer as the shape the contract gives it.
-fn read<T: for<'de> Deserialize<'de>>(data: serde_json::Value, what: &str) -> Result<T> {
+fn read<T: for<'de> Deserialize<'de>>(data: serde_json::Value, what: &'static str) -> Result<T> {
     serde_json::from_value(data).map_err(|error| unreadable_answer(what, &error))
 }
 
@@ -2611,8 +2616,9 @@ fn sealed_object(ciphertext: &[u8]) -> Result<SealedSyncObject> {
             .map_err(|_| malformed("what was handed over to publish is not a sealed object"))?;
     // The rule broken, which names a bucket and a length and nothing that was sealed.
     object.check_structure().map_err(|rule| {
-        malformed(format!(
-            "that sealed object is not one a service admits: {rule}"
+        malformed(crate::shown!(
+            "that sealed object is not one a service admits: {}",
+            rule
         ))
     })?;
     Ok(object)
@@ -2635,8 +2641,9 @@ fn sealed_bundle(ciphertext: &[u8]) -> Result<SealedRecoveryBundle> {
         ciphertext: kr_protocol::scalars::Bytes::new(ciphertext.to_vec()),
     };
     bundle.check_structure().map_err(|rule| {
-        malformed(format!(
-            "that recovery bundle is not one a service admits: {rule}"
+        malformed(crate::shown!(
+            "that recovery bundle is not one a service admits: {}",
+            rule
         ))
     })?;
     Ok(bundle)
@@ -2725,7 +2732,11 @@ fn copy_position(
 }
 
 /// Reads what a status query or a fence answered, and holds it to the identity asked about.
-fn status_answer(data: serde_json::Value, request_id: Uuid, what: &str) -> Result<StatusAnswer> {
+fn status_answer(
+    data: serde_json::Value,
+    request_id: Uuid,
+    what: &'static str,
+) -> Result<StatusAnswer> {
     let answer: StatusAnswer = read(data, what)?;
     if answer.request_id != request_id {
         return Err(contrary("an answer about another request identity"));
@@ -2768,10 +2779,13 @@ fn one_history(
 }
 
 /// Refuses a counter the service could not compare exactly, before anything is sent.
-fn a_counter(what: &str, value: u64) -> Result<()> {
+fn a_counter(what: &'static str, value: u64) -> Result<()> {
     if value > MAX_SYNC_COUNTER {
-        return Err(malformed(format!(
-            "{what} is at most {MAX_SYNC_COUNTER} and this one is {value}"
+        return Err(malformed(crate::shown!(
+            "{} is at most {} and this one is {}",
+            what,
+            MAX_SYNC_COUNTER,
+            value
         )));
     }
     Ok(())
@@ -2796,11 +2810,11 @@ fn retired_where_no_epoch_was() -> ClientError {
 ///
 /// The service answered, so whatever it did is done; what this client lacks is an answer it can
 /// act on, which is an unknown outcome like any other answer it could not read.
-fn contrary(what: &str) -> ClientError {
-    ClientError::Host(ProtocolError::new(
+fn contrary(what: impl Into<Shown>) -> ClientError {
+    ClientError::refusal(
         ErrorCode::OutcomeUnknown,
-        format!("the service answered {what}"),
-    ))
+        crate::shown!("the service answered {}", what.into()),
+    )
 }
 
 #[cfg(test)]

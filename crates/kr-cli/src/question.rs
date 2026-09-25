@@ -506,7 +506,7 @@ struct Failure {
 fn answer_failure(error: AnswerError) -> CliError {
     let code = error.code();
     match error {
-        AnswerError::Form(message) => CliError::Usage(message),
+        AnswerError::Form(message) => CliError::Usage(message.into_string()),
         AnswerError::Retired(reason) => CliError::Refused(ProtocolError::new(
             code,
             format!(

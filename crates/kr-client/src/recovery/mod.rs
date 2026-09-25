@@ -44,6 +44,7 @@ use kr_protocol::ids::SyncConflictId;
 use kr_protocol::scalars::Digest256;
 
 use crate::services::SyncPosition;
+use crate::shown::{IoFault, Said, Shown};
 
 pub use crate::recovery::bundle::{
     BundleStore, LostWrite, Migrated, MigrationRecord, OfflineExport, WriterEnabled,
@@ -64,7 +65,7 @@ pub use kr_crypto::backup::{
 };
 
 /// What can go wrong on the recovery path.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum RecoveryError {
     /// The kit declares a cryptographic profile this build does not read.
@@ -306,12 +307,12 @@ pub enum RecoveryError {
         recovery: Option<crate::services::SyncRecoveryId>,
     },
     /// This device's record of a bundle write could not be read or written.
-    #[error("the recovery bundle's write record at {path} could not be used: {source}")]
+    #[error("the recovery bundle's write record at {path} could not be used: {fault}")]
     Storage {
         /// What was being read or written.
-        path: std::path::PathBuf,
+        path: Shown,
         /// The underlying failure.
-        source: std::io::Error,
+        fault: IoFault,
     },
     /// This device's record of a bundle write is not one this build can read back.
     ///
@@ -322,7 +323,7 @@ pub enum RecoveryError {
     #[error("the recovery bundle's write record at {path} cannot be read back by this build")]
     UnreadableWriteRecord {
         /// Which record.
-        path: std::path::PathBuf,
+        path: Shown,
     },
     /// Another bundle store on this device holds that bundle's write record.
     ///
@@ -332,16 +333,16 @@ pub enum RecoveryError {
     #[error("another recovery bundle store on this device holds the write record at {path}")]
     BundleStoreInUse {
         /// The lock the other store holds.
-        path: std::path::PathBuf,
+        path: Shown,
     },
     /// The table refuses this material, for the reason it gives.
     ///
     /// Asked before a byte of the material is read, so what is refused is named rather than
     /// silently left out.
-    #[error("{} is never carried here: {because}", .material.as_str())]
+    #[error("{material} is never carried here: {because}")]
     Refused {
         /// What was offered.
-        material: Material,
+        material: MaterialName,
         /// The table's reason.
         because: &'static str,
     },
@@ -358,12 +359,42 @@ pub enum RecoveryError {
     #[error("{0}")]
     Service(#[from] crate::error::ClientError),
     /// A cryptographic operation failed.
+    ///
+    /// It holds what [`Shown::crypto`] says of the failure.
     #[error("{0}")]
-    Crypto(#[from] kr_crypto::CryptoError),
+    Crypto(Shown),
     /// A value could not be encoded or decoded as KR-CBOR-1.
+    ///
+    /// It holds what [`Shown::cbor`] says of the failure.
     #[error("{0}")]
-    Cbor(#[from] kr_cbor::CborError),
+    Cbor(Shown),
 }
+
+crate::debug_as_display!(RecoveryError);
+
+impl From<kr_crypto::CryptoError> for RecoveryError {
+    fn from(error: kr_crypto::CryptoError) -> Self {
+        Self::Crypto(Shown::crypto(&error))
+    }
+}
+
+impl From<kr_cbor::CborError> for RecoveryError {
+    fn from(error: kr_cbor::CborError) -> Self {
+        Self::Cbor(Shown::cbor(&error))
+    }
+}
+
+/// A kind of material, named the way a refusal of it says it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MaterialName(pub Material);
+
+impl Said for MaterialName {
+    fn said(&self) -> Shown {
+        Shown::said(self.0.as_str())
+    }
+}
+
+crate::display_as_said!(MaterialName);
 
 /// The result of a recovery operation.
 pub type Result<T> = core::result::Result<T, RecoveryError>;
