@@ -1046,14 +1046,18 @@ mod tests {
 
     /// KR-REQ-07.16, KR-REQ-07.30: each shell loads the integration once, and a login shell that
     /// also runs `.bashrc` still loads it once.
+    ///
+    /// It starts `/bin/bash`, which every Linux and macOS host this runs on has. A host without one
+    /// fails here and says so, because a check that returned early would be counted as one that
+    /// passed.
     #[cfg(unix)]
     #[test]
     fn a_shell_loads_the_integration_exactly_once() {
         let bash = Path::new("/bin/bash");
-        if !bash.exists() {
-            eprintln!("skipped: this host has no /bin/bash to start");
-            return;
-        }
+        assert!(
+            bash.is_file(),
+            "this host has no /bin/bash to start, so this check cannot run here"
+        );
         for login in [
             "echo hello\n",
             ". ~/.bashrc\n",
@@ -1065,7 +1069,15 @@ mod tests {
                 .expect("a home directory");
             let loaded = home.path().join("loaded");
             let package = home.path().join("entry.sh");
-            std::fs::write(&package, format!("printf x >> {}\n", loaded.display()))
+            // The shell is told where to record each load as text, so a path that is not text is
+            // refused here rather than written as another path the count would never be read from.
+            let told = loaded.to_str().unwrap_or_else(|| {
+                panic!(
+                    "{} is not UTF-8, so no shell can be told it",
+                    loaded.display()
+                )
+            });
+            std::fs::write(&package, format!("printf x >> '{told}'\n"))
                 .expect("writes the package's entry");
             std::fs::write(home.path().join(".bashrc"), "").expect("writes .bashrc");
             std::fs::write(home.path().join(".bash_profile"), login)
