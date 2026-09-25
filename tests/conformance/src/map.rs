@@ -636,6 +636,8 @@ impl Scope {
         }
         let (mut at, rest) = match path.first().map(String::as_str) {
             None => return Some(from.to_vec()),
+            // A path from the root of the paths names another crate, which is not followed.
+            Some("::") => return None,
             Some("crate") => (Vec::new(), &path[1..]),
             Some("self" | "super") => (from.to_vec(), path),
             Some(first) => {
@@ -825,6 +827,12 @@ fn unlisted_names(modules: &[Module], scope: &Scope) -> bool {
                         return false;
                     };
                     let root = path.first().map_or("", String::as_str);
+                    // From the root of the paths, only the standard library is inside.
+                    if root == "::" {
+                        return !path
+                            .get(1)
+                            .is_some_and(|name| STANDARD_ROOTS.contains(&name.as_str()));
+                    }
                     let mut child = module.path.clone();
                     child.push(root.to_owned());
                     !(matches!(root, "crate" | "self" | "super")

@@ -141,9 +141,10 @@ compiles:
   (`helper(...)` or `path::helper(...)`, with or without a turbofish), or as the last name of a
   plain `use` among a module's items that the report follows to a function of that name. Anywhere
   else is a problem: a binding or a parameter, a field, a method or a value, a rename with `as` to
-  or from the name, a type, trait, module, constant, static or macro of that name, a function of
-  that name inside a function, a block, an implementation, a trait or a macro, a path through the
-  name (`helper::...`), a `use` of it anywhere but among a module's items, or the name after `dyn`,
+  or from the name, a type, trait, module, constant, static, macro or enum variant of that name, a
+  function of that name inside a function, a block, an implementation, a trait or a macro, a path
+  through the name (`helper::...`), a `use` of it anywhere but among a module's items or one the
+  report does not follow (`use ::name::helper` names another crate), or the name after `dyn`,
   `impl` or `?`.
 - No helper is named like a keyword or like one of the traits a type writes like a call (`Fn`,
   `FnMut`, `FnOnce`, `AsyncFn`, `AsyncFnMut`, `AsyncFnOnce`).
@@ -165,7 +166,9 @@ compiles:
   compares identifiers once it has normalised them, and the report compares them as written.
 - The report reads every file the target compiles: no module file is declared anywhere but among a
   module's items (inside a function, say, where the report does not follow it), no module's files
-  are chosen by a `cfg_attr`, and every declared module has its file.
+  are chosen by a `cfg_attr`, no module's own file carries a `path` attribute (or a `cfg_attr` that
+  may set one) among its inner attributes, which moves where the compiler looks for its modules,
+  and every declared module has its file.
 - The target is of the 2018 edition or later.
 
 The report checks these on tokens and nothing else, so it errs towards a problem: text inside
@@ -186,16 +189,22 @@ identifiers stay references that the result lists with the reason. That happens 
   parameter, a nested item, a module the body declares, or a `use` or glob in the body;
 - a macro or attribute in or on the test may rewrite or re-scope the call: a macro in the body other
   than the standard library's above by their bare names, a `cfg` in the body, which may compile the
-  call out, and an attribute on the test or in its body other than a built-in one, `#[test]`, a
-  derive of the trusted ones with serde's helper attribute, a `rustfmt` or `clippy` tool attribute
-  and `#[tokio::test]`. `tokio::test` is trusted only where the package takes `tokio` from
-  crates.io under that name, as its lockfile resolves it, and the tool attributes only where no
-  dependency takes the tool's name;
+  call out, and an attribute on the test or in its body other than the built-in ones the report
+  knows (`allow`, `cfg`, `cold`, `deny`, `deprecated`, `doc`, `expect`, `forbid`, `ignore`,
+  `inline`, `macro_export`, `macro_use`, `must_use`, `non_exhaustive`, `path`, `recursion_limit`,
+  `repr`, `should_panic`, `track_caller`, `warn`), `#[test]`, a derive of the trusted ones with
+  serde's helper attribute, a `rustfmt` or `clippy` tool attribute and `#[tokio::test]`.
+  `tokio::test` is trusted only where the package takes `tokio` from crates.io under that name, as
+  its lockfile resolves it, and the tool attributes only where no dependency takes the tool's name.
+  Any other attribute, built into the compiler or not (`#![no_std]`, say), counts as one that may
+  rewrite what it is on;
 - an attribute on the helper, on its module or on a module around it or around the test is other
-  than a built-in one: there, a tool's attribute counts as one that may rewrite what it is on;
+  than one of those built-in ones: there, a tool's attribute counts as one that may rewrite what it
+  is on too;
 - the target brings in names its source does not list: an item under `#[macro_use]`, an
   `extern crate`, a macro invoked among a module's items (`include!` among them), an item under an
-  attribute other than the trusted ones, or a glob from outside the crate and the standard library;
+  attribute other than the trusted ones, or a glob from outside the crate and the standard library
+  (a glob from the root of the paths, `use ::name::*`, included);
 - the helper is under a `cfg` of its own or of a module around it, other than exactly `cfg(test)`
   and the crate root's own `cfg`, or its module takes its name twice, or its module is declared
   twice;
@@ -207,9 +216,9 @@ identifiers stay references that the result lists with the reason. That happens 
 The report reads each target's crate root as Cargo describes it and follows every `mod`
 declaration among a module's items as the compiler does, so a test is named exactly as the test
 harness names it. A `path` attribute is read from the directory of the file it is in at the file's
-top level, and from the inline module's directory inside one; on an inline module it names the
-directory of the modules inside; and the file it names keeps its own modules beside it, as a
-`mod.rs` does. A module whose file is not there, or whose files a `cfg_attr` chooses, is a warning,
+top level, and from the inline module's directory inside one; on an inline module, written before
+it or at the start of its body, it names the directory of the modules inside; and the file it names
+keeps its own modules beside it, as a `mod.rs` does. A module whose file is not there, or whose files a `cfg_attr` chooses, is a warning,
 and in a target with a helper a problem.
 
 ### Case tables kept as data
