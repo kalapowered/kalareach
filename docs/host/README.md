@@ -2444,15 +2444,17 @@ A creation whose answer was lost is the awkward case. The service holds that upl
 identity this host never learned and refuses another creation until the upload's lifetime runs
 out, and a pass after that creates it again.
 
-A publication is signed at the instant its generation was admitted, so every send of it is the same
-bytes and the service answers a repeat as a duplicate. The uploader still does not send one again
-while an earlier send may be on its way. It fetches the generation instead, and sends again only
-once the service does not hold it and no request sent for it can be admitted any more, two
-freshness windows after it was signed. After a restart, `Uploader::settle` makes that fetch for
-every publication an earlier process dispatched, and a daemon calls it before reconciliation, which
-would otherwise write the outcome down as unknown. A process that stopped between dispatching a
-publication and sending it leaves that generation unknown: its production ends there, and the next
-generation carries the backup.
+A publication is signed at the instant its generation was admitted, so one the service refused,
+or one refused on this host before it left, goes again as the same bytes. One that may have left
+without an answer is never sent again. The uploader fetches the generation instead and records it
+as published if the service holds it. If the service still does not hold it two freshness windows
+after the send, the uploader stops waiting: the attempt stops, the outcome is written down as
+unknown, the generation's production ends, and the next generation carries the backup. That a
+publication may have left is noted before the request goes, so a pass cancelled while it is on its
+way leaves the next pass asking. After a restart, `Uploader::settle` makes the same fetch for every
+publication an earlier process dispatched, and a daemon calls it before reconciliation, which would
+otherwise write the outcome down as unknown. A process that stopped between dispatching a
+publication and sending it leaves that generation unknown in the same way.
 
 An attempt ends on evidence about its own work. A collection deleted from the account console
 stops the attempt, retires this host's writer for that archive and cancels what it was still
@@ -2461,7 +2463,9 @@ enrolling a new collection. A staged object that is gone, or is no longer the ci
 admitted, stops its generation. Any other refusal, and any failure of the transport, leaves the
 attempt for the next pass. When the service refuses a part or a completion as not permitted, the
 uploader asks it to abandon the upload: a confirmed abandonment means the object goes up again
-under a new upload, and a refused one leaves the upload to go on as it was.
+under a new upload, and a refused one leaves the upload to go on as it was. An upload nothing
+carries any more that the service will not abandon is forgotten, and what the service holds of its
+object stays written down as unknown.
 
 Under a privacy fence nothing new leaves, whether a dispatch, a further part, an object or a
 publication. The upload in progress is abandoned at the service and its attempt stopped, which is

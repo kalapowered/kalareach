@@ -49,14 +49,16 @@
 //! # A publication is made the same way every time
 //!
 //! The writer signs the generation's descriptor at the instant the generation was admitted, and an
-//! Ed25519 signature over the same bytes is the same signature, so every send of a generation's
-//! publication is the same publication, which the service answers again as a duplicate. What the
-//! uploader does not do is send it again while an earlier send may still be on its way without an
-//! answer: section 23 retries no outcome that is unknown. It fetches the generation instead. The
-//! service holding its descriptor under this writer is the answer. A service that still does not
-//! hold it once no request sent for it can be admitted any more, two freshness windows after it
-//! was signed, holds nothing that request carried: the outcome is then known, and the publication
-//! is sent again where production may go on and the attempt stopped where it may not.
+//! Ed25519 signature over the same bytes is the same signature, so a publication refused by an
+//! answer, or refused on this host before it left, is sent again as the same publication. One that
+//! may have left without an answer is never sent again: section 23 retries no outcome that is
+//! unknown, and nothing the service offers can prove that a request it admitted will not still run.
+//! The uploader fetches the generation instead. The service holding its descriptor under this
+//! writer is the answer. One that still does not hold it two freshness windows after the send is
+//! given up on: the attempt stops, which writes down that this host cannot establish what the
+//! service holds and ends the generation's production, and the next generation carries the backup.
+//! That this host may have sent it is written down before the request can leave, so a pass cancelled
+//! while the request is on its way leaves the next pass asking rather than sending.
 //!
 //! # A restart with a publication on its way
 //!
@@ -118,9 +120,13 @@ use crate::error::{ControllerError, Result};
 /// next.
 pub const EXECUTOR: &str = "the managed storage uploader";
 
-/// How long after it was signed a request can still be admitted: a freshness window, with the
-/// service's clock allowed to differ from this host's by as much again.
-const ADMISSIBLE_FOR_MS: u64 = 2 * SERVICE_REQUEST_FRESHNESS_MS;
+/// How long the uploader keeps asking whether a publication sent without an answer reached the
+/// service before it gives up on it: a freshness window, with the service's clock allowed to differ
+/// from this host's by as much again.
+///
+/// It bounds the wait. It is not evidence that nothing sent will land, and giving up records the
+/// outcome as one this host cannot establish.
+const WAITS_FOR_AN_ANSWER_MS: u64 = 2 * SERVICE_REQUEST_FRESHNESS_MS;
 
 /// What one step did.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -184,8 +190,9 @@ pub enum Stepped {
     },
     /// An upload nothing carries any more that the service would not abandon.
     ///
-    /// It is forgotten: nothing more is sent under it, and an upload the service still holds open
-    /// ends when its lifetime runs out.
+    /// It is forgotten, and nothing more is sent under it. What the service holds of the object is
+    /// not known here: an open upload ends when its lifetime runs out, and a completed one stays
+    /// stored.
     Unabandoned {
         /// The object it carried.
         object_id: BackupObjectId,
@@ -265,8 +272,8 @@ impl Stepped {
                  kept, so this host forgets it"
             ),
             Self::Unabandoned { object_id, reason } => format!(
-                "the service would not abandon the upload of object {object_id}, which ends when \
-                 its lifetime runs out: {reason}"
+                "the service would not abandon the upload of object {object_id}, so what it holds \
+                 of that object is not known here: {reason}"
             ),
             Self::Stopped { sequence, reason } => {
                 format!("backup attempt {sequence} stopped: {reason}")
@@ -1073,6 +1080,11 @@ impl Uploader {
     /* ---------------------------------------------------------------------- */
 
     /// Carries a publication attempt dispatched to this uploader.
+    ///
+    /// A send of it that may be on its way without an answer, this process's or an earlier one's, is
+    /// established by fetching the generation and never by sending it again. The service holding it
+    /// is the answer. One that does not hold it once [`WAITS_FOR_AN_ANSWER_MS`] have passed since the
+    /// send is given up on, and the attempt stops with its outcome unknown.
     async fn carry_publication(
         &mut self,
         attempt: &Attempt,
@@ -1088,37 +1100,39 @@ impl Uploader {
         } else {
             Some(self.started_at_ms)
         };
-        if let Some(since) = on_its_way_since {
-            match self.held(generation).await {
-                Ok(true) => return self.published(attempt, now),
-                Ok(false) if now.get() >= since.saturating_add(ADMISSIBLE_FOR_MS) => {
-                    // No request sent for it can be admitted any more, and the service holds
-                    // none: nothing that was sent landed, and nothing of it is on its way.
-                    self.unanswered.remove(&sequence);
-                    self.dispatched_here.insert(sequence);
-                }
-                Ok(false) => {
-                    return Ok(Stepped::Waiting {
-                        reason: format!(
-                            "the publication of backup attempt {sequence} may still reach the \
-                             service, which does not hold it yet"
-                        ),
-                    });
-                }
-                Err(error) => {
-                    return Ok(Stepped::Waiting {
-                        reason: format!(
-                            "whether the service holds the publication of backup attempt \
-                             {sequence} is not known: {error}"
-                        ),
-                    });
-                }
+        let Some(since) = on_its_way_since else {
+            // Nothing of it is on its way, so it is sent, or it ends where it may not be.
+            if may_produce(generation, privacy) {
+                return self.publish(attempt, generation, now).await;
             }
+            return self.stop(attempt, production_over(generation, privacy), now);
+        };
+        match self.held(generation).await {
+            Ok(true) => self.published(attempt, now),
+            Ok(false) if now.get() >= since.saturating_add(WAITS_FOR_AN_ANSWER_MS) => {
+                self.unanswered.remove(&sequence);
+                self.stop(
+                    attempt,
+                    "its publication was sent without an answer and the service does not hold \
+                     it, so what the service will hold of it is not something this host can \
+                     establish, and it is not sent again"
+                        .to_owned(),
+                    now,
+                )
+            }
+            Ok(false) => Ok(Stepped::Waiting {
+                reason: format!(
+                    "the publication of backup attempt {sequence} may still reach the service, \
+                     which does not hold it yet"
+                ),
+            }),
+            Err(error) => Ok(Stepped::Waiting {
+                reason: format!(
+                    "whether the service holds the publication of backup attempt {sequence} is \
+                     not known: {error}"
+                ),
+            }),
         }
-        if may_produce(generation, privacy) {
-            return self.publish(attempt, generation, now).await;
-        }
-        self.stop(attempt, production_over(generation, privacy), now)
     }
 
     async fn publish(
@@ -1134,29 +1148,41 @@ impl Uploader {
         if !may_send(&self.backup, attempt)? {
             return Ok(not_carried());
         }
+        // Written down before the request can leave and cleared only by an answer or by a refusal
+        // made before anything left, so a pass cancelled while it is on its way leaves the next one
+        // asking the service rather than sending again.
+        let sequence = attempt.sequence;
+        self.unanswered.insert(sequence, now.get());
         match self.manifest.publish_dispatched(&publication).await {
             Ok(Dispatched::Answered(ArchiveAnswer::Done(_))) => self.published(attempt, now),
             Ok(Dispatched::Answered(ArchiveAnswer::CollectionDeleted)) => {
+                self.unanswered.remove(&sequence);
                 self.collection_deleted(attempt, generation, now)
             }
-            Ok(Dispatched::Answered(ArchiveAnswer::UploadGone)) => Ok(Stepped::Waiting {
-                reason: "the service answered a publication as an upload it holds none of"
-                    .to_owned(),
-            }),
-            Ok(Dispatched::NotSent(error)) => Ok(Stepped::Waiting {
-                reason: format!("the publication was not sent: {error}"),
-            }),
-            // The service answered and published nothing, so the same publication sent again is
-            // the first one that can land.
-            Err(error @ ClientError::Refused { .. }) => Ok(Stepped::Waiting {
-                reason: format!("the service did not publish the generation: {error}"),
-            }),
-            Err(error) => {
-                self.unanswered.insert(attempt.sequence, now.get());
+            Ok(Dispatched::Answered(ArchiveAnswer::UploadGone)) => {
+                self.unanswered.remove(&sequence);
                 Ok(Stepped::Waiting {
-                    reason: format!("the publication may have left and was not answered: {error}"),
+                    reason: "the service answered a publication as an upload it holds none of"
+                        .to_owned(),
                 })
             }
+            Ok(Dispatched::NotSent(error)) => {
+                self.unanswered.remove(&sequence);
+                Ok(Stepped::Waiting {
+                    reason: format!("the publication was not sent: {error}"),
+                })
+            }
+            // The service answered and published nothing, so the same publication sent again is
+            // the first one that can land.
+            Err(error @ ClientError::Refused { .. }) => {
+                self.unanswered.remove(&sequence);
+                Ok(Stepped::Waiting {
+                    reason: format!("the service did not publish the generation: {error}"),
+                })
+            }
+            Err(error) => Ok(Stepped::Waiting {
+                reason: format!("the publication may have left and was not answered: {error}"),
+            }),
         }
     }
 

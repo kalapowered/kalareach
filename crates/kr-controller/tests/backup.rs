@@ -5547,6 +5547,9 @@ enum Fault {
     Lost,
     /// It is refused as not permitted, and nothing is done.
     Forbidden,
+    /// It arrives and is never answered, and nothing is done: the caller waits for as long as it
+    /// is willing to.
+    Hang,
 }
 
 /// Where one upload the scripted service created has got to.
@@ -5654,7 +5657,7 @@ fn answered<T>(
             let _ = take();
             Err(unanswered())
         }
-        None => take(),
+        Some(Fault::Hang) | None => take(),
     }
 }
 
@@ -6200,6 +6203,9 @@ impl BackupManifestService for Web {
                 Kind::Publish,
                 Asked::Publish(publication.payload.descriptor.backup_generation),
             );
+            if fault == Some(Fault::Hang) {
+                std::future::pending::<()>().await;
+            }
             answered(fault, || self.take_publication(publication))
         })
     }
@@ -6696,11 +6702,14 @@ async fn after_a_crash_an_upload_goes_on_at_the_part_after_the_last_one_acknowle
     host.web.nothing_asked_twice();
 }
 
+/// Section 23: a publication that may have left without an answer is established by a fetch and
+/// never sent again. One the service holds is recorded; one it still does not hold after the wait is
+/// given up on, with its outcome unknown and its generation's production over.
 #[tokio::test]
-async fn a_publication_that_may_have_left_is_fetched_and_sent_again_only_once_it_cannot_land() {
-    // The request never arrived.
+async fn a_publication_that_may_have_left_is_fetched_and_never_sent_again() {
+    // The request never arrived, which nothing here can tell from one still on its way.
     let host = Host::open();
-    host.admit(1, &[64]);
+    let publication = host.admit(1, &[64]) + 1;
     host.web.fail(Kind::Publish, 1, Fault::Dropped);
     let mut uploader = host.uploader(10_000);
     let sent = uploader
@@ -6709,29 +6718,29 @@ async fn a_publication_that_may_have_left_is_fetched_and_sent_again_only_once_it
         .expect("a pass");
     assert_eq!(kinds(&sent.steps).last(), Some(&"waiting"));
 
-    // While a request sent for it could still be admitted, the uploader asks whether the service
-    // holds it, and sends nothing.
+    // The uploader asks whether the service holds it, and sends nothing.
     let within = uploader
         .pass(TimestampMs::new(10_000 + ADMISSIBLE_MS - 1))
         .await
         .expect("a pass");
     assert_eq!(kinds(&within.steps), ["waiting"]);
-    assert_eq!(
-        host.web.count(|asked| matches!(asked, Asked::Publish(_))),
-        0
-    );
 
-    // Once none can, nothing that was sent landed, and the same publication is sent again.
+    // After the wait it gives up on it, and still sends nothing.
     let after = uploader
         .pass(TimestampMs::new(10_000 + ADMISSIBLE_MS))
         .await
         .expect("a pass");
-    assert_eq!(kinds(&after.steps), ["published"]);
+    assert_eq!(kinds(&after.steps), ["stopped"]);
     assert_eq!(
         host.web.count(|asked| matches!(asked, Asked::Publish(_))),
-        1
+        0,
+        "the one publication sent never arrived, and none was sent again"
     );
-    assert_eq!(host.generation(1).remote, Remote::Published);
+    assert!(host.web.count(|asked| matches!(asked, Asked::Fetch(_))) >= 2);
+    let record = host.generation(1);
+    assert_eq!(record.production, Production::Cancelled);
+    assert_eq!(record.remote, Remote::Unknown);
+    assert_eq!(host.outcome(publication), Some(AttemptOutcome::Stopped));
 
     // The request arrived and its answer was lost: the fetch finds it, and it is not sent again.
     let host = Host::open();
@@ -6752,6 +6761,76 @@ async fn a_publication_that_may_have_left_is_fetched_and_sent_again_only_once_it
         1
     );
     assert_eq!(host.generation(1).production, Production::Complete);
+}
+
+/// A pass cancelled while its publication is on its way leaves the next pass asking the service,
+/// never sending the publication again.
+#[tokio::test]
+async fn a_publication_cancelled_on_its_way_is_asked_about_and_never_sent_again() {
+    let host = Host::open();
+    host.admit(1, &[64]);
+    host.web.fail(Kind::Publish, 1, Fault::Hang);
+    let mut uploader = host.uploader(10_000);
+    let cancelled = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        uploader.pass(TimestampMs::new(10_000)),
+    )
+    .await;
+    assert!(
+        cancelled.is_err(),
+        "the pass was cancelled while its publication was on its way"
+    );
+    assert_eq!(
+        host.web.count(|asked| matches!(asked, Asked::Publish(_))),
+        1
+    );
+
+    let next = uploader
+        .pass(TimestampMs::new(11_000))
+        .await
+        .expect("a pass");
+    assert_eq!(kinds(&next.steps), ["waiting"]);
+    let later = uploader
+        .pass(TimestampMs::new(10_000 + ADMISSIBLE_MS))
+        .await
+        .expect("a pass");
+    assert_eq!(kinds(&later.steps), ["stopped"]);
+    assert_eq!(
+        host.web.count(|asked| matches!(asked, Asked::Publish(_))),
+        1,
+        "the publication on its way when the pass was cancelled is the only one sent"
+    );
+    assert!(host.web.count(|asked| matches!(asked, Asked::Fetch(_))) >= 2);
+    assert_eq!(host.generation(1).remote, Remote::Unknown);
+}
+
+/// An upload the service completed, whose answer never reached this host, is not abandoned when
+/// privacy mode asks, and the report makes no promise about it: what the service holds of the
+/// object is written down as unknown.
+#[tokio::test]
+async fn an_upload_the_service_completed_is_reported_unknown_when_it_will_not_be_abandoned() {
+    let host = Host::open();
+    let upload = host.admit(1, &[64]);
+    host.web.fail(Kind::Complete, 1, Fault::Lost);
+    let mut uploader = host.uploader(10_000);
+    steps_until(&mut uploader, 10_000, "waiting").await;
+    host.service
+        .raise_fence(PrivacyGeneration::new(1), TimestampMs::new(11_000))
+        .expect("the fence is raised");
+
+    let steps = passes(&mut uploader, 12_000).await;
+    assert_eq!(kinds(&steps), ["unabandoned", "stopped"]);
+    let said = steps[0].describe();
+    assert!(said.contains("not known here"), "{said}");
+    assert!(!said.contains("lifetime"), "{said}");
+    assert_eq!(host.generation(1).remote, Remote::Unknown);
+    assert_eq!(host.outcome(upload), Some(AttemptOutcome::Stopped));
+    assert_eq!(
+        host.web.stored_objects(),
+        1,
+        "the object the service stored, once"
+    );
+    host.web.stored_once();
 }
 
 #[tokio::test]
