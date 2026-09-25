@@ -93,8 +93,9 @@ pub struct Test {
     /// every call of a body a macro or attribute this reading cannot see into may rewrite.
     pub calls: BTreeSet<Vec<String>>,
     /// The macro and attribute names the reading of it took on trust as the standard library's (or,
-    /// for `tokio::test`, as the Tokio crate's, written `tokio::`): its calls are proved only while
-    /// its target neither defines nor imports any of them.
+    /// for `tokio::test`, as the Tokio crate's, written `tokio::`): the conventions forbid its target
+    /// to declare any of them, and the map holds the crate and tool roots among them against what
+    /// the package depends on.
     pub assumes: BTreeSet<String>,
     /// The names its body's own `use` declarations bring in.
     pub imports: Vec<Import>,
@@ -163,8 +164,8 @@ pub struct Module {
     /// `extern crate`, a macro invoked among its items, or an item under an attribute that may be
     /// a macro, whose expansion may define anything.
     pub unlisted_names: bool,
-    /// The names the attributes of its items are taken on trust by, for the map to hold against
-    /// what the target defines and imports.
+    /// The names the attributes of its items are taken on trust by, whose crate and tool roots the
+    /// map holds against what the package depends on.
     pub assumes: BTreeSet<String>,
     /// Whether an attribute on it, on the `mod` that declares it or on an enclosing module's, may be
     /// a macro that rewrites everything in it.
@@ -391,9 +392,9 @@ impl Attribute {
     /// standard library's traits adds implementations only, serde's derives put all they add
     /// inside an unnamed constant and read their `#[serde(...)]` helpers, and `#[tokio::test]` runs
     /// the test's block as written on a runtime; each is trusted by the names it is known by
-    /// (`serde::` and `tokio::` for the crates), which the map holds against what the target
-    /// defines and imports and what the package depends on. Any other attribute may be a macro
-    /// that rewrites what it is on.
+    /// (`serde::` and `tokio::` for the crates), which the conventions forbid the target to declare,
+    /// and whose roots the map holds against what the package depends on. Any other attribute may
+    /// be a macro that rewrites what it is on.
     fn trusted(&self) -> Option<Vec<String>> {
         const BUILT_IN: &[&str] = &[
             "allow",
@@ -1267,8 +1268,9 @@ pub const NO_CODE: &[&str] = &[
 /// the test is known to add no name to, and rewrite nothing of, the code it is on: the standard
 /// library's macros by their bare names, [`RUN_AS_WRITTEN`] ones with their arguments read as code
 /// and [`NO_CODE`] ones passed over, and the attributes [`Attribute::trusted`] names. The names
-/// they are taken on trust by are returned, for the map to hold against what the target defines
-/// and imports. Any other macro, a macro the body defines, or any other attribute, in the body or
+/// they are taken on trust by are returned: the conventions forbid the target to declare any of
+/// them, and the map holds the crate and tool roots among them against what the package depends
+/// on. Any other macro, a macro the body defines, or any other attribute, in the body or
 /// on the test, may rewrite or re-scope any call, so none is kept; so is a `cfg` in the body, which
 /// may compile a call out of this platform's build. A macro definition (`macro_rules! name {`, in
 /// full) in the body is passed over: it runs only where the macro is invoked. A module the body
@@ -1829,8 +1831,8 @@ fn trusted_meaning(name: &str) -> Option<&'static str> {
 }
 
 /// How this occurrence of the trusted `name` declares it, when it does: a module, a macro, a type
-/// named after a root, the name `as` gives to something else, or a plain `use` of anything but what
-/// the reading trusts by that name.
+/// named after a root, the name `as` gives to something else, or a `use` that brings in anything
+/// but what the reading trusts by that name.
 fn trusted_declaration(
     around: &Around<'_>,
     name: &str,
@@ -1854,8 +1856,10 @@ fn trusted_declaration(
     {
         return Some("a type, which a path that starts at that name would reach");
     }
+    // Any other name in a `use` declaration, a segment of a path included (`use a::core::{self}`),
+    // is held to what the declaration brings in by that name.
     let declaration = declaration?;
-    if !around.ends_a_use_path() || around.word_after(1) == Some("as") {
+    if around.word_after(1) == Some("as") {
         return None;
     }
     declaration
@@ -2153,7 +2157,7 @@ mod tests {
             .collect();
         assert_eq!(trusted, names);
         // A macro the body defines after invoking it is out of this reading's sight: the name is
-        // handed on as trusted, for the map to hold against the target's definitions.
+        // handed on as trusted, and the definition of a trusted name breaks the conventions.
         let later = calls(
             &lex("println!(); shared(); #[macro_export] macro_rules! println { () => {} }")
                 .expect("lexes"),
@@ -2300,6 +2304,8 @@ mod tests {
             ("extern crate foo as core;", "core"),
             ("use foo as std;", "std"),
             ("use foo::core;", "core"),
+            ("use dep::core::{self};", "core"),
+            ("use crate::m::std::{self, inner};", "std"),
             ("use crate::a::{self as alloc};", "alloc"),
             ("struct std;", "std"),
             ("enum core {}", "core"),
@@ -2335,6 +2341,7 @@ mod tests {
             "use std::fmt::Debug as Printed;",
             "use serde::{Deserialize, Serialize};",
             "use tokio;",
+            "use core::{self, fmt};",
             "extern crate alloc;",
             "#[derive(Debug, Clone, serde::Serialize)] struct S;",
             "#[test] fn t() { println!(\"{}\", file!()); std::println!(); }",
