@@ -1351,7 +1351,8 @@ mod platform {
     use kr_ipc::paths::EnvironmentPaths;
 
     use super::{
-        Asked, Definition, Manager, Record, Refusal, SETUP_ACTION, refused, run, same_file, text,
+        Asked, Definition, Manager, READ_LIMIT, Record, Refusal, SETUP_ACTION, refused, run,
+        same_file, text,
     };
     use crate::error::{CliError, Result};
 
@@ -1551,10 +1552,11 @@ mod platform {
         }
 
         /// The rule: the manager loads the unit cleanly from kr's file, has read that file since
-        /// it last changed, starts it the way the file says, and prints one command for it, the
-        /// file's, with its program, words and flags as kr wrote them, and no other command.
-        /// Whatever else a drop-in sets for the unit, its environment, limits or timeouts, is the
-        /// host's and the person's own, and kr leaves it to them.
+        /// it last changed, and reads no drop-in for it that sets a command or how it is started,
+        /// so the command comes from kr's byte-checked file alone; and what it prints agrees: one
+        /// command, the file's, with its program, words and flags as kr wrote them, started the
+        /// way the file says. Whatever else a drop-in sets for the unit, its environment, limits
+        /// or timeouts, is the host's and the person's own, and kr leaves it to them.
         fn differs(&self, definition: &Definition) -> Option<String> {
             let name = definition.target();
             match &self.fragment {
@@ -1593,6 +1595,23 @@ mod platform {
                     "kr cannot read back which drop-ins the user manager reads for {name}: {why}"
                 ));
             }
+            let mut problems = Vec::new();
+            let setters: Vec<String> = self
+                .drop_ins
+                .iter()
+                .filter_map(|drop_in| match read_drop_in(drop_in) {
+                    Ok(contents) => command_key(&contents)
+                        .map(|key| format!("{} sets {key}", drop_in.display())),
+                    Err(why) => Some(format!("kr cannot read {}: {why}", drop_in.display())),
+                })
+                .collect();
+            if !setters.is_empty() {
+                problems.push(format!(
+                    "the command for {name} has to come from the definition kr wrote alone, and a \
+                     drop-in may set it: {}",
+                    setters.join(", ")
+                ));
+            }
             let written = printed(definition);
             let starts = self
                 .commands
@@ -1613,13 +1632,14 @@ mod platform {
             if self.start_type != START_TYPE {
                 held.push(format!("Type={}", self.start_type));
             }
-            (!held.is_empty()).then(|| {
-                format!(
+            if !held.is_empty() {
+                problems.push(format!(
                     "the user manager would not run {name} as kr wrote it: it holds {}, where kr \
                      wrote {START}={written}… and Type={START_TYPE}, and no other command",
                     held.join(", ")
-                )
-            })
+                ));
+            }
+            (!problems.is_empty()).then(|| problems.join("; "))
         }
 
         /// The drop-ins the manager reads for the unit, for a person to look in.
@@ -1634,6 +1654,39 @@ mod platform {
                 .collect();
             format!("the drop-ins it reads for it are {}", listed.join(", "))
         }
+    }
+
+    /// A drop-in's text, read as the manager reads it and no further than [`READ_LIMIT`].
+    fn read_drop_in(path: &std::path::Path) -> std::result::Result<String, String> {
+        use std::io::Read as _;
+
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)
+            .and_then(|file| file.take(READ_LIMIT + 1).read_to_end(&mut bytes))
+            .map_err(|error| error.to_string())?;
+        if bytes.len() as u64 > READ_LIMIT {
+            return Err(format!("it is larger than the {READ_LIMIT} bytes kr reads"));
+        }
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// The key in a drop-in that could set the daemon's command or how it is started: a key that
+    /// starts with `Exec`, or `Type`, compared without regard to case.
+    ///
+    /// Every line is read on its own, whatever section it is in and whether or not it continues
+    /// the one before, and only comment lines and section headers are passed over. So the scan can
+    /// refuse a drop-in the manager would read as harmless, and never passes one that sets either.
+    pub(super) fn command_key(contents: &str) -> Option<String> {
+        contents.lines().find_map(|line| {
+            let line = line.trim_start();
+            if line.starts_with(['#', ';', '[']) {
+                return None;
+            }
+            let (key, _) = line.split_once('=')?;
+            let key = key.trim();
+            let lower = key.to_ascii_lowercase();
+            (lower.starts_with("exec") || lower == "type").then(|| key.to_owned())
+        })
     }
 
     /// How `systemctl show` begins printing the command a definition names, up to its flags: the
@@ -2310,18 +2363,74 @@ mod tests {
         let unflagged = exact.replace("flags=no-env-expand", "flags=");
 
         assert_eq!(shown(&path, "", &only, "").difference(&written), None);
+
+        // Drop-ins on disk, one of them under a directory with a space in its name, as
+        // `systemctl show` quotes such a name.
+        let host = kr_ipc::testing::TempHost::create();
+        let drop_in = |directory: &str, name: &str, contents: &str| {
+            let at = host.root().join(directory).join(name);
+            std::fs::create_dir_all(at.parent().expect("a directory")).expect("a directory");
+            std::fs::write(&at, contents).expect("a drop-in");
+            let text = at.display().to_string();
+            if text.contains(' ') {
+                format!("\"{text}\"")
+            } else {
+                text
+            }
+        };
+        let kept = [
+            drop_in(
+                "some one/kr-controller-test.service.d",
+                "limits.conf",
+                "[Service]\nEnvironment=KR_TEST=1\nLimitNOFILE=4096\n",
+            ),
+            drop_in(
+                "service.d",
+                "10-timeout-abort.conf",
+                "[Service]\nTimeoutStopFailureMode=abort\n",
+            ),
+            drop_in(
+                "service.d",
+                "20-commented.conf",
+                "[Service]\n# ExecStart=/bin/true\n  ; Type=notify\n",
+            ),
+        ];
         assert_eq!(
-            shown(
-                &path,
-                "\"/home/some one/.config/systemd/user/kr-controller-test.service.d/limits.conf\" \
-                 /usr/lib/systemd/user/service.d/10-timeout-abort.conf",
-                &only,
-                "",
-            )
-            .difference(&written),
+            shown(&path, &kept.join(" "), &only, "").difference(&written),
             None,
             "drop-ins that leave the command alone are the host's and the person's"
         );
+        for (name, contents, key) in [
+            (
+                "resplit.conf",
+                "[Service]\nExecStart=\nExecStart=\":/opt/kr/kr-controller\" \"--state-dir /state\"\n",
+                "sets ExecStart",
+            ),
+            ("type.conf", "[Service]\n  type = notify\n", "sets type"),
+            (
+                "continued.conf",
+                "[Service]\nEnvironment=A=1 \\\nExecStartPre=/bin/true\n",
+                "sets ExecStartPre",
+            ),
+            (
+                "unit.conf",
+                "[Unit]\nExecCondition=/bin/true\n",
+                "sets ExecCondition",
+            ),
+        ] {
+            let listed = drop_in("kr-controller-test.service.d", name, contents);
+            let why = shown(&path, &listed, &only, "")
+                .difference(&written)
+                .expect("refused, though the command prints as kr wrote it");
+            assert!(
+                why.contains(&format!("{name} {key}")) && why.contains("drop-ins it reads"),
+                "{name}: {why}"
+            );
+        }
+        let why = shown(&path, "/nowhere/gone.conf", &only, "")
+            .difference(&written)
+            .expect("a drop-in kr cannot read is refused");
+        assert!(why.contains("kr cannot read /nowhere/gone.conf"), "{why}");
         let other = "{ path=/bin/true ; argv[]=/bin/true ; flags= ; start_time=[n/a] ; \
                      stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }";
         for (unit, what) in [
@@ -2412,6 +2521,41 @@ mod tests {
                 .expect("not read")
                 .contains("has not read the definition")
         );
+    }
+
+    /// A drop-in is scanned line by line for a key that could set the daemon's command or its
+    /// start type, and anything that could be such a key is taken for one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_drop_in_that_could_set_the_command_is_found_line_by_line() {
+        for (contents, key) in [
+            ("[Service]\nExecStart=/bin/true\n", Some("ExecStart")),
+            (
+                "[Service]\n  ExecStopPost = /bin/true\n",
+                Some("ExecStopPost"),
+            ),
+            ("[Service]\nexecstart=/bin/true\n", Some("execstart")),
+            (
+                "[Service]\nExecReloadPost=/bin/true\n",
+                Some("ExecReloadPost"),
+            ),
+            ("[Service]\nType=notify\n", Some("Type")),
+            ("[Unit]\nExecCondition=/bin/true\n", Some("ExecCondition")),
+            (
+                "[Service]\nEnvironment=A=1 \\\nExecStart=x\n",
+                Some("ExecStart"),
+            ),
+            ("[Service]\nEnvironment=ExecStart=x\nTimeoutSec=5\n", None),
+            ("[Service]\n# ExecStart=x\n; Type=notify\n", None),
+            ("[Service]\nTimeoutStopFailureMode=abort\n", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                platform::command_key(contents).as_deref(),
+                key,
+                "{contents:?}"
+            );
+        }
     }
 
     /// A `DropInPaths` value is read back name for name: as printed where a name needs no quotes,
