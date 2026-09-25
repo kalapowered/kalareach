@@ -35,6 +35,10 @@ fn main() -> ExitCode {
     let Some(command) = arguments.first() else {
         return usage("no command");
     };
+    // Cargo's runner for one test binary while a step's tests are listed.
+    if command == "list-one" {
+        return ExitCode::from(kr_conformance::run::list_one(&arguments[1..]));
+    }
     let mut root = None;
     let mut evidence_directory = None;
     let mut groups = Vec::new();
@@ -96,6 +100,7 @@ fn map(root: PathBuf, typescript: bool) -> ExitCode {
         applications: None,
         steps: None,
         environment: Vec::new(),
+        lister: PathBuf::new(),
     };
     let map = report::map_for(&options);
     let tests: usize = map.keys.values().map(std::collections::BTreeMap::len).sum();
@@ -166,6 +171,13 @@ fn run(
         },
         _ => None,
     };
+    let lister = match std::env::current_exe() {
+        Ok(lister) => lister,
+        Err(error) => {
+            eprintln!("kr-conformance: this program's own path could not be read: {error}");
+            return ExitCode::from(2);
+        }
+    };
     let options = Options {
         root,
         evidence: evidence.clone(),
@@ -177,6 +189,7 @@ fn run(
         applications,
         steps: None,
         environment: Vec::new(),
+        lister,
     };
     let document = match report::run(&options, &mut |line| eprintln!("{line}")) {
         Ok(document) => document,

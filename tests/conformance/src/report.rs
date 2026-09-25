@@ -337,6 +337,9 @@ pub struct Options {
     pub steps: Option<Vec<plan::Step>>,
     /// Variables every step is run with, beyond the report's own environment.
     pub environment: Vec<(String, String)>,
+    /// The `kr-conformance` program, which Cargo runs each test binary through while a step's
+    /// tests are listed.
+    pub lister: PathBuf,
 }
 
 /// Why a run stopped before it ran anything.
@@ -462,6 +465,7 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
                 root: &options.root,
                 evidence: &options.evidence,
                 environment: &options.environment,
+                lister: &options.lister,
             },
             &map.packages,
         );

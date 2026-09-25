@@ -6,12 +6,13 @@
 //! which is how the report learns which package and target each test binary is: two packages can
 //! both have a test target called `fixtures`, and only the executable tells them apart.
 //!
-//! What the build names is what the run is held to. Every test binary it built is listed, through
-//! Cargo and one target at a time, and has to be run and read; a listing that fails, a binary the
-//! log never ran, and a log that cannot be read are each the step's error, so a step can never pass
-//! on less output than it was built for. A target with a harness of its own (`harness = false`) is
-//! a program that prints neither a list nor verdicts: it is never named in a listing, it is run with
-//! the step, and only its exit status, which is the step's, counts.
+//! What the build names is what the run is held to. Every test binary it built is listed, by the
+//! step's own command with this program as Cargo's runner, and has to be run and read; a listing
+//! that fails, a binary the log never ran, and a log that cannot be read are each the step's error,
+//! so a step can never pass on less output than it was built for. A target with a harness of its
+//! own (`harness = false`) is a program that prints neither a list nor verdicts: the runner does
+//! not run it while the tests are listed, it is run with the step, and only its exit status, which
+//! is the step's, counts.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -59,6 +60,8 @@ pub struct Place<'a> {
     pub evidence: &'a Path,
     /// Further variables.
     pub environment: &'a [(String, String)],
+    /// This program, which Cargo runs each test binary through while the step's tests are listed.
+    pub lister: &'a Path,
 }
 
 impl Place<'_> {
@@ -238,78 +241,170 @@ pub fn has_harness(packages: &[Package], target: &TargetId) -> bool {
         .is_none_or(|found| found.harness)
 }
 
-/// Every test each binary of a step holds, whatever the step's own filters are, as Cargo lists
-/// them: one `cargo test -- --list` for each of the step's targets, named by its own selector, so
-/// each binary lists in the environment Cargo gives it and each list is that one binary's. A target
-/// with a harness of its own is a program that would run rather than list, so it is never named.
+/// The line the lister writes before it runs one test binary to list its tests, then the binary.
+pub const LISTING_BEGIN: &str = "\u{1}kr-conformance listing\t";
+
+/// The line the lister writes once that binary has exited: the binary, a tab, its exit status (or
+/// `skipped` for a program with a harness of its own, which it does not run).
+pub const LISTING_END: &str = "\u{1}kr-conformance listed\t";
+
+/// The variable naming the test binaries with a harness of its own, by file name, comma separated.
+pub const OWN_HARNESS_VARIABLE: &str = "KR_CONFORMANCE_OWN_HARNESS";
+
+/// Runs one test binary for Cargo, as its runner, framed by the listing's two marker lines, and
+/// returns its exit status: `arguments` are the binary and what Cargo passes it. A binary this
+/// run's [`OWN_HARNESS_VARIABLE`] names is not run at all.
+#[must_use]
+pub fn list_one(arguments: &[String]) -> u8 {
+    let Some((executable, rest)) = arguments.split_first() else {
+        eprintln!("kr-conformance list-one: no test binary to run");
+        return 2;
+    };
+    let own = std::env::var(OWN_HARNESS_VARIABLE).unwrap_or_default();
+    let name = file_name(executable);
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{LISTING_BEGIN}{executable}");
+    let _ = out.flush();
+    drop(out);
+    let status = if own.split(',').any(|entry| entry == name) {
+        "skipped".to_owned()
+    } else {
+        match Command::new(executable).args(rest).status() {
+            Ok(status) => status
+                .code()
+                .map_or_else(|| "a signal".to_owned(), |code| code.to_string()),
+            Err(error) => format!("could not start: {error}"),
+        }
+    };
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{LISTING_END}{executable}\t{status}");
+    let _ = out.flush();
+    u8::from(!matches!(status.as_str(), "0" | "skipped"))
+}
+
+/// The host's target triple, as the toolchain the step builds with names it.
+fn host(place: &Place<'_>) -> Result<String, String> {
+    let output = place
+        .command(&["rustc".to_owned(), "-vV".to_owned()])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("rustc could not be asked for the host: {error}"))?;
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .map(|host| host.trim().to_owned())
+        .ok_or_else(|| "rustc named no host".to_owned())
+}
+
+/// Every test each binary of a step holds, whatever the step's own filters are, as each binary
+/// lists them when Cargo runs it: the step's own command with `-- --list`, so the build is the
+/// step's, features and all, and Cargo gives each binary its environment; with this program as
+/// Cargo's runner, which frames each binary's list with the binary's own path, so each list is
+/// known to be that binary's. A target with a harness of its own is a program that would run
+/// rather than list, so the runner does not run it.
 ///
 /// # Errors
 ///
-/// Returns the listing that failed, or one that printed other than exactly one list: a binary that
-/// lists nothing would have its tests judged from the run alone.
+/// Returns the listing that failed, a binary that did not list exactly once, or one the build did
+/// not make: a binary that lists nothing would have its tests judged from the run alone.
 fn list(
     step: &Step,
     place: &Place<'_>,
     executables: &BTreeMap<String, TargetId>,
     packages: &[Package],
 ) -> Result<BTreeMap<TargetId, BTreeSet<String>>, String> {
-    let release = step.command.iter().any(|word| word == "--release");
+    let lister = place
+        .lister
+        .to_str()
+        .filter(|path| !path.chars().any(char::is_whitespace))
+        .ok_or_else(|| {
+            format!(
+                "{} cannot be Cargo's runner: its path has a space in it",
+                place.lister.display()
+            )
+        })?;
+    let variable = format!(
+        "CARGO_TARGET_{}_RUNNER",
+        host(place)?.to_ascii_uppercase().replace(['-', '.'], "_")
+    );
+    let own: Vec<&str> = executables
+        .iter()
+        .filter(|(_, target)| !has_harness(packages, target))
+        .map(|(executable, _)| executable.as_str())
+        .collect();
+    let mut command: Vec<String> = step
+        .command
+        .iter()
+        .take_while(|word| *word != "--")
+        .cloned()
+        .collect();
+    command.extend(["--".to_owned(), "--list".to_owned()]);
+    let output = place
+        .command(&command)
+        .env(&variable, format!("{lister} list-one"))
+        .env(OWN_HARNESS_VARIABLE, own.join(","))
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| format!("the step's tests could not be listed: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "`{}` did not list the step's tests (exit {})",
+            command.join(" "),
+            output
+                .status
+                .code()
+                .map_or_else(|| "by a signal".to_owned(), |code| code.to_string())
+        ));
+    }
     let mut listed = BTreeMap::new();
-    for target in executables.values() {
-        if !has_harness(packages, target) || listed.contains_key(target) {
-            continue;
-        }
-        let mut command: Vec<String> = ["cargo", "test", "--locked"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
-        if release {
-            command.push("--release".to_owned());
-        }
-        command.extend(["-p".to_owned(), target.package.clone()]);
-        command.extend(
-            target
-                .kind
-                .selector(&target.name)
-                .split(' ')
-                .map(str::to_owned),
-        );
-        command.extend(["--".to_owned(), "--list".to_owned()]);
-        let output = place
-            .command(&command)
-            .stdin(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|error| format!("`{}` could not be started: {error}", command.join(" ")))?;
-        if !output.status.success() {
-            return Err(format!(
-                "`{}` did not list the tests (exit {})",
-                command.join(" "),
-                output
-                    .status
-                    .code()
-                    .map_or_else(|| "by a signal".to_owned(), |code| code.to_string())
-            ));
-        }
-        let mut names = BTreeSet::new();
-        let mut counts = 0;
-        for line in libtest::plain(&String::from_utf8_lossy(&output.stdout)).lines() {
+    let mut current: Option<(String, BTreeSet<String>, usize)> = None;
+    for line in libtest::plain(&String::from_utf8_lossy(&output.stdout)).lines() {
+        if let Some(executable) = line.strip_prefix(LISTING_BEGIN) {
+            current = Some((executable.to_owned(), BTreeSet::new(), 0));
+        } else if let Some(rest) = line.strip_prefix(LISTING_END) {
+            let Some((executable, names, counts)) = current.take() else {
+                return Err("the listing ended a binary it never began".to_owned());
+            };
+            let (ended, status) = rest.rsplit_once('\t').unwrap_or((rest, ""));
+            if ended != executable {
+                return Err(format!("the listing began {executable} and ended {ended}"));
+            }
+            if status == "skipped" {
+                continue;
+            }
+            let target = executables.get(&file_name(&executable)).ok_or_else(|| {
+                format!("the listing ran {executable}, which the step's build did not make")
+            })?;
+            if status != "0" || counts != 1 {
+                return Err(format!(
+                    "{target} did not list its tests (exit {status}, {counts} lists)"
+                ));
+            }
+            listed.insert(target.clone(), names);
+        } else if let Some((_, names, counts)) = current.as_mut() {
             if let Some(name) = line
                 .strip_suffix(": test")
                 .or_else(|| line.strip_suffix(": bench"))
             {
                 names.insert(name.to_owned());
             } else if is_count(line) {
-                counts += 1;
+                *counts += 1;
             }
         }
-        if counts != 1 {
-            return Err(format!(
-                "`{}` printed {counts} lists where its one binary prints one",
-                command.join(" ")
-            ));
-        }
-        listed.insert(target.clone(), names);
+    }
+    let unlisted: Vec<String> = executables
+        .iter()
+        .filter(|(executable, target)| {
+            !own.contains(&executable.as_str()) && !listed.contains_key(*target)
+        })
+        .map(|(_, target)| target.to_string())
+        .collect();
+    if !unlisted.is_empty() {
+        return Err(format!(
+            "the listing did not run {}, which the step's build made",
+            unlisted.join(", ")
+        ));
     }
     Ok(listed)
 }
