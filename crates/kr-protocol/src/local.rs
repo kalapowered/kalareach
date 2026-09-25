@@ -184,7 +184,8 @@ pub fn states_utc_deadlines(capabilities: &CanonicalSet<CapabilityId>) -> bool {
 /// method under the pairing grant with `voice.use` taken out, the methods that need it are the
 /// daemon's own voice methods, and the voice module performs its one effect as the daemon's own
 /// request, which carries no rights. So no worker holds work under a voice grant, and withdrawing
-/// one owes no fence. Every builder of a forwarded mutation refuses a set this answers false for.
+/// one owes no fence. A forwarded mutation whose rights this answers false for is neither encoded
+/// nor decoded, and both builders of one refuse such a set before anything is sent.
 #[must_use]
 pub fn may_travel_to_a_worker(
     rights: &crate::scalars::CanonicalSet<crate::rights::ActionRight>,
@@ -219,6 +220,8 @@ pub struct ForwardedMutation {
     /// Empty when the envelope names no grant, which is what a locally authenticated caller's
     /// operating-system identity is. The worker narrows nothing for such a caller: there is no
     /// grant to narrow by, and its peer credentials already proved it is this user.
+    #[serde(with = "worker_rights")]
+    #[schemars(with = "CanonicalSet<crate::rights::ActionRight>")]
     pub grant_rights: CanonicalSet<crate::rights::ActionRight>,
     /// The deadline the host derived at first admission, on the machine's own continuous clock.
     ///
@@ -233,6 +236,39 @@ pub struct ForwardedMutation {
     /// long past, because the clock restarts at the boot, so a stale one expires rather than being
     /// honoured.
     pub accepted_deadline_boot_ms: U64,
+}
+
+/// The rights beside a forwarded mutation, as they are encoded and decoded: a set that holds
+/// `voice.use` is refused both ways ([`may_travel_to_a_worker`]), so no frame carries it, whoever
+/// builds it and however it is sent.
+mod worker_rights {
+    use serde::{Deserialize as _, Serialize as _};
+
+    use crate::rights::ActionRight;
+    use crate::scalars::CanonicalSet;
+
+    /// Why a set is refused.
+    const REFUSED: &str = "voice.use never travels to a worker";
+
+    pub fn serialize<S: serde::Serializer>(
+        rights: &CanonicalSet<ActionRight>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        if !super::may_travel_to_a_worker(rights) {
+            return Err(serde::ser::Error::custom(REFUSED));
+        }
+        rights.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<CanonicalSet<ActionRight>, D::Error> {
+        let rights = CanonicalSet::<ActionRight>::deserialize(deserializer)?;
+        if !super::may_travel_to_a_worker(&rights) {
+            return Err(serde::de::Error::custom(REFUSED));
+        }
+        Ok(rights)
+    }
 }
 
 /// What one of the control daemon's connections to a worker is for.
@@ -356,6 +392,86 @@ mod tests {
             .into_iter()
             .collect();
         assert_eq!(super::stated_utc_floor(&two), None, "two floors state none");
+    }
+
+    /// A forwarded mutation that carries `voice.use` is neither encoded nor decoded, however it is
+    /// built; one that does not round-trips.
+    #[test]
+    fn a_forwarded_mutation_never_carries_a_voice_right_in_either_direction() {
+        use crate::actor::{ActorEnvelope, ActorIngress};
+        use crate::envelope::{ActionTarget, MutationRequest};
+        use crate::ids::{
+            ActionId, ActionWindowId, ActorId, ConnectionId, ControllerGeneration, EnvironmentId,
+        };
+        use crate::local::ForwardedMutation as Built;
+        use crate::rights::ActionRight;
+        use crate::scalars::{DurationMs, Nullable, U64, Uuid};
+
+        let frame = |rights: &[ActionRight]| {
+            ControlFrame::Forwarded(Box::new(Built {
+                mutation: MutationRequest {
+                    request_id: RequestId::new(1),
+                    method: Method::SessionClose.into(),
+                    method_version: MethodVersion::V1,
+                    action_id: ActionId::new(Uuid::from_bytes([1; 16])),
+                    grant_id: Nullable::null(),
+                    target: ActionTarget {
+                        environment_id: EnvironmentId::new(Uuid::from_bytes([2; 16])),
+                        session_id: Nullable::null(),
+                        session_epoch: Nullable::null(),
+                        application_instance_id: Nullable::null(),
+                        agent_binding_revision: Nullable::null(),
+                    },
+                    expected: ParamsValue::empty(),
+                    action_window_id: ActionWindowId::new("device:test").expect("a window"),
+                    requested_ttl_ms: DurationMs::new(30_000),
+                    params: ParamsValue::empty(),
+                },
+                actor: ActorEnvelope {
+                    actor_id: ActorId::new("device:test").expect("a principal"),
+                    ingress: ActorIngress::PairedDevice,
+                    device_id: Nullable::null(),
+                    grant_id: Nullable::null(),
+                    grant_revision: Nullable::null(),
+                    controller_generation: ControllerGeneration::new(1),
+                    connection_id: ConnectionId::new(Uuid::from_bytes([3; 16])),
+                },
+                grant_rights: rights.iter().copied().collect(),
+                accepted_deadline_boot_ms: U64::new(5),
+            }))
+        };
+
+        let allowed = frame(&[ActionRight::SessionView]);
+        let bytes = kr_cbor::to_canonical_vec(&allowed).expect("encodes");
+        let decoded: ControlFrame =
+            kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT).expect("decodes");
+        assert_eq!(decoded, allowed);
+
+        let refused =
+            kr_cbor::to_canonical_vec(&frame(&[ActionRight::SessionView, ActionRight::VoiceUse]))
+                .expect_err("a frame carrying voice.use is not encoded");
+        assert!(
+            refused.to_string().contains("never travels to a worker"),
+            "{refused}"
+        );
+
+        // Decoding refuses it too, whatever wrote it.
+        let read = |rights: &[&'static str]| {
+            super::worker_rights::deserialize(serde::de::value::SeqDeserializer::<
+                _,
+                serde::de::value::Error,
+            >::new(rights.iter().copied()))
+        };
+        assert_eq!(
+            read(&["session.view"]).expect("decodes"),
+            [ActionRight::SessionView].into_iter().collect()
+        );
+        let undecoded = read(&["session.view", "voice.use"])
+            .expect_err("a set carrying voice.use is not decoded");
+        assert!(
+            undecoded.to_string().contains("never travels to a worker"),
+            "{undecoded}"
+        );
     }
 
     #[test]

@@ -3070,59 +3070,6 @@ mod tests {
         );
     }
 
-    /// Rights travel to a worker only beside a forwarded mutation, and a forwarded mutation is
-    /// built in exactly two places, each of which refuses a set that holds `voice.use`: the proxy
-    /// link a device's work goes over, and the local client. A third builder in the daemon or the
-    /// local client fails this, so no path can reach a worker with a voice right without passing
-    /// one of the two refusals.
-    #[test]
-    fn a_forwarded_mutation_is_built_only_where_a_voice_right_is_refused() {
-        fn walk(
-            directory: &std::path::Path,
-            found: &mut Vec<(String, usize)>,
-            root: &std::path::Path,
-        ) {
-            let mut entries: Vec<_> = std::fs::read_dir(directory)
-                .expect("reads the source directory")
-                .map(|entry| entry.expect("an entry").path())
-                .collect();
-            entries.sort();
-            for path in entries {
-                if path.is_dir() {
-                    walk(&path, found, root);
-                } else if path.extension().is_some_and(|extension| extension == "rs") {
-                    let text = std::fs::read_to_string(&path).expect("reads the source");
-                    let built = text.matches(concat!("Forwarded", "Mutation {")).count();
-                    if built > 0 {
-                        let name = path
-                            .strip_prefix(root)
-                            .expect("inside the crates")
-                            .to_string_lossy()
-                            .replace('\\', "/");
-                        found.push((name, built));
-                    }
-                }
-            }
-        }
-
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("the crates directory")
-            .to_path_buf();
-        let mut found = Vec::new();
-        for source in ["kr-controller/src", "kr-ipc/src"] {
-            walk(&root.join(source), &mut found, &root);
-        }
-        assert_eq!(
-            found,
-            vec![
-                ("kr-controller/src/net/proxy.rs".to_owned(), 1),
-                ("kr-ipc/src/client.rs".to_owned(), 1),
-            ],
-            "a forwarded mutation is built only by the two builders that refuse a voice right"
-        );
-    }
-
     /// No frame a worker receives carries a voice right, whichever way work reaches it, which is
     /// why a voice grant's withdrawal owes no fence. The device's pairing grant carries every
     /// right, `voice.use` included, and it holds a live voice grant; its session's worker records
@@ -3134,7 +3081,8 @@ mod tests {
     /// - Its forwarded mutation and its close, sent through the door's own `mutate`, reach the
     ///   worker carrying exactly the rights decided for them, and a local close carries none.
     /// - Both builders of a forwarded mutation, the proxy link and the local client, refuse a set
-    ///   that holds `voice.use` before anything is sent.
+    ///   that holds `voice.use` before anything is sent, and a frame built under another name and
+    ///   written straight to a link is not encoded.
     /// - Every voice effect is performed here or not at all: the one the daemon performs, a
     ///   session read, succeeds and reaches the worker as the daemon's own request, which carries
     ///   no rights, and nothing else reaches it.
@@ -3350,6 +3298,25 @@ mod tests {
             ),
             "the local client refuses a voice right: {local:?}"
         );
+        // And a frame built under another name and written straight to the link, past both
+        // builders, is not encoded.
+        {
+            use kr_protocol::local::ForwardedMutation as Built;
+
+            let written = link
+                .writer()
+                .write_message(&ControlFrame::Forwarded(Box::new(Built {
+                    mutation: fake::close_request(world.environment_id, world.session_id),
+                    actor: world.actor.clone(),
+                    grant_rights: with_voice.clone(),
+                    accepted_deadline_boot_ms: kr_protocol::scalars::U64::new(u64::MAX),
+                })))
+                .await;
+            assert!(
+                written.is_err(),
+                "a frame carrying voice.use is not encoded, however it is built and sent"
+            );
+        }
         drop(client);
         assert_eq!(
             recorded
