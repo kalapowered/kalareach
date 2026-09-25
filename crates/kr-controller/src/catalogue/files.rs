@@ -2,10 +2,10 @@
 //!
 //! Two installers write into an application's own directory: the contact skill's
 //! ([`crate::agent_tools`]) and the native bridge recipes the catalogue applies. What both need
-//! lives here, once: a replacement that cannot leave a document truncated and keeps its mode, the
-//! refusal to replace a document whose access-control list the replacement would not carry, the
-//! refusal on the platform where this host cannot read those lists, the durable directory entries,
-//! and the digests a change is recorded by.
+//! lives here, once: a replacement that cannot leave a document truncated and keeps who can read
+//! it, the refusal to replace a document whose access controls the replacement would not carry,
+//! the refusal on the platform where this host cannot read those lists, the durable directory
+//! entries, and the digests a change is recorded by.
 
 use std::path::{Path, PathBuf};
 
@@ -71,13 +71,17 @@ pub(crate) fn guard_access_controls(path: &Path, instead: &str) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    if extended_access_controls(path)? {
+    let extended = extended_access_controls(path).map_err(|error| match error {
+        // A control this host does not evaluate is refused as one it cannot carry is, with the
+        // same advice.
+        ControllerError::PermissionDenied { detail } => ControllerError::PermissionDenied {
+            detail: format!("{detail}; {instead}"),
+        },
+        other => other,
+    })?;
+    if extended {
         return Err(ControllerError::PermissionDenied {
-            detail: format!(
-                "{} is protected by an access-control list, and changing it here would not carry \
-                 that across; {instead}",
-                display(path)
-            ),
+            detail: format!("{} {NOT_CARRIED}; {instead}", display(path)),
         });
     }
     // Changing it means writing a new file beside it and renaming that over it. A directory that
@@ -141,12 +145,55 @@ fn interpret_probe(answer: std::result::Result<usize, rustix::io::Errno>) -> Res
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// Returns true when the file has access controls a new file written beside it would not be
+/// given: an owner other than the one this process gives the files it creates, a list protected
+/// from its directory, absent or empty, or an entry set on the file itself where its list records
+/// which entries it inherited.
+///
+/// A replacement is a new file renamed over the old one, and Windows gives a new file its owner
+/// from this process and its lists from its directory. A list written the older way does not
+/// record which entries it inherited, so an entry set on such a file is not seen here; the write
+/// compares the copy it made with the file before either replaces the other, and refuses there.
+///
+/// # Errors
+///
+/// Returns [`ControllerError::Storage`] when the file's access cannot be read, and
+/// [`ControllerError::PermissionDenied`] when it carries a control this host does not evaluate:
+/// encryption, or an entry of a kind this host does not read.
+#[cfg(windows)]
+pub(crate) fn extended_access_controls(path: &Path) -> Result<bool> {
+    let access =
+        kr_ipc::paths::FileAccess::of(path).map_err(|refusal| refused_read(path, refusal))?;
+    let owned = access
+        .is_owned_as_new_files_are()
+        .map_err(|refusal| refused_read(path, refusal))?;
+    Ok(!owned || !access.records_nothing_set_here())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 pub(crate) fn extended_access_controls(path: &Path) -> Result<bool> {
     // Nothing here can read this platform's access controls, so nothing here can promise to keep
     // them. An existing document is refused rather than replaced.
     let _ = path;
     Ok(true)
+}
+
+/// Answers a refusal of the Windows access reader: a read that failed is a storage failure, and a
+/// control the reader does not evaluate is a refusal to change the file.
+#[cfg(windows)]
+fn refused_read(path: &Path, refusal: kr_ipc::paths::AccessListRefusal) -> ControllerError {
+    match refusal {
+        kr_ipc::paths::AccessListRefusal::Unreadable(detail) => storage(std::io::Error::other(
+            format!("{}: {detail}", display(path)),
+        )),
+        kr_ipc::paths::AccessListRefusal::Policy(detail) => ControllerError::PermissionDenied {
+            detail: format!(
+                "{}: {detail}, so this host cannot tell whether replacing it would change who can \
+                 read it",
+                display(path)
+            ),
+        },
+    }
 }
 
 /// Returns true when files created in this directory are given access controls by it.
@@ -176,10 +223,62 @@ fn inheritable_access_controls(directory: &Path) -> Result<bool> {
     ))
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// On Windows a document whose descriptor records nothing set on it carries what its directory
+/// gives its files, which a replacement made there is given too, so the directory is not read
+/// here. Where the directory's list changed since the document inherited from it, or the document
+/// was moved in from another directory, the write compares the copy it made with the document and
+/// refuses there.
+#[cfg(windows)]
+fn inheritable_access_controls(directory: &Path) -> Result<bool> {
+    let _ = directory;
+    Ok(false)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn inheritable_access_controls(directory: &Path) -> Result<bool> {
     let _ = directory;
     Ok(true)
+}
+
+/// Why a document is refused when its access controls are ones a replacement would not carry.
+#[cfg(not(windows))]
+const NOT_CARRIED: &str =
+    "is protected by an access-control list, and changing it here would not carry that across";
+
+/// Why a document is refused when its access controls are ones a replacement would not carry.
+#[cfg(windows)]
+const NOT_CARRIED: &str = "has an owner or an access-control list that a new file in its directory \
+     would not be given, and changing it here would change who can read it";
+
+/// What a copy that would change who can read the document it replaces is given.
+#[cfg(not(windows))]
+const COPY_DIFFERS: &str = "is given an access-control list by the directory itself";
+
+/// What a copy that would change who can read the document it replaces is given.
+#[cfg(windows)]
+const COPY_DIFFERS: &str =
+    "is given another owner or access-control list than the file it would replace";
+
+/// Returns true when the copy about to take `document`'s place would change who can read it.
+///
+/// On macOS and Linux the copy was created with the document's mode bits, so what it can differ in
+/// is an access-control list its directory gave it.
+#[cfg(not(windows))]
+fn copy_changes_access(_copy: &std::fs::File, temporary: &Path, _document: &Path) -> Result<bool> {
+    extended_access_controls(temporary)
+}
+
+/// Returns true when the copy about to take `document`'s place would change who can read it.
+///
+/// On Windows the copy's owner and lists, read through the handle that created it, are compared
+/// with the document's, read again now, whole.
+#[cfg(windows)]
+fn copy_changes_access(copy: &std::fs::File, temporary: &Path, document: &Path) -> Result<bool> {
+    let copy = kr_ipc::paths::FileAccess::read(copy)
+        .map_err(|refusal| refused_read(temporary, refusal))?;
+    let document = kr_ipc::paths::FileAccess::of(document)
+        .map_err(|refusal| refused_read(document, refusal))?;
+    Ok(copy != document)
 }
 
 /// Makes a directory's own entries durable.
@@ -263,17 +362,27 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8], default_mode: u32) -> 
     }
     #[cfg(not(unix))]
     let _ = default_mode;
+    // On Windows the copy's own handle reads its access back, which needs it to read as well.
+    #[cfg(windows)]
+    options.read(true);
     let mut file = options.open(&temporary).map_err(storage)?;
     // The copy that is about to take an existing file's place, before anything is written into it.
     // A directory can give what is created in it access its own files do not have, and the rename
-    // below would hand that to the document being replaced.
-    if path.exists() && extended_access_controls(&temporary)? {
+    // below would hand that to the document being replaced. A check that cannot be made refuses as
+    // one that fails does, and neither leaves the copy behind.
+    let changes = if path.exists() {
+        copy_changes_access(&file, &temporary, path)
+    } else {
+        Ok(false)
+    };
+    if !matches!(changes, Ok(false)) {
         drop(file);
         let _ = std::fs::remove_file(&temporary);
+        changes?;
         return Err(ControllerError::PermissionDenied {
             detail: format!(
-                "a new file in {} is given an access-control list by the directory itself, so \
-                 replacing {} here would change who can read it",
+                "a new file in {} {COPY_DIFFERS}, so replacing {} here would change who can read \
+                 it",
                 display(parent),
                 display(path)
             ),
@@ -357,5 +466,29 @@ mod tests {
         } else {
             answer.expect("changes are made here");
         }
+    }
+
+    /// A read of a file's access that failed is a storage failure, and a control the reader does
+    /// not evaluate is a refusal to change the file.
+    #[cfg(windows)]
+    #[test]
+    fn a_refused_read_of_a_files_access_is_answered_by_its_kind() {
+        use kr_ipc::paths::AccessListRefusal;
+
+        let path = Path::new("C:\\somewhere\\config.toml");
+        assert!(matches!(
+            refused_read(
+                path,
+                AccessListRefusal::Unreadable("it could not be read".to_owned())
+            ),
+            ControllerError::Storage { .. }
+        ));
+        assert!(matches!(
+            refused_read(
+                path,
+                AccessListRefusal::Policy("it is encrypted".to_owned())
+            ),
+            ControllerError::PermissionDenied { .. }
+        ));
     }
 }
