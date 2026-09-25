@@ -2448,8 +2448,9 @@ mod tests {
 
     /// A device restoring from a recovery kit authorises for the restore alone: the browser's
     /// answer, the exchange and the kept grant are the ones every sign-in goes through, and the
-    /// token that comes of it is handed out for `backup.restore` and refused for every scope the
-    /// application's own sign-in would have carried and for writing a bundle.
+    /// token that comes of it is handed out for `backup.restore` and refused for every resource
+    /// scope the application's own sign-in would have carried and for writing a bundle. The
+    /// identity scopes are the grant's own, so they are not among them.
     #[tokio::test]
     async fn a_restore_authorisation_holds_a_token_for_its_scope_and_for_no_other() {
         let request = AuthorisationRequest::asking(
@@ -2511,7 +2512,13 @@ mod tests {
                 .expose(),
             "a-restore-token"
         );
-        for other in [BACKUP_WRITE_SCOPE, LEASE_SCOPE, USAGE_SCOPE, "reasoning"] {
+        let resources = &REQUESTED_SCOPES[IDENTITY_SCOPES.len()..];
+        assert_eq!(
+            resources.len(),
+            4,
+            "every resource the application asks for"
+        );
+        for other in resources.iter().chain([&BACKUP_WRITE_SCOPE]) {
             let refused = account.token(other).await.expect_err("not this grant's");
             assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{other}");
         }

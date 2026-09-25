@@ -1349,23 +1349,90 @@ mod tests {
         }
     }
 
-    /// Whether a request left is decided by the path each call takes, so two calls made at once
-    /// through one exchange each say their own: the one refused here was not sent, and the one
-    /// the transport was given was.
+    /// A token source that holds each caller until the test lets one through, as a refresh in
+    /// flight does.
+    #[derive(Debug)]
+    struct Refreshing {
+        through: tokio::sync::Semaphore,
+    }
+
+    impl Refreshing {
+        fn holding() -> Arc<Self> {
+            Arc::new(Self {
+                through: tokio::sync::Semaphore::new(0),
+            })
+        }
+
+        fn let_one_through(&self) {
+            self.through.add_permits(1);
+        }
+    }
+
+    impl AccountTokenSource for Refreshing {
+        fn token<'a>(&'a self, _scope: &'a str) -> ServiceFuture<'a, AccountToken> {
+            Box::pin(async move {
+                self.through
+                    .acquire()
+                    .await
+                    .expect("the source stays open")
+                    .forget();
+                AccountToken::new(TOKEN)
+            })
+        }
+    }
+
+    /// Whether a request left is decided by the path each call takes, so two calls in flight at
+    /// once through one exchange each say their own. One waits for its token, as a refresh makes
+    /// it wait, while the other's request leaves and its answer is lost: that one may have run.
+    /// Meanwhile the instant the first was to be signed at, inside the service's window when the
+    /// call began, falls out of it, and the first is refused here when its token arrives: nothing
+    /// of it ever reached the transport.
     #[tokio::test]
-    async fn two_calls_at_once_each_say_whether_their_own_request_left() {
+    async fn two_calls_in_flight_at_once_each_say_whether_their_own_request_left() {
         let wire = Wire::answering(Err(ErrorCode::UpstreamUnavailable));
         let service = service(&wire);
-        let absent = presenting(&Tokens::holding(None));
-        let held = presenting(&Tokens::holding(Some(TOKEN)));
-        let (refused, lost) =
-            tokio::join!(send(&service, Some(&absent)), send(&service, Some(&held)),);
-        assert!(
-            matches!(refused, Err(Unanswered::NotSent(_))),
-            "{refused:?}"
+        let refreshing = Refreshing::holding();
+        let waits = AccountAuthorisation::new(
+            Arc::clone(&refreshing) as Arc<dyn AccountTokenSource>,
+            "backup.write",
         );
+        let held = presenting(&Tokens::holding(Some(TOKEN)));
+        let signed_at_ms = now_ms() + 1_000 - SERVICE_REQUEST_FRESHNESS_MS;
+        assert!(
+            now_ms().abs_diff(signed_at_ms) <= SERVICE_REQUEST_FRESHNESS_MS,
+            "inside the window when the call begins"
+        );
+        let document = serde_json::json!({ "note": "a request" });
+        let waiting = service.dispatch(
+            "/api/sync/exchange",
+            Method::SyncCompareExchange,
+            &document,
+            256 * 1024,
+            Some(signed_at_ms),
+            Some(&waits),
+        );
+        let meanwhile = async {
+            let lost = send(&service, Some(&held)).await;
+            assert_eq!(
+                wire.requests(),
+                1,
+                "the call waiting for its token has sent nothing"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2_000)).await;
+            refreshing.let_one_through();
+            lost
+        };
+        let (refused, lost) = tokio::join!(waiting, meanwhile);
+        match refused {
+            Err(Unanswered::NotSent(error)) => assert_eq!(error.code(), ErrorCode::ClockUntrusted),
+            other => panic!("aged out while it waited, and not sent: {other:?}"),
+        }
         assert!(matches!(lost, Err(Unanswered::Sent(_))), "{lost:?}");
-        assert_eq!(wire.requests(), 1);
+        assert_eq!(
+            wire.requests(),
+            1,
+            "only the lost request reached the transport"
+        );
     }
 
     /// A caller that does not ask whether its request left gets the error it always got.
