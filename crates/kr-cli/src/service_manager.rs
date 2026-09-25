@@ -1429,16 +1429,21 @@ mod platform {
             |pid| shown!(", which runs as process {}", pid),
         );
         Some(shown!(
-            "launchd holds an earlier form of {}{}, with {} than the definition kr wrote; {}",
+            "launchd holds an earlier form of {}{}, with {} than the definition kr wrote; \
+             launchctl print {} shows what it runs, and {}",
             target,
             process,
             Shown::joined(differences.into_iter().map(Shown::said), " and "),
+            target,
             remedy
         ))
     }
 
     /// That launchd holds exactly `definition` once it has been loaded, or what it holds instead.
-    fn loaded_as_written(found: &Job, definition: &Definition) -> std::result::Result<(), Shown> {
+    pub(super) fn loaded_as_written(
+        found: &Job,
+        definition: &Definition,
+    ) -> std::result::Result<(), Shown> {
         let why = match found {
             Job::Loaded(loaded) => match held_otherwise(loaded, definition) {
                 None => return Ok(()),
@@ -1881,10 +1886,20 @@ mod platform {
         }
 
         /// Why the user manager would not run the definition kr wrote as kr wrote it, when it
-        /// would not, with where a person sees the drop-ins it reads for the unit.
+        /// would not, with how many drop-ins it reads for the unit and the two commands that show
+        /// a person what a difference does not repeat: the files it reads for the unit, and what
+        /// it holds.
         pub(super) fn difference(&self, definition: &Definition) -> Option<Shown> {
             let why = self.differs(definition)?;
-            Some(shown!("{}; {}", why, self.reads(definition)))
+            let unit = definition.target_said();
+            Some(shown!(
+                "{}; {}; systemctl --user cat {} shows the files it reads for it, and systemctl \
+                 --user show {} what it holds",
+                why,
+                self.reads(),
+                unit,
+                unit
+            ))
         }
 
         /// The rule: the manager loads the unit cleanly from kr's file, has read that file since
@@ -2015,9 +2030,9 @@ mod platform {
             (!problems.is_empty()).then(|| Shown::joined(problems, "; "))
         }
 
-        /// How many drop-ins the manager reads for the unit, and the command that shows them to a
-        /// person: their names and what they hold are not repeated.
-        pub(super) fn reads(&self, definition: &Definition) -> Shown {
+        /// How many drop-ins the manager reads for the unit: their names and what they hold are
+        /// not repeated.
+        pub(super) fn reads(&self) -> Shown {
             if let Some(why) = &self.unread_drop_ins {
                 return shown!(
                     "kr cannot read back which drop-ins it reads for it: {}",
@@ -2026,15 +2041,8 @@ mod platform {
             }
             match self.drop_ins.len() {
                 0 => Shown::said("it reads no drop-in for it"),
-                1 => shown!(
-                    "it reads one drop-in for it, which systemctl --user cat {} shows",
-                    definition.target_said()
-                ),
-                count => shown!(
-                    "it reads {} drop-ins for it, which systemctl --user cat {} shows",
-                    count,
-                    definition.target_said()
-                ),
+                1 => Shown::said("it reads one drop-in for it"),
+                count => shown!("it reads {} drop-ins for it", count),
             }
         }
     }
@@ -2871,6 +2879,57 @@ mod tests {
         )))
     }
 
+    /// Once launchd has loaded the definition, it has to hold exactly that definition. Anything
+    /// else is a failure that says what launchd holds instead in words of kr's own, never what it
+    /// printed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_definition_just_loaded_is_held_as_written_or_said_without_what_launchd_printed() {
+        let written = definition(
+            &PathBuf::from(format!("/Users/someone/Library/LaunchAgents/{LABEL}.plist")),
+            "the job\n",
+        );
+        let path = written.path.display().to_string();
+        // The success control: launchd holds exactly the definition.
+        assert_eq!(
+            platform::loaded_as_written(&held(&path, ""), &written),
+            Ok(())
+        );
+        let prefix =
+            format!("launchd does not hold the definition just loaded as gui/501/{LABEL}: ");
+        let nothing = platform::loaded_as_written(&platform::Job::NotLoaded, &written)
+            .expect_err("nothing is held");
+        assert_eq!(
+            nothing.as_str(),
+            format!("{prefix}it holds nothing under that label")
+        );
+        let foreign = platform::Job::Loaded(platform::Loaded::read(&format!(
+            "gui/501/{LABEL} = {{\n\tpath = /Users/someone/{MARKER}/other.plist\n}}\n"
+        )));
+        let earlier = held(&path, &format!("\t\t{MARKER}\n"));
+        let mut renderings = Vec::new();
+        for (job, words) in [
+            (foreign, "from a definition other than the one kr wrote"),
+            (
+                earlier,
+                "an earlier form of gui/501/kr-controller-0d15ea5e-0000-4000-8000-000000000001, \
+                 which runs as process 4242, with other arguments than the definition kr wrote; \
+                 launchctl print gui/501/kr-controller-0d15ea5e-0000-4000-8000-000000000001 shows \
+                 what it runs",
+            ),
+        ] {
+            // The negative control: what launchd printed holds the marker.
+            assert!(format!("{job:?}").contains(MARKER), "{words}");
+            let why = platform::loaded_as_written(&job, &written).expect_err("not as written");
+            assert!(
+                why.as_str().starts_with(&prefix) && why.as_str().contains(words),
+                "{words}: {why}"
+            );
+            renderings.extend(failure_renderings(CliError::HostUnavailable(why)));
+        }
+        assert_unmarked("a definition just loaded", &renderings);
+    }
+
     /// KR-REQ-07.12: a start request loads the definition where launchd holds nothing under its
     /// label, starts the job where launchd holds exactly the definition, and refuses anything else
     /// with its remedy. The check and the request both decide this way, each from what launchd
@@ -3054,8 +3113,8 @@ mod tests {
     /// The user manager runs the definition as kr wrote it when it loads the unit cleanly from
     /// kr's file, has read it since it changed, starts it as the file says and prints one command
     /// for it, the file's, program, words and flags as kr wrote them. Anything else is a
-    /// difference, said by what differs, and every difference says where the drop-ins the manager
-    /// reads are shown.
+    /// difference, said by what differs, and every difference says how many drop-ins the manager
+    /// reads and the commands that show the files and what the manager holds.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_user_unit_differs_when_the_manager_would_run_anything_but_the_definition() {
@@ -3144,7 +3203,8 @@ mod tests {
             assert!(
                 why.as_str().contains(&format!("one of them sets {key}"))
                     && why.as_str().contains(&format!(
-                        "it reads one drop-in for it, which systemctl --user cat {unit_name} shows"
+                        "it reads one drop-in for it; systemctl --user cat {unit_name} shows the \
+                         files it reads for it, and systemctl --user show {unit_name} what it holds"
                     )),
                 "{name}: {why}"
             );
@@ -3238,8 +3298,13 @@ mod tests {
             let why = unit.difference(&written).expect("a difference");
             assert!(why.as_str().contains(&what), "{what}: {why}");
             assert!(
-                why.as_str().contains("drop-in"),
-                "every difference says where the drop-ins the manager reads are: {why}"
+                why.as_str().contains("drop-in")
+                    && why.as_str().ends_with(&format!(
+                        "systemctl --user cat {unit_name} shows the files it reads for it, and \
+                         systemctl --user show {unit_name} what it holds"
+                    )),
+                "every difference says how many drop-ins the manager reads and which commands \
+                 show what it does not repeat: {why}"
             );
         }
         let why = shown(
@@ -3252,7 +3317,8 @@ mod tests {
         .expect("a difference");
         assert!(
             why.as_str().contains(&format!(
-                "it reads one drop-in for it, which systemctl --user cat {unit_name} shows"
+                "it reads one drop-in for it; systemctl --user cat {unit_name} shows the files it \
+                 reads for it, and systemctl --user show {unit_name} what it holds"
             )) && !why.as_str().contains("/x/y.service.d"),
             "{why}"
         );

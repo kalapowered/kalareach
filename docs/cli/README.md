@@ -1085,8 +1085,9 @@ the setup takes the definition once it has been applied. kr ends no daemon, so i
 Such a failure says what differs in kr's own words and the manager's fixed names for load states,
 start types and settings. It never repeats what the manager printed, a file the manager names, a
 drop-in's name or what the drop-in holds, or a path read back from kr's record. Instead it names
-the command that shows them: `launchctl print <domain>/<label>` for a job, and `systemctl --user
-cat kr-controller-<environment>.service` for a unit and its drop-ins.
+the commands that show them: `launchctl print <domain>/<label>` for a job, and for a unit `systemctl
+--user cat kr-controller-<environment>.service`, which shows the files the manager reads for it,
+and `systemctl --user show kr-controller-<environment>.service`, which shows what it holds.
 
 | Platform | The definition | Where it is loaded |
 | --- | --- | --- |
