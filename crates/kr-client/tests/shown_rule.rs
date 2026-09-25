@@ -571,7 +571,9 @@ impl fmt::Display for Finding {
 /// One name a file imports.
 #[derive(Clone, Debug)]
 struct Import {
-    /// The name it is known by in the file.
+    /// The module scope the import is written in, as an index into [`Source::scopes`].
+    scope: usize,
+    /// The name it is known by there.
     local: String,
     /// The full path it names.
     path: Vec<String>,
@@ -587,16 +589,19 @@ struct Source {
     module: Vec<String>,
     /// Its production tokens: everything that can compile without `test`.
     tokens: Vec<Located>,
+    /// The scope each production token is in, as an index into `scopes`.
+    token_scopes: Vec<usize>,
+    /// Each module scope's path below the file's own module: the file itself first, then every
+    /// module it declares inline.
+    scopes: Vec<Vec<String>>,
     /// The modules it declares in files of their own, and whether each is test code.
     children: Vec<(String, bool)>,
-    /// The modules it declares inline.
-    inline_modules: BTreeSet<String>,
-    /// The names it imports.
+    /// The names each scope imports.
     imports: Vec<Import>,
-    /// Whether it imports everything from somewhere, which leaves a bare name unplaceable.
-    globs: bool,
-    /// The types, traits and aliases it defines.
-    definitions: BTreeSet<String>,
+    /// The scopes that import everything from somewhere, where a bare name cannot be placed.
+    globs: BTreeSet<usize>,
+    /// The types, traits and aliases each scope defines.
+    definitions: BTreeSet<(usize, String)>,
     /// What this reading cannot follow in it.
     problems: Vec<Finding>,
 }
@@ -607,19 +612,40 @@ const PRIMITIVES: [&str; 17] = [
     "char", "str", "f32", "f64",
 ];
 
-/// Names a renamed import would hide from this reading.
-const RENAME_GUARDED: [&str; 11] = [
-    "Display",
+/// The derives this reading knows write no rendering of their own beyond `Debug`, which the rule
+/// reads separately. Any other derive can write an `impl` this reading cannot see.
+const DERIVES: [&str; 20] = [
     "Debug",
-    "Error",
-    "Plain",
-    "Said",
-    "Shown",
-    "IoFault",
-    "fmt",
+    "Clone",
+    "Copy",
+    "PartialEq",
+    "Eq",
+    "PartialOrd",
+    "Ord",
+    "Hash",
+    "Default",
+    "Serialize",
+    "Deserialize",
+    "serde::Serialize",
+    "serde::Deserialize",
+    "JsonSchema",
+    "schemars::JsonSchema",
+    "Args",
+    "Parser",
+    "Subcommand",
+    "ValueEnum",
+    "thiserror::Error",
+];
+
+/// Attributes whose presence under a `cfg_attr` would change what this reading reads.
+const READ_ATTRIBUTES: [&str; 7] = [
+    "path",
     "error",
-    "thiserror",
-    "Write",
+    "derive",
+    "source",
+    "from",
+    "cfg",
+    "macro_use",
 ];
 
 impl Source {
@@ -632,91 +658,108 @@ impl Source {
         });
     }
 
-    /// The full path of `segments` as a path written in this file, first segment resolved through
-    /// its imports, its modules and its definitions; `None` when this reading cannot place it.
-    fn resolve(&self, segments: &[String], aliases: &BTreeMap<String, String>) -> Option<String> {
+    /// The scope the production token at `index` is in.
+    fn scope_at(&self, index: usize) -> usize {
+        self.token_scopes.get(index).copied().unwrap_or(0)
+    }
+
+    /// The full module path of one scope.
+    fn module_of(&self, scope: usize) -> Vec<String> {
+        self.module
+            .iter()
+            .chain(&self.scopes[scope])
+            .cloned()
+            .collect()
+    }
+
+    /// Whether `name` is a module declared in `scope`: a file of its own at the file's top, or an
+    /// inline one written there.
+    fn declares_module(&self, scope: usize, name: &str) -> bool {
+        let parent = &self.scopes[scope];
+        (scope == 0 && self.children.iter().any(|(child, _)| child == name))
+            || self.scopes.iter().any(|path| {
+                path.len() == parent.len() + 1
+                    && path.starts_with(parent)
+                    && path.last().is_some_and(|last| last == name)
+            })
+    }
+
+    /// The path `segments` names when it starts with `crate`, `self`, `super` or a module declared
+    /// in `scope`; `None` otherwise.
+    fn relative(&self, segments: &[String], scope: usize) -> Option<Vec<String>> {
         let (first, rest) = segments.split_first()?;
-        let path: Vec<String> = match first.as_str() {
-            "crate" => std::iter::once(self.crate_name.clone())
-                .chain(rest.iter().cloned())
-                .collect(),
-            "self" => self.module.iter().chain(rest).cloned().collect(),
+        let module = self.module_of(scope);
+        match first.as_str() {
+            "crate" => Some(
+                std::iter::once(self.crate_name.clone())
+                    .chain(rest.iter().cloned())
+                    .collect(),
+            ),
+            "self" => Some(module.into_iter().chain(rest.iter().cloned()).collect()),
             "super" => {
                 let supers = segments
                     .iter()
                     .take_while(|segment| *segment == "super")
                     .count();
-                let keep = self.module.len().checked_sub(supers)?;
-                if keep == 0 {
-                    return None;
-                }
-                self.module[..keep]
-                    .iter()
-                    .chain(&segments[supers..])
-                    .cloned()
+                let keep = module.len().checked_sub(supers).filter(|keep| *keep > 0)?;
+                Some(
+                    module[..keep]
+                        .iter()
+                        .chain(&segments[supers..])
+                        .cloned()
+                        .collect(),
+                )
+            }
+            _ if self.declares_module(scope, first) => {
+                Some(module.into_iter().chain(segments.iter().cloned()).collect())
+            }
+            _ => None,
+        }
+    }
+
+    /// The full path of `segments` as a path written in `scope`, its first segment resolved
+    /// through that scope's imports, modules and definitions; `None` when this reading cannot
+    /// place it.
+    fn resolve(
+        &self,
+        segments: &[String],
+        scope: usize,
+        aliases: &BTreeMap<String, String>,
+    ) -> Option<String> {
+        let (first, rest) = segments.split_first()?;
+        let path: Vec<String> = if first == "Self" {
+            return None;
+        } else if let Some(path) = self.relative(segments, scope) {
+            path
+        } else if rest.is_empty() && PRIMITIVES.contains(&first.as_str()) {
+            vec!["prim".to_owned(), first.clone()]
+        } else {
+            let imported: BTreeSet<&Vec<String>> = self
+                .imports
+                .iter()
+                .filter(|import| import.scope == scope && import.local == *first)
+                .map(|import| &import.path)
+                .collect();
+            if imported.len() > 1 {
+                return None;
+            }
+            if let Some(path) = imported.into_iter().next() {
+                path.iter().chain(rest).cloned().collect()
+            } else if rest.is_empty() && self.definitions.contains(&(scope, first.clone())) {
+                self.module_of(scope)
+                    .into_iter()
+                    .chain(segments.iter().cloned())
                     .collect()
-            }
-            "Self" => return None,
-            _ if rest.is_empty() && PRIMITIVES.contains(&first.as_str()) => {
-                vec!["prim".to_owned(), first.clone()]
-            }
-            _ => {
-                let imported: BTreeSet<&Vec<String>> = self
-                    .imports
-                    .iter()
-                    .filter(|import| import.local == *first)
-                    .map(|import| &import.path)
-                    .collect();
-                if imported.len() > 1 {
-                    return None;
-                }
-                if let Some(path) = imported.into_iter().next() {
-                    path.iter().chain(rest).cloned().collect()
-                } else if self.children.iter().any(|(child, _)| child == first)
-                    || self.inline_modules.contains(first)
-                    || rest.is_empty() && self.definitions.contains(first)
-                {
-                    self.module.iter().chain(segments).cloned().collect()
-                } else if rest.is_empty() {
-                    // A bare name neither imported nor defined here: a glob's or the prelude's,
-                    // which this reading does not place.
-                    return None;
-                } else {
-                    segments.to_vec()
-                }
+            } else if rest.is_empty() {
+                // A bare name neither imported nor defined in its scope: a glob's or the
+                // prelude's, which this reading does not place.
+                return None;
+            } else {
+                segments.to_vec()
             }
         };
         let joined = path.join("::");
         Some(aliases.get(&joined).cloned().unwrap_or(joined))
-    }
-
-    /// The full path an import names, read from where the import is written.
-    fn import_path(&self, segments: &[String]) -> Vec<String> {
-        match segments.first().map(String::as_str) {
-            Some("crate") => std::iter::once(self.crate_name.clone())
-                .chain(segments[1..].iter().cloned())
-                .collect(),
-            Some("self") => self.module.iter().chain(&segments[1..]).cloned().collect(),
-            Some("super") => {
-                let supers = segments
-                    .iter()
-                    .take_while(|segment| *segment == "super")
-                    .count();
-                let keep = self.module.len().saturating_sub(supers).max(1);
-                self.module[..keep]
-                    .iter()
-                    .chain(&segments[supers..])
-                    .cloned()
-                    .collect()
-            }
-            Some(first)
-                if self.children.iter().any(|(child, _)| child == first)
-                    || self.inline_modules.contains(first) =>
-            {
-                self.module.iter().chain(segments).cloned().collect()
-            }
-            _ => segments.to_vec(),
-        }
     }
 }
 
@@ -752,7 +795,7 @@ fn use_tree(
                 return;
             }
             Some(Token::Punct('*')) => {
-                source.globs = true;
+                found.push((segments, Some("*".to_owned())));
                 return;
             }
             _ => break,
@@ -763,11 +806,11 @@ fn use_tree(
     } else {
         None
     };
+    // Outside the two files that define what may be shown, a name is imported as itself: a
+    // renamed trait, type or macro is one this reading would not recognise where it is used.
     if let Some(renamed) = &renamed
         && renamed != "_"
-        && segments
-            .last()
-            .is_some_and(|last| RENAME_GUARDED.contains(&last.as_str()))
+        && !SHOWN_FILES.contains(&source.name.as_str())
     {
         source.problem(
             line,
@@ -778,8 +821,8 @@ fn use_tree(
     found.push((segments, renamed));
 }
 
-/// Reads one file into its production tokens, its imports, its definitions and the modules it
-/// declares.
+/// Reads one file into its production tokens, its scopes, imports and definitions, and the modules
+/// it declares.
 fn read_source(
     root: &Path,
     path: &Path,
@@ -799,10 +842,11 @@ fn read_source(
         crate_name: crate_name.to_owned(),
         module,
         tokens: Vec::new(),
+        token_scopes: Vec::new(),
+        scopes: vec![Vec::new()],
         children: Vec::new(),
-        inline_modules: BTreeSet::new(),
         imports: Vec::new(),
-        globs: false,
+        globs: BTreeSet::new(),
         definitions: BTreeSet::new(),
         problems: Vec::new(),
     };
@@ -819,17 +863,30 @@ fn read_source(
             let inner = punct(all.get(index + 1), '!');
             let open = index + 1 + usize::from(inner);
             let compiles = cfg_compiles_without_test(&all, open);
-            if ident(all.get(open + 1)) == Some("path") {
-                source.problem(
-                    all[index].line,
-                    "#[path]",
-                    "a module file this reading cannot follow",
-                );
+            let line = all[index].line;
+            match ident(all.get(open + 1)) {
+                Some("path") => {
+                    source.problem(line, "#[path]", "a module file this reading cannot follow");
+                }
+                Some("cfg_attr") if punct(all.get(open + 2), '(') => {
+                    let parts = arguments(&all, open + 2).unwrap_or_default();
+                    let reads = parts.iter().skip(1).any(|part| {
+                        ident(part.first()).is_some_and(|word| READ_ATTRIBUTES.contains(&word))
+                    });
+                    if reads {
+                        source.problem(
+                            line,
+                            "#[cfg_attr]",
+                            "an attribute under cfg_attr, which this reading cannot follow",
+                        );
+                    }
+                }
+                _ => {}
             }
             if inner {
                 if depth > 0 && compiles.is_some() {
                     source.problem(
-                        all[index].line,
+                        line,
                         "#![cfg]",
                         "an inner cfg inside a block, which this reading cannot follow",
                     );
@@ -878,39 +935,76 @@ fn read_source(
     if !file_test {
         source.tokens.append(&mut attributes);
     }
-    // What the production tokens define and import.
+    // The module scope of every production token: the file's own, or an inline module's.
     let tokens = std::mem::take(&mut source.tokens);
+    let mut stack: Vec<(usize, i64)> = Vec::new();
+    let mut depth = 0_i64;
+    let mut opening: Option<String> = None;
+    for (at, located) in tokens.iter().enumerate() {
+        let current = stack.last().map_or(0, |(scope, _)| *scope);
+        source.token_scopes.push(current);
+        match &located.token {
+            Token::Ident(word) if word == "mod" && punct(tokens.get(at + 2), '{') => {
+                opening = ident(tokens.get(at + 1)).map(ToOwned::to_owned);
+            }
+            Token::Punct('{') => {
+                depth += 1;
+                if let Some(name) = opening.take() {
+                    let mut path = source.scopes[current].clone();
+                    path.push(name);
+                    source.scopes.push(path);
+                    stack.push((source.scopes.len() - 1, depth));
+                }
+            }
+            Token::Punct('}') => {
+                if stack.last().is_some_and(|(_, opened)| *opened == depth) {
+                    stack.pop();
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    // What each scope defines and imports.
     let mut found = Vec::new();
     for (at, located) in tokens.iter().enumerate() {
+        let scope = source.token_scopes[at];
         match ident(Some(located)) {
             Some("struct" | "enum" | "union" | "trait" | "type") => {
                 if let Some(defined) = ident(tokens.get(at + 1)) {
-                    source.definitions.insert(defined.to_owned());
-                }
-            }
-            Some("mod") if punct(tokens.get(at + 2), '{') => {
-                if let Some(inline) = ident(tokens.get(at + 1)) {
-                    source.inline_modules.insert(inline.to_owned());
+                    source.definitions.insert((scope, defined.to_owned()));
                 }
             }
             Some("use") => {
                 let end = (at..tokens.len())
                     .find(|&end| punct(tokens.get(end), ';'))
                     .unwrap_or(tokens.len());
+                let mut in_scope = Vec::new();
                 use_tree(
                     &tokens[at + 1..end],
                     &[],
                     located.line,
                     &mut source,
-                    &mut found,
+                    &mut in_scope,
+                );
+                found.extend(
+                    in_scope
+                        .into_iter()
+                        .map(|(segments, renamed)| (scope, segments, renamed)),
                 );
             }
             _ => {}
         }
     }
     source.tokens = tokens;
-    for (segments, renamed) in found {
-        let path = source.import_path(&segments);
+    for (scope, segments, renamed) in found {
+        if renamed.as_deref() == Some("*") {
+            source.globs.insert(scope);
+            continue;
+        }
+        let path = source
+            .relative(&segments, scope)
+            .unwrap_or_else(|| segments.clone());
         let local = match renamed {
             Some(renamed) => renamed,
             None if segments.last().is_some_and(|last| last == "self") => {
@@ -924,7 +1018,7 @@ fn read_source(
             path
         };
         if local != "_" {
-            source.imports.push(Import { local, path });
+            source.imports.push(Import { scope, local, path });
         }
     }
     Ok(source)
@@ -1090,6 +1184,7 @@ fn written_path(tokens: &[Located]) -> (Vec<String>, usize) {
 fn held(
     source: &Source,
     tokens: &[Located],
+    scope: usize,
     aliases: &BTreeMap<String, String>,
 ) -> Vec<Option<String>> {
     if punct(tokens.first(), '&') {
@@ -1104,7 +1199,7 @@ fn held(
         if ident(tokens.get(index)) == Some("mut") {
             index += 1;
         }
-        return held(source, &tokens[index..], aliases)
+        return held(source, &tokens[index..], scope, aliases)
             .into_iter()
             .map(|inner| inner.map(|inner| format!("&{lifetime} {inner}")))
             .collect();
@@ -1114,7 +1209,7 @@ fn held(
         return vec![None];
     }
     if after == tokens.len() {
-        return vec![source.resolve(&segments, aliases)];
+        return vec![source.resolve(&segments, scope, aliases)];
     }
     if !punct(tokens.get(after), '<') || !punct(tokens.last(), '>') {
         return vec![None];
@@ -1126,12 +1221,12 @@ fn held(
     if wrapper {
         return generics
             .iter()
-            .flat_map(|argument| held(source, argument, aliases))
+            .flat_map(|argument| held(source, argument, scope, aliases))
             .collect();
     }
     vec![
         source
-            .resolve(&segments, aliases)
+            .resolve(&segments, scope, aliases)
             .map(|path| format!("{path}<..>")),
     ]
 }
@@ -1152,7 +1247,7 @@ struct Known {
 fn aliases(sources: &[Source]) -> BTreeMap<String, String> {
     let mut aliases = BTreeMap::new();
     for source in sources.iter().filter(|source| source.module.len() == 1) {
-        for import in &source.imports {
+        for import in source.imports.iter().filter(|import| import.scope == 0) {
             aliases.insert(
                 format!("{}::{}", source.crate_name, import.local),
                 import.path.join("::"),
@@ -1178,9 +1273,14 @@ fn collect_known(sources: &[Source], aliases: &BTreeMap<String, String>) -> Know
                         .find(|&end| punct(tokens.get(end), '{'))
                         .unwrap_or(tokens.len());
                     known.plain.extend(
-                        held(source, &tokens[index + 2..end], aliases)
-                            .into_iter()
-                            .flatten(),
+                        held(
+                            source,
+                            &tokens[index + 2..end],
+                            source.scope_at(index),
+                            aliases,
+                        )
+                        .into_iter()
+                        .flatten(),
                     );
                 }
                 "plain" | "debug_as_display"
@@ -1190,7 +1290,9 @@ fn collect_known(sources: &[Source], aliases: &BTreeMap<String, String>) -> Know
                         continue;
                     }
                     for argument in arguments(tokens, index + 2).unwrap_or_default() {
-                        let paths = held(source, &argument, aliases).into_iter().flatten();
+                        let paths = held(source, &argument, source.scope_at(index), aliases)
+                            .into_iter()
+                            .flatten();
                         if word == "plain" {
                             known.plain.extend(paths);
                         } else {
@@ -1205,9 +1307,14 @@ fn collect_known(sources: &[Source], aliases: &BTreeMap<String, String>) -> Know
                     let end = (index + 2..tokens.len())
                         .find(|&end| punct(tokens.get(end), '{') || punct(tokens.get(end), ';'))
                         .unwrap_or(tokens.len());
-                    for path in held(source, &tokens[index + 2..end], aliases)
-                        .into_iter()
-                        .flatten()
+                    for path in held(
+                        source,
+                        &tokens[index + 2..end],
+                        source.scope_at(index),
+                        aliases,
+                    )
+                    .into_iter()
+                    .flatten()
                     {
                         known
                             .errors
@@ -1220,7 +1327,10 @@ fn collect_known(sources: &[Source], aliases: &BTreeMap<String, String>) -> Know
                     if derives.iter().any(|name| name == "thiserror::Error")
                         && let Some(name) = defined_after(tokens, index)
                     {
-                        let path = format!("{}::{name}", source.module.join("::"));
+                        let path = format!(
+                            "{}::{name}",
+                            source.module_of(source.scope_at(index)).join("::")
+                        );
                         known.errors.insert(path.clone(), source.name.clone());
                         known.thiserror.insert(path);
                     }
@@ -1373,9 +1483,14 @@ fn check_source(
                 let end = (index + 2..tokens.len())
                     .find(|&end| punct(tokens.get(end), '{'))
                     .unwrap_or(tokens.len());
-                for path in held(source, &tokens[index + 2..end], aliases)
-                    .into_iter()
-                    .flatten()
+                for path in held(
+                    source,
+                    &tokens[index + 2..end],
+                    source.scope_at(index),
+                    aliases,
+                )
+                .into_iter()
+                .flatten()
                 {
                     if known.errors.contains_key(&path) {
                         find(line, &path, "an error type with a Debug written by hand");
@@ -1439,7 +1554,9 @@ fn check_source(
                     "standard error written outside the reporter",
                 );
             }
-            "info" | "warn" | "error" | "debug" | "trace" | "event" | "span" if next_is_bang => {
+            "info" | "warn" | "error" | "debug" | "trace" | "event" | "span" | "log"
+                if next_is_bang =>
+            {
                 find(line, word, "a log line");
             }
             "assert_eq" | "assert_ne" | "debug_assert_eq" | "debug_assert_ne"
@@ -1463,8 +1580,14 @@ fn check_source(
                     find(line, word, "an assertion that formats a value");
                 }
             }
+            // A method call, and a path call such as `Result::expect(value, "...")`; not a lint
+            // attribute of the same name.
             "unwrap" | "expect" | "unwrap_err" | "expect_err"
-                if after_dot && punct(tokens.get(index + 1), '(') =>
+                if punct(tokens.get(index + 1), '(')
+                    && (after_dot
+                        || index >= 2
+                            && punct(tokens.get(index - 1), ':')
+                            && punct(tokens.get(index - 2), ':')) =>
             {
                 find(
                     line,
@@ -1496,38 +1619,40 @@ fn check_source(
                             &defined,
                             "an Error derive not spelled thiserror::Error",
                         );
+                    } else if !DERIVES.contains(&derive.as_str()) {
+                        find(
+                            line,
+                            &defined,
+                            "a derive this reading does not know, which can write an impl",
+                        );
                     }
                 }
-                let path = format!("{}::{defined}", source.module.join("::"));
+                let path = format!(
+                    "{}::{defined}",
+                    source.module_of(source.scope_at(index)).join("::")
+                );
                 if known.errors.contains_key(&path)
                     && derives.iter().any(|derive| derive == "Debug")
                 {
                     find(line, &defined, "an error type that derives Debug");
                 }
             }
+            // A macro can write any item from what it is given, so outside the two files that
+            // define what may be shown there are none.
             "macro_rules" if next_is_bang && !shown_file => {
-                let open = index + 3;
-                let body_close = closing(tokens, open).unwrap_or(open);
-                let writes = tokens[open.min(tokens.len())..body_close.min(tokens.len())]
-                    .iter()
-                    .any(|located| {
-                        matches!(
-                            ident(Some(located)),
-                            Some("struct" | "enum" | "union" | "trait" | "impl")
-                        )
-                    });
-                if writes {
-                    let item = ident(tokens.get(index + 2)).unwrap_or("?").to_owned();
-                    find(
-                        line,
-                        &item,
-                        "a macro that defines a type or writes an impl this reading cannot see",
-                    );
-                }
+                let item = ident(tokens.get(index + 2)).unwrap_or("?").to_owned();
+                find(
+                    line,
+                    &item,
+                    "a macro, which can define a type or write an impl this reading cannot see",
+                );
             }
             "struct" | "enum" if !shown_file => {
                 if let Some(name) = ident(tokens.get(index + 1)) {
-                    let path = format!("{}::{name}", source.module.join("::"));
+                    let path = format!(
+                        "{}::{name}",
+                        source.module_of(source.scope_at(index)).join("::")
+                    );
                     if known.errors.contains_key(&path) {
                         check_error_type(source, index, &path, known, aliases, &mut find);
                     }
@@ -1633,7 +1758,17 @@ fn check_error_type(
         let fields = fields(tokens, index);
         let rendered = error_attributes(tokens, before_item(tokens, at), at, path, &fields, find);
         if derived {
-            check_rendered_fields(source, &fields, &rendered, path, None, known, aliases, find);
+            check_rendered_fields(
+                source,
+                source.scope_at(at),
+                &fields,
+                &rendered,
+                path,
+                None,
+                known,
+                aliases,
+                find,
+            );
         }
         return;
     }
@@ -1667,6 +1802,7 @@ fn check_error_type(
         if derived {
             check_rendered_fields(
                 source,
+                source.scope_at(at),
                 &variant_fields,
                 &rendered,
                 path,
@@ -1820,6 +1956,7 @@ fn error_attributes(
 )]
 fn check_rendered_fields(
     source: &Source,
+    scope: usize,
     fields: &[Field],
     rendered: &Rendered,
     path: &str,
@@ -1839,7 +1976,7 @@ fn check_rendered_fields(
         if !reached {
             continue;
         }
-        for field_type in held(source, &field.type_tokens, aliases) {
+        for field_type in held(source, &field.type_tokens, scope, aliases) {
             let Some(field_type) = field_type else {
                 find(
                     field.line,
@@ -1983,8 +2120,8 @@ impl Drop for Scratch {
 }
 
 /// The claims and the errors every control can use, in the files the rule names.
-const SHOWN_CONTROL: &str =
-    "pub struct Named;\nimpl Plain for Named {}\nplain!(u64, &'static str);\n";
+const SHOWN_CONTROL: &str = "pub struct Named;\nimpl Plain for Named {}\n\
+                             plain!(u64, &'static str, kr_protocol::scalars::Uuid);\n";
 const ERRORS_CONTROL: &str = "#[derive(thiserror::Error)]\npub enum CliError {\n    \
                               #[error(\"refused\")]\n    Refused,\n}\n\
                               kr_client::debug_as_display!(CliError);\n";
@@ -2135,13 +2272,13 @@ fn each_break_of_the_rule_is_named_with_its_class_and_place() {
             "a type a macro defines",
             "macro_rules! failure {\n    ($name:ident) => { pub struct $name(String); };\n}\n",
             1,
-            "a macro that defines a type or writes an impl",
+            "a macro, which can define a type or write an impl",
         ),
         (
             "an impl a macro writes",
-            "macro_rules! shows {\n    ($trait:path, $name:ident) => { impl $trait for $name { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(\"x\") } } };\n}\n",
+            "macro_rules! shows {\n    ($keyword:ident $trait:path, $name:ident) => { $keyword $trait for $name { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(\"x\") } } };\n}\n",
             1,
-            "a macro that defines a type or writes an impl",
+            "a macro, which can define a type or write an impl",
         ),
         (
             "an item that compiles on some platform without test",
@@ -2168,6 +2305,48 @@ fn each_break_of_the_rule_is_named_with_its_class_and_place() {
             "included source this reading cannot follow",
         ),
         (
+            "a renamed protocol error",
+            "use kr_protocol::error::ProtocolError as Refusal;\nfn f(text: String) {\n    let _ = Refusal::new(ErrorCode::Internal, text);\n}\n",
+            1,
+            "a renamed import this reading cannot follow",
+        ),
+        (
+            "a renamed output macro",
+            "use std::eprintln as say;\nfn f(text: &str) {\n    say!(\"{text}\");\n}\n",
+            1,
+            "a renamed import this reading cannot follow",
+        ),
+        (
+            "a path under cfg_attr",
+            "#[cfg_attr(all(), path = \"other.rs\")]\nmod item;\n",
+            1,
+            "an attribute under cfg_attr",
+        ),
+        (
+            "an #[error] under cfg_attr",
+            "#[derive(thiserror::Error)]\npub enum Failure {\n    #[cfg_attr(all(), error(\"{0}\"))]\n    Failed(String),\n}\nkr_client::debug_as_display!(Failure);\n",
+            3,
+            "an attribute under cfg_attr",
+        ),
+        (
+            "a derive that writes a Display",
+            "#[derive(Clone, derive_more::Display)]\npub struct Shows(String);\n",
+            1,
+            "a derive this reading does not know",
+        ),
+        (
+            "an expect called by its path",
+            "fn f(input: String) {\n    Result::expect(Err::<(), _>(std::io::Error::other(input)), \"read\");\n}\n",
+            2,
+            "an unwrap or expect",
+        ),
+        (
+            "a name placed in another module's scope",
+            "mod first {\n    use kr_protocol::scalars::Uuid;\n}\nmod second {\n    pub type Uuid = String;\n    #[derive(thiserror::Error)]\n    pub enum Failure {\n        #[error(\"failed: {0}\")]\n        Failed(Uuid),\n    }\n    kr_client::debug_as_display!(Failure);\n}\n",
+            9,
+            "error field of type kr_cli::control::second::Uuid",
+        ),
+        (
             "an error whose Debug is not its Display",
             "#[derive(thiserror::Error)]\npub enum Failure {\n    #[error(\"failed\")]\n    Failed,\n}\n",
             0,
@@ -2175,7 +2354,7 @@ fn each_break_of_the_rule_is_named_with_its_class_and_place() {
         ),
     ];
     for (position, (class, text, line, what)) in cases.iter().enumerate() {
-        let findings = if text.contains("mod moved;") {
+        let findings = if text.contains("mod moved;") || text.contains("mod item;") {
             // A module whose file is named elsewhere has no conventional file, and the reading
             // says so before anything else.
             let scratch = Scratch::new(
@@ -2184,6 +2363,7 @@ fn each_break_of_the_rule_is_named_with_its_class_and_place() {
                     ("lib.rs", "mod control;\n"),
                     ("control.rs", text),
                     ("control/moved.rs", ""),
+                    ("control/item.rs", ""),
                 ],
             );
             let sources = scratch.sources().expect("the control is readable");
