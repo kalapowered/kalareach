@@ -13274,4 +13274,92 @@ mod one_barrier_for_every_restriction {
         assert_eq!(revision(&controller).await, before + 3);
         drop(controller);
     }
+
+    /// A configuration acceptance whose ceiling could not move owes no fence of its own, so it
+    /// never creates a debt for one. It fences because another change's debt is published; when a
+    /// barrier captures that debt while the acceptance waits for the registry, the acceptance
+    /// captures nothing and reports that barrier, and the revision advances once.
+    ///
+    /// On one thread, so the order is exact: the other barrier waits for the registry first, the
+    /// acceptance decides to fence and waits behind it, and only then is the registry let go.
+    #[tokio::test]
+    async fn an_acceptance_whose_ceiling_could_not_move_fences_under_no_debt_of_its_own() {
+        use kr_protocol::hostinfo::configuration::{Change, ConfigurationDocument};
+        use kr_protocol::rights::ActionRight;
+
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = super::a_floor_owed_its_record::daemon(&temp).await;
+        controller
+            .apply_configuration(&Change::GrantRights(Some(vec![
+                ActionRight::SessionView.as_str().to_owned(),
+                ActionRight::SessionRename.as_str().to_owned(),
+            ])))
+            .await
+            .expect("a ceiling this host accepts");
+        let before = revision(&controller).await;
+        let registry = beside(&temp);
+        registry
+            .execute_batch(
+                "CREATE TRIGGER refuse_debt BEFORE INSERT ON fence_debt
+                 BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+            )
+            .expect("no debt can be written");
+        // Another change's debt, published and not yet captured.
+        let other = crate::grants::store::DebtId::fresh();
+        controller.publish_debts(&[(other, Reach::Host)]);
+        let mut narrowed = ConfigurationDocument::empty();
+        narrowed.revision = 3;
+        narrowed.ceilings.grant_rights = kr_protocol::scalars::Nullable::some(vec![
+            ActionRight::SessionView.as_str().to_owned(),
+        ]);
+        let path = kr_worker::config::document_path(&temp.environment());
+        kr_ipc::paths::write_owner_only_file(
+            &path,
+            kr_protocol::hostinfo::configuration::contents(&narrowed).as_bytes(),
+        )
+        .expect("the narrowed document");
+
+        let held = controller.registry.lock().await;
+        let capture = tokio::spawn({
+            let controller = Arc::clone(&controller);
+            async move { controller.raise_owed_barrier().await }
+        });
+        tokio::task::yield_now().await;
+        let acceptance = tokio::spawn({
+            let controller = Arc::clone(&controller);
+            async move { controller.accept_configuration().await }
+        });
+        tokio::task::yield_now().await;
+        drop(held);
+        let captured = capture
+            .await
+            .expect("the barrier runs")
+            .expect("it is raised")
+            .expect("it captured the other change's debt");
+        let accepted = acceptance.await.expect("the acceptance runs");
+
+        assert!(
+            accepted
+                .not_in_force
+                .as_ref()
+                .is_some_and(|problem| problem.as_str().contains("did not change")),
+            "the ceiling could not move: {:?}",
+            accepted.not_in_force
+        );
+        assert_eq!(
+            accepted
+                .barrier
+                .as_ref()
+                .map(|barrier| barrier.authority_revision),
+            Some(captured.authority_revision),
+            "the acceptance fenced, and reports the barrier that captured the published debt"
+        );
+        assert_eq!(
+            revision(&controller).await,
+            before + 1,
+            "one barrier: the acceptance created no debt of its own"
+        );
+        controller.check_fence().expect("and nothing is left owed");
+        drop(controller);
+    }
 }
