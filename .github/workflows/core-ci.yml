@@ -265,9 +265,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes gnome-keyring dbus-x11
 
-      # The one test that writes to this machine's own credential store. It does nothing until a run
-      # says it may, because on a person's machine that store is their login keyring, so the switch
-      # is set here and on no other step.
+      # The one test that writes to this machine's own credential store. An ordinary run leaves it
+      # out as ignored, and it fails before it writes unless the run sets the switch that says it
+      # may, because on a person's machine that store is their login keyring, so it runs here with
+      # --ignored and the switch is set here and on no other step.
       #
       # The store lives for this step and nowhere else. `dbus-run-session` gives the command a
       # session bus of its own and ends it when the command returns; the keyring is made under a
@@ -309,7 +310,7 @@ jobs:
               echo "no credential store answered on this session bus" >&2
               exit 1
             fi
-            cargo test --locked -p kr-client --lib -- --nocapture --exact \
+            cargo test --locked -p kr-client --lib -- --nocapture --ignored --exact \
               sync::keys::tests::a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again
           '
 
@@ -556,14 +557,15 @@ jobs:
 
       # A collection key belongs in the operating system's own credential store, and on this system
       # that is the Credential Manager, which this runner's account already has. The one test that
-      # writes to it does nothing until a run says it may, because on a person's machine that store
-      # holds their own credentials, so the switch is set here and on no other step. What the test
-      # writes is named for the run and taken away before the test finishes.
+      # writes to it is ignored in an ordinary run and fails before it writes unless the run sets
+      # the switch that says it may, because on a person's machine that store holds their own
+      # credentials, so it runs here with --ignored and the switch is set here and on no other
+      # step. What the test writes is named for the run and taken away before the test finishes.
       - name: A collection key is kept in this runner's credential store
         if: ${{ !cancelled() }}
         env:
           KR_TEST_PLATFORM_SECRET_STORE: "1"
-        run: cargo test --locked -p kr-client --lib -- --nocapture --exact sync::keys::tests::a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again
+        run: cargo test --locked -p kr-client --lib -- --nocapture --ignored --exact sync::keys::tests::a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again
 
       # The other Windows target the product ships on. Nothing is executed for it here; this is
       # the compile the release baseline asks for.
@@ -798,18 +800,19 @@ jobs:
         run: cargo test --locked -p companion-tauri -p kr-client
 
       # A collection key belongs in the operating system's own credential store, and on this system
-      # that is the login keychain. The one test that writes to it does nothing until a run says it
-      # may, because on a person's machine that keychain is their own, so the switch is set here and
-      # on no other step. What the test writes is named for the run and taken away before the test
-      # finishes. The step above ran the same suite with the switch unset, where this test prints
-      # why it did nothing. The Linux half of this matrix has the Secret Service leg in the job that
-      # starts a bus for it, so this step is this platform's alone.
+      # that is the login keychain. The one test that writes to it is ignored in an ordinary run and
+      # fails before it writes unless the run sets the switch that says it may, because on a
+      # person's machine that keychain is their own, so it runs here with --ignored and the switch
+      # is set here and on no other step. What the test writes is named for the run and taken away
+      # before the test finishes. The step above ran the same suite, where this test is ignored.
+      # The Linux half of this matrix has the Secret Service leg in the job that starts a bus for
+      # it, so this step is this platform's alone.
       - name: A collection key is kept in this runner's credential store
         if: ${{ !cancelled() && runner.os == 'macOS' }}
         env:
           KR_TEST_PLATFORM_SECRET_STORE: "1"
         run: |
-          cargo test --locked -p kr-client --lib -- --nocapture --exact \
+          cargo test --locked -p kr-client --lib -- --nocapture --ignored --exact \
             sync::keys::tests::a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again
 
       - name: Install the browsers the end-to-end run drives
@@ -1034,8 +1037,6 @@ jobs:
       #   nothing without one. The rust job runs each leg against the deployment it names.
       # - The container cases, which need podman, and this runner has none. The rust job's runner
       #   has it, and its test step runs them.
-      # - The case that writes to the platform's credential store, which does nothing without its
-      #   switch. The companion job's macOS leg runs it with the switch set.
       # - The two cases that launch a built shell package, which do nothing unless
       #   KR_SHELL_PACKAGES names one, and this job builds none. The shell-packages job builds the
       #   packages and drives them through the contract and qualification suites; these two cases
@@ -1055,7 +1056,6 @@ jobs:
           --skip the_argument_vector_reaches_the_container_exactly_as_it_was_built
           --skip a_helper_path_with_a_space_in_it_is_one_argument_inside_the_container
           --skip a_refresh_that_reached_a_running_environment_without_a_helper_scopes_no_channel
-          --skip a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again
           --skip the_built_packages_are_qualified_where_this_run_has_them
           --skip a_real_qualified_package_registers_and_qualifies_on_this_hosts_endpoint
           --skip a_repository_whose_own_data_is_on_another_filesystem_is_captured
