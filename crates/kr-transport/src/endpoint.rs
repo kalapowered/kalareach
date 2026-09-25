@@ -504,10 +504,7 @@ impl Refusals {
     ///
     /// A refused upgrade counts only while the status shows it. The status reports the latest
     /// state and can pass over the states between two readings, so a relay seen refusing the
-    /// upgrade and then seen being dialled again may have been reached in between. That is true of
-    /// a relay's own refusal as well, but a relay's refusal is its lasting answer to the
-    /// credentials iroh presents again on every attempt, while a network that refused one upgrade
-    /// can let the next one through.
+    /// upgrade and then seen being dialled again may have been reached in between.
     fn observe(&mut self, snapshot: impl IntoIterator<Item = RelayObservation>) {
         let mut reported = BTreeSet::new();
         for observation in snapshot {
