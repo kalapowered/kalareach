@@ -479,6 +479,8 @@ struct Idle {
     resident: u64,
 }
 
+/// KR-PERF-003: idle local terminal resources, the daemon and twenty idle sessions' workers and root
+/// shells together, resident memory and processor use averaged over five minutes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "runs for five minutes by design; scripts/performance.sh runs it"]
 async fn idle_resources_for_twenty_sessions_and_thirty_two_views() {
@@ -645,6 +647,8 @@ async fn idle(host: &Host, owned: &mut Owned) -> Result<Idle, String> {
     Ok(Idle { cores, resident })
 }
 
+/// KR-PERF-004: a local attach to a warm worker, from the connection to the first usable screen of
+/// a 120x40 session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "a measurement rather than a test; scripts/performance.sh runs it"]
 async fn attach_to_a_usable_screen() {
