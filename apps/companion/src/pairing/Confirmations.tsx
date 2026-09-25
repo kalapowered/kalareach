@@ -61,23 +61,30 @@ export function useConfirmations(): OwnerView | null {
   const [view, setView] = useState<OwnerView | null>(null)
   useEffect(() => {
     let watching = true
-    // An event is newer than the first read, so a read that answers after one is let go.
+    let stop: (() => void) | null = null
+    // The requests are read once the listener is registered, so none can fall between the two.
+    // An event heard before the read answers is at least as new, so the read is let go then.
     let heard = false
     port
-      .ownerConfirmations()
-      .then((current) => {
+      .onConfirmations((next) => {
+        heard = true
+        if (watching) setView(next)
+      })
+      .then(async (unlisten) => {
+        if (!watching) {
+          unlisten()
+          return
+        }
+        stop = unlisten
+        const current = await port.ownerConfirmations()
         if (watching && !heard) setView(current)
       })
       .catch(() => {
         // A computer that cannot pair has no confirmations to show.
       })
-    const stop = port.onConfirmations((next) => {
-      heard = true
-      setView(next)
-    })
     return () => {
       watching = false
-      stop()
+      stop?.()
     }
   }, [port])
   return view

@@ -266,6 +266,12 @@ export interface FakeHostControls {
   setReviewOutcome(outcome: ReviewOutcome): void
   /** The references the page asked to review, in order. */
   readonly reviewed: string[]
+  /**
+   * Holds every pairing and confirmations listener the page registers from now on, as the desktop
+   * shell's registration does until it completes: nothing published meanwhile reaches it. Returns
+   * the function that completes the registrations.
+   */
+  holdRegistrations(): () => void
 }
 
 /** The fake host, and the controls a test drives it with. */
@@ -300,6 +306,18 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
   }
   let reviewOutcome: ReviewOutcome = 'confirmed'
   const reviewed: string[] = []
+  let registering: Promise<void> = Promise.resolve()
+  /** Adds `listener` to `set` once registration completes, and resolves then with its stop. */
+  const register = <T,>(
+    set: Set<(value: T) => void>,
+    listener: (value: T) => void
+  ): Promise<() => void> =>
+    registering.then(() => {
+      set.add(listener)
+      return () => {
+        set.delete(listener)
+      }
+    })
   const listeners = new Set<(event: HostEvent) => void>()
   const dropListeners = new Set<(files: readonly DroppedFile[]) => void>()
   const savedExports: Written[] = []
@@ -669,12 +687,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       publishPairing({ invitation: null, state: { state: 'idle' } })
       return Promise.resolve()
     },
-    onPairing: (listener) => {
-      pairingListeners.add(listener)
-      return () => {
-        pairingListeners.delete(listener)
-      }
-    },
+    onPairing: (listener) => register(pairingListeners, listener),
     ownerConfirmations: () => Promise.resolve(owner),
     ownerConfirmationReview: (reference) => {
       reviewed.push(reference)
@@ -687,12 +700,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       }
       return Promise.resolve(outcome)
     },
-    onConfirmations: (listener) => {
-      ownerListeners.add(listener)
-      return () => {
-        ownerListeners.delete(listener)
-      }
-    },
+    onConfirmations: (listener) => register(ownerListeners, listener),
 
     openExternal: (url) => {
       if (!url.startsWith('https://') && !url.startsWith('mailto:')) {
@@ -1088,7 +1096,17 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     setReviewOutcome(outcome) {
       reviewOutcome = outcome
     },
-    reviewed
+    reviewed,
+    holdRegistrations() {
+      let complete = () => {}
+      registering = new Promise((resolve) => {
+        complete = resolve
+      })
+      return () => {
+        complete()
+        registering = Promise.resolve()
+      }
+    }
   }
 
   return { port, controls }
