@@ -12,6 +12,8 @@ use std::path::Path;
 
 use kr_shell_integration::contract::qualification::{DetachExclusion, ShellKind};
 
+use super::told;
+
 /// The flag a reader raises while it waits inside an operation of the person's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PendingFlag {
@@ -128,23 +130,32 @@ pub fn print_assembled(kind: ShellKind, marker: &str) -> String {
 /// The child probe: the same package started as a child of the managed root shell.
 #[must_use]
 pub fn child_probe(kind: ShellKind, executable: &Path) -> String {
+    let executable = told(executable);
     match kind {
         // The word the caller waits for is put together by the child out of pieces, so it reaches
         // the screen because the child ran and printed it rather than because the line that
         // started it was echoed back.
         ShellKind::PowerShell => format!(
-            "& '{}' -NoLogo -NoProfile -Command 'if ($env:KR_SHELL_BRIDGE) {{ \"kr-child=\" + \"[$env:KR_SHELL_BRIDGE]\" }} else {{ \"kr-child=\" + \"[unset]\" }}'",
-            executable.display()
+            "& '{executable}' -NoLogo -NoProfile -Command 'if ($env:KR_SHELL_BRIDGE) {{ \"kr-child=\" + \"[$env:KR_SHELL_BRIDGE]\" }} else {{ \"kr-child=\" + \"[unset]\" }}'"
         ),
         ShellKind::Fish => format!(
-            "{} -c 'echo kr-child=[(set -q KR_SHELL_BRIDGE; and echo $KR_SHELL_BRIDGE; or echo unset)]'",
-            executable.display()
+            "{executable} -c 'echo kr-child=[(set -q KR_SHELL_BRIDGE; and echo $KR_SHELL_BRIDGE; or echo unset)]'"
         ),
-        _ => format!(
-            "{} -c 'echo kr-child=[${{KR_SHELL_BRIDGE:-unset}}]'",
-            executable.display()
-        ),
+        _ => format!("{executable} -c 'echo kr-child=[${{KR_SHELL_BRIDGE:-unset}}]'"),
     }
+}
+
+/// A child probe for an executable whose path is not text is refused by name, rather than typed at
+/// the shell as a lossy copy that names another file.
+#[test]
+#[should_panic(expected = "is not UTF-8, so no shell can be told it")]
+fn a_child_probe_for_a_path_that_is_not_text_is_refused_rather_than_typed_as_another() {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let executable = std::path::PathBuf::from(std::ffi::OsString::from_vec(
+        b"/tmp/kr-shell-\xff/bin/zsh".to_vec(),
+    ));
+    let _ = child_probe(ShellKind::Zsh, &executable);
 }
 
 /// Everything this package's shell is told.

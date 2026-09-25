@@ -859,25 +859,7 @@ impl CaseSetup {
             std::fs::write(&destination, entry).expect("the startup entry");
         }
 
-        let mut environment = vec![
-            ("HOME".to_owned(), home.display().to_string()),
-            ("ZDOTDIR".to_owned(), home.display().to_string()),
-            (
-                "XDG_CONFIG_HOME".to_owned(),
-                home.join(".config").display().to_string(),
-            ),
-            (
-                "XDG_DATA_HOME".to_owned(),
-                home.join(".local/share").display().to_string(),
-            ),
-            (
-                "XDG_CACHE_HOME".to_owned(),
-                home.join(".cache").display().to_string(),
-            ),
-            ("KR_TEST_ORDER".to_owned(), order.display().to_string()),
-            ("TERM".to_owned(), "xterm-256color".to_owned()),
-            ("LANG".to_owned(), "C".to_owned()),
-        ];
+        let mut environment = home_environment(&home, &order);
         for id in &case.requires {
             let stack = stacks
                 .get(id)
@@ -939,6 +921,34 @@ impl CaseSetup {
     }
 }
 
+/// What a case's shell is told about its home and its order record, each path as the text a shell
+/// is told for it ([`told`]), so a path that is not text is refused rather than given as another.
+fn home_environment(home: &Path, order: &Path) -> Vec<(String, String)> {
+    vec![
+        ("HOME".to_owned(), told(home)),
+        ("ZDOTDIR".to_owned(), told(home)),
+        ("XDG_CONFIG_HOME".to_owned(), told(&home.join(".config"))),
+        ("XDG_DATA_HOME".to_owned(), told(&home.join(".local/share"))),
+        ("XDG_CACHE_HOME".to_owned(), told(&home.join(".cache"))),
+        ("KR_TEST_ORDER".to_owned(), told(order)),
+        ("TERM".to_owned(), "xterm-256color".to_owned()),
+        ("LANG".to_owned(), "C".to_owned()),
+    ]
+}
+
+/// A case home whose path is not text is refused by name, rather than given to the shell as a
+/// lossy copy that names another directory.
+#[test]
+#[should_panic(expected = "is not UTF-8, so no shell can be told it")]
+fn a_case_home_that_is_not_text_is_refused_rather_than_given_as_another() {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let home = PathBuf::from(std::ffi::OsString::from_vec(
+        b"/tmp/kr-qualification-\xff/home".to_vec(),
+    ));
+    let _ = home_environment(&home, &home.join("order"));
+}
+
 /// Joins a path a case named to the home, refusing one that climbs out of it.
 fn home_path(home: &Path, relative: &str) -> PathBuf {
     let path = Path::new(relative);
@@ -974,7 +984,7 @@ fn declared_package(
     let text = |value: &serde_json::Value| value.as_str().unwrap_or_default().to_owned();
     PackageDeclaration {
         kind: package.kind,
-        executable: package.executable.display().to_string(),
+        executable: told(&package.executable),
         upstream_version: text(&shell["upstream_version"]),
         editor_abi: text(&shell["editor_abi"]),
         integration_version: text(&shell["integration_version"]),

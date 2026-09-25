@@ -253,7 +253,7 @@ pub fn the_handshake_declares_the_packaged_reader(kind: ShellKind) {
     assert_eq!(hello.abi, BridgeAbi::qualified(kind));
     assert_eq!(
         hello.shell.executable,
-        package.executable.to_string_lossy(),
+        told(&package.executable),
         "the package names the executable it was launched as"
     );
     assert_eq!(
