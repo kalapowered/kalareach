@@ -27,7 +27,7 @@ it arrived under when it arrived under one. See [Rights and capabilities are not
 thing](README.md#rights-and-capabilities-are-not-the-same-thing).
 
 **Attachment ordinal** (`attachment_ordinal`). The order in which attachments joined a session,
-which decides who owns the terminal's size next when its owner leaves.
+which decides who owns the terminal's size next when its owner leaves or withdraws its claim.
 
 **Capability** (`capability_id`, `capability_revision`). What a binding can currently do, with the
 evidence for it. Capability evidence never creates authority: a right is what a grant permits.
@@ -79,8 +79,8 @@ control daemon, registry and directories.
 See [Envelopes](README.md#envelopes).
 
 **Geometry owner.** The attachment that decides the pseudo-terminal's size. By default it is the
-first authorised attachment that claims it; ownership passes by explicit transfer or, when the
-owner leaves, in attachment order.
+first authorised attachment that claims it; ownership passes by explicit transfer, or, when the
+owner leaves or withdraws its claim, to the oldest remaining claim in attachment order.
 
 **Grant** (`grant_id`). A host-issued authority object: which rights, over which resources, for how
 long, and how much history. A delegated grant is never wider than the grant it came from. See
