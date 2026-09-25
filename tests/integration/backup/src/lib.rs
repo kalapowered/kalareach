@@ -261,8 +261,11 @@ impl Watched {
                     never_ran: data["never_ran"] == true,
                 });
             }
+        } else if value["error"]["code"] == "KEY_EPOCH_RETIRED" {
+            // The one refusal that names a place, a key record's revision, has to name its
+            // history as well.
+            self.hold(member, value["error"].get("recovery_id"));
         } else if let Some(named) = value["error"].get("recovery_id") {
-            // A refusal that names a place names its history too.
             self.hold(member, Some(named));
         }
     }
@@ -298,6 +301,12 @@ impl ServiceHttp for Watched {
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         Box::pin(async move {
             let member = self.note(body);
+            if member.is_none() {
+                self.wrong(
+                    "a request this transport could not read, so its answer went unchecked"
+                        .to_owned(),
+                );
+            }
             let answer = self.inner.post_json(url, body, headers).await;
             if let (Some(member), Ok(answer)) = (&member, &answer) {
                 self.check(member, answer);
@@ -454,11 +463,16 @@ impl RunDirectory {
     ///
     /// Panics when the file cannot be written.
     pub fn write(&self, name: &str, value: &serde_json::Value) {
-        std::fs::write(
-            self.path(name),
-            serde_json::to_vec_pretty(value).expect("a JSON value"),
-        )
-        .expect("written");
+        use std::io::Write as _;
+        // Readable by this account alone: a phase can hand the next one a printed kit, which holds
+        // a seed, even one made for the run.
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(self.path(name)).expect("the file");
+        file.write_all(&serde_json::to_vec_pretty(value).expect("a JSON value"))
+            .expect("written");
     }
 
     /// Reads one value an earlier phase wrote.
@@ -496,4 +510,124 @@ pub fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A service that answers every request with one answer.
+    #[derive(Debug)]
+    struct Answering(serde_json::Value);
+
+    impl ServiceHttp for Answering {
+        fn post_json<'a>(
+            &'a self,
+            _url: &'a str,
+            _body: &'a [u8],
+            _headers: &'a [(&'a str, &'a str)],
+        ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+            let body = serde_json::to_vec(&self.0).expect("an answer");
+            Box::pin(std::future::ready(Ok(ServiceHttpAnswer {
+                status: 200,
+                body,
+            })))
+        }
+    }
+
+    fn recovery(byte: u8) -> SyncRecoveryId {
+        SyncRecoveryId::new(kr_protocol::scalars::Uuid::from_bytes([byte; 16]))
+    }
+
+    /// What a transport expecting `expected` makes of one `member` request answered with `answer`.
+    async fn watched(
+        expected: Option<SyncRecoveryId>,
+        member: &str,
+        answer: serde_json::Value,
+    ) -> (usize, Vec<String>) {
+        let watched = Watched::new(Arc::new(Answering(answer)), expected);
+        let request = serde_json::json!({ "body": { member: { "collection_id": "c" } } });
+        let body = serde_json::to_vec(&request).expect("a request");
+        watched
+            .post_json("http://127.0.0.1:1/api/sync", &body, &[])
+            .await
+            .expect("answered");
+        let wrong = watched.wrong.lock().expect("the findings").clone();
+        (watched.named(), wrong)
+    }
+
+    fn data(recovery: Option<serde_json::Value>) -> serde_json::Value {
+        let mut data = serde_json::json!({ "state": "written" });
+        if let Some(recovery) = recovery {
+            data["recovery_id"] = recovery;
+        }
+        serde_json::json!({ "ok": true, "data": data })
+    }
+
+    #[tokio::test]
+    async fn a_null_history_is_named_where_none_was_ever_put_back() {
+        let (named, wrong) = watched(None, "exchange", data(Some(serde_json::Value::Null))).await;
+        assert_eq!((named, wrong.len()), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn an_answer_missing_its_history_is_told_from_one_naming_none() {
+        let (named, wrong) = watched(None, "exchange", data(None)).await;
+        assert_eq!(named, 0);
+        assert_eq!(wrong, ["a exchange answer named no history"]);
+    }
+
+    #[tokio::test]
+    async fn the_recovery_expected_is_named_and_any_other_is_not() {
+        let expected = recovery(1);
+        let right = data(Some(expected.get().to_string().into()));
+        assert_eq!(watched(Some(expected), "status", right.clone()).await.0, 1);
+        let other = data(Some(recovery(2).get().to_string().into()));
+        assert_eq!(watched(Some(expected), "status", other).await.1.len(), 1);
+        // A null where a recovery is expected is a deployment that forgot it was put back.
+        let none = data(Some(serde_json::Value::Null));
+        assert_eq!(watched(Some(expected), "fence", none).await.1.len(), 1);
+        // And a recovery where none is expected is a deployment that was put back after all.
+        assert_eq!(watched(None, "compare", right).await.1.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_retired_epoch_names_its_history_and_other_refusals_need_not() {
+        let retired = |recovery: Option<serde_json::Value>| {
+            let mut error = serde_json::json!({ "code": "KEY_EPOCH_RETIRED", "key_epoch": "1" });
+            if let Some(recovery) = recovery {
+                error["recovery_id"] = recovery;
+            }
+            serde_json::json!({ "ok": false, "error": error })
+        };
+        assert_eq!(
+            watched(None, "exchange", retired(Some(serde_json::Value::Null))).await,
+            (1, Vec::new())
+        );
+        assert_eq!(watched(None, "exchange", retired(None)).await.1.len(), 1);
+        let absent = serde_json::json!({ "ok": false, "error": { "code": "COLLECTION_ABSENT" } });
+        assert_eq!(watched(None, "keys", absent).await, (0, Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn a_listing_names_each_entrys_history_and_a_resolution_names_none() {
+        let listing = serde_json::json!({ "ok": true, "data": { "memberships": [
+            { "recovery_id": null }, { "recovery_id": null }
+        ] } });
+        assert_eq!(watched(None, "memberships", listing).await, (2, Vec::new()));
+        let short = serde_json::json!({ "ok": true, "data": { "memberships": [ {} ] } });
+        assert_eq!(watched(None, "memberships", short).await.1.len(), 1);
+        let resolved = serde_json::json!({ "ok": true, "data": { "dropped": "1" } });
+        assert_eq!(watched(None, "resolve", resolved).await, (0, Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn a_request_the_transport_cannot_read_is_a_finding() {
+        let watched = Watched::new(Arc::new(Answering(data(None))), None);
+        watched
+            .post_json("http://127.0.0.1:1/api/sync", b"not json", &[])
+            .await
+            .expect("answered");
+        assert_eq!(watched.wrong.lock().expect("the findings").len(), 1);
+    }
 }
