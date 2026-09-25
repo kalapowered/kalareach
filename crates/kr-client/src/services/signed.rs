@@ -410,14 +410,25 @@ fn plain_message(code: &str, message: String) -> String {
 /// says the answer is not the service's own. Inside `data` and `error` the members are each
 /// adapter's to read, and a member it does not read is one a newer service may add.
 fn answer_of(answer: &ServiceHttpAnswer) -> Result<Answer> {
+    /// The two members beside `ok` are each absent (`None`) or present, and a present one may be
+    /// `null` (`Some(None)`), so a member that is there with nothing in it is still there.
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Envelope {
         ok: bool,
-        #[serde(default)]
-        data: Option<serde_json::Value>,
-        #[serde(default)]
-        error: Option<Named>,
+        #[serde(default, deserialize_with = "present")]
+        data: Option<Option<serde_json::Value>>,
+        #[serde(default, deserialize_with = "present")]
+        error: Option<Option<Named>>,
+    }
+
+    /// Reads a member that is there, `null` included.
+    fn present<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+        T: Deserialize<'de>,
+    {
+        T::deserialize(deserializer).map(Some)
     }
 
     /// The members every refusal carries, read directly: a field named twice is refused here.
@@ -446,6 +457,7 @@ fn answer_of(answer: &ServiceHttpAnswer) -> Result<Answer> {
         }
         return envelope
             .data
+            .flatten()
             .map(Answer::Data)
             .ok_or_else(|| unreadable(answer.status, "its answer carries no data"));
     }
@@ -453,7 +465,7 @@ fn answer_of(answer: &ServiceHttpAnswer) -> Result<Answer> {
     if envelope.data.is_some() {
         return Err(unreadable(answer.status, "its refusal carries data"));
     }
-    let Some(named) = envelope.error else {
+    let Some(named) = envelope.error.flatten() else {
         return Err(unreadable(answer.status, "its refusal names no error"));
     };
     Ok(Answer::Refused(Refusal {
@@ -787,6 +799,17 @@ mod tests {
                 403,
                 r#"{"ok":false,"error":{"code":"FORBIDDEN","message":"no"},"data":{"note":"x"}}"#,
                 ErrorCode::HostNotConfigured,
+            ),
+            // A member that is there with nothing in it is there all the same.
+            (
+                200,
+                r#"{"ok":true,"data":{},"error":null}"#,
+                ErrorCode::OutcomeUnknown,
+            ),
+            (
+                429,
+                r#"{"ok":false,"error":{"code":"RATE_LIMITED","message":"wait"},"data":null}"#,
+                ErrorCode::UpstreamUnavailable,
             ),
         ] {
             let error = answer_of(&ServiceHttpAnswer {
