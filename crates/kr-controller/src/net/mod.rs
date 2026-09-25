@@ -1797,9 +1797,7 @@ pub(super) mod tests {
         temp: &kr_ipc::testing::TempHost,
         boot_identity: kr_protocol::identity::BootIdentity,
     ) -> Arc<Controller> {
-        Controller::start(setup(temp, boot_identity))
-            .await
-            .expect("the daemon starts")
+        started(|| Controller::start(setup(temp, boot_identity.clone()))).await
     }
 
     /// Starts a daemon as [`daemon`] does, on clocks this test moves by hand.
@@ -1807,15 +1805,44 @@ pub(super) mod tests {
         temp: &kr_ipc::testing::TempHost,
         clocks: crate::service::Clocks,
     ) -> Arc<Controller> {
-        Controller::start_on_clocks(
-            setup(
-                temp,
-                kr_ipc::identity::boot_identity().expect("a boot identity"),
-            ),
-            clocks,
-        )
+        started(|| {
+            Controller::start_on_clocks(
+                setup(
+                    temp,
+                    kr_ipc::identity::boot_identity().expect("a boot identity"),
+                ),
+                clocks.clone(),
+            )
+        })
         .await
-        .expect("the daemon starts")
+    }
+
+    /// How long a daemon is given to take over an environment a daemon before it held.
+    ///
+    /// A daemon lets go of its environment once nothing of it is left, and its own tasks can still
+    /// hold it for a moment after the test has let it go: one asking its registry a question, or
+    /// reading its clocks. A replacement started at once can therefore find the environment held.
+    /// That is a liveness condition: what these tests assert is that the replacement takes the
+    /// environment over, not how soon the last reference goes.
+    const ENVIRONMENT_HANDOVER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Starts a daemon with `start`, and again while a daemon this test let go still holds the
+    /// environment, until [`ENVIRONMENT_HANDOVER_DEADLINE`]. Any other failure fails the test.
+    async fn started<F, S>(start: F) -> Arc<Controller>
+    where
+        F: Fn() -> S,
+        S: std::future::Future<Output = crate::error::Result<Arc<Controller>>>,
+    {
+        let begun = std::time::Instant::now();
+        loop {
+            match start().await {
+                Ok(controller) => return controller,
+                Err(crate::error::ControllerError::AlreadyRunning { .. })
+                    if begun.elapsed() < ENVIRONMENT_HANDOVER_DEADLINE => {}
+                Err(error) => panic!("the daemon starts: {error}"),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     /// Clocks this test moves by hand: a continuous clock, and a wall clock that reads what the
