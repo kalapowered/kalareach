@@ -235,15 +235,15 @@ Three properties make an installation safe to undo:
   first write, so a refusal leaves the agent's tree exactly as it found it.
 * **Other settings survive.** A TOML configuration is edited in place with a format-preserving
   editor, so ordering and comments are untouched. A JSON configuration is reparsed and rewritten:
-  every setting survives, and the document's key order and indentation are normalised. The
-  replacement keeps the permission bits of the document it replaces, because an agent's
+  every setting survives, and the document's key order and indentation are normalised. On macOS and
+  Linux the replacement keeps the permission bits of the document it replaces, because an agent's
   configuration can hold a credential. What it cannot keep, it will not take: a document protected
   by an access-control list beyond those bits is refused, by both installation and removal, before
   anything is written, with the advice to add or remove the server with the agent's own command.
   Reapplying such a list needs calls this host does not make, and somebody who restricted a file
   meant it. The same refusal covers a document whose directory hands out access to whatever is
-  created in it, because the replacement is a new file in that directory and would be given what
-  the document it replaces does not have. Where a platform will not answer the question at all, the
+  created in it, because the replacement is a new file in that directory and would be given what the
+  document it replaces does not have. Where a platform will not answer the question at all, the
   answer is not read as "no list": the document is refused.
 
 A directory the installation created is removed only when it is empty, and a directory that was
@@ -267,14 +267,21 @@ That contract rests on a change reaching the disk before the record that account
 rests in turn on making a directory's own entries durable: every change, and every write of the
 record, flushes the directory that names it before the next step begins.
 
-On Windows `kr skill install` and `kr skill remove` refuse before anything is changed, and say to
-add the server with the agent's own command; `kr skill status` still reports whatever is there.
-Every file an installation writes over, its own record included, is replaced by a new file renamed
-into place, and the access-control check above decides whether that replacement would change who
-can read it. This host reads access-control lists on macOS and Linux only. Windows gives every file
-a list, so there the check would refuse every replacement and an installation would stop part way
-through, once its record had been written; the host makes no change rather than one it would have
-to abandon.
+On Windows every file has an access-control list, and a replacement is a new file that gets its
+owner from this host and its lists from its directory. Before anything is written, an installation
+or a removal reads each configuration document it would rewrite and refuses one that belongs to
+another account, one whose list is protected from its directory, absent or empty, one with an entry
+somebody set on the file itself, and one that is encrypted or carries a control this host does not
+evaluate: a conditional entry, a resource attribute, a central access policy, a process trust label
+or an access filter. Windows marks which entries a file inherited only in a list it keeps in the
+automatically inherited form. A list written the older way, as some profiles have throughout, marks
+none, so an entry set on such a file is not seen at that point. The same is true of a directory
+whose list changed after the document inherited from it, and of a document moved in from another
+directory. The write itself refuses all three, because every file an installation writes over, its
+own record included, is compared with the copy about to take its place before anything is written
+into the copy: owner, both lists and the mandatory label, entry by entry. A copy that differs is
+removed, and the file keeps its contents and its access. An installation stopped there is recorded
+as unfinished, and `kr skill remove` undoes what it did.
 
 Each change is noted in the record before it happens and recorded after it, and the record is marked
 complete only when the last one is. An installation interrupted part way through is therefore not
