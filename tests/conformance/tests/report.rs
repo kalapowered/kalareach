@@ -201,6 +201,7 @@ fn a_call_a_macro_or_attribute_may_rewrite_move_or_rename_keys_nothing() {
         ("KR-REQ-03.42", "which no test is proved to call"),
         ("KR-REQ-03.43", "which no test is proved to call"),
         ("KR-REQ-03.44", "which a cfg may leave out of a build"),
+        ("KR-REQ-03.68", "which no test is proved to call"),
     ] {
         let row = identifier(row);
         assert!(
@@ -291,10 +292,19 @@ fn a_source_outside_the_conventions_is_a_problem_and_keys_no_helper() {
         &[
             ("tests/absent.rs:3", "module missing has no file"),
             (
+                "tests/absolute.rs:8",
+                "a `use` of `shared`, a keyed helper's name, that the reading does not follow",
+            ),
+            (
+                "tests/carrier/mod.rs:1",
+                "a `path` attribute inside a module's own file",
+            ),
+            (
                 "tests/aliased.rs:3",
                 "`println` is declared here as the name `as` gives",
             ),
             ("tests/chosen.rs:4", "a `cfg_attr` chooses"),
+            ("tests/innerchosen.rs:3", "a `cfg_attr` chooses"),
             (
                 "tests/elsewhere/deep.rs:2",
                 "`assert_eq` is declared here as a macro",
@@ -369,6 +379,10 @@ fn a_source_outside_the_conventions_is_a_problem_and_keys_no_helper() {
             (
                 "tests/loaded/neighbour.rs:2",
                 "`assert_eq` is declared here as a macro",
+            ),
+            (
+                "tests/moved/sub.rs:2",
+                "`println` is declared here as a macro",
             ),
             (
                 "tests/localcore.rs:3",
@@ -461,6 +475,10 @@ fn a_source_outside_the_conventions_is_a_problem_and_keys_no_helper() {
         "KR-REQ-03.61",
         "KR-REQ-03.62",
         "KR-REQ-03.63",
+        "KR-REQ-03.64",
+        "KR-REQ-03.65",
+        "KR-REQ-03.66",
+        "KR-REQ-03.67",
     ] {
         let row = identifier(row);
         assert!(
