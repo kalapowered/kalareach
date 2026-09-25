@@ -25,6 +25,11 @@ use kr_protocol::scalars::Digest256;
 /// How many times the identity of a file that changed while it was read is read again.
 const IDENTITY_ATTEMPTS: usize = 3;
 
+/// How many times the check that a process executes the hashed code is taken, when what it read
+/// changed while it was taken. Only a reading that held still decides.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const IMAGE_ATTEMPTS: usize = 3;
+
 /// A file's identity, as the kernel reports it for one opened file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FileIdentity {
@@ -277,6 +282,14 @@ pub type VerifiedFiles = Mutex<BTreeSet<FileIdentity>>;
 /// and passes when its digest is the one that was hashed. An upgrade that unlinks the running file
 /// changes its metadata and not its code, and passes; a rewrite of its code does not.
 ///
+/// The link is opened again after each reading. When it names another identity then (the process
+/// exec'd, or the file's metadata moved while it was read), the reading is taken again through the
+/// newly opened file, at most [`IMAGE_ATTEMPTS`] times, and only a reading that held still decides:
+/// an upgrade during a check passes by its content, and a process that exec'd other code is refused.
+///
+/// The check proves what the process executed when it was read. A process can exec after that and
+/// before its bridge is admitted; the next bridge is checked again.
+///
 /// # Errors
 ///
 /// Returns why the process does not execute it, or why that could not be established.
@@ -287,7 +300,44 @@ pub fn verify_image(
     verified: &VerifiedFiles,
     stop: &AtomicBool,
 ) -> Result<(), String> {
-    OpenedImage::open(process)?.check(process, identity, verified, stop)
+    verify_opening(process, identity, verified, stop, || {
+        OpenedImage::open(process)
+    })
+}
+
+/// The check of [`verify_image`], with the way the process's image is opened given, so a test can
+/// change the file between two openings.
+#[cfg(target_os = "linux")]
+fn verify_opening(
+    process: &ProcessStartIdentity,
+    identity: &ExecutableIdentity,
+    verified: &VerifiedFiles,
+    stop: &AtomicBool,
+    mut open: impl FnMut() -> Result<OpenedImage, String>,
+) -> Result<(), String> {
+    let mut opened = open()?;
+    for _ in 0..IMAGE_ATTEMPTS {
+        match opened.check(process, identity, verified, stop, &mut open)? {
+            Checked::Holds => return Ok(()),
+            Checked::Differs => return Err(other_code(process)),
+            Checked::Moved(now) => opened = now,
+        }
+    }
+    Err(format!(
+        "the image of process {} kept changing while it was checked",
+        process.pid
+    ))
+}
+
+/// What one reading of a process's image found.
+#[cfg(target_os = "linux")]
+enum Checked {
+    /// The process executes the hashed code, and the reading held still.
+    Holds,
+    /// It executes other code, and the reading held still.
+    Differs,
+    /// The link names another identity than the one read: the file it names now, to read again.
+    Moved(OpenedImage),
 }
 
 /// The file a process executes, opened through `/proc/<pid>/exe`, and its identity then.
@@ -316,22 +366,27 @@ impl OpenedImage {
         })
     }
 
-    /// Checks the opened file against what was hashed, then that the process still executes it:
-    /// an exec while the file was hashed shows as another file at the link.
+    /// Reads the opened file against what was hashed, then opens the link again: the reading
+    /// decides only when the link still names the identity that was read, so an exec or a change of
+    /// the file while it was read shows as [`Checked::Moved`].
     fn check(
         &self,
         process: &ProcessStartIdentity,
         identity: &ExecutableIdentity,
         verified: &VerifiedFiles,
         stop: &AtomicBool,
-    ) -> Result<(), String> {
+        open: &mut impl FnMut() -> Result<Self, String>,
+    ) -> Result<Checked, String> {
         let before = self.identity;
         let known = before == identity.hashed.file
             || verified
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .contains(&before);
-        let same = known || {
+        // Whether the file holds the hashed code, and nothing when it changed while it was hashed.
+        let holds = if known {
+            Some(true)
+        } else {
             let hashed = hash_file(
                 &self.file,
                 &self.link,
@@ -340,29 +395,26 @@ impl OpenedImage {
                 stop,
             )?;
             let after = regular_identity(&self.file, &self.link)?;
-            hashed.is_some_and(|(digest, _)| digest == identity.hashed.digest) && after == before
+            hashed
+                .filter(|_| after == before)
+                .map(|(digest, _)| digest == identity.hashed.digest)
         };
-        let now = open_without_waiting(&self.link)
-            .map_err(|error| {
-                format!(
-                    "the image of process {} cannot be read: {error}",
-                    process.pid
-                )
-            })
-            .and_then(|file| regular_identity(&file, &self.link))?;
+        let now = open()?;
         still_registered(process)?;
-        if same && now == before {
-            verified
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(before);
-            Ok(())
-        } else {
-            Err(format!(
-                "process {} executes other code than the file its launch presented",
-                process.pid
-            ))
+        if now.identity != before {
+            return Ok(Checked::Moved(now));
         }
+        Ok(match holds {
+            Some(true) => {
+                verified
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(before);
+                Checked::Holds
+            }
+            Some(false) => Checked::Differs,
+            None => Checked::Moved(now),
+        })
     }
 }
 
@@ -370,7 +422,12 @@ impl OpenedImage {
 /// executes the code that was hashed.
 ///
 /// macOS compares the code-directory hash the kernel keeps for the process's main executable with
-/// the ones the hashed file's own signature carries.
+/// the ones the hashed file's own signature carries. The hash is read before and after the start
+/// check; two readings that differ (an exec between them) are taken again, at most
+/// [`IMAGE_ATTEMPTS`] times, and only equal readings decide.
+///
+/// The check proves what the process executed when it was read. A process can exec after that and
+/// before its bridge is admitted; the next bridge is checked again.
 ///
 /// # Errors
 ///
@@ -384,18 +441,43 @@ pub fn verify_image(
 ) -> Result<(), String> {
     let pid = i32::try_from(process.pid.get())
         .map_err(|_| format!("{} is not a process identifier", process.pid))?;
-    let running = code_signature::of_process(pid)?;
-    still_registered(process)?;
-    // Read again after the start check: an exec in between shows as another hash.
-    let again = code_signature::of_process(pid)?;
-    if running == again && identity.hashed.code_directories.contains(&running) {
-        Ok(())
-    } else {
-        Err(format!(
-            "process {} executes other code than the file its launch presented",
-            process.pid
-        ))
+    verify_reading(process, identity, || code_signature::of_process(pid))
+}
+
+/// The check of [`verify_image`], with the reading of the process's code-directory hash given, so a
+/// test can present readings that change.
+#[cfg(target_os = "macos")]
+fn verify_reading(
+    process: &ProcessStartIdentity,
+    identity: &ExecutableIdentity,
+    mut read: impl FnMut() -> Result<CodeDirectoryHash, String>,
+) -> Result<(), String> {
+    for _ in 0..IMAGE_ATTEMPTS {
+        let running = read()?;
+        still_registered(process)?;
+        // Read again after the start check: an exec in between shows as another hash.
+        if read()? != running {
+            continue;
+        }
+        return if identity.hashed.code_directories.contains(&running) {
+            Ok(())
+        } else {
+            Err(other_code(process))
+        };
     }
+    Err(format!(
+        "the image of process {} kept changing while it was checked",
+        process.pid
+    ))
+}
+
+/// The refusal of a process that executes other code than the file its launch presented.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn other_code(process: &ProcessStartIdentity) -> String {
+    format!(
+        "process {} executes other code than the file its launch presented",
+        process.pid
+    )
 }
 
 /// No record of a process's image is read on this platform, so nothing here is verified.
@@ -978,8 +1060,9 @@ mod tests {
         assert!(refused.contains("stopped"), "{refused}");
     }
 
-    /// On Linux, a process that execs another program after its image was opened and before the
-    /// check ends is refused, although the file opened first holds the digest that was hashed.
+    /// On Linux, a process that execs another program after its image was read and before the link
+    /// is opened again is read again, and refused for the other program's code, although the file
+    /// read first holds the digest that was hashed.
     #[cfg(target_os = "linux")]
     #[test]
     fn an_exec_during_the_check_is_refused() {
@@ -992,34 +1075,221 @@ mod tests {
         let process =
             kr_ipc::identity::process_start_identity(child.id()).expect("the child is identified");
         let bash = identity_of(Path::new("/bin/bash"));
-        let opened = OpenedImage::open(&process).expect("its image is opened");
-        child
-            .stdin
-            .as_mut()
-            .expect("its input")
-            .write_all(b"go\n")
-            .expect("it is told to exec");
         let link = format!("/proc/{}/exe", child.id());
-        let started = std::time::Instant::now();
-        while std::fs::read_link(&link).is_ok_and(|target| target.ends_with("bash")) {
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(10),
-                "it execs"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let result = opened.check(
+        let mut input = child.stdin.take().expect("its input");
+        let mut opens = 0_u32;
+        let result = verify_opening(
             &process,
             &bash,
             &VerifiedFiles::default(),
             &AtomicBool::new(false),
+            || {
+                opens += 1;
+                if opens == 2 {
+                    input.write_all(b"go\n").expect("it is told to exec");
+                    let started = std::time::Instant::now();
+                    while std::fs::read_link(&link).is_ok_and(|target| target.ends_with("bash")) {
+                        assert!(
+                            started.elapsed() < std::time::Duration::from_secs(10),
+                            "it execs"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
+                OpenedImage::open(&process)
+            },
         );
         let _ = child.kill();
         let _ = child.wait();
-        assert!(
-            result.is_err(),
-            "the process no longer executes what was checked"
+        let refused = result.expect_err("the process no longer executes what was checked");
+        assert!(refused.contains("other code"), "{refused}");
+        assert_eq!(
+            opens, 3,
+            "the other program is read, and its link opened again"
         );
+    }
+
+    /// A copy of bash in a fresh directory on this host's temporary disk, and a process running it
+    /// that waits on its input until the test ends it.
+    #[cfg(target_os = "linux")]
+    fn running_copy() -> (std::path::PathBuf, std::process::Child) {
+        let directory = std::env::temp_dir().join(format!("kr-image-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(&directory).expect("a directory");
+        let program = directory.join("program");
+        std::fs::copy("/bin/bash", &program).expect("a copy of bash");
+        let started = std::time::Instant::now();
+        let child = loop {
+            match std::process::Command::new(&program)
+                .args(["-c", "read line"])
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+            {
+                Ok(child) => break child,
+                // The copy stays busy while a child that another test forked holds it open.
+                Err(error)
+                    if error.raw_os_error() == Some(libc::ETXTBSY)
+                        && started.elapsed() < std::time::Duration::from_secs(10) =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("the copy runs: {error}"),
+            }
+        };
+        (program, child)
+    }
+
+    /// Changes a file's metadata a clock tick after anything before it, so its change time moves.
+    #[cfg(target_os = "linux")]
+    fn a_tick_later(change: impl FnOnce()) {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        change();
+    }
+
+    /// On Linux, an upgrade that installs a new file over the running one while a check runs changes
+    /// the running file's metadata and not its code: the check, which had passed by the identity it
+    /// knew, reads the file again by its content and passes, and a later check passes by the identity
+    /// it remembered.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_upgrade_during_the_check_is_decided_again() {
+        let (program, mut child) = running_copy();
+        let process =
+            kr_ipc::identity::process_start_identity(child.id()).expect("the child is identified");
+        let hashed = identity_of(&program);
+        let verified = VerifiedFiles::default();
+        let stop = AtomicBool::new(false);
+        let mut opens = 0_u32;
+        let upgraded = verify_opening(&process, &hashed, &verified, &stop, || {
+            opens += 1;
+            if opens == 2 {
+                a_tick_later(|| {
+                    let staged = program.with_extension("next");
+                    std::fs::copy("/bin/bash", &staged).expect("the new version");
+                    std::fs::rename(&staged, &program).expect("installed over the running one");
+                });
+            }
+            OpenedImage::open(&process)
+        });
+        let later = verify_image(&process, &hashed, &verified, &stop);
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(program.parent().expect("its directory"));
+        upgraded.expect("the upgraded file still holds the hashed code");
+        assert_eq!(opens, 3, "the moved file is read again");
+        later.expect("a later check passes by the identity it remembered");
+    }
+
+    /// On Linux, a hard link made to the running file while a check hashes it moves its change time:
+    /// the check reads the file again by its content and passes, and a later check passes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_hard_link_made_during_the_check_is_decided_again() {
+        let (program, mut child) = running_copy();
+        let process =
+            kr_ipc::identity::process_start_identity(child.id()).expect("the child is identified");
+        let hashed = identity_of(&program);
+        // A first link before the check, so its first reading is not of the identity it hashed and
+        // is decided by the content.
+        a_tick_later(|| {
+            std::fs::hard_link(&program, program.with_extension("first")).expect("a first link");
+        });
+        let verified = VerifiedFiles::default();
+        let stop = AtomicBool::new(false);
+        let mut opens = 0_u32;
+        let linked = verify_opening(&process, &hashed, &verified, &stop, || {
+            opens += 1;
+            if opens == 2 {
+                a_tick_later(|| {
+                    std::fs::hard_link(&program, program.with_extension("second"))
+                        .expect("a second link");
+                });
+            }
+            OpenedImage::open(&process)
+        });
+        let later = verify_image(&process, &hashed, &verified, &stop);
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(program.parent().expect("its directory"));
+        linked.expect("the linked file still holds the hashed code");
+        assert_eq!(opens, 3, "the moved file is read again");
+        later.expect("a later check passes by the identity it remembered");
+    }
+
+    /// On Linux, a reading whose file keeps moving is refused after three attempts, each with its
+    /// link opened again; a check that tried without end would see the file settle and pass.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_reading_that_keeps_changing_is_refused() {
+        let (program, mut child) = running_copy();
+        let process =
+            kr_ipc::identity::process_start_identity(child.id()).expect("the child is identified");
+        let hashed = identity_of(&program);
+        let mut opens = 0_u64;
+        let result = verify_opening(
+            &process,
+            &hashed,
+            &VerifiedFiles::default(),
+            &AtomicBool::new(false),
+            || {
+                opens += 1;
+                // Every opening after the first finds another modification time, until the tenth.
+                if (2..=10).contains(&opens) {
+                    std::fs::File::open(&program)
+                        .and_then(|file| {
+                            file.set_modified(
+                                std::time::UNIX_EPOCH
+                                    + std::time::Duration::from_secs(1_000_000 + opens),
+                            )
+                        })
+                        .expect("its time is set");
+                }
+                OpenedImage::open(&process)
+            },
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(program.parent().expect("its directory"));
+        let refused = result.expect_err("a reading that never held still is refused");
+        assert!(refused.contains("kept changing"), "{refused}");
+        assert_eq!(opens, 4, "three readings, each with its link opened again");
+    }
+
+    /// On macOS, two readings of the process's code-directory hash that differ (an exec between
+    /// them) are taken again and only equal readings decide; readings that never agree are refused
+    /// after three attempts, where a check that tried without end would see them settle and pass.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn readings_that_differ_are_taken_again() {
+        let me = kr_ipc::identity::current_process_start_identity().expect("this process");
+        let hashed = ExecutableIdentity {
+            hashed: HashedFile {
+                file: FileIdentity {
+                    device: 0,
+                    inode: 0,
+                    size: 0,
+                    modified_ns: 0,
+                    changed_ns: 0,
+                },
+                digest: Digest256::from_bytes([0; 32]),
+                code_directories: vec![[1; 20]],
+            },
+            version: None,
+        };
+        let mut readings = [[1; 20], [2; 20], [1; 20], [1; 20]].into_iter();
+        verify_reading(&me, &hashed, || Ok(readings.next().expect("a reading")))
+            .expect("an exec between two readings, then equal readings of the hashed code");
+        let mut readings = [[1; 20], [2; 20], [2; 20], [2; 20]].into_iter();
+        let refused = verify_reading(&me, &hashed, || Ok(readings.next().expect("a reading")))
+            .expect_err("equal readings of other code");
+        assert!(refused.contains("other code"), "{refused}");
+        let mut count = 0_u8;
+        let refused = verify_reading(&me, &hashed, || {
+            count += 1;
+            Ok(if count <= 6 { [count + 1; 20] } else { [1; 20] })
+        })
+        .expect_err("readings that never agree");
+        assert!(refused.contains("kept changing"), "{refused}");
+        assert_eq!(count, 6, "three attempts of two readings");
     }
 
     #[test]
