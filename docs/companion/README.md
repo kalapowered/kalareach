@@ -50,6 +50,10 @@ the host presents it: the session's output directly, or a viewport with the host
 host's own words. It reads the summary of its own attachment and no other, and a viewport whose
 worker reported no reason says so, and is never shown as direct.
 
+A session fits a window as narrow as 320 px. Its actions move below its title, in the same order
+and at the same size, a long name or directory wraps whole, and the terminal's badges and footer
+controls wrap inside the terminal.
+
 ## The boundary
 
 The window is a WebView and the WebView is not trusted. Section 13 of the specification fixes what

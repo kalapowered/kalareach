@@ -148,13 +148,43 @@
   white-space: nowrap;
 }
 
+/*
+ * Where the window is too narrow for the title and the actions side by side, the actions move below
+ * the title and wrap as two groups: the view switch, then Settings with Close session. Nothing
+ * shrinks, so every control keeps its size, and they read in the order the keyboard reaches them.
+ */
 .session-header {
   margin-bottom: 20px;
+  flex-wrap: wrap;
+  row-gap: var(--gap-4);
+}
+
+.session-header > :first-child {
+  flex: 1 1 16rem;
+  min-width: 0;
+}
+
+.session-header .page-actions {
+  flex-wrap: wrap;
+  flex-shrink: 1;
+  min-width: 0;
+}
+
+.session-commands {
+  display: flex;
+  flex-wrap: wrap;
+  gap: inherit;
+}
+
+/* The name and the directory are the host's. A long one wraps, whole, instead of widening the page. */
+.session-header h1 {
+  overflow-wrap: anywhere;
 }
 
 .session-meta {
   color: var(--muted);
   font-size: 0.6875rem;
+  overflow-wrap: anywhere;
 }
 
 .session-tabs {
@@ -472,6 +502,21 @@
 
 .xterm .xterm-scrollable-element > .invisible.fade {
   transition: none !important;
+}
+
+/*
+ * The heading's second row holds the badges. In a narrow window they wrap onto more lines, and a
+ * badge longer than the terminal is wide wraps its own words, so none runs under the terminal's
+ * edge. The footer's controls wrap the same way: the two sizes together, then the way back.
+ */
+.terminal-heading > .row + .row,
+.terminal-footer > .row {
+  flex-wrap: wrap;
+}
+
+.terminal-heading .badge {
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .terminal-footer {

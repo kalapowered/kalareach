@@ -233,23 +233,25 @@ export function Session({
               go({ view: 'session', sessionId, pane: next })
             }}
           />
-          <Button
-            data-testid="open-settings"
-            onClick={() => {
-              setSettingsOpen(true)
-            }}
-          >
-            Settings
-          </Button>
-          <Button
-            tone="danger"
-            data-testid="close-session"
-            onClick={() => {
-              setClosing(true)
-            }}
-          >
-            Close session
-          </Button>
+          <span className="session-commands">
+            <Button
+              data-testid="open-settings"
+              onClick={() => {
+                setSettingsOpen(true)
+              }}
+            >
+              Settings
+            </Button>
+            <Button
+              tone="danger"
+              data-testid="close-session"
+              onClick={() => {
+                setClosing(true)
+              }}
+            >
+              Close session
+            </Button>
+          </span>
         </div>
       </header>
 

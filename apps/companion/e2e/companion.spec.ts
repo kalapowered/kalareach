@@ -9,7 +9,7 @@
  * Every screenshot goes under `/tmp`, and each one is named for the requirement row it closes.
  */
 
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Locator, type Page } from '@playwright/test'
 
 import { terminalAttachment } from '../src/terminal/modes'
 
@@ -551,6 +551,181 @@ test.describe('how the host presents a raw view', () => {
     )
     await page.screenshot({ path: shotFor('terminal-presentation-08.02-moved'), fullPage: true })
   })
+})
+
+// KR-REQ-13.19: a window as narrow as a phone. Nothing runs past the window's edge or the
+// terminal's, the controls keep the size they have in a wide window, and they read in the order the
+// keyboard reaches them: along a row, then down to the next.
+test.describe('a session in a window 320 px wide', () => {
+  /** Where a screenshot for this browser goes, so each engine keeps its own. */
+  const shotFor = (name: string): string => shot(`${name}-${test.info().project.name}`)
+
+  /** How far the page runs past the window's width. */
+  const pageOverflow = (page: Page): Promise<number> =>
+    page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+
+  /** How far what `locator` holds runs past its own box, whether it is shown or clipped. */
+  const spill = (locator: Locator): Promise<number> =>
+    locator.evaluate((element) => element.scrollWidth - element.clientWidth)
+
+  interface Placed {
+    readonly name: string
+    readonly left: number
+    readonly right: number
+    readonly top: number
+    readonly bottom: number
+    readonly width: number
+    readonly height: number
+  }
+
+  /** Each control inside `locator`, in the order the keyboard reaches them, with its box. */
+  const placed = (locator: Locator): Promise<Placed[]> =>
+    locator.locator('button').evaluateAll((buttons) =>
+      buttons.map((button) => {
+        const box = button.getBoundingClientRect()
+        return {
+          name: button.textContent ?? '',
+          left: box.left,
+          right: box.right,
+          top: box.top,
+          bottom: box.bottom,
+          width: box.width,
+          height: box.height
+        }
+      })
+    )
+
+  /** Checks that each control follows the one before it: to its right on its row, or below it. */
+  function inReadingOrder(controls: readonly Placed[]): void {
+    for (let index = 1; index < controls.length; index += 1) {
+      const before = controls[index - 1]
+      const after = controls[index]
+      const sameRow = after.top < before.bottom && before.top < after.bottom
+      expect
+        .soft(sameRow ? after.left >= before.right - 1 : after.top >= before.bottom - 1, `${after.name} follows ${before.name}`)
+        .toBe(true)
+    }
+  }
+
+  /** Checks that the narrow controls are the wide ones, each the same size and inside `edge`. */
+  function wholeAndUnshrunk(
+    narrow: readonly Placed[],
+    wide: readonly Placed[],
+    edge: { readonly left: number; readonly right: number }
+  ): void {
+    expect(narrow.map((each) => each.name)).toEqual(wide.map((each) => each.name))
+    narrow.forEach((control, index) => {
+      expect.soft(Math.abs(control.width - wide[index].width), `${control.name}'s width`).toBeLessThanOrEqual(1)
+      expect.soft(Math.abs(control.height - wide[index].height), `${control.name}'s height`).toBeLessThanOrEqual(1)
+      expect.soft(control.left, `${control.name}'s left edge`).toBeGreaterThanOrEqual(edge.left - 1)
+      expect.soft(control.right, `${control.name}'s right edge`).toBeLessThanOrEqual(edge.right + 1)
+    })
+  }
+
+  /** Opens a session's terminal and waits for the screen, whose badges come with it. */
+  async function openTerminal(page: Page): Promise<void> {
+    await page.getByRole('tab', { name: 'Terminal' }).click()
+    await page.getByTestId('palette-provenance').waitFor()
+  }
+
+  test('the header and the conversation fit, with the header whole and in order', async ({ page }) => {
+    await openSession(page)
+    const header = page.locator('.session-header')
+    const wide = await placed(header)
+    await page.setViewportSize({ width: 320, height: 720 })
+
+    expect.soft(await pageOverflow(page), 'the page').toBeLessThanOrEqual(1)
+    expect.soft(await spill(header), 'the header').toBeLessThanOrEqual(1)
+    const narrow = await placed(header)
+    wholeAndUnshrunk(narrow, wide, { left: 0, right: 320 })
+    inReadingOrder(narrow)
+
+    // The working directory and the name are the host's. Long ones wrap inside the window, whole,
+    // rather than widening the page or being cut off.
+    await page.evaluate(() => {
+      const name = document.querySelector('.session-header h1')
+      const directory = document.querySelector('.session-header .session-meta')
+      if (name) name.textContent = 'a-folder-whose-name-is-longer-than-the-window-is-wide'
+      if (directory) {
+        directory.textContent = '/Users/someone/work/clients/a-long-client-name/repositories/the-service'
+      }
+    })
+    expect.soft(await pageOverflow(page), 'the page with a long directory').toBeLessThanOrEqual(1)
+    expect.soft(await spill(header.locator('h1')), 'the name').toBeLessThanOrEqual(1)
+    expect.soft(await spill(header.locator('.session-meta')), 'the directory').toBeLessThanOrEqual(1)
+  })
+
+  test('the terminal, its badges and its footer fit, with every control whole and in order', async ({
+    page
+  }) => {
+    await openSession(page)
+    await openTerminal(page)
+    const footer = page.locator('.terminal-footer')
+    const wide = await placed(footer)
+    await page.setViewportSize({ width: 320, height: 720 })
+
+    expect.soft(await pageOverflow(page), 'the page').toBeLessThanOrEqual(1)
+    const terminal = await page.getByTestId('raw-terminal').evaluate((element) => {
+      const box = element.getBoundingClientRect()
+      return { left: box.left, right: box.right }
+    })
+    expect.soft(await spill(page.locator('.terminal-heading')), 'the heading').toBeLessThanOrEqual(1)
+    expect.soft(await spill(footer), 'the footer').toBeLessThanOrEqual(1)
+    for (const badge of await page.locator('.terminal-heading .badge').all()) {
+      const box = await badge.boundingBox()
+      expect.soft(box?.x ?? -1, 'a badge starts inside the terminal').toBeGreaterThanOrEqual(terminal.left - 1)
+      expect
+        .soft((box?.x ?? 0) + (box?.width ?? Number.POSITIVE_INFINITY), 'a badge ends inside the terminal')
+        .toBeLessThanOrEqual(terminal.right + 1)
+    }
+    const narrow = await placed(footer)
+    wholeAndUnshrunk(narrow, wide, terminal)
+    inReadingOrder(narrow)
+  })
+
+  test('the header and the footer still fit with touch targets of 44 and 48 px', async ({ page }) => {
+    await openSession(page)
+    await openTerminal(page)
+    await page.setViewportSize({ width: 320, height: 720 })
+    for (const target of [44, 48]) {
+      // The token every control takes its minimum from, as a coarse pointer or a phone sets it.
+      await page.evaluate((size) => {
+        document.documentElement.style.setProperty('--target', `${size}px`)
+      }, target)
+      expect.soft(await pageOverflow(page), `the page at ${target} px`).toBeLessThanOrEqual(1)
+      expect.soft(await spill(page.locator('.terminal-footer')), `the footer at ${target} px`).toBeLessThanOrEqual(1)
+      const controls = [
+        ...(await placed(page.locator('.session-header'))),
+        ...(await placed(page.locator('.terminal-footer')))
+      ]
+      for (const control of controls.filter((each) => !['Conversation', 'Terminal'].includes(each.name))) {
+        expect.soft(control.height, `${control.name}'s height at ${target} px`).toBeGreaterThanOrEqual(target - 0.1)
+        expect.soft(control.width, `${control.name}'s width at ${target} px`).toBeGreaterThanOrEqual(target - 0.1)
+        expect.soft(control.right, `${control.name} inside the window at ${target} px`).toBeLessThanOrEqual(321)
+      }
+      const view = await page.locator('.session-header .segmented').boundingBox()
+      expect.soft(view?.height ?? 0, `the view switch at ${target} px`).toBeGreaterThanOrEqual(target - 0.1)
+    }
+  })
+
+  for (const theme of ['light', 'dark'] as const) {
+    test(`the session in a wide window and at 320 px, ${theme}`, async ({ page }) => {
+      await page.addInitScript((mode) => {
+        localStorage.setItem('kalareach-theme', mode)
+      }, theme)
+      await openSession(page)
+      await expect(page.locator('html')).toHaveAttribute('data-theme', theme)
+      const size = page.viewportSize() ?? { width: 1280, height: 720 }
+      for (const pane of ['conversation', 'terminal'] as const) {
+        if (pane === 'terminal') await openTerminal(page)
+        await page.setViewportSize(size)
+        await page.screenshot({ path: shotFor(`session-13.19-${pane}-desktop-${theme}`), fullPage: true })
+        await page.setViewportSize({ width: 320, height: 720 })
+        expect.soft(await pageOverflow(page), `the ${pane} at 320 px`).toBeLessThanOrEqual(1)
+        await page.screenshot({ path: shotFor(`session-13.19-${pane}-320-${theme}`), fullPage: true })
+      }
+    })
+  }
 })
 
 test.describe('packages', () => {
