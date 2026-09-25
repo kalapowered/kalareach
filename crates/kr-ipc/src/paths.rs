@@ -403,6 +403,39 @@ impl EnvironmentPaths {
         self.state_dir.join("secrets")
     }
 
+    /// Returns the endpoint on which this environment's starter takes a launch from the daemon.
+    ///
+    /// Windows only: there the environment's scheduled task runs a starter, and the starter, not
+    /// the daemon, creates each worker ([`crate::starter`]). One instance of this pipe waits for
+    /// each launch the daemon has handed over.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcError::SocketPathTooLong`] when the name does not fit the platform's limit.
+    #[cfg(windows)]
+    pub fn starter_endpoint(&self) -> Result<Endpoint> {
+        self.endpoint("s")
+    }
+
+    /// Returns the directory in which a request to start this environment's daemon waits for the
+    /// starter that takes it.
+    ///
+    /// In the runtime directory: a request belongs to one boot, and its deadline is counted on that
+    /// boot's clock ([`crate::starter`]).
+    #[must_use]
+    pub fn start_claims_dir(&self) -> PathBuf {
+        self.runtime_dir.join("claims")
+    }
+
+    /// Returns the file that records which login session this environment's work runs in.
+    ///
+    /// In the state directory, because it has to outlive the daemon that wrote it: a replacement
+    /// daemon reads it before it takes over anything ([`crate::starter`]).
+    #[must_use]
+    pub fn session_record(&self) -> PathBuf {
+        self.state_dir.join("login-session")
+    }
+
     #[cfg(unix)]
     fn endpoint(&self, role: &str) -> Result<Endpoint> {
         Endpoint::from_path(self.runtime_dir.join(format!("{role}.sock")))
