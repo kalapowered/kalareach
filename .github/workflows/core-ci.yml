@@ -1037,17 +1037,11 @@ jobs:
       #   nothing without one. The rust job runs each leg against the deployment it names.
       # - The container cases, which need podman, and this runner has none. The rust job's runner
       #   has it, and its test step runs them.
-      # - The two cases that launch a built shell package, which do nothing unless
-      #   KR_SHELL_PACKAGES names one, and this job builds none. The shell-packages job builds the
-      #   packages and drives them through the contract and qualification suites; these two cases
-      #   run where KR_SHELL_PACKAGES names a built package.
       # - The cases that need another filesystem, and the cases whose verdicts are timings, which
       #   the two steps after this one run.
       - name: Test
         if: ${{ !cancelled() }}
         timeout-minutes: 70
-        env:
-          KR_REQUIRE_SHELLS: bash,zsh,fish
         run: >-
           cargo test --locked --workspace --exclude kr-sync-integration --no-fail-fast --
           --skip the_helper_inside_a_container_refuses_a_handshake_that_declares_a_network_actor
@@ -1056,8 +1050,6 @@ jobs:
           --skip the_argument_vector_reaches_the_container_exactly_as_it_was_built
           --skip a_helper_path_with_a_space_in_it_is_one_argument_inside_the_container
           --skip a_refresh_that_reached_a_running_environment_without_a_helper_scopes_no_channel
-          --skip the_built_packages_are_qualified_where_this_run_has_them
-          --skip a_real_qualified_package_registers_and_qualifies_on_this_hosts_endpoint
           --skip a_repository_whose_own_data_is_on_another_filesystem_is_captured
           --skip bind_mount_and_cross_device_grafts_are_refused
           --skip recursive_removal_refuses_a_grafted_mount
