@@ -304,11 +304,13 @@ impl ConsoleOutput {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let collected = Arc::clone(&seen);
         std::thread::spawn(move || {
-            // A real terminal answers a cursor-position report request (`ESC[6n`) with the cursor's
-            // position (`ESC[row;colR`). `kr` asks for it while it sets up the terminal and reads the
-            // answer before it does anything else, so a console that never answers holds it there and
-            // nothing it would go on to do - refuse, or ask to pair - is ever reached. This stand-in
-            // answers a fixed position, which is all that setup needs to carry on.
+            // The pseudo-console asks this terminal where its cursor is. portable-pty creates it with
+            // PSEUDOCONSOLE_INHERIT_CURSOR, and with that flag the console host writes a cursor-position
+            // report request (`ESC[6n`) when it starts and serves nothing to the process attached to it
+            // until the terminal answers (`ESC[row;colR`). A real terminal answers at once; one that
+            // never does holds `kr` before its first console call returns, so it never gets as far as
+            // refusing or asking. This stand-in answers a fixed position, which is all the console host
+            // needs.
             const QUERY: &[u8] = b"\x1b[6n";
             const REPLY: &[u8] = b"\x1b[1;1R";
             let mut answered = 0_usize;
