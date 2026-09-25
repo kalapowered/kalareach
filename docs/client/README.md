@@ -83,6 +83,62 @@ a caller that is not signed in and for an account that may not do this, so it cl
 refusal and `ClientError::Refused` carries the action. This device's draft store has its own answers
 too: a draft that will not fit is not a reason to update the application.
 
+## What a diagnostic may show
+
+A failure, a line on standard error and a panic, from this library and from the command line, say
+only a `shown::Shown`. A `Shown` is built from this program's own words (a `&'static str` written
+in its source), from values with nothing in them to hide (`Plain`: numbers, identifiers that are
+UUIDs or counters, and codes and states from a fixed vocabulary), and from what a reducer or a door
+decided may be said. There is no way to make one from a `String`, so text that arrived from a
+person, a file, a host or a service reaches a diagnostic only through one of those.
+
+A reducer keeps what somebody diagnosing a fault needs and drops the rest:
+
+| Reducer | What it says |
+| --- | --- |
+| `address` | The scheme, the host and the port. An address with a user name or a password in it is not printed at all, and no path, query or fragment ever is |
+| `cbor` | The KR-CBOR-1 rule the bytes broke and the offset where they broke it, never a key, a value or a decoder's message |
+| `json` | The kind of fault, with its line and column |
+| `io` | The kind of failure and the operating system's error number; a message a caller attached is dropped |
+| `frame`, `ipc`, `transport`, `crypto` | Their own fixed words, with CBOR and input or output failures said as above |
+| `identifier`, `route` | Each part that is an identifier or a lowercase word, and a placeholder for any other |
+| `terminfo` | A terminal type that is a terminfo name, and a placeholder for anything else |
+| `root`, `within`, `stored` | A directory this program was configured with or derived, a fixed name under one, and a file in a store, whose name is said only when the store wrote it |
+
+A door passes text whole, because the value it takes was written to be shown to a person: a host's
+refusal message (section 23 makes that plain text for a person, with no credentials in it), a
+managed service's refusal, a package's words about its controls, and the signal a closure record
+names. A host sentence goes through a door too, and one that arrived from a document rather than
+being composed here is said by its class and its length.
+
+So an error holds text only as a `Shown`, and an input or output failure as an `IoFault`, which is
+not itself an error and is never a `source()`. A `thiserror` message is one literal whose holes
+name the variant's own fields, `Debug` is the same text as `Display`, and a hand-written `Error`
+names no source, so walking a failure's chain finds nothing its rendering left out. `ClientError`
+and `CliError` still carry the values other crates build and match (a host's `ProtocolError`, a
+`TransportError`, an `IpcError`) and render each through its door or reducer.
+`kr_client::error::refusal` is the one place a `ProtocolError` is made from text, and it takes a
+`Shown`.
+
+The command line reports every failure through one reporter, which writes the line on standard
+error and the `--json` failure document. A usage mistake is said by its kind and by what the
+command declares: the argument, the values it takes, a suggestion and the usage line. What was
+typed is never repeated, because an argument in the wrong place can be a secret pasted into it.
+`kr account token show` and `kr account token import` say a stored origin as an address, and the
+stored scopes as the names this build knows, with the others counted.
+
+Two tests hold this. `crates/kr-client/tests/shown_rule.rs` reads both crates' sources and names
+the file and line of anything that could put other text in a rendering: a hand-written `Display`, a
+`Plain` claim outside the two `shown.rs` files, an error field a rendering reaches that is none of
+the types above, a formatted panic, an assertion that prints what it compares, a log line, or
+standard error written outside the reporter. The marker tests plant one marker where input goes
+(each text leaf, map key and other leaf of a stored file or a service's answer, malformed bytes,
+typed arguments, origins) and look for it in every rendering that comes back, as text, as decimal
+and hexadecimal bytes, and in base64.
+
+The rule does not reach standard output yet, nor the `--json` answers other than a failure document
+and the account token's, nor the derived `Debug` of a type that is not a failure.
+
 ## Drafts
 
 A draft is durable and belongs to this device. An attachment is only what is presenting it.
