@@ -465,6 +465,10 @@ const SPENT: Duration = Duration::from_millis(400);
 #[cfg(unix)]
 const READING_TOLERANCE: f64 = 0.05;
 
+/// How long the spending process has to say what it spent before it is stopped and the test fails.
+#[cfg(unix)]
+const SPENDER_LIMIT: Duration = Duration::from_secs(60);
+
 /// A process that spent a fraction of a second of processor time is read as having spent it.
 ///
 /// The idle measurement is the difference of two readings of each process five minutes apart, and
@@ -496,26 +500,40 @@ fn a_process_that_spends_processor_time_is_read_as_spending_it() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("the spending process starts");
-    let mut output = std::io::BufReader::new(spender.stdout.take().expect("its output"));
-    let mut said = None;
-    let mut line = String::new();
-    while said.is_none() && output.read_line(&mut line).unwrap_or(0) > 0 {
-        said = line
-            .trim()
-            .strip_prefix("spent ")
-            .and_then(|nanoseconds| nanoseconds.parse::<u64>().ok());
-        line.clear();
-    }
-    let read = processor_seconds(spender.id());
-    // Its input closing is what lets it end, and what it writes on the way out is read to the end
-    // so that nothing it writes fails.
+    // Its output is read on a thread of its own, to the end, so that nothing it writes on its way
+    // out fails; what it says is waited for with a limit, so a process that never says it cannot
+    // hold this test up.
+    let output = spender.stdout.take().expect("its output");
+    let (saying, said) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut output = std::io::BufReader::new(output);
+        let mut line = String::new();
+        while output.read_line(&mut line).unwrap_or(0) > 0 {
+            if let Some(nanoseconds) = line
+                .trim()
+                .strip_prefix("spent ")
+                .and_then(|nanoseconds| nanoseconds.parse::<u64>().ok())
+            {
+                let _ = saying.send(nanoseconds);
+            }
+            line.clear();
+        }
+    });
+    let said = said.recv_timeout(SPENDER_LIMIT);
+    let read = said.is_ok().then(|| processor_seconds(spender.id()));
+    // Its input closing is what lets it end; one that never said what it spent is stopped.
     drop(spender.stdin.take());
-    let _ = std::io::copy(&mut output, &mut std::io::sink());
+    if said.is_err() {
+        let _ = spender.kill();
+    }
     let _ = spender.wait();
+    let _ = reader.join();
 
     let said = said.expect("the spending process says what it spent");
     let spent = Duration::from_nanos(said).as_secs_f64();
-    let read = read.expect("the spending process's processor time is read");
+    let read = read
+        .expect("read once it said")
+        .expect("the spending process's processor time is read");
     assert!(
         (read - spent).abs() <= READING_TOLERANCE,
         "a process that spent {spent:.3} s of processor time is read as having spent {read:.3} s"
