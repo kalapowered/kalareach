@@ -221,13 +221,7 @@ impl Host {
     fn platform_supervisor(&self) -> Box<dyn WorkerSupervisor> {
         #[cfg(windows)]
         if let Some(task) = &self.task {
-            return Box::new(
-                kr_controller::supervision::windows::TaskSupervisor::new(
-                    self.paths(),
-                    &task.definition().starter,
-                )
-                .expect("the task supervisor"),
-            );
+            return Box::new(task.supervisor(&self.paths()));
         }
         Box::new(DetachedSupervisor::new())
     }
@@ -1683,6 +1677,18 @@ async fn close(client: &mut LocalClient, host: &Host, session_id: SessionId) -> 
 #[cfg(windows)]
 #[test]
 fn a_worker_start_that_must_break_away_is_refused_inside_a_job_that_forbids_it() {
+    use kr_ipc::starter::{BREAKAWAY_OK, KILL_ON_JOB_CLOSE, SILENT_BREAKAWAY_OK};
+
+    let flags = kr_ipc::paths::current_job_limit_flags().expect("this process's job");
+    if !flags.is_some_and(|flags| {
+        flags & KILL_ON_JOB_CLOSE != 0 && flags & (BREAKAWAY_OK | SILENT_BREAKAWAY_OK) == 0
+    }) {
+        eprintln!(
+            "skipped: this process is not in a job that kills on close and forbids breakaway \
+             (limit flags {flags:?}), as it is under cargo"
+        );
+        return;
+    }
     let temp = teardown::Tree::create();
     let jobs = temp.root().join("jobs");
     std::fs::create_dir_all(&jobs).expect("a jobs directory");
@@ -1726,8 +1732,11 @@ fn nested_daemon_supervisor(
     starter: &Path,
 ) -> Box<dyn WorkerSupervisor> {
     use kr_controller::supervision::windows::TaskSupervisor;
+    use kr_controller::supervision::windows::testing::definition;
 
-    Box::new(TaskSupervisor::new(environment.clone(), starter).expect("the task supervisor"))
+    let expected = definition(environment, starter).expect("the task's definition");
+    let through_the_task = TaskSupervisor::for_definition(environment.clone(), expected);
+    Box::new(through_the_task)
 }
 
 /// Hosts a control daemon for its parent's host tree, inside the jobs its parent built, until
@@ -1848,13 +1857,18 @@ async fn a_worker_outlives_the_nested_jobs_its_daemon_ran_in() {
     drop(registry);
 
     // The jobs close. The outer one ends every process in it, the daemon among them.
+    assert!(
+        daemon.try_wait().expect("the daemon's state").is_none(),
+        "the daemon was still running when its jobs closed"
+    );
     drop(inner);
     drop(outer);
-    let ended = tokio::task::spawn_blocking(move || daemon.wait())
+    // Closing a job that kills on close ends its members as `TerminateJobObject` does, with the
+    // exit code it is given, which is zero: that the daemon has ended is what the wait shows.
+    tokio::task::spawn_blocking(move || daemon.wait())
         .await
         .expect("the wait")
-        .expect("the daemon's process is collected");
-    assert!(!ended.success(), "the jobs ended the daemon: {ended:?}");
+        .expect("the jobs ended the daemon, and its process is collected");
     let _ = reader.join();
     assert_eq!(
         kr_ipc::identity::process_state(&worker),
