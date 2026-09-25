@@ -570,6 +570,30 @@ async fn run(cli: Cli) -> Result<Completion> {
             kr_cli::pair::run(&paths, command, cli.json).await?;
             Ok(Completion::Done)
         }
+        Command::Project(command) => {
+            kr_cli::project::run(&paths, command, cli.json).await?;
+            Ok(Completion::Done)
+        }
+        Command::Workspace(command) => {
+            kr_cli::workspace::run(&paths, command, cli.json).await?;
+            Ok(Completion::Done)
+        }
+        Command::Changeset(command) => {
+            kr_cli::changeset::run(&paths, command, cli.json).await?;
+            Ok(Completion::Done)
+        }
+        Command::Diff(command) => {
+            kr_cli::diff::run(&paths, command, cli.json).await?;
+            Ok(Completion::Done)
+        }
+        Command::Device(command) => {
+            kr_cli::device::run(&paths, command, cli.json).await?;
+            Ok(Completion::Done)
+        }
+        Command::Plugin(command) => {
+            kr_cli::plugin::run(&paths, command, cli.json).await?;
+            Ok(Completion::Done)
+        }
         Command::Skill(command) => skill(&paths, command, cli.json).await,
         Command::AgentTools(arguments) => {
             if !arguments.stdio {

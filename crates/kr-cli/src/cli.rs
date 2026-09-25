@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 /// The KalaReach command line.
 #[derive(Debug, Parser)]
@@ -70,6 +70,558 @@ pub enum Command {
     /// withdraw one, or show where one has reached.
     #[command(subcommand, visible_alias = "p")]
     Pair(PairCommand),
+    /// Manage the source repositories of an environment. Plugin repositories are `kr plugin repo`.
+    #[command(subcommand)]
+    Project(ProjectCommand),
+    /// Select and manage the shared or isolated working copies of a repository. A live session is
+    /// never moved from the one it runs in.
+    #[command(subcommand)]
+    Workspace(WorkspaceCommand),
+    /// Capture, read or materialise exact versions of a workspace's work.
+    #[command(subcommand)]
+    Changeset(ChangesetCommand),
+    /// Review changes, or apply or revert a change set explicitly at a destination you name.
+    #[command(subcommand)]
+    Diff(DiffCommand),
+    /// Inspect the devices paired with this host, or revoke one.
+    #[command(subcommand)]
+    Device(DeviceCommand),
+    /// Manage plugin packages, their capabilities and the repositories they come from.
+    #[command(subcommand)]
+    Plugin(PluginCommand),
+}
+
+/// The environment one command acts in.
+#[derive(Debug, Args)]
+pub struct EnvironmentSelector {
+    /// The environment to act in, by identifier. Without it, this installation's own.
+    #[arg(long)]
+    pub environment: Option<String>,
+}
+
+/// One `kr project` operation.
+#[derive(Debug, Subcommand)]
+pub enum ProjectCommand {
+    /// List the repositories this environment knows.
+    List(ProjectListArguments),
+    /// Create an empty repository in a new directory.
+    Init(ProjectInitArguments),
+    /// Clone a repository into a new directory.
+    Clone(ProjectCloneArguments),
+    /// Register a Git checkout that already exists. Nothing inside it changes.
+    Adopt(ProjectAdoptArguments),
+}
+
+/// `kr project list`.
+#[derive(Debug, Args)]
+pub struct ProjectListArguments {
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// `kr project init`.
+#[derive(Debug, Args)]
+pub struct ProjectInitArguments {
+    /// The directory to create. Its parent has to exist, and it must not.
+    pub path: PathBuf,
+    /// The label the repository is shown with. The directory's name when absent.
+    #[arg(long)]
+    pub label: Option<String>,
+    /// The name of the first branch. Git's own default when absent.
+    #[arg(long)]
+    pub initial_branch: Option<String>,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// `kr project clone`.
+#[derive(Debug, Args)]
+pub struct ProjectCloneArguments {
+    /// Where to clone from: an `https://` URL, an ssh remote (`ssh://host/path` or
+    /// `user@host:path`), the absolute path of a repository on this machine, or the identifier of
+    /// a repository this environment has registered.
+    pub source: String,
+    /// The directory to create. Its parent has to exist, and it must not.
+    pub path: PathBuf,
+    /// The label the repository is shown with. The directory's name when absent.
+    #[arg(long)]
+    pub label: Option<String>,
+    /// The name the remote is given inside the new repository.
+    #[arg(long, default_value = "origin")]
+    pub remote_name: String,
+    /// The approved credential broker that authenticates an https or ssh remote.
+    #[arg(long, default_value = "os-secret-store")]
+    pub credential_broker: String,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// `kr project adopt`.
+#[derive(Debug, Args)]
+pub struct ProjectAdoptArguments {
+    /// The Git checkout to register.
+    pub path: PathBuf,
+    /// The label the repository is shown with. The directory's name when absent.
+    #[arg(long)]
+    pub label: Option<String>,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// One `kr workspace` operation.
+#[derive(Debug, Subcommand)]
+pub enum WorkspaceCommand {
+    /// List workspaces. Listing one never removes anything.
+    List(WorkspaceListArguments),
+    /// Create a shared or isolated workspace, or preview what one would hold.
+    Create(WorkspaceCreateArguments),
+    /// Remove a workspace, once no live session or run is bound to it.
+    Remove(WorkspaceRemoveArguments),
+}
+
+/// `kr workspace list`.
+#[derive(Debug, Args)]
+pub struct WorkspaceListArguments {
+    /// Only the workspaces of this repository, by identifier.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// Which kind of working copy a workspace is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum WorkspaceKindArgument {
+    /// The repository's own working tree, used where it is, with its uncommitted work in place.
+    Shared,
+    /// A separate working tree, made from a base you name.
+    Isolated,
+}
+
+/// How an isolated workspace is separated from the repository's own tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum IsolationArgument {
+    /// A Git worktree: separate files, shared repository metadata. Not a security sandbox.
+    GitWorktree,
+    /// An independent clone, with its own objects and references.
+    IndependentClone,
+}
+
+/// One class of uncommitted work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum InclusionArgument {
+    /// Tracked files with uncommitted modifications.
+    DirtyFiles,
+    /// Files Git neither tracks nor ignores.
+    UntrackedFiles,
+    /// Submodule working trees.
+    Submodules,
+    /// Files whose content Git reports as binary.
+    BinaryFiles,
+    /// Files an ignore rule covers, which is what a build usually produces.
+    GeneratedArtefacts,
+    /// Every class above.
+    All,
+}
+
+/// `kr workspace create`.
+#[derive(Debug, Args)]
+pub struct WorkspaceCreateArguments {
+    /// The repository to make a working copy of, by identifier.
+    pub project: String,
+    /// Which kind of working copy. There is no default.
+    #[arg(long, value_enum)]
+    pub kind: WorkspaceKindArgument,
+    /// How an isolated workspace is separated. Required for an isolated workspace.
+    #[arg(long, value_enum)]
+    pub isolation: Option<IsolationArgument>,
+    /// Where an isolated workspace's tree goes: a new directory whose parent exists.
+    #[arg(long)]
+    pub path: Option<PathBuf>,
+    /// A class of uncommitted work an isolated workspace starts with. Repeat it for each class;
+    /// a class not named is left out, and the repository's own tree keeps it either way.
+    #[arg(long = "include", value_enum)]
+    pub include: Vec<InclusionArgument>,
+    /// The revision an isolated workspace starts from. The repository's current one when absent.
+    #[arg(long)]
+    pub base: Option<String>,
+    /// The change set, by identifier, whose version an isolated workspace starts from.
+    #[arg(long)]
+    pub base_change_set: Option<String>,
+    /// Show what the workspace would hold, and create nothing.
+    #[arg(long)]
+    pub preview: bool,
+    /// The label the workspace is shown with. The directory's name, or `shared`, when absent.
+    #[arg(long)]
+    pub label: Option<String>,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// `kr workspace remove`.
+#[derive(Debug, Args)]
+pub struct WorkspaceRemoveArguments {
+    /// The workspace, by identifier.
+    pub workspace: String,
+    /// Remove what the workspace still holds as well: its uncommitted work, pinned change sets
+    /// and review evidence. Without it nothing held is removed, and what is held is listed.
+    #[arg(long)]
+    pub remove_retained: bool,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// One `kr changeset` operation.
+#[derive(Debug, Subcommand)]
+pub enum ChangesetCommand {
+    /// Capture an immutable version of a workspace's work.
+    Capture(ChangesetCaptureArguments),
+    /// Read one exact version of a change set, and every version beside it.
+    Read(ChangesetReadArguments),
+    /// Write one exact version into an independent directory of this host's own.
+    Materialize(ChangesetMaterializeArguments),
+}
+
+/// How consistent a capture's source has to be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ConsistencyArgument {
+    /// Files read one at a time from the live working tree.
+    PerFile,
+    /// The working tree held still for the whole of the read.
+    Quiesced,
+    /// Every path from an immutable Git object.
+    Atomic,
+}
+
+/// `kr changeset capture`.
+#[derive(Debug, Args)]
+pub struct ChangesetCaptureArguments {
+    /// The workspace to capture, by identifier.
+    pub workspace: String,
+    /// Add a version to this change set, by identifier, instead of starting a new one.
+    #[arg(long)]
+    pub change_set: Option<String>,
+    /// The label a new change set is given.
+    #[arg(long, required_unless_present = "change_set")]
+    pub label: Option<String>,
+    /// A class of uncommitted work to capture. Repeat it for each class; a class not named is
+    /// left out.
+    #[arg(long = "include", value_enum)]
+    pub include: Vec<InclusionArgument>,
+    /// Capture only paths under this one, relative to the repository's top level. Repeat it for
+    /// each path.
+    #[arg(long = "include-path")]
+    pub include_paths: Vec<String>,
+    /// Leave out paths under this one, whatever else says. Repeat it for each path.
+    #[arg(long = "exclude-path")]
+    pub exclude_paths: Vec<String>,
+    /// Say that the working tree is quiet for this capture. The host records what you said and
+    /// decides the consistency itself.
+    #[arg(long)]
+    pub quiesced: bool,
+    /// Refuse the capture unless its source reaches this consistency.
+    #[arg(long, value_enum)]
+    pub require: Option<ConsistencyArgument>,
+    /// Pin the version against its workspace, so removing the workspace accounts for it.
+    #[arg(long)]
+    pub pin: bool,
+    /// A note recorded with the version.
+    #[arg(long, default_value = "")]
+    pub note: String,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// `kr changeset read`.
+#[derive(Debug, Args)]
+pub struct ChangesetReadArguments {
+    /// The change set, by identifier.
+    pub change_set: String,
+    /// The version to read. The latest when absent.
+    #[arg(long)]
+    pub version: Option<u64>,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// What a materialisation is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum PurposeArgument {
+    /// A test run.
+    Test,
+    /// A reviewer's own copy.
+    Review,
+    /// Somebody looking at it.
+    Inspection,
+}
+
+/// `kr changeset materialize`.
+#[derive(Debug, Args)]
+pub struct ChangesetMaterializeArguments {
+    /// The change set, by identifier.
+    pub change_set: String,
+    /// The exact version to write.
+    pub version: u64,
+    /// What the copy is for.
+    #[arg(long, value_enum)]
+    pub purpose: PurposeArgument,
+    /// The label the copy is shown with. Its purpose when absent.
+    #[arg(long)]
+    pub label: Option<String>,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// One `kr diff` operation.
+#[derive(Debug, Subcommand)]
+pub enum DiffCommand {
+    /// Read the changes of a workspace's live tree or of a captured version.
+    Read(DiffReadArguments),
+    /// Apply a change-set version at the destination you name.
+    Apply(DiffApplyArguments),
+    /// Revert a change-set version at the destination you name.
+    Revert(DiffApplyArguments),
+}
+
+/// `kr diff read`.
+#[derive(Debug, Args)]
+pub struct DiffReadArguments {
+    /// The workspace whose live tree to read, by identifier.
+    #[arg(
+        long,
+        required_unless_present = "change_set",
+        conflicts_with = "change_set"
+    )]
+    pub workspace: Option<String>,
+    /// The change set whose captured version to read, by identifier.
+    #[arg(long, requires = "version")]
+    pub change_set: Option<String>,
+    /// The exact version of the change set to read.
+    #[arg(long, requires = "change_set")]
+    pub version: Option<u64>,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// Where an apply or a revert puts what it carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum DestinationArgument {
+    /// A new immutable version, written to no working tree.
+    Proposal,
+    /// A Git reference, moved only when it holds the value you expect.
+    Reference,
+    /// The workspace's own files, written in place. Conflict detection is best effort.
+    WorkingTree,
+}
+
+/// `kr diff apply` and `kr diff revert`.
+#[derive(Debug, Args)]
+pub struct DiffApplyArguments {
+    /// The change set, by identifier.
+    pub change_set: String,
+    /// The exact version of it.
+    pub version: u64,
+    /// Where it goes. There is no default.
+    #[arg(long, value_enum)]
+    pub to: DestinationArgument,
+    /// The workspace the destination is in, by identifier. Every destination but a bare proposal
+    /// names one.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// The full name of the reference a `reference` destination moves, such as `refs/heads/main`.
+    #[arg(long, requires = "reference_at")]
+    pub reference: Option<String>,
+    /// The value that reference holds now, or `absent` when it does not exist.
+    #[arg(long, requires = "reference")]
+    pub reference_at: Option<String>,
+    /// What one path holds now, as `PATH=DIGEST` with the digest `kr diff read` shows, or
+    /// `PATH=absent`. Repeat it for every path the change writes.
+    #[arg(long = "expect", value_name = "PATH=DIGEST")]
+    pub expect: Vec<String>,
+    /// Apply only this one of the version's changed paths. Repeat it for each; all of them when
+    /// absent.
+    #[arg(long = "path")]
+    pub paths: Vec<String>,
+    /// Check the destination and stop, whatever the check finds.
+    #[arg(long)]
+    pub preflight: bool,
+    /// A limitation of the destination you have read, exactly as the host states it. A write to a
+    /// working tree is refused until every one of them is passed back.
+    #[arg(long = "acknowledge", value_name = "LIMITATION")]
+    pub acknowledge: Vec<String>,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// One `kr device` operation.
+#[derive(Debug, Subcommand)]
+pub enum DeviceCommand {
+    /// List the paired devices, and the last authority revision each one acknowledged.
+    List(DeviceListArguments),
+    /// Revoke a device and every grant it holds.
+    Revoke(DeviceRevokeArguments),
+}
+
+/// `kr device list`.
+#[derive(Debug, Args)]
+pub struct DeviceListArguments {
+    /// Include devices that have been revoked.
+    #[arg(long)]
+    pub include_revoked: bool,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// `kr device revoke`.
+#[derive(Debug, Args)]
+pub struct DeviceRevokeArguments {
+    /// The device, by identifier.
+    pub device: String,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// One `kr plugin` operation.
+#[derive(Debug, Subcommand)]
+pub enum PluginCommand {
+    /// List the plugins installed in an environment.
+    List(PluginListArguments),
+    /// Install a package from an enrolled repository.
+    Install(PluginInstallArguments),
+    /// Remove an installed plugin.
+    Remove(PluginArguments),
+    /// Pin an installed plugin to one exact package hash, or release its pin.
+    Pin(PluginPinArguments),
+    /// Enable an installed plugin.
+    Enable(PluginArguments),
+    /// Disable an installed plugin without removing it.
+    Disable(PluginArguments),
+    /// Manage the repositories plugins come from and the trust placed in them.
+    #[command(subcommand)]
+    Repo(PluginRepoCommand),
+}
+
+/// `kr plugin list`.
+#[derive(Debug, Args)]
+pub struct PluginListArguments {
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// `kr plugin install`.
+#[derive(Debug, Args)]
+pub struct PluginInstallArguments {
+    /// The repository to install from.
+    pub catalogue: String,
+    /// The package, such as `kalareach/example-declarative`.
+    pub plugin: String,
+    /// The release.
+    pub version: String,
+    /// The exact package hash you expect, as `kr plugin repo sync` and the repository's index
+    /// name it.
+    #[arg(long)]
+    pub digest: String,
+    /// A capability to grant the installation. Repeat it for each capability.
+    #[arg(long = "grant", value_name = "CAPABILITY")]
+    pub grant: Vec<String>,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// `kr plugin remove`, `kr plugin enable` and `kr plugin disable`.
+#[derive(Debug, Args)]
+pub struct PluginArguments {
+    /// The installed package.
+    pub plugin: String,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// `kr plugin pin`.
+#[derive(Debug, Args)]
+pub struct PluginPinArguments {
+    /// The installed package.
+    pub plugin: String,
+    /// The exact package hash to hold it at. Without it the pin is released.
+    #[arg(long)]
+    pub digest: Option<String>,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// One `kr plugin repo` operation.
+#[derive(Debug, Subcommand)]
+pub enum PluginRepoCommand {
+    /// List the enrolled repositories, their roots, generations and budgets.
+    List(PluginListArguments),
+    /// Adopt a repository's trust root. Only an owner device can confirm that.
+    Add(PluginRepoAddArguments),
+    /// Fetch a repository's newest generation inside the trust it already has.
+    Sync(PluginRepoArguments),
+    /// Hold a repository at one generation, or release it.
+    Pin(PluginRepoPinArguments),
+    /// Remove a repository and stop trusting its root. What was installed from it stays.
+    Remove(PluginRepoArguments),
+}
+
+/// `kr plugin repo add`.
+#[derive(Debug, Args)]
+pub struct PluginRepoAddArguments {
+    /// The identifier this host gives the repository.
+    pub catalogue: String,
+    /// The trust root to adopt, as a file.
+    #[arg(long)]
+    pub root: PathBuf,
+    /// Where the repository's metadata lives.
+    #[arg(long)]
+    pub metadata_url: String,
+    /// Where the repository's targets live.
+    #[arg(long)]
+    pub targets_url: String,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// `kr plugin repo sync` and `kr plugin repo remove`.
+#[derive(Debug, Args)]
+pub struct PluginRepoArguments {
+    /// The repository.
+    pub catalogue: String,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// `kr plugin repo pin`.
+#[derive(Debug, Args)]
+pub struct PluginRepoPinArguments {
+    /// The repository.
+    pub catalogue: String,
+    /// The generation to hold it at. Without it the pin is released.
+    #[arg(long)]
+    pub generation: Option<u64>,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
 }
 
 /// One `kr pair` operation.

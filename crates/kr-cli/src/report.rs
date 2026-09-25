@@ -29,6 +29,43 @@ pub fn failure(error: &CliError) -> Value {
     })
 }
 
+/// Renders a host's answer as machine-readable output: the answer exactly as the host sent it,
+/// marked as a success.
+///
+/// # Errors
+///
+/// Returns [`CliError::Other`] when the answer cannot be written as JSON.
+pub fn answer<T: serde::Serialize>(answer: &T) -> Result<Value, CliError> {
+    let mut document = serde_json::to_value(answer).map_err(|error| {
+        CliError::Other(format!("the host's answer could not be written: {error}"))
+    })?;
+    match document.as_object_mut() {
+        Some(object) => {
+            object.insert("ok".to_owned(), Value::Bool(true));
+            Ok(document)
+        }
+        None => Ok(json!({ "ok": true, "answer": document })),
+    }
+}
+
+/// Returns the name a value of one of the protocol's named sets goes by on the wire, which is the
+/// name a person is shown.
+#[must_use]
+pub fn wire_name<T: serde::Serialize>(value: &T) -> String {
+    match serde_json::to_value(value) {
+        Ok(Value::String(name)) => name,
+        _ => String::from("unnamed"),
+    }
+}
+
+/// Prints one machine-readable document on standard output.
+pub fn print_json(document: &Value) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(document).unwrap_or_else(|_| "{}".to_owned())
+    );
+}
+
 /// Renders one session.
 #[must_use]
 pub fn session(summary: &SessionSummary) -> Value {

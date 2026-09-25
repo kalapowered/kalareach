@@ -11,6 +11,13 @@
 //! | [`account`] | The managed-service account token this host presents, and where it is kept |
 //! | [`bind`] | Which session, if any, this process is inside, as the sessions' workers answer |
 //! | [`pair`] | `kr pair`: invitations, approving the device that answers one, and the first owner |
+//! | [`daemon`] | Reaching an environment's control daemon for the commands below |
+//! | [`project`] | `kr project`: an environment's source repositories |
+//! | [`workspace`] | `kr workspace`: the shared and isolated working copies of a repository |
+//! | [`changeset`] | `kr changeset`: exact versions of a workspace's work |
+//! | [`diff`] | `kr diff`: reading changes, and applying or reverting one at a named destination |
+//! | [`device`] | `kr device`: the paired devices, and revoking one |
+//! | [`plugin`] | `kr plugin`: plugin packages and the repositories they come from |
 //! | [`resolve`] | Finding a session by number or identifier, and reaching its worker |
 //! | [`contact`] | The contact tools an agent reaches its person through, over the Model Context Protocol |
 //! | [`create`] | The palette a new session starts with |
@@ -30,13 +37,19 @@ pub mod account;
 pub mod attach;
 pub mod bind;
 pub mod bridge;
+pub mod changeset;
 pub mod cli;
 pub mod contact;
 pub mod create;
+pub mod daemon;
+pub mod device;
+pub mod diff;
 pub mod doctor;
 pub mod error;
 pub mod pair;
 pub mod platform;
+pub mod plugin;
+pub mod project;
 pub mod question;
 pub mod render;
 pub mod report;
@@ -46,6 +59,7 @@ pub mod shell;
 pub mod skill;
 pub mod terminal;
 pub mod windows;
+pub mod workspace;
 
 pub use crate::error::{CliError, Result};
 

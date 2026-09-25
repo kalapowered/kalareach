@@ -21,10 +21,22 @@ worker directly for what a session owns.
 | `kr host terminal` | — | Show the terminal applications this host has, and which one a new window opens in |
 | `kr bridge --stdio` | — | Serve this environment to a local process bridge on standard input and output |
 | `kr bridge [list/enrol/forget/refresh]` | — | The environments this host has enrolled, and what it last saw of them |
-| `kr pair [invite/confirm/cancel/status]` | — | Pair a device: issue an invitation, approve the device that answers it, withdraw one, or read one |
+| `kr pair [invite/confirm/cancel/status]` | `kr p` | Pair a device: issue an invitation, approve the device that answers it, withdraw one, or read one |
+| `kr project [list/init/clone/adopt]` | — | An environment's source repositories: list them, create one, clone one, or register a checkout that exists |
+| `kr workspace [list/create/remove]` | — | The shared or isolated working copies of a repository. A live session is never moved |
+| `kr changeset [capture/read/materialize]` | — | Capture an exact version of a workspace's work, read one, or write one out on its own |
+| `kr diff [read/apply/revert]` | — | Read changes, or apply or revert a change-set version at a destination you name |
+| `kr device [list/revoke]` | — | The devices paired with this host, and revoking one |
+| `kr plugin [list/install/remove/pin/enable/disable]` | — | Plugin packages and what they may do |
+| `kr plugin repo [list/add/sync/pin/remove]` | — | The repositories plugins come from, and the trust placed in them |
 
 `--help`, `--version` and `--json` work everywhere. A literal `--` ends option parsing. Neither
 shell commands nor paths are assembled by interpolating text.
+
+The commands from `kr project` to `kr plugin repo` act in this installation's own environment, or in
+the one `--environment <id>` names. Each is a client of one method the control daemon serves, and
+the daemon decides every refusal. A command that removes or revokes something names it by its
+identifier, never by a label or a number.
 
 A session is named by its display number or its identifier. Display numbers increase within an
 environment and are never reused. A number that names sessions in more than one environment is
@@ -800,6 +812,121 @@ and cannot establish it otherwise. So in a window opened after a session started
 This guard exists so that an agent running in a session cannot start the ceremony by accident. It
 is not isolation from other code running under the same account, which can do anything `kr` does.
 
+## `kr project`
+
+`kr project` works with an environment's source repositories. Plugin repositories are a separate
+thing, managed with `kr plugin repo`.
+
+| Command | What it does |
+| --- | --- |
+| `kr project list` | Lists the repositories, each with its state, its origin and how many workspaces it has |
+| `kr project init <path> [--label <label>] [--initial-branch <name>]` | Creates an empty repository in a new directory |
+| `kr project clone <source> <path> [--label <label>] [--remote-name <name>] [--credential-broker <name>]` | Clones into a new directory |
+| `kr project adopt <path> [--label <label>]` | Registers a Git checkout that already exists, and changes nothing inside it |
+
+`<path>` is a directory whose parent exists, and a relative one is taken from the directory `kr`
+runs in. The daemon opens the parent with this host's own authority and creates the one name inside
+it, so nothing lands anywhere else. Without `--label` a repository is labelled with its directory's
+name, and from then on it is named by the identifier the daemon gave it.
+
+A clone's source is an `https://` URL, an ssh remote (`ssh://host/path` or `user@host:path`), the
+absolute path of a repository on this machine, or the identifier of a repository this environment
+has registered. Anything else, a `git://` or `file://` URL included, is refused before anything is
+sent. The credential broker `--credential-broker` names authenticates a network remote; it is
+`os-secret-store` unless you say otherwise, and a URL that carries a credential is refused.
+
+## `kr workspace`
+
+| Command | What it does |
+| --- | --- |
+| `kr workspace list [--project <id>]` | Lists workspaces. Listing one never removes anything |
+| `kr workspace create <project> --kind shared` | Uses the repository's own tree, where it is |
+| `kr workspace create <project> --kind isolated --isolation <git-worktree\|independent-clone> --path <path> [--include <class>]... [--base <revision>] [--base-change-set <id>] [--preview]` | Makes a separate tree from a base |
+| `kr workspace remove <workspace> [--remove-retained]` | Removes a workspace once no live session or run is bound to it |
+
+There is no default kind. A shared workspace is the person's own tree, and all of their uncommitted
+work stays in it, so `--include` is refused there. An isolated one starts with the classes of
+uncommitted work `--include` names: `dirty-files`, `untracked-files`, `submodules`, `binary-files`,
+`generated-artefacts`, or `all`. A class it does not name is left out of the new tree and stays
+where it is in the original. A Git worktree shares the repository's objects and references under
+the same account, so it is not a sandbox, and an independent clone has objects of its own.
+
+`--preview` sends the same request with nothing written and prints what the workspace would hold:
+each class with how many of its paths would come across, the base revision, and what the host says
+the preview cannot promise.
+
+A removal keeps what the workspace still holds, which is its uncommitted work, the change sets
+pinned against it and review evidence. It lists them and leaves the workspace waiting, and
+`--remove-retained` removes them too. The tree of a shared workspace is never removed.
+
+## `kr changeset` and `kr diff`
+
+| Command | What it does |
+| --- | --- |
+| `kr changeset capture <workspace> (--label <label> \| --change-set <id>) [--include <class>]... [--include-path <path>]... [--exclude-path <path>]... [--quiesced] [--require <per-file\|quiesced\|atomic>] [--pin] [--note <text>]` | Records one immutable version of a workspace's work |
+| `kr changeset read <change-set> [--version <n>]` | Reads one exact version, the latest by default, with every version beside it |
+| `kr changeset materialize <change-set> <version> --purpose <test\|review\|inspection> [--label <label>]` | Writes one exact version into a directory of the host's own |
+| `kr diff read (--workspace <id> \| --change-set <id> --version <n>)` | Reads the changes of a live tree or of one captured version, each path with its content digest |
+| `kr diff apply <change-set> <version> --to <proposal\|reference\|working-tree> ...` | Applies that version at the destination named |
+| `kr diff revert <change-set> <version> --to <proposal\|reference\|working-tree> ...` | Reverts it there |
+
+A capture takes the classes of uncommitted work `--include` names and nothing else, the way an
+isolated workspace does. `--include-path` and `--exclude-path` narrow what it reads, and the host's
+own secret rules always apply. The version records the consistency the host could establish about
+its source: `per_file_capture`, `quiesced_capture` or `atomic_snapshot`. `--quiesced` records what
+you say about the tree and decides nothing, and `--require` refuses a capture that cannot reach the
+class it names.
+
+An apply names its destination every time. `proposal` records a new version and writes to no tree.
+`reference` moves the Git reference `--reference` names, and only while it holds the value
+`--reference-at` gives, or `absent` for one that does not exist yet. `working-tree` writes the
+workspace's own files in place. Every destination but a bare proposal names `--workspace`.
+
+Each path the change writes is named with `--expect PATH=DIGEST`, the digest being the one
+`kr diff read` shows, or with `--expect PATH=absent`, and the host checks every one before it
+writes. A destination that is not as expected is `DRAFT_CONFLICT`, and nothing is written. `--path`
+limits the apply to some of the version's paths and `--preflight` checks without writing. A write
+to a working tree is refused until you pass back each limitation the host states for it, with
+`--acknowledge`.
+
+## `kr device`
+
+`kr device list [--include-revoked]` lists the devices paired with this host: each one's
+identifier, its name, whether it is an owner device, and the last authority revision it
+acknowledged. A device that is offline cannot apply a revocation it has not received, and the
+acknowledgement is how you see which devices have.
+
+`kr device revoke <device>` revokes a device and every grant it holds. An identifier this host never
+paired is refused with `RESOURCE_UNAVAILABLE` and nothing is sent; a device already revoked answers
+with its revocation as it stands.
+
+## `kr plugin`
+
+| Command | What it does |
+| --- | --- |
+| `kr plugin list` | Lists the plugins installed in the environment |
+| `kr plugin install <repository> <plugin> <version> --digest <hash> [--grant <capability>]...` | Installs a package from an enrolled repository, at exactly the hash named |
+| `kr plugin remove <plugin>` | Removes an installed plugin and closes its live bindings |
+| `kr plugin pin <plugin> [--digest <hash>]` | Holds it at one exact hash, or releases the pin when no hash is given |
+| `kr plugin enable <plugin>` and `kr plugin disable <plugin>` | Enables it, or disables it without removing it |
+| `kr plugin repo list` | Lists the enrolled repositories with their roots, generations and budgets |
+| `kr plugin repo add <repository> --root <file> --metadata-url <url> --targets-url <url>` | Refused at a terminal, as below |
+| `kr plugin repo sync <repository>` | Fetches its newest generation inside the trust it already has |
+| `kr plugin repo pin <repository> [--generation <n>]` | Holds it at one generation, or releases it |
+| `kr plugin repo remove <repository>` | Stops trusting its root; what was installed from it stays installed |
+
+Two decisions are the owner's, and section 10 says this account's own identity is not the owner's
+confirmation. The first is adopting a repository's trust root. A request to add a repository
+carries an owner device's signed confirmation of exactly that root, so `kr plugin repo add` refuses
+with `OWNER_CONFIRMATION_REQUIRED` and sends nothing: add the repository from an owner device.
+
+The second is an installation that may do more than the one it replaces or, with none to replace,
+more than its repository permits by itself, and every release that installs a native bridge.
+`kr plugin install` asks without a confirmation, which is all an installation inside what is
+already permitted needs. When the host answers that this one needs the owner, `kr` exits with
+`OWNER_CONFIRMATION_REQUIRED` and says to confirm and install it from an owner device. It leaves no
+confirmation waiting.
+
 ## `kr host power`
 
 Automatic sleep is the machine's own policy, and `kr` changes it only when you ask:
@@ -956,3 +1083,9 @@ A direct invitation has `"mode": "direct"` and no `code` or `rendezvous_origin`.
 
 `kr pair confirm --json` returns `ok`, `invitation_id`, `device_id`, `grant_id`, `device_name` and
 `platform`.
+
+`kr project`, `kr workspace`, `kr changeset`, `kr diff`, `kr device` and `kr plugin` print the
+host's answer exactly as it sent it, with `ok` beside it. `kr project list --json` is
+`{ "ok": true, "projects": [ ... ] }`, and `kr workspace create --json` carries `workspace`, which
+is null for a preview, beside `preview` and `unapplied`. Identifiers are strings, and so are 64-bit
+counts, which the host writes as decimal text.
