@@ -114,6 +114,16 @@ impl Producer {
     }
 
     fn seal(&self, generation: u64, objects: &[StagedObject]) -> SealedArchive {
+        self.seal_with_manifest(generation, objects, object_id(0xf0))
+    }
+
+    /// Seals as [`Self::seal`] does, with the encrypted manifest under a name of the caller's.
+    fn seal_with_manifest(
+        &self,
+        generation: u64,
+        objects: &[StagedObject],
+        manifest_object_id: BackupObjectId,
+    ) -> SealedArchive {
         let mut recipients = ArchiveRecipients::new(CollectionKind::Owned);
         assert!(recipients.add(*self.device.public()));
         seal_archive(
@@ -124,7 +134,7 @@ impl Producer {
                 archive_id: archive_id(),
                 backup_generation: BackupGeneration::new(generation),
                 owner_device_id: owner_device(),
-                manifest_object_id: object_id(0xf0),
+                manifest_object_id,
                 created_at_ms: TimestampMs::new(1_700_000_000_000),
             },
             objects,
@@ -5603,7 +5613,8 @@ fn a_deletion_is_asked_for_once_only_for_what_no_other_generation_names_and_neve
         );
     }
 
-    // A newer generation is published, naming an object of its own and the same manifest.
+    // A newer generation is published, naming objects of its own only: the manifest the first two
+    // share stays theirs alone.
     {
         let service = BackupService::open(&state).expect("the service opens again");
         service
@@ -5612,7 +5623,7 @@ fn a_deletion_is_asked_for_once_only_for_what_no_other_generation_names_and_neve
         let third = [stage(3, "c.cbor", b"three")];
         let upload = service
             .admit(
-                &producer.seal(3, &third),
+                &producer.seal_with_manifest(3, &third, object_id(0xf3)),
                 &third,
                 writer,
                 TimestampMs::new(6_500),
@@ -5638,8 +5649,8 @@ fn a_deletion_is_asked_for_once_only_for_what_no_other_generation_names_and_neve
     }
 
     let mut store = BackupStore::open(&state).expect("the backup store");
-    // An object only the unknown generation names may be deleted now; the manifest two other
-    // generations name may not.
+    // An object only the unknown generation names may be deleted now; the manifest the second
+    // generation, still producing, names too may not.
     store
         .note_deletion_asked(archive_id(), generation_one, own, TimestampMs::new(7_000))
         .expect("an object only it names may be deleted");
@@ -5756,6 +5767,13 @@ fn a_deletion_is_asked_for_once_only_for_what_no_other_generation_names_and_neve
     assert!(
         matches!(fenced, Err(ControllerError::Refused { .. })),
         "{fenced:?}"
+    );
+    // Nor is a deletion written down before privacy mode sent again under it.
+    let resent =
+        store.note_deletion_asked(archive_id(), generation_one, own, TimestampMs::new(15_000));
+    assert!(
+        matches!(resent, Err(ControllerError::Refused { .. })),
+        "{resent:?}"
     );
     drop(store);
 

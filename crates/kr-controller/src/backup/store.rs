@@ -2512,7 +2512,8 @@ impl BackupStore {
     /// That the service does not hold the old generation is the caller's to have asked. From then
     /// on no generation this host admits names the object, so the request, and any later one for
     /// the same object, can only ever reach this object. A deletion already written down is left as
-    /// it is, so asking again after an unanswered request writes nothing new.
+    /// it is, so asking again after an unanswered request writes nothing new; privacy mode is read
+    /// for it again, since that alone can move after it was written down.
     ///
     /// # Errors
     ///
@@ -2535,6 +2536,44 @@ impl BackupStore {
             .connection
             .writing()
             .map_err(ControllerError::registry)?;
+        // Privacy mode first. It can move after a deletion is written down, so it is read for one
+        // already written down too, before its request is sent again.
+        if let Some(fenced) = inhibited_at(&transaction)? {
+            return Err(ControllerError::Refused {
+                code: kr_protocol::error::ErrorCode::PermissionDenied,
+                detail: format!(
+                    "no backup object is deleted while privacy mode holds, fenced at privacy \
+                     generation {fenced}"
+                ),
+            });
+        }
+        let admitted_under: Option<i64> = transaction
+            .read_one(
+                sql!(
+                    "SELECT privacy_generation FROM generations
+                  WHERE archive_id = ?1 AND backup_generation = ?2"
+                ),
+                params![archive, generation],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(ControllerError::registry)?;
+        let Some(admitted_under) = admitted_under else {
+            return Err(ControllerError::InvalidArgument(
+                "that backup generation is not one this host admitted".to_owned(),
+            ));
+        };
+        if admitted_under != current_generation(&transaction)? {
+            return Err(ControllerError::Refused {
+                code: kr_protocol::error::ErrorCode::PermissionDenied,
+                detail: "that generation belongs to work privacy mode drew its line under, whose \
+                         objects go only by the person's own action"
+                    .to_owned(),
+            });
+        }
+        // What else decides it cannot move against a deletion once it is written down: the
+        // generation's outcome, the newer publication, and the admission rule that keeps every
+        // other generation from naming the object. So one already written down is asked again.
         let asked: i64 = transaction
             .read_one(
                 sql!(
@@ -2588,33 +2627,7 @@ impl BackupStore {
                     .to_owned(),
             ));
         }
-        if let Some(fenced) = inhibited_at(&transaction)? {
-            return Err(ControllerError::Refused {
-                code: kr_protocol::error::ErrorCode::PermissionDenied,
-                detail: format!(
-                    "no backup object is deleted while privacy mode holds, fenced at privacy \
-                     generation {fenced}"
-                ),
-            });
-        }
-        let admitted_under: i64 = transaction
-            .read_one(
-                sql!(
-                    "SELECT privacy_generation FROM generations
-                  WHERE archive_id = ?1 AND backup_generation = ?2"
-                ),
-                params![archive, generation],
-                |row| row.get(0),
-            )
-            .map_err(ControllerError::registry)?;
-        if admitted_under != current_generation(&transaction)? {
-            return Err(ControllerError::Refused {
-                code: kr_protocol::error::ErrorCode::PermissionDenied,
-                detail: "that generation belongs to work privacy mode drew its line under, whose \
-                         objects go only by the person's own action"
-                    .to_owned(),
-            });
-        }
+
         let named: i64 = transaction
             .read_one(
                 sql!(
