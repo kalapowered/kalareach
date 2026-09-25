@@ -1,5 +1,6 @@
 //! tmux: the pane it draws against the grid the worker holds, a click between panes, focus
-//! passing through it, and an overlong control string and a broken character passed through it.
+//! passing through it, a key in xterm's `modifyOtherKeys` protocol, and an overlong control string
+//! and a broken character passed through it.
 
 use std::path::Path;
 use std::process::Command;
@@ -28,9 +29,17 @@ struct Tmux {
 
 impl Tmux {
     fn new(directory: &Path) -> Self {
+        Self::with(directory, "")
+    }
+
+    /// A server whose configuration adds `more` to the one every case runs with.
+    fn with(directory: &Path, more: &str) -> Self {
         let tmux = application("tmux");
-        std::fs::write(directory.join("tmux.conf"), CONFIGURATION)
-            .expect("writes the configuration");
+        std::fs::write(
+            directory.join("tmux.conf"),
+            format!("{CONFIGURATION}{more}"),
+        )
+        .expect("writes the configuration");
         Self {
             program: tmux.executable,
             socket: directory.join("tmux.sock"),
@@ -92,13 +101,13 @@ impl Drop for Tmux {
     }
 }
 
-fn no_query_reached_the_terminal(session: &Session) {
+async fn no_query_reached_the_terminal(session: &Session) {
     let asked = queries::find(&session.written());
     assert!(
         !asked.is_empty(),
         "tmux asked its terminal nothing, so this case shows nothing about queries"
     );
-    let reached = queries::find(&session.received());
+    let reached = queries::find(&session.received().await);
     assert!(
         reached.is_empty(),
         "the queries tmux asked reached the attached terminal: {}",
@@ -171,7 +180,7 @@ async fn the_pane_tmux_holds_is_the_grid_the_worker_holds() {
         }
     }
     assert!(disagreements.is_empty(), "{}", disagreements.join("\n"));
-    no_query_reached_the_terminal(&session);
+    no_query_reached_the_terminal(&session).await;
 }
 
 /// KR-ACC-004, KR-REQ-27.04: with the mouse on, tmux turns on SGR mouse reporting, and a click in
@@ -206,7 +215,7 @@ async fn a_click_in_the_other_pane_makes_it_the_active_one() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    no_query_reached_the_terminal(&session);
+    no_query_reached_the_terminal(&session).await;
 }
 
 /// KR-ACC-004, KR-REQ-27.04: tmux asks its terminal for focus events, and a focus report typed
@@ -235,7 +244,47 @@ async fn a_focus_report_reaches_the_program_in_the_pane_that_asked_for_it() {
         })
         .await;
     assert!(screen.shows("033   [   O 033   [   I"), "{screen}");
-    no_query_reached_the_terminal(&session);
+    no_query_reached_the_terminal(&session).await;
+}
+
+/// KR-ACC-004, KR-REQ-27.04: with extended keys on, tmux asks its terminal for xterm's
+/// `modifyOtherKeys` at level 2, and the session's snapshot records that level. A control-Enter
+/// typed in that protocol reaches the program in the pane, which asked for the same protocol, as
+/// that key rather than as a plain Enter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs the pinned applications; scripts/run-conformance.sh --group applications runs it"]
+async fn a_key_in_the_modify_other_keys_protocol_reaches_the_pane_that_asked_for_it() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let tmux = Tmux::with(
+        directory.path(),
+        "set -g extended-keys on\n\
+         set -g extended-keys-format xterm\n\
+         set -as terminal-features 'xterm*:extkeys'\n",
+    );
+    // The pane's program asks for modifyOtherKeys at level 2 and shows what it reads.
+    let mut session = Session::start(tmux.launch(
+        directory.path(),
+        "printf '\\033[>4;2mkr-keys\\n'; stty -icanon -echo; exec od -c",
+    ))
+    .await;
+    let screen = session
+        .wait_for("the pane's program", |screen| screen.shows("kr-keys"))
+        .await;
+    assert!(
+        screen.keyboard.contains("modify_other_keys: U64(2)"),
+        "tmux asked the session for modifyOtherKeys at level 2: {}",
+        screen.keyboard
+    );
+    // Control-Enter, as xterm writes it at that level: `CSI 27 ; 5 ; 13 ~`.
+    session.type_bytes(b"\x1b[27;5;13~");
+    // `od -c` writes what it read in blocks of sixteen bytes; the key's ten and six more fill one.
+    session.type_bytes(b"012345");
+    let key = "033   [   2   7   ;   5   ;   1   3   ~";
+    let screen = session
+        .wait_for("control-Enter in the pane", |screen| screen.shows(key))
+        .await;
+    assert!(screen.shows(key), "{screen}");
+    no_query_reached_the_terminal(&session).await;
 }
 
 /// KR-ACC-004, KR-REQ-27.04: an operating-system command longer than the profile's control-string
@@ -271,5 +320,5 @@ async fn an_overlong_control_string_and_a_broken_character_through_tmux_leave_it
         pane[..pane.len().min(grid.len())],
         "tmux's pane and the grid"
     );
-    no_query_reached_the_terminal(&session);
+    no_query_reached_the_terminal(&session).await;
 }

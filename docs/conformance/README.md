@@ -264,7 +264,14 @@ a worker, attaches to it over the worker's own endpoint with the product's clien
 the session's own input path. Each case compares the worker's snapshot of the canonical grid with the
 screen the program itself says it is showing, and shows that no query the program asked reached the
 attached terminal: the stream the attachment was sent is searched for every request a terminal
-answers, independently of the engine's own class table.
+answers, independently of the engine's own class table. That search waits until the attachment has
+provably been sent everything up to the end of the program's last query: the worker sends each event
+with the position in the stream it starts at or describes, in order, so once an event from past that
+point has arrived, nothing before it is still on its way. An attachment the worker tells to
+resynchronise subscribes again, as the product's own client does, and is sent a fresh screen from
+the session's position; one the worker moves to a projection is sent screens rather than bytes, so
+nothing the program writes reaches it at all. A capture that broke, through a lost connection, an
+event it could not decode, a refused subscription or a detach, fails the case.
 
 `tests/conformance/applications.lock` pins each program by URL and SHA-256 for each platform. The
 script fetches each release once into a cache outside the repository (`KR_CONFORMANCE_APPLICATIONS`,
@@ -280,7 +287,7 @@ with the reason, and its cases are reported as not run. Nothing is taken from a 
 | htop | 3.5.3 | The release's source | Its screen on the alternate screen and back; a click on its Quit label |
 | lazygit | 0.65.1 | The release's build | Its panels over a repository and back; a click on a commit |
 | fzf | 0.74.4 | The release's build | A typed query and its choice; a pasted CJK query; a click on an item |
-| tmux | 3.7c | The release's source | Its pane against the grid, row for row, with every sample's width as tmux's own; a click between panes; a focus report reaching the pane; an overlong control string and a broken character through it |
+| tmux | 3.7c | The release's source | Its pane against the grid, row for row, with every sample's width as tmux's own; a click between panes; a focus report reaching the pane; control-Enter in xterm's `modifyOtherKeys` protocol, which tmux asks the session for, reaching the pane that asked for it; an overlong control string and a broken character through it |
 | GNU screen | 5.0.2 | The release's source | Its window against the grid, row for row, as its own hardcopy shows it |
 
 A program with no build for a platform is not run there, and the result says why: htop, tmux and GNU
