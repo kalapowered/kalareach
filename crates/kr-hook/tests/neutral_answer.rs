@@ -336,3 +336,152 @@ fn kr_req_12_27_a_worker_that_never_answers_cannot_hold_a_hook() {
         assert!(ran.took < SHORTEST_TIMEOUT, "{case}: {:?}", ran.took);
     }
 }
+
+/// KR-REQ-12.27: a standard error nobody reads cannot hold a hook. With standard error a pipe that
+/// is full before the hook starts, every hook still writes `{}` and exits 0 inside the shortest
+/// timeout any registration names. The control, an empty pipe, still gets the diagnostic line.
+#[cfg(unix)]
+#[test]
+fn kr_req_12_27_a_standard_error_nobody_reads_cannot_hold_a_hook() {
+    let placed = Placed::new();
+    for hooks in every_application() {
+        for full in [true, false] {
+            let case = format!(
+                "{} with standard error {}",
+                hooks.application,
+                if full { "full" } else { "empty" }
+            );
+            let (mut diagnostics, writer) = std::io::pipe().expect("a pipe for standard error");
+            if full {
+                fill(&writer);
+            }
+            // Input the hook cannot read, which it says so about on standard error.
+            let held = run_beside(
+                placed.command(&[hooks.application, "hook"]),
+                b"not json",
+                writer,
+            );
+            assert!(
+                held.answered.is_some_and(|after| after < SHORTEST_TIMEOUT),
+                "{case}: no answer within {SHORTEST_TIMEOUT:?}"
+            );
+            assert_eq!(held.answer, b"{}\n", "{case}");
+            assert_eq!(
+                held.code,
+                Some(0),
+                "{case}: exited within {SHORTEST_TIMEOUT:?}: {:?}",
+                held.exited
+            );
+            if !full {
+                let mut said = String::new();
+                diagnostics
+                    .read_to_string(&mut said)
+                    .expect("the diagnostics are read");
+                assert!(
+                    said.starts_with("kr-hook: ")
+                        && said.ends_with('\n')
+                        && said.lines().count() == 1,
+                    "{case}: one diagnostic line: {said:?}"
+                );
+                assert_eq!(neutral(&held.answer, &said), Ok(()), "{case}");
+            }
+        }
+    }
+}
+
+/// What a hook did beside a standard error of the test's own.
+#[cfg(unix)]
+struct Held {
+    /// Everything it wrote to standard output.
+    answer: Vec<u8>,
+    /// How long after its start the first of that arrived, where it did in time.
+    answered: Option<Duration>,
+    /// Its exit code, where it exited in time.
+    code: Option<i32>,
+    /// How long after its start it exited, where it did in time.
+    exited: Option<Duration>,
+}
+
+/// Runs a hook with `input` on its standard input and `diagnostics` as its standard error, for at
+/// most [`SHORTEST_TIMEOUT`], and ends it if it is still running then.
+#[cfg(unix)]
+fn run_beside(
+    mut command: std::process::Command,
+    input: &[u8],
+    diagnostics: std::io::PipeWriter,
+) -> Held {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(diagnostics));
+    let started = Instant::now();
+    let mut child = command.spawn().expect("the forwarder starts");
+    // The command keeps the pipe's writing end until it is dropped, and the control reads the
+    // pipe to its end.
+    drop(command);
+    let mut stdin = child.stdin.take().expect("its input");
+    stdin.write_all(input).expect("the input is written");
+    drop(stdin);
+    let mut stdout = child.stdout.take().expect("its output");
+    let (first, arrived) = std::sync::mpsc::channel();
+    let reading = std::thread::spawn(move || {
+        let mut answer = Vec::new();
+        let mut buffer = [0_u8; 64];
+        while let Ok(count) = stdout.read(&mut buffer) {
+            if count == 0 {
+                break;
+            }
+            if answer.is_empty() {
+                let _ = first.send(started.elapsed());
+            }
+            answer.extend_from_slice(&buffer[..count]);
+        }
+        answer
+    });
+    let answered = arrived
+        .recv_timeout(SHORTEST_TIMEOUT.saturating_sub(started.elapsed()))
+        .ok();
+    let (code, exited) = loop {
+        if let Some(status) = child.try_wait().expect("the forwarder can be waited on") {
+            break (status.code(), Some(started.elapsed()));
+        }
+        if started.elapsed() >= SHORTEST_TIMEOUT {
+            // This test's own child, which it has not collected, so the number is still its.
+            let _ = child.kill();
+            let _ = child.wait();
+            break (None, None);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    Held {
+        answer: reading.join().expect("the output is read"),
+        answered,
+        code,
+        exited,
+    }
+}
+
+/// Fills a pipe until it takes nothing more, and leaves its writing end blocking again, as the
+/// standard error a hook is given would be.
+#[cfg(unix)]
+fn fill(pipe: &std::io::PipeWriter) {
+    use std::io::Write as _;
+
+    rustix::io::ioctl_fionbio(pipe, true).expect("a pipe that says when it is full");
+    let mut writer = pipe;
+    // Whole pages first, then single bytes, so no room is left that one short line could take.
+    for size in [4096_usize, 1] {
+        let bytes = vec![b'.'; size];
+        loop {
+            match writer.write(&bytes) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("the pipe could not be filled: {error}"),
+            }
+        }
+    }
+    rustix::io::ioctl_fionbio(pipe, false).expect("the pipe blocks again");
+}
