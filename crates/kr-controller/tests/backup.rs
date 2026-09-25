@@ -5677,6 +5677,7 @@ enum Asked {
     Abort(String),
     Publish(BackupGeneration),
     Fetch(BackupGeneration),
+    Delete(BackupObjectId),
 }
 
 /// The requests a fault can be scripted for.
@@ -5688,6 +5689,7 @@ enum Kind {
     Abort,
     Publish,
     Fetch,
+    Delete,
 }
 
 /// What the scripted service does with one request it was told to fail.
@@ -5733,6 +5735,8 @@ struct Scripted {
     deleted: BTreeSet<ArchiveId>,
     uploads: BTreeMap<String, ScriptedUpload>,
     stored: BTreeMap<(ArchiveId, BackupObjectId), Vec<u8>>,
+    /// Objects deleted, whose names are free again.
+    tombstoned: BTreeSet<(ArchiveId, BackupObjectId)>,
     times_stored: BTreeMap<(ArchiveId, BackupObjectId), u32>,
     times_written: BTreeMap<(String, u32), u32>,
     published: BTreeMap<(ArchiveId, BackupGeneration), BackupGenerationPublication>,
@@ -5754,7 +5758,9 @@ type PartHook = Box<dyn FnMut(u32) + Send>;
 /// it gave, and a publication sent again as a duplicate; a publication is held to its writer's
 /// signature, and a deleted collection takes neither an upload nor a publication. A collection
 /// takes no generation at or below the newest it has held, whatever order publications arrive in,
-/// and a fetch of the newest is answered with the highest generation it holds.
+/// and a fetch of the newest is answered with the highest generation it holds. A deletion makes a
+/// stored object a tombstone and frees its name; one of an object it holds none of is answered as
+/// the storage client answers the service's `NOT_FOUND`.
 struct Web {
     writer: AuthorisationKey,
     writer_key_id: KeyId,
@@ -6147,6 +6153,37 @@ impl Web {
         Ok(ArchiveAnswer::Done(completed))
     }
 
+    fn take_deletion(
+        &self,
+        archive_id: ArchiveId,
+        object_id: BackupObjectId,
+    ) -> kr_client::Result<ObjectDeleted> {
+        let mut state = self.scripted();
+        let identity = (archive_id, object_id);
+        let already = if state.stored.remove(&identity).is_some() {
+            state.tombstoned.insert(identity);
+            false
+        } else if state.tombstoned.contains(&identity) {
+            true
+        } else {
+            return Err(ClientError::Host(ProtocolError::new(
+                ErrorCode::UnknownSession,
+                "the service holds no stored object under that identity",
+            )));
+        };
+        Ok(ObjectDeleted {
+            already,
+            deleted_at: "2026-09-25T17:00:00.000Z".to_owned(),
+            purge_after: "2026-10-02T17:00:00.000Z".to_owned(),
+            retained_bytes: 0,
+            retention: RetentionPolicy {
+                daily_snapshots: 30,
+                tombstone_days: 7,
+                provider_recovery_days: 30,
+            },
+        })
+    }
+
     fn take_abandonment(
         &self,
         upload_id: &UploadId,
@@ -6377,10 +6414,13 @@ impl StorageService for Web {
 
     fn delete_object(
         &self,
-        _archive_id: ArchiveId,
-        _object_id: BackupObjectId,
+        archive_id: ArchiveId,
+        object_id: BackupObjectId,
     ) -> ServiceFuture<'_, ObjectDeleted> {
-        Box::pin(async { Err(not_scripted()) })
+        Box::pin(async move {
+            let fault = self.arriving(Kind::Delete, Asked::Delete(object_id));
+            answered(fault, || self.take_deletion(archive_id, object_id))
+        })
     }
 }
 
@@ -6495,15 +6535,34 @@ impl Host {
             .sequence
     }
 
+    /// Admits one generation whose members are these objects, named here, of these plaintext sizes.
+    fn admit_objects(&self, generation: u64, members: &[(BackupObjectId, usize)]) -> u64 {
+        self.try_admit_objects(generation, members)
+            .expect("the generation is admitted")
+            .sequence
+    }
+
     fn try_admit(&self, generation: u64, sizes: &[usize]) -> Result<Admitted, ControllerError> {
-        let objects: Vec<StagedObject> = sizes
+        let members: Vec<(BackupObjectId, usize)> = sizes
             .iter()
             .enumerate()
-            .map(|(index, size)| {
-                let member = member_of(generation, index);
+            .map(|(index, size)| (member_of(generation, index), *size))
+            .collect();
+        self.try_admit_objects(generation, &members)
+    }
+
+    fn try_admit_objects(
+        &self,
+        generation: u64,
+        members: &[(BackupObjectId, usize)],
+    ) -> Result<Admitted, ControllerError> {
+        let objects: Vec<StagedObject> = members
+            .iter()
+            .enumerate()
+            .map(|(index, (member, size))| {
                 stage_object(
                     &ObjectSource {
-                        object_id: member,
+                        object_id: *member,
                         filename: &format!("member-{index}.cbor"),
                         plaintext: &vec![0x5a; *size],
                     },
@@ -6615,6 +6674,7 @@ fn kind_of(step: &Stepped) -> &'static str {
         Stepped::Unabandoned { .. } => "unabandoned",
         Stepped::Stopped { .. } => "stopped",
         Stepped::Unknown { .. } => "unknown",
+        Stepped::Released { .. } => "released",
         Stepped::CollectionDeleted { .. } => "collection deleted",
         Stepped::Waiting { .. } => "waiting",
     }
@@ -6890,7 +6950,10 @@ async fn an_older_generation_the_service_has_passed_ends_once_and_is_not_sent_ag
     let mut uploader = host.uploader(10_000);
     let steps = passes(&mut uploader, 10_000).await;
     assert_eq!(host.generation(2).remote, Remote::Published);
-    let Some(Stepped::Stopped { reason, .. }) = steps.last() else {
+    let Some(reason) = steps.iter().find_map(|step| match step {
+        Stepped::Stopped { reason, .. } => Some(reason),
+        _ => None,
+    }) else {
         panic!("the older generation did not end: {steps:?}");
     };
     assert!(
@@ -6911,6 +6974,22 @@ async fn an_older_generation_the_service_has_passed_ends_once_and_is_not_sent_ag
         1,
         "refused once and not sent again"
     );
+    // What it stored is given back, since no publication can name it; the newer generation keeps
+    // everything.
+    for (generation, kept) in [(1, false), (2, true)] {
+        for object in host
+            .service
+            .objects(archive_id(), BackupGeneration::new(generation))
+            .expect("a read")
+        {
+            assert_eq!(
+                host.web.stored_bytes(object.object_id).is_some(),
+                kept,
+                "{object:?}"
+            );
+            assert_eq!(object.released_at_ms.is_none(), kept, "{object:?}");
+        }
+    }
     assert!(passes(&mut uploader, 11_000).await.is_empty());
 }
 
@@ -6983,9 +7062,9 @@ async fn after_a_crash_a_generation_the_service_does_not_hold_is_reported_unknow
         "backup attempt {} published its generation",
         publication + 2
     );
-    assert_eq!(
-        steps.last().map(Stepped::describe).as_deref(),
-        Some(published.as_str())
+    assert!(
+        steps.iter().any(|step| step.describe() == published),
+        "{steps:?}"
     );
     let completed: Vec<u64> = host
         .service
@@ -7061,6 +7140,326 @@ async fn after_a_crash_a_generation_the_service_does_not_hold_is_reported_unknow
             "{lines:?}"
         );
     }
+}
+
+/// Runs a host to where the crash case leaves it: generation 1's publication was dispatched and
+/// never sent, the host restarted, and it has stopped asking about it, so generation 1 is unknown.
+async fn a_host_with_an_unknown_generation(
+    members: &[(BackupObjectId, usize)],
+) -> (Host, Uploader) {
+    let mut host = Host::open();
+    let publication = host.admit_objects(1, members) + 1;
+    stop_between_dispatch_and_send(&host, publication).await;
+    let (mut uploader, _) = host.restart(20_000).await;
+    passes(&mut uploader, 20_000).await;
+    passes(&mut uploader, 20_000 + ADMISSIBLE_MS).await;
+    let record = host.generation(1);
+    assert_eq!(record.production, Production::Cancelled);
+    assert_eq!(record.remote, Remote::Unknown);
+    (host, uploader)
+}
+
+fn deletions(host: &Host) -> usize {
+    host.web.count(|asked| matches!(asked, Asked::Delete(_)))
+}
+
+/// What an unknown generation left at the service is given back. Once this host holds a newer
+/// generation of the archive as published, the service takes no publication of the unknown one any
+/// more, so nothing can name its objects. The uploader asks whether the service holds it, and when
+/// it does not, deletes each of its objects once and writes each deletion down; the service gives
+/// their storage back after its tombstone window. Nothing is deleted before that, and nothing
+/// twice, in this process or the next.
+#[tokio::test]
+async fn an_unknown_generations_objects_are_deleted_once_a_newer_one_is_published() {
+    let (mut host, mut uploader) =
+        a_host_with_an_unknown_generation(&[(member_of(1, 0), 64)]).await;
+    let unknown: Vec<BackupObjectId> = host
+        .service
+        .objects(archive_id(), BackupGeneration::new(1))
+        .expect("a read")
+        .iter()
+        .map(|object| object.object_id)
+        .collect();
+    assert_eq!(unknown.len(), 2, "a member and the encrypted manifest");
+    for object in &unknown {
+        assert!(host.web.stored_bytes(*object).is_some());
+    }
+
+    // The control: until a newer generation is published, the unknown one keeps everything.
+    assert!(passes(&mut uploader, 30_000).await.is_empty());
+    assert_eq!(deletions(&host), 0);
+
+    host.admit(2, &[64]);
+    let steps = passes(&mut uploader, 40_000).await;
+    assert_eq!(host.generation(2).remote, Remote::Published);
+    let released: Vec<&Stepped> = steps
+        .iter()
+        .filter(|step| kind_of(step) == "released")
+        .collect();
+    assert_eq!(released.len(), unknown.len(), "{steps:?}");
+    let said = released[0].describe();
+    assert!(said.contains("deleted at the service"), "{said}");
+    assert!(said.contains("no publication can name it"), "{said}");
+    for object in host
+        .service
+        .objects(archive_id(), BackupGeneration::new(1))
+        .expect("a read")
+    {
+        assert!(
+            host.web.stored_bytes(object.object_id).is_none(),
+            "{object:?}"
+        );
+        assert!(object.released_at_ms.is_some(), "written down: {object:?}");
+        assert!(object.is_acknowledged(), "what was acknowledged stays");
+    }
+    for object in host
+        .service
+        .objects(archive_id(), BackupGeneration::new(2))
+        .expect("a read")
+    {
+        assert!(
+            host.web.stored_bytes(object.object_id).is_some(),
+            "{object:?}"
+        );
+        assert_eq!(object.released_at_ms, None);
+    }
+
+    // Nothing more is asked, in this process or the next.
+    let asked = host.web.asked().len();
+    assert!(passes(&mut uploader, 50_000).await.is_empty());
+    let (mut uploader, _) = host.restart(60_000).await;
+    assert!(passes(&mut uploader, 60_000).await.is_empty());
+    assert_eq!(host.web.asked().len(), asked);
+    host.web.nothing_asked_twice();
+}
+
+/// A deletion whose answer never came back waits for the next pass, which asks again; the service
+/// answers with the tombstone it already made, and the release is written down once.
+#[tokio::test]
+async fn a_deletion_whose_answer_was_lost_is_asked_again_in_the_next_pass() {
+    let (host, mut uploader) = a_host_with_an_unknown_generation(&[(member_of(1, 0), 64)]).await;
+    host.web.fail(Kind::Delete, 1, Fault::Lost);
+    host.admit(2, &[64]);
+    let steps = passes(&mut uploader, 30_000).await;
+    assert!(
+        steps.iter().any(|step| matches!(
+            step,
+            Stepped::Waiting { reason } if reason.contains("was not deleted at the service yet")
+        )),
+        "{steps:?}"
+    );
+    let objects = host
+        .service
+        .objects(archive_id(), BackupGeneration::new(1))
+        .expect("a read");
+    for object in &objects {
+        assert!(object.released_at_ms.is_some(), "{object:?}");
+        assert!(
+            host.web.stored_bytes(object.object_id).is_none(),
+            "{object:?}"
+        );
+    }
+    assert_eq!(
+        host.web
+            .count(|asked| *asked == Asked::Delete(member_of(1, 0))),
+        2,
+        "the lost deletion and the one after it"
+    );
+    assert_eq!(deletions(&host), objects.len() + 1);
+}
+
+/// An object is deleted only when no generation this host still holds names it. This host's store
+/// keys each object by its generation, so nothing stops two generations of one archive naming the
+/// same object, and the service holds one object under that name: deleting it for one generation
+/// would delete it for the other. A generation still producing keeps every object it names, and
+/// what no other generation names is deleted.
+#[tokio::test]
+async fn an_object_a_producing_generation_names_is_never_deleted() {
+    let shared = object_id(0x51);
+    let own = object_id(0x52);
+    let (host, mut uploader) = a_host_with_an_unknown_generation(&[(shared, 64), (own, 64)]).await;
+    // Generation 2 waits to upload the object, which the service holds for generation 1, and
+    // generation 3 is published.
+    host.admit_objects(2, &[(shared, 64)]);
+    host.admit(3, &[64]);
+    passes(&mut uploader, 30_000).await;
+    assert_eq!(host.generation(2).production, Production::Producing);
+    assert_eq!(host.generation(3).remote, Remote::Published);
+    assert_eq!(
+        host.web.count(|asked| *asked == Asked::Delete(shared)),
+        0,
+        "the object generation 2 names is kept"
+    );
+    assert!(host.web.stored_bytes(shared).is_some());
+    assert_eq!(host.web.count(|asked| *asked == Asked::Delete(own)), 1);
+    assert!(host.web.stored_bytes(own).is_none());
+    for object in host
+        .service
+        .objects(archive_id(), BackupGeneration::new(1))
+        .expect("a read")
+    {
+        assert_eq!(
+            object.released_at_ms.is_some(),
+            object.object_id != shared,
+            "{object:?}"
+        );
+    }
+}
+
+/// A generation the service holds as published keeps every object it names, when a generation
+/// whose outcome is unknown names one of them too.
+#[tokio::test]
+async fn an_object_a_published_generation_names_is_never_deleted() {
+    let shared = object_id(0x61);
+    let own = object_id(0x62);
+    let host = Host::open();
+    host.admit_objects(1, &[(shared, 64), (own, 64)]);
+    host.admit_objects(2, &[(shared, 64)]);
+    // Generation 1's first creation never arrives, so generation 2 uploads the object it names
+    // and is published, and generation 1 then waits on that object.
+    host.web.fail(Kind::Create, 1, Fault::Dropped);
+    let mut uploader = host.uploader(10_000);
+    passes(&mut uploader, 10_000).await;
+    assert_eq!(host.generation(2).remote, Remote::Published);
+    // Its staged copy of that object goes, so generation 1 can never be sent: it stops with its
+    // outcome unknown.
+    let staged = host
+        .service
+        .objects(archive_id(), BackupGeneration::new(1))
+        .expect("a read")
+        .into_iter()
+        .find(|object| object.object_id == shared)
+        .expect("the shared object")
+        .staged_path;
+    std::fs::remove_file(&staged).expect("the staged copy is removed");
+    passes(&mut uploader, 11_000).await;
+    let record = host.generation(1);
+    assert_eq!(record.production, Production::Cancelled);
+    assert_eq!(record.remote, Remote::Unknown);
+    assert_eq!(
+        host.web.count(|asked| *asked == Asked::Delete(shared)),
+        0,
+        "the object the published generation names is kept"
+    );
+    assert!(host.web.stored_bytes(shared).is_some());
+    assert_eq!(host.web.newest(), host.web.publication(2));
+    assert_eq!(
+        host.web.count(|asked| *asked == Asked::Delete(own)),
+        1,
+        "asked once, and the service holds none of it"
+    );
+}
+
+/// An unknown generation the service turns out to hold keeps its objects: its publication reached
+/// the service before the newer one, so the service holds it as published, and so does this host
+/// once it asks.
+#[tokio::test]
+async fn an_unknown_generation_the_service_holds_is_written_down_published_and_keeps_its_objects() {
+    let mut host = Host::open();
+    host.admit(1, &[64]);
+    host.web.fail(Kind::Publish, 1, Fault::Delayed);
+    {
+        let mut uploader = host.uploader(10_000);
+        let stopped = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            uploader.pass(TimestampMs::new(10_000)),
+        )
+        .await;
+        assert!(stopped.is_err(), "the host stopped with it on its way");
+    }
+    let (mut uploader, _) = host.restart(20_000).await;
+    passes(&mut uploader, 20_000).await;
+    passes(&mut uploader, 20_000 + ADMISSIBLE_MS).await;
+    assert_eq!(host.generation(1).remote, Remote::Unknown);
+
+    // It lands after this host stopped asking, and before the next generation is published.
+    let answers = host.web.deliver_late();
+    assert!(
+        matches!(answers.as_slice(), [Ok(ArchiveAnswer::Done(_))]),
+        "{answers:?}"
+    );
+    host.admit(2, &[64]);
+    let steps = passes(&mut uploader, 30_000).await;
+    assert!(
+        steps.iter().any(|step| matches!(
+            step,
+            Stepped::Published {
+                publication: Publication::RetainedArtifact { .. },
+                ..
+            }
+        )),
+        "{steps:?}"
+    );
+    assert_eq!(host.generation(1).remote, Remote::Published);
+    assert_eq!(deletions(&host), 0);
+    for object in host
+        .service
+        .objects(archive_id(), BackupGeneration::new(1))
+        .expect("a read")
+    {
+        assert!(
+            host.web.stored_bytes(object.object_id).is_some(),
+            "{object:?}"
+        );
+        assert_eq!(object.released_at_ms, None);
+    }
+}
+
+/// Privacy mode's retained artifacts are deleted only by the person's own action. An unknown
+/// generation stays as it is while privacy mode is on, and after it is off again, since it belongs
+/// to the work privacy mode drew its line under.
+#[tokio::test]
+async fn an_unknown_generation_privacy_mode_keeps_is_never_deleted() {
+    let (host, mut uploader) = a_host_with_an_unknown_generation(&[(member_of(1, 0), 64)]).await;
+    host.admit(2, &[64]);
+    steps_until(&mut uploader, 30_000, "published").await;
+    host.service
+        .raise_fence(PrivacyGeneration::new(1), TimestampMs::new(31_000))
+        .expect("the fence is raised");
+    passes(&mut uploader, 32_000).await;
+    assert_eq!(deletions(&host), 0, "nothing is deleted under the fence");
+
+    host.service
+        .run_cleanup(PrivacyGeneration::new(1), TimestampMs::new(33_000))
+        .expect("the cleanup runs");
+    assert_eq!(
+        host.service
+            .release_fence(
+                PrivacyGeneration::new(1),
+                PrivacyGeneration::new(2),
+                TimestampMs::new(34_000),
+            )
+            .expect("the release is attempted"),
+        FenceRelease::Released
+    );
+    host.admit(3, &[64]);
+    passes(&mut uploader, 35_000).await;
+    assert_eq!(host.generation(3).remote, Remote::Published);
+    assert_eq!(deletions(&host), 0, "nor after privacy mode is off");
+    for object in host
+        .service
+        .objects(archive_id(), BackupGeneration::new(1))
+        .expect("a read")
+    {
+        assert!(
+            host.web.stored_bytes(object.object_id).is_some(),
+            "{object:?}"
+        );
+    }
+}
+
+/// A collection deleted from the account console is the service's to empty: this host asks for
+/// nothing of it once it has been told.
+#[tokio::test]
+async fn an_unknown_generation_whose_collection_was_deleted_is_never_deleted() {
+    let (host, mut uploader) = a_host_with_an_unknown_generation(&[(member_of(1, 0), 64)]).await;
+    host.admit(2, &[64]);
+    steps_until(&mut uploader, 30_000, "published").await;
+    host.web.delete_collection(archive_id());
+    host.admit(3, &[64]);
+    let steps = passes(&mut uploader, 31_000).await;
+    assert!(kinds(&steps).contains(&"collection deleted"), "{steps:?}");
+    assert_eq!(deletions(&host), 0);
 }
 
 /// A process can also stop while an answer is on its way back. The request it had sent is asked

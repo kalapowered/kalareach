@@ -2467,6 +2467,17 @@ content. An unknown generation changes nothing newer either. The backup manifest
 publication that reaches it after a newer generation is published, and a fetch of the newest still
 answers with the newer generation.
 
+What an unknown generation stored is given back. The storage service keeps a stored object until
+something deletes it, so once this host holds a newer generation of the archive as published, the
+uploader asks whether the service holds the unknown one. If it does, the publication landed before
+the newer one: the generation is written down as published and keeps everything. If not, it never
+will, so each of its objects is deleted once, each answer is written down in `backup.sqlite`'s
+`releases` table, and the service gives the storage back after its tombstone window. An object that
+another generation this host still holds also names is kept, because the service holds one object
+under one name, and the store refuses to write such an object down as released. Nothing is deleted
+under privacy mode's line, whose retained artifacts go only by the person's own action, and nothing
+of a collection deleted from the account console.
+
 An attempt ends on evidence about its own work. A collection deleted from the account console
 stops the attempt, retires this host's writer for that archive and cancels what it was still
 producing there, and the report says the collection was deleted and that backing up again means

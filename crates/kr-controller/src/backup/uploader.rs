@@ -72,6 +72,20 @@
 //! generation is published, the service refuses it, because it takes no generation at or below
 //! the newest it has held, and a fetch of the newest is answered with the highest generation held.
 //!
+//! # What an unknown generation leaves at the service
+//!
+//! Every object an unknown generation stored is still at the service, and nothing the service does
+//! gives that storage back: it keeps a stored object until something deletes it. So the uploader
+//! does, once nothing can name the objects any more, which is when this host holds a newer
+//! generation of the archive as published. It asks whether the service holds the unknown one,
+//! which it does if the publication landed before the newer one: that one is written down as
+//! published and keeps everything. Otherwise it never will, and each of its objects is deleted
+//! once and the answer written down, and the service gives the storage back after its tombstone
+//! window. An object another generation this host still holds also names is kept, because the
+//! service holds one object under one name. Nothing is deleted under privacy mode's line, whose
+//! retained artifacts go only by the person's own action, nor from a collection deleted from the
+//! account console, which the service empties itself.
+//!
 //! # A restart with a publication on its way
 //!
 //! [`Uploader::settle`] makes that fetch for every publication an earlier process dispatched, and a
@@ -93,10 +107,10 @@
 //!
 //! # What this host sends
 //!
-//! Staged ciphertext and the public descriptor, and nothing else. A staged object is read back and
-//! held to the length and hash it was admitted with before any of it leaves. Nothing is sent before
-//! this host has reconciled its store, and nothing new while the storage service says backup
-//! storage is off.
+//! Staged ciphertext, the public descriptor, and the deletion of objects no publication can name,
+//! and nothing else. A staged object is read back and held to the length and hash it was admitted
+//! with before any of it leaves. Nothing is sent before this host has reconciled its store, and
+//! nothing new while the storage service says backup storage is off.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -122,7 +136,7 @@ use kr_worker::privacy::PrivacyGeneration;
 use crate::backup::BackupService;
 use crate::backup::store::{
     Attempt, AttemptStatus, GenerationRecord, ObjectRecord, PrivacyStatus, Production, Publication,
-    Step, UploadRecord,
+    Remote, Step, UploadRecord,
 };
 use crate::error::{ControllerError, Result};
 
@@ -238,6 +252,24 @@ pub enum Stepped {
         /// carries content from before that line.
         privacy: Option<String>,
     },
+    /// The service no longer holds one object of a generation no publication can name, so the
+    /// storage it took is given back.
+    ///
+    /// The generation's outcome was unknown, this host holds a newer generation of the archive as
+    /// published, so the service takes no publication of the old one any more, and the service
+    /// said it does not hold that one. This host asked for the object's deletion and wrote the
+    /// answer down.
+    Released {
+        /// The archive.
+        archive_id: ArchiveId,
+        /// The generation that named the object.
+        backup_generation: BackupGeneration,
+        /// The object.
+        object_id: BackupObjectId,
+        /// Whether the service deleted it, rather than answering that it holds no object of that
+        /// name.
+        deleted: bool,
+    },
     /// The archive's collection was deleted from the account console.
     ///
     /// The attempt is stopped, this host's writer for that archive is retired and what it was still
@@ -321,6 +353,27 @@ impl Stepped {
                 backup_generation.get(),
                 never_complete(privacy.as_deref())
             ),
+            Self::Released {
+                archive_id,
+                backup_generation,
+                object_id,
+                deleted: true,
+            } => format!(
+                "object {object_id} of backup generation {} of archive {archive_id} is deleted at \
+                 the service, since no publication can name it, and its storage is given back \
+                 after the service's tombstone window",
+                backup_generation.get()
+            ),
+            Self::Released {
+                archive_id,
+                backup_generation,
+                object_id,
+                deleted: false,
+            } => format!(
+                "the service holds no object {object_id} of backup generation {} of archive \
+                 {archive_id}, which no publication can name, so nothing of it is charged",
+                backup_generation.get()
+            ),
             Self::CollectionDeleted {
                 sequence,
                 archive_id,
@@ -390,6 +443,8 @@ struct Turn {
     restarted: BTreeSet<(ArchiveId, BackupGeneration, BackupObjectId)>,
     /// Uploads that could not be abandoned in this pass.
     unabandoned: BTreeSet<String>,
+    /// Generations left behind whose reclamation waited in this pass.
+    unreclaimed: BTreeSet<(ArchiveId, BackupGeneration)>,
 }
 
 /// The executor that carries the backup outbox.
@@ -406,6 +461,9 @@ pub struct Uploader {
     dispatched_here: BTreeSet<u64>,
     /// Publication attempts whose request this process sent without an answer, and when.
     unanswered: BTreeMap<u64, u64>,
+    /// Generations left behind that this process asked the service about and found it does not
+    /// hold. Nothing can publish one after that, so the answer stands.
+    unheld: BTreeSet<(ArchiveId, BackupGeneration)>,
 }
 
 impl fmt::Debug for Uploader {
@@ -441,6 +499,7 @@ impl Uploader {
             started_at_ms: now.get(),
             dispatched_here: BTreeSet::new(),
             unanswered: BTreeMap::new(),
+            unheld: BTreeSet::new(),
         }
     }
 
@@ -506,10 +565,15 @@ impl Uploader {
             return Ok(report);
         }
         let uploads = self.backup.store().uploads()?;
-        if self.backup.outbox()?.is_empty() && uploads.is_empty() {
+        let outbox = self.backup.outbox()?;
+        let privacy = self.backup.privacy_status()?;
+        if outbox.is_empty()
+            && uploads.is_empty()
+            && self.reclaimable(&outbox, &privacy)?.is_empty()
+        {
             return Ok(report);
         }
-        if self.backup.privacy_status()?.inhibited_at().is_none() {
+        if privacy.inhibited_at().is_none() {
             match self.storage.status().await {
                 Ok(status) if status.backup == BackupState::On => {}
                 Ok(_) => {
@@ -598,7 +662,10 @@ impl Uploader {
             }
             return Ok(Some(stepped));
         }
-        self.abandon_what_was_left(&outbox, &privacy, turn).await
+        if let Some(stepped) = self.abandon_what_was_left(&outbox, &privacy, turn).await? {
+            return Ok(Some(stepped));
+        }
+        self.reclaim(&outbox, &privacy, now, turn).await
     }
 
     /* ---------------------------------------------------------------------- */
@@ -1349,6 +1416,289 @@ impl Uploader {
             kr_crypto::sign::sign(&self.writer, &transcript).map_err(|error| unsigned(&error))?;
         Ok(BackupGenerationPublication { payload, signature })
     }
+
+    /* ---------------------------------------------------------------------- */
+    /* What an unknown generation left at the service                          */
+    /* ---------------------------------------------------------------------- */
+
+    /// Gives back, one object a step, what a generation no publication can name left at the
+    /// service.
+    ///
+    /// A generation left behind is asked about first: the service holding it means its
+    /// publication landed before the newer one, and it is written down as published and keeps
+    /// everything. One the service does not hold never will, so each of its objects that no other
+    /// generation still names is deleted, and the answer written down.
+    async fn reclaim(
+        &mut self,
+        outbox: &[Attempt],
+        privacy: &PrivacyStatus,
+        now: TimestampMs,
+        turn: &mut Turn,
+    ) -> Result<Option<Stepped>> {
+        loop {
+            let Some(work) = self
+                .reclaimable(outbox, privacy)?
+                .into_iter()
+                .find(|work| !turn.unreclaimed.contains(&work.generation_key()))
+            else {
+                return Ok(None);
+            };
+            let generation = match work {
+                Reclaim::Delete(generation, object) => {
+                    return self
+                        .release(&generation, &object, now, turn)
+                        .await
+                        .map(Some);
+                }
+                Reclaim::Ask(generation) => generation,
+            };
+            let generation_key = generation_key(&generation);
+            match self.held(&generation).await {
+                // Its objects can be deleted now, in this step.
+                Ok(false) => {
+                    self.unheld.insert(generation_key);
+                }
+                Ok(true) => return self.found_published(&generation, now, turn).map(Some),
+                Err(error) => {
+                    turn.unreclaimed.insert(generation_key);
+                    return Ok(Some(Stepped::Waiting {
+                        reason: format!(
+                            "whether the service holds backup generation {} of archive {}, which \
+                             no publication can name any more, is not known: {error}",
+                            generation.backup_generation.get(),
+                            generation.archive_id
+                        ),
+                    }));
+                }
+            }
+        }
+    }
+
+    /// What can be done now about generations no publication can name, in the order of the store.
+    ///
+    /// Each such generation is asked about until the service is known not to hold it: this
+    /// process asked, or a deletion of one of its objects is written down, which is only ever
+    /// asked for after that. Then each object of it is deleted that is not yet written down as
+    /// released and that no other generation this host records names, unless that generation is
+    /// one no publication can name either and the service is known not to hold. Nothing is done
+    /// under privacy mode, whose retained artifacts are deleted only by the person's own action.
+    fn reclaimable(&self, outbox: &[Attempt], privacy: &PrivacyStatus) -> Result<Vec<Reclaim>> {
+        if privacy.inhibited_at().is_some() {
+            return Ok(Vec::new());
+        }
+        let generations = self.backup.generations()?;
+        let uploads = self.backup.store().uploads()?;
+        let mut behind: Vec<(GenerationRecord, Vec<ObjectRecord>, bool)> = Vec::new();
+        for record in &generations {
+            if !self.left_behind(record, &generations, outbox, &uploads, privacy)? {
+                continue;
+            }
+            let objects = self
+                .backup
+                .objects(record.archive_id, record.backup_generation)?;
+            let unheld = self.unheld.contains(&generation_key(record))
+                || objects.iter().any(|object| object.released_at_ms.is_some());
+            behind.push((record.clone(), objects, unheld));
+        }
+        if behind.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Every generation of each archive that names each object, whatever its state.
+        let mut named: BTreeMap<(ArchiveId, BackupObjectId), Vec<BackupGeneration>> =
+            BTreeMap::new();
+        for record in &generations {
+            if !behind
+                .iter()
+                .any(|(left, _, _)| left.archive_id == record.archive_id)
+            {
+                continue;
+            }
+            for object in self
+                .backup
+                .objects(record.archive_id, record.backup_generation)?
+            {
+                named
+                    .entry((object.archive_id, object.object_id))
+                    .or_default()
+                    .push(record.backup_generation);
+            }
+        }
+        let settled = |archive_id: ArchiveId, backup_generation: BackupGeneration| {
+            behind.iter().any(|(left, _, unheld)| {
+                *unheld
+                    && left.archive_id == archive_id
+                    && left.backup_generation == backup_generation
+            })
+        };
+        let mut work = Vec::new();
+        for (record, objects, unheld) in &behind {
+            let unreleased = objects
+                .iter()
+                .filter(|object| object.released_at_ms.is_none());
+            if !*unheld {
+                if objects.iter().any(|object| object.released_at_ms.is_none()) {
+                    work.push(Reclaim::Ask(record.clone()));
+                }
+                continue;
+            }
+            for object in unreleased {
+                let held_elsewhere = named
+                    .get(&(object.archive_id, object.object_id))
+                    .into_iter()
+                    .flatten()
+                    .any(|other| {
+                        *other != record.backup_generation && !settled(record.archive_id, *other)
+                    });
+                if !held_elsewhere {
+                    work.push(Reclaim::Delete(record.clone(), object.clone()));
+                }
+            }
+        }
+        Ok(work)
+    }
+
+    /// Whether no publication can name `record` any more, and nothing of it is still in hand.
+    ///
+    /// Its production ended with its outcome unknown, no attempt or upload of it is open, privacy
+    /// mode drew no line under it, its writer is still enrolled for the archive, so no deleted
+    /// collection is touched, and this host holds a newer generation of the archive as published:
+    /// the service takes no generation at or below the newest it has held.
+    fn left_behind(
+        &self,
+        record: &GenerationRecord,
+        generations: &[GenerationRecord],
+        outbox: &[Attempt],
+        uploads: &[UploadRecord],
+        privacy: &PrivacyStatus,
+    ) -> Result<bool> {
+        let key = generation_key(record);
+        if record.production != Production::Cancelled
+            || record.remote != Remote::Unknown
+            || privacy_line(record, privacy).is_some()
+            || outbox
+                .iter()
+                .any(|attempt| (attempt.archive_id, attempt.backup_generation) == key)
+            || uploads
+                .iter()
+                .any(|upload| (upload.archive_id, upload.backup_generation) == key)
+        {
+            return Ok(false);
+        }
+        let passed = generations.iter().any(|newer| {
+            newer.archive_id == record.archive_id
+                && newer.backup_generation > record.backup_generation
+                && newer.remote == Remote::Published
+        });
+        Ok(passed
+            && self
+                .backup
+                .store()
+                .authorises(record.archive_id, record.writer_key_id)?)
+    }
+
+    /// Deletes one object of a generation no publication can name, and writes the answer down.
+    ///
+    /// A deletion the service answered and one it answered by holding no object of that name
+    /// both end with nothing of it charged beyond the service's tombstone window. Any other answer
+    /// leaves it for the next pass.
+    async fn release(
+        &mut self,
+        generation: &GenerationRecord,
+        object: &ObjectRecord,
+        now: TimestampMs,
+        turn: &mut Turn,
+    ) -> Result<Stepped> {
+        let deleted = match self
+            .storage
+            .delete_object(generation.archive_id, object.object_id)
+            .await
+        {
+            Ok(_) => true,
+            Err(error) if error.code() == ErrorCode::UnknownSession => false,
+            Err(error) => {
+                turn.unreclaimed.insert(generation_key(generation));
+                return Ok(Stepped::Waiting {
+                    reason: format!(
+                        "object {} of backup generation {} of archive {} was not deleted at the \
+                         service yet: {error}",
+                        object.object_id,
+                        generation.backup_generation.get(),
+                        generation.archive_id
+                    ),
+                });
+            }
+        };
+        let recorded = self.backup.store().note_object_released(
+            generation.archive_id,
+            generation.backup_generation,
+            object.object_id,
+            now,
+        );
+        let stepped = match recorded {
+            Ok(()) => Stepped::Released {
+                archive_id: generation.archive_id,
+                backup_generation: generation.backup_generation,
+                object_id: object.object_id,
+                deleted,
+            },
+            Err(error) => waiting_on(error)?,
+        };
+        if matches!(stepped, Stepped::Waiting { .. }) {
+            turn.unreclaimed.insert(generation_key(generation));
+        }
+        Ok(stepped)
+    }
+
+    /// Writes down a generation of unknown outcome the service turns out to hold: its publication
+    /// reached the service after all, under the attempt that sent it.
+    fn found_published(
+        &mut self,
+        generation: &GenerationRecord,
+        now: TimestampMs,
+        turn: &mut Turn,
+    ) -> Result<Stepped> {
+        let sent = self.backup.attempts()?.into_iter().find(|attempt| {
+            attempt.archive_id == generation.archive_id
+                && attempt.backup_generation == generation.backup_generation
+                && attempt.step == Step::Publish
+        });
+        let stepped = match sent {
+            Some(attempt) => self.published(&attempt, now)?,
+            None => Stepped::Waiting {
+                reason: format!(
+                    "the service holds backup generation {} of archive {}, which this host has no \
+                     record of sending, so everything it named is kept",
+                    generation.backup_generation.get(),
+                    generation.archive_id
+                ),
+            },
+        };
+        if matches!(stepped, Stepped::Waiting { .. }) {
+            turn.unreclaimed.insert(generation_key(generation));
+        }
+        Ok(stepped)
+    }
+}
+
+/// One thing that can be done about a generation no publication can name any more.
+enum Reclaim {
+    /// Ask the service whether it holds the generation.
+    Ask(GenerationRecord),
+    /// Delete one object of a generation the service does not hold.
+    Delete(GenerationRecord, ObjectRecord),
+}
+
+impl Reclaim {
+    fn generation_key(&self) -> (ArchiveId, BackupGeneration) {
+        match self {
+            Self::Ask(generation) | Self::Delete(generation, _) => generation_key(generation),
+        }
+    }
+}
+
+/// One generation, as the uploader keys what it knows about it.
+const fn generation_key(generation: &GenerationRecord) -> (ArchiveId, BackupGeneration) {
+    (generation.archive_id, generation.backup_generation)
 }
 
 /// Whether `generation` may still produce: nothing inhibits production, it is producing, and it was
