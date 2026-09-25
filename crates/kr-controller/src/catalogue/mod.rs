@@ -30,6 +30,7 @@
 
 use std::sync::Arc;
 
+use kr_plugin_catalogue::transport::RepositoryTransport;
 use kr_plugin_catalogue::{
     Authority, CapabilityCeiling, Catalogue, CatalogueError, CatalogueResult, Change, Claimed,
     Effect, Enrolment, Installation, InstallationGrant, InstallationView, Owner, ReceiptClaim,
@@ -175,6 +176,21 @@ impl Authority for Confirmed<'_> {
     }
 }
 
+/// How this host's catalogue reaches its repositories.
+///
+/// A directory on this host is read where it is, and an address is fetched with this product's
+/// trust and through `proxy`, or directly when that is `None`. A host whose certificate
+/// verification cannot be set up still reads the repositories on its own disk, and says why
+/// whenever it is asked to fetch one.
+fn repository_transport(proxy: Option<&kr_transport::config::ProxyUrl>) -> RepositoryTransport {
+    match kr_client::services::http::client_builder(proxy) {
+        Ok(builder) => RepositoryTransport::over(builder),
+        Err(error) => {
+            RepositoryTransport::local_only(format!("this host fetches no repository: {error}"))
+        }
+    }
+}
+
 /// The catalogue, as the daemon holds it.
 #[derive(Debug)]
 pub struct CatalogueModule {
@@ -189,16 +205,24 @@ impl CatalogueModule {
     /// one serves anything: its change may have been made, so it is never performed again and
     /// never reported as refused.
     ///
+    /// Its repositories are fetched with this product's trust and through `proxy`, the one this
+    /// host's configuration document selected when the daemon started, or directly when it
+    /// selected none; a directory on this host is read where it is.
+    ///
     /// # Errors
     ///
     /// Returns [`crate::ControllerError::RegistryUnavailable`] when the catalogue's directory or
     /// its records cannot be opened.
-    pub fn open(paths: &kr_ipc::paths::EnvironmentPaths) -> crate::Result<Self> {
+    pub fn open(
+        paths: &kr_ipc::paths::EnvironmentPaths,
+        proxy: Option<&kr_transport::config::ProxyUrl>,
+    ) -> crate::Result<Self> {
         let root = paths.state_dir().join("catalogue");
         let unavailable = |error: CatalogueError| crate::ControllerError::RegistryUnavailable {
             detail: error.to_string(),
         };
-        let mut catalogue = Catalogue::open(&root).map_err(unavailable)?;
+        let mut catalogue =
+            Catalogue::open(&root, Arc::new(repository_transport(proxy))).map_err(unavailable)?;
         catalogue
             .recover_interrupted(kr_ipc::now_ms().get())
             .map_err(unavailable)?;
@@ -1521,6 +1545,217 @@ fn encode<T: serde::Serialize>(value: &T) -> Answer<ParamsValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// KR-REQ-26.14: a repository address is fetched through the proxy this host selected. The
+    /// proxy is asked for a tunnel to the repository, and when it refuses, the fetch fails rather
+    /// than going around it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repository_is_fetched_through_the_proxy_this_host_selected() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(std::net::SocketAddr::from((
+            std::net::Ipv4Addr::LOCALHOST,
+            0,
+        )))
+        .await
+        .expect("a loopback port");
+        let proxy_port = listener.local_addr().expect("an address").port();
+        let asked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorded = Arc::clone(&asked);
+        let proxy = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read_u8().await {
+                        Ok(byte) => head.push(byte),
+                        Err(_) => break,
+                    }
+                }
+                let line = String::from_utf8_lossy(&head)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                recorded
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(line);
+                let _ = stream
+                    .write_all(b"HTTP/1.1 403 Refused\r\ncontent-length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+        // Nothing listens at the repository's address: a fetch that went around the proxy would
+        // fail too, so what the proxy was asked is the whole of the evidence.
+        let unused = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let repository = unused.local_addr().expect("an address");
+        drop(unused);
+
+        let transport = repository_transport(Some(
+            &format!("http://127.0.0.1:{proxy_port}")
+                .parse()
+                .expect("a proxy address"),
+        ));
+        let fetched = tough::Transport::fetch(
+            &transport,
+            format!("https://{repository}/1.root.json")
+                .parse()
+                .expect("an address"),
+        )
+        .await;
+        proxy.abort();
+        assert!(fetched.is_err(), "the proxy refused every tunnel");
+        let asked = asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let tunnel = format!("CONNECT {repository} HTTP/1.1");
+        assert!(
+            !asked.is_empty() && asked.iter().all(|line| *line == tunnel),
+            "{asked:?}"
+        );
+    }
+
+    /// A loopback server that answers every request with `status` and `body`, and counts them.
+    async fn answering(
+        status: u16,
+        body: &'static [u8],
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(std::net::SocketAddr::from((
+            std::net::Ipv4Addr::LOCALHOST,
+            0,
+        )))
+        .await
+        .expect("a loopback port");
+        let origin = format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().expect("an address").port()
+        );
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&asked);
+        let serving = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read_u8().await {
+                        Ok(byte) => head.push(byte),
+                        Err(_) => break,
+                    }
+                }
+                let answer = format!(
+                    "HTTP/1.1 {status} Answer\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(answer.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+            }
+        });
+        (origin, asked, serving)
+    }
+
+    /// Fetches `address` through the transport a host with no proxy selected builds.
+    async fn fetched(address: &str) -> Result<Vec<u8>, tough::TransportError> {
+        use futures_util::TryStreamExt as _;
+
+        let stream = tough::Transport::fetch(
+            &repository_transport(None),
+            address.parse().expect("an address"),
+        )
+        .await?;
+        let chunks: Vec<tough::Bytes> = stream.try_collect().await?;
+        Ok(chunks.concat())
+    }
+
+    /// A file a repository's server answers 403, 404 or 410 for is not there, which is how the
+    /// update client finds the newest signed root. It is asked for once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_file_its_server_answers_403_404_or_410_for_is_not_there() {
+        for status in [403, 404, 410] {
+            let (origin, asked, serving) = answering(status, b"").await;
+            let error = fetched(&format!("{origin}/2.root.json"))
+                .await
+                .expect_err("no such file");
+            assert_eq!(
+                error.kind(),
+                tough::TransportErrorKind::FileNotFound,
+                "{status}: {error}"
+            );
+            assert_eq!(
+                asked.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{status}"
+            );
+            serving.abort();
+        }
+    }
+
+    /// A server that fails is asked again, four times in all, and then the fetch fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_server_that_fails_is_asked_again_and_then_the_fetch_fails() {
+        let (origin, asked, serving) = answering(503, b"").await;
+        let error = fetched(&format!("{origin}/timestamp.json"))
+            .await
+            .expect_err("the server keeps failing");
+        assert_eq!(error.kind(), tough::TransportErrorKind::Other, "{error}");
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 4);
+        serving.abort();
+    }
+
+    /// A file the server has is read whole, as it arrives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_file_the_server_has_is_read_whole() {
+        let (origin, asked, serving) = answering(200, b"{\"signed\": {}}").await;
+        let body = fetched(&format!("{origin}/timestamp.json"))
+            .await
+            .expect("the file");
+        assert_eq!(body, b"{\"signed\": {}}");
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+        serving.abort();
+    }
+
+    /// A host whose certificate verification cannot be set up still reads a repository on its
+    /// own disk, and says why whenever it is asked to fetch one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_host_that_cannot_verify_reads_its_disk_and_says_why_it_fetches_nothing() {
+        use futures_util::TryStreamExt as _;
+
+        let transport = RepositoryTransport::local_only("no certificate store");
+        let directory = tempfile::tempdir().expect("a directory");
+        let file = directory.path().join("1.root.json");
+        std::fs::write(&file, b"{}").expect("a file");
+        let read: Vec<tough::Bytes> = tough::Transport::fetch(
+            &transport,
+            url::Url::from_file_path(&file).expect("a file address"),
+        )
+        .await
+        .expect("the file")
+        .try_collect()
+        .await
+        .expect("its bytes");
+        assert_eq!(read.concat(), b"{}");
+        let Err(refused) = tough::Transport::fetch(
+            &transport,
+            "https://plugins.example/1.root.json"
+                .parse()
+                .expect("an address"),
+        )
+        .await
+        else {
+            panic!("a host that cannot verify fetched a repository");
+        };
+        assert!(
+            std::error::Error::source(&refused)
+                .is_some_and(|cause| cause.to_string() == "no certificate store"),
+            "{refused:?}"
+        );
+    }
 
     #[test]
     fn the_daemon_serves_the_two_plugin_groups() {

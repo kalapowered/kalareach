@@ -784,7 +784,11 @@ impl Controller {
         let authority_revision = registry.authority_revision()?;
         let transfer = Arc::new(crate::transfer::TransferModule::open(&setup.paths).await?);
         let project = Arc::new(crate::project::ProjectModule::open(&setup.paths).await?);
-        let catalogue = Arc::new(crate::catalogue::CatalogueModule::open(&setup.paths)?);
+        // The catalogue fetches through the proxy this daemon started with, the endpoint's own.
+        let catalogue = Arc::new(crate::catalogue::CatalogueModule::open(
+            &setup.paths,
+            Self::proxy_of(&started)?.as_ref(),
+        )?);
         // The change-set service reads every repository through the project service's own opened
         // handles and restricted execution profile, so it takes that service rather than opening
         // a second one.

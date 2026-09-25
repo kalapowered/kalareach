@@ -4446,6 +4446,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-websockets",
  "toml_edit 0.25.15+spec-1.1.0",
+ "tough",
  "url",
 ]
 
@@ -4582,6 +4583,7 @@ dependencies = [
  "kr-plugin-sdk",
  "kr-protocol",
  "percent-encoding",
+ "reqwest",
  "rusqlite",
  "rustix",
  "serde",
@@ -9873,9 +9875,7 @@ dependencies = [
  "olpc-cjson",
  "pem 3.0.6",
  "percent-encoding",
- "reqwest",
  "rustls",
- "rustls-platform-verifier",
  "serde",
  "serde_json",
  "serde_plain",

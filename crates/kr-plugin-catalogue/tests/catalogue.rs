@@ -16,6 +16,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use kr_plugin_catalogue::budget::{Resource, Stage};
+use kr_plugin_catalogue::transport::RepositoryTransport;
 use kr_plugin_catalogue::{
     Authority, BudgetLedger, CapabilityCeiling, Catalogue, CatalogueError, CatalogueResult, Change,
     Claimed, Committed, DisablePolicy, Effect, Enrolment, FetchReason, Installation,
@@ -34,6 +35,14 @@ use kr_protocol::ids::{EnvironmentId, RepositoryGeneration};
 use kr_protocol::scalars::{Nullable, TimestampMs, U64, Uuid};
 
 use support::{Generation, GenerationSpec, KeySet};
+
+/// The transport every test here opens its catalogue with: its repositories are directories on
+/// the internal disk, read by `file` URL, and nothing is fetched over a network.
+fn local() -> Arc<dyn tough::Transport + Send + Sync> {
+    Arc::new(RepositoryTransport::local_only(
+        "a test reads its repositories from disk",
+    ))
+}
 
 fn environment() -> EnvironmentId {
     EnvironmentId::new(Uuid::NIL)
@@ -74,7 +83,8 @@ async fn enrolled(
     budgets: RepositoryBudgets,
     ceiling: CapabilityCeiling,
 ) -> Catalogue {
-    let mut catalogue = Catalogue::open(&home.join("catalogue")).expect("an openable catalogue");
+    let mut catalogue =
+        Catalogue::open(&home.join("catalogue"), local()).expect("an openable catalogue");
     let enrolment = Enrolment::new(
         repository(),
         RepositoryKind::Official,
@@ -131,7 +141,7 @@ async fn kr_req_11_07_metadata_signed_by_another_root_is_refused() {
     let stranger =
         Generation::build(&home.path().join("stranger"), GenerationSpec::default()).await;
 
-    let mut catalogue = Catalogue::open(&home.path().join("catalogue")).expect("openable");
+    let mut catalogue = Catalogue::open(&home.path().join("catalogue"), local()).expect("openable");
     let enrolment = Enrolment::new(
         repository(),
         RepositoryKind::Community,
@@ -542,7 +552,8 @@ async fn kr_req_11_07_root_key_rotation_advances_and_withholding_rotated_root_fa
 
     // A host enrolled with root v1 fails to sync if root v2 is withheld by the repository:
     let home2 = tempfile::tempdir().expect("tempdir");
-    let mut catalogue2 = Catalogue::open(&home2.path().join("catalogue")).expect("openable");
+    let mut catalogue2 =
+        Catalogue::open(&home2.path().join("catalogue"), local()).expect("openable");
     let enrolment2 = Enrolment::new(
         repository(),
         RepositoryKind::Official,
@@ -608,7 +619,8 @@ async fn kr_req_11_07_root_key_rotation_advances_and_withholding_rotated_root_fa
     );
 
     // Restart retains root v2
-    let mut restarted = Catalogue::open(&home.path().join("catalogue")).expect("reopenable");
+    let mut restarted =
+        Catalogue::open(&home.path().join("catalogue"), local()).expect("reopenable");
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(
             &restarted
@@ -661,7 +673,7 @@ async fn kr_req_11_07_the_verified_root_is_what_the_next_load_starts_from() {
     );
     assert!(!adopted.is_empty());
 
-    let reopened = Catalogue::open(&home.path().join("catalogue")).expect("openable");
+    let reopened = Catalogue::open(&home.path().join("catalogue"), local()).expect("openable");
     assert_eq!(
         reopened
             .repository(&repository())
@@ -834,7 +846,7 @@ async fn kr_req_11_09_an_installed_package_is_enabled_without_its_repository() {
 #[test]
 fn a_repository_this_host_cannot_fetch_is_refused_by_name() {
     let home = tempfile::tempdir().expect("a temporary directory");
-    let mut catalogue = Catalogue::open(&home.path().join("catalogue")).expect("openable");
+    let mut catalogue = Catalogue::open(&home.path().join("catalogue"), local()).expect("openable");
     assert!(catalogue.fetches_network());
     catalogue.set_fetches_network(false);
     assert!(!catalogue.fetches_network());
@@ -2016,7 +2028,7 @@ async fn kr_req_11_11_an_installation_decided_under_one_ceiling_is_refused_under
         // may.
         let root = home.path().join("catalogue");
         let widen = move || {
-            let mut other = Catalogue::open(&root).expect("a second catalogue");
+            let mut other = Catalogue::open(&root, local()).expect("a second catalogue");
             let mut enrolment = other
                 .repository(&repository())
                 .expect("readable")
@@ -2259,7 +2271,7 @@ fn retaining_at(
 ) -> Catalogue {
     let mut budgets = RepositoryBudgets::defaults();
     budgets.retained_metadata_bytes = U64::new(budget);
-    let mut catalogue = Catalogue::open(root).expect("an openable catalogue");
+    let mut catalogue = Catalogue::open(root, local()).expect("an openable catalogue");
     catalogue
         .enrol(
             Enrolment::new(
@@ -2482,7 +2494,7 @@ async fn kr_req_11_12_a_checkpoint_is_kept_only_where_it_fits_beside_the_generat
     assert_eq!(limit.requested, checkpoint + first_index);
     for catalogue in [
         catalogue,
-        Catalogue::open(&root).expect("the catalogue reopens"),
+        Catalogue::open(&root, local()).expect("the catalogue reopens"),
     ] {
         assert_eq!(checkpoint_of(&catalogue), before);
         assert_eq!(
@@ -2563,8 +2575,9 @@ async fn kr_req_11_12_a_package_is_staged_only_inside_room_for_its_payloads_and_
     for (budget, fits) in [(2 * package, true), (2 * package - 1, false)] {
         let mut budgets = RepositoryBudgets::defaults();
         budgets.payload_cache_bytes = U64::new(budget);
-        let mut catalogue = Catalogue::open(&home.path().join(format!("catalogue-{budget}")))
-            .expect("an openable catalogue");
+        let mut catalogue =
+            Catalogue::open(&home.path().join(format!("catalogue-{budget}")), local())
+                .expect("an openable catalogue");
         catalogue
             .enrol(
                 Enrolment::new(
@@ -2723,8 +2736,9 @@ async fn kr_req_11_12_two_paths_that_share_a_digest_are_staged_twice_and_fetched
     for (budget, fits) in [(fetched + staged, true), (fetched + staged - 1, false)] {
         let mut budgets = RepositoryBudgets::defaults();
         budgets.payload_cache_bytes = U64::new(budget);
-        let mut catalogue = Catalogue::open(&home.path().join(format!("catalogue-{budget}")))
-            .expect("an openable catalogue");
+        let mut catalogue =
+            Catalogue::open(&home.path().join(format!("catalogue-{budget}")), local())
+                .expect("an openable catalogue");
         catalogue
             .enrol(
                 Enrolment::new(
@@ -3333,7 +3347,7 @@ async fn kr_req_11_12_an_upgraded_package_is_kept_while_the_broker_or_a_binding_
             )])),
             _ => Arc::new(Reporting(vec![old])),
         };
-        let mut catalogue = Catalogue::with_broker(&home.path().join("catalogue"), broker)
+        let mut catalogue = Catalogue::with_broker(&home.path().join("catalogue"), broker, local())
             .expect("an openable catalogue");
         catalogue
             .enrol(
@@ -3710,7 +3724,7 @@ async fn the_development_generation_verifies_and_is_searchable_offline() {
     let working = home.path().join("development");
     support::copy_tree(&fixture, &working);
 
-    let mut catalogue = Catalogue::open(&home.path().join("catalogue")).expect("openable");
+    let mut catalogue = Catalogue::open(&home.path().join("catalogue"), local()).expect("openable");
     let enrolment = Enrolment::new(
         repository(),
         RepositoryKind::Official,
@@ -3810,7 +3824,7 @@ fn the_development_fixture_names_the_commit_it_was_copied_from() {
 #[test]
 fn kr_req_11_11_a_wider_ceiling_or_a_new_root_is_the_owners_decision() {
     let home = tempfile::tempdir().expect("a temporary directory");
-    let mut catalogue = Catalogue::open(&home.path().join("catalogue")).expect("openable");
+    let mut catalogue = Catalogue::open(&home.path().join("catalogue"), local()).expect("openable");
     let enrolment = Enrolment::new(
         repository(),
         RepositoryKind::Official,
@@ -3864,7 +3878,7 @@ fn a_version_control_branch_is_never_update_authority() {
 #[test]
 fn an_independent_root_is_kept_separate_from_the_official_one() {
     let home = tempfile::tempdir().expect("a temporary directory");
-    let mut catalogue = Catalogue::open(&home.path().join("catalogue")).expect("openable");
+    let mut catalogue = Catalogue::open(&home.path().join("catalogue"), local()).expect("openable");
     for (name, root) in [
         ("official", b"official root".as_slice()),
         ("vendor", b"vendor root"),
@@ -3891,7 +3905,7 @@ fn an_independent_root_is_kept_separate_from_the_official_one() {
     assert_ne!(roots[0], roots[1], "one repository's root is not another's");
 
     // And a restart finds both, each against the root it adopted.
-    let reopened = Catalogue::open(&home.path().join("catalogue")).expect("openable");
+    let reopened = Catalogue::open(&home.path().join("catalogue"), local()).expect("openable");
     let after: Vec<PayloadDigest> = reopened
         .repositories()
         .expect("readable")
@@ -4213,7 +4227,7 @@ async fn kr_req_11_09_installed_operations_survive_the_repository_being_removed(
 
     // And what a restart reads back says the same thing, from the ceiling it recorded rather than
     // from the default one: the repository is gone and the wider ceiling it had is still here.
-    let reopened = Catalogue::open(&home.path().join("catalogue")).expect("reopens");
+    let reopened = Catalogue::open(&home.path().join("catalogue"), local()).expect("reopens");
     let effective = reopened
         .effective_capabilities(environment(), &plugin())
         .expect("effective capabilities after a restart");
@@ -4317,7 +4331,7 @@ async fn lower_role_versions_under_new_keys_are_accepted_after_a_failed_sync_and
 
     // A restart in between changes nothing: the reset is kept with the root.
     drop(catalogue);
-    let mut catalogue = Catalogue::open(&home.path().join("catalogue")).expect("reopens");
+    let mut catalogue = Catalogue::open(&home.path().join("catalogue"), local()).expect("reopens");
     std::fs::write(&index, &published).expect("writable");
     let outcome = catalogue
         .sync(&repository())
@@ -4630,7 +4644,7 @@ async fn an_accepted_generation_stays_installable_after_the_repository_moves_on(
     support::copy_tree(&second.metadata_dir(), &first.metadata_dir());
     support::copy_tree(&second.targets_dir(), &first.targets_dir());
 
-    let mut catalogue = Catalogue::open(&home.path().join("catalogue")).expect("reopens");
+    let mut catalogue = Catalogue::open(&home.path().join("catalogue"), local()).expect("reopens");
     let watched = Watched::default();
     catalogue.set_transport(Arc::new(watched.clone()));
     let installation = catalogue
@@ -4953,7 +4967,7 @@ async fn a_change_refused_at_its_commit_changes_nothing() {
 
     for catalogue in [
         &catalogue,
-        &Catalogue::open(&home.path().join("catalogue")).expect("reopens"),
+        &Catalogue::open(&home.path().join("catalogue"), local()).expect("reopens"),
     ] {
         let enrolment = catalogue
             .repository(&repository())
@@ -5065,7 +5079,7 @@ async fn a_change_that_committed_under_a_failing_authority_is_uncertain_and_is_w
 
     for catalogue in [
         &catalogue,
-        &Catalogue::open(&home.path().join("catalogue")).expect("reopens"),
+        &Catalogue::open(&home.path().join("catalogue"), local()).expect("reopens"),
     ] {
         assert_eq!(
             catalogue
@@ -5095,7 +5109,8 @@ async fn two_catalogues_on_one_directory_lose_nothing_of_each_other() {
     let home = tempfile::tempdir().expect("a temporary directory");
     let generation = Generation::build(home.path(), GenerationSpec::default()).await;
     let mut first = installed_catalogue(home.path(), &generation).await;
-    let mut second = Catalogue::open(&home.path().join("catalogue")).expect("a second catalogue");
+    let mut second =
+        Catalogue::open(&home.path().join("catalogue"), local()).expect("a second catalogue");
 
     // Each installs into its own environment and changes its own installation, interleaved.
     let elsewhere = EnvironmentId::new(Uuid::from_bytes([2; 16]));
@@ -5121,7 +5136,7 @@ async fn two_catalogues_on_one_directory_lose_nothing_of_each_other() {
         .pin(&repository(), Some(RepositoryGeneration::new(1)))
         .expect("the repository pinned by the first");
 
-    let reopened = Catalogue::open(&home.path().join("catalogue")).expect("reopens");
+    let reopened = Catalogue::open(&home.path().join("catalogue"), local()).expect("reopens");
     let here = reopened
         .installation(environment(), &plugin())
         .expect("readable")
@@ -5250,7 +5265,7 @@ async fn kr_req_24_01_the_catalogue_keeps_its_installation_state_durably_across_
     let installed = catalogue.installations().expect("readable");
     let repositories = catalogue.repository_views().expect("readable");
     drop(catalogue);
-    let reopened = Catalogue::open(&home.path().join("catalogue")).expect("reopens");
+    let reopened = Catalogue::open(&home.path().join("catalogue"), local()).expect("reopens");
     assert_eq!(reopened.installations().expect("readable"), installed);
     assert_eq!(reopened.repository_views().expect("readable"), repositories);
     assert_eq!(
@@ -5377,7 +5392,7 @@ async fn an_action_is_claimed_once_settled_with_its_effect_and_recovered_as_unkn
         Claimed::Fresh
     );
     drop(catalogue);
-    let mut reopened = Catalogue::open(&home.path().join("catalogue")).expect("reopens");
+    let mut reopened = Catalogue::open(&home.path().join("catalogue"), local()).expect("reopens");
     assert_eq!(reopened.recover_interrupted(9).expect("recorded"), 1);
     let recovered = reopened
         .receipt(&ReceiptKey::new("kr:local", "four"))
@@ -5511,7 +5526,7 @@ async fn a_sync_that_kept_a_new_root_and_then_failed_is_unknown_and_says_what_it
     // A resubmission finds the receipt and its answer, here and after a restart, and nothing is
     // performed again.
     drop(catalogue);
-    let mut reopened = Catalogue::open(&home.path().join("catalogue")).expect("reopens");
+    let mut reopened = Catalogue::open(&home.path().join("catalogue"), local()).expect("reopens");
     assert_eq!(reopened.recover_interrupted(7).expect("recorded"), 0);
     for (action, state, error) in [
         (
@@ -5648,7 +5663,7 @@ async fn a_generation_pinned_while_a_sync_ran_keeps_every_payload_it_pins() {
     let pin = async {
         held.reached.notified().await;
         let mut other =
-            Catalogue::open(&home.path().join("catalogue")).expect("a second catalogue");
+            Catalogue::open(&home.path().join("catalogue"), local()).expect("a second catalogue");
         other
             .pin(&repository(), Some(RepositoryGeneration::new(1)))
             .expect("pinned");
@@ -5741,7 +5756,7 @@ fn enrolled_at(
 ) -> Catalogue {
     let mut budgets = RepositoryBudgets::defaults();
     budgets.metadata_bytes = U64::new(allowance);
-    let mut catalogue = Catalogue::open(root).expect("an openable catalogue");
+    let mut catalogue = Catalogue::open(root, local()).expect("an openable catalogue");
     catalogue
         .enrol(
             Enrolment::new(
@@ -5884,7 +5899,7 @@ async fn an_installation_pinned_while_a_sync_ran_keeps_its_payloads() {
     let pin = async {
         held.reached.notified().await;
         let mut other =
-            Catalogue::open(&home.path().join("catalogue")).expect("a second catalogue");
+            Catalogue::open(&home.path().join("catalogue"), local()).expect("a second catalogue");
         other
             .pin_package(environment(), &plugin(), Some(installation.package_digest))
             .expect("pinned");
@@ -6294,7 +6309,7 @@ async fn a_store_directory_that_is_a_link_is_refused_before_anything_is_written_
         let before = tree_of(&elsewhere);
 
         let outcomes = match open.as_mut() {
-            None => vec![("open", Catalogue::open(&root).map(drop))],
+            None => vec![("open", Catalogue::open(&root, local()).map(drop))],
             Some(catalogue) => {
                 let synced = catalogue.sync(&repository()).await.map(drop);
                 let installed = install_example(catalogue, digest).await.map(drop);
@@ -6319,7 +6334,7 @@ async fn a_store_directory_that_is_a_link_is_refused_before_anything_is_written_
         std::fs::rename(home.path().join("aside"), &directory).expect("put back");
         let mut catalogue = match open {
             Some(catalogue) => catalogue,
-            None => Catalogue::open(&root).expect("the catalogue's own directory"),
+            None => Catalogue::open(&root, local()).expect("the catalogue's own directory"),
         };
         let synced = catalogue.sync(&repository()).await.expect("generation 2");
         assert_eq!(synced.generation.get(), 2, "{depth}");
@@ -6352,7 +6367,7 @@ fn a_catalogue_directory_that_is_a_link_is_refused_however_it_is_spelt() {
         for (what, refusal) in [
             (
                 "the catalogue",
-                Catalogue::open(&spelling).expect_err("a catalogue through a link"),
+                Catalogue::open(&spelling, local()).expect_err("a catalogue through a link"),
             ),
             (
                 "a repository's store",

@@ -82,6 +82,8 @@ kr-transfer.workspace = true
 rcgen.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
 tempfile.workspace = true
+# The catalogue's fetch, asked directly, to show which proxy a repository is fetched through.
+tough.workspace = true
 # A loopback room for the host's WebSocket to attach to, and the room's end of it.
 futures-util.workspace = true
 tokio-websockets = { workspace = true, features = ["server"] }

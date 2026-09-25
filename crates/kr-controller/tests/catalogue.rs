@@ -183,7 +183,7 @@ fn host() -> Host {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
-    let module = CatalogueModule::open(&environment).expect("an openable catalogue");
+    let module = CatalogueModule::open(&environment, None).expect("an openable catalogue");
     let working_temp = tempfile::tempdir().expect("a temporary directory");
     let working = working_temp.path().join("development");
     copy_tree(&fixture(), &working);
@@ -1185,7 +1185,7 @@ async fn both_groups_reach_the_catalogue_through_the_daemon() {
 
     // What a restarted daemon opens reads the same receipt: the deadline is recorded with the
     // claim, not derived again from whatever admits the next request.
-    let reopened = CatalogueModule::open(&environment).expect("the catalogue reopens");
+    let reopened = CatalogueModule::open(&environment, None).expect("the catalogue reopens");
     let restarted = reopened
         .action_read(&first.receipt.actor_id, sync.action_id)
         .await
@@ -1881,7 +1881,15 @@ async fn kr_req_10_05_and_11_11_a_ceiling_widened_after_the_confirmation_refuses
     let ceiling = listed_ceiling(&host, "development").await;
     let root = host.module.catalogue().lock().await.root().to_path_buf();
     *host.ceremony.after_accept.lock().expect("the step") = Some(Box::new(move || {
-        let mut other = kr_plugin_catalogue::Catalogue::open(&root).expect("a second catalogue");
+        let mut other = kr_plugin_catalogue::Catalogue::open(
+            &root,
+            std::sync::Arc::new(
+                kr_plugin_catalogue::transport::RepositoryTransport::local_only(
+                    "a test reads its repositories from disk",
+                ),
+            ),
+        )
+        .expect("a second catalogue");
         let id = RepositoryId::new("development").expect("a valid identifier");
         let mut enrolment = other.repository(&id).expect("readable").expect("enrolled");
         enrolment.ceiling =
