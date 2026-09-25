@@ -719,6 +719,18 @@ mod cases {
                     planted.at
                 );
                 assert!(!said.contains(NEUTRAL), "{}: {said}", planted.at);
+                // The reason is the rule the store's own decoder reports for these bytes.
+                match kr_cbor::from_canonical_slice::<crate::sync::SyncObject>(
+                    &planted.input,
+                    &kr_cbor::Limits::DEFAULT,
+                ) {
+                    Err(broken) => assert!(
+                        said.ends_with(&Shown::cbor(&broken).into_string()),
+                        "{}: {said}",
+                        planted.at
+                    ),
+                    Ok(_) => assert!(said.contains("it holds object"), "{}: {said}", planted.at),
+                }
             }
         }
         assert!(refused > 0, "the neutral plantings are refused too");
