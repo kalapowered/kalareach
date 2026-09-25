@@ -336,12 +336,17 @@ impl<'r> Host<'r> {
     }
 
     /// The live sessions, as `kr list` reports them.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `kr list` does not answer with a list of sessions: an answer without one has
+    /// not said that there are none.
     #[must_use]
     pub fn live_sessions(&self) -> Vec<Value> {
-        self.kr_json(&["list"])["sessions"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
+        let listed = self.kr_json(&["list"]);
+        listed["sessions"].as_array().cloned().unwrap_or_else(|| {
+            panic!("kr list answered something that is not a list of sessions: {listed}")
+        })
     }
 
     /// Waits for `kr status` to report a session closed, and returns that report.
