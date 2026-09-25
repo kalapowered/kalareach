@@ -288,8 +288,24 @@ pub fn authority_feed_left(
 }
 
 /// One line of what a leg left, as the checkpoint reads it.
+///
+/// One line whatever the failure said: the checkpoint reads a leg's output line by line, so a line
+/// break inside a failure would cut what follows it out of the report. Every control character is
+/// written as its escape instead.
 fn not_given_back(what: &str) -> String {
-    format!("this leg could not {GIVE_BACK}: {what}")
+    let mut line = format!("this leg could not {GIVE_BACK}: ");
+    for character in what.chars() {
+        match character {
+            '\n' => line.push_str("\\n"),
+            '\r' => line.push_str("\\r"),
+            '\t' => line.push_str("\\t"),
+            control if control.is_control() => {
+                line.push_str(&format!("\\u{{{:x}}}", u32::from(control)));
+            }
+            other => line.push(other),
+        }
+    }
+    line
 }
 
 /// A service that answers nothing, for the legs that prove what an unavailable feed means.
@@ -436,6 +452,23 @@ mod tests {
         assert_eq!(
             what_the_checkpoint_names(&left),
             vec!["the announcement mailbox could not be read: refused".to_owned()]
+        );
+    }
+
+    /// A failure whose text runs over several lines is still one line of the report, so the
+    /// checkpoint, which reads line by line, names all of it.
+    #[test]
+    fn a_failure_over_several_lines_is_reported_on_one() {
+        let left = authority_feed_left(
+            &answered(true, 0),
+            &Err("the mailbox refused:\nfirst line\r\nsecond line\u{7}".to_owned()),
+        );
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(left[0].lines().count(), 1, "{left:?}");
+        assert!(!left[0].contains(['\n', '\r', '\u{7}']), "{left:?}");
+        assert_eq!(
+            what_the_checkpoint_names(&left),
+            vec!["the mailbox refused:\\nfirst line\\r\\nsecond line\\u{7}".to_owned()]
         );
     }
 
