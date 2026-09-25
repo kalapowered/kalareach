@@ -892,9 +892,9 @@ fn path_prefix(prefix: std::path::Prefix<'_>) -> String {
 
 /// The word `segment` is in one of the paths the service adapters call, if it is one.
 fn route_word(segment: &str) -> Option<&'static str> {
-    use crate::services::{account, authority, mailbox, relay, sync, voice};
+    use crate::services::{account, authority, backup, mailbox, relay, storage, sync, voice};
 
-    const PATHS: [&str; 15] = [
+    const PATHS: [&str; 24] = [
         sync::SYNC_EXCHANGE_PATH,
         authority::AUTHORITY_SYNC_PATH,
         mailbox::MAILBOX_DELIVER_PATH,
@@ -911,6 +911,15 @@ fn route_word(segment: &str) -> Option<&'static str> {
         voice::VOICE_METADATA_PATH,
         // What the voice adapter adds after a call's identifier.
         "/control/close",
+        storage::STORAGE_STATUS_PATH,
+        storage::STORAGE_RETENTION_PATH,
+        storage::STORAGE_UPLOAD_CREATE_PATH,
+        storage::STORAGE_UPLOAD_PART_PATH,
+        storage::STORAGE_UPLOAD_COMPLETE_PATH,
+        storage::STORAGE_UPLOAD_ABORT_PATH,
+        storage::STORAGE_READ_PATH,
+        storage::STORAGE_DELETE_PATH,
+        backup::BACKUP_MANIFEST_PATH,
     ];
     PATHS
         .iter()
@@ -1623,6 +1632,17 @@ mod tests {
         );
         let said = Shown::route(&format!("/api/voice/sessions/{MARKER}/close"));
         assert_eq!(said.as_str(), "/api/voice/sessions/[a segment]/close");
+        // Managed storage and the backup manifest are adapters of their own, and their paths are
+        // said in their words too.
+        for path in [
+            crate::services::storage::STORAGE_UPLOAD_PART_PATH,
+            crate::services::storage::STORAGE_READ_PATH,
+            crate::services::backup::BACKUP_MANIFEST_PATH,
+        ] {
+            assert_eq!(Shown::route(path).as_str(), path);
+        }
+        let said = Shown::route(&format!("/api/storage/upload/{MARKER}"));
+        assert_eq!(said.as_str(), "/api/storage/upload/[a segment]");
         assert_eq!(
             Shown::collection("settings/0e1f9a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b").as_str(),
             "settings/0e1f9a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b"
