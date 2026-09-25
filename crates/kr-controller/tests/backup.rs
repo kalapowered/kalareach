@@ -6462,6 +6462,7 @@ fn kind_of(step: &Stepped) -> &'static str {
         Stepped::Forgotten { .. } => "forgotten",
         Stepped::Unabandoned { .. } => "unabandoned",
         Stepped::Stopped { .. } => "stopped",
+        Stepped::Unknown { .. } => "unknown",
         Stepped::CollectionDeleted { .. } => "collection deleted",
         Stepped::Waiting { .. } => "waiting",
     }
@@ -6625,12 +6626,13 @@ async fn a_crash_after_any_step_and_a_restart_finish_the_generation_once_with_no
         let record = host.generation(1);
         if stopped_after == uninterrupted.len() - 1 {
             // Stopped between the publication's dispatch and its send. Reconciliation wrote down an
-            // outcome this host cannot establish, and once nothing sent for it could land any more
-            // the attempt ended: nothing is published again.
+            // outcome this host cannot establish, and once this host stopped asking about it the
+            // attempt ended with that generation unknown: nothing is published again, and the next
+            // generation carries the backup.
             assert_eq!(record.production, Production::Cancelled);
             assert_eq!(record.remote, Remote::Unknown);
             assert!(host.web.publication(1).is_none());
-            assert_eq!(kinds(&late), ["stopped"]);
+            assert_eq!(kinds(&late), ["unknown"]);
         } else {
             assert_eq!(
                 record.production,
@@ -6760,6 +6762,155 @@ async fn an_older_generation_the_service_has_passed_ends_once_and_is_not_sent_ag
     assert!(passes(&mut uploader, 11_000).await.is_empty());
 }
 
+/// Runs an uploader until it has dispatched the publication attempt `publication`, and stops there:
+/// the process ends between the publication's dispatch and its send.
+async fn stop_between_dispatch_and_send(host: &Host, publication: u64) {
+    let mut uploader = host.uploader(10_000);
+    loop {
+        let step = uploader
+            .step(TimestampMs::new(10_000))
+            .await
+            .expect("a step")
+            .expect("a step to take");
+        if matches!(step, Stepped::Dispatched { sequence } if sequence == publication) {
+            return;
+        }
+    }
+}
+
+/// A crash between a publication's dispatch and its send leaves that generation unknown, and
+/// unknown is never success. The store holds it cancelled with its outcome unknown, and each pass
+/// after the restart names it unknown and says the next generation carries its content; only the
+/// next generation is counted as a completed backup.
+#[tokio::test]
+async fn after_a_crash_a_generation_the_service_does_not_hold_is_reported_unknown_never_complete() {
+    let mut host = Host::open();
+    let publication = host.admit(1, &[64]) + 1;
+    stop_between_dispatch_and_send(&host, publication).await;
+    let (mut uploader, settled) = host.restart(20_000).await;
+    assert!(settled.is_empty(), "the service does not hold it");
+
+    let names_it_unknown = |lines: &[String]| {
+        lines.iter().any(|line| {
+            line.contains(&format!("backup generation 1 of archive {}", archive_id()))
+                && line.contains("unknown")
+                && line.contains("not a completed backup")
+                && line.contains("not sent again")
+                && line.contains("the next generation carries its content")
+        })
+    };
+    let asking = uploader
+        .pass(TimestampMs::new(20_000))
+        .await
+        .expect("a pass")
+        .describe();
+    assert!(names_it_unknown(&asking), "{asking:?}");
+    let given_up = uploader
+        .pass(TimestampMs::new(20_000 + ADMISSIBLE_MS))
+        .await
+        .expect("a pass");
+    assert_eq!(kinds(&given_up.steps), ["unknown"]);
+    let said = given_up.describe();
+    assert!(names_it_unknown(&said), "{said:?}");
+    for line in asking.iter().chain(&said) {
+        assert!(!line.contains("published"), "{line}");
+    }
+
+    // The store never counts it: production is over without completing, what the service holds
+    // is unknown, and the attempt stopped rather than being accepted.
+    let record = host.generation(1);
+    assert_eq!(record.production, Production::Cancelled);
+    assert_eq!(record.remote, Remote::Unknown);
+    assert_eq!(host.outcome(publication), Some(AttemptOutcome::Stopped));
+    assert!(host.web.publication(1).is_none());
+
+    // The next generation carries its content and is the one completed backup.
+    host.admit(2, &[64]);
+    let steps = passes(&mut uploader, 30_000 + ADMISSIBLE_MS).await;
+    let published = format!(
+        "backup attempt {} published its generation",
+        publication + 2
+    );
+    assert_eq!(
+        steps.last().map(Stepped::describe).as_deref(),
+        Some(published.as_str())
+    );
+    let completed: Vec<u64> = host
+        .service
+        .generations()
+        .expect("a read")
+        .iter()
+        .filter(|record| {
+            record.production == Production::Complete && record.remote == Remote::Published
+        })
+        .map(|record| record.backup_generation.get())
+        .collect();
+    assert_eq!(completed, [2]);
+    assert_eq!(host.generation(1).remote, Remote::Unknown);
+
+    // The control: a crash after the service took the publication is settled at the restart, and
+    // nothing is reported unknown.
+    let mut host = Host::open();
+    host.admit(1, &[64]);
+    host.web.fail(Kind::Publish, 1, Fault::Lost);
+    {
+        let mut uploader = host.uploader(10_000);
+        steps_until(&mut uploader, 10_000, "waiting").await;
+    }
+    let (mut uploader, settled) = host.restart(20_000).await;
+    assert_eq!(kinds(&settled), ["settled"]);
+    let report = uploader
+        .pass(TimestampMs::new(20_000))
+        .await
+        .expect("a pass");
+    let lines: Vec<String> = settled.iter().map(Stepped::describe).collect();
+    for line in lines.iter().chain(&report.describe()) {
+        assert!(!line.contains("unknown"), "{line}");
+    }
+    assert_eq!(host.generation(1).production, Production::Complete);
+    assert_eq!(host.generation(1).remote, Remote::Published);
+
+    // A generation privacy mode drew its line under is unknown in the same way, and no later
+    // generation is said to carry its content: privacy mode removes it from this host.
+    let mut host = Host::open();
+    let publication = host.admit(1, &[64]) + 1;
+    stop_between_dispatch_and_send(&host, publication).await;
+    host.service
+        .raise_fence(PrivacyGeneration::new(1), TimestampMs::new(15_000))
+        .expect("the fence is raised");
+    let (mut uploader, _) = host.restart(20_000).await;
+    let asking = uploader
+        .pass(TimestampMs::new(20_000))
+        .await
+        .expect("a pass")
+        .describe();
+    let given_up = uploader
+        .pass(TimestampMs::new(20_000 + ADMISSIBLE_MS))
+        .await
+        .expect("a pass");
+    assert_eq!(kinds(&given_up.steps), ["unknown"]);
+    for lines in [asking, given_up.describe()] {
+        assert!(
+            lines.iter().any(|line| {
+                line.contains("backup generation 1")
+                    && line.contains("unknown")
+                    && line.contains("not a completed backup")
+                    && line.contains(
+                        "no later generation carries its content, because privacy mode stopped \
+                         backup production at privacy generation 1",
+                    )
+            }),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|line| !line.contains("the next generation")),
+            "{lines:?}"
+        );
+    }
+}
+
 /// A process can also stop while an answer is on its way back. The request it had sent is asked
 /// for again, or found, and the service stores nothing twice.
 #[tokio::test]
@@ -6880,7 +7031,7 @@ async fn a_publication_that_may_have_left_is_fetched_and_never_sent_again() {
         .pass(TimestampMs::new(10_000 + ADMISSIBLE_MS))
         .await
         .expect("a pass");
-    assert_eq!(kinds(&after.steps), ["stopped"]);
+    assert_eq!(kinds(&after.steps), ["unknown"]);
     assert_eq!(
         host.web.count(|asked| matches!(asked, Asked::Publish(_))),
         0,
@@ -6944,7 +7095,7 @@ async fn a_publication_cancelled_on_its_way_is_asked_about_and_never_sent_again(
         .pass(TimestampMs::new(10_000 + ADMISSIBLE_MS))
         .await
         .expect("a pass");
-    assert_eq!(kinds(&later.steps), ["stopped"]);
+    assert_eq!(kinds(&later.steps), ["unknown"]);
     assert_eq!(
         host.web.count(|asked| matches!(asked, Asked::Publish(_))),
         1,
@@ -6986,7 +7137,7 @@ async fn a_publication_whose_stop_the_store_refused_is_asked_about_again_and_nev
         .pass(TimestampMs::new(10_000 + ADMISSIBLE_MS))
         .await
         .expect("a pass");
-    assert_eq!(kinds(&after.steps), ["stopped"]);
+    assert_eq!(kinds(&after.steps), ["unknown"]);
     assert_eq!(
         host.web.count(|asked| matches!(asked, Asked::Publish(_))),
         0,

@@ -2459,6 +2459,14 @@ publication an earlier process dispatched, and a daemon calls it before reconcil
 otherwise write the outcome down as unknown. A process that stopped between dispatching a
 publication and sending it leaves that generation unknown in the same way.
 
+An unknown generation is never counted as a success. While the uploader still asks about it after a
+restart, and once it has stopped asking, the pass reports it by generation and archive as unknown:
+not a completed backup, not sent again, and carried by the next generation. Where privacy mode drew
+its line under the generation, the report says instead that no later generation carries its
+content. An unknown generation changes nothing newer either. The backup manifest refuses a
+publication that reaches it after a newer generation is published, and a fetch of the newest still
+answers with the newer generation.
+
 An attempt ends on evidence about its own work. A collection deleted from the account console
 stops the attempt, retires this host's writer for that archive and cancels what it was still
 producing there, and the report says the collection was deleted and that backing up again means

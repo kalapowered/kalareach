@@ -59,10 +59,18 @@
 //! is unknown, and nothing the service offers can prove that a request it admitted will not still
 //! run. The uploader fetches the generation instead. The service holding its descriptor under this
 //! writer is the answer. One that still does not hold it two freshness windows after the send is
-//! given up on: the attempt stops, which writes down that this host cannot establish what the
-//! service holds and ends the generation's production, and the next generation carries the backup.
-//! That this host may have sent it is written down before the request can leave, so a pass cancelled
-//! while the request is on its way leaves the next pass asking rather than sending.
+//! given up on as [`Stepped::Unknown`]: the attempt stops, which writes down that this host cannot
+//! establish what the service holds and ends the generation's production. That this host may have
+//! sent it is written down before the request can leave, so a pass cancelled while the request is
+//! on its way leaves the next pass asking rather than sending.
+//!
+//! # An unknown generation
+//!
+//! A generation whose outcome is unknown is never success. It is not a completed backup, nothing of
+//! it is sent again, the pass reports it as unknown, and the next generation carries its content.
+//! It changes nothing newer either. Should its publication reach the service after a newer
+//! generation is published, the service refuses it, because it takes no generation at or below
+//! the newest it has held, and a fetch of the newest is answered with the highest generation held.
 //!
 //! # A restart with a publication on its way
 //!
@@ -71,8 +79,9 @@
 //! left and was never answered down as an outcome this host cannot establish, and ends its
 //! generation's production; one the service holds is recorded first, so reconciliation finishes
 //! the generation instead. One the service does not hold stays unknown, and so does one whose
-//! process stopped between its dispatch and its send: that generation's production ends there, and
-//! the next generation carries the backup.
+//! process stopped between its dispatch and its send: that generation's production ends there,
+//! each pass names it unknown while this host still asks the service about it, and the next
+//! generation carries the backup.
 //!
 //! # Privacy mode
 //!
@@ -210,6 +219,25 @@ pub enum Stepped {
         /// Why.
         reason: String,
     },
+    /// A publication that may have left this host, which the service does not hold, and which
+    /// this host has stopped asking about.
+    ///
+    /// Its generation's outcome is unknown, and unknown is never success: the generation is not a
+    /// completed backup, nothing of it is sent again, and the next generation of the archive
+    /// carries its content. Should the publication still reach the service after a newer
+    /// generation is published, the service refuses it, because it takes no generation at or below
+    /// the newest it has held.
+    Unknown {
+        /// The publication attempt, which is stopped.
+        sequence: u64,
+        /// The archive.
+        archive_id: ArchiveId,
+        /// The generation whose outcome is unknown.
+        backup_generation: BackupGeneration,
+        /// Privacy mode's line under the generation, when it drew one. No later generation
+        /// carries content from before that line.
+        privacy: Option<String>,
+    },
     /// The archive's collection was deleted from the account console.
     ///
     /// The attempt is stopped, this host's writer for that archive is retired and what it was still
@@ -282,6 +310,17 @@ impl Stepped {
             Self::Stopped { sequence, reason } => {
                 format!("backup attempt {sequence} stopped: {reason}")
             }
+            Self::Unknown {
+                archive_id,
+                backup_generation,
+                privacy,
+                ..
+            } => format!(
+                "backup generation {} of archive {archive_id} is unknown: the service does not \
+                 hold its publication, which may have left this host. {}",
+                backup_generation.get(),
+                never_complete(privacy.as_deref())
+            ),
             Self::CollectionDeleted {
                 sequence,
                 archive_id,
@@ -1089,7 +1128,7 @@ impl Uploader {
     /// A send of it that may be on its way without an answer, this process's or an earlier one's, is
     /// established by fetching the generation and never by sending it again. The service holding it
     /// is the answer. One that does not hold it once [`WAITS_FOR_AN_ANSWER_MS`] have passed since the
-    /// send is given up on, and the attempt stops with its outcome unknown.
+    /// send is given up on as [`Stepped::Unknown`]: the attempt stops with its outcome unknown.
     async fn carry_publication(
         &mut self,
         attempt: &Attempt,
@@ -1118,19 +1157,32 @@ impl Uploader {
                 // The note that it may have left goes only once the stop is written down: a stop
                 // the store refused leaves the attempt dispatched, and the next pass has to ask
                 // again rather than send.
-                let stopped = self.stop(
-                    attempt,
-                    "its publication was sent without an answer and the service does not hold \
-                     it, so what the service will hold of it is not something this host can \
-                     establish, and it is not sent again"
-                        .to_owned(),
-                    now,
-                )?;
-                if matches!(stopped, Stepped::Stopped { .. }) {
-                    self.unanswered.remove(&sequence);
+                match self.backup.note_attempt_stopped(sequence, now) {
+                    Ok(()) => {
+                        self.unanswered.remove(&sequence);
+                        self.dispatched_here.remove(&sequence);
+                        Ok(Stepped::Unknown {
+                            sequence,
+                            archive_id: generation.archive_id,
+                            backup_generation: generation.backup_generation,
+                            privacy: privacy_line(generation, privacy),
+                        })
+                    }
+                    Err(error) => waiting_on(error),
                 }
-                Ok(stopped)
             }
+            // An earlier process dispatched it, so its outcome is already one this host cannot
+            // establish, and that is what a person is told while this host still asks.
+            Ok(false) if !self.dispatched_here.contains(&sequence) => Ok(Stepped::Waiting {
+                reason: format!(
+                    "the service does not hold the publication of backup generation {} of archive \
+                     {}, which may have left before this host restarted. That generation is \
+                     unknown. {}",
+                    generation.backup_generation.get(),
+                    generation.archive_id,
+                    never_complete(privacy_line(generation, privacy).as_deref())
+                ),
+            }),
             Ok(false) => Ok(Stepped::Waiting {
                 reason: format!(
                     "the publication of backup attempt {sequence} may still reach the service, \
@@ -1332,10 +1384,7 @@ fn may_send(backup: &BackupService, attempt: &Attempt) -> Result<bool> {
 
 /// Why a generation may no longer produce, for the attempt that stops over it.
 fn production_over(generation: &GenerationRecord, privacy: &PrivacyStatus) -> String {
-    if let Some(fenced) = privacy.inhibited_at() {
-        return format!("privacy mode stopped backup production at privacy generation {fenced}");
-    }
-    if generation.production != Production::Producing {
+    if privacy.inhibited_at().is_none() && generation.production != Production::Producing {
         return generation.detail.clone().unwrap_or_else(|| {
             format!(
                 "that backup generation's production is {}",
@@ -1343,10 +1392,34 @@ fn production_over(generation: &GenerationRecord, privacy: &PrivacyStatus) -> St
             )
         });
     }
-    format!(
-        "that backup work was admitted under privacy generation {}, and this host is at {}",
-        generation.privacy_generation, privacy.current_generation
-    )
+    privacy_line(generation, privacy)
+        .unwrap_or_else(|| "that backup generation may no longer produce".to_owned())
+}
+
+/// The line privacy mode drew under `generation`, if it drew one: backup production stopped, or
+/// this host moved to a later privacy generation since the work was admitted.
+fn privacy_line(generation: &GenerationRecord, privacy: &PrivacyStatus) -> Option<String> {
+    if let Some(fenced) = privacy.inhibited_at() {
+        return Some(format!(
+            "privacy mode stopped backup production at privacy generation {fenced}"
+        ));
+    }
+    (generation.privacy_generation != privacy.current_generation).then(|| {
+        format!(
+            "that backup work was admitted under privacy generation {}, and this host is at {}",
+            generation.privacy_generation, privacy.current_generation
+        )
+    })
+}
+
+/// What a generation whose outcome is unknown is to a person: never a completed backup, never
+/// sent again, and carried by the next generation unless privacy mode drew its line under it.
+fn never_complete(privacy: Option<&str>) -> String {
+    let carried = privacy.map_or_else(
+        || "the next generation carries its content".to_owned(),
+        |line| format!("no later generation carries its content, because {line}"),
+    );
+    format!("It is not a completed backup and it is not sent again, and {carried}")
 }
 
 /// Whether another upload attempt of `attempt`'s generation is already carrying its objects.
