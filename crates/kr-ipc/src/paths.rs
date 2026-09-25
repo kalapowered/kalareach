@@ -735,8 +735,8 @@ fn check_owner_only(path: &Path, _metadata: &std::fs::Metadata) -> Result<()> {
 mod windows {
     #![expect(
         unsafe_code,
-        reason = "an owner-only access-control list, and reading one back from an opened handle, \
-                  are calls into advapi32, which has no safe interface"
+        reason = "an owner-only access-control list, and reading one or a file's whole access back \
+                  from an opened handle, are calls into advapi32, which has no safe interface"
     )]
 
     use std::os::windows::io::{AsRawHandle as _, BorrowedHandle};
@@ -747,7 +747,8 @@ mod windows {
         FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtOpenFile,
     };
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE, LocalFree,
+        CloseHandle, ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, GENERIC_ALL,
+        GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE, HANDLE, LocalFree,
     };
     use windows_sys::Win32::Foundation::{
         OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, STATUS_OBJECT_NAME_NOT_FOUND,
@@ -758,15 +759,23 @@ mod windows {
         ConvertStringSidToSidW, GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
     };
     use windows_sys::Win32::Security::{
-        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
-        GetSecurityDescriptorControl, GetTokenInformation, OWNER_SECURITY_INFORMATION,
-        PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES,
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ATTRIBUTE_SECURITY_INFORMATION,
+        DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetKernelObjectSecurity, GetLengthSid,
+        GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
+        GetSecurityDescriptorSacl, GetTokenInformation, INHERITED_ACE, IsValidSid,
+        LABEL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        SCOPE_SECURITY_INFORMATION, SE_DACL_PROTECTED, SE_SACL_PROTECTED, SECURITY_ATTRIBUTES,
         TOKEN_INFORMATION_CLASS, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenOwner, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateDirectoryW, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        CreateDirectoryW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_ENCRYPTED, FILE_GENERIC_EXECUTE,
+        FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+    use windows_sys::Win32::System::SystemServices::{
+        ACCESS_FILTER_SECURITY_INFORMATION, PROCESS_TRUST_LABEL_SECURITY_INFORMATION,
+    };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     use crate::error::{IpcError, Result};
@@ -1159,6 +1168,454 @@ mod windows {
         Ok(())
     }
 
+    /// Every class of a file's security descriptor that decides who can reach the file and that
+    /// needs no privilege to read: the owner, the discretionary list, the mandatory label, resource
+    /// attributes, central access policy identifiers, the process trust label and access filters.
+    /// Audit entries are not asked for: reading them needs a privilege, and they grant and deny
+    /// nothing.
+    const ACCESS_CLASSES: u32 = OWNER_SECURITY_INFORMATION
+        | DACL_SECURITY_INFORMATION
+        | LABEL_SECURITY_INFORMATION
+        | ATTRIBUTE_SECURITY_INFORMATION
+        | SCOPE_SECURITY_INFORMATION
+        | PROCESS_TRUST_LABEL_SECURITY_INFORMATION.cast_unsigned()
+        | ACCESS_FILTER_SECURITY_INFORMATION.cast_unsigned();
+
+    /// Who can reach a file, as its security descriptor and its encryption say.
+    ///
+    /// A file is replaced by writing a new file in its directory and renaming it over the old one,
+    /// and the new file carries what Windows gives a file created there, not what the old one
+    /// carried. Two readings are equal when everything that decides access is equal: the owner, the
+    /// discretionary list (absent, or protected or not with its entries in order, each an allow or a
+    /// deny with its flags, its account and its rights, generic rights read as the file rights they
+    /// stand for), and the system list's protection with its mandatory label entries in order, each
+    /// label's mask read as the policy it is. Nothing else is compared, because nothing else is
+    /// read: a file carrying any other control that decides access is refused instead (see
+    /// [`FileAccess::read`]).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct FileAccess {
+        owner: Account,
+        discretionary: Option<AccessList>,
+        system_protected: bool,
+        labels: Vec<AccessEntry>,
+    }
+
+    /// A discretionary list: whether it is protected from what its directory passes down, and its
+    /// entries in the order access is decided by.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct AccessList {
+        protected: bool,
+        entries: Vec<AccessEntry>,
+    }
+
+    /// One entry of a discretionary list, or one mandatory label.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct AccessEntry {
+        kind: EntryKind,
+        /// The entry's own flags, inheritance among them.
+        flags: u8,
+        /// The rights an allow or a deny names, generic rights read as file rights; for a label,
+        /// its policy, as it is.
+        mask: u32,
+        account: Account,
+    }
+
+    impl AccessEntry {
+        /// Returns true when the entry came from the directory above rather than being set here.
+        fn is_inherited(&self) -> bool {
+            u32::from(self.flags) & INHERITED_ACE != 0
+        }
+    }
+
+    /// What an entry does.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum EntryKind {
+        /// It grants the rights it names.
+        Allow,
+        /// It denies the rights it names.
+        Deny,
+        /// It is the file's mandatory integrity label.
+        Label,
+    }
+
+    /// An account, as the bytes of the security identifier that names it.
+    #[derive(Clone, PartialEq, Eq)]
+    struct Account(Vec<u8>);
+
+    impl std::fmt::Debug for Account {
+        /// Written the way Windows writes one, `S-1-5-18`, when the bytes hold one.
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let bytes = &self.0;
+            if bytes.len() < 8 || bytes.len() != 8 + 4 * usize::from(bytes[1]) {
+                return write!(formatter, "an account of {} bytes", bytes.len());
+            }
+            let authority = bytes[2..8]
+                .iter()
+                .fold(0_u64, |value, byte| (value << 8) | u64::from(*byte));
+            write!(formatter, "S-{}-{authority}", bytes[0])?;
+            for part in bytes[8..].chunks_exact(4) {
+                write!(
+                    formatter,
+                    "-{}",
+                    u32::from_le_bytes([part[0], part[1], part[2], part[3]])
+                )?;
+            }
+            Ok(())
+        }
+    }
+
+    impl FileAccess {
+        /// Reads who can reach the file an open handle holds.
+        ///
+        /// The handle has to hold `READ_CONTROL` and `FILE_READ_ATTRIBUTES`. Every class
+        /// [`ACCESS_CLASSES`] names is asked for in one query, and a query that fails is a read that
+        /// failed, never a file that carries nothing.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`AccessListRefusal::Unreadable`] when the file's attributes or descriptor cannot
+        /// be read, and [`AccessListRefusal::Policy`] when the file carries a control this host does
+        /// not evaluate: a discretionary entry other than an allow or a deny (a callback, conditional,
+        /// object or compound entry), a resource attribute, a central access policy, a process trust
+        /// label, an access filter or any other entry in the system list but a label, or encryption,
+        /// because who can read an encrypted file depends on keys no descriptor shows.
+        pub fn read(file: &std::fs::File) -> std::result::Result<Self, AccessListRefusal> {
+            use std::os::windows::fs::MetadataExt as _;
+            use std::os::windows::io::AsHandle as _;
+
+            let attributes = file
+                .metadata()
+                .map_err(|error| {
+                    AccessListRefusal::Unreadable(format!(
+                        "its attributes could not be read: {error}"
+                    ))
+                })?
+                .file_attributes();
+            if attributes & FILE_ATTRIBUTE_ENCRYPTED != 0 {
+                return Err(AccessListRefusal::Policy(
+                    "it is encrypted, and who can read an encrypted file depends on keys this host \
+                     does not read"
+                        .to_owned(),
+                ));
+            }
+            let descriptor = query_descriptor(file.as_handle())?;
+            read_descriptor(&descriptor)
+        }
+
+        /// Opens the file at `path` with the rights [`FileAccess::read`] needs and nothing more,
+        /// sharing everything, and reads it.
+        ///
+        /// A link at the path is followed, as the readers of the other platforms follow one.
+        ///
+        /// # Errors
+        ///
+        /// As [`FileAccess::read`], and [`AccessListRefusal::Unreadable`] when the file cannot be
+        /// opened.
+        pub fn of(path: &Path) -> std::result::Result<Self, AccessListRefusal> {
+            use std::os::windows::fs::OpenOptionsExt as _;
+
+            let file = std::fs::OpenOptions::new()
+                .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .open(path)
+                .map_err(|error| {
+                    AccessListRefusal::Unreadable(format!(
+                        "it could not be opened to read who can reach it: {error}"
+                    ))
+                })?;
+            Self::read(&file)
+        }
+
+        /// Returns true when everything that decides access came from the file's directory: there
+        /// is a discretionary list, it is not protected, it has entries and every one of them is
+        /// inherited, the system list is not protected, and every label is inherited.
+        ///
+        /// That is what a file created in a directory carries, so a file of which this is true
+        /// carries nothing a new file there would not be given by the same directory.
+        #[must_use]
+        pub fn is_inherited_whole(&self) -> bool {
+            let Some(list) = &self.discretionary else {
+                return false;
+            };
+            !list.protected
+                && !list.entries.is_empty()
+                && list.entries.iter().all(AccessEntry::is_inherited)
+                && !self.system_protected
+                && self.labels.iter().all(AccessEntry::is_inherited)
+        }
+
+        /// Returns true when the file belongs to the account this process gives the files it
+        /// creates, which is the owner a replacement written by this process would have.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`AccessListRefusal::Unreadable`] when this process's own token cannot be read.
+        pub fn is_owned_as_new_files_are(&self) -> std::result::Result<bool, AccessListRefusal> {
+            let accounts = TokenAccounts::read()?;
+            let owner = account_in(accounts.owner(), &accounts.owner, usize::MAX)?;
+            Ok(owner == self.owner)
+        }
+    }
+
+    /// Reads the security descriptor a handle holds, every class [`ACCESS_CLASSES`] names, into
+    /// a buffer aligned for it.
+    fn query_descriptor(
+        handle: BorrowedHandle<'_>,
+    ) -> std::result::Result<Vec<u64>, AccessListRefusal> {
+        let mut buffer = vec![0_u64; 128];
+        // A descriptor can grow between the call that measures it and the call that reads it, so
+        // the read is tried again with the size the last call asked for, a few times and no more.
+        for _ in 0..4 {
+            let length = u32::try_from(buffer.len() * 8).unwrap_or(u32::MAX);
+            let mut needed: u32 = 0;
+            // SAFETY: the handle is borrowed for the call; the buffer holds `length` bytes and is
+            // aligned for a descriptor; `needed` is a live out parameter.
+            let read = unsafe {
+                GetKernelObjectSecurity(
+                    handle.as_raw_handle(),
+                    ACCESS_CLASSES,
+                    buffer.as_mut_ptr().cast(),
+                    length,
+                    &raw mut needed,
+                )
+            };
+            if read != 0 {
+                return Ok(buffer);
+            }
+            let error = std::io::Error::last_os_error();
+            let wanted = usize::try_from(needed).unwrap_or(usize::MAX);
+            if error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER.cast_signed())
+                || wanted <= buffer.len() * 8
+            {
+                return Err(AccessListRefusal::Unreadable(format!(
+                    "its security descriptor could not be read: {error}"
+                )));
+            }
+            buffer = vec![0_u64; wanted.div_ceil(8)];
+        }
+        Err(AccessListRefusal::Unreadable(
+            "its security descriptor kept growing while it was read".to_owned(),
+        ))
+    }
+
+    /// Reads what decides access out of a descriptor [`query_descriptor`] returned.
+    fn read_descriptor(descriptor: &[u64]) -> std::result::Result<FileAccess, AccessListRefusal> {
+        let pointer: PSECURITY_DESCRIPTOR = descriptor.as_ptr().cast_mut().cast();
+        let failed = |what: &str| {
+            AccessListRefusal::Unreadable(format!(
+                "the {what} of its security descriptor could not be read: {}",
+                std::io::Error::last_os_error()
+            ))
+        };
+        let mut control: u16 = 0;
+        let mut revision: u32 = 0;
+        // SAFETY: the descriptor is the one the kernel wrote into this buffer, and both out
+        // parameters are live.
+        if unsafe { GetSecurityDescriptorControl(pointer, &raw mut control, &raw mut revision) }
+            == 0
+        {
+            return Err(failed("control"));
+        }
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut defaulted: windows_sys::core::BOOL = 0;
+        // SAFETY: as above; `owner` receives a pointer into the same buffer.
+        if unsafe { GetSecurityDescriptorOwner(pointer, &raw mut owner, &raw mut defaulted) } == 0 {
+            return Err(failed("owner"));
+        }
+        if owner.is_null() {
+            return Err(AccessListRefusal::Policy("it records no owner".to_owned()));
+        }
+        let owner = account_in(owner, descriptor, usize::MAX)?;
+
+        let mut present: windows_sys::core::BOOL = 0;
+        let mut list: *mut ACL = std::ptr::null_mut();
+        // SAFETY: as above; `list` receives a pointer into the same buffer, or null.
+        if unsafe {
+            GetSecurityDescriptorDacl(pointer, &raw mut present, &raw mut list, &raw mut defaulted)
+        } == 0
+        {
+            return Err(failed("discretionary list"));
+        }
+        // No list at all grants every account full access, which is not the same as a list with no
+        // entries, which grants nothing.
+        let discretionary = if present == 0 || list.is_null() {
+            None
+        } else {
+            Some(AccessList {
+                protected: control & SE_DACL_PROTECTED != 0,
+                entries: entries(list, descriptor, false)?,
+            })
+        };
+
+        let mut system: *mut ACL = std::ptr::null_mut();
+        // SAFETY: as above.
+        if unsafe {
+            GetSecurityDescriptorSacl(
+                pointer,
+                &raw mut present,
+                &raw mut system,
+                &raw mut defaulted,
+            )
+        } == 0
+        {
+            return Err(failed("system list"));
+        }
+        let labels = if present == 0 || system.is_null() {
+            Vec::new()
+        } else {
+            entries(system, descriptor, true)?
+        };
+        Ok(FileAccess {
+            owner,
+            discretionary,
+            system_protected: control & SE_SACL_PROTECTED != 0,
+            labels,
+        })
+    }
+
+    /// Reads every entry of a list inside `descriptor`, refusing one this host does not evaluate.
+    ///
+    /// `system` says which list it is: the discretionary list holds allows and denies, and the
+    /// system list as it was asked for holds labels and the other controls, which are refused.
+    fn entries(
+        list: *const ACL,
+        descriptor: &[u64],
+        system: bool,
+    ) -> std::result::Result<Vec<AccessEntry>, AccessListRefusal> {
+        let name = if system {
+            "system list"
+        } else {
+            "access-control list"
+        };
+        // SAFETY: `list` points at a list inside the descriptor the kernel wrote into `descriptor`.
+        let count = unsafe { (*list).AceCount };
+        let mut read = Vec::with_capacity(usize::from(count));
+        for index in 0..u32::from(count) {
+            let mut entry: *mut core::ffi::c_void = std::ptr::null_mut();
+            // SAFETY: `list` is live and `index` is below the entry count it reported.
+            if unsafe { GetAce(list, index, &raw mut entry) } == 0 || entry.is_null() {
+                return Err(AccessListRefusal::Unreadable(format!(
+                    "entry {index} of its {name} could not be read: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            // SAFETY: every entry in a list begins with its header.
+            let header = unsafe { std::ptr::read_unaligned(entry.cast::<ACE_HEADER>()) };
+            let kind = entry_kind(header.AceType, system).map_err(|kind| {
+                AccessListRefusal::Policy(format!(
+                    "its {name} carries {kind}, which this host does not evaluate"
+                ))
+            })?;
+            // An allow, a deny and a label are laid out alike: the header, a mask, and then the
+            // account's identifier.
+            let mask_at = std::mem::offset_of!(ACCESS_ALLOWED_ACE, Mask);
+            let account_at = std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+            let size = usize::from(header.AceSize);
+            if size < account_at {
+                return Err(AccessListRefusal::Unreadable(format!(
+                    "entry {index} of its {name} is {size} bytes, too short to name an account"
+                )));
+            }
+            // SAFETY: the entry is at least `account_at` bytes long, so its mask lies inside it.
+            let mask =
+                unsafe { std::ptr::read_unaligned(entry.cast::<u8>().add(mask_at).cast::<u32>()) };
+            // SAFETY: as above; the identifier starts at `account_at` inside the entry.
+            let sid: PSID = unsafe { entry.cast::<u8>().add(account_at) }.cast();
+            let account = account_in(sid, descriptor, size - account_at)?;
+            read.push(AccessEntry {
+                kind,
+                flags: header.AceFlags,
+                mask: if kind == EntryKind::Label {
+                    mask
+                } else {
+                    file_rights(mask)
+                },
+                account,
+            });
+        }
+        Ok(read)
+    }
+
+    /// Says what an entry of this type is, or names it as one this host does not evaluate.
+    fn entry_kind(kind: u8, system: bool) -> std::result::Result<EntryKind, String> {
+        use windows_sys::Win32::System::SystemServices::{
+            SYSTEM_ACCESS_FILTER_ACE_TYPE, SYSTEM_MANDATORY_LABEL_ACE_TYPE,
+            SYSTEM_PROCESS_TRUST_LABEL_ACE_TYPE, SYSTEM_RESOURCE_ATTRIBUTE_ACE_TYPE,
+            SYSTEM_SCOPED_POLICY_ID_ACE_TYPE,
+        };
+
+        let code = u32::from(kind);
+        match (system, kind) {
+            (false, ACCESS_ALLOWED_ACE_TYPE) => Ok(EntryKind::Allow),
+            (false, ACCESS_DENIED_ACE_TYPE) => Ok(EntryKind::Deny),
+            (true, _) if code == SYSTEM_MANDATORY_LABEL_ACE_TYPE => Ok(EntryKind::Label),
+            (true, _) if code == SYSTEM_RESOURCE_ATTRIBUTE_ACE_TYPE => {
+                Err("a resource attribute".to_owned())
+            }
+            (true, _) if code == SYSTEM_SCOPED_POLICY_ID_ACE_TYPE => {
+                Err("a central access policy".to_owned())
+            }
+            (true, _) if code == SYSTEM_PROCESS_TRUST_LABEL_ACE_TYPE => {
+                Err("a process trust label".to_owned())
+            }
+            (true, _) if code == SYSTEM_ACCESS_FILTER_ACE_TYPE => {
+                Err("an access filter".to_owned())
+            }
+            (_, other) => Err(format!("a type-{other} entry")),
+        }
+    }
+
+    /// Reads a mask of an allow or a deny as the file rights it names, each generic right replaced
+    /// by the file rights it stands for, so an entry written with a generic right and one written
+    /// with the rights it means read the same.
+    fn file_rights(mask: u32) -> u32 {
+        let mut rights = mask & !(GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | GENERIC_ALL);
+        for (generic, specific) in [
+            (GENERIC_READ, FILE_GENERIC_READ),
+            (GENERIC_WRITE, FILE_GENERIC_WRITE),
+            (GENERIC_EXECUTE, FILE_GENERIC_EXECUTE),
+            (GENERIC_ALL, FILE_ALL_ACCESS),
+        ] {
+            if mask & generic != 0 {
+                rights |= specific;
+            }
+        }
+        rights
+    }
+
+    /// Copies the identifier at `sid` out of `buffer`, checking that it is a valid identifier that
+    /// lies wholly inside the buffer and inside the `room` its entry leaves for it.
+    fn account_in(
+        sid: PSID,
+        buffer: &[u64],
+        room: usize,
+    ) -> std::result::Result<Account, AccessListRefusal> {
+        let unreadable =
+            || AccessListRefusal::Unreadable("it names an account that is not whole".to_owned());
+        let start = buffer.as_ptr() as usize;
+        let end = start + buffer.len() * 8;
+        let at = sid as usize;
+        // The fixed part of an identifier is eight bytes, which is as much as the check of its
+        // validity reads before it knows how long the identifier is.
+        if sid.is_null() || at < start || at.saturating_add(8) > end || room < 8 {
+            return Err(unreadable());
+        }
+        // SAFETY: the identifier's fixed part lies inside the buffer, as checked above.
+        if unsafe { IsValidSid(sid) } == 0 {
+            return Err(unreadable());
+        }
+        // SAFETY: the identifier is valid, so its length is read from its own fixed part.
+        let length = usize::try_from(unsafe { GetLengthSid(sid) }).unwrap_or(usize::MAX);
+        if length > room || at.saturating_add(length) > end {
+            return Err(unreadable());
+        }
+        // SAFETY: the identifier's `length` bytes lie inside the buffer, as checked above, and the
+        // buffer outlives the copy.
+        Ok(Account(
+            unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), length) }.to_vec(),
+        ))
+    }
+
     /// A security identifier this module allocated.
     struct OwnedSid(PSID);
 
@@ -1340,14 +1797,245 @@ mod windows {
     fn wide_str(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(std::iter::once(0)).collect()
     }
+
+    /// Creates a file with one explicit security descriptor, written as SDDL.
+    ///
+    /// For this crate's tests of [`FileAccess`], which need files carrying lists, labels and
+    /// entries no ordinary creation gives them. The product writes no list.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating system's error when the descriptor cannot be built or the file cannot
+    /// be created with it.
+    #[cfg(test)]
+    pub(crate) fn create_file_with_descriptor(
+        path: &Path,
+        descriptor: &str,
+    ) -> std::io::Result<()> {
+        use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL,
+        };
+
+        let wide_path = wide(path.as_os_str());
+        let built = BuiltDescriptor::parse(descriptor)?;
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(0),
+            lpSecurityDescriptor: built.0,
+            bInheritHandle: 0,
+        };
+        // SAFETY: `wide_path` is a null-terminated wide buffer this function owns for the call, and
+        // `attributes` points at a descriptor that lives until `built` is dropped, after the call.
+        let handle = unsafe {
+            CreateFileW(
+                wide_path.as_ptr(),
+                GENERIC_WRITE,
+                0,
+                &raw const attributes,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: the handle came from the creation above and is closed exactly once.
+        unsafe {
+            CloseHandle(handle);
+        }
+        Ok(())
+    }
+
+    /// Sets a directory's discretionary list, written as SDDL, without carrying it to anything the
+    /// directory already holds: the older call used here changes the one object it names.
+    ///
+    /// For this crate's tests of a file that inherited its list before its directory's changed.
+    /// The product writes no list.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating system's error when the descriptor cannot be built or set.
+    #[cfg(test)]
+    pub(crate) fn set_list_without_propagation(
+        path: &Path,
+        descriptor: &str,
+    ) -> std::io::Result<()> {
+        use windows_sys::Win32::Security::SetFileSecurityW;
+
+        let wide_path = wide(path.as_os_str());
+        let built = BuiltDescriptor::parse(descriptor)?;
+        // SAFETY: `wide_path` is a null-terminated wide buffer this function owns for the call, and
+        // the descriptor lives until `built` is dropped, after the call.
+        let set =
+            unsafe { SetFileSecurityW(wide_path.as_ptr(), DACL_SECURITY_INFORMATION, built.0) };
+        if set == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// A security descriptor built from SDDL, freed when it goes out of scope.
+    #[cfg(test)]
+    struct BuiltDescriptor(PSECURITY_DESCRIPTOR);
+
+    #[cfg(test)]
+    impl BuiltDescriptor {
+        fn parse(descriptor: &str) -> std::io::Result<Self> {
+            let wide_descriptor = wide_str(descriptor);
+            let mut built: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+            // SAFETY: the text is a null-terminated wide buffer this function owns for the call,
+            // `built` is a live out parameter, and the size parameter is optional.
+            let parsed = unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    wide_descriptor.as_ptr(),
+                    SDDL_REVISION_1,
+                    &raw mut built,
+                    std::ptr::null_mut(),
+                )
+            };
+            if parsed == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(Self(built))
+        }
+    }
+
+    #[cfg(test)]
+    impl Drop for BuiltDescriptor {
+        fn drop(&mut self) {
+            // SAFETY: the descriptor was allocated by the conversion above and is freed once.
+            unsafe {
+                LocalFree(self.0.cast());
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// An account the tests name: the local system.
+        fn system() -> Account {
+            Account(vec![1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0])
+        }
+
+        fn entry(kind: EntryKind, flags: u32, mask: u32) -> AccessEntry {
+            AccessEntry {
+                kind,
+                flags: u8::try_from(flags).expect("an entry's flags fit a byte"),
+                mask,
+                account: system(),
+            }
+        }
+
+        /// A generic right reads as the file rights it stands for, and a mask with none reads as
+        /// it is.
+        #[test]
+        fn generic_rights_read_as_the_file_rights_they_stand_for() {
+            assert_eq!(file_rights(GENERIC_ALL), FILE_ALL_ACCESS);
+            assert_eq!(file_rights(GENERIC_READ), FILE_GENERIC_READ);
+            assert_eq!(file_rights(GENERIC_WRITE), FILE_GENERIC_WRITE);
+            assert_eq!(file_rights(GENERIC_EXECUTE), FILE_GENERIC_EXECUTE);
+            assert_eq!(
+                file_rights(GENERIC_READ | GENERIC_EXECUTE),
+                FILE_GENERIC_READ | FILE_GENERIC_EXECUTE
+            );
+            assert_eq!(file_rights(FILE_ALL_ACCESS), FILE_ALL_ACCESS);
+            assert_eq!(file_rights(FILE_GENERIC_READ), FILE_GENERIC_READ);
+        }
+
+        /// A list is inherited whole only when nothing in it, and nothing in the system list, was
+        /// set on the file itself: each case below changes one thing from the control.
+        #[test]
+        fn a_list_is_inherited_whole_only_when_nothing_in_it_was_set_here() {
+            let control = FileAccess {
+                owner: system(),
+                discretionary: Some(AccessList {
+                    protected: false,
+                    entries: vec![entry(EntryKind::Allow, INHERITED_ACE, FILE_ALL_ACCESS)],
+                }),
+                system_protected: false,
+                labels: vec![entry(EntryKind::Label, INHERITED_ACE, 1)],
+            };
+            assert!(control.is_inherited_whole());
+
+            let mut protected = control.clone();
+            if let Some(list) = protected.discretionary.as_mut() {
+                list.protected = true;
+            }
+            let mut explicit = control.clone();
+            if let Some(list) = explicit.discretionary.as_mut() {
+                list.entries
+                    .push(entry(EntryKind::Deny, 0, FILE_GENERIC_WRITE));
+            }
+            let mut empty = control.clone();
+            if let Some(list) = empty.discretionary.as_mut() {
+                list.entries.clear();
+            }
+            let absent = FileAccess {
+                discretionary: None,
+                ..control.clone()
+            };
+            let system_protected = FileAccess {
+                system_protected: true,
+                ..control.clone()
+            };
+            let labelled = FileAccess {
+                labels: vec![entry(EntryKind::Label, 0, 1)],
+                ..control.clone()
+            };
+            for (what, access) in [
+                ("a protected list of inherited entries", protected),
+                ("an explicit entry", explicit),
+                ("an empty list", empty),
+                ("no list", absent),
+                ("a protected system list", system_protected),
+                ("an explicit label", labelled),
+            ] {
+                assert!(!access.is_inherited_whole(), "{what}");
+                assert_ne!(access, control, "{what}");
+            }
+        }
+
+        /// The entry types this host evaluates, and the ones it names and refuses.
+        #[test]
+        fn only_allows_denies_and_labels_are_evaluated() {
+            assert_eq!(entry_kind(0, false), Ok(EntryKind::Allow));
+            assert_eq!(entry_kind(1, false), Ok(EntryKind::Deny));
+            assert_eq!(entry_kind(0x11, true), Ok(EntryKind::Label));
+            for (kind, named) in [
+                (0x12, "a resource attribute"),
+                (0x13, "a central access policy"),
+                (0x14, "a process trust label"),
+                (0x15, "an access filter"),
+            ] {
+                assert_eq!(entry_kind(kind, true), Err(named.to_owned()));
+            }
+            // A label in the discretionary list, an allow in the system list, and a callback,
+            // an object and a compound entry anywhere.
+            for (kind, system) in [(0x11, false), (0, true), (9, false), (5, false), (4, false)] {
+                assert!(entry_kind(kind, system).is_err(), "{kind} in {system}");
+            }
+        }
+
+        /// An account is written the way Windows writes one.
+        #[test]
+        fn an_account_is_written_as_windows_writes_it() {
+            assert_eq!(format!("{:?}", system()), "S-1-5-18");
+        }
+    }
 }
 
-/// For this crate's own tests of files a wider list would let another account reach.
-#[cfg(all(windows, test))]
-pub(crate) use self::windows::create_directory_with_list;
 #[cfg(windows)]
 pub use self::windows::{
-    AccessListRefusal, check_access_list, current_job_limit_flags, open_child,
+    AccessListRefusal, FileAccess, check_access_list, current_job_limit_flags, open_child,
+};
+/// For this crate's own tests of files a wider list would let another account reach, and of the
+/// access reader.
+#[cfg(all(windows, test))]
+pub(crate) use self::windows::{
+    create_directory_with_list, create_file_with_descriptor, set_list_without_propagation,
 };
 
 /// Returns the current user's identifier.
@@ -2253,6 +2941,284 @@ mod tests {
             kr_protocol::error::ErrorCode::PermissionDenied
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A directory under the system's temporary directory that inherits its list from the one
+    /// above, as a person's own directories do, removed when the test ends however it ends.
+    #[cfg(windows)]
+    struct Inheriting(PathBuf);
+
+    #[cfg(windows)]
+    impl Inheriting {
+        fn new(name: &str) -> Self {
+            let suffix = crate::new_uuid().to_string();
+            let path = std::env::temp_dir().join(format!("kr-access-{name}-{}", &suffix[..8]));
+            std::fs::create_dir(&path).expect("a directory that inherits its list");
+            Self(path)
+        }
+
+        /// A file of this directory's own, made as any program makes one.
+        fn file(&self, name: &str) -> PathBuf {
+            let path = self.0.join(name);
+            std::fs::write(&path, name).expect("a file made in the directory");
+            path
+        }
+
+        /// A file made with one explicit descriptor.
+        fn described(&self, name: &str, descriptor: &str) -> PathBuf {
+            let path = self.0.join(name);
+            create_file_with_descriptor(&path, descriptor)
+                .unwrap_or_else(|error| panic!("{name} is created with {descriptor}: {error}"));
+            path
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for Inheriting {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Reads who can reach a file, failing the test when it cannot.
+    #[cfg(windows)]
+    fn access(path: &Path) -> FileAccess {
+        FileAccess::of(path)
+            .unwrap_or_else(|refusal| panic!("{} is read: {refusal:?}", path.display()))
+    }
+
+    /// Two files made in one directory have the same access, which is all inherited from the
+    /// directory and owned by the account this process gives new files: what a replacement made
+    /// beside a document carries.
+    #[cfg(windows)]
+    #[test]
+    fn two_files_made_in_one_directory_have_the_same_access() {
+        let directory = Inheriting::new("same");
+        let first = access(&directory.file("first"));
+        let second = access(&directory.file("second"));
+        assert_eq!(first, second);
+        assert!(first.is_inherited_whole(), "{first:?}");
+        assert!(first.is_owned_as_new_files_are().expect("the token"));
+    }
+
+    /// An entry set on the file itself, a list protected from its directory, and another owner
+    /// each make a file's access another than a new file's beside it, and each is told apart from
+    /// a file the directory made; the control is a sibling left as it was made.
+    #[cfg(windows)]
+    #[test]
+    fn an_entry_set_here_a_protected_list_or_another_owner_is_another_access() {
+        let directory = Inheriting::new("changed");
+        let made = access(&directory.file("control"));
+        let granted = directory.file("granted");
+        run(
+            "icacls.exe",
+            &[
+                granted.as_os_str(),
+                "/grant".as_ref(),
+                "*S-1-1-0:(R)".as_ref(),
+            ],
+        );
+        let protected = directory.file("protected");
+        run(
+            "icacls.exe",
+            &[protected.as_os_str(), "/inheritance:d".as_ref()],
+        );
+        let owned = directory.file("owned");
+        run(
+            "icacls.exe",
+            &[
+                owned.as_os_str(),
+                "/setowner".as_ref(),
+                "*S-1-5-18".as_ref(),
+            ],
+        );
+
+        let granted = access(&granted);
+        let protected = access(&protected);
+        let owned = access(&owned);
+        for (what, changed) in [
+            ("an explicit entry", &granted),
+            ("a protected list", &protected),
+            ("another owner", &owned),
+        ] {
+            assert_ne!(changed, &made, "{what}");
+        }
+        assert!(!granted.is_inherited_whole(), "{granted:?}");
+        assert!(!protected.is_inherited_whole(), "{protected:?}");
+        assert!(
+            owned.is_inherited_whole(),
+            "only its owner changed: {owned:?}"
+        );
+        assert!(!owned.is_owned_as_new_files_are().expect("the token"));
+        assert!(made.is_owned_as_new_files_are().expect("the token"));
+        assert_eq!(access(&directory.file("again")), made, "the control holds");
+    }
+
+    /// A file whose directory passes one entry fewer has another access than one whose directory
+    /// passes it, though both are inherited whole.
+    #[cfg(windows)]
+    #[test]
+    fn a_file_whose_directory_passes_one_entry_fewer_has_another_access() {
+        let fewer = Inheriting::new("fewer");
+        let more = Inheriting::new("more");
+        run(
+            "icacls.exe",
+            &[
+                more.0.as_os_str(),
+                "/grant".as_ref(),
+                "*S-1-1-0:(OI)(R)".as_ref(),
+            ],
+        );
+        let without = access(&fewer.file("without"));
+        let with = access(&more.file("with"));
+        assert_ne!(without, with);
+        assert!(without.is_inherited_whole() && with.is_inherited_whole());
+        assert_eq!(access(&fewer.file("control")), without);
+    }
+
+    /// Entries are read in their order and with their rights, a generic right as the file rights
+    /// it stands for, and a file with no list apart from one with an empty list.
+    #[cfg(windows)]
+    #[test]
+    fn order_rights_and_an_absent_list_are_read_as_they_are() {
+        let directory = Inheriting::new("described");
+        let allow_deny = "D:P(A;;FR;;;WD)(D;;FW;;;WD)";
+        let first = access(&directory.described("allow-deny", allow_deny));
+        assert_eq!(
+            access(&directory.described("allow-deny-again", allow_deny)),
+            first,
+            "the same descriptor reads the same"
+        );
+        assert_ne!(
+            access(&directory.described("deny-allow", "D:P(D;;FW;;;WD)(A;;FR;;;WD)")),
+            first,
+            "entries in another order"
+        );
+        let all = access(&directory.described("all", "D:P(A;;FA;;;WD)"));
+        assert_ne!(
+            access(&directory.described("read", "D:P(A;;FR;;;WD)")),
+            all,
+            "other rights"
+        );
+        assert_eq!(
+            access(&directory.described("generic", "D:P(A;;GA;;;WD)")),
+            all,
+            "a generic right reads as the rights it stands for"
+        );
+        let absent = access(&directory.described("no-list", "D:NO_ACCESS_CONTROL"));
+        let empty = access(&directory.described("empty-list", "D:P"));
+        assert_ne!(absent, empty, "no list is not an empty one");
+        assert!(!absent.is_inherited_whole() && !empty.is_inherited_whole());
+    }
+
+    /// A mandatory label is read with its policy: one that forbids reading up is another access
+    /// than none, and than one that forbids only writing up; a label set on an otherwise inherited
+    /// file keeps it from being inherited whole.
+    #[cfg(windows)]
+    #[test]
+    fn a_label_is_read_with_the_policy_it_sets() {
+        let directory = Inheriting::new("labelled");
+        let unlabelled = access(&directory.described("unlabelled", "D:P(A;;FA;;;WD)"));
+        let no_read_up = "D:P(A;;FA;;;WD)S:(ML;;NRNW;;;ME)";
+        let reading = access(&directory.described("no-read-up", no_read_up));
+        assert_ne!(reading, unlabelled);
+        assert_eq!(
+            access(&directory.described("no-read-up-again", no_read_up)),
+            reading
+        );
+        assert_ne!(
+            access(&directory.described("no-write-up", "D:P(A;;FA;;;WD)S:(ML;;NW;;;ME)")),
+            reading,
+            "another policy"
+        );
+        let inherited = access(&directory.file("inherited"));
+        let set_here = access(&directory.described("label-set-here", "S:(ML;;NW;;;ME)"));
+        assert!(inherited.is_inherited_whole(), "{inherited:?}");
+        assert!(!set_here.is_inherited_whole(), "{set_here:?}");
+    }
+
+    /// Controls this host does not evaluate are refused rather than read: a conditional entry, a
+    /// resource attribute and encryption. Beside each, a file without it reads.
+    #[cfg(windows)]
+    #[test]
+    fn controls_this_host_does_not_evaluate_are_refused() {
+        use std::os::windows::fs::MetadataExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_ENCRYPTED;
+
+        let directory = Inheriting::new("refused");
+        access(&directory.described("plain", "D:P(A;;FR;;;WD)(A;;FA;;;OW)"));
+        let conditional = directory.described(
+            "conditional",
+            "D:P(XA;;FR;;;WD;(@User.Title==\"PM\"))(A;;FA;;;OW)",
+        );
+        let attribute = directory.described(
+            "attribute",
+            "D:P(A;;FR;;;WD)(A;;FA;;;OW)S:(RA;;;;;WD;(\"Secrecy\",TU,0x0,3))",
+        );
+        let encrypted = directory.file("encrypted");
+        access(&directory.file("unencrypted"));
+        run(
+            "cipher.exe",
+            &["/e".as_ref(), "/a".as_ref(), encrypted.as_os_str()],
+        );
+        assert_ne!(
+            std::fs::metadata(&encrypted)
+                .expect("reads the attributes")
+                .file_attributes()
+                & FILE_ATTRIBUTE_ENCRYPTED,
+            0,
+            "the file is encrypted"
+        );
+        for (what, path) in [
+            ("a conditional entry", &conditional),
+            ("a resource attribute", &attribute),
+            ("encryption", &encrypted),
+        ] {
+            let refused = FileAccess::of(path).expect_err(what);
+            assert!(
+                matches!(refused, AccessListRefusal::Policy(_)),
+                "{what}: {refused:?}"
+            );
+        }
+    }
+
+    /// A file whose owner may not read its descriptor is a read that failed, never a file with
+    /// nothing in its lists; beside it, a file whose owner may read everything reads.
+    #[cfg(windows)]
+    #[test]
+    fn a_descriptor_that_cannot_be_read_is_unreadable() {
+        let directory = Inheriting::new("unreadable");
+        access(&directory.described("readable", "D:P(A;;FA;;;OW)"));
+        // The owner's own entry grants reading its contents and nothing else, which takes away
+        // the reading of its descriptor an owner otherwise has.
+        let unreadable = directory.described("unreadable", "D:P(A;;0x1;;;OW)");
+        let refused = FileAccess::of(&unreadable).expect_err("the descriptor cannot be read");
+        assert!(
+            matches!(refused, AccessListRefusal::Unreadable(_)),
+            "{refused:?}"
+        );
+    }
+
+    /// A file that inherited its list before its directory's list changed without the change
+    /// reaching it has another access than a file made there afterwards, though both read as
+    /// inherited whole: what reading a document alone cannot see, and what comparing the
+    /// replacement with it does.
+    #[cfg(windows)]
+    #[test]
+    fn a_file_that_inherited_before_its_directory_changed_differs_from_a_new_one() {
+        let directory = Inheriting::new("unpropagated");
+        let old = directory.file("old");
+        let before = access(&old);
+        assert_eq!(access(&directory.file("sibling")), before, "the control");
+        set_list_without_propagation(
+            &directory.0,
+            "D:(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICIIO;FA;;;CO)(A;OICI;0x1200a9;;;WD)",
+        )
+        .expect("the directory's list changes and nothing inside it does");
+        assert_eq!(access(&old), before, "the file inside kept its list");
+        let new = access(&directory.file("new"));
+        assert_ne!(new, before);
+        assert!(new.is_inherited_whole() && before.is_inherited_whole());
     }
 
     /// A path through a junction is flushed to where the junction leads.
