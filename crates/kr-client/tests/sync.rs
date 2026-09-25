@@ -13,7 +13,7 @@ use kr_client::drafts::{
     Published as DraftPublished, SyncCheckpoint as DraftCheckpoint, draft_collection,
 };
 use kr_client::services::{
-    ServiceFuture, SyncBackupService, SyncExchanged, SyncPosition, SyncRecoveryId,
+    ServiceFuture, SyncBackupService, SyncExchanged, SyncFetched, SyncPosition, SyncRecoveryId,
     SyncRequestFence, SyncRequestStatus, SyncRevision,
 };
 use kr_client::sync::{
@@ -867,22 +867,20 @@ impl SyncBackupService for Service {
         })
     }
 
-    fn fetch<'a>(&'a self, collection: &'a str) -> ServiceFuture<'a, (SyncPosition, Vec<u8>)> {
+    fn fetch<'a>(&'a self, collection: &'a str) -> ServiceFuture<'a, SyncFetched> {
         Box::pin(async move {
             if *self.fetch_unreachable.lock().await {
                 return Err(lost("what the service holds could not be fetched"));
             }
-            self.objects
-                .lock()
-                .await
-                .get(collection)
-                .cloned()
-                .ok_or_else(|| {
-                    ClientError::Host(ProtocolError::new(
-                        ErrorCode::UnknownSession,
-                        "no such object",
-                    ))
-                })
+            // A collection that holds nothing says so in the history the service answers from.
+            let recovery = self.history().await;
+            Ok(self.objects.lock().await.get(collection).cloned().map_or(
+                SyncFetched::Absent { recovery },
+                |(position, ciphertext)| SyncFetched::Held {
+                    position,
+                    ciphertext,
+                },
+            ))
         })
     }
 
@@ -1018,7 +1016,7 @@ impl SyncBackupService for GatedService {
         )
     }
 
-    fn fetch<'a>(&'a self, collection: &'a str) -> ServiceFuture<'a, (SyncPosition, Vec<u8>)> {
+    fn fetch<'a>(&'a self, collection: &'a str) -> ServiceFuture<'a, SyncFetched> {
         Box::pin(async move {
             let answered = self.inner.fetch(collection).await;
             if std::mem::take(&mut *self.hold_a_fetch.lock().await) {
@@ -5825,6 +5823,364 @@ async fn a_draft_publication_attempted_before_its_collection_was_put_back_is_nev
         drafts.load(draft.draft_id).expect("the draft"),
         draft,
         "the person's draft is untouched throughout"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// KR-REQ-24.13 and KR-REQ-20.13 across a restore: a collection put back without the object
+// ---------------------------------------------------------------------------
+
+/// KR-REQ-24.13 across a restore: a draft publication whose answer was lost, in a collection put
+/// back from an archive that held no draft, is never attempted again under its identity. The fetch
+/// that finds the restored collection empty follows it into the history the restore began, the
+/// next publication of the same revision is new work under an identity of its own, and the draft
+/// half's reconciliation ends the first publication with its account kept.
+#[tokio::test]
+async fn a_draft_whose_collection_was_put_back_empty_is_never_attempted_again_under_its_identity() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
+    let draft = drafts
+        .create(draft_target(), "mine".to_owned(), TimestampMs::new(NOW))
+        .expect("a draft");
+
+    // An export taken before the draft was ever published, and then the publication: the service
+    // applies it and the answer never comes back.
+    let archive = service.export().await;
+    service.lose_the_next_answer().await;
+    sync.publish(
+        &drafts,
+        draft.draft_id,
+        draft.revision,
+        TimestampMs::new(NOW),
+    )
+    .await
+    .expect_err("the answer never came back");
+    let first = service.exchanges().await[0].request_id;
+
+    // The service is put back from that export. The draft's collection holds nothing in the
+    // history the restore began, and the receipt of the write went with the history it ran in.
+    let restored = recovery(0xd2);
+    service.put_back(&archive, restored).await;
+
+    // A fetch finds the collection empty. Nothing comes down and nothing is kept.
+    let absent = sync
+        .fetch_beside(&drafts, draft.draft_id, TimestampMs::new(NOW + 1))
+        .await
+        .expect_err("the restored collection holds no draft");
+    assert_eq!(absent.code(), ErrorCode::UnknownSession, "{absent}");
+
+    // Publishing the same revision again, well inside the span a later attempt may be made in, is
+    // not a later attempt at the first publication: the restored collection holds no receipt of
+    // it, so its identity presented there could run the same write a second time. It is new work
+    // under an identity of its own, compared against nothing, and it lands in the restored
+    // history.
+    assert_eq!(
+        sync.publish(
+            &drafts,
+            draft.draft_id,
+            draft.revision,
+            TimestampMs::new(NOW + 2)
+        )
+        .await
+        .expect("an answer"),
+        DraftPublished::Accepted {
+            position: in_history(at(1), Some(restored))
+        }
+    );
+    let sent = service.exchanges().await;
+    assert_eq!(sent.len(), 2);
+    assert_ne!(
+        sent[1].request_id, first,
+        "the first identity is never presented again"
+    );
+    assert_eq!(sent[1].expected, None);
+
+    // The draft half's reconciliation ends the first publication at once, under the generation in
+    // force, and keeps its account: the restored service cannot say that it never ran.
+    let reconciled = sync
+        .reconcile_unsettled(&drafts, TimestampMs::new(NOW + 3))
+        .await
+        .expect("reconciled");
+    assert_eq!(reconciled.fenced, 1);
+    assert_eq!(reconciled.accounts_kept, 1);
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    let fences = service.fence_requests().await;
+    assert_eq!(fences.len(), 1);
+    assert_eq!(fences[0].request_id, first);
+    assert_eq!(
+        service.exchanges().await.len(),
+        2,
+        "nothing was written on this device's behalf"
+    );
+    assert_eq!(
+        drafts.load(draft.draft_id).expect("the draft"),
+        draft,
+        "the person's draft is untouched throughout"
+    );
+}
+
+/// KR-REQ-20.13 across a restore: a fetch that finds a setting's collection put back empty follows
+/// the collection into the history the restore began. The note named a place in the history the
+/// restore replaced, so it goes, and the next publication compares against nothing, which is what
+/// the restored collection holds, rather than being refused against a place it never had.
+#[tokio::test]
+async fn a_fetch_that_finds_its_collection_put_back_empty_follows_it_and_frees_the_next_publication()
+ {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (client, object_id) = device_client(directory.path(), "one", &service);
+    let mut mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    // An export taken before this device's first write, and then the write.
+    let archive = service.export().await;
+    publish_again(&client, &mut mine, NOW).await;
+
+    // The service is put back from that export, so the collection holds nothing in the history
+    // the restore began.
+    let restored = recovery(0xd3);
+    service.put_back(&archive, restored).await;
+    let sent_before = service.exchanges().await.len();
+
+    let absent = client
+        .fetch(
+            SyncObjectKind::Settings,
+            object_id,
+            TimestampMs::new(NOW + 1),
+        )
+        .await
+        .expect_err("the restored collection holds nothing");
+    assert_eq!(absent.code(), ErrorCode::UnknownSession, "{absent}");
+    assert_eq!(
+        client.store().checkpoint(object_id).expect("a note"),
+        None,
+        "the note named a place in the history the restore replaced"
+    );
+    assert_eq!(
+        client
+            .store()
+            .basis(object_id)
+            .expect("a history")
+            .recovery(),
+        Some(restored),
+        "the collection is read in the history the restore began"
+    );
+    assert_eq!(
+        client.store().object(object_id).expect("read"),
+        Some(mine.clone()),
+        "this device's own settings are never replaced"
+    );
+    assert!(
+        client
+            .store()
+            .conflicts(object_id)
+            .expect("copies")
+            .is_empty(),
+        "nothing came down to keep"
+    );
+    assert_eq!(service.exchanges().await.len(), sent_before);
+
+    // Nothing publishes on its own. The next publication the person asks for compares against
+    // nothing and lands in the restored history.
+    assert_eq!(
+        publish_again(&client, &mut mine, NOW + 2).await,
+        Published::Accepted {
+            position: in_history(at(1), Some(restored))
+        }
+    );
+    let sent = service.exchanges().await;
+    assert_eq!(sent.len(), sent_before + 1);
+    assert_eq!(sent[sent_before].expected, None);
+}
+
+/// KR-REQ-24.13, the control: a collection that holds nothing in the history this device reads it
+/// in moves nothing. A draft publication whose request never arrived is attempted again under its
+/// own identity, which is what lets a service answer a retry from its receipt, and a setting's
+/// note stays where it was.
+#[tokio::test]
+async fn an_empty_collection_in_the_history_this_device_reads_moves_nothing() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
+    let draft = drafts
+        .create(draft_target(), "mine".to_owned(), TimestampMs::new(NOW))
+        .expect("a draft");
+    let draft_object = SyncObjectId::new(draft.draft_id.get());
+
+    // The publication is sent and lost on its way, so the collection still holds nothing.
+    service.drop_the_next_request().await;
+    sync.publish(
+        &drafts,
+        draft.draft_id,
+        draft.revision,
+        TimestampMs::new(NOW),
+    )
+    .await
+    .expect_err("the request never arrived");
+    let first = service.exchanges().await[0].request_id;
+
+    // A fetch finds the collection empty in the history this device reads it in: no news about
+    // the history.
+    let absent = sync
+        .fetch_beside(&drafts, draft.draft_id, TimestampMs::new(NOW + 1))
+        .await
+        .expect_err("the collection holds no draft");
+    assert_eq!(absent.code(), ErrorCode::UnknownSession, "{absent}");
+    assert_eq!(
+        sync.store()
+            .basis(draft_object)
+            .expect("a history")
+            .recovery(),
+        None
+    );
+
+    // Publishing the same revision again is a later attempt at the same publication: its identity,
+    // its bytes and its comparison.
+    assert_eq!(
+        sync.publish(
+            &drafts,
+            draft.draft_id,
+            draft.revision,
+            TimestampMs::new(NOW + 2)
+        )
+        .await
+        .expect("an answer"),
+        DraftPublished::Accepted { position: at(1) }
+    );
+    let sent = service.exchanges().await;
+    assert_eq!(sent.len(), 2);
+    assert_eq!(
+        sent[1].request_id, first,
+        "the same publication, attempted again"
+    );
+    assert_eq!(sent[1].ciphertext, sent[0].ciphertext);
+    assert_eq!(client.outstanding().expect("a count"), 0);
+
+    // A setting whose object another device removed: the collection holds nothing, in the history
+    // the note is in, and the note stays for the next comparison to meet.
+    let object_id = fresh_object_id().expect("an identity");
+    let mut mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    publish_again(&client, &mut mine, NOW + 3).await;
+    service
+        .remove(&sync_collection(SyncObjectKind::Settings, object_id))
+        .await;
+    let absent = client
+        .fetch(
+            SyncObjectKind::Settings,
+            object_id,
+            TimestampMs::new(NOW + 4),
+        )
+        .await
+        .expect_err("the collection holds nothing");
+    assert_eq!(absent.code(), ErrorCode::UnknownSession, "{absent}");
+    assert_eq!(
+        client
+            .store()
+            .checkpoint(object_id)
+            .expect("a note")
+            .expect("it stands")
+            .position,
+        at(1)
+    );
+    assert_eq!(
+        client
+            .store()
+            .basis(object_id)
+            .expect("a history")
+            .recovery(),
+        None
+    );
+}
+
+/// KR-REQ-20.13 across a restore, the control: a collection that holds nothing in a history it
+/// has since been put back from moves nothing. The fetch left before this device followed the
+/// restore, and an empty collection in the history the restore replaced says nothing about the
+/// one this device reads now.
+#[tokio::test]
+async fn an_empty_collection_in_a_history_already_put_back_from_moves_nothing() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(GatedService::new());
+    let one = gated_client(directory.path(), "shared", &service);
+    let two = gated_client(directory.path(), "shared", &service);
+    let object_id = fresh_object_id().expect("an identity");
+    let collection = sync_collection(SyncObjectKind::Settings, object_id);
+    let theirs = object(
+        object_id,
+        2,
+        SyncBody::Settings(settings(&[("theme", "light")], &[])),
+        NOW,
+    );
+
+    // A fetch finds the collection empty, in the history the service has, and the answer is held
+    // on its way back.
+    service.hold_the_next_fetch().await;
+    let late = tokio::spawn({
+        let one = Arc::clone(&one);
+        async move {
+            one.fetch(
+                SyncObjectKind::Settings,
+                object_id,
+                TimestampMs::new(NOW + 1),
+            )
+            .await
+        }
+    });
+    service.wait_for_a_publication().await;
+
+    // Meanwhile the service is put back from an archive that holds another device's settings, and
+    // another window reads the collection in the history the restore began.
+    let restored = recovery(0xd4);
+    service
+        .inner
+        .put_back(
+            &Export {
+                objects: [(collection.clone(), (at(3), sealed_object(&theirs)))].into(),
+                ..Export::default()
+            },
+            restored,
+        )
+        .await;
+    two.fetch(
+        SyncObjectKind::Settings,
+        object_id,
+        TimestampMs::new(NOW + 2),
+    )
+    .await
+    .expect("the collection put back is followed");
+    let note = |client: &SyncClient| {
+        client
+            .store()
+            .checkpoint(object_id)
+            .expect("a note")
+            .expect("one stands")
+            .position
+    };
+    assert_eq!(note(&two), in_history(at(3), Some(restored)));
+
+    // The held answer arrives, from the history the restore replaced. Nothing follows from it:
+    // the note and the history stay where the restored collection put them.
+    service.let_it_go();
+    let refused = late
+        .await
+        .expect("the task finished")
+        .expect_err("an answer from a history this device does not follow");
+    assert!(
+        matches!(refused, SyncError::UnfollowedHistory { .. }),
+        "{refused}"
+    );
+    assert_eq!(note(&one), in_history(at(3), Some(restored)));
+    assert_eq!(
+        one.store().basis(object_id).expect("a history").recovery(),
+        Some(restored)
     );
 }
 

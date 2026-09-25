@@ -265,6 +265,21 @@ pub enum RecoveryError {
         /// The position the service answered with, in another history.
         found: SyncPosition,
     },
+    /// The service answered from another history of the bundle's collection than the one this
+    /// store read the bundle in, and holds no bundle there: the collection was put back from an
+    /// archive that held none at the locator.
+    ///
+    /// It is refused as a bundle put back is, before anything is compared, and the way out is the
+    /// same: read the locator from a store that knows nothing, and judge what comes back.
+    #[error(
+        "the recovery bundle was read at {expected}, and that locator now holds none, in a collection put back from an archive"
+    )]
+    BundlePutBackEmpty {
+        /// The position this device last saw.
+        expected: SyncPosition,
+        /// The history the service answered from, which holds no bundle at the locator.
+        recovery: Option<crate::services::SyncRecoveryId>,
+    },
     /// This device's record of a bundle write could not be read or written.
     #[error("the recovery bundle's write record at {path} could not be used: {source}")]
     Storage {

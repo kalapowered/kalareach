@@ -109,8 +109,8 @@ use serde::{Deserialize, Serialize};
 use super::relay::{ServiceHttp, ServiceSigner};
 use super::signed::{Answer, Refusal, SignedService, malformed, unreadable_answer};
 use super::{
-    KeyHead, Keyed, ServiceFuture, SyncBackupService, SyncExchanged, SyncPosition, SyncRecoveryId,
-    SyncRequestFence, SyncRequestStatus, SyncRevision,
+    KeyHead, Keyed, ServiceFuture, SyncBackupService, SyncExchanged, SyncFetched, SyncPosition,
+    SyncRecoveryId, SyncRequestFence, SyncRequestStatus, SyncRevision,
 };
 use crate::error::{ClientError, Result};
 use crate::sync::membership::{
@@ -1641,8 +1641,9 @@ impl ManagedSyncService {
         dropped(self.ask(&request, None).await?.data()?)
     }
 
-    /// One fetch: the object a collection holds, and where it stands.
-    async fn held(&self, collection: &str) -> Result<(SyncPosition, Vec<u8>)> {
+    /// One fetch: the object a collection holds and where it stands, or the history of a collection
+    /// that holds none.
+    async fn held(&self, collection: &str) -> Result<SyncFetched> {
         let named = Collection::named(collection)?;
         // A read for one kind, which is the whole of what section 20 lets the service know about
         // an object it cannot read.
@@ -1655,23 +1656,23 @@ impl ManagedSyncService {
         )?;
         let data = self.ask(&request, None).await?.data()?;
         let comparison = comparison(read(data, "what a comparison answered")?)?;
-        let held = comparison
+        let recovery = comparison.recovery;
+        let Some(held) = comparison
             .objects
             .into_iter()
             .find(|held| held.object_id == named.object_id)
-            .ok_or_else(|| {
-                ClientError::Host(ProtocolError::new(
-                    ErrorCode::UnknownSession,
-                    format!(
-                        "the service holds no {} object in that collection",
-                        named.kind
-                    ),
-                ))
-            })?;
+        else {
+            // The comparison names its history even when it names no place, and an empty
+            // collection is an answer about that history.
+            return Ok(SyncFetched::Absent { recovery });
+        };
         if held.kind != named.kind {
             return Err(contrary("a read for one kind with an object of another"));
         }
-        Ok((held.position, held.ciphertext))
+        Ok(SyncFetched::Held {
+            position: held.position,
+            ciphertext: held.ciphertext,
+        })
     }
 
     /* ---------------------------------------------------------------------- */
@@ -1896,7 +1897,7 @@ impl SyncBackupService for ManagedSyncService {
         ))
     }
 
-    fn fetch<'a>(&'a self, collection: &'a str) -> ServiceFuture<'a, (SyncPosition, Vec<u8>)> {
+    fn fetch<'a>(&'a self, collection: &'a str) -> ServiceFuture<'a, SyncFetched> {
         Box::pin(self.held(collection))
     }
 

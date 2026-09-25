@@ -17,8 +17,8 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-20.13 | `kr_req_20_13_a_lost_comparison_keeps_both_copies_until_the_person_chooses`, `kr_req_20_13_a_stale_expected_revision_is_refused_and_kept_as_a_copy`, `kr_req_20_13_a_draft_is_published_as_a_draft_and_never_as_an_execution_request`, `kr_req_20_13_a_sealed_object_the_service_refuses_is_refused_here_first`, `kr_req_20_13_an_answer_lost_in_flight_is_settled_from_the_receipt_and_applied_once`, `kr_req_20_13_a_fenced_identity_never_ran_and_nothing_runs_under_it_afterwards` |
-//! | KR-REQ-20.13, KR-REQ-24.28 and KR-REQ-18.05, client side across a restore | The same legs read the recovery identity on every answer they take, an exchange, a refusal, a comparison, a status query with and without a receipt, and a fence, and hold a deployment that has never been put back to naming none |
+//! | KR-REQ-20.13 | `kr_req_20_13_a_lost_comparison_keeps_both_copies_until_the_person_chooses`, `kr_req_20_13_a_stale_expected_revision_is_refused_and_kept_as_a_copy`, `kr_req_20_13_a_draft_is_published_as_a_draft_and_never_as_an_execution_request`, `kr_req_20_13_a_sealed_object_the_service_refuses_is_refused_here_first`, `kr_req_20_13_an_answer_lost_in_flight_is_settled_from_the_receipt_and_applied_once`, `kr_req_20_13_a_fenced_identity_never_ran_and_nothing_runs_under_it_afterwards`, `kr_req_20_13_a_fetch_of_an_object_never_published_answers_its_absence_under_no_history` |
+//! | KR-REQ-20.13, KR-REQ-24.28 and KR-REQ-18.05, client side across a restore | The same legs read the recovery identity on every answer they take, an exchange, a refusal, a comparison, a status query with and without a receipt, a fence and a fetch that finds nothing, and hold a deployment that has never been put back to naming none |
 //! | KR-REQ-18.05 | `kr_req_18_05_a_setting_is_stored_sealed_in_a_declared_bucket` |
 //! | KR-REQ-24.28 | `kr_req_24_28_a_client_fenced_by_privacy_mode_publishes_nothing_and_keeps_its_pinned_labels` |
 //!
@@ -46,7 +46,7 @@ use kr_client::services::relay::{ServiceHttp, ServiceHttpAnswer, ServiceSigner};
 use kr_client::services::signed::SignedService;
 use kr_client::services::sync::{MAX_SYNC_REQUEST_BYTES, ManagedSyncService, SYNC_EXCHANGE_PATH};
 use kr_client::services::{
-    ServiceFuture, SyncBackupService, SyncExchanged, SyncPosition, SyncRequestFence,
+    ServiceFuture, SyncBackupService, SyncExchanged, SyncFetched, SyncPosition, SyncRequestFence,
     SyncRequestStatus, SyncRevision,
 };
 use kr_client::sync::{
@@ -1068,6 +1068,42 @@ async fn kr_req_20_13_a_fenced_identity_never_ran_and_nothing_runs_under_it_afte
         assert!(compared.objects.is_empty(), "the exchange stored nothing");
 
         "a fence of an identity that never arrived answers that nothing ran, an exchange under it afterwards is refused as fenced and stores nothing, and a status query repeats what the fence established".to_owned()
+    })
+    .await;
+}
+
+/// KR-REQ-20.13: a fetch of an object never published finds its collection holding none, and the
+/// answer names the history that holds none: no history, on a deployment never put back.
+#[tokio::test]
+async fn kr_req_20_13_a_fetch_of_an_object_never_published_answers_its_absence_under_no_history() {
+    leg(|run| async move {
+        let object_id = fresh_object_id().expect("an identity");
+        let collection = sync_collection(SyncObjectKind::Settings, object_id);
+
+        assert_eq!(
+            run.service.fetch(&collection).await.expect("answered"),
+            SyncFetched::Absent { recovery: None },
+            "an empty collection is an answer, in the history the deployment names"
+        );
+
+        // A device told so keeps nothing: no note, no copy, and the collection is read in no
+        // history, as it was before it asked.
+        let client = run.device("one");
+        let before = run.sent();
+        let absent = client
+            .fetch(SyncObjectKind::Settings, object_id, now())
+            .await
+            .expect_err("nothing is held");
+        assert_eq!(absent.code(), ErrorCode::UnknownSession, "{absent}");
+        assert_eq!(run.sent(), before + 1, "one read and nothing written");
+        assert_eq!(client.store().checkpoint(object_id).expect("a note"), None);
+        assert!(client.store().conflicts(object_id).expect("copies").is_empty());
+        assert_eq!(
+            client.store().basis(object_id).expect("a history").recovery(),
+            None
+        );
+
+        "a fetch of an object never published is answered as a collection holding none, naming no history on a deployment never put back, and a device told so writes nothing and keeps no note".to_owned()
     })
     .await;
 }

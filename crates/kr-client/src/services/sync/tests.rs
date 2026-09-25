@@ -898,7 +898,7 @@ async fn every_answer_names_the_history_its_places_are_in() {
         restored,
     )]);
     assert_eq!(
-        client.fetch(&settings_of(object)).await.expect("fetched").0,
+        held_at(client.fetch(&settings_of(object)).await.expect("fetched")),
         SyncPosition::at(4, revision(9), Some(restored))
     );
     let mut with_everything = compared(
@@ -1422,7 +1422,7 @@ async fn an_answer_carrying_members_this_client_does_not_read_is_read_all_the_sa
     held_object["recovery"] = "the same".into();
     recorder.answering(vec![with_more(compared(vec![held_object], Vec::new()))]);
     assert_eq!(
-        client.fetch(&settings_of(object)).await.expect("fetched").0,
+        held_at(client.fetch(&settings_of(object)).await.expect("fetched")),
         SyncPosition::at(4, revision(9), None)
     );
 
@@ -1534,6 +1534,16 @@ fn held(
     })
 }
 
+/// The place a fetch found the object at, for an answer that found one.
+fn held_at(fetched: SyncFetched) -> SyncPosition {
+    match fetched {
+        SyncFetched::Held { position, .. } => position,
+        SyncFetched::Absent { .. } => panic!("the collection holds the object: {fetched:?}"),
+    }
+}
+
+/// KR-REQ-20.13: a fetch answers the object and where it stands, or a collection that holds none
+/// in the history the comparison names.
 #[tokio::test]
 async fn a_fetch_is_the_object_and_the_place_the_service_states() {
     let (client, recorder) = sync_client();
@@ -1544,7 +1554,13 @@ async fn a_fetch_is_the_object_and_the_place_the_service_states() {
         Vec::new(),
     )]);
 
-    let (position, ciphertext) = client.fetch(&settings_of(object)).await.expect("fetched");
+    let SyncFetched::Held {
+        position,
+        ciphertext,
+    } = client.fetch(&settings_of(object)).await.expect("fetched")
+    else {
+        panic!("the collection holds the object");
+    };
     assert_eq!(position, SyncPosition::at(4, revision(9), None));
     assert_eq!(
         ciphertext,
@@ -1563,15 +1579,20 @@ async fn a_fetch_is_the_object_and_the_place_the_service_states() {
         "a read for the one kind the name says"
     );
 
-    // A collection holding nothing of that kind has nothing to fetch.
+    // A collection holding nothing of that kind is an answer, in the history the comparison
+    // names: none for a service never put back, and the restore's own after one.
     recorder.answering(vec![compared(Vec::new(), Vec::new())]);
     assert_eq!(
-        client
-            .fetch(&settings_of(object))
-            .await
-            .expect_err("nothing is held")
-            .code(),
-        ErrorCode::UnknownSession
+        client.fetch(&settings_of(object)).await.expect("answered"),
+        SyncFetched::Absent { recovery: None }
+    );
+    let restored = put_back_by(0xb5);
+    recorder.answering(vec![under(compared(Vec::new(), Vec::new()), restored)]);
+    assert_eq!(
+        client.fetch(&settings_of(object)).await.expect("answered"),
+        SyncFetched::Absent {
+            recovery: Some(restored)
+        }
     );
 }
 
@@ -1705,6 +1726,15 @@ fn a_rendering_of_a_request_an_object_or_a_copy_carries_nothing_sealed() {
         .replace(' ', ""),
     );
 
+    let fetched = SyncFetched::Held {
+        position: SyncPosition::at(4, revision(9), None),
+        ciphertext: ciphertext.clone(),
+    };
+    renders_only(
+        &fetched,
+        &format!("Held{{position:{:?},..}}", held.position).replace(' ', ""),
+    );
+
     let copy = SyncHeldCopy {
         sequence: 3,
         conflict_id: SyncConflictId::new(identity(4)),
@@ -1726,7 +1756,11 @@ fn a_rendering_of_a_request_an_object_or_a_copy_carries_nothing_sealed() {
 
     // The nonce travels beside the ciphertext and is part of what is sealed. The renderings above
     // are held to exact fields, and this is the marker check that goes with them.
-    for rendering in [format!("{held:?}"), format!("{copy:#?}")] {
+    for rendering in [
+        format!("{held:?}"),
+        format!("{fetched:#?}"),
+        format!("{copy:#?}"),
+    ] {
         assert!(!rendering.contains("126"), "{rendering}");
         assert!(!rendering.contains("7e"), "{rendering}");
     }

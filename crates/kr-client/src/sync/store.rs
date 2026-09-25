@@ -1485,31 +1485,43 @@ impl SyncStore {
     ) -> Result<()> {
         let current = current.filter(|position| position.write_sequence != 0);
         match held.revision {
-            RequestRevision::Object(_) => {
-                let Some(note) = self.read_checkpoint(held.object_id)? else {
-                    return Ok(());
-                };
-                if note.position.recovery() == recovery {
-                    return Ok(());
-                }
-                let path = self.path(held.object_id, CHECKPOINT_EXTENSION);
-                match current {
-                    Some(position) => {
-                        let bytes = kr_cbor::to_canonical_vec(&SyncCheckpoint {
-                            position,
-                            published_revision: Nullable::null(),
-                        })?;
-                        self.write_bytes(&path, &bytes)
-                    }
-                    None => self.remove_file(&path),
-                }
-            }
+            RequestRevision::Object(_) => self.follow_note(held.object_id, current, recovery),
             RequestRevision::Draft(_) => match drafts {
                 Some(drafts) => drafts
                     .follow_refusal(DraftId::new(held.object_id.get()), current, recovery)
                     .map_err(SyncError::from),
                 None => Ok(()),
             },
+        }
+    }
+
+    /// Follows the collection with the note beside one object after an answer read in the history
+    /// this device reads the collection in, when the note is in another: the note takes the place
+    /// the answer names, and goes where the answer names none.
+    ///
+    /// The caller holds the lock.
+    fn follow_note(
+        &self,
+        object_id: SyncObjectId,
+        current: Option<SyncPosition>,
+        recovery: Option<SyncRecoveryId>,
+    ) -> Result<()> {
+        let Some(note) = self.read_checkpoint(object_id)? else {
+            return Ok(());
+        };
+        if note.position.recovery() == recovery {
+            return Ok(());
+        }
+        let path = self.path(object_id, CHECKPOINT_EXTENSION);
+        match current {
+            Some(position) => {
+                let bytes = kr_cbor::to_canonical_vec(&SyncCheckpoint {
+                    position,
+                    published_revision: Nullable::null(),
+                })?;
+                self.write_bytes(&path, &bytes)
+            }
+            None => self.remove_file(&path),
         }
     }
 
@@ -2746,6 +2758,37 @@ impl SyncStore {
         })();
         drop(guard);
         applied
+    }
+
+    /// Reads a fetch that found the collection holding no object against the history of the
+    /// collection, under the late-result rule, in one step.
+    ///
+    /// An absence names no place, so it is read as a refusal that names none is. In a history this
+    /// device has not met, answering a fetch made against the one it reads, the collection was put
+    /// back without the object: this device moves to that history, and the note goes, because it
+    /// names a place in the history the restore replaced. In the history this device reads nothing
+    /// moves, beyond a note still naming a place in a history the collection was put back from,
+    /// which goes as it does after a refusal. In a history this device does not follow nothing
+    /// moves at all. Nothing is kept either way, because nothing came down.
+    ///
+    /// Returns that the answer was read, or, under a generation privacy mode has fenced or moved
+    /// past, that nothing ran and which generation is in force instead, or that the answer was in
+    /// a history this device does not follow.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Storage`] when the privacy record, the history or the note cannot be
+    /// read, written or removed.
+    pub fn apply_absence(
+        &self,
+        produced_under: u64,
+        object_id: SyncObjectId,
+        basis: Basis,
+        answered: Option<SyncRecoveryId>,
+    ) -> Result<InGeneration<()>> {
+        self.apply_under_history(produced_under, object_id, basis, answered, || {
+            self.follow_note(object_id, None, answered)
+        })
     }
 
     /// Runs one step under the late-result rule: only while production is not fenced and the

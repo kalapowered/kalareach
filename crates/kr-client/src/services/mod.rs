@@ -58,6 +58,7 @@
 //! | [`mailbox::MailboxPage`] | Those items | How many came back, the cursor, what the mailbox holds |
 //! | [`sync::SyncHeldObject`] | A sealed object a collection holds | The object, its kind, where it stands, its key epoch |
 //! | [`sync::SyncHeldCopy`] | A sealed copy of a refused write | The copy, its object and kind, where the object stood, its key epoch |
+//! | [`SyncFetched`] | A sealed object one fetch found | Where the object stands, or the history that holds none |
 //!
 //! A type that holds one of these only through one of these, as [`relay::RelayLeaseAnswer`] holds a
 //! grant, is safe to derive, because the rendering it composes is the redacted one.
@@ -696,6 +697,76 @@ impl SyncRequestFence {
     }
 }
 
+/// What one fetch found in a collection: the object, or that the collection holds none.
+///
+/// Both answers name a history. An object names it through the place it is held at. An absence
+/// names it beside what it says, because a collection that holds nothing is an answer about one
+/// history of it: a collection put back from an archive that did not hold the object holds nothing
+/// in the history the restore began, and a caller that read that as nothing new would go on
+/// comparing against a place, and presenting work attempted in, the history the restore replaced.
+///
+/// It holds a sealed object, so it writes its own [`std::fmt::Debug`]: where the object stands, or
+/// the history that holds none, and nothing sealed.
+#[derive(Clone, PartialEq, Eq)]
+pub enum SyncFetched {
+    /// The collection holds the object.
+    Held {
+        /// Where the object stands: the write that put it there, and that write's place in the
+        /// order.
+        position: SyncPosition,
+        /// The sealed object, in canonical KR-CBOR-1, which is what a sealer opens.
+        ciphertext: Vec<u8>,
+    },
+    /// The collection holds no object.
+    Absent {
+        /// The history that holds none: the recovery the service named, or none for a service never
+        /// put back.
+        recovery: Option<SyncRecoveryId>,
+    },
+}
+
+impl SyncFetched {
+    /// Returns the history this answer came from: the recovery it named, or none for a service
+    /// never put back.
+    #[must_use]
+    pub const fn recovery(&self) -> Option<SyncRecoveryId> {
+        match self {
+            Self::Held { position, .. } => position.recovery(),
+            Self::Absent { recovery } => *recovery,
+        }
+    }
+}
+
+impl std::fmt::Debug for SyncFetched {
+    /// Where the object stands, or the history that holds none. Never the sealed object.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Held { position, .. } => formatter
+                .debug_struct("Held")
+                .field("position", position)
+                .finish_non_exhaustive(),
+            Self::Absent { recovery } => formatter
+                .debug_struct("Absent")
+                .field("recovery", recovery)
+                .finish(),
+        }
+    }
+}
+
+/// What a caller reports when a collection holds none of what it fetched, in the history of the
+/// collection it reads.
+///
+/// The service answered: the collection holds nothing, so what was asked for by name is unknown to
+/// the service. A caller reports it only once it has read the absence against the history of the
+/// collection, because an absence in another history says something else.
+#[must_use]
+pub fn nothing_held(what: &str) -> ClientError {
+    ClientError::Host(kr_protocol::error::ProtocolError::new(
+        kr_protocol::error::ErrorCode::UnknownSession,
+        format!("the service holds no {what} in that collection"),
+    ))
+}
+
 /// Where a shared collection's key records stood when a service answered: the newest record's key
 /// epoch and its revision.
 ///
@@ -863,12 +934,15 @@ pub trait SyncBackupService: Send + Sync + std::fmt::Debug {
         last_signed_at_ms: u64,
     ) -> ServiceFuture<'a, SyncRequestFence>;
 
-    /// Fetches an encrypted object and the position it is held at.
+    /// Fetches an encrypted object and the position it is held at, or the history of a collection
+    /// that holds none.
     ///
     /// The position comes back with the bytes because a caller that fetched after losing a
     /// comparison needs it to make the next one: without it, the only way to learn where the object
-    /// stands is to lose again.
-    fn fetch<'a>(&'a self, collection: &'a str) -> ServiceFuture<'a, (SyncPosition, Vec<u8>)>;
+    /// stands is to lose again. A collection that holds nothing is an answer rather than a failure,
+    /// and it names its history for the reason a refusal of an object the collection never held
+    /// does: in a history the caller has not met, the collection was put back without the object.
+    fn fetch<'a>(&'a self, collection: &'a str) -> ServiceFuture<'a, SyncFetched>;
 
     /// Drops the copy the service kept of one refused write, because the person has chosen.
     ///
@@ -1142,7 +1216,7 @@ impl SyncBackupService for NullService {
         unconfigured(ManagedService::SyncBackup.as_str())
     }
 
-    fn fetch<'a>(&'a self, _collection: &'a str) -> ServiceFuture<'a, (SyncPosition, Vec<u8>)> {
+    fn fetch<'a>(&'a self, _collection: &'a str) -> ServiceFuture<'a, SyncFetched> {
         unconfigured(ManagedService::SyncBackup.as_str())
     }
 

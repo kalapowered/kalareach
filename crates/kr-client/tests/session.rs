@@ -19,7 +19,8 @@ use kr_client::error::ClientError;
 use kr_client::retry::{Recovery, RequestClass, UserAction};
 use kr_client::services::{
     ManagedService, NullService, RelayLeaseService, ServiceClients, SyncBackupService,
-    SyncExchanged, SyncPosition, SyncRecoveryId, SyncRequestFence, SyncRequestStatus, SyncRevision,
+    SyncExchanged, SyncFetched, SyncPosition, SyncRecoveryId, SyncRequestFence, SyncRequestStatus,
+    SyncRevision,
 };
 use kr_client::sync::SyncStore;
 
@@ -1328,19 +1329,17 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
     fn fetch<'a>(
         &'a self,
         collection: &'a str,
-    ) -> kr_client::services::ServiceFuture<'a, (SyncPosition, Vec<u8>)> {
+    ) -> kr_client::services::ServiceFuture<'a, SyncFetched> {
         Box::pin(async move {
-            self.objects
-                .lock()
-                .await
-                .get(collection)
-                .map(|(position, ciphertext)| (*position, ciphertext.clone()))
-                .ok_or_else(|| {
-                    ClientError::Host(ProtocolError::new(
-                        ErrorCode::InvalidArgument,
-                        "no such object",
-                    ))
-                })
+            // A collection that holds nothing says so in the history the service answers from.
+            let recovery = *self.recovery.lock().await;
+            Ok(self.objects.lock().await.get(collection).map_or(
+                SyncFetched::Absent { recovery },
+                |(position, ciphertext)| SyncFetched::Held {
+                    position: *position,
+                    ciphertext: ciphertext.clone(),
+                },
+            ))
         })
     }
 

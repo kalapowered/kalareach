@@ -15,7 +15,7 @@ use kr_client::recovery::{
     parse_kit, qr_payload, render_kit,
 };
 use kr_client::services::{
-    ServiceFuture, SyncBackupService, SyncExchanged, SyncPosition, SyncRecoveryId,
+    ServiceFuture, SyncBackupService, SyncExchanged, SyncFetched, SyncPosition, SyncRecoveryId,
     SyncRequestFence, SyncRequestStatus, SyncRevision,
 };
 use kr_crypto::backup::{
@@ -99,6 +99,15 @@ enum Receipt {
     },
 }
 
+/// What the next fetch answers with, in place of what the collection holds.
+#[derive(Clone, Copy, Debug)]
+enum ScriptedFetch {
+    /// The bytes the collection holds, at this position.
+    At(SyncPosition),
+    /// No bundle at the locator, in this history.
+    Nothing(Option<SyncRecoveryId>),
+}
+
 #[derive(Debug, Default)]
 struct StoredCollection {
     position: Option<SyncPosition>,
@@ -114,8 +123,8 @@ struct ScriptedService {
     /// How many times anything asked this service for a request's recorded state.
     statuses_asked: Mutex<u64>,
     interruption: Mutex<Interruption>,
-    /// A position the next fetch answers with instead of the one it holds.
-    fetch_answers: Mutex<Option<SyncPosition>>,
+    /// What the next fetch answers with instead of what the collection holds.
+    fetch_answers: Mutex<Option<ScriptedFetch>>,
     /// Whether the next fetch is lost on its way back.
     fetch_is_lost: Mutex<bool>,
     /// A position the next applied exchange answers with instead of the one it assigned.
@@ -172,7 +181,12 @@ impl ScriptedService {
 
     /// Makes the next fetch answer with a position of the suite's choosing.
     fn next_fetch_answers(&self, position: SyncPosition) {
-        *self.fetch_answers.lock().expect("the script") = Some(position);
+        *self.fetch_answers.lock().expect("the script") = Some(ScriptedFetch::At(position));
+    }
+
+    /// Makes the next fetch find no bundle at the locator, in the history of the suite's choosing.
+    fn next_fetch_finds_nothing_in(&self, recovery: Option<SyncRecoveryId>) {
+        *self.fetch_answers.lock().expect("the script") = Some(ScriptedFetch::Nothing(recovery));
     }
 
     /// Makes the next fetch fail as a read whose answer never came back.
@@ -290,6 +304,17 @@ impl ScriptedService {
     }
 }
 
+/// The bytes a locator holds, read past any store: what access to the service reaches.
+async fn held_bytes(service: &ScriptedService, collection: &str) -> Vec<u8> {
+    match SyncBackupService::fetch(service, collection)
+        .await
+        .expect("access reaches the bytes")
+    {
+        SyncFetched::Held { ciphertext, .. } => ciphertext,
+        SyncFetched::Absent { .. } => panic!("the locator holds a bundle"),
+    }
+}
+
 /// An answer that never came back, which is the one refusal that establishes nothing.
 fn lost(what: &'static str) -> ClientError {
     ClientError::Host(ProtocolError::new(ErrorCode::UpstreamUnavailable, what))
@@ -404,27 +429,31 @@ impl SyncBackupService for ScriptedService {
         })
     }
 
-    fn fetch<'a>(&'a self, collection: &'a str) -> ServiceFuture<'a, (SyncPosition, Vec<u8>)> {
+    fn fetch<'a>(&'a self, collection: &'a str) -> ServiceFuture<'a, SyncFetched> {
         Box::pin(async move {
             if std::mem::take(&mut *self.fetch_is_lost.lock().expect("the script")) {
                 return Err(lost("the read never came back"));
             }
             let scripted = self.fetch_answers.lock().expect("the script").take();
+            if let Some(ScriptedFetch::Nothing(recovery)) = scripted {
+                return Ok(SyncFetched::Absent { recovery });
+            }
             let collections = self.collections.lock().expect("the store");
-            collections.get(collection).map_or_else(
-                || {
-                    Err(ClientError::Host(ProtocolError::new(
-                        ErrorCode::UnknownSession,
-                        "no such collection",
-                    )))
-                },
+            // A locator that holds nothing says so, in the one history this service has.
+            Ok(collections.get(collection).map_or(
+                SyncFetched::Absent { recovery: None },
                 |entry| {
-                    let position = scripted
-                        .or(entry.position)
-                        .expect("the collection holds a write");
-                    Ok((position, entry.ciphertext.clone()))
+                    let position = match scripted {
+                        Some(ScriptedFetch::At(position)) => Some(position),
+                        _ => entry.position,
+                    }
+                    .expect("the collection holds a write");
+                    SyncFetched::Held {
+                        position,
+                        ciphertext: entry.ciphertext.clone(),
+                    }
                 },
-            )
+            ))
         })
     }
 
@@ -1797,6 +1826,67 @@ async fn a_bundle_put_back_under_another_recovery_is_refused_before_anything_is_
     assert_eq!(fresh.position(), Some(in_restored(6)));
 }
 
+/// KR-REQ-20.13 across a restore: a locator put back from an archive that held no bundle there is
+/// refused as a bundle put back, before anything is compared. A locator that holds none in the
+/// history this store read the bundle in is only empty, and so is one a store that has read nothing
+/// meets.
+#[tokio::test]
+async fn a_locator_put_back_without_its_bundle_is_refused_as_a_bundle_put_back() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    store
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(1_000),
+        )
+        .await
+        .expect("the write lands");
+    assert_eq!(store.position(), Some(at(1)));
+
+    // The service is put back from an archive that held no bundle at the locator: it holds none,
+    // in the history the restore began. That bundle could lack a writer this device trusted, so
+    // it is refused as a bundle put back, and nothing is adopted.
+    let restored = Some(SyncRecoveryId::new(Uuid::from_bytes([0xb1; 16])));
+    service.next_fetch_finds_nothing_in(restored);
+    let refused = store
+        .fetch(&seed)
+        .await
+        .expect_err("a locator put back is not compared");
+    assert!(
+        matches!(
+            refused,
+            RecoveryError::BundlePutBackEmpty { expected, recovery }
+                if expected == at(1) && recovery == restored
+        ),
+        "{refused}"
+    );
+    assert_eq!(store.position(), Some(at(1)), "nothing was adopted");
+
+    // None in the history this store read the bundle in is an empty locator and no restore.
+    service.next_fetch_finds_nothing_in(None);
+    let empty = store.fetch(&seed).await.expect_err("nothing is held");
+    assert!(
+        matches!(&empty, RecoveryError::Service(error) if error.code() == ErrorCode::UnknownSession),
+        "{empty}"
+    );
+    assert_eq!(store.position(), Some(at(1)));
+
+    // A store that has read nothing compares nothing, so an empty locator is only empty to it,
+    // whatever history it is in.
+    let mut fresh = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    service.next_fetch_finds_nothing_in(restored);
+    let empty = fresh.fetch(&seed).await.expect_err("nothing is held");
+    assert!(
+        matches!(&empty, RecoveryError::Service(error) if error.code() == ErrorCode::UnknownSession),
+        "{empty}"
+    );
+}
+
 #[tokio::test]
 async fn a_write_record_stored_before_positions_named_their_history_still_reads() {
     /// A place in the order, as a record stored it before a position named its history.
@@ -3037,9 +3127,7 @@ async fn service_access_alone_does_not_decrypt_the_bundle() {
     ));
 
     // And the ciphertext itself, which access does reach, is nothing without the seed.
-    let (_, ciphertext) = SyncBackupService::fetch(service.as_ref(), LOCATOR)
-        .await
-        .expect("access reaches the bytes");
+    let ciphertext = held_bytes(&service, LOCATOR).await;
     assert!(!ciphertext.is_empty());
     let another_owner = RecoverySeed::generate().expect("a seed");
     let key = another_owner
@@ -3101,9 +3189,7 @@ async fn substituting_the_origin_or_the_locator_fails_authentication() {
     ));
 
     // And a locator substitution: the service serves this bundle under another name.
-    let (_, ciphertext) = SyncBackupService::fetch(service.as_ref(), LOCATOR)
-        .await
-        .expect("the bytes");
+    let ciphertext = held_bytes(&service, LOCATOR).await;
     service.substitute("another-locator", ciphertext);
     let elsewhere = RecoveryContext {
         service_origin: ORIGIN.to_owned(),
@@ -4591,9 +4677,7 @@ async fn the_encrypted_bundle_and_selected_archives_export_offline() {
 
     // The export is ciphertext and nothing else: the encrypted bundle as the service holds it, and
     // the selected archive's own bytes.
-    let (_, encrypted_bundle) = SyncBackupService::fetch(service.as_ref(), LOCATOR)
-        .await
-        .expect("the encrypted bundle");
+    let encrypted_bundle = held_bytes(&service, LOCATOR).await;
     let export = OfflineExport::new(
         encrypted_bundle,
         sealed.descriptor_bytes.clone(),
@@ -4815,10 +4899,13 @@ impl SyncBackupService for ForgetfulService {
         })
     }
 
-    fn fetch<'a>(&'a self, _collection: &'a str) -> ServiceFuture<'a, (SyncPosition, Vec<u8>)> {
+    fn fetch<'a>(&'a self, _collection: &'a str) -> ServiceFuture<'a, SyncFetched> {
         Box::pin(async move {
             let write_sequence = *self.write_sequence.lock().expect("the order");
-            Ok((at(write_sequence), vec![0u8; 64]))
+            Ok(SyncFetched::Held {
+                position: at(write_sequence),
+                ciphertext: vec![0u8; 64],
+            })
         })
     }
 

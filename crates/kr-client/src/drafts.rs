@@ -52,7 +52,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{ClientError, Result};
 use crate::retry::UserAction;
-use crate::services::{SyncExchanged, SyncPosition, SyncRecoveryId};
+use crate::services::{SyncExchanged, SyncFetched, SyncPosition, SyncRecoveryId, nothing_held};
 use crate::sync::client::{
     Answer, ask_about, count_settled, diverged, end_fenced, finish_resolutions, forked,
 };
@@ -1793,7 +1793,10 @@ impl DraftSync {
     /// Returns [`SyncError::Fenced`] while privacy mode is on, [`SyncError::LateResult`] when a
     /// fence landed while the answer was on its way, [`SyncError::NotAWrite`] when the service
     /// answered with a position no write of the draft can be at, [`SyncError::ForkedHistory`] when
-    /// the note names the same place under another name, the service's refusal, and, through
+    /// the note names the same place under another name, [`SyncError::UnfollowedHistory`] when
+    /// the answer came from a history this device does not follow, the service's refusal,
+    /// `UNKNOWN_SESSION` when the draft's collection holds none in the history this device reads
+    /// it in, which a collection put back without it moves this device to first, and, through
     /// [`SyncError::Client`], [`ClientError::Cbor`] when the object is not a draft this build reads
     /// or is larger than a synchronised object may carry, [`DraftError::Corrupt`] when it opens to a
     /// different draft, and [`DraftError::Storage`] when the copy or the note cannot be written.
@@ -1995,6 +1998,13 @@ impl DraftSync {
     /// the synchronisation store, against the generation, so a cleanup that landed while the answer
     /// was out finds nothing to undo. A note two histories claim is left where it is and reported,
     /// after the copy is kept, because the copy is what the person chooses from either way.
+    ///
+    /// A collection that holds no draft is read against the history of the collection under the
+    /// same hold and the same generation, as a refusal that names no place is. Put back without
+    /// the draft, the collection is followed and the note goes: the next publication compares
+    /// against nothing, and one attempted in the history the restore replaced is never attempted
+    /// again. The caller is told the draft is not held, or [`SyncError::UnfollowedHistory`] for a
+    /// history this device does not follow.
     async fn bring_down(
         &self,
         drafts: &DraftStore,
@@ -2006,7 +2016,35 @@ impl DraftSync {
         let object_id = SyncObjectId::new(draft_id.get());
         // The history of the draft's collection the fetch is made against, taken as it leaves.
         let basis = self.store.basis(object_id)?;
-        let (position, ciphertext) = self.service.fetch(&draft_collection(draft_id)).await?;
+        let (position, ciphertext) = match self.service.fetch(&draft_collection(draft_id)).await? {
+            SyncFetched::Held {
+                position,
+                ciphertext,
+            } => (position, ciphertext),
+            SyncFetched::Absent { recovery } => {
+                return match self.store.apply_under_history(
+                    produced_under,
+                    object_id,
+                    basis,
+                    recovery,
+                    || {
+                        drafts
+                            .follow_refusal(draft_id, None, recovery)
+                            .map_err(SyncError::from)
+                    },
+                )? {
+                    InGeneration::Applied(()) => Err(nothing_held("draft").into()),
+                    InGeneration::Discarded {
+                        produced_under,
+                        current,
+                    } => Ok(BroughtDown::Discarded {
+                        produced_under,
+                        current,
+                    }),
+                    InGeneration::Unfollowed => Err(SyncError::UnfollowedHistory { object_id }),
+                };
+            }
+        };
         if position.is_removal() || position.write_sequence == 0 {
             return Err(SyncError::NotAWrite {
                 object_id,

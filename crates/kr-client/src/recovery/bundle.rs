@@ -64,7 +64,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::ClientError;
 use crate::recovery::record::{Known, RecordFile, WriteRecord};
 use crate::recovery::{RecoveryError, Result};
-use crate::services::{SyncBackupService, SyncExchanged, SyncPosition, SyncRequestFence};
+use crate::services::{
+    SyncBackupService, SyncExchanged, SyncFetched, SyncPosition, SyncRequestFence, nothing_held,
+};
 
 /// Returns the collection name one bundle is stored under.
 ///
@@ -1352,20 +1354,40 @@ impl OfflineExport {
 /// `seen` is where the reader last saw the bundle, and the place that comes back is held to it:
 /// one a write of the bundle can be at, no earlier, and not another name for the same place.
 ///
+/// A locator that holds no bundle names the history that holds none. In another history than the
+/// one `seen` is in, the collection was put back from an archive that held no bundle there, and that
+/// is refused before anything is compared, as a bundle put back is.
+///
 /// # Errors
 ///
-/// Returns [`RecoveryError::BundleNotAuthentic`] when the bytes do not open here, the refusals of
-/// a place [`BundleStore::commit`] lists, and a service error when the fetch fails.
+/// Returns [`RecoveryError::BundleNotAuthentic`] when the bytes do not open here,
+/// [`RecoveryError::BundlePutBackEmpty`] when the locator holds no bundle in another history than
+/// the one `seen` is in, the refusals of a place [`BundleStore::commit`] lists, and a service
+/// error when the fetch fails or the locator holds no bundle.
 pub(super) async fn read_bundle(
     service: &dyn SyncBackupService,
     context: &RecoveryContext,
     seen: Option<SyncPosition>,
     seed: &RecoverySeed,
 ) -> Result<Baseline> {
-    let (position, ciphertext) = service
+    let (position, ciphertext) = match service
         .fetch(bundle_collection(context))
         .await
-        .map_err(RecoveryError::Service)?;
+        .map_err(RecoveryError::Service)?
+    {
+        SyncFetched::Held {
+            position,
+            ciphertext,
+        } => (position, ciphertext),
+        SyncFetched::Absent { recovery } => {
+            return Err(match seen {
+                Some(expected) if expected.recovery() != recovery => {
+                    RecoveryError::BundlePutBackEmpty { expected, recovery }
+                }
+                _ => RecoveryError::Service(nothing_held("recovery bundle")),
+            });
+        }
+    };
     diagnose(seen, position)?;
     let key = seed.bundle_key_for(context)?;
     let bundle = kr_crypto::archive::decrypt_recovery_bundle(&key, &ciphertext)

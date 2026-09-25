@@ -68,15 +68,15 @@ use kr_protocol::scalars::{Nullable, TimestampMs, U64, Uuid};
 use kr_protocol::sync::SyncObjectKind;
 
 use super::store::{
-    Across, Basis, Claimed, ConflictCopy, Crossing, Dispatch, End, Outcome, PrivacyRecord,
-    RequestRecord, RequestState, Result, Settled, Settlement, Standing, SyncCheckpoint, SyncError,
-    SyncStore, collection_of,
+    Across, Basis, Claimed, ConflictCopy, Crossing, Dispatch, End, InGeneration, Outcome,
+    PrivacyRecord, RequestRecord, RequestState, Result, Settled, Settlement, Standing,
+    SyncCheckpoint, SyncError, SyncStore, collection_of,
 };
 use super::{SyncBody, SyncObject, SyncSettings, Zeroising, sync_collection};
 use crate::drafts::DraftSealer;
 use crate::services::{
-    SyncBackupService, SyncExchanged, SyncPosition, SyncRecoveryId, SyncRequestFence,
-    SyncRequestStatus,
+    SyncBackupService, SyncExchanged, SyncFetched, SyncPosition, SyncRecoveryId, SyncRequestFence,
+    SyncRequestStatus, nothing_held,
 };
 
 /// What became of a publication.
@@ -553,7 +553,30 @@ impl SyncClient {
             .ok_or_else(|| SyncError::DraftElsewhere {
                 collection: collection.clone(),
             })?;
-        let (position, other, basis) = self.fetch_current(staged.object_id, &collection).await?;
+        let (position, other, basis) = match self
+            .fetch_current(
+                staged.object_id,
+                staged.kind,
+                &collection,
+                staged.produced_under.get(),
+            )
+            .await?
+        {
+            Current::Held {
+                position,
+                object,
+                basis,
+            } => (position, object, basis),
+            Current::Late {
+                produced_under,
+                current,
+            } => {
+                return Ok(Published::Discarded {
+                    produced_under,
+                    current,
+                });
+            }
+        };
         // A refusal keeps a copy whatever this device holds. The comparison did not replace the
         // object, so what came down is another device's content and the person chooses between the
         // two; that is not the fetch's question of whether the two are the same content at all.
@@ -681,18 +704,57 @@ impl SyncClient {
 
     /// Fetches what the service holds now, diagnosing a service that has gone back or forked, and
     /// hands back the history the fetch was made against.
+    ///
+    /// A collection that holds nothing names the history that holds nothing, and that answer is
+    /// read against the history of the collection here, under the store's lock and the generation
+    /// `produced_under` names, as a refusal that names no place is
+    /// ([`SyncStore::apply_absence`]). Put back without the object, the collection is followed and
+    /// the note goes; the caller is told the object is not held, or
+    /// [`SyncError::UnfollowedHistory`] for a history this device does not follow.
     async fn fetch_current(
         &self,
         object_id: SyncObjectId,
+        kind: SyncObjectKind,
         collection: &str,
-    ) -> Result<(SyncPosition, SyncObject, Basis)> {
-        // The note and the history before the call leaves, so the answer is compared with what this
-        // device held when it asked, and read against the history it asked in.
+        produced_under: u64,
+    ) -> Result<Current> {
+        // The note this device holds **before** it asks, so a reply another observation overtook
+        // is not mistaken for a service that went back. The note may move while this call is out;
+        // that is two answers arriving out of order, and the store keeps the later of them. The
+        // history is taken with it, and the answer is read against that history when it is
+        // applied.
         let (note, basis) = self.store.checkpoint_and_basis(object_id)?;
-        let (position, ciphertext) = self.service.fetch(collection).await?;
+        let (position, ciphertext) = match self.service.fetch(collection).await? {
+            SyncFetched::Held {
+                position,
+                ciphertext,
+            } => (position, ciphertext),
+            SyncFetched::Absent { recovery } => {
+                return match self
+                    .store
+                    .apply_absence(produced_under, object_id, basis, recovery)?
+                {
+                    InGeneration::Applied(()) => {
+                        Err(nothing_held(&format!("{kind} object")).into())
+                    }
+                    InGeneration::Discarded {
+                        produced_under,
+                        current,
+                    } => Ok(Current::Late {
+                        produced_under,
+                        current,
+                    }),
+                    InGeneration::Unfollowed => Err(SyncError::UnfollowedHistory { object_id }),
+                };
+            }
+        };
         diagnose(object_id, note.map(|note| note.position), position)?;
-        let other = self.open_object(collection, object_id, &ciphertext)?;
-        Ok((position, other, basis))
+        let object = self.open_object(collection, object_id, &ciphertext)?;
+        Ok(Current::Held {
+            position,
+            object,
+            basis,
+        })
     }
 
     /// Fetches one object and keeps what the service holds beside this device's own.
@@ -706,12 +768,19 @@ impl SyncClient {
     /// and recreating either after the cleanup would undo it. An answer that arrives after a fence
     /// is refused for the same reason, and nothing it brought down is written.
     ///
+    /// A collection that holds nothing is read against the history of the collection first. Put
+    /// back without the object, it is followed: this device reads it in the history the restore
+    /// began, and the note goes, so the next publication compares against nothing and work
+    /// attempted in the history the restore replaced is never attempted again.
+    ///
     /// # Errors
     ///
     /// Returns [`SyncError::Fenced`] while privacy mode is on, [`SyncError::LateResult`] when a
-    /// fence landed while the answer was on its way, the service's refusal,
-    /// [`SyncError::NotThatObject`] when the object that came down is not the one this collection
-    /// was asked for, [`SyncError::DraftElsewhere`] when a draft is asked for, and
+    /// fence landed while the answer was on its way, the service's refusal, `UNKNOWN_SESSION` when
+    /// the collection holds no such object in the history this device reads it in,
+    /// [`SyncError::UnfollowedHistory`] when the answer came from a history this device does not
+    /// follow, [`SyncError::NotThatObject`] when the object that came down is not the one this
+    /// collection was asked for, [`SyncError::DraftElsewhere`] when a draft is asked for, and
     /// [`SyncError::Storage`] when the copy or the note cannot be written.
     pub async fn fetch(
         &self,
@@ -735,14 +804,25 @@ impl SyncClient {
                 generation: privacy.generation.get(),
             });
         }
-        // The note this device holds **before** it asks, so a reply another observation overtook is
-        // not mistaken for a service that went back. The note may move while this call is out; that
-        // is two answers arriving out of order, and the store keeps the later of them. The history
-        // is taken with it, and the answer is read against that history when it is applied.
-        let (note, basis) = self.store.checkpoint_and_basis(object_id)?;
-        let (position, ciphertext) = self.service.fetch(&collection).await?;
-        diagnose(object_id, note.map(|note| note.position), position)?;
-        let other = self.open_object(&collection, object_id, &ciphertext)?;
+        let (position, other, basis) = match self
+            .fetch_current(object_id, kind, &collection, privacy.generation.get())
+            .await?
+        {
+            Current::Held {
+                position,
+                object,
+                basis,
+            } => (position, object, basis),
+            Current::Late {
+                produced_under,
+                current,
+            } => {
+                return Err(SyncError::LateResult {
+                    produced_under,
+                    current,
+                });
+            }
+        };
 
         // The copy and the note are written under one hold, against the generation this fetch was
         // started under. A cleanup that landed while the answer was on its way finds nothing to
@@ -1386,6 +1466,27 @@ pub fn fresh_revision() -> crate::Result<SyncRevisionId> {
 
 fn fresh_uuid() -> crate::Result<Uuid> {
     Ok(kr_transport::random::fresh_uuid_v4()?)
+}
+
+/// What a fetch found for one object, for a caller that goes on to apply it.
+enum Current {
+    /// The object, where it stands, and the history of the collection the fetch was made against.
+    Held {
+        /// Where the object stands.
+        position: SyncPosition,
+        /// The object, opened and checked against the collection it came from.
+        object: SyncObject,
+        /// The history the fetch was made against.
+        basis: Basis,
+    },
+    /// The collection holds nothing, and privacy mode fenced or moved past the generation the
+    /// fetch was started under before the answer was read, so nothing was written.
+    Late {
+        /// The generation the fetch was started under.
+        produced_under: u64,
+        /// The generation in force now.
+        current: u64,
+    },
 }
 
 /// What the service said about one request, once the reconciliation rule has been applied to it.
