@@ -622,6 +622,45 @@ test.describe('a session in a window 320 px wide', () => {
     })
   }
 
+  /**
+   * What in `root` runs past its own box, shown or clipped. Left out: an element that scrolls
+   * sideways on purpose, text kept for a screen reader alone, and the terminal's screen with the
+   * frame that holds it, because the screen is the host's columns, panned and zoomed, never wrapped.
+   */
+  const runningPast = (root: Locator): Promise<string[]> =>
+    root.evaluate((element) => {
+      const found: string[] = []
+      for (const each of [element, ...Array.from(element.querySelectorAll('*'))]) {
+        if (!(each instanceof HTMLElement) || each.closest('.terminal-surface, .visually-hidden')) continue
+        if (each.querySelector('.terminal-surface')) continue
+        const across = getComputedStyle(each).overflowX
+        if (across === 'auto' || across === 'scroll') continue
+        if (each.scrollWidth - each.clientWidth > 1) {
+          found.push(`${each.tagName.toLowerCase()}.${each.className} "${(each.textContent ?? '').slice(0, 40)}"`)
+        }
+      }
+      return found
+    })
+
+  /**
+   * The tabs in `root` that a press does not reach across `target` px of height, centred on the
+   * tab: each tab is the target, whatever its drawn height.
+   */
+  const tabsShortOf = (root: Locator, target: number): Promise<string[]> =>
+    root.getByRole('tab').evaluateAll((tabs, size) => {
+      const short: string[] = []
+      for (const tab of tabs) {
+        tab.scrollIntoView({ block: 'center' })
+        const box = tab.getBoundingClientRect()
+        const middle = box.top + box.height / 2
+        for (const y of [middle - size / 2 + 0.5, middle + size / 2 - 0.5]) {
+          const hit = document.elementFromPoint(box.left + box.width / 2, y)
+          if (!hit || !tab.contains(hit)) short.push(`${tab.textContent ?? ''} at ${Math.round(y - middle)} px`)
+        }
+      }
+      return short
+    }, target)
+
   /** Opens a session's terminal and waits for the screen, whose badges come with it. */
   async function openTerminal(page: Page): Promise<void> {
     await page.getByRole('tab', { name: 'Terminal' }).click()
@@ -639,6 +678,7 @@ test.describe('a session in a window 320 px wide', () => {
     const narrow = await placed(header)
     wholeAndUnshrunk(narrow, wide, { left: 0, right: 320 })
     inReadingOrder(narrow)
+    expect.soft(await runningPast(page.locator('main')), 'what runs past its own box').toEqual([])
 
     // The working directory and the name are the host's. Long ones wrap inside the window, whole,
     // rather than widening the page or being cut off.
@@ -681,12 +721,17 @@ test.describe('a session in a window 320 px wide', () => {
     const narrow = await placed(footer)
     wholeAndUnshrunk(narrow, wide, terminal)
     inReadingOrder(narrow)
+    expect.soft(await runningPast(page.locator('main')), 'what runs past its own box').toEqual([])
   })
 
   test('the header and the footer still fit with touch targets of 44 and 48 px', async ({ page }) => {
     await openSession(page)
     await openTerminal(page)
     await page.setViewportSize({ width: 320, height: 720 })
+    const own = await page.evaluate(() =>
+      Number.parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--target'))
+    )
+    expect.soft(await tabsShortOf(page.locator('main'), own), `the tabs at ${own} px`).toEqual([])
     for (const target of [44, 48]) {
       // The token every control takes its minimum from, as a coarse pointer or a phone sets it.
       await page.evaluate((size) => {
@@ -703,8 +748,8 @@ test.describe('a session in a window 320 px wide', () => {
         expect.soft(control.width, `${control.name}'s width at ${target} px`).toBeGreaterThanOrEqual(target - 0.1)
         expect.soft(control.right, `${control.name} inside the window at ${target} px`).toBeLessThanOrEqual(321)
       }
-      const view = await page.locator('.session-header .segmented').boundingBox()
-      expect.soft(view?.height ?? 0, `the view switch at ${target} px`).toBeGreaterThanOrEqual(target - 0.1)
+      // A tab is drawn inside its switch's frame; a press anywhere across the target still lands on it.
+      expect.soft(await tabsShortOf(page.locator('main'), target), `the tabs at ${target} px`).toEqual([])
     }
   })
 

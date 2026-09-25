@@ -346,6 +346,7 @@
 
 .tool-result {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   color: var(--accent);
@@ -355,6 +356,12 @@
   padding: 10px 12px;
   font-size: 0.6875rem;
   margin: 8px 22px;
+}
+
+/* A tool's summary is often a path. In a narrow window it takes the next line and wraps there. */
+.tool-result > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .diff-summary,

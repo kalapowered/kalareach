@@ -332,6 +332,7 @@ main {
 }
 
 .segmented button {
+  position: relative;
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -347,6 +348,16 @@ main {
     background-color var(--state) ease,
     color var(--state) ease,
     border-color var(--state) ease;
+}
+
+/*
+ * A tab is drawn 6 px shorter than the target so the frame around it is the target. Its press area
+ * reaches through the frame's padding to the full height, so a press on the frame lands on it.
+ */
+.segmented button::after {
+  content: '';
+  position: absolute;
+  inset: -4px 0;
 }
 
 .segmented button[aria-selected='true'] {
