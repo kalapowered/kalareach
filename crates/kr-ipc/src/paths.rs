@@ -686,8 +686,16 @@ mod windows {
     use std::os::windows::io::{AsRawHandle as _, BorrowedHandle};
     use std::path::Path;
 
+    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtOpenFile,
+    };
     use windows_sys::Win32::Foundation::{
         CloseHandle, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE, LocalFree,
+    };
+    use windows_sys::Win32::Foundation::{
+        OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, STATUS_OBJECT_NAME_NOT_FOUND,
+        STATUS_OBJECT_PATH_NOT_FOUND, STATUS_SUCCESS, UNICODE_STRING,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -700,77 +708,100 @@ mod windows {
         TOKEN_INFORMATION_CLASS, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenOwner, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateDirectoryW, FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
+        CreateDirectoryW, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     use crate::error::{IpcError, Result};
 
-    /// The path separator, as one wide code unit.
-    const SEPARATOR: u16 = b'\\' as u16;
-
-    /// Whether `child` is a name directly inside `directory`, judged from the two open handles
-    /// rather than from the paths they were opened by.
+    /// Opens a name directly inside a directory, from the directory's own open handle.
     ///
-    /// Each handle's final path is the one the operating system resolves it to now, with every
-    /// reparse point on the way already followed and the drive named in full. A name directly
-    /// inside the directory has the directory's own final path, then one separator, then a name with
-    /// no separator of its own. A file reached through a link the caller did not expect, or one in a
-    /// directory swapped for another since it was opened, resolves somewhere the directory's final
-    /// path does not begin, and is not a child. The handles are open, so each names one object for
-    /// as long as this holds it, whatever happens to the names on the way to them.
+    /// This is the [`openat`] of this platform, which has no Win32 call for it. The name is resolved
+    /// against the handle in one step, so a directory swapped for another since the handle was
+    /// opened is never consulted (its handle still names the directory that was checked), and a file
+    /// replaced by a rename while this runs opens as one whole version or the other and never as
+    /// nothing. The name carries no separator, so it cannot climb out of the directory. The
+    /// reparse-point option opens a link itself rather than following it, so the caller refuses one
+    /// by its attributes rather than being sent wherever it points.
     ///
-    /// A reparse point opened without following it is its own final path, so it looks like a child
-    /// of the directory it sits in: the caller refuses one by its attributes, not by this.
+    /// `None` is a name that is not there, which a caller reads as no descriptor rather than a
+    /// failure.
+    ///
+    /// [`openat`]: https://man7.org/linux/man-pages/man2/openat.2.html
     ///
     /// # Errors
     ///
-    /// Returns the operating system's error when either handle's final path cannot be read.
-    pub fn directory_contains(
+    /// Returns the operating system's error when the name cannot be opened for a reason other than
+    /// its absence.
+    pub fn open_child(
         directory: BorrowedHandle<'_>,
-        child: BorrowedHandle<'_>,
-    ) -> std::io::Result<bool> {
-        let directory = final_path(directory)?;
-        let child = final_path(child)?;
-        let Some(rest) = child.strip_prefix(directory.as_slice()) else {
-            return Ok(false);
-        };
-        // The directory's final path may or may not already end in a separator: a drive root does,
-        // an ordinary directory does not. Either way exactly one separator stands between it and the
-        // child's name, and the name that follows carries none of its own.
-        let leaf = match (directory.last(), rest.first()) {
-            (Some(&SEPARATOR), _) => rest,
-            (_, Some(&SEPARATOR)) => &rest[1..],
-            _ => return Ok(false),
-        };
-        Ok(!leaf.is_empty() && !leaf.contains(&SEPARATOR))
-    }
+        name: &std::ffi::OsStr,
+    ) -> std::io::Result<Option<std::fs::File>> {
+        use std::os::windows::ffi::OsStrExt as _;
+        use std::os::windows::io::FromRawHandle as _;
 
-    /// Reads the final path of an open handle as wide code units.
-    fn final_path(handle: BorrowedHandle<'_>) -> std::io::Result<Vec<u16>> {
-        let mut buffer = vec![0_u16; 512];
-        loop {
-            // SAFETY: the handle is borrowed for the call, and the buffer holds the length passed.
-            let needed = unsafe {
-                GetFinalPathNameByHandleW(
-                    handle.as_raw_handle(),
-                    buffer.as_mut_ptr(),
-                    u32::try_from(buffer.len()).unwrap_or(u32::MAX),
-                    FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
-                )
-            };
-            let needed = usize::try_from(needed).unwrap_or(0);
-            if needed == 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // The count excludes the terminator when the path fitted and includes it when it did
-            // not, so a value below the buffer means the path is in hand.
-            if needed < buffer.len() {
-                buffer.truncate(needed);
-                return Ok(buffer);
-            }
-            buffer.resize(needed, 0);
+        let mut wide: Vec<u16> = name.encode_wide().collect();
+        // A name resolved relative to a directory handle is one component, so a separator in it, or
+        // the whole-path forms the native call would otherwise read, is refused here rather than
+        // resolved. `\` and `/` are both separators to this platform, and a leading `\??\` or `\\`
+        // would leave the directory the handle names.
+        if wide.is_empty()
+            || wide.contains(&(b'\\' as u16))
+            || wide.contains(&(b'/' as u16))
+            || wide.contains(&0)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "a name opened relative to a directory is one component",
+            ));
         }
+        let length = u16::try_from(wide.len() * 2).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "the name is too long")
+        })?;
+        let object_name = UNICODE_STRING {
+            Length: length,
+            MaximumLength: length,
+            Buffer: wide.as_mut_ptr(),
+        };
+        let attributes = OBJECT_ATTRIBUTES {
+            Length: u32::try_from(std::mem::size_of::<OBJECT_ATTRIBUTES>()).unwrap_or(0),
+            RootDirectory: directory.as_raw_handle(),
+            ObjectName: &raw const object_name,
+            // Case-insensitive, as every path on this platform is by default.
+            Attributes: OBJ_CASE_INSENSITIVE,
+            SecurityDescriptor: std::ptr::null(),
+            SecurityQualityOfService: std::ptr::null(),
+        };
+        let mut handle: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
+        let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+        // SAFETY: `handle` and `status_block` are live out parameters; `attributes` points at
+        // `object_name`, whose buffer is `wide`, and all three are locals that live to the end of
+        // this function, past the call. `directory` is a handle borrowed for this call and used as
+        // the root the name resolves against. The options open an existing name only, so the call
+        // creates nothing.
+        let status = unsafe {
+            NtOpenFile(
+                &raw mut handle,
+                FILE_GENERIC_READ,
+                &raw const attributes,
+                &raw mut status_block,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            )
+        };
+        if status == STATUS_SUCCESS {
+            // SAFETY: the call above filled `handle` with a file handle this owns and closes once.
+            return Ok(Some(unsafe {
+                std::fs::File::from_raw_handle(handle.cast())
+            }));
+        }
+        if status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND {
+            return Ok(None);
+        }
+        // SAFETY: the status is the one the call returned; this only maps it to a Win32 code.
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        Err(std::io::Error::from_raw_os_error(code.cast_signed()))
     }
 
     /// The object's owner only, with inheritance blocked and children covered.
@@ -1208,7 +1239,7 @@ mod windows {
 }
 
 #[cfg(windows)]
-pub use self::windows::{AccessListRefusal, check_access_list, directory_contains};
+pub use self::windows::{AccessListRefusal, check_access_list, open_child};
 
 /// Returns the current user's identifier.
 #[cfg(unix)]

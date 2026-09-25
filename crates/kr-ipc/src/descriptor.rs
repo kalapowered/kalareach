@@ -260,14 +260,17 @@ impl DescriptorDirectory {
         use std::os::windows::io::AsHandle as _;
         use windows_sys::Win32::Storage::FileSystem::{
             FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-            FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_TRAVERSE,
         };
 
         // Backup semantics let a program open a directory at all; the reparse-point flag opens a
         // link itself rather than following it, so a link planted here is refused by its attributes
-        // below rather than opening whatever it points at.
+        // below rather than opening whatever it points at. The access asks for the right to read the
+        // directory's own security information and for the right to traverse it, which is what opening
+        // an entry relative to this handle needs.
         let handle = match std::fs::OpenOptions::new()
             .read(true)
+            .access_mode(FILE_GENERIC_READ | FILE_TRAVERSE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)
         {
@@ -449,33 +452,27 @@ impl DescriptorDirectory {
 
     #[cfg(windows)]
     fn open_entry(&self, path: &Path) -> Result<Option<std::fs::File>> {
-        use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+        use std::os::windows::fs::MetadataExt as _;
         use std::os::windows::io::AsHandle as _;
-        use windows_sys::Win32::Storage::FileSystem::{
-            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
-        };
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
         // A descriptor is a file inside this directory, named by its last component only.
-        if path.file_name().is_none() {
+        let Some(name) = path.file_name() else {
             return Err(IpcError::UntrustedFile {
                 path: path.to_path_buf(),
                 reason: "a descriptor is a file inside the descriptor directory",
             });
-        }
-        // The reparse-point flag opens a link itself rather than following it, so a symbolic link or
-        // a junction planted here opens as the link and is refused by its attributes below, never by
-        // opening whatever it points at. Windows has no open relative to a directory handle, so the
-        // file is opened by name and then proven to be a child of the directory that was checked;
-        // that is what makes a directory swapped between the check and this open refuse rather than
-        // hand back a file from somewhere else.
-        let file = match std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(IpcError::io("open", path, error)),
+        };
+        // Opened relative to the directory handle that was checked, which is what makes the file the
+        // one inside that directory: a directory swapped for another since it was checked is never
+        // consulted, and a descriptor replaced by a rename while this runs opens as one whole
+        // version or the other. The open does not follow a reparse point, so a symbolic link or a
+        // junction planted under a descriptor's name opens as the link itself and is refused by its
+        // attributes below rather than sending this wherever it points.
+        let Some(file) = crate::paths::open_child(self.handle.as_handle(), name)
+            .map_err(|error| IpcError::io("open", path, error))?
+        else {
+            return Ok(None);
         };
         let attributes = file
             .metadata()
@@ -485,14 +482,6 @@ impl DescriptorDirectory {
             return Err(IpcError::UntrustedFile {
                 path: path.to_path_buf(),
                 reason: "a descriptor must not be a symbolic link or a junction",
-            });
-        }
-        if !crate::paths::directory_contains(self.handle.as_handle(), file.as_handle())
-            .map_err(|error| IpcError::io("inspect", path, error))?
-        {
-            return Err(IpcError::UntrustedFile {
-                path: path.to_path_buf(),
-                reason: "a descriptor must be a file inside the descriptor directory that was checked",
             });
         }
         Ok(Some(file))
