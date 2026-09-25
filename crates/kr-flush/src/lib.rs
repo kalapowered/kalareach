@@ -81,8 +81,10 @@ fn flush_through(directory: &Path, right: u32) -> std::io::Result<()> {
 /// directory flushed is the one the handle holds even where its name has since been renamed or put
 /// somewhere else. On Unix the second descriptor is opened for reading, because the handle may be a
 /// reference to the directory rather than a file description, which is what Linux gives for an
-/// `O_PATH` open and refuses to flush. On Windows the second handle holds only the right `kind`
-/// names, as [`flush_directory`]'s does, and the flush is asked of the operating system through it.
+/// `O_PATH` open and refuses to flush, and it is synchronised as [`flush_directory`] synchronises
+/// the directory it opens by name: on macOS that asks the drive to write out what it holds, not only
+/// the kernel. On Windows the second handle holds only the right `kind` names, as
+/// [`flush_directory`]'s does, and the flush is asked of the operating system through it.
 ///
 /// # Errors
 ///
@@ -102,7 +104,7 @@ pub fn flush_held_directory(
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
     )?;
-    rustix::fs::fsync(&flushable).map_err(std::io::Error::from)
+    std::fs::File::from(flushable).sync_all()
 }
 
 /// Flushes a directory this process holds open, after a name inside it was created, replaced or
