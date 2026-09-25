@@ -26,6 +26,14 @@
 //! `authorization` header. The signature covers none of it: a service checks the two proofs apart
 //! and binds them to one request itself.
 //!
+//! # Content
+//!
+//! Managed storage carries ciphertext in both directions, and ciphertext is content rather than a
+//! document. A part's body is the ciphertext, so its signed request travels in a header beside it
+//! ([`Carriage::Header`]), and a read is answered with the ciphertext itself on a success
+//! ([`Content`]). Both go through the one call: the same token, the same credential, the same bound
+//! on the signed request and the same boundary between a request that left and one that did not.
+//!
 //! # Whether a request left
 //!
 //! A caller whose request came back without an answer has one question: can the request have run?
@@ -42,12 +50,13 @@
 //! A request body carries a credential and an answer carries whatever answered, so the types here
 //! write their own [`std::fmt::Debug`] under this module's rule: the method, the signer kind and
 //! the gateway, and nothing that travelled. A second authorisation renders its scope and never its
-//! source or a token.
+//! source or a token, and content renders its length and never its bytes.
 
 use std::fmt;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{AuthorisationKey, Nonce256, TimestampMs};
@@ -117,6 +126,55 @@ impl From<Unanswered> for ClientError {
     fn from(unanswered: Unanswered) -> Self {
         match unanswered {
             Unanswered::NotSent(error) | Unanswered::Sent(error) => error,
+        }
+    }
+}
+
+/// How one signed request travels.
+///
+/// Every managed-service method sends its signed request as its body, a JSON document, but one: a
+/// storage part, whose body is the ciphertext itself. Its signed request travels in a header
+/// instead, as unpadded base64url of the same JSON, so the signature covers the part's declared
+/// length and hash rather than its bytes, and the service bounds what it reads before it reads any.
+#[derive(Clone, Copy)]
+pub(crate) enum Carriage<'a> {
+    /// The signed request is the body.
+    Body,
+    /// The signed request travels in `header`, and `content` is the body.
+    Header {
+        /// The header's name, lower-cased.
+        header: &'static str,
+        /// The bytes the signed request describes.
+        content: &'a [u8],
+    },
+}
+
+/// How one request leaves: the instant it is signed at, its second authorisation, and how it
+/// travels.
+struct Sending<'a> {
+    signed_at_ms: Option<u64>,
+    account: Option<&'a AccountAuthorisation>,
+    carriage: Carriage<'a>,
+}
+
+/// What a request whose success is content was answered: the bytes, or the refusal the service
+/// named.
+pub(crate) enum Content {
+    /// The bytes a success carried, as they arrived.
+    Bytes(Vec<u8>),
+    /// The refusal the service named.
+    Refused(Refusal),
+}
+
+impl fmt::Debug for Content {
+    /// How many bytes came back, or the refusal's code and status. Never the bytes.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bytes(bytes) => formatter
+                .debug_struct("Bytes")
+                .field("length", &bytes.len())
+                .finish(),
+            Self::Refused(refusal) => formatter.debug_tuple("Refused").field(refusal).finish(),
         }
     }
 }
@@ -291,6 +349,88 @@ impl SignedService {
         signed_at_ms: Option<u64>,
         account: Option<&AccountAuthorisation>,
     ) -> std::result::Result<Answer, Unanswered> {
+        let sending = Sending {
+            signed_at_ms,
+            account,
+            carriage: Carriage::Body,
+        };
+        let answer = self
+            .send(path, method, body, request_limit, sending)
+            .await?;
+        answer_of(&answer).map_err(Unanswered::Sent)
+    }
+
+    /// Sends one signed request, signed now, that travels as `carriage` says, and returns what the
+    /// service answered: its `data`, or the refusal it named.
+    ///
+    /// For the one request whose body is content rather than a document. Everything else about it
+    /// is [`Self::dispatch`]'s: the second authorisation, the clock window, the bound on the signed
+    /// request, and whether a request that went unanswered left this device.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::dispatch`].
+    pub(crate) async fn dispatch_carried<B: Serialize>(
+        &self,
+        path: &str,
+        method: Method,
+        body: &B,
+        request_limit: usize,
+        account: Option<&AccountAuthorisation>,
+        carriage: Carriage<'_>,
+    ) -> std::result::Result<Answer, Unanswered> {
+        let sending = Sending {
+            signed_at_ms: None,
+            account,
+            carriage,
+        };
+        let answer = self
+            .send(path, method, body, request_limit, sending)
+            .await?;
+        answer_of(&answer).map_err(Unanswered::Sent)
+    }
+
+    /// Sends one signed request, signed now, whose success is content rather than a document, and
+    /// returns the content or the refusal the service named.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::dispatch`]. A success envelope where the status says the request failed is an
+    /// answer this client cannot read.
+    pub(crate) async fn dispatch_for_content<B: Serialize>(
+        &self,
+        path: &str,
+        method: Method,
+        body: &B,
+        request_limit: usize,
+        account: Option<&AccountAuthorisation>,
+    ) -> std::result::Result<Content, Unanswered> {
+        let sending = Sending {
+            signed_at_ms: None,
+            account,
+            carriage: Carriage::Body,
+        };
+        let answer = self
+            .send(path, method, body, request_limit, sending)
+            .await?;
+        content_of(answer).map_err(Unanswered::Sent)
+    }
+
+    /// The one path every request takes: the document, the token, the credential, the bound, and
+    /// then the transport, which is where a request starts to leave this device.
+    async fn send<B: Serialize>(
+        &self,
+        path: &str,
+        method: Method,
+        body: &B,
+        request_limit: usize,
+        sending: Sending<'_>,
+    ) -> std::result::Result<ServiceHttpAnswer, Unanswered> {
+        let Sending {
+            signed_at_ms,
+            account,
+            carriage,
+        } = sending;
         let document = serde_json::to_value(body).map_err(|error| {
             Unanswered::NotSent(malformed(crate::shown!(
                 "a request could not be written: {}",
@@ -319,19 +459,26 @@ impl SignedService {
                 request.len()
             ))));
         }
-        let headers: Vec<(&str, &str)> = authorisation
-            .iter()
-            .map(|value| ("authorization", value.as_str()))
-            .collect();
         let url = format!("{}{path}", self.origin.as_str());
+        let token = authorisation
+            .iter()
+            .map(|value| ("authorization", value.as_str()));
         // From here the transport holds the request, so whatever goes wrong may have happened after
         // the service received it.
-        let answer = self
-            .http
-            .post_json(&url, &request, &headers)
-            .await
-            .map_err(Unanswered::Sent)?;
-        answer_of(&answer).map_err(Unanswered::Sent)
+        match carriage {
+            Carriage::Body => {
+                let headers: Vec<(&str, &str)> = token.collect();
+                self.http.post_json(&url, &request, &headers).await
+            }
+            Carriage::Header { header, content } => {
+                let carried = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&request);
+                let headers: Vec<(&str, &str)> = std::iter::once((header, carried.as_str()))
+                    .chain(token)
+                    .collect();
+                self.http.post_bytes(&url, content, &headers).await
+            }
+        }
+        .map_err(Unanswered::Sent)
     }
 
     /// The bytes of one signed request: the document, and the credential over its digest.
@@ -616,6 +763,26 @@ fn answer_of(answer: &ServiceHttpAnswer) -> Result<Answer> {
     }))
 }
 
+/// The bytes a success carried, or the refusal a failure carried.
+///
+/// A request whose success is content is answered with the content itself on a success status and
+/// with the service's envelope otherwise. So a success is its bytes, whatever they are: they are
+/// content, and nothing here reads them. Anything else is read as an envelope, and a refusal is the
+/// one thing it may be, because a success envelope under a status that says the request failed is
+/// not this service's answer.
+fn content_of(answer: ServiceHttpAnswer) -> Result<Content> {
+    if (200..300).contains(&answer.status) {
+        return Ok(Content::Bytes(answer.body));
+    }
+    match answer_of(&answer)? {
+        Answer::Refused(refusal) => Ok(Content::Refused(refusal)),
+        Answer::Data(_) => Err(unreadable(
+            answer.status,
+            "its answer is a success under a status that says the request failed",
+        )),
+    }
+}
+
 /// The protocol code one service error code means, and what a person does about it.
 ///
 /// The status decides the codes this service does not name, because a body carrying an unknown code
@@ -654,6 +821,19 @@ fn answer_of(answer: &ServiceHttpAnswer) -> Result<Answer> {
 /// device can correct that, and the request as sent is not at fault, so it is `CLOCK_UNTRUSTED`,
 /// which retries nothing by itself, and the person waits: asking again can succeed only once the
 /// cutoff falls behind the clocks.
+///
+/// Managed storage and the backup manifest answer two more. `COLLECTION_DELETED` is a backup
+/// collection its owner deleted from the account console: its archive takes no upload and its
+/// manifest no publication again, whoever sends them, and backing up again means enrolling a new
+/// collection. That is a change of configuration and never an update of this client, so it is the
+/// permission it refuses, with that action, and the service's own message names the new
+/// collection. `SERVICE_UNAVAILABLE` is a service with no room for this request now: a write fence,
+/// a tenant being moved, or a part the isolate cannot hold yet. It is capacity rather than a
+/// fault, and it names the delay to wait.
+///
+/// An upload that spends an account's storage without the account's proof is answered
+/// `QUOTA_EXHAUSTED`, the same code an exhausted allowance is, with a message that says where
+/// backup storage comes from. The ledger's own `PAYMENT_REQUIRED` never reaches this client.
 fn classify(code: &str, status: u16) -> (ErrorCode, UserAction) {
     match code {
         "UNAUTHENTICATED" => (ErrorCode::PermissionDenied, UserAction::FixConfiguration),
@@ -671,6 +851,8 @@ fn classify(code: &str, status: u16) -> (ErrorCode, UserAction) {
         "COLLECTION_ABSENT" => (ErrorCode::UnknownSession, UserAction::Nothing),
         "KEY_EPOCH_RETIRED" => (ErrorCode::ResyncRequired, UserAction::Resync),
         "SIGNED_BEFORE_CUTOFF" => (ErrorCode::ClockUntrusted, UserAction::Wait),
+        "COLLECTION_DELETED" => (ErrorCode::PermissionDenied, UserAction::FixConfiguration),
+        "SERVICE_UNAVAILABLE" => (ErrorCode::ServiceCapacity, UserAction::Wait),
         _ if status >= 500 => (ErrorCode::UpstreamUnavailable, UserAction::Wait),
         _ => (ErrorCode::InvalidArgument, UserAction::Update),
     }
@@ -1010,6 +1192,8 @@ mod tests {
     struct Sent {
         body: Vec<u8>,
         headers: Vec<(String, String)>,
+        /// Whether it was given content to send rather than a document.
+        content: bool,
     }
 
     /// A transport that keeps every request it is given, headers included, and answers each one
@@ -1065,6 +1249,38 @@ mod tests {
                 .map(|sent| sent.body.clone())
                 .collect()
         }
+
+        /// Whether each request was sent as content rather than as a document.
+        fn contents(&self) -> Vec<bool> {
+            self.sent
+                .lock()
+                .expect("the requests")
+                .iter()
+                .map(|sent| sent.content)
+                .collect()
+        }
+
+        /// Keeps one request and answers it as this wire answers every request.
+        fn take(
+            &self,
+            body: &[u8],
+            headers: &[(&str, &str)],
+            content: bool,
+        ) -> ServiceFuture<'static, ServiceHttpAnswer> {
+            self.sent.lock().expect("the requests").push(Sent {
+                body: body.to_vec(),
+                headers: headers
+                    .iter()
+                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                    .collect(),
+                content,
+            });
+            let answer = self
+                .answer
+                .clone()
+                .map_err(|code| ClientError::refusal(code, Shown::said("the connection dropped")));
+            Box::pin(async move { answer })
+        }
     }
 
     impl ServiceHttp for Wire {
@@ -1074,18 +1290,16 @@ mod tests {
             body: &'a [u8],
             headers: &'a [(&'a str, &'a str)],
         ) -> ServiceFuture<'a, ServiceHttpAnswer> {
-            self.sent.lock().expect("the requests").push(Sent {
-                body: body.to_vec(),
-                headers: headers
-                    .iter()
-                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
-                    .collect(),
-            });
-            let answer = self
-                .answer
-                .clone()
-                .map_err(|code| ClientError::refusal(code, Shown::said("the connection dropped")));
-            Box::pin(async move { answer })
+            self.take(body, headers, false)
+        }
+
+        fn post_bytes<'a>(
+            &'a self,
+            _url: &'a str,
+            body: &'a [u8],
+            headers: &'a [(&'a str, &'a str)],
+        ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+            self.take(body, headers, true)
         }
     }
 
@@ -1631,6 +1845,216 @@ mod tests {
                 )]]
             );
             assert_unmarked("a request that may have run", &failure_renderings(error));
+        }
+    }
+
+    /* ---------------------------------------------------------------------- */
+    /* A request whose body is content, and an answer that is content          */
+    /* ---------------------------------------------------------------------- */
+
+    /// The content a carried request describes, as a storage part would be.
+    const CONTENT: &[u8] = &[0x00, 0xff, 0x7b, 0x22, 0x0a, 0xc3, 0x28];
+
+    /// One request carried in a header beside `CONTENT`, signed now.
+    async fn carry(
+        service: &SignedService,
+        account: Option<&AccountAuthorisation>,
+    ) -> std::result::Result<Answer, Unanswered> {
+        service
+            .dispatch_carried(
+                "/api/storage/upload/part",
+                Method::StorageUploadPart,
+                &serde_json::json!({ "note": "a part" }),
+                8 * 1024,
+                account,
+                Carriage::Header {
+                    header: "kr-service-request",
+                    content: CONTENT,
+                },
+            )
+            .await
+    }
+
+    /// A request carried in a header is the same signed request, as unpadded base64url of its
+    /// JSON, and the body is the content and nothing else. The account token goes beside it, as it
+    /// goes beside every request that presents one, and neither the header nor the body holds it.
+    #[tokio::test]
+    async fn a_request_carried_in_a_header_travels_beside_its_content_and_its_token() {
+        use base64::Engine as _;
+
+        let wire = Wire::data();
+        let service = service(&wire);
+        let tokens = Tokens::holding(Some(TOKEN));
+        let answer = carry(&service, Some(&presenting(&tokens)))
+            .await
+            .expect("an answer");
+        assert!(matches!(answer, Answer::Data(_)), "{answer:?}");
+
+        assert_eq!(wire.contents(), [true], "sent as content");
+        assert_eq!(
+            wire.bodies(),
+            [CONTENT.to_vec()],
+            "the content, byte for byte"
+        );
+        let headers = wire.headers();
+        assert_eq!(headers[0].len(), 2, "{:?}", headers[0]);
+        assert_eq!(headers[0][0].0, "kr-service-request");
+        assert_eq!(
+            headers[0][1],
+            ("authorization".to_owned(), format!("Bearer {TOKEN}"))
+        );
+        let document = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&headers[0][0].1)
+            .expect("unpadded base64url");
+        assert!(
+            !String::from_utf8_lossy(&document).contains(TOKEN),
+            "the token is never in the signed request"
+        );
+        let request: serde_json::Value =
+            serde_json::from_slice(&document).expect("a signed request");
+        assert_eq!(request["body"], serde_json::json!({ "note": "a part" }));
+        assert_eq!(
+            digest_of(&document),
+            canonical_body_digest(&request["body"]).expect("a digest"),
+            "the signature covers the document, and not the content beside it"
+        );
+        assert_eq!(
+            request["signature"]["payload"]["method"],
+            "storage.upload.part"
+        );
+    }
+
+    /// The boundary is the same one: a request carried in a header whose token its source will
+    /// not give is not sent, and nothing reaches the transport.
+    #[tokio::test]
+    async fn a_request_carried_in_a_header_is_not_sent_without_its_token() {
+        let wire = Wire::data();
+        let refused = carry(&service(&wire), Some(&presenting(&Tokens::holding(None))))
+            .await
+            .expect_err("no token");
+        assert!(matches!(refused, Unanswered::NotSent(_)), "{refused:?}");
+        assert_eq!(wire.requests(), 0);
+    }
+
+    /// A success whose answer is content is the bytes, whatever they are, because nothing here
+    /// reads content. A failure is read as the envelope it is, and a success envelope where a
+    /// failure status says otherwise is not an answer this client reads.
+    #[tokio::test]
+    async fn a_success_whose_answer_is_content_comes_back_as_its_bytes() {
+        let read = |wire: &Arc<Wire>| {
+            let service = service(wire);
+            async move {
+                service
+                    .dispatch_for_content(
+                        "/api/storage/object/read",
+                        Method::StorageObjectRead,
+                        &serde_json::json!({ "note": "a read" }),
+                        8 * 1024,
+                        None,
+                    )
+                    .await
+            }
+        };
+
+        // Bytes that happen to look like an envelope are still the bytes.
+        for body in [
+            CONTENT.to_vec(),
+            br#"{"ok":false,"error":{"code":"FORBIDDEN","message":"no"}}"#.to_vec(),
+            Vec::new(),
+        ] {
+            let wire = Wire::answering(Ok(ServiceHttpAnswer {
+                status: 200,
+                body: body.clone(),
+            }));
+            match read(&wire).await {
+                Ok(Content::Bytes(bytes)) => assert_eq!(bytes, body),
+                other => panic!("the bytes: {other:?}"),
+            }
+            assert_eq!(wire.contents(), [false], "the request is a document");
+        }
+
+        let wire = Wire::answering(Ok(ServiceHttpAnswer {
+            status: 404,
+            body:
+                br#"{"ok":false,"error":{"code":"NOT_FOUND","message":"No such stored object."}}"#
+                    .to_vec(),
+        }));
+        match read(&wire).await {
+            Ok(Content::Refused(refusal)) => assert_eq!(refusal.code(), "NOT_FOUND"),
+            other => panic!("a refusal: {other:?}"),
+        }
+
+        for (status, body, code) in [
+            (
+                404,
+                br#"{"ok":true,"data":{"note":"x"}}"#.to_vec(),
+                ErrorCode::HostNotConfigured,
+            ),
+            (
+                502,
+                b"<html>Bad Gateway</html>".to_vec(),
+                ErrorCode::UpstreamUnavailable,
+            ),
+        ] {
+            let wire = Wire::answering(Ok(ServiceHttpAnswer { status, body }));
+            match read(&wire).await {
+                Err(Unanswered::Sent(error)) => assert_eq!(error.code(), code, "{status}"),
+                other => panic!("not an answer this client reads: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_rendering_of_content_carries_its_length_and_never_its_bytes() {
+        renders_only(
+            &Content::Bytes(NEVER_RENDERED.as_bytes().to_vec()),
+            &format!("Bytes{{length:{}}}", NEVER_RENDERED.len()),
+        );
+    }
+
+    /// The storage and backup services' own refusals say what a person does. A collection deleted
+    /// from the account console takes nothing again, whoever asks, which a new collection is the
+    /// way round: a change of configuration, and never an update. A service with no room for the
+    /// request now is a capacity to wait for, with the delay it named.
+    #[test]
+    fn a_storage_refusal_says_what_a_person_does_about_it() {
+        for (status, code, message, expected, action) in [
+            (
+                410,
+                "COLLECTION_DELETED",
+                "That backup collection was deleted from the account console. Enrol a new collection to back up again.",
+                ErrorCode::PermissionDenied,
+                UserAction::FixConfiguration,
+            ),
+            (
+                503,
+                "SERVICE_UNAVAILABLE",
+                "This service has no room for that part at the moment. Send it again shortly.",
+                ErrorCode::ServiceCapacity,
+                UserAction::Wait,
+            ),
+        ] {
+            let error = answer_of(&ServiceHttpAnswer {
+                status,
+                body: serde_json::to_vec(&serde_json::json!({
+                    "ok": false,
+                    "error": { "code": code, "message": message, "retryAfterSeconds": 2 },
+                }))
+                .expect("a refusal"),
+            })
+            .and_then(Answer::data)
+            .expect_err("a refusal");
+            assert_eq!(error.code(), expected, "{code}");
+            assert_eq!(error.user_action(), action, "{code}");
+            assert!(error.to_string().contains(message), "{error}");
+            let ClientError::Refused {
+                retry_after_seconds,
+                ..
+            } = error
+            else {
+                panic!("a refusal the service named: {error:?}");
+            };
+            assert_eq!(retry_after_seconds, Some(2));
         }
     }
 }

@@ -122,6 +122,29 @@ pub trait ServiceHttp: Send + Sync + std::fmt::Debug {
         body: &'a [u8],
         headers: &'a [(&'a str, &'a str)],
     ) -> ServiceFuture<'a, ServiceHttpAnswer>;
+
+    /// Posts content that is not a JSON document, and returns what came back.
+    ///
+    /// One managed-service request carries such a body: a storage part, whose body is the
+    /// ciphertext itself and whose signed request travels in a header beside it. An
+    /// implementation sends `body` byte for byte as `application/octet-stream`, and treats
+    /// `headers` and the answer exactly as [`Self::post_json`] does.
+    ///
+    /// A transport that carries documents only keeps this default. It sends nothing and says so,
+    /// so a caller that needed it is told this transport cannot carry the request.
+    fn post_bytes<'a>(
+        &'a self,
+        _url: &'a str,
+        _body: &'a [u8],
+        _headers: &'a [(&'a str, &'a str)],
+    ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+        Box::pin(async {
+            Err(ClientError::refusal(
+                ErrorCode::UnsupportedCapability,
+                Shown::said("this transport carries JSON documents only, so nothing was sent"),
+            ))
+        })
+    }
 }
 
 /// What an HTTP exchange returned.

@@ -526,6 +526,25 @@ impl ServiceHttp for HttpService {
             .await
         })
     }
+
+    /// The same exchange, under the same deadlines and bounds, with content as the body.
+    fn post_bytes<'a>(
+        &'a self,
+        url: &'a str,
+        body: &'a [u8],
+        headers: &'a [(&'a str, &'a str)],
+    ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+        Box::pin(async move {
+            let target = self.target(url)?;
+            self.exchange(
+                reqwest::Method::POST,
+                target,
+                Some(("application/octet-stream", body)),
+                headers,
+            )
+            .await
+        })
+    }
 }
 
 impl AccountHttp for HttpService {
@@ -1851,6 +1870,57 @@ mod tests {
             .expect_err("another origin");
         assert_eq!(code(&refused), ErrorCode::InvalidArgument);
         assert_eq!(gateway.received().len(), 2);
+    }
+
+    /// A storage part: its content is the body, byte for byte and labelled as bytes, and its
+    /// signed request travels in the header it was given, beside the account token.
+    #[tokio::test]
+    async fn content_arrives_as_bytes_beside_the_headers_it_was_given() {
+        let gateway = Gateway::start(Behaviour::Answer {
+            status: 200,
+            body: b"{}".to_vec(),
+        })
+        .await;
+        let transport = gateway.transport();
+        let content = [0x00, 0xff, 0x7b, 0x0a, 0xc3, 0x28, 0x00];
+        transport
+            .post_bytes(
+                &gateway.url("/api/storage/upload/part"),
+                &content,
+                &[
+                    ("kr-service-request", "eyJib2R5Ijp7fX0"),
+                    ("authorization", "Bearer opensesame"),
+                ],
+            )
+            .await
+            .expect("an answer");
+
+        let received = gateway.received();
+        assert_eq!(received.len(), 1);
+        let request = &received[0];
+        assert!(
+            request
+                .head
+                .starts_with("POST /api/storage/upload/part HTTP/1.1")
+        );
+        let head = request.head.to_ascii_lowercase();
+        assert!(head.contains("content-type: application/octet-stream"));
+        assert!(head.contains("kr-service-request: eyjib2r5ijp7fx0"));
+        assert!(head.contains("authorization: bearer opensesame"));
+        assert_eq!(request.body, content);
+
+        // The same rules as every other exchange: another origin is refused before anything is
+        // sent.
+        let refused = transport
+            .post_bytes(
+                "https://elsewhere.example/api/storage/upload/part",
+                &content,
+                &[],
+            )
+            .await
+            .expect_err("another origin");
+        assert_eq!(code(&refused), ErrorCode::InvalidArgument);
+        assert_eq!(gateway.received().len(), 1);
     }
 
     #[tokio::test]
