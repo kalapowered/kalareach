@@ -40,6 +40,11 @@ pub enum Moment {
     Before,
     /// The service acts on the request and its answer is lost.
     After,
+    /// The service cannot resolve the account token beside the request this once, so the request
+    /// proves no account, as a token the account system could not check proves none.
+    ProofUnread,
+    /// The request's body arrives cut short, so the service reads less than was sent.
+    BodyCut,
 }
 
 /// One fault a test arranged: the `nth` request to `path` from now on, counting from one, fails.
@@ -293,6 +298,16 @@ impl StorageWeb {
             content: content.map(<[u8]>::to_vec),
             reached,
         });
+        let token = if moment == Some(Moment::ProofUnread) {
+            None
+        } else {
+            token
+        };
+        let content = if moment == Some(Moment::BodyCut) {
+            content.map(|content| &content[..content.len() / 2])
+        } else {
+            content
+        };
         let lost = || {
             Err(ClientError::Host(ProtocolError::new(
                 ErrorCode::UpstreamUnavailable,

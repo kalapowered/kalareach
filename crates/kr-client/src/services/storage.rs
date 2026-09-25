@@ -34,14 +34,15 @@
 //!
 //! # Refusals that are answers
 //!
-//! Some refusals say something about the work rather than about the request, and a caller acts on
-//! them: [`ArchiveAnswer::CollectionDeleted`], a backup collection its owner deleted from the
-//! account console, which takes nothing more, so backing up again means enrolling a new
-//! collection; [`ArchiveAnswer::UploadGone`], an upload that takes nothing more, because it
-//! expired, was closed, or is not one the service holds for this caller, so the object is uploaded
-//! again under a new one; and [`ArchiveAnswer::Refused`], a request the service will refuse
-//! however often it is sent. Every other refusal is the error the service named, with what a
-//! person does about it, and it may pass.
+//! A refusal is read as an answer about the work only where its code means that in every use the
+//! service makes of it, never where one code covers several reasons. Two qualify:
+//! [`ArchiveAnswer::CollectionDeleted`], a backup collection its owner deleted from the account
+//! console, which takes nothing again, so backing up again means enrolling a new collection; and
+//! [`ArchiveAnswer::UploadGone`], an upload the service holds none of. `FORBIDDEN` about an upload
+//! covers an upload that expired or closed and a pair of proofs the service could not bind this
+//! time, and `INVALID_REQUEST` covers a body cut short in transit as well as one that is wrong, so
+//! both stay the errors the service named: the upload may still take the next part, and a caller
+//! that wants it ended asks the service to abandon it, whose answer is the explicit state.
 //!
 //! # What is never rendered
 //!
@@ -62,7 +63,7 @@ use serde::{Deserialize, Serialize};
 use super::account::{AccountTokenSource, BACKUP_WRITE_SCOPE};
 use super::relay::{ServiceHttp, ServiceSigner};
 use super::signed::{
-    AccountAuthorisation, Answer, Carriage, Content, Refusal, SignedService, Unanswered, malformed,
+    AccountAuthorisation, Answer, Carriage, Content, SignedService, Unanswered, malformed,
     unreadable_answer,
 };
 use super::{ServiceFuture, StorageService};
@@ -342,24 +343,13 @@ pub enum ArchiveAnswer<T> {
     /// never an update of this client. An upload creation, a completion and a publication can meet
     /// it.
     CollectionDeleted,
-    /// The upload takes nothing more.
+    /// The service holds no such upload: it never made one under that identity.
     ///
-    /// It expired, it was closed, the service holds no such upload, or it belongs to another pair
-    /// of proofs than this client's. What it held is the service's to clean up, and the object is
-    /// uploaded again under a new one. A part, a completion and an abandonment can meet it.
+    /// Nothing can be sent under it, so the object is uploaded under a new one. A part, a
+    /// completion and an abandonment can meet it. An upload that expired or was closed is refused
+    /// `FORBIDDEN` instead, as a pair of proofs the service could not bind is, so that stays an
+    /// error: [`StorageService::abort_upload`] is what establishes that an upload has ended.
     UploadGone,
-    /// The service will not take this request, whoever sends it again.
-    ///
-    /// A request it cannot read, a part that does not match what it declared, a completion whose
-    /// parts do not add up, other content for a generation already published, or a writer the
-    /// collection did not enrol: the error says which, in the service's words. A refusal that may
-    /// pass, a rate or a capacity limit, an allowance, a sign-in, stays an error instead.
-    Refused {
-        /// What the service said.
-        error: ProtocolError,
-        /// What a person does about it.
-        action: UserAction,
-    },
 }
 
 impl<T> ArchiveAnswer<T> {
@@ -374,27 +364,9 @@ impl<T> ArchiveAnswer<T> {
             Self::CollectionDeleted => Err(collection_deleted()),
             Self::UploadGone => Err(ClientError::Host(ProtocolError::new(
                 ErrorCode::StaleSession,
-                "that upload takes nothing more; upload the object again".to_owned(),
+                "the service holds no such upload; upload the object again".to_owned(),
             ))),
-            Self::Refused { error, action } => Err(ClientError::Refused {
-                error,
-                retry_after_seconds: None,
-                action,
-            }),
         }
-    }
-}
-
-/// A refusal the service will give whoever sends the request again, as an answer.
-pub(crate) fn declined<T>(refusal: Refusal) -> ArchiveAnswer<T> {
-    let error = refusal.into_error();
-    let action = error.user_action();
-    match error {
-        ClientError::Refused { error, .. } => ArchiveAnswer::Refused { error, action },
-        other => ArchiveAnswer::Refused {
-            error: ProtocolError::new(other.code(), other.to_string()),
-            action,
-        },
     }
 }
 
@@ -1069,9 +1041,6 @@ impl ManagedStorageService {
             Answer::Refused(refusal) if refusal.code() == "COLLECTION_DELETED" => {
                 return Ok(ArchiveAnswer::CollectionDeleted);
             }
-            Answer::Refused(refusal) if refusal.code() == "INVALID_REQUEST" => {
-                return Ok(declined(refusal));
-            }
             Answer::Refused(refusal) => return Err(refusal.into_error()),
         };
         let answer: CreateAnswer = read(data, "what an upload creation answered")?;
@@ -1140,9 +1109,6 @@ impl ManagedStorageService {
             ArchiveAnswer::Done(data) => data,
             ArchiveAnswer::CollectionDeleted => return Ok(ArchiveAnswer::CollectionDeleted),
             ArchiveAnswer::UploadGone => return Ok(ArchiveAnswer::UploadGone),
-            ArchiveAnswer::Refused { error, action } => {
-                return Ok(ArchiveAnswer::Refused { error, action });
-            }
         };
         let answer: PartAnswer = read(data, "what a part answered")?;
         if answer.part_number != part.number || answer.length_bytes.get() != length {
@@ -1177,9 +1143,6 @@ impl ManagedStorageService {
             ArchiveAnswer::Done(data) => data,
             ArchiveAnswer::CollectionDeleted => return Ok(ArchiveAnswer::CollectionDeleted),
             ArchiveAnswer::UploadGone => return Ok(ArchiveAnswer::UploadGone),
-            ArchiveAnswer::Refused { error, action } => {
-                return Ok(ArchiveAnswer::Refused { error, action });
-            }
         };
         let answer: CompleteAnswer = read(data, "what an upload completion answered")?;
         if answer.object.encrypted_len.get() != table.total_bytes()
@@ -1215,9 +1178,6 @@ impl ManagedStorageService {
             ArchiveAnswer::Done(data) => data,
             ArchiveAnswer::CollectionDeleted => return Ok(ArchiveAnswer::CollectionDeleted),
             ArchiveAnswer::UploadGone => return Ok(ArchiveAnswer::UploadGone),
-            ArchiveAnswer::Refused { error, action } => {
-                return Ok(ArchiveAnswer::Refused { error, action });
-            }
         };
         let answer: AbortAnswer = read(data, "what an upload abandonment answered")?;
         Ok(ArchiveAnswer::Done(UploadAborted {
@@ -1404,9 +1364,6 @@ pub async fn upload_parts(
             ArchiveAnswer::Done(_) => {}
             ArchiveAnswer::CollectionDeleted => return Ok(ArchiveAnswer::CollectionDeleted),
             ArchiveAnswer::UploadGone => return Ok(ArchiveAnswer::UploadGone),
-            ArchiveAnswer::Refused { error, action } => {
-                return Ok(ArchiveAnswer::Refused { error, action });
-            }
         }
         progress.parts_acknowledged = number;
         acknowledged(progress)?;
@@ -1420,19 +1377,18 @@ pub async fn upload_parts(
 
 /// Reads the answer to a request about one upload, taking the refusals that are answers as answers.
 ///
-/// An upload that is closed, expired, being cleaned up or already stored is refused `FORBIDDEN`
-/// for anything but a completion asked for again, and so is one created under another pair of
-/// proofs; one the service never made is `NOT_FOUND`. Either way it takes nothing more from this
-/// caller, which is [`ArchiveAnswer::UploadGone`]. `INVALID_REQUEST` about an upload is a part that
-/// does not match what it declared or a completion whose parts do not add up, which the service
-/// refuses however often it is asked, which is [`ArchiveAnswer::Refused`].
+/// An upload the service never made is `NOT_FOUND`, and nothing can be sent under it, which is
+/// [`ArchiveAnswer::UploadGone`]. `FORBIDDEN` is not: it answers an upload that expired, closed or
+/// was stored, and equally a pair of proofs the service could not bind this time, or a part number
+/// declared twice two ways, after which the upload is still open. `INVALID_REQUEST` answers a body
+/// cut short in transit as well as a declaration that is wrong, and the upload stays open after
+/// either. So both stay the errors the service named, and the upload keeps its identity.
 fn upload_answer(answer: Answer) -> Result<ArchiveAnswer<serde_json::Value>> {
     match answer {
         Answer::Data(data) => Ok(ArchiveAnswer::Done(data)),
         Answer::Refused(refusal) => match refusal.code() {
             "COLLECTION_DELETED" => Ok(ArchiveAnswer::CollectionDeleted),
-            "FORBIDDEN" | "NOT_FOUND" => Ok(ArchiveAnswer::UploadGone),
-            "INVALID_REQUEST" => Ok(declined(refusal)),
+            "NOT_FOUND" => Ok(ArchiveAnswer::UploadGone),
             _ => Err(refusal.into_error()),
         },
     }

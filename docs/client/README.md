@@ -1044,10 +1044,13 @@ enrolment and a fetch spend nothing and carry no token.
   acknowledgement before the next part leaves, so a transfer that stopped goes on at the next part and
   sends no acknowledged part again. A part sent again after its answer was lost is answered as the part
   it is, and a completion asked for again is answered with the result it already gave.
-- Two refusals are answers a caller acts on, `ArchiveAnswer`: `CollectionDeleted`, a collection its
-  owner deleted from the account console, which takes no upload and no publication again, so backing
-  up again means enrolling a new collection; and `UploadGone`, an upload that expired, was closed or is
-  not one the service holds for this caller, so the object is uploaded again under a new one. Where
+- A refusal is an answer about the work, `ArchiveAnswer`, only where its code means that in every use
+  the service makes of it: `CollectionDeleted`, a collection its owner deleted from the account
+  console, which takes no upload and no publication again, so backing up again means enrolling a new
+  collection; and `UploadGone`, an upload the service holds none of. `FORBIDDEN` about an upload also
+  answers a pair of proofs the service could not bind that time, and `INVALID_REQUEST` a body cut short
+  on its way, and the upload takes the next part after either, so both stay the errors the service
+  named; an upload is ended by asking the service to abandon it, whose answer says it is over. Where
   `COLLECTION_DELETED` reaches a caller as an error it is a change of configuration, with a message
   that says to enrol a new collection, and never an update. A service with no room for a part now,
   `SERVICE_UNAVAILABLE`, is capacity to wait for, with the delay it names. An upload that would spend
@@ -1058,8 +1061,9 @@ enrolment and a fetch spend nothing and carry no token.
   duplicate, and other content for a generation already published is refused. A fetch answers with the
   publication exactly as it was published, or with nothing when the service holds no such generation,
   or none as new as the checkpoint presented.
-- A read answers with up to 8 MiB of ciphertext, so `services::managed_response_limits` gives the read
-  path a bound of its own.
+- A read answers with up to 8 MiB of ciphertext, and a fetch with a whole publication, which for a
+  descriptor at its bound is past the bound an ordinary answer is read under, so
+  `services::managed_response_limits` gives each path a bound of its own.
 
 A field left `None` is a service this client does not use, and nothing degrades. Direct connections,
 local sessions, drafts, plugins, local descriptions and user-operated alternatives need none of

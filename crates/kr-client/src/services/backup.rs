@@ -51,7 +51,7 @@ use serde::{Deserialize, Serialize};
 use super::account::{AccountTokenSource, BACKUP_WRITE_SCOPE};
 use super::relay::{ServiceHttp, ServiceSigner};
 use super::signed::{AccountAuthorisation, Answer, SignedService, Unanswered, unreadable_answer};
-use super::storage::{ArchiveAnswer, declined};
+use super::storage::ArchiveAnswer;
 use super::{BackupManifestService, Dispatched, ServiceFuture};
 use crate::error::{ClientError, Result};
 use kr_protocol::error::{ErrorCode, ProtocolError};
@@ -64,6 +64,17 @@ pub const BACKUP_MANIFEST_PATH: &str = "/api/backup/manifest";
 /// A descriptor is at most 64 KiB in its canonical encoding, and it travels as JSON with its bytes
 /// as base64url, so this is that bound with the expansion and the rest of the request allowed for.
 pub const MAX_BACKUP_REQUEST_BYTES: usize = 256 * 1024;
+
+/// How many bytes of a backup-manifest answer this client reads.
+///
+/// A fetch is the largest answer: one publication, whose descriptor is at most 64 KiB in its
+/// canonical encoding and larger as JSON, where its bytes travel as base64url and its members by
+/// name, beside a collection that names at most sixteen generations and two writers. A descriptor at
+/// its bound makes a fetch answer well past [`super::http::DEFAULT_RESPONSE_LIMIT_BYTES`], so the
+/// manifest's path carries a bound of its own, the same one a publication request is held to, and
+/// `a_fetch_of_the_largest_descriptor_is_read_under_the_manifests_own_bound` holds this to a
+/// descriptor at its bound, read through the transport.
+pub const BACKUP_ANSWER_LIMIT_BYTES: u64 = 256 * 1024;
 
 /* -------------------------------------------------------------------------- */
 /* What the service answers                                                    */
@@ -400,14 +411,9 @@ impl ManagedBackupManifestService {
             Answer::Refused(refusal) if refusal.code() == "COLLECTION_DELETED" => {
                 return Ok(Dispatched::Answered(ArchiveAnswer::CollectionDeleted));
             }
-            // Another writer, other content for a generation already published, a generation
-            // behind the checkpoint, or a publication the service cannot read: refused however
-            // often it is sent.
-            Answer::Refused(refusal)
-                if matches!(refusal.code(), "FORBIDDEN" | "INVALID_REQUEST") =>
-            {
-                return Ok(Dispatched::Answered(declined(refusal)));
-            }
+            // Every other refusal is the error the service named. `FORBIDDEN` covers a writer the
+            // owner has not enrolled yet as well as content that can never be published, so it
+            // says nothing on its own about whether asking again can succeed.
             Answer::Refused(refusal) => return Err(refusal.into_error()),
         };
         let answer: PublishAnswer = read(data, "what a publication answered")?;

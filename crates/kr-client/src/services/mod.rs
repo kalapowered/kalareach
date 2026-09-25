@@ -195,6 +195,10 @@ pub fn managed_response_limits() -> ResponseLimits {
             storage::STORAGE_READ_PATH,
             storage::STORAGE_READ_ANSWER_LIMIT_BYTES,
         )
+        .for_path(
+            backup::BACKUP_MANIFEST_PATH,
+            backup::BACKUP_ANSWER_LIMIT_BYTES,
+        )
 }
 
 /// How this module's rule about what is never rendered is checked.
@@ -1054,8 +1058,10 @@ pub trait SyncBackupService: Send + Sync + std::fmt::Debug {
 /// 3. **Completion is the service's, and a repeat is answered the same.** A completion asked for
 ///    again after its answer was lost gets the result the first one got.
 /// 4. **Two answers are about the work.** A collection deleted from the account console takes
-///    nothing again, and an upload that expired or was closed takes nothing more: each is an
-///    [`storage::ArchiveAnswer`] rather than an error, because a caller acts on it.
+///    nothing again, and an upload the service holds none of takes nothing: each is an
+///    [`storage::ArchiveAnswer`] rather than an error, because a caller acts on it. A refusal whose
+///    code covers several reasons stays the error the service named, and an upload is ended by
+///    asking the service to abandon it, whose answer says it is over.
 /// 5. **Nothing is sent without the account's proof.** An installation alone holds no backup
 ///    storage, so an implementation given no account sends no request.
 pub trait StorageService: Send + Sync + std::fmt::Debug {
@@ -1694,6 +1700,11 @@ mod tests {
             limits.of(storage::STORAGE_UPLOAD_PART_PATH),
             http::DEFAULT_RESPONSE_LIMIT_BYTES,
             "a part answers with counts, not with content"
+        );
+        assert_eq!(
+            limits.of(backup::BACKUP_MANIFEST_PATH),
+            backup::BACKUP_ANSWER_LIMIT_BYTES,
+            "a fetch answers with a whole publication"
         );
     }
 }

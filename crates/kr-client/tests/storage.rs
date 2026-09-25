@@ -426,10 +426,13 @@ async fn a_part_travels_as_its_ciphertext_beside_its_signed_request() {
 
 /// KR-REQ-20.22: one refusal each method meets, as the service sends it, with what a person does
 /// about it. An upload into storage that is off is the permission the person turns on; a stale
-/// retention change is a request to read the revision again; a part of an upload that expired and
-/// the abandonment of one the service never made are the upload taking nothing more; a service with
-/// no room for a part is capacity to wait for; a read and a deletion of nothing stored are an object
-/// the service holds none of.
+/// retention change is the service's generic refusal, which says to read the revision again; a part
+/// and a completion of an upload that expired are the service's own `FORBIDDEN`, which also answers
+/// other things, so the upload keeps its identity and its abandonment is what ends it; the
+/// abandonment of an upload the service never made is an upload it holds none of; a completion whose
+/// parts do not add up is the service's `INVALID_REQUEST`; a service with no room for a part is
+/// capacity to wait for; a read and a deletion of nothing stored are an object the service holds
+/// none of.
 #[tokio::test]
 async fn each_storage_method_meets_a_refusal_the_service_sends() {
     let web = Arc::new(StorageWeb::new());
@@ -461,27 +464,39 @@ async fn each_storage_method_meets_a_refusal_the_service_sends() {
     backup_on(&client).await;
     let progress = created(&client, 1, &bytes).await;
     web.expire_uploads();
-    assert_eq!(
-        client
-            .upload_part(
-                &progress.upload_id,
-                UploadPart {
-                    number: 1,
-                    bytes: &bytes,
-                },
-            )
-            .await
-            .expect("an answer"),
-        ArchiveAnswer::UploadGone,
-        "an expired upload takes nothing more"
+    let expired = client
+        .upload_part(
+            &progress.upload_id,
+            UploadPart {
+                number: 1,
+                bytes: &bytes,
+            },
+        )
+        .await
+        .expect_err("an expired upload");
+    refused(
+        &expired,
+        ErrorCode::PermissionDenied,
+        UserAction::FixConfiguration,
     );
-    assert_eq!(
-        client
-            .complete_upload(&progress.upload_id, &progress.table)
-            .await
-            .expect("an answer"),
-        ArchiveAnswer::UploadGone
+    let expired = client
+        .complete_upload(&progress.upload_id, &progress.table)
+        .await
+        .expect_err("an expired upload");
+    refused(
+        &expired,
+        ErrorCode::PermissionDenied,
+        UserAction::FixConfiguration,
     );
+    // Its abandonment is the explicit state: the service confirms the upload is over.
+    let ArchiveAnswer::Done(abandoned) = client
+        .abort_upload(&progress.upload_id)
+        .await
+        .expect("an answer")
+    else {
+        panic!("an abandonment");
+    };
+    assert!(abandoned.cleaned);
     assert_eq!(
         client
             .abort_upload(&kr_client::services::UploadId::new("no-such-upload").expect("an id"))
@@ -491,7 +506,7 @@ async fn each_storage_method_meets_a_refusal_the_service_sends() {
         "an upload the service never made"
     );
 
-    // A completion whose parts do not add up is refused however often it is asked for.
+    // A completion whose parts do not add up.
     let two_parts = ciphertext(STORAGE_PART_SIZE_BYTES + 1);
     let mut halfway = created(&client, 2, &two_parts).await;
     halfway.table = PartTable::for_total(STORAGE_PART_SIZE_BYTES).expect("a table");
@@ -507,12 +522,8 @@ async fn each_storage_method_meets_a_refusal_the_service_sends() {
     let short = client
         .complete_upload(&halfway.upload_id, &whole)
         .await
-        .expect("an answer");
-    let ArchiveAnswer::Refused { error, action } = short else {
-        panic!("refused: {short:?}");
-    };
-    assert_eq!(error.code, ErrorCode::InvalidArgument);
-    assert_eq!(action, UserAction::Update);
+        .expect_err("a part is missing");
+    refused(&short, ErrorCode::InvalidArgument, UserAction::Update);
 
     let absent = client
         .read_object(archive_id(), object_id(0x44), 0, 16)
@@ -654,6 +665,85 @@ async fn an_upload_interrupted_after_its_second_part_goes_on_without_sending_tha
         web.stored(&archive_id().to_string(), &object_id(1).to_string()),
         Some(bytes),
         "the object, whole and in order"
+    );
+}
+
+/// A part the service refused because it could not bind the account's proof this once is an error,
+/// not the end of the upload: the upload keeps its identity and takes the same part under the next
+/// request, whose proof binds.
+#[tokio::test]
+async fn an_upload_whose_proof_the_service_could_not_bind_once_goes_on_under_the_next() {
+    let web = Arc::new(StorageWeb::new());
+    let device = Device::generate();
+    let client = storage(&web, &device, Some(&Tokens::signed_in()));
+    backup_on(&client).await;
+    let bytes = ciphertext(STORAGE_PART_SIZE_BYTES + 9);
+    let mut progress = created(&client, 1, &bytes).await;
+
+    web.fail("/api/storage/upload/part", 2, Moment::ProofUnread);
+    let unbound = upload_parts(&client, &mut progress, &bytes, &mut forget)
+        .await
+        .expect_err("the second part's proof did not bind");
+    refused(
+        &unbound,
+        ErrorCode::PermissionDenied,
+        UserAction::FixConfiguration,
+    );
+    assert_eq!(progress.parts_acknowledged, 1);
+
+    assert_eq!(
+        upload_parts(&client, &mut progress, &bytes, &mut forget)
+            .await
+            .expect("the rest"),
+        ArchiveAnswer::Done(())
+    );
+    let ArchiveAnswer::Done(completed) = client
+        .complete_upload(&progress.upload_id, &progress.table)
+        .await
+        .expect("an answer")
+    else {
+        panic!("a completion");
+    };
+    assert_eq!(completed.object.encrypted_len, bytes.len() as u64);
+    assert_eq!(web.parts_sent(), [1, 2, 2]);
+    assert_eq!(
+        web.stored(&archive_id().to_string(), &object_id(1).to_string()),
+        Some(bytes)
+    );
+}
+
+/// A part whose body arrived cut short is refused as not the length it declared, and the upload
+/// takes it again whole: the refusal is an error about that body and not the end of the upload.
+#[tokio::test]
+async fn a_part_cut_short_on_its_way_is_refused_and_taken_again_whole() {
+    let web = Arc::new(StorageWeb::new());
+    let device = Device::generate();
+    let client = storage(&web, &device, Some(&Tokens::signed_in()));
+    backup_on(&client).await;
+    let bytes = ciphertext(4_096);
+    let mut progress = created(&client, 1, &bytes).await;
+
+    web.fail("/api/storage/upload/part", 1, Moment::BodyCut);
+    let cut = upload_parts(&client, &mut progress, &bytes, &mut forget)
+        .await
+        .expect_err("the body was cut short");
+    refused(&cut, ErrorCode::InvalidArgument, UserAction::Update);
+    assert_eq!(progress.parts_acknowledged, 0);
+
+    upload_parts(&client, &mut progress, &bytes, &mut forget)
+        .await
+        .expect("the part, whole");
+    let ArchiveAnswer::Done(completed) = client
+        .complete_upload(&progress.upload_id, &progress.table)
+        .await
+        .expect("an answer")
+    else {
+        panic!("a completion");
+    };
+    assert!(!completed.duplicate);
+    assert_eq!(
+        web.stored(&archive_id().to_string(), &object_id(1).to_string()),
+        Some(bytes)
     );
 }
 
@@ -819,13 +909,21 @@ struct Archive {
 }
 
 impl Archive {
-    /// Generation `generation`, sealed and signed by `device`'s key.
+    /// Generation `generation`, sealed and signed by `device`'s key, for one recipient.
     fn sealed(device: &Arc<Device>, generation: u64) -> Self {
+        Self::sealed_for(device, generation, 1).expect("a sealed archive")
+    }
+
+    /// Generation `generation`, sealed and signed by `device`'s key, for `readers` recipients, or
+    /// none when that many take the descriptor past its bound.
+    fn sealed_for(device: &Arc<Device>, generation: u64, readers: usize) -> Option<Self> {
         let writer = &device.0;
         let sender = StoredEnvelopeKeyPair::generate().expect("a producer key");
-        let reader = StoredEnvelopeKeyPair::generate().expect("a recipient key");
         let mut recipients = ArchiveRecipients::new(CollectionKind::Owned);
-        assert!(recipients.add(*reader.public()));
+        for _ in 0..readers {
+            let reader = StoredEnvelopeKeyPair::generate().expect("a recipient key");
+            assert!(recipients.add(*reader.public()));
+        }
         let objects = [stage_object(
             &ObjectSource {
                 object_id: object_id(1),
@@ -848,11 +946,26 @@ impl Archive {
             },
             &objects,
         )
-        .expect("a sealed archive");
-        Self {
+        .ok()?;
+        Some(Self {
             sealed,
             device: Arc::clone(device),
+        })
+    }
+
+    /// The archive whose descriptor is as large as a producer seals one: as many recipients as fit
+    /// under the descriptor's bound.
+    fn largest(device: &Arc<Device>) -> Self {
+        let (mut fits, mut past) = (1, kr_protocol::archive::MAX_ARCHIVE_RECIPIENTS + 1);
+        while past - fits > 1 {
+            let middle = usize::midpoint(fits, past);
+            if Self::sealed_for(device, 1, middle).is_some() {
+                fits = middle;
+            } else {
+                past = middle;
+            }
         }
+        Self::sealed_for(device, 1, fits).expect("the largest archive that fits")
     }
 
     /// The key that writes and owns the archive.
@@ -1025,22 +1138,16 @@ async fn a_publication_sent_again_is_a_duplicate_and_other_content_for_it_is_ref
     assert!(again.duplicate);
     assert_eq!(web.generations(&archive_id().to_string()), [1]);
 
-    // Other content for a generation already published is refused however often it is sent, so
-    // it is an answer rather than an error that may pass.
     let other = publisher
         .publish(&archive.publication_at(3_000))
         .await
-        .expect("an answer");
-    let ArchiveAnswer::Refused { error, action } = other else {
-        panic!("refused: {other:?}");
-    };
-    assert_eq!(error.code, ErrorCode::PermissionDenied);
-    assert_eq!(action, UserAction::FixConfiguration);
-    assert!(
-        error.message.contains("different content"),
-        "{}",
-        error.message
+        .expect_err("other content for a generation already published");
+    refused(
+        &other,
+        ErrorCode::PermissionDenied,
+        UserAction::FixConfiguration,
     );
+    assert!(other.to_string().contains("different content"), "{other}");
 
     let stranger = Device::generate();
     let taken = manifest(&web, &stranger, None)
@@ -1243,4 +1350,139 @@ async fn a_publication_says_whether_it_left_this_device() {
         panic!("answered: {again:?}");
     };
     assert!(published.duplicate, "it had landed");
+}
+
+/* -------------------------------------------------------------------------- */
+/* Through the transport                                                       */
+/* -------------------------------------------------------------------------- */
+
+/// Serves every request on `listener` with `answer`, as a plain HTTP service on loopback would.
+async fn serve(listener: tokio::net::TcpListener, answer: Vec<u8>) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    while let Ok((mut socket, _)) = listener.accept().await {
+        let answer = answer.clone();
+        tokio::spawn(async move {
+            // The request's head, and its body as long as the head says it is.
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 16 * 1024];
+            loop {
+                let Ok(read) = socket.read(&mut buffer).await else {
+                    return;
+                };
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                let length = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if request.len() >= end + 4 + length {
+                    break;
+                }
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                answer.len()
+            );
+            let _ = socket.write_all(head.as_bytes()).await;
+            let _ = socket.write_all(&answer).await;
+            let _ = socket.shutdown().await;
+        });
+    }
+}
+
+/// A fetch of the largest descriptor a producer seals answers with more than the transport reads of
+/// an ordinary answer, and the manifest's own bound reads it whole, through the transport a
+/// composition root builds. The control: the same answer under the ordinary bound is refused as
+/// too large.
+#[tokio::test]
+async fn a_fetch_of_the_largest_descriptor_is_read_under_the_manifests_own_bound() {
+    use kr_client::services::backup::BACKUP_ANSWER_LIMIT_BYTES;
+    use kr_client::services::http::DEFAULT_RESPONSE_LIMIT_BYTES;
+    use kr_client::services::{
+        HttpDeadlines, HttpService, ResponseLimits, managed_response_limits,
+    };
+
+    let device = Device::generate();
+    let archive = Archive::largest(&device);
+    let publication = archive.publication();
+    let generations: Vec<String> = (1..=16)
+        .rev()
+        .map(|generation: u64| generation.to_string())
+        .collect();
+    let writer = serde_json::json!({
+        "writer_key_id": archive.writer().key_id(),
+        "writer_revision": "1",
+        "enrolled_at": "2026-09-25T16:00:00.000Z",
+    });
+    let answer = serde_json::to_vec(&serde_json::json!({
+        "ok": true,
+        "data": {
+            "publication": publication,
+            "published_at": "2026-09-25T17:00:00.000Z",
+            "collection": {
+                "archive_id": archive_id(),
+                "checkpoint_generation": "16",
+                "generations": generations,
+                "bytes": "1048576",
+                "allowance_bytes": "10737418240",
+            },
+            "current_writer": writer,
+        },
+    }))
+    .expect("an answer");
+    assert!(
+        answer.len() as u64 > DEFAULT_RESPONSE_LIMIT_BYTES,
+        "the largest fetch is {} bytes, past the ordinary bound",
+        answer.len()
+    );
+    assert!(
+        answer.len() as u64 <= BACKUP_ANSWER_LIMIT_BYTES,
+        "the largest fetch is {} bytes, within the manifest's own bound",
+        answer.len()
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback listener");
+    let origin = GatewayOrigin::new(format!(
+        "http://127.0.0.1:{}",
+        listener.local_addr().expect("an address").port()
+    ))
+    .expect("a loopback origin");
+    let server = tokio::spawn(serve(listener, answer));
+
+    let fetch = |limits: ResponseLimits| {
+        let origin = origin.clone();
+        let device = Arc::clone(&device);
+        async move {
+            let http = HttpService::with(origin.clone(), HttpDeadlines::default(), limits)
+                .expect("a transport");
+            ManagedBackupManifestService::new(
+                origin,
+                Arc::new(http) as Arc<_>,
+                device as Arc<dyn ServiceSigner>,
+            )
+            .fetch(archive_id(), Some(BackupGeneration::new(1)), None)
+            .await
+        }
+    };
+
+    let fetched = fetch(managed_response_limits())
+        .await
+        .expect("an answer")
+        .expect("the generation");
+    assert_eq!(fetched.publication, publication, "read whole");
+    let refused = fetch(ResponseLimits::default())
+        .await
+        .expect_err("too large for the ordinary bound");
+    assert!(refused.to_string().contains("bytes"), "{refused}");
+    server.abort();
 }
