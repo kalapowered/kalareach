@@ -1595,14 +1595,16 @@ async fn a_device_waits_inside_the_hosts_request_budget_for_an_owner_who_takes_t
     );
 }
 
-/// KR-REQ-10.36, KR-REQ-10.23: fresh connections fail for a while just as the device nears the end
-/// of the questions its connection has, and the owner approves after the first of them failed. A
-/// device that then asked its last question at once would hear that the owner had not decided yet,
-/// and have nothing left to hear the approval on: the host serves a committed device no new unpaired
-/// connection. This device keeps the last question while it tries fresh connections, and asks it
-/// only once several in a row have failed, which is how it learns that the host committed it.
+/// KR-REQ-10.36, KR-REQ-10.23: a network that drops every new connection as the device comes to
+/// the end of its connection, and an owner who approves only once the device has come to its last
+/// question there and three fresh connections have failed in a row. A host serves a committed
+/// device no new unpaired connection, so that last question is the device's only way to learn what
+/// it became, and a device that had asked it already would have nothing left to hear the approval
+/// on. This device keeps it while fresh connections fail and asks it at the connection's last call,
+/// before the host ends the connection, and finds itself committed. New connections work again once
+/// the owner has approved, and meet a host that has committed the device.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_last_question_waits_while_fresh_connections_fail() {
+async fn the_last_question_waits_for_the_connections_last_call() {
     let owner_keys = keys();
     let host = Host::start(&owner_keys).await;
     let environment = host.environment_id;
@@ -1623,15 +1625,15 @@ async fn the_last_question_waits_while_fresh_connections_fail() {
         }
     })
     .await
-    .expect("the device nears the end of its connection's questions");
+    .expect("the device comes to its last question");
     let dials = made(&link).dials.load(Ordering::SeqCst);
     tokio::time::timeout(Duration::from_secs(30), async {
-        while made(&link).dials.load(Ordering::SeqCst) == dials {
+        while made(&link).dials.load(Ordering::SeqCst) < dials + 3 {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("the device tries a fresh connection, which fails");
+    .expect("three fresh connections fail in a row");
     calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
         .await
         .expect("the owner approves");
