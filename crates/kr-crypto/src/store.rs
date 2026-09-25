@@ -584,19 +584,14 @@ pub(crate) fn write_owner_only(path: &Path, secret: &[u8]) -> Result<()> {
         })
 }
 
-/// Flushes a directory entry to the device.
-#[cfg(unix)]
+/// Flushes the directory a file's name was just created or replaced in, so the name survives a
+/// crash.
 pub(crate) fn sync_directory(directory: &Path) -> Result<()> {
-    std::fs::File::open(directory)
-        .and_then(|handle| handle.sync_all())
-        .map_err(|error| CryptoError::SecretStore {
+    kr_flush::flush_directory(directory, kr_flush::NameKind::File).map_err(|error| {
+        CryptoError::SecretStore {
             message: format!("sync {}: {error}", directory.display()),
-        })
-}
-
-#[cfg(not(unix))]
-pub(crate) fn sync_directory(_directory: &Path) -> Result<()> {
-    Ok(())
+        }
+    })
 }
 
 /// Rejects a fallback directory that another account owns or can read.
@@ -1348,6 +1343,45 @@ mod tests {
             !base.join(STORE_KIND_MARKER).exists(),
             "naming a directory for one run is not a choice recorded against this host"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// KR-REQ-10.47: a secret's name, and the store's record of its choice, are flushed into their
+    /// directory through a handle that may add a file to it. While a handle that shares no writing
+    /// holds the directory, the flush is refused and says so, where a flush that did nothing would
+    /// report the name durable; once it is let go, the same flush is made.
+    #[cfg(windows)]
+    #[test]
+    fn a_name_whose_directory_cannot_be_flushed_is_reported() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        /// The right to list a directory, which is all the handle holds.
+        const FILE_LIST_DIRECTORY: u32 = 0x0001;
+        /// Reading is shared with other handles.
+        const FILE_SHARE_READ: u32 = 0x0001;
+        /// Deleting is shared; writing is not.
+        const FILE_SHARE_DELETE: u32 = 0x0004;
+        /// What lets a program open a directory at all.
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+        let base = scratch_directory("held");
+        let opened = open_store_in(&base).expect("a store in the named directory");
+        let name = SecretName::new("host/x").expect("a name");
+        opened.store.set(&name, b"seed").expect("a write");
+        let scope = base.join("host");
+        let holding = std::fs::OpenOptions::new()
+            .access_mode(FILE_LIST_DIRECTORY)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&scope)
+            .expect("the directory is held");
+        let refused = sync_directory(&scope).expect_err("the flush is refused while it is held");
+        assert!(
+            matches!(refused, CryptoError::SecretStore { ref message } if message.starts_with("sync ")),
+            "{refused}"
+        );
+        drop(holding);
+        sync_directory(&scope).expect("and made once it is let go");
         let _ = std::fs::remove_dir_all(&base);
     }
 
