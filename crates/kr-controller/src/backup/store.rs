@@ -40,7 +40,15 @@ use crate::error::{ControllerError, Result};
 /// before anything else is read. What a store *enforces* is not left to it: opening compares the
 /// schema itself against the one this build writes, so a database holding a weaker rule is refused
 /// whether or not anybody remembered to move this number when that rule changed.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
+
+/// The schema version the previous build wrote, which is this build's schema without the upload
+/// table and its rules.
+///
+/// Remove it, with the step that reads it, once no supported host can still hold a store at this
+/// version: when the releases that wrote one are outside the installed-version upgrade window that
+/// section 24 keeps host migrators for.
+const VERSION_WITHOUT_UPLOADS: i64 = 6;
 
 /// Whether this host may go on producing for one generation.
 ///
@@ -527,6 +535,24 @@ impl ObjectRecord {
     }
 }
 
+/// One object's upload in progress, as the store holds it.
+///
+/// The storage service names an upload only in the answer that created it, so this is where a
+/// transfer that stopped finds it again. It holds identities and a count and nothing else.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UploadRecord {
+    /// The archive.
+    pub archive_id: ArchiveId,
+    /// The generation.
+    pub backup_generation: BackupGeneration,
+    /// The object the upload carries.
+    pub object_id: BackupObjectId,
+    /// The identity the service gave the upload.
+    pub upload_id: String,
+    /// How many of its parts the service has acknowledged: parts one to this, sent in order.
+    pub parts_acknowledged: u64,
+}
+
 /// One dispatch attempt: a step this host took, or is taking, for one generation.
 ///
 /// The `sequence` is its identity and never changes. Neither do the archive, the generation, the
@@ -688,6 +714,9 @@ impl BackupStore {
                     row.get(0)
                 })
                 .map_err(ControllerError::registry)?;
+            if version == VERSION_WITHOUT_UPLOADS {
+                return self.migrate_from_version_6();
+            }
             if version != SCHEMA_VERSION {
                 return Err(ControllerError::RegistryUnavailable {
                     detail: format!(
@@ -743,11 +772,7 @@ impl BackupStore {
     /// of whoever changed a rule last. So what is compared is the schema itself, against the one
     /// this build makes from nothing, object by object.
     fn expect_the_schema_this_build_writes(&self) -> Result<()> {
-        let fresh = Database::in_memory().map_err(ControllerError::registry)?;
-        fresh
-            .run_script(DEFINITION)
-            .map_err(ControllerError::registry)?;
-        let expected = read_definition(&fresh)?;
+        let expected = definition_this_build_writes()?;
         let found = read_definition(&self.connection)?;
         if found == expected {
             return Ok(());
@@ -756,10 +781,123 @@ impl BackupStore {
             detail: first_difference(&found, &expected),
         })
     }
+
+    /// Takes a store the previous build wrote, at schema version 6, to this build's schema, once.
+    ///
+    /// This build's schema is version 6's with the upload table and its rules added and nothing
+    /// else changed, so a version-6 store gains exactly those, in one transaction with the new
+    /// version. What it then holds is compared with this build's schema inside that transaction, so
+    /// a version-6 store holding anything this build does not define is refused as any other store
+    /// is, and is left as it was found. What it recorded is kept: the upload table starts empty,
+    /// which is what a store that could not record an upload holds.
+    ///
+    /// Remove this step with [`VERSION_WITHOUT_UPLOADS`].
+    fn migrate_from_version_6(&mut self) -> Result<()> {
+        let expected = definition_this_build_writes()?;
+        let transaction = self
+            .connection
+            .writing()
+            .map_err(ControllerError::registry)?;
+        transaction
+            .run_script(UPLOADS)
+            .map_err(ControllerError::registry)?;
+        transaction
+            .run(
+                sql!("UPDATE schema_version SET version = ?1"),
+                params![SCHEMA_VERSION],
+            )
+            .map_err(ControllerError::registry)?;
+        let found = read_definition(&transaction)?;
+        if found != expected {
+            // Dropping the transaction rolls it back, so the store stays at version 6.
+            return Err(ControllerError::RegistryUnavailable {
+                detail: first_difference(&found, &expected),
+            });
+        }
+        transaction.commit().map_err(ControllerError::registry)
+    }
 }
 
+/// The schema this build writes, as a database made from nothing holds it.
+fn definition_this_build_writes() -> Result<Vec<(String, String)>> {
+    let fresh = Database::in_memory().map_err(ControllerError::registry)?;
+    fresh
+        .run_script(DEFINITION)
+        .map_err(ControllerError::registry)?;
+    read_definition(&fresh)
+}
+
+/// The upload in progress of each object: the identity the storage service gave it, and how many
+/// of its parts the service has acknowledged.
+///
+/// The service names an upload only in the answer that created it, so this is the one place a
+/// transfer that stopped can find it again and go on at the next part. It holds identities and a
+/// count, as the rest of the store does, and no key, content or filename. Its rules: an object has
+/// one upload recorded at a time, an object a service holds takes none, an upload keeps its object
+/// and its identity, and what the service acknowledged of it is never unsaid.
+///
+/// One text, in [`DEFINITION`] and in the step that brings a version-6 store to this schema, so the
+/// two cannot write these objects differently.
+macro_rules! uploads_definition {
+    () => {
+        "CREATE TABLE IF NOT EXISTS uploads (
+                     archive_id         BLOB NOT NULL,
+                     backup_generation  INTEGER NOT NULL,
+                     object_id          BLOB NOT NULL,
+                     upload_id          TEXT NOT NULL,
+                     parts_acknowledged INTEGER NOT NULL DEFAULT 0,
+                     PRIMARY KEY (archive_id, backup_generation, object_id),
+                     FOREIGN KEY (archive_id, backup_generation, object_id)
+                         REFERENCES objects (archive_id, backup_generation, object_id),
+                     CHECK (length(upload_id) BETWEEN 1 AND 256),
+                     CHECK (parts_acknowledged >= 0)
+                 );
+                 CREATE TRIGGER IF NOT EXISTS an_upload_is_never_replaced
+                 BEFORE INSERT ON uploads
+                 WHEN EXISTS (SELECT 1 FROM uploads
+                               WHERE archive_id = NEW.archive_id
+                                 AND backup_generation = NEW.backup_generation
+                                 AND object_id = NEW.object_id)
+                 BEGIN
+                     SELECT RAISE(ABORT, 'an object has one upload recorded at a time, and one that \
+                                          ended is forgotten first');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS an_object_a_service_holds_takes_no_upload
+                 BEFORE INSERT ON uploads
+                 WHEN EXISTS (SELECT 1 FROM objects
+                               WHERE archive_id = NEW.archive_id
+                                 AND backup_generation = NEW.backup_generation
+                                 AND object_id = NEW.object_id
+                                 AND acknowledged_bytes >= encrypted_len)
+                 BEGIN
+                     SELECT RAISE(ABORT, 'an object a service has acknowledged is not uploaded \
+                                          again');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS an_upload_keeps_what_it_is
+                 BEFORE UPDATE ON uploads
+                 WHEN NEW.archive_id <> OLD.archive_id
+                   OR NEW.backup_generation <> OLD.backup_generation
+                   OR NEW.object_id <> OLD.object_id
+                   OR NEW.upload_id <> OLD.upload_id
+                 BEGIN
+                     SELECT RAISE(ABORT, 'an upload keeps the object it is of and the identity the \
+                                          service gave it');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS an_acknowledged_part_is_never_withdrawn
+                 BEFORE UPDATE OF parts_acknowledged ON uploads
+                 WHEN NEW.parts_acknowledged < OLD.parts_acknowledged
+                 BEGIN
+                     SELECT RAISE(ABORT, 'what a service acknowledged of an upload is never \
+                                          unsaid');
+                 END;"
+    };
+}
+
+/// What a version-6 store gains on its way to this build's schema.
+const UPLOADS: Statement = sql!(uploads_definition!());
+
 /// Everything one backup store is: its tables, its indexes, and the rules it enforces.
-const DEFINITION: Statement = sql!(
+const DEFINITION: Statement = sql!(concat!(
     "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
                  CREATE TABLE IF NOT EXISTS generations (
                      archive_id         BLOB NOT NULL,
@@ -1166,12 +1304,15 @@ const DEFINITION: Statement = sql!(
                  BEGIN
                      SELECT RAISE(ABORT, 'cleanup this host already owes is never written over');
                  END;
+                 ",
+    uploads_definition!(),
+    "
                  INSERT INTO privacy_state (id, current_generation, enabled) VALUES (0, 0, 0);"
-);
+));
 
 /// Every table, index and trigger one database holds, each with the statement that made it.
-fn read_definition(connection: &Database) -> Result<Vec<(String, String)>> {
-    let mut statement = connection
+fn read_definition(reader: &impl Reads) -> Result<Vec<(String, String)>> {
+    let mut statement = reader
         .prepared(sql!(
             "SELECT type || ' ' || name, COALESCE(sql, '') FROM sqlite_master
               WHERE name NOT GLOB 'sqlite_*' ORDER BY type, name"
@@ -1419,6 +1560,17 @@ impl BackupStore {
                     object_id.get().as_bytes().as_slice(),
                     encrypted_len
                 ],
+            )
+            .map_err(ControllerError::registry)?;
+        // The object is at a service, so the upload that carried it is over: nothing more is sent
+        // under it, and an object a service holds takes no upload again.
+        transaction
+            .run(
+                sql!(
+                    "DELETE FROM uploads
+                 WHERE archive_id = ?1 AND backup_generation = ?2 AND object_id = ?3"
+                ),
+                params![archive, generation, object_id.get().as_bytes().as_slice()],
             )
             .map_err(ControllerError::registry)?;
         // The generation now has an artifact somewhere other than this host, whatever becomes of
@@ -2067,6 +2219,199 @@ impl BackupStore {
                 ],
                 read_object,
             )
+            .map_err(ControllerError::registry)?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.map_err(ControllerError::registry)??);
+        }
+        Ok(records)
+    }
+
+    /// Records the upload a service created for one object, as the upload attempt that asked for
+    /// it.
+    ///
+    /// The attempt is checked as an acknowledgement's is: an upload attempt of that generation
+    /// that left this host. Neither privacy mode nor production decides it, because it records what
+    /// a service holds rather than work this host is taking on: an upload recorded under a fence is
+    /// one this host can still abandon.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::InvalidArgument`] when the attempt is not an upload attempt of
+    /// that generation that left this host, and [`ControllerError::RegistryUnavailable`] when the
+    /// store refuses the write, which it does for an object that already has an upload recorded or
+    /// that a service already holds.
+    pub fn record_upload(
+        &mut self,
+        attempt: u64,
+        archive_id: ArchiveId,
+        backup_generation: BackupGeneration,
+        object_id: BackupObjectId,
+        upload_id: &str,
+    ) -> Result<()> {
+        let archive = archive_id.get().as_bytes().to_vec();
+        let generation = i64::try_from(backup_generation.get()).unwrap_or(i64::MAX);
+        let attempt = i64::try_from(attempt).unwrap_or(i64::MAX);
+        let transaction = self
+            .connection
+            .writing()
+            .map_err(ControllerError::registry)?;
+        let carrier: Option<String> = transaction
+            .read_one(
+                sql!(
+                    "SELECT status FROM outbox
+                  WHERE sequence = ?1 AND archive_id = ?2 AND backup_generation = ?3
+                    AND step = ?4 AND status <> 'queued'"
+                ),
+                params![attempt, archive, generation, Step::Upload.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(ControllerError::registry)?;
+        if carrier.is_none() {
+            return Err(ControllerError::InvalidArgument(
+                "that is not an upload attempt of that backup generation that left this host"
+                    .to_owned(),
+            ));
+        }
+        transaction
+            .run(
+                sql!(
+                    "INSERT INTO uploads
+                     (archive_id, backup_generation, object_id, upload_id, parts_acknowledged)
+                 VALUES (?1, ?2, ?3, ?4, 0)"
+                ),
+                params![
+                    archive,
+                    generation,
+                    object_id.get().as_bytes().as_slice(),
+                    upload_id
+                ],
+            )
+            .map_err(ControllerError::registry)?;
+        transaction.commit().map_err(ControllerError::registry)
+    }
+
+    /// Records that a service acknowledged parts one to `parts` of one object's upload.
+    ///
+    /// Only for the upload the object has recorded under `upload_id`, and only forward: a count
+    /// below the one recorded is a late answer and changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::InvalidArgument`] when the object has no upload recorded under
+    /// that identity, and [`ControllerError::RegistryUnavailable`] when the store refuses the write.
+    pub fn note_parts_acknowledged(
+        &mut self,
+        archive_id: ArchiveId,
+        backup_generation: BackupGeneration,
+        object_id: BackupObjectId,
+        upload_id: &str,
+        parts: u64,
+    ) -> Result<()> {
+        let changed = self
+            .connection
+            .run(
+                sql!(
+                    "UPDATE uploads SET parts_acknowledged = MAX(parts_acknowledged, ?5)
+                 WHERE archive_id = ?1 AND backup_generation = ?2 AND object_id = ?3
+                   AND upload_id = ?4"
+                ),
+                params![
+                    archive_id.get().as_bytes().as_slice(),
+                    i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
+                    object_id.get().as_bytes().as_slice(),
+                    upload_id,
+                    i64::try_from(parts).unwrap_or(i64::MAX),
+                ],
+            )
+            .map_err(ControllerError::registry)?;
+        if changed == 0 {
+            return Err(ControllerError::InvalidArgument(
+                "that object has no upload recorded under that identity".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Forgets one object's upload, which the service will take nothing more of.
+    ///
+    /// Only the upload `upload_id` names: one recorded since under another identity is left alone.
+    /// Returns whether it was there to forget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
+    pub fn forget_upload(
+        &mut self,
+        archive_id: ArchiveId,
+        backup_generation: BackupGeneration,
+        object_id: BackupObjectId,
+        upload_id: &str,
+    ) -> Result<bool> {
+        let forgotten = self
+            .connection
+            .run(
+                sql!(
+                    "DELETE FROM uploads
+                 WHERE archive_id = ?1 AND backup_generation = ?2 AND object_id = ?3
+                   AND upload_id = ?4"
+                ),
+                params![
+                    archive_id.get().as_bytes().as_slice(),
+                    i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
+                    object_id.get().as_bytes().as_slice(),
+                    upload_id,
+                ],
+            )
+            .map_err(ControllerError::registry)?;
+        Ok(forgotten > 0)
+    }
+
+    /// Returns one object's upload in progress, if it has one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
+    pub fn upload(
+        &self,
+        archive_id: ArchiveId,
+        backup_generation: BackupGeneration,
+        object_id: BackupObjectId,
+    ) -> Result<Option<UploadRecord>> {
+        self.connection
+            .read_one(
+                sql!(
+                    "SELECT archive_id, backup_generation, object_id, upload_id, parts_acknowledged
+                 FROM uploads WHERE archive_id = ?1 AND backup_generation = ?2 AND object_id = ?3"
+                ),
+                params![
+                    archive_id.get().as_bytes().as_slice(),
+                    i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
+                    object_id.get().as_bytes().as_slice(),
+                ],
+                read_upload,
+            )
+            .optional()
+            .map_err(ControllerError::registry)?
+            .transpose()
+    }
+
+    /// Returns every upload in progress, by generation and object.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
+    pub fn uploads(&self) -> Result<Vec<UploadRecord>> {
+        let mut statement = self
+            .connection
+            .prepared(sql!(
+                "SELECT archive_id, backup_generation, object_id, upload_id, parts_acknowledged
+                 FROM uploads ORDER BY archive_id, backup_generation, object_id"
+            ))
+            .map_err(ControllerError::registry)?;
+        let rows = statement
+            .query_map([], read_upload)
             .map_err(ControllerError::registry)?;
         let mut records = Vec::new();
         for row in rows {
@@ -3550,6 +3895,7 @@ fn try_finish_generation(
             .map_err(ControllerError::registry)?;
         for statement in [
             sql!("DELETE FROM outbox WHERE archive_id = ?1 AND backup_generation = ?2"),
+            sql!("DELETE FROM uploads WHERE archive_id = ?1 AND backup_generation = ?2"),
             sql!("DELETE FROM objects WHERE archive_id = ?1 AND backup_generation = ?2"),
         ] {
             transaction
@@ -3859,6 +4205,23 @@ fn read_object(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<ObjectRecord>
             staged_path: PathBuf::from(path),
             local_state: LocalState::parse(&local_state)?,
             acknowledged_bytes: u64::try_from(acknowledged).unwrap_or(0),
+        })
+    })())
+}
+
+fn read_upload(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<UploadRecord>> {
+    let archive: Vec<u8> = row.get(0)?;
+    let generation: i64 = row.get(1)?;
+    let object: Vec<u8> = row.get(2)?;
+    let upload_id: String = row.get(3)?;
+    let parts: i64 = row.get(4)?;
+    Ok((|| {
+        Ok(UploadRecord {
+            archive_id: ArchiveId::new(uuid(&archive, "an archive identifier")?),
+            backup_generation: BackupGeneration::new(u64::try_from(generation).unwrap_or(0)),
+            object_id: BackupObjectId::new(uuid(&object, "an object identifier")?),
+            upload_id,
+            parts_acknowledged: u64::try_from(parts).unwrap_or(0),
         })
     })())
 }

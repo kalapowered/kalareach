@@ -7,9 +7,10 @@
 
 use kr_controller::backup::store::{
     AttemptOutcome, AttemptStatus, BackupStore, FenceRelease, LocalState, ObligationKind,
-    Production, Publication, Remote, Step,
+    Production, Publication, Remote, SCHEMA_VERSION, Step, UploadRecord,
 };
 use kr_controller::backup::{BackupService, RestoreRequest, SUBSYSTEM_NAME};
+use kr_controller::error::ControllerError;
 use kr_crypto::backup::{
     ArchivePlan, ArchiveRecipients, CheckpointSource, CollectionKind, GenerationExpectation,
     KeyRotation, Material, ObjectSource, SealedArchive, StagedObject, seal_archive, stage_object,
@@ -5157,4 +5158,327 @@ fn hold_without_shared_writing(directory: &std::path::Path) -> std::fs::File {
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(directory)
         .expect("the directory is held")
+}
+
+// ---------------------------------------------------------------------------------------------
+// Uploads in progress: what lets an upload go on at its next part after a restart.
+// ---------------------------------------------------------------------------------------------
+
+/// A state directory on the internal disk, which goes with the test.
+fn state_directory() -> (tempfile::TempDir, std::path::PathBuf) {
+    let root = tempfile::tempdir().expect("a disposable directory on the internal disk");
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).expect("the state directory");
+    (root, state)
+}
+
+/// A store on the internal disk holding one generation whose upload attempt has left this host.
+///
+/// Returns the member that is uploading and that attempt's sequence. The service that wrote it is
+/// gone, so a test reads and writes the store itself.
+fn a_store_with_an_upload_in_flight(state: &std::path::Path) -> (BackupObjectId, u64) {
+    let producer = Producer::generate();
+    let objects = [stage(1, "a.cbor", b"one")];
+    let sealed = producer.seal(1, &objects);
+    let service = BackupService::open(state).expect("a backup service");
+    service
+        .reconcile(TimestampMs::new(4_000))
+        .expect("the startup reconciliation a service opens unready without");
+    service
+        .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+        .expect("the writer is enrolled");
+    let admitted = service
+        .admit(
+            &sealed,
+            &objects,
+            producer.writer.key_id(),
+            TimestampMs::new(5_000),
+        )
+        .expect("the generation is admitted");
+    service
+        .note_dispatched(admitted.sequence, EXECUTOR, TimestampMs::new(5_100))
+        .expect("the upload is in flight");
+    (objects[0].object_id(), admitted.sequence)
+}
+
+#[test]
+fn an_upload_in_progress_is_kept_across_a_restart_until_its_object_is_held() {
+    let (_root, state) = state_directory();
+    let (member, upload) = a_store_with_an_upload_in_flight(&state);
+    let first = BackupGeneration::new(1);
+    {
+        let mut store = BackupStore::open(&state).expect("the backup store");
+        store
+            .record_upload(upload, archive_id(), first, member, "upload-one")
+            .expect("the upload the service created is recorded");
+        store
+            .note_parts_acknowledged(archive_id(), first, member, "upload-one", 2)
+            .expect("two parts are acknowledged");
+        // A late answer names fewer parts than are already written down, and changes nothing.
+        store
+            .note_parts_acknowledged(archive_id(), first, member, "upload-one", 1)
+            .expect("a late answer is taken and changes nothing");
+        // An answer about an upload this host did not record is not about this one.
+        let other = store.note_parts_acknowledged(archive_id(), first, member, "upload-two", 3);
+        assert!(
+            matches!(other, Err(ControllerError::InvalidArgument(_))),
+            "{other:?}"
+        );
+        // One upload of an object at a time.
+        let second = store.record_upload(upload, archive_id(), first, member, "upload-two");
+        assert!(second.is_err(), "{second:?}");
+        // And only an upload attempt of that generation that left this host records one.
+        let elsewhere = store.record_upload(
+            upload,
+            archive_id(),
+            BackupGeneration::new(2),
+            member,
+            "upload-three",
+        );
+        assert!(
+            matches!(elsewhere, Err(ControllerError::InvalidArgument(_))),
+            "{elsewhere:?}"
+        );
+    }
+
+    // A restart finds it where it was.
+    let mut store = BackupStore::open(&state).expect("the store opens again");
+    let kept = UploadRecord {
+        archive_id: archive_id(),
+        backup_generation: first,
+        object_id: member,
+        upload_id: "upload-one".to_owned(),
+        parts_acknowledged: 2,
+    };
+    assert_eq!(
+        store.upload(archive_id(), first, member).expect("a read"),
+        Some(kept.clone())
+    );
+    assert_eq!(store.uploads().expect("a read"), vec![kept]);
+
+    // Forgetting names the upload: another identity forgets nothing.
+    assert!(
+        !store
+            .forget_upload(archive_id(), first, member, "upload-two")
+            .expect("a write")
+    );
+    assert!(
+        store
+            .upload(archive_id(), first, member)
+            .expect("a read")
+            .is_some()
+    );
+
+    // The object arriving ends its upload in the same write, and an object a service holds takes
+    // no upload again.
+    store
+        .note_object_uploaded(upload, archive_id(), first, member, TimestampMs::new(6_000))
+        .expect("the member is acknowledged");
+    assert_eq!(
+        store.upload(archive_id(), first, member).expect("a read"),
+        None
+    );
+    let again = store.record_upload(upload, archive_id(), first, member, "upload-four");
+    assert!(again.is_err(), "{again:?}");
+}
+
+#[test]
+fn direct_sql_cannot_replace_an_upload_or_unsay_what_the_service_acknowledged() {
+    let (_root, state) = state_directory();
+    let (member, upload) = a_store_with_an_upload_in_flight(&state);
+    {
+        let mut store = BackupStore::open(&state).expect("the backup store");
+        store
+            .record_upload(
+                upload,
+                archive_id(),
+                BackupGeneration::new(1),
+                member,
+                "upload-one",
+            )
+            .expect("the upload is recorded");
+        store
+            .note_parts_acknowledged(
+                archive_id(),
+                BackupGeneration::new(1),
+                member,
+                "upload-one",
+                2,
+            )
+            .expect("two parts are acknowledged");
+    }
+
+    // These rules live in the database. An upload keeps its object and the identity the service
+    // gave it, what the service acknowledged of it is never unsaid, a second upload of the same
+    // object is written neither beside it nor over it, and an upload is of an object this host
+    // staged.
+    let connection =
+        rusqlite::Connection::open(state.join("backup.sqlite")).expect("the backup store");
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .expect("foreign keys, as the store opens its own connection");
+    for statement in [
+        "UPDATE uploads SET parts_acknowledged = 1",
+        "UPDATE uploads SET upload_id = 'upload-two'",
+        "UPDATE uploads SET backup_generation = 2",
+        "UPDATE uploads SET object_id = X'000102030405060708090a0b0c0d0e0f'",
+        "INSERT INTO uploads
+             (archive_id, backup_generation, object_id, upload_id, parts_acknowledged)
+         SELECT archive_id, backup_generation, object_id, 'upload-two', 0 FROM uploads",
+        "INSERT OR REPLACE INTO uploads
+             (archive_id, backup_generation, object_id, upload_id, parts_acknowledged)
+         SELECT archive_id, backup_generation, object_id, 'upload-two', 0 FROM uploads",
+        "INSERT INTO uploads
+             (archive_id, backup_generation, object_id, upload_id, parts_acknowledged)
+         SELECT archive_id, backup_generation, X'000102030405060708090a0b0c0d0e0f',
+                'upload-three', 0
+           FROM uploads",
+    ] {
+        let refused = connection.execute(statement, []);
+        assert!(refused.is_err(), "{statement} was permitted: {refused:?}");
+    }
+    let member_bytes = member.get().as_bytes().to_vec();
+    // An identity is text the service gave, never an empty one.
+    let blank = connection.execute(
+        "INSERT INTO uploads
+             (archive_id, backup_generation, object_id, upload_id, parts_acknowledged)
+         SELECT archive_id, backup_generation, object_id, '', 0 FROM objects
+          WHERE object_id <> ?1",
+        rusqlite::params![member_bytes],
+    );
+    assert!(blank.is_err(), "an upload without an identity: {blank:?}");
+
+    // An object a service holds takes no upload.
+    connection
+        .execute("DELETE FROM uploads", [])
+        .expect("forgetting an upload is how one ends");
+    connection
+        .execute(
+            "UPDATE objects SET acknowledged_bytes = encrypted_len WHERE object_id = ?1",
+            rusqlite::params![member_bytes],
+        )
+        .expect("the member is held");
+    let held = connection.execute(
+        "INSERT INTO uploads
+             (archive_id, backup_generation, object_id, upload_id, parts_acknowledged)
+         SELECT archive_id, backup_generation, object_id, 'upload-five', 0 FROM objects
+          WHERE object_id = ?1",
+        rusqlite::params![member_bytes],
+    );
+    assert!(
+        held.is_err(),
+        "an upload of an object a service holds: {held:?}"
+    );
+}
+
+/// How many objects of the upload table a database holds: the table and its rules.
+fn upload_objects(connection: &rusqlite::Connection) -> i64 {
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+              WHERE tbl_name = 'uploads' AND name NOT GLOB 'sqlite_*'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("the schema")
+}
+
+fn schema_version(connection: &rusqlite::Connection) -> i64 {
+    connection
+        .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+        .expect("the version")
+}
+
+/// Writes a store back to the schema the previous build wrote: this build's schema without the
+/// upload table and its rules, at version 6.
+fn as_version_6(state: &std::path::Path) {
+    let connection =
+        rusqlite::Connection::open(state.join("backup.sqlite")).expect("the backup store");
+    connection
+        .execute_batch(
+            "DROP TRIGGER an_upload_is_never_replaced;
+             DROP TRIGGER an_object_a_service_holds_takes_no_upload;
+             DROP TRIGGER an_upload_keeps_what_it_is;
+             DROP TRIGGER an_acknowledged_part_is_never_withdrawn;
+             DROP TABLE uploads;
+             UPDATE schema_version SET version = 6;",
+        )
+        .expect("the store is written back to version 6");
+    assert_eq!(upload_objects(&connection), 0);
+    assert_eq!(schema_version(&connection), 6);
+}
+
+/// A store the previous build wrote is brought to this build's schema once, by the step that adds
+/// the upload table, and keeps everything it had recorded.
+#[test]
+fn a_version_6_store_is_brought_to_this_builds_schema_once_and_keeps_what_it_recorded() {
+    let (_root, state) = state_directory();
+    let (member, upload) = a_store_with_an_upload_in_flight(&state);
+    let first = BackupGeneration::new(1);
+    let (generations, attempts, objects) = {
+        let store = BackupStore::open(&state).expect("the backup store");
+        (
+            store.generations().expect("a read"),
+            store.attempts().expect("a read"),
+            store.objects(archive_id(), first).expect("a read"),
+        )
+    };
+    as_version_6(&state);
+
+    let mut store = BackupStore::open(&state).expect("a version-6 store opens, brought forward");
+    assert_eq!(store.generations().expect("a read"), generations);
+    assert_eq!(store.attempts().expect("a read"), attempts);
+    assert_eq!(store.objects(archive_id(), first).expect("a read"), objects);
+    assert!(store.uploads().expect("a read").is_empty());
+    store
+        .record_upload(upload, archive_id(), first, member, "upload-one")
+        .expect("the upload table takes an upload");
+    drop(store);
+
+    let connection =
+        rusqlite::Connection::open(state.join("backup.sqlite")).expect("the backup store");
+    assert_eq!(schema_version(&connection), SCHEMA_VERSION);
+    assert_eq!(
+        upload_objects(&connection),
+        5,
+        "the table and its four rules"
+    );
+    drop(connection);
+
+    // Once: the next open finds this build's store and takes it as it is.
+    let store = BackupStore::open(&state).expect("the store opens again");
+    assert_eq!(store.uploads().expect("a read").len(), 1);
+}
+
+/// A store at version 6 that holds something this build does not define is refused as any other
+/// store is, and the step that would have brought it forward leaves it exactly as it was.
+#[test]
+fn a_version_6_store_holding_a_rule_this_build_never_wrote_is_refused_and_left_at_version_6() {
+    let (_root, state) = state_directory();
+    a_store_with_an_upload_in_flight(&state);
+    as_version_6(&state);
+    let connection =
+        rusqlite::Connection::open(state.join("backup.sqlite")).expect("the backup store");
+    connection
+        .execute_batch(
+            "CREATE TRIGGER sqliteXforget AFTER INSERT ON writers
+             BEGIN
+                 DELETE FROM outbox WHERE status = 'terminal';
+             END;",
+        )
+        .expect("the added rule is written");
+    drop(connection);
+
+    let message = match BackupStore::open(&state) {
+        Ok(_) => panic!("a version-6 store holding a rule this build never wrote was opened"),
+        Err(refusal) => refusal.to_string(),
+    };
+    assert!(
+        message.contains("sqliteXforget"),
+        "the refusal says what this build does not define: {message}"
+    );
+    let connection =
+        rusqlite::Connection::open(state.join("backup.sqlite")).expect("the backup store");
+    assert_eq!(schema_version(&connection), 6);
+    assert_eq!(upload_objects(&connection), 0);
 }
