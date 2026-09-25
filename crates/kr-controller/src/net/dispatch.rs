@@ -3374,6 +3374,30 @@ mod write_boundary {
     use super::{Authorisation, FrameSink, RelayGrant, Relaying, RemoteOutput, Written};
     use crate::service::Controller;
 
+    /// How long a test waits for a write to start waiting before it fails. A write that returns
+    /// without waiting would otherwise hold the test, and the job running it, for ever.
+    const WAIT_BOUND: Duration = Duration::from_secs(30);
+
+    /// Clocks this test moves by hand: a continuous clock, and a wall clock that reads what the
+    /// test last set, from the machine's reading now. A bound on either passes only when the test
+    /// moves it, however long the runner takes between two steps.
+    fn manual_clocks() -> (
+        kr_transport::clock::ManualClock,
+        Arc<std::sync::atomic::AtomicU64>,
+        crate::service::Clocks,
+    ) {
+        let continuous = kr_transport::clock::ManualClock::new();
+        let wall = Arc::new(std::sync::atomic::AtomicU64::new(kr_ipc::now_ms().get()));
+        let clocks = crate::service::Clocks {
+            continuous: Arc::new(continuous.clone()),
+            wall: {
+                let wall = Arc::clone(&wall);
+                crate::service::WallClock::from_fn(move || wall.load(Ordering::SeqCst))
+            },
+        };
+        (continuous, wall, clocks)
+    }
+
     /// How far one frame got at the peer.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Reached {
@@ -3410,11 +3434,14 @@ mod write_boundary {
             })
         }
 
-        /// Returns once writes have started to wait `times` times.
+        /// Returns once writes have started to wait `times` times, and fails the test when they
+        /// have not within [`WAIT_BOUND`].
         async fn waited(&self, times: u32) {
-            self.waits
-                .acquire_many(times)
+            tokio::time::timeout(WAIT_BOUND, self.waits.acquire_many(times))
                 .await
+                .unwrap_or_else(|_| {
+                    panic!("the write did not start to wait {times} times within {WAIT_BOUND:?}")
+                })
                 .expect("the count stays open")
                 .forget();
         }
@@ -3650,11 +3677,13 @@ mod write_boundary {
         }
     }
 
-    /// A decision bounded in time stops holding when its bound passes while the batch waits.
+    /// A decision bounded in time stops holding when its bound passes while the batch waits. On
+    /// clocks the test moves by hand, so the bound passes only once the batch is waiting.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_batch_held_past_its_decisions_bound_is_not_written() {
         let temp = kr_ipc::testing::TempHost::create();
-        let controller = super::super::tests::daemon(&temp).await;
+        let (continuous, _wall, clocks) = manual_clocks();
+        let controller = super::super::tests::daemon_on(&temp, clocks).await;
         let stream = HeldStream::new(false);
         let output = output(&controller, &stream);
         let frame = batch();
@@ -3673,7 +3702,7 @@ mod write_boundary {
         };
         let (written, ()) = tokio::join!(output.write(&frame, Some(relaying)), async {
             stream.waited(1).await;
-            tokio::time::sleep(Duration::from_millis(60)).await;
+            continuous.advance(Duration::from_millis(60));
             stream.writer.add_permits(1);
         });
         assert_eq!(written, Written::Undecided);
@@ -3887,11 +3916,12 @@ mod write_boundary {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_moment_the_boundary_reads_holds_for_every_later_decision() {
         let temp = kr_ipc::testing::TempHost::create();
-        let controller = super::super::tests::daemon(&temp).await;
+        let (_continuous, wall, clocks) = manual_clocks();
+        let controller = super::super::tests::daemon_on(&temp, clocks).await;
         let stream = HeldStream::new(false);
         let output = output(&controller, &stream);
         let frame = batch();
-        let lapses_at_ms = kr_ipc::now_ms().get() + 200;
+        let lapses_at_ms = wall.load(Ordering::SeqCst) + 200;
         let (expiring, expiring_record) = super::super::tests::granted(
             kr_protocol::grant::GrantExpiry::At {
                 expires_at_ms: kr_protocol::scalars::TimestampMs::new(lapses_at_ms),
@@ -3910,7 +3940,8 @@ mod write_boundary {
         };
         let (written, ()) = tokio::join!(output.write(&frame, Some(relaying)), async {
             stream.waited(1).await;
-            tokio::time::sleep(Duration::from_millis(400)).await;
+            // Nothing but the boundary reads the wall clock from here.
+            wall.store(lapses_at_ms + 200, Ordering::SeqCst);
             stream.writer.add_permits(1);
         });
         assert_eq!(written, Written::Undecided);
@@ -3952,11 +3983,12 @@ mod write_boundary {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_bound_the_boundary_finds_run_out_is_written_down_outside_the_poll() {
         let temp = kr_ipc::testing::TempHost::create();
-        let controller = super::super::tests::daemon(&temp).await;
+        let (continuous, wall, clocks) = manual_clocks();
+        let controller = super::super::tests::daemon_on(&temp, clocks).await;
         let stream = HeldStream::new(false);
         let output = output(&controller, &stream);
         let frame = batch();
-        let synchronised = kr_ipc::now_ms().get();
+        let synchronised = wall.load(Ordering::SeqCst);
         controller
             .update_policy(|policy| {
                 policy.set_offline_validity(Some(kr_protocol::sharing::OfflineValidityPolicy {
@@ -3999,7 +4031,7 @@ mod write_boundary {
         };
         let (written, ()) = tokio::join!(output.write(&frame, Some(relaying)), async {
             stream.waited(1).await;
-            tokio::time::sleep(Duration::from_millis(400)).await;
+            continuous.advance(Duration::from_millis(400));
             stream.writer.add_permits(1);
         });
         assert_eq!(written, Written::Undecided);

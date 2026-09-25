@@ -1803,7 +1803,7 @@ pub(super) mod tests {
     }
 
     /// Starts a daemon as [`daemon`] does, on clocks this test moves by hand.
-    async fn daemon_on(
+    pub(super) async fn daemon_on(
         temp: &kr_ipc::testing::TempHost,
         clocks: crate::service::Clocks,
     ) -> Arc<Controller> {
