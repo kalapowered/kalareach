@@ -396,8 +396,9 @@ that went back or forked.
   a refusal that names no place. In a new history, to a call that left in the current one, the
   collection was put back without the object: the new history becomes current and the note goes,
   so the next publication compares against nothing, and a draft publication attempted in the
-  replaced history is never attempted again. In the current history nothing moves. Either way the
-  caller is told the object is not held (`UNKNOWN_SESSION`). From a history the collection was put
+  replaced history is never attempted again. In the current history the history stays where it
+  is, and only a note still naming a place in a history the collection was put back from goes.
+  Either way the caller is told the object is not held (`UNKNOWN_SESSION`). From a history the collection was put
   back from, or from a new one answering a call that left before this device moved on, nothing
   moves and the caller is told `SyncError::UnfollowedHistory`. An answer that arrives after
   privacy mode moved past its generation writes nothing, the history included. The recovery bundle
