@@ -928,8 +928,8 @@ pub enum QuestionCommand {
     Answer(QuestionAnswerArguments),
     /// Withdraw one question without answering it.
     Cancel(QuestionShowArguments),
-    /// Show the answers kept on this device that did not reach their session, and say of each
-    /// whether it can still be sent. Nothing is sent.
+    /// Show the answers kept on this device, and say of each whether it can still be sent. Nothing
+    /// is sent.
     Drafts,
     /// Send one kept answer. Nothing else sends a kept answer.
     Send(QuestionShowArguments),

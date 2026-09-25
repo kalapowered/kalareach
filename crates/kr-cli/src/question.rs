@@ -122,8 +122,9 @@ pub async fn show(
 /// # Errors
 ///
 /// Returns [`CliError::AnswerKept`] when the answer was kept rather than sent, [`CliError::Usage`]
-/// for an answer that does not fit the question's form, and [`CliError::Refused`] when the question
-/// has already been resolved, has expired, or has moved to a revision this command did not read.
+/// for an answer that does not fit the question's form, [`CliError::Refused`] when the question
+/// has already been resolved, has expired, or has moved to a revision this command did not read,
+/// and [`CliError::Unfinished`] when the worker took the answer and its reply cannot be read.
 pub async fn answer(
     paths: &HostPaths,
     question_id: QuestionId,
@@ -145,7 +146,22 @@ pub async fn answer(
     match answered {
         Ok(Answered::Sent(question)) => Ok(*question),
         Ok(Answered::Kept(draft)) => Err(kept(&workers, draft.question_id, "was kept")),
-        Err(error) => Err(answer_failure(error)),
+        // What the failure says of the answer is what the attempt established, not what the
+        // failure's kind suggests.
+        Err(error) => Err(match workers.delivery() {
+            Delivery::Taken => {
+                let still_kept = kept_draft(&drafts, question_id)?.is_some();
+                taken(
+                    &workers,
+                    descriptor.session_id,
+                    question_id,
+                    error,
+                    still_kept,
+                )
+            }
+            Delivery::Unknown => unkept(&workers, question_id, error),
+            Delivery::NotSent | Delivery::NotTaken => answer_failure(error),
+        }),
     }
 }
 
@@ -189,8 +205,8 @@ fn unreconciled(workers: &Workers, error: AnswerError) -> CliError {
 /// # Errors
 ///
 /// Returns [`CliError::Usage`] when no answer to the question is kept, [`CliError::AnswerKept`]
-/// when the worker could not take it and it stays kept, and [`CliError::Refused`] when the question
-/// ended or moved.
+/// when the worker could not take it and it stays kept, [`CliError::Refused`] when the question
+/// ended or moved, and [`CliError::Unfinished`] when the worker took it and what came after failed.
 pub async fn send(
     paths: &HostPaths,
     question_id: QuestionId,
@@ -211,26 +227,26 @@ pub async fn send(
         Err(error) => {
             let still_kept = !matches!(error, AnswerError::Retired(_))
                 && kept_draft(&drafts, question_id)?.is_some();
-            if still_kept {
-                Err(still_kept_failure(&workers, question_id, error))
+            Err(if workers.delivery() == Delivery::Taken {
+                taken(&workers, draft.session_id, question_id, error, still_kept)
+            } else if still_kept {
+                still_kept_failure(&workers, question_id, error)
             } else {
-                Err(answer_failure(error))
-            }
+                answer_failure(error)
+            })
         }
     }
 }
 
 /// The failure a kept answer `kr question send` could not send is reported as.
 ///
-/// The failure keeps its own code. What it says about the answer is what sending it established:
-/// a refusal of the read that comes first, or a worker that could not be reached, sent nothing;
-/// an answer the connection lost on the way, or whose reply could not be read, may have arrived.
+/// The failure keeps its own code. What it says about the answer is what sending it established,
+/// as the worker connection recorded it step by step: nothing written, refused by the worker, or
+/// written with nothing to say whether the worker took it.
 fn still_kept_failure(workers: &Workers, question_id: QuestionId, error: AnswerError) -> CliError {
     let retention = format!("the answer to question {question_id} is still kept on this device");
+    let delivery = workers.delivery();
     let failure = workers.failure();
-    let delivery = failure
-        .as_ref()
-        .map_or(Delivery::NotSent, |failure| failure.delivery);
     match error {
         AnswerError::Host(
             ClientError::Host(refusal) | ClientError::Refused { error: refusal, .. },
@@ -271,14 +287,60 @@ fn kept_draft(drafts: &AnswerDrafts, question_id: QuestionId) -> Result<Option<A
 fn kept(workers: &Workers, question_id: QuestionId, which: &str) -> CliError {
     let failure = workers.failure().unwrap_or_else(|| Failure {
         code: ErrorCode::ResourceUnavailable,
-        delivery: Delivery::NotSent,
         why: "its session's worker could not take it".to_owned(),
     });
     let retention = format!("the answer to question {question_id} {which} on this device");
     CliError::AnswerKept {
         code: failure.code,
-        message: kept_message(question_id, failure.delivery, &failure.why, &retention),
+        message: kept_message(question_id, workers.delivery(), &failure.why, &retention),
     }
+}
+
+/// The failure reported when a worker took the answer and what came after failed: its reply could
+/// not be read, or the copy kept on this device could not be removed.
+///
+/// The answer is never called unsent, and it is not offered for sending again: the next
+/// `kr question drafts` finds its question answered and retires any copy still kept.
+fn taken(
+    workers: &Workers,
+    session_id: SessionId,
+    question_id: QuestionId,
+    error: AnswerError,
+    still_kept: bool,
+) -> CliError {
+    let after = workers
+        .failure()
+        .map_or_else(|| error.to_string(), |failure| failure.why);
+    let copy = if still_kept {
+        format!(
+            "an answer to question {question_id} is still kept on this device, and \
+             `kr question drafts` retires it once its question reads as answered"
+        )
+    } else {
+        "nothing is kept for it".to_owned()
+    };
+    CliError::Unfinished {
+        code: error.code(),
+        message: format!(
+            "session {session_id}'s worker took the answer to question {question_id}, but \
+             {after}; {copy}"
+        ),
+    }
+}
+
+/// The failure reported for an answer that went out, whose fate is not known, and that the rules
+/// do not keep: a reply that is not a message is its worker's own answer, not a lost connection.
+fn unkept(workers: &Workers, question_id: QuestionId, error: AnswerError) -> CliError {
+    let why = workers
+        .failure()
+        .map_or_else(|| error.to_string(), |failure| failure.why);
+    CliError::Refused(ProtocolError::new(
+        error.code(),
+        format!(
+            "{why}. The answer was not kept: `kr question show {question_id}` says whether its \
+             question was answered"
+        ),
+    ))
 }
 
 /// Says what became of a kept answer, claiming no more about its delivery than was established.
@@ -286,44 +348,55 @@ fn kept(workers: &Workers, question_id: QuestionId, which: &str) -> CliError {
 /// An answer that may have reached its worker is never said to be unsent; the next
 /// `kr question drafts` retires it when it did arrive.
 fn kept_message(question_id: QuestionId, delivery: Delivery, why: &str, retention: &str) -> String {
-    match delivery {
+    let next = match delivery {
+        Delivery::NotSent | Delivery::NotTaken => format!(
+            "`kr question drafts` says whether it can still be sent, and \
+             `kr question send {question_id}` sends it"
+        ),
         Delivery::Unknown => format!(
-            "{}: {why}. `kr question drafts` retires it if it arrived, and \
-             `kr question send {question_id}` sends it if it did not",
-            retained(delivery, retention)
+            "`kr question drafts` retires it if it arrived, and \
+             `kr question send {question_id}` sends it if it did not"
         ),
-        Delivery::NotSent => format!(
-            "{}: {why}. `kr question drafts` says whether it can still be sent, and \
-             `kr question send {question_id}` sends it",
-            retained(delivery, retention)
-        ),
-    }
+        Delivery::Taken => {
+            "`kr question drafts` retires it once its question reads as answered".to_owned()
+        }
+    };
+    format!("{}: {why}. {next}", retained(delivery, retention))
 }
 
-/// That an answer is kept, and what is known of its delivery.
+/// That an answer is kept, and what this command established about its delivery.
 fn retained(delivery: Delivery, retention: &str) -> String {
     match delivery {
-        Delivery::NotSent => format!("{retention} and was not sent"),
+        Delivery::NotSent => format!("{retention}, and this command did not send it"),
+        Delivery::NotTaken => format!("{retention}, and its session's worker did not take it"),
         Delivery::Unknown => {
             format!("{retention}, and whether its session's worker took it is not known")
         }
+        Delivery::Taken => format!("{retention}, and its session's worker took it"),
     }
 }
 
-/// What trying to send an answer established about whether it reached the worker.
+/// What this command's attempt to send an answer established about whether its worker took it.
+///
+/// It is recorded as the attempt goes, independently of how the attempt failed, so a failure after
+/// the answer went out is never read as an answer that did not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Delivery {
-    /// Nothing reached the worker.
+    /// Nothing was written to the worker.
     NotSent,
-    /// The worker may have taken it, and nothing says whether it did.
+    /// The worker answered that it did not take it.
+    NotTaken,
+    /// It was written, and nothing says whether the worker took it.
     Unknown,
+    /// The worker answered that it took it.
+    Taken,
 }
 
-/// Why the last answer was not taken, as the connection to its worker established it.
+/// Why the last answer was not taken, or what failed after it was, as the connection to its
+/// worker recorded it.
 #[derive(Clone, Debug)]
 struct Failure {
     code: ErrorCode,
-    delivery: Delivery,
     why: String,
 }
 
@@ -437,6 +510,9 @@ pub struct Workers {
     build_id: BuildId,
     connections: tokio::sync::Mutex<BTreeMap<SessionId, LocalClient>>,
     failure: std::sync::Mutex<Option<Failure>>,
+    /// What the attempt to send the answer has established so far. Nothing is written before the
+    /// attempt, so it starts as not sent.
+    delivery: std::sync::Mutex<Delivery>,
     /// The environment each session ran in: where its descriptor is published, and whose daemon
     /// says whether it ended.
     environments: BTreeMap<SessionId, EnvironmentId>,
@@ -451,6 +527,7 @@ impl Workers {
             build_id,
             connections: tokio::sync::Mutex::new(BTreeMap::new()),
             failure: std::sync::Mutex::new(None),
+            delivery: std::sync::Mutex::new(Delivery::NotSent),
             environments: BTreeMap::new(),
         }
     }
@@ -477,7 +554,7 @@ impl Workers {
         self
     }
 
-    /// Why the last answer was not taken, and what trying to send it established.
+    /// Why the last answer was not taken, or what failed after it was.
     fn failure(&self) -> Option<Failure> {
         self.failure
             .lock()
@@ -485,15 +562,26 @@ impl Workers {
             .clone()
     }
 
-    fn failed(&self, code: ErrorCode, delivery: Delivery, why: String) {
+    fn failed(&self, code: ErrorCode, why: String) {
         *self
             .failure
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Failure {
-            code,
-            delivery,
-            why,
-        });
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Failure { code, why });
+    }
+
+    /// What the attempt to send the answer established about whether its worker took it.
+    fn delivery(&self) -> Delivery {
+        *self
+            .delivery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn delivered(&self, delivery: Delivery) {
+        *self
+            .delivery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = delivery;
     }
 
     /// The connection to the worker of `session_id`, opened and proved when there is none yet.
@@ -537,7 +625,6 @@ impl Workers {
                 Err(why) => {
                     self.failed(
                         ErrorCode::ResourceUnavailable,
-                        Delivery::NotSent,
                         format!(
                             "session {session_id}'s worker could not be reached ({error}), and \
                              {why}"
@@ -684,6 +771,8 @@ impl QuestionHost for Workers {
         params: QuestionAnswerParams,
     ) -> std::result::Result<Question, ClientError> {
         let session_id = params.session_id;
+        // Nothing is written until the mutation goes out, whatever an earlier attempt recorded.
+        self.delivered(Delivery::NotSent);
         let mut connections = self.connections.lock().await;
         let client = self.connection(&mut connections, session_id).await?;
         let action_id = ActionId::new(kr_ipc::new_uuid());
@@ -698,7 +787,6 @@ impl QuestionHost for Workers {
                 connections.remove(&session_id);
                 self.failed(
                     failure.code(),
-                    Delivery::NotSent,
                     format!(
                         "the connection to session {session_id}'s worker failed before the answer \
                          was sent ({failure})"
@@ -707,10 +795,19 @@ impl QuestionHost for Workers {
                 return Err(ClientError::Ipc(failure));
             }
         };
+        // From here the answer may be on its way, and only the worker's word says more.
+        self.delivered(Delivery::Unknown);
         match client.repeat(&mutation).await {
             Ok(Ok(value)) => {
-                let resolved: QuestionResolveResult = value.to_typed()?;
-                Ok(resolved.question)
+                self.delivered(Delivery::Taken);
+                match value.to_typed::<QuestionResolveResult>() {
+                    Ok(resolved) => Ok(resolved.question),
+                    Err(unreadable) => {
+                        let error = ClientError::from(unreadable);
+                        self.failed(error.code(), format!("its reply cannot be read ({error})"));
+                        Err(error)
+                    }
+                }
             }
             // A refusal is the worker not taking the answer, unless the worker itself says it
             // cannot tell what became of it.
@@ -718,17 +815,16 @@ impl QuestionHost for Workers {
                 if refusal.code == ErrorCode::OutcomeUnknown {
                     self.failed(
                         refusal.code,
-                        Delivery::Unknown,
                         format!(
                             "session {session_id}'s worker could not say what became of it \
                              ({refusal})"
                         ),
                     );
                 } else {
+                    self.delivered(Delivery::NotTaken);
                     self.failed(
                         refusal.code,
-                        Delivery::NotSent,
-                        format!("session {session_id}'s worker did not take it ({refusal})"),
+                        format!("session {session_id}'s worker refused it ({refusal})"),
                     );
                 }
                 Err(ClientError::from(refusal))
@@ -739,7 +835,6 @@ impl QuestionHost for Workers {
                 connections.remove(&session_id);
                 self.failed(
                     ErrorCode::OutcomeUnknown,
-                    Delivery::Unknown,
                     format!(
                         "the connection to session {session_id}'s worker ended while the answer \
                          was being sent ({failure})"
@@ -753,7 +848,6 @@ impl QuestionHost for Workers {
                 connections.remove(&session_id);
                 self.failed(
                     failure.code(),
-                    Delivery::Unknown,
                     format!(
                         "session {session_id}'s worker sent a reply this command cannot read, so \
                          whether it took the answer is not known ({failure})"

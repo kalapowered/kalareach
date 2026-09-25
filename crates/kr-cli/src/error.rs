@@ -47,7 +47,8 @@ pub enum CliError {
     #[error("{0}")]
     SessionClosed(String),
     /// The host acted and did not finish what was asked, such as an apply that wrote part of a
-    /// change or one whose result it cannot establish. The command's own output carries what the
+    /// change or one whose result it cannot establish, or what followed an action failed, such as
+    /// reading the reply to an answer a worker took. The command's own output carries what the
     /// host reported.
     #[error("{message}")]
     Unfinished {
@@ -56,9 +57,9 @@ pub enum CliError {
         /// What did not finish, for a person.
         message: String,
     },
-    /// A person's answer did not reach its session's worker, or whether it did is not known, so it
-    /// is kept on this device rather than sent. `kr question drafts` shows it and `kr question send`
-    /// sends it; nothing else does.
+    /// A person's answer was not taken by its session's worker, or whether it was is not known, so
+    /// it is kept on this device. `kr question drafts` shows it and `kr question send` sends it;
+    /// nothing else does.
     #[error("{message}")]
     AnswerKept {
         /// The stable code the failure carries.

@@ -16,6 +16,7 @@
 
 #![cfg(unix)]
 
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -58,6 +59,10 @@ enum Behaviour {
     RepliesWithGarbage,
     /// Refuses an answer with `OUTCOME_UNKNOWN`: it cannot say what became of it.
     CannotSayWhatBecameOfAnswers,
+    /// Takes an answer and replies with a result that is not an answered question.
+    TakesAnswersAndRepliesUnreadably,
+    /// Takes an answer, makes the store of kept answers read-only, and replies.
+    TakesAnswersAndLocksTheStore,
 }
 
 /// Which environment the scripted session runs in.
@@ -86,6 +91,8 @@ struct State {
     behaviour: Behaviour,
     /// Every answer it was sent, whether or not it took it.
     answers_received: usize,
+    /// The directory `kr` keeps answers in.
+    store: PathBuf,
 }
 
 /// A host tree with one scripted session in it, holding one question.
@@ -104,6 +111,8 @@ struct Host {
 impl Drop for Host {
     fn drop(&mut self) {
         self.serving.abort();
+        // The tree is removed afterwards, which a read-only store would stop.
+        self.unlock_store();
     }
 }
 
@@ -163,6 +172,7 @@ impl Host {
             question,
             behaviour,
             answers_received: 0,
+            store: temp.paths().state_root().join("kept-answers"),
         }));
         let serving = tokio::spawn(serve(
             listener,
@@ -183,6 +193,15 @@ impl Host {
 
     fn behave(&self, behaviour: Behaviour) {
         self.state().behaviour = behaviour;
+    }
+
+    /// Lets `kr` write to the store of kept answers again.
+    fn unlock_store(&self) {
+        let store = self.state().store.clone();
+        if store.is_dir() {
+            std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o700))
+                .expect("the store is writable again");
+        }
     }
 
     /// Stops the worker, as a worker that ended would, and leaves its descriptor where it was.
@@ -543,6 +562,27 @@ async fn serve_one(
                             "this worker cannot say what became of the answer",
                         ))
                     }
+                    "question.answer"
+                        if behaviour == Behaviour::TakesAnswersAndRepliesUnreadably =>
+                    {
+                        take(&state, &mutation.params).and_then(|_| {
+                            ParamsValue::from_typed(&QuestionReadResult {
+                                questions: Vec::new(),
+                            })
+                            .map_err(|error| refusal(&error.to_string()))
+                        })
+                    }
+                    "question.answer" if behaviour == Behaviour::TakesAnswersAndLocksTheStore => {
+                        let taken = take(&state, &mutation.params);
+                        let store = state
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .store
+                            .clone();
+                        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o500))
+                            .expect("the store is read-only");
+                        taken
+                    }
                     "question.answer" => take(&state, &mutation.params),
                     other => Err(refusal(&format!("this worker answers no {other}"))),
                 };
@@ -661,10 +701,15 @@ async fn an_answer_the_worker_could_not_take_is_kept_and_nothing_is_sent() {
     // says only what it knows.
     let message = document["message"].as_str().expect("a message");
     match document["code"].as_str() {
-        Some("RESOURCE_UNAVAILABLE") => assert!(message.contains("was not sent"), "{message}"),
+        Some("RESOURCE_UNAVAILABLE") => {
+            assert!(
+                message.contains("this command did not send it"),
+                "{message}"
+            );
+        }
         Some("OUTCOME_UNKNOWN") => {
             assert!(message.contains("is not known"), "{message}");
-            assert!(!message.contains("was not sent"), "{message}");
+            assert!(!message.contains("did not send"), "{message}");
         }
         other => panic!("a kept answer carries {other:?}: {document}"),
     }
@@ -764,7 +809,7 @@ async fn an_answer_whose_reply_was_lost_is_kept_as_unknown_and_never_sent_twice(
     assert_eq!(document["kept"], Value::Bool(true), "{document}");
     let message = document["message"].as_str().expect("a message");
     assert!(message.contains("is not known"), "{message}");
-    assert!(!message.contains("was not sent"), "{message}");
+    assert!(!message.contains("did not send"), "{message}");
     assert!(host.kept().is_file());
     assert_eq!(host.answers_received(), 1, "the worker took it");
 
@@ -782,8 +827,6 @@ async fn an_answer_whose_reply_was_lost_is_kept_as_unknown_and_never_sent_twice(
 /// descriptor put right is offered again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_descriptor_that_cannot_be_read_retires_nothing() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let host = Host::start(Behaviour::EndsAfterTheRead).await;
     let question = host.question();
     let (status, _) = host.json(&["question", "answer", &question, "--choice", "left"]);
@@ -936,8 +979,6 @@ async fn an_unreachable_worker_retires_a_kept_answer_only_on_a_recorded_closure(
 /// it, proves the descriptor absent, and that daemon's word retires the answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_descriptor_directory_that_cannot_be_trusted_retires_nothing() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let host = kept_answer().await;
     let daemon = host.daemon(Registry::NeverHeld);
     let directory = host.environment.descriptors_dir();
@@ -975,8 +1016,6 @@ async fn a_descriptor_directory_that_cannot_be_trusted_retires_nothing() {
 /// daemon recording a closure retires nothing, and the session's own environment's daemon does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_kept_answer_is_asked_after_only_in_its_own_environment() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let host = Host::start_in(Behaviour::EndsAfterTheRead, Place::SecondEnvironment).await;
     assert_ne!(
         host.environment.environment_id(),
@@ -1042,7 +1081,7 @@ async fn an_answer_a_worker_cannot_account_for_is_kept_as_unknown() {
         assert_eq!(document["code"], "OUTCOME_UNKNOWN", "{line:?}: {document}");
         let message = document["message"].as_str().expect("a message");
         assert!(message.contains("is not known"), "{message}");
-        assert!(!message.contains("was not sent"), "{message}");
+        assert!(!message.contains("did not send"), "{message}");
         assert!(!message.contains("did not take"), "{message}");
         assert!(host.kept().is_file(), "{line:?}: the answer is kept");
     }
@@ -1063,9 +1102,82 @@ async fn a_kept_answer_whose_reply_cannot_be_read_is_still_kept_as_unknown() {
     assert_eq!(document["code"], "INVALID_ARGUMENT", "{document}");
     let message = document["message"].as_str().expect("a message");
     assert!(message.contains("is not known"), "{message}");
-    assert!(!message.contains("was not sent"), "{message}");
+    assert!(!message.contains("did not send"), "{message}");
     assert!(host.kept().is_file(), "the answer is still kept");
     assert_eq!(host.answers_received(), 1);
+}
+
+/// KR-REQ-11.63: a worker that took an answer took it, even when its reply cannot be read, so the
+/// answer is never called unsent and is not kept to be sent again. `kr question answer` says the
+/// worker took it and keeps nothing; `kr question send` says so of a kept answer, and the next
+/// `kr question drafts` finds the question answered and retires the copy without sending it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_a_worker_took_is_never_called_unsent_when_its_reply_cannot_be_read() {
+    let host = Host::start(Behaviour::TakesAnswersAndRepliesUnreadably).await;
+    let question = host.question();
+    let (status, document) = host.json(&["question", "answer", &question, "--choice", "left"]);
+    assert_eq!(status, Some(1), "{document}");
+    assert_eq!(document["code"], "INVALID_ARGUMENT", "{document}");
+    let message = document["message"].as_str().expect("a message");
+    assert!(message.contains("worker took the answer"), "{message}");
+    assert!(message.contains("nothing is kept"), "{message}");
+    assert!(!message.contains("did not send"), "{message}");
+    assert!(!message.contains("not known"), "{message}");
+    assert!(
+        !host.kept().exists(),
+        "an answer the worker took is not kept"
+    );
+    assert_eq!(host.answers_received(), 1);
+
+    let host = kept_answer().await;
+    let question = host.question();
+    host.behave(Behaviour::TakesAnswersAndRepliesUnreadably);
+    let (status, document) = host.json(&["question", "send", &question]);
+    assert_eq!(status, Some(1), "{document}");
+    assert_eq!(document["code"], "INVALID_ARGUMENT", "{document}");
+    assert!(document.get("kept").is_none(), "{document}");
+    let message = document["message"].as_str().expect("a message");
+    assert!(message.contains("worker took the answer"), "{message}");
+    assert!(message.contains("still kept"), "{message}");
+    assert!(!message.contains("did not send"), "{message}");
+    assert_eq!(host.answers_received(), 1, "the worker took it");
+
+    host.behave(Behaviour::Serves);
+    let (status, document) = host.json(&["question", "drafts"]);
+    assert_eq!(status, Some(0), "{document}");
+    assert_eq!(document["drafts"][0]["state"], "retired", "{document}");
+    assert_eq!(document["drafts"][0]["reason_code"], "QUESTION_RESOLVED");
+    assert!(!host.kept().exists(), "the copy is retired");
+    assert_eq!(host.answers_received(), 1, "and it was not sent again");
+}
+
+/// KR-REQ-11.63: an answer `kr question send` sent and its worker took is never called unsent, even
+/// when the copy kept on this device cannot be removed afterwards. The command says the worker took
+/// it and that the copy is still kept, and the next `kr question drafts` retires the copy without
+/// sending it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sent_answer_whose_kept_copy_cannot_be_removed_is_never_called_unsent() {
+    let host = kept_answer().await;
+    let question = host.question();
+    host.behave(Behaviour::TakesAnswersAndLocksTheStore);
+    let (status, document) = host.json(&["question", "send", &question]);
+    host.unlock_store();
+    assert_eq!(status, Some(1), "{document}");
+    assert_eq!(document["code"], "STORAGE_UNAVAILABLE", "{document}");
+    let message = document["message"].as_str().expect("a message");
+    assert!(message.contains("worker took the answer"), "{message}");
+    assert!(message.contains("still kept"), "{message}");
+    assert!(!message.contains("did not send"), "{message}");
+    assert!(host.kept().is_file(), "the copy could not be removed");
+    assert_eq!(host.answers_received(), 1, "the worker took it");
+
+    host.behave(Behaviour::Serves);
+    let (status, document) = host.json(&["question", "drafts"]);
+    assert_eq!(status, Some(0), "{document}");
+    assert_eq!(document["drafts"][0]["state"], "retired", "{document}");
+    assert_eq!(document["drafts"][0]["reason_code"], "QUESTION_RESOLVED");
+    assert!(!host.kept().exists(), "the copy is retired");
+    assert_eq!(host.answers_received(), 1, "and it was not sent again");
 }
 
 /// KR-REQ-11.63: a worker that refuses the read `kr question send` makes first is reported with its
@@ -1082,11 +1194,11 @@ async fn a_refused_read_keeps_its_code_and_the_answer() {
     let (status, document) = host.json(&["question", "send", &question]);
     assert_eq!(status, Some(8), "{document}");
     assert_eq!(document["code"], "PERMISSION_DENIED", "{document}");
+    let message = document["message"].as_str().expect("a message");
+    assert!(message.contains("still kept"), "{message}");
     assert!(
-        document["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("still kept")),
-        "{document}"
+        message.contains("this command did not send it"),
+        "{message}"
     );
     assert!(host.kept().is_file());
     let (status, document) = host.json(&["question", "drafts"]);

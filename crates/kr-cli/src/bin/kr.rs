@@ -1332,8 +1332,9 @@ async fn question(
 
 /// Reports an answer that was sent, or one that was kept on this device instead.
 ///
-/// A kept answer is a failure, because it did not reach its session, and its document says it was
-/// kept, so a script can tell it from an answer that was refused.
+/// A kept answer is a failure, because its session's worker did not take it or whether it did is
+/// not known, and its document says it was kept, so a script can tell it from an answer that was
+/// refused.
 fn report_answered(
     question_id: kr_protocol::ids::QuestionId,
     answered: Result<kr_protocol::question::Question>,

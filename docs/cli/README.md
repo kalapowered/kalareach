@@ -539,9 +539,14 @@ fails before the answer is sent, or ends while it is being sent so that nobody c
 arrived, or the worker refuses it for the moment, `kr question answer` keeps the answer in this
 user's state directory, readable only by its owner, with the question and the revision it answered.
 It says so and exits with 3, and its `--json` document carries `"kept": true` beside the failure:
-`RESOURCE_UNAVAILABLE` when the answer did not go, `OUTCOME_UNKNOWN` when whether it arrived is not
-known, which the command never calls unsent. A reply that is not a message is the worker's own
-answer rather than a lost connection, so it is shown as a refusal and nothing is kept.
+`OUTCOME_UNKNOWN` when whether it arrived is not known, and otherwise the code of what stopped it.
+What the command says of the answer is what its attempt established, step by step: that it did not
+send it, that the worker did not take it, or that whether the worker took it is not known, which it
+never calls unsent. A reply that is not a message is the worker's own answer rather than a lost
+connection, so it is shown as a refusal that says the answer's fate is not known, and nothing is
+kept. A worker that replied that it took the answer took it: when that reply cannot be read, or the
+copy kept on this device cannot be removed afterwards, the command says the worker took the answer
+and exits with 1, and the next `kr question drafts` retires any copy still kept.
 
 `kr question drafts` reads each kept answer's question again. An answer whose question is still
 pending at the revision it answered is offered, and stays kept. Any other is retired: its question
