@@ -68,7 +68,7 @@ fn write_recorder(path: &Path, record: &Path, head: &str, tail: &str) {
          printf 'end\\n'\n\
          }} >> '{record}'\n\
          printf '%s%s\\n' '{head}' '{tail}'\n",
-        record = record.display()
+        record = told(record)
     );
     std::fs::write(path, script).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
@@ -204,10 +204,18 @@ impl Probes {
     /// What a shell is started with so that the program is found on its search path.
     #[must_use]
     pub fn environment(&self) -> Vec<(String, String)> {
-        let inherited = std::env::var("PATH").unwrap_or_default();
+        // The search path is told to the shell as text, like every path here: one that is not
+        // text is refused rather than dropped.
+        let inherited = match std::env::var("PATH") {
+            Ok(inherited) => inherited,
+            Err(std::env::VarError::NotPresent) => String::new(),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                panic!("this test's PATH is not UTF-8, so no shell can be told it")
+            }
+        };
         vec![(
             "PATH".to_owned(),
-            format!("{}:{inherited}", self.root.join("bin").display()),
+            format!("{}:{inherited}", told(&self.root.join("bin"))),
         )]
     }
 
@@ -356,8 +364,8 @@ pub fn an_interactive_command_asks_once_and_runs_as_typed(kind: ShellKind) {
     assert!(request.interactive);
     // What the shell's own search found and where the command runs, at the revision the reader
     // reported for this prompt.
-    assert_eq!(request.executable, probes.probe().display().to_string());
-    assert_eq!(request.cwd, session.home().display().to_string());
+    assert_eq!(request.executable, told(&probes.probe()));
+    assert_eq!(request.cwd, told(&session.home()));
     assert_eq!(request.cwd_revision, entry.cwd_revision);
     assert_eq!(request.prompt_generation, entry.prompt_generation);
     assert_eq!(
@@ -379,13 +387,13 @@ pub fn an_interactive_command_asks_once_and_runs_as_typed(kind: ShellKind) {
     // A directory the line itself moved to is the one named, at the revision after the move.
     let elsewhere = probes.elsewhere();
     let asked = session.run_asking(
-        &format!("cd '{}' && kr-probe moved", elsewhere.display()),
+        &format!("cd '{}' && kr-probe moved", told(&elsewhere)),
         "probe-ran",
     );
     assert_eq!(asked.len(), 1, "one command asks once: {asked:?}");
     let entry = session.commands.last_line_reader().clone();
     assert_eq!(asked[0].prompt_generation, entry.prompt_generation);
-    assert_eq!(asked[0].cwd, elsewhere.display().to_string());
+    assert_eq!(asked[0].cwd, told(&elsewhere));
     assert_eq!(asked[0].cwd_revision.get(), entry.cwd_revision.get() + 1);
 
     // A session created with an integration for the name, and no backend behind it, is answered
@@ -438,7 +446,7 @@ pub fn forms_the_root_shell_does_not_start_itself_never_ask(kind: ShellKind) {
             "a background job",
             "kr-probe in-the-background & wait".to_owned(),
         ),
-        ("a sourced script", format!(". '{}'", script.display())),
+        ("a sourced script", format!(". '{}'", told(&script))),
         (
             "a function",
             "kr_probe_function() { kr-probe in-a-function; }; kr_probe_function".to_owned(),
@@ -501,7 +509,7 @@ pub fn forms_the_root_shell_does_not_start_itself_never_ask(kind: ShellKind) {
 
     // The interpreter a script is started with is a command of the line, so it asks; nothing
     // the script runs does.
-    let asked = session.run_asking(&format!("sh '{}'", script.display()), "probe-ran");
+    let asked = session.run_asking(&format!("sh '{}'", told(&script)), "probe-ran");
     assert_eq!(asked.len(), 1, "only the interpreter asks: {asked:?}");
     assert_eq!(asked[0].argv[0], "sh");
     assert_eq!(last_run(&probes).arguments, ["from-a-script"]);
@@ -520,7 +528,7 @@ pub fn assignments_in_front_of_a_command_run_what_they_select(kind: ShellKind) {
     // A backend for whatever is asked about, so a question that named the wrong file would start
     // the launcher in the command's place.
     session.commands.policy = ResolvePolicy::Backend {
-        launcher: probes.launcher().display().to_string(),
+        launcher: told(&probes.launcher()),
         environment: Vec::new(),
         added: Vec::new(),
     };
@@ -528,10 +536,7 @@ pub fn assignments_in_front_of_a_command_run_what_they_select(kind: ShellKind) {
 
     let launches = probes.launches().len();
     let asked = session.run_asking(
-        &format!(
-            "PATH='{}':\"$PATH\" kr-probe from-the-other",
-            other.display()
-        ),
+        &format!("PATH='{}':\"$PATH\" kr-probe from-the-other", told(&other)),
         match kind {
             ShellKind::Bash => "launcher-ran",
             _ => "other-ran",
@@ -542,14 +547,11 @@ pub fn assignments_in_front_of_a_command_run_what_they_select(kind: ShellKind) {
             assert_eq!(asked.len(), 1, "one command asks once: {asked:?}");
             assert_eq!(
                 asked[0].executable,
-                other.join("kr-probe").display().to_string(),
+                told(&other.join("kr-probe")),
                 "the question names the file the command's own search path finds"
             );
             let launched = probes.launches().last().cloned().expect("the launcher ran");
-            assert_eq!(
-                launched.arguments[2],
-                other.join("kr-probe").display().to_string()
-            );
+            assert_eq!(launched.arguments[2], told(&other.join("kr-probe")));
         }
         _ => {
             assert!(
@@ -596,10 +598,7 @@ pub fn diagnostics_that_cannot_be_written_never_hold_a_command_up(kind: ShellKin
         .expect("mkfifo starts");
     assert!(made.success(), "a pipe for the diagnostics");
     let mut environment = probes.environment();
-    environment.push((
-        "KR_SHELL_BRIDGE_TRACE".to_owned(),
-        fifo.display().to_string(),
-    ));
+    environment.push(("KR_SHELL_BRIDGE_TRACE".to_owned(), told(&fifo)));
     let mut session = Session::start_with(&package, &environment);
     session.first_prompt();
     session.forget_events();
@@ -615,7 +614,7 @@ pub fn an_absolute_path_invocation_runs_as_typed(kind: ShellKind) {
     let package = Package::built(kind);
     let probes = Probes::new();
     let mut session = a_session_with_probes(&package, &probes);
-    let probe = probes.probe().display().to_string();
+    let probe = told(&probes.probe());
 
     let asked = session.run_asking(&format!("'{probe}' by-path"), "probe-ran");
     assert_eq!(asked.len(), 1, "one command asks once: {asked:?}");
@@ -726,7 +725,7 @@ pub fn a_backend_runs_the_command_through_the_launcher_it_names(kind: ShellKind)
         added: vec!["--kr-integrated".to_owned()],
     };
 
-    session.commands.policy = backend(probes.launcher().display().to_string());
+    session.commands.policy = backend(told(&probes.launcher()));
     let runs = probes.runs().len();
     let asked = session.run_asking("kr-probe one 'two words'", "launcher-ran");
     assert_eq!(asked.len(), 1, "one command asks once: {asked:?}");
@@ -735,7 +734,7 @@ pub fn a_backend_runs_the_command_through_the_launcher_it_names(kind: ShellKind)
         .last()
         .cloned()
         .expect("the launcher recorded its start");
-    let probe = probes.probe().display().to_string();
+    let probe = told(&probes.probe());
     assert_eq!(
         launched.arguments,
         [
@@ -770,7 +769,7 @@ pub fn a_backend_runs_the_command_through_the_launcher_it_names(kind: ShellKind)
     // command runs exactly as it was typed.
     for launcher in [
         "kr-hook".to_owned(),
-        probes.elsewhere().join("kr-hook").display().to_string(),
+        told(&probes.elsewhere().join("kr-hook")),
     ] {
         session.commands.policy = backend(launcher.clone());
         let launches = probes.launches().len();
@@ -784,7 +783,7 @@ pub fn a_backend_runs_the_command_through_the_launcher_it_names(kind: ShellKind)
 
     // A launcher that is an executable file the system cannot start leaves the command as it was
     // typed, with the shell's own environment.
-    session.commands.policy = backend(probes.broken_launcher().display().to_string());
+    session.commands.policy = backend(told(&probes.broken_launcher()));
     let asked = session.run_asking("kr-probe unstartable", "probe-ran");
     assert_eq!(asked.len(), 1, "one command asks once: {asked:?}");
     let ran = last_run(&probes);
@@ -837,7 +836,7 @@ pub fn each_line_reports_its_block_with_status_duration_and_directory(kind: Shel
     assert_eq!(started.session_id, session.session_id);
     assert_eq!(started.command, command);
     assert_eq!(started.prompt_generation, entry.prompt_generation);
-    assert_eq!(started.cwd, session.home().display().to_string());
+    assert_eq!(started.cwd, told(&session.home()));
     assert_eq!(started.cwd_revision, entry.cwd_revision);
     assert!(
         started.exit_status.0.is_none() && started.duration_ms.0.is_none(),
