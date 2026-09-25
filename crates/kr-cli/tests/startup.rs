@@ -18,15 +18,16 @@
 //!
 //! The installation is laid out the way a package lays it out: `kr`, its restoration guard, the
 //! daemon and the worker side by side on the internal disk, where `kr` finds the daemon beside
-//! itself. The daemon there is a short script, which is what `kr` starts. It runs the real daemon
-//! with its keys in the environment's own `secrets` directory, which is what every harness in this
-//! repository gives a daemon so that nothing reaches the credential store of the person running the
-//! tests. Every other argument the daemon is given is `kr`'s own, and so is its environment. The
-//! script records the daemon's process number in the test's own tree, and holds the daemon as its
-//! own child until the test ends: the test holds a lifeline open, and when it closes, however the
-//! test ended, the script ends the daemon it started, which it has not collected and whose number
-//! is therefore still its own. Every runtime and state directory is inside the test's own temporary
-//! tree.
+//! itself. The daemon there is a short script, which is what `kr` starts. It hands over to a copy of
+//! this test binary, which supervises the real daemon: it starts it with its keys in the
+//! environment's own `secrets` directory, which is what every harness in this repository gives a
+//! daemon so that nothing reaches the credential store of the person running the tests, and with
+//! every other argument and the whole environment `kr` gave it. The supervisor records the daemon's
+//! process number in the test's own tree and holds the daemon as a child it has not collected until
+//! the test's lifeline closes, however the test ended; it then ends the daemon and collects it.
+//! Only a process's own parent signals it, and only before collecting it, so no number is ever
+//! signalled after it could have passed to something else, and the test process signals nothing.
+//! Every runtime and state directory is inside the test's own temporary tree.
 
 #![cfg(unix)]
 
@@ -65,22 +66,34 @@ const STREAMS_DEADLINE: Duration = Duration::from_secs(10);
 /// The name the real daemon is placed under, beside the script `kr` runs as the daemon.
 const DAEMON_UNDER_TEST: &str = "kr-controller-under-test";
 
+/// The name this test binary's copy is placed under, beside the script that hands over to it.
+const SUPERVISOR_PROGRAM: &str = "startup-supervisor";
+
+/// The test the supervisor runs as.
+const SUPERVISOR_TEST: &str = "supervise_one_daemon_when_asked";
+
+/// Set, to the real daemon's path, when this binary runs as a daemon's supervisor.
+const SUPERVISE: &str = "KR_STARTUP_TEST_SUPERVISE";
+
+/// The daemon's arguments, one to a line, when this binary runs as a daemon's supervisor.
+const SUPERVISED_ARGUMENTS: &str = "KR_STARTUP_TEST_ARGUMENTS";
+
 /// The file in a test's own tree that each daemon script records its daemon's process number in.
 const LAUNCHED: &str = "launched-daemons";
 
-/// The file in a test's own tree that each daemon script records its own process number in when
-/// it starts.
+/// The file in a test's own tree that each supervisor records its own process number in when it
+/// starts.
 const STARTS: &str = "daemon-starts";
 
 /// The FIFO in a test's own tree that the test holds open for as long as it runs.
 const LIFELINE: &str = "daemon-lifeline";
 
-/// When present in a test's own tree, how many daemon scripts have to have started before any of
-/// them starts its daemon, so that the daemons meet at the environment's lock.
+/// When present in a test's own tree, how many supervisors have to have started before any of them
+/// starts its daemon, so that the daemons meet at the environment's lock.
 const BARRIER: &str = "daemon-barrier";
 
-/// When present in a test's own tree, how many seconds each daemon script waits before it starts
-/// its daemon, which is what a daemon slow to come up looks like from outside.
+/// When present in a test's own tree, how many seconds each supervisor waits before it starts its
+/// daemon, which is what a daemon slow to come up looks like from outside.
 const DELAY: &str = "daemon-delay";
 
 /// The tools a service, lingering or a privilege would be obtained through.
@@ -151,102 +164,197 @@ fn installation() -> &'static Path {
         );
         let daemon = directory.join(DAEMON_UNDER_TEST);
         kr_ipc::testing::place_and_start_once(&controller, &daemon, &["--version"]);
+        let supervisor = directory.join(SUPERVISOR_PROGRAM);
+        kr_ipc::testing::place_and_start_once(
+            &std::env::current_exe().expect("this test binary"),
+            &supervisor,
+            &["--list"],
+        );
         // Written under a name nothing runs, and placed under the one `kr` runs by a copy, like
         // every program these tests start: no descriptor this process holds is ever open on it.
         let source = directory.join("kr-controller.sh");
-        std::fs::write(&source, daemon_script(&daemon)).expect("writes the daemon script");
+        std::fs::write(&source, daemon_script(&daemon, &supervisor))
+            .expect("writes the daemon script");
         kr_ipc::testing::place_program(&source, &directory.join("kr-controller"));
         directory.to_path_buf()
     })
 }
 
-/// The daemon `kr` finds beside itself in these tests.
-///
-/// It opens the test's lifeline first, records itself, and waits at the test's barrier or for the
-/// test's delay when the test asks for either. It then starts the real daemon, with its keys in
-/// the environment's own `secrets` directory, the rest of `kr`'s arguments and none of its own
-/// descriptors, as a child of its own, and records the daemon's process number. It then waits for
-/// the lifeline to close and ends the daemon, which it has not collected until then: a daemon that
-/// ended by itself stays a process nobody has collected, and its number cannot be given to anything
-/// else before this script is done with it.
-fn daemon_script(daemon: &Path) -> String {
+/// The daemon `kr` finds beside itself in these tests: a script that hands over, with everything
+/// `kr` gave it, to this test binary's copy running as the daemon's supervisor.
+fn daemon_script(daemon: &Path, supervisor: &Path) -> String {
     format!(
         "#!/bin/sh\n\
-         state=\n\
-         previous=\n\
-         for argument in \"$@\"; do\n\
-         \x20 if [ \"$previous\" = --state-dir ]; then state=$argument; fi\n\
-         \x20 previous=$argument\n\
-         done\n\
-         tree=\"$state/..\"\n\
-         exec 3< \"$tree/{LIFELINE}\"\n\
-         echo $$ >> \"$tree/{STARTS}\"\n\
-         if [ -f \"$tree/{BARRIER}\" ]; then\n\
-         \x20 wanted=$(cat \"$tree/{BARRIER}\")\n\
-         \x20 tries=0\n\
-         \x20 while [ $(( $(wc -l < \"$tree/{STARTS}\") )) -lt \"$wanted\" ] && [ \"$tries\" -lt 600 ]; do\n\
-         \x20   sleep 0.05\n\
-         \x20   tries=$((tries + 1))\n\
-         \x20 done\n\
-         fi\n\
-         if [ -f \"$tree/{DELAY}\" ]; then sleep \"$(cat \"$tree/{DELAY}\")\"; fi\n\
-         '{}' --secret-store file \"$@\" 3<&- &\n\
-         daemon=$!\n\
-         echo \"$daemon\" >> \"$tree/{LAUNCHED}\"\n\
-         read -r _ <&3\n\
-         kill \"$daemon\" 2>/dev/null\n\
-         wait \"$daemon\"\n",
-        daemon.display()
+         exec /usr/bin/env {SUPERVISE}='{}' {SUPERVISED_ARGUMENTS}=\"$(printf '%s\\n' \"$@\")\" \
+         '{}' {SUPERVISOR_TEST} --exact --quiet\n",
+        daemon.display(),
+        supervisor.display()
     )
+}
+
+/// Not a check of its own: the entry point the daemon script runs this binary's copy through, with
+/// [`SUPERVISE`] set, to supervise one daemon. The test harness running it without that variable
+/// finds nothing to supervise.
+#[test]
+fn supervise_one_daemon_when_asked() {
+    if let Some(daemon) = std::env::var_os(SUPERVISE) {
+        supervise(Path::new(&daemon));
+    }
+}
+
+/// Supervises one daemon for a test.
+///
+/// It opens the test's lifeline, records itself, and waits at the test's barrier or out the test's
+/// delay when the test asks for either. A lifeline that has closed by then means the test has
+/// ended, and nothing is started. Otherwise it starts the real daemon as its child, with its keys
+/// in the environment's own `secrets` directory and everything else `kr` gave the script, records
+/// the daemon's process number, and waits for the lifeline to close. Only then does it end the
+/// daemon and collect it. Rust collects a child only when asked, so a daemon that ended by itself in
+/// the meantime is still this process's uncollected child, its number is still its own, and
+/// signalling it reaches nothing else.
+fn supervise(daemon: &Path) {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let arguments: Vec<String> = std::env::var(SUPERVISED_ARGUMENTS)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let state = arguments
+        .windows(2)
+        .find(|pair| pair[0] == "--state-dir")
+        .map(|pair| PathBuf::from(&pair[1]))
+        .expect("kr names the state tree");
+    let tree = state
+        .parent()
+        .expect("the state tree is inside the test's own tree")
+        .to_path_buf();
+    // One write of the whole line: supervisors append to the same record at once, and a line
+    // written in two pieces could be split by another's.
+    let record = |name: &str, pid: u32| {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(tree.join(name))
+            .expect("opens a record");
+        file.write_all(format!("{pid}\n").as_bytes())
+            .expect("records a process");
+    };
+    // Read without waiting, so a closed lifeline is seen as its end rather than waited on.
+    let lifeline = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(tree.join(LIFELINE))
+        .expect("opens the lifeline");
+    record(STARTS, std::process::id());
+    let waited = Instant::now();
+    if let Ok(wanted) = std::fs::read_to_string(tree.join(BARRIER)) {
+        let wanted: usize = wanted.trim().parse().expect("a number of starts");
+        while std::fs::read_to_string(tree.join(STARTS))
+            .unwrap_or_default()
+            .lines()
+            .count()
+            < wanted
+            && waited.elapsed() < Duration::from_secs(30)
+            && !closed(&lifeline)
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    if let Ok(seconds) = std::fs::read_to_string(tree.join(DELAY)) {
+        let delay = Duration::from_secs(seconds.trim().parse().expect("a number of seconds"));
+        while waited.elapsed() < delay && !closed(&lifeline) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    if closed(&lifeline) {
+        return;
+    }
+    let mut child = Command::new(daemon)
+        .arg("--secret-store")
+        .arg("file")
+        .args(&arguments)
+        .env_remove(SUPERVISE)
+        .env_remove(SUPERVISED_ARGUMENTS)
+        .spawn()
+        .expect("starts the daemon");
+    record(LAUNCHED, child.id());
+    while !closed(&lifeline) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // This process's own child, not collected yet, so the number is still its.
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Whether nothing holds the lifeline open any more, which is how a supervisor learns the test has
+/// ended.
+fn closed(lifeline: &std::fs::File) -> bool {
+    use std::io::Read as _;
+
+    let mut byte = [0; 1];
+    match (&*lifeline).read(&mut byte) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(error) => error.kind() != std::io::ErrorKind::WouldBlock,
+    }
 }
 
 /// A host tree of a test's own, where the standalone start is tried.
 ///
 /// However a test ends, each daemon `kr` started in the tree is ended before the tree goes, by the
-/// script that started it, and then, through the tree, every worker a daemon recorded.
+/// supervisor that started it; every supervisor has ended; and then, through the tree, every worker
+/// a daemon recorded.
 struct Standalone {
     tree: teardown::Tree,
     home: PathBuf,
-    /// The lifeline every daemon script in this tree waits on, held open for as long as the test
-    /// runs.
+    /// The lifeline every supervisor in this tree waits on, held open for as long as the test runs.
     lifeline: Option<std::fs::File>,
 }
 
 impl Drop for Standalone {
     fn drop(&mut self) {
-        // Each daemon, named by its start identity while its script still holds it, so a number
-        // given to something else afterwards is not mistaken for it.
-        let mut daemons = Vec::new();
-        for pid in self.launched() {
+        // Every supervisor and every daemon, named by its start identity while it still holds its
+        // number: a supervisor has not ended while the lifeline is open, and a daemon has not been
+        // collected. A number given to something else afterwards is then not mistaken for either.
+        let mut started = Vec::new();
+        for pid in self
+            .recorded(STARTS)
+            .into_iter()
+            .chain(self.recorded(LAUNCHED))
+        {
             match kr_ipc::identity::query_process(pid) {
-                ProcessQuery::Present(identity) => daemons.push(identity),
+                ProcessQuery::Present(identity) => started.push(identity),
                 ProcessQuery::Gone => {}
                 ProcessQuery::CannotEstablish(error) => self.tree.hold(format!(
-                    "whether the daemon {pid} this test started has ended cannot be established: \
+                    "whether the process {pid} this test started has ended cannot be established: \
                      {error}"
                 )),
             }
         }
-        // The cue for every daemon script to end the daemon it started.
+        // The cue for every supervisor to end the daemon it started, collect it and end.
         drop(self.lifeline.take());
-        let started = Instant::now();
-        for identity in daemons {
+        let begun = Instant::now();
+        for identity in started {
             loop {
                 match kr_ipc::identity::process_state(&identity) {
                     ProcessState::Ended => break,
-                    ProcessState::Running if started.elapsed() < STREAMS_DEADLINE => {
+                    ProcessState::Running if begun.elapsed() < STREAMS_DEADLINE => {
                         std::thread::sleep(Duration::from_millis(50));
                     }
                     ProcessState::Running => {
                         self.tree.hold(format!(
-                            "the daemon {} this test started did not end once its lifeline closed",
+                            "the process {} this test started did not end once its lifeline \
+                             closed",
                             identity.pid.get()
                         ));
                         break;
                     }
                     ProcessState::Unknown { detail } => {
                         self.tree.hold(format!(
-                            "whether the daemon {} this test started has ended cannot be \
+                            "whether the process {} this test started has ended cannot be \
                              established: {detail}",
                             identity.pid.get()
                         ));
@@ -357,7 +465,12 @@ impl Standalone {
 
     /// The daemons `kr` started in this tree, by process number, in the order they started.
     fn launched(&self) -> Vec<u32> {
-        std::fs::read_to_string(self.tree.root().join(LAUNCHED))
+        self.recorded(LAUNCHED)
+    }
+
+    /// The processes one record in this tree names, in the order they were recorded.
+    fn recorded(&self, name: &str) -> Vec<u32> {
+        std::fs::read_to_string(self.tree.root().join(name))
             .unwrap_or_default()
             .lines()
             .filter_map(|line| line.trim().parse().ok())
@@ -366,8 +479,9 @@ impl Standalone {
 
     /// The daemons `kr` started in this tree that are running now.
     ///
-    /// A daemon that could not take the environment ends by itself and waits for its script to
-    /// collect it, which counts as ended.
+    /// A daemon that could not take the environment ends by itself and waits for its supervisor to
+    /// collect it, which counts as ended. Its number stays its own until then, so each number here
+    /// names the daemon it was recorded for.
     fn running(&self) -> Vec<u32> {
         self.launched()
             .into_iter()
@@ -843,16 +957,24 @@ fn a_daemon_that_does_not_come_up_in_time_is_named_and_no_second_one_is_left() {
         "and what the daemon it started said: {message}"
     );
 
-    assert_eq!(host.launched().len(), 1, "the command started one daemon");
+    let launched = host.launched();
+    assert_eq!(launched.len(), 1, "the command started one daemon");
     let started = Instant::now();
     while !host.running().is_empty() {
         assert!(
             started.elapsed() < LIVENESS_DEADLINE,
-            "the daemon that could not take the environment ended: {:?}",
-            host.launched()
+            "the daemon that could not take the environment ended: {launched:?}"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+    let daemon =
+        rustix::process::Pid::from_raw(i32::try_from(launched[0]).expect("a process number"))
+            .expect("a process number");
+    assert!(
+        rustix::process::test_kill_process(daemon).is_ok(),
+        "the daemon that ended by itself still holds its number, because its supervisor has not \
+         collected it"
+    );
     assert!(!host.answers(), "and nothing answers for the environment");
     drop(held);
 }
@@ -980,9 +1102,14 @@ fn selecting_and_using_the_standalone_start_installs_nothing_and_seeks_no_privil
     }
     if cfg!(target_os = "linux") {
         assert!(
-            recorded.iter().any(|call| call.tool == "systemctl"),
-            "the daemon's query of the user manager went through the recording tool, so the \
-             tools it runs by name are the ones on the PATH it inherited: {recorded:?}"
+            recorded.iter().any(|call| {
+                daemons.contains(&call.caller)
+                    && call.tool == "systemctl"
+                    && call.arguments == ["--user", "show", "--property=Version", "--value"]
+            }),
+            "the daemon's query of the user manager went through the recording tool, in exactly \
+             the form it asks, so the tools it runs by name are the ones on the PATH it \
+             inherited: {recorded:?}"
         );
     }
     assert!(
@@ -1310,4 +1437,161 @@ fn status_reports_each_terminal_attachments_presentation_and_its_reason() {
 
     drop((undeclared_client, smaller_client));
     host.close(&created);
+}
+
+/// A worker of this test's own for `session_id`, which publishes its descriptor, proves itself as a
+/// session's worker does and answers `session.read`, and never answers `events.snapshot`.
+///
+/// It runs on the runtime it is started from, for as long as that runtime runs.
+async fn a_worker_that_withholds_its_attachments(host: &Standalone, session_id: SessionId) {
+    use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Response};
+
+    let environment = host.tree.environment();
+    let environment_id = host.tree.environment_id();
+    let display = kr_protocol::session::DisplayNumber::new(9);
+    let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
+    let process = kr_ipc::identity::current_process_start_identity().expect("a process identity");
+    let identity = kr_ipc::verify::WorkerIdentity::generate(
+        session_id,
+        SessionEpoch::V1,
+        boot.clone(),
+        process.clone(),
+        kr_protocol::hello::PROTOCOL_VERSION,
+    )
+    .expect("a session key");
+    let endpoint = environment.worker_endpoint(display).expect("an endpoint");
+    let endpoint_text = endpoint.as_text();
+    kr_ipc::descriptor::publish(
+        &environment,
+        &kr_protocol::worker::WorkerDescriptor {
+            session_id,
+            session_epoch: SessionEpoch::V1,
+            environment_id,
+            display_number: display,
+            boot_identity: boot.clone(),
+            process_start_identity: process,
+            protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
+            endpoint: endpoint_text.clone(),
+            worker_public_key: *identity.public_key(),
+            worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+            published_at_ms: kr_protocol::scalars::TimestampMs::new(0),
+        },
+    )
+    .expect("publishes the descriptor");
+    let read = kr_protocol::session::SessionReadResult {
+        session: kr_protocol::session::SessionSummary {
+            session_id,
+            session_epoch: SessionEpoch::V1,
+            environment_id,
+            display_number: display,
+            state: kr_protocol::session::SessionState::Live,
+            shell_mode: kr_protocol::session::ShellMode::NativeCompat,
+            shell_path: "/bin/sh".to_owned(),
+            cwd: "/".to_owned(),
+            worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+            desktop: kr_protocol::identity::DesktopBinding::none(),
+            created_at_ms: kr_protocol::scalars::TimestampMs::new(1),
+            dimensions: Dimensions::new(120, 40),
+            attachment_count: kr_protocol::scalars::U64::new(1),
+            application_state: Nullable::null(),
+            root_process: Nullable::null(),
+            closure: Nullable::null(),
+        },
+        endpoint: Nullable::some(endpoint_text.clone()),
+        launch_profile: Nullable::null(),
+        last_command_block: Nullable::null(),
+        outstanding_launches: Nullable::null(),
+    };
+    let boot_epoch = kr_ipc::identity::boot_epoch(&boot).expect("a boot epoch");
+    let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");
+    tokio::spawn(async move {
+        while let Ok((connection, peer)) = listener.accept().await {
+            let (mut reader, mut writer) =
+                kr_ipc::framed::split(connection, kr_protocol::frame::StreamKind::Control);
+            let connection_id = kr_protocol::ids::ConnectionId::new(kr_ipc::new_uuid());
+            while let Ok(frame) = reader.read_message::<ControlFrame>().await {
+                let answer = match frame {
+                    ControlFrame::Hello(_) => {
+                        ControlFrame::HelloAck(Box::new(kr_protocol::local::LocalHelloAck {
+                            selected_version: kr_protocol::hello::PROTOCOL_VERSION,
+                            role: kr_protocol::local::LocalRole::Worker,
+                            connection_id,
+                            environment_id,
+                            boot_identity: boot.clone(),
+                            peer: peer.to_wire(),
+                            action_window: kr_protocol::hello::ActionWindow {
+                                action_window_id: kr_protocol::ids::ActionWindowId::new(
+                                    "withholding-worker",
+                                )
+                                .expect("a window identifier"),
+                                connection_id,
+                                boot_epoch,
+                                issued_at_ms: kr_protocol::scalars::TimestampMs::new(0),
+                                valid_for_ms: kr_protocol::scalars::DurationMs::new(60_000),
+                            },
+                            capabilities: CanonicalSet::new(),
+                            max_receive: kr_protocol::hello::ReceiveLimits::default(),
+                        }))
+                    }
+                    ControlFrame::VerifyChallenge(challenge) => ControlFrame::VerifyProof(
+                        identity
+                            .answer(&challenge, &endpoint_text)
+                            .expect("proves itself"),
+                    ),
+                    ControlFrame::Request(request)
+                        if request.method.method() == Some(Method::SessionRead) =>
+                    {
+                        ControlFrame::Response(Response {
+                            request_id: request.request_id,
+                            outcome: Outcome::Ok(ParamsValue::from_typed(&read).expect("encodes")),
+                        })
+                    }
+                    // `events.snapshot`, and anything else, is never answered.
+                    _ => continue,
+                };
+                if writer.write_message(&answer).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// KR-REQ-08.02: a worker that answers the session read and never the question about its
+/// attachments leaves `kr status` the session, and the attachments are reported as not read.
+///
+/// `kr status` waits its bound for the second answer, prints the session it has, and says why the
+/// attachments are missing: `terminal_attachments` is null and `terminal_attachments_unread` names
+/// the bound.
+#[test]
+fn status_reports_the_session_when_its_worker_withholds_the_attachments() {
+    let host = Standalone::create();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    runtime.block_on(a_worker_that_withholds_its_attachments(&host, session_id));
+
+    let started = Instant::now();
+    let output = start(host.kr(&["--json", "status", &session_id.to_string()])).finish("kr status");
+    let report = document(&output, "kr status");
+    assert!(output.status.success(), "{report}");
+    assert_eq!(report["session_id"], session_id.to_string(), "{report}");
+    assert_eq!(report["state"], "live", "{report}");
+    assert_eq!(report["terminal_attachments"], Value::Null, "{report}");
+    let unread = report["terminal_attachments_unread"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        unread.contains("did not answer within 10 seconds"),
+        "the status says why the attachments are missing: {report}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(60),
+        "and it waited its bound rather than for ever: {:?}",
+        started.elapsed()
+    );
+    drop(runtime);
 }
