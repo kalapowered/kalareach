@@ -586,27 +586,36 @@ impl Shown {
             .iter()
             .filter(|root| path.starts_with(root))
             .max_by_key(|root| root.components().count());
-        let (mut said, rest) = match root {
-            Some(root) => (root.clone(), path.strip_prefix(root).unwrap_or(path)),
-            None => (std::path::PathBuf::new(), path),
+        let (start, rest) = match root {
+            Some(root) => (
+                root.display().to_string(),
+                path.strip_prefix(root).unwrap_or(path),
+            ),
+            None => (String::new(), path),
         };
-        for component in rest.components() {
-            match component {
-                std::path::Component::Normal(name) => said.push(
+        let pieces = rest
+            .components()
+            .map(|component| match component {
+                std::path::Component::Prefix(prefix) => Piece::Prefix(path_prefix(prefix.kind())),
+                std::path::Component::RootDir => Piece::Root,
+                std::path::Component::CurDir => Piece::Name("."),
+                std::path::Component::ParentDir => Piece::Name(".."),
+                std::path::Component::Normal(name) => Piece::Name(
                     name.to_str()
-                        .filter(|name| {
-                            HOST_TREE_NAMES.contains(name)
-                                || written_by_a_store(name, HOST_TREE_EXTENSIONS)
+                        .and_then(|name| {
+                            HOST_TREE_NAMES
+                                .iter()
+                                .find(|known| **known == name)
+                                .copied()
+                                .or_else(|| {
+                                    written_by_a_store(name, HOST_TREE_EXTENSIONS).then_some(name)
+                                })
                         })
                         .unwrap_or("[a name]"),
                 ),
-                std::path::Component::Prefix(prefix) => said.push(path_prefix(prefix.kind())),
-                std::path::Component::RootDir
-                | std::path::Component::CurDir
-                | std::path::Component::ParentDir => said.push(component.as_os_str()),
-            }
-        }
-        Self::decided(said.display().to_string())
+            })
+            .collect::<Vec<_>>();
+        Self::decided(assemble(start, &pieces, std::path::MAIN_SEPARATOR_STR))
     }
 
     /* ---------------------------------------------------------------------- */
@@ -711,6 +720,42 @@ fn written_by_a_store(name: &str, extensions: &[&str]) -> bool {
         return false;
     };
     identifier(first) && parts.all(|part| identifier(part) || extensions.contains(&part))
+}
+
+/// One part of a path as [`Shown::host_path`] says it.
+enum Piece<'a> {
+    /// A prefix, as [`path_prefix`] says it.
+    Prefix(String),
+    /// The root directory.
+    Root,
+    /// A name, or its placeholder.
+    Name(&'a str),
+}
+
+/// Joins the parts of a path after `start` with `separator`, as text: a placeholder is kept where a
+/// path joined by the platform would treat the root that follows it as starting over.
+fn assemble(mut said: String, pieces: &[Piece<'_>], separator: &str) -> String {
+    let mut separated = said.is_empty() || said.ends_with(separator);
+    for piece in pieces {
+        match piece {
+            Piece::Prefix(prefix) => {
+                said.push_str(prefix);
+                separated = false;
+            }
+            Piece::Root => {
+                said.push_str(separator);
+                separated = true;
+            }
+            Piece::Name(name) => {
+                if !separated {
+                    said.push_str(separator);
+                }
+                said.push_str(name);
+                separated = false;
+            }
+        }
+    }
+    said
 }
 
 /// What a path's prefix says outside a configured root: a drive's letter, and a placeholder for a
@@ -1379,6 +1424,33 @@ mod tests {
         ] {
             assert_eq!(path_prefix(prefix), "[a network or device path]");
         }
+    }
+
+    /// A path outside a configured root keeps its prefix's placeholder when a root follows it, as
+    /// a network path on Windows has one.
+    #[test]
+    fn a_placeholder_prefix_survives_the_root_after_it() {
+        let pieces = [
+            Piece::Prefix(path_prefix(std::path::Prefix::UNC(
+                std::ffi::OsStr::new(MARKER),
+                std::ffi::OsStr::new("share"),
+            ))),
+            Piece::Root,
+            Piece::Name("[a name]"),
+            Piece::Name("0e1f9a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b.kr"),
+        ];
+        assert_eq!(
+            assemble(String::new(), &pieces, "\\"),
+            "[a network or device path]\\[a name]\\0e1f9a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b.kr"
+        );
+        assert_eq!(
+            assemble(
+                "/configured/root".to_owned(),
+                &[Piece::Name("sessions")],
+                "/"
+            ),
+            "/configured/root/sessions"
+        );
     }
 
     /// A terminal type is said when it is a terminfo name this build lists, and replaced otherwise,
