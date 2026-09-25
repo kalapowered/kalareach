@@ -185,12 +185,13 @@ report stops before it runs anything.
 A macro's body is read like any other code, but where a macro's definition or arguments hold a
 metavariable or a repetition (`$name`, `$( ... )*`), its tokens do not show the code it writes: a
 metavariable stands for whatever the macro is handed, a keyword or a `.` included, and a repetition
-for any number of copies of what it holds, none included. So inside such a macro a keyed helper's
-name is a problem however it is written, and so is a name the report trusts, unless it names a
-metavariable (`$core`) or is written where the macro cannot make a declaration of it: invoked
-(`assert!`), before `::` and a name (`std::mem`), after a `.`, or inside an attribute
-(`#[derive(Debug)]`). What another macro makes of the tokens it is handed falls under the rules on
-where that macro is invoked, below.
+for any number of copies of what it holds, none included. So inside such a macro, on top of the
+conventions above, a keyed helper's name is a problem however it is written, and a name the report
+trusts is one unless it names a metavariable (`$core`) or is written where the macro cannot make a
+declaration of it: invoked (`assert!`), before `::` and a name other than `self`, `super`, `crate`
+or `Self` (`std::mem`, but not `core::self`, which brings `core` in inside a use tree's braces),
+after a `.`, or inside an attribute (`#[derive(Debug)]`). What another macro makes of the tokens it
+is handed falls under the rules on where that macro is invoked, below.
 
 A repetition that opens or ends inside an item's header is a problem, because the report could not
 tell where the item's name, generic parameters or body are. A header runs from a keyword written in

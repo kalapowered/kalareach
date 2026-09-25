@@ -459,6 +459,10 @@ fn a_source_outside_the_conventions_is_a_problem_and_keys_no_helper() {
                 "`len`, a keyed helper's name, is written here as part of a macro whose metavariables or repetitions",
             ),
             (
+                "tests/rewritten.rs:57",
+                "`core` is written here in a macro whose metavariables or repetitions may make it a declaration",
+            ),
+            (
                 "tests/shadowed.rs:8",
                 "`println` is declared here as a macro",
             ),
