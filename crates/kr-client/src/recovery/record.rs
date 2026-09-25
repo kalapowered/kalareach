@@ -23,8 +23,9 @@
 //!
 //! It is written and flushed to the device before the write leaves, and the write is not sent if
 //! that fails. It stays until the next write replaces it, as the store's own memory of the write
-//! does. What is known of the write is written again when an answer arrives or the write is
-//! settled. That second writing can fail and leave the record saying less than the store knows,
+//! does, except for a write refused before anything left: that one is taken back, the record it
+//! replaced put back or, where there was none, the record removed. What is known of the write is
+//! written again when an answer arrives or the write is settled. That second writing can fail and leave the record saying less than the store knows,
 //! which is the safe direction: a restart then asks about the write again, and the service answers
 //! the same way.
 //!
@@ -220,6 +221,27 @@ impl RecordFile {
         if let Err(source) = std::fs::rename(&self.partial, &self.path) {
             let _ = std::fs::remove_file(&self.partial);
             return Err(storage(&self.path, source));
+        }
+        kr_ipc::paths::flush_directory(&self.directory, kr_ipc::paths::NameKind::File)
+            .map_err(|source| storage(&self.directory, source))
+    }
+
+    /// Puts back the record a write that never left replaced: `previous`, or no record at all
+    /// where there was none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecoveryError::Storage`] when the disk will not take it back. The record of the
+    /// write that never left then stays, saying the write is outstanding, which a store opened over
+    /// it ends with one fence: nothing ran under that identity, so the fence settles it.
+    pub(super) fn restore(&self, previous: Option<&WriteRecord>) -> Result<()> {
+        if let Some(previous) = previous {
+            return self.save(previous);
+        }
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(storage(&self.path, source)),
         }
         kr_ipc::paths::flush_directory(&self.directory, kr_ipc::paths::NameKind::File)
             .map_err(|source| storage(&self.directory, source))

@@ -45,6 +45,15 @@
 //!
 //! Until one of the two happens the store writes nothing further, which is what keeps this device
 //! from ever meeting its own earlier write and being told another device wrote.
+//!
+//! A write that never left is the one exception, and the service is what says it never left:
+//! [`SyncBackupService::compare_exchange_dispatched`] answers [`SyncDispatch::NotSent`] for a
+//! request it refused before anything was sent, for want of an account token, for a signing
+//! instant outside the service's window or for any other reason of its own. Nothing can run under
+//! that identity, so the store puts back what the call found, the record on the disk included as
+//! far as the disk allows, reports [`RecoveryError::BundleNotSent`], and the next write goes out. A
+//! record the disk would not take back is a write that never left and still reads as outstanding,
+//! which a restart ends with one fence. Everything after the request left stays unknown.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -59,23 +68,46 @@ use kr_protocol::ids::SyncConflictId;
 use kr_protocol::scalars::{
     Bytes, Digest256, KeyId, Nullable, StoredEnvelopeKey, TimestampMs, U64,
 };
+use kr_protocol::sync::{MAX_SEALED_RECOVERY_BUNDLE_BYTES, SyncObjectKind};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ClientError;
 use crate::recovery::record::{Known, RecordFile, WriteRecord};
 use crate::recovery::{RecoveryError, Result};
 use crate::services::{
-    SyncBackupService, SyncExchanged, SyncFetched, SyncPosition, SyncRequestFence, nothing_held,
+    SyncBackupService, SyncDispatch, SyncExchanged, SyncFetched, SyncPosition, SyncRequestFence,
+    nothing_held,
 };
 
 /// Returns the collection name one bundle is stored under.
 ///
-/// It is the locator itself. The locator is opaque and stable, which is the whole point of it:
+/// It is the bundle's kind and its locator, as every synchronised object's collection is named by
+/// its kind and its identity. The locator is opaque and stable, which is the whole point of it:
 /// bundle updates go to the same name for the life of the kit, so enabling a new writer never
-/// means reprinting the seed.
+/// means reprinting the seed. A managed service addresses the locator for the whole origin, so a
+/// device that holds only the kit reaches the same collection the owner's devices write.
 #[must_use]
-pub fn bundle_collection(context: &RecoveryContext) -> &str {
-    &context.bundle_locator
+pub fn bundle_collection(context: &RecoveryContext) -> String {
+    format!(
+        "{}/{}",
+        SyncObjectKind::RecoveryBundle,
+        context.bundle_locator
+    )
+}
+
+/// Draws a locator for a new recovery kit: a random identifier in its canonical spelling.
+///
+/// It is drawn from the operating system's generator, as every request identity is, so two owners
+/// never draw the same one. It leaves this device first in the bundle's first write, before the kit
+/// that prints it exists, so the service that write reaches is the first to see it.
+///
+/// # Errors
+///
+/// Returns [`RecoveryError::Service`] when this device could not produce random bytes.
+pub fn fresh_locator() -> Result<String> {
+    Ok(kr_transport::random::fresh_uuid_v4()
+        .map_err(ClientError::from)?
+        .to_string())
 }
 
 /// What became of a bundle write whose answer never arrived.
@@ -311,7 +343,7 @@ impl BundleStore {
     async fn fence(&self, record: &WriteRecord) -> Result<SyncRequestFence> {
         self.service
             .fence_request(
-                bundle_collection(&self.context),
+                &bundle_collection(&self.context),
                 record.request_id,
                 record.signed_at_ms.get(),
                 record.signed_at_ms.get(),
@@ -570,7 +602,10 @@ impl BundleStore {
     ///
     /// Returns [`RecoveryError::BundleConflict`] when the service refused the comparison because
     /// another device wrote first, [`RecoveryError::BundleOutcomeUnknown`] when the answer never
-    /// came back, [`RecoveryError::BundleWriteUnsettled`] when a previous write is still
+    /// came back, [`RecoveryError::BundleNotSent`] when the write was refused before anything
+    /// left this device, which leaves the store as it was, [`RecoveryError::BundleTooLarge`] for
+    /// a bundle sealed past the bound a service keeps, which is refused before anything is
+    /// recorded, [`RecoveryError::BundleWriteUnsettled`] when a previous write is still
     /// outstanding, [`RecoveryError::Storage`] or [`RecoveryError::UnreadableWriteRecord`] when the
     /// record of the write cannot be written, in which case nothing is sent, and
     /// [`RecoveryError::BundleNotAWrite`], [`RecoveryError::BundleWentBack`],
@@ -611,6 +646,14 @@ impl BundleStore {
         candidate.written_at_ms = now_ms;
         let key = seed.bundle_key_for(&self.context)?;
         let ciphertext = kr_crypto::archive::encrypt_recovery_bundle(&key, &candidate)?;
+        // A bundle no service keeps is refused before anything is recorded or sent, so a store
+        // never holds a record of a write that could not have been made.
+        if ciphertext.len() as u64 > MAX_SEALED_RECOVERY_BUNDLE_BYTES {
+            return Err(RecoveryError::BundleTooLarge {
+                len: ciphertext.len(),
+                limit: MAX_SEALED_RECOVERY_BUNDLE_BYTES,
+            });
+        }
         let sent = sealed_digest(&ciphertext);
         let request_id = kr_transport::random::fresh_uuid_v4().map_err(ClientError::from)?;
         // Recorded before the call and not after it, because the case this is for is the one where
@@ -628,11 +671,11 @@ impl BundleStore {
             known: Known::Unsettled,
         };
         self.file.save(&record)?;
-        self.last_write = Some(record);
+        let previous = self.last_write.replace(record);
         match self
             .service
-            .compare_exchange(
-                bundle_collection(&self.context),
+            .compare_exchange_dispatched(
+                &bundle_collection(&self.context),
                 request_id,
                 now_ms.get(),
                 expected,
@@ -640,7 +683,18 @@ impl BundleStore {
             )
             .await
         {
-            Ok(SyncExchanged::Applied { position }) => {
+            // Refused before anything left: nothing can run under the identity, so the store is put
+            // back as the call found it. The record on the disk goes back too, as far as the disk
+            // allows; one it would not take back reads as a write outstanding, which a restart ends
+            // with one fence, and this process goes on from the record it had.
+            Ok(SyncDispatch::NotSent(refused)) => {
+                let _ = self.file.restore(previous.as_ref());
+                self.last_write = previous;
+                Err(RecoveryError::BundleNotSent {
+                    source: Box::new(refused),
+                })
+            }
+            Ok(SyncDispatch::Answered(SyncExchanged::Applied { position })) => {
                 // A position this device cannot read leaves the write outstanding rather than
                 // recorded: the service says it applied the write, and where it says it landed is
                 // somewhere no write of this bundle can be. Ending the request is then what
@@ -655,7 +709,7 @@ impl BundleStore {
                 *bundle = candidate;
                 Ok(position)
             }
-            Ok(SyncExchanged::Refused { retained, .. }) => {
+            Ok(SyncDispatch::Answered(SyncExchanged::Refused { retained, .. })) => {
                 // A refusal is an answer: the service compared, the comparison did not hold, and
                 // the bundle this device sent was not written. Nothing is outstanding.
                 self.answered();
@@ -664,13 +718,15 @@ impl BundleStore {
             // Refused as signed before the service's cutoff: this write ran nothing. This store
             // concludes no more from that than from a write that was never answered, so the write
             // stays outstanding until it is ended, as one would.
-            Ok(SyncExchanged::SignedBeforeCutoff) => Err(RecoveryError::BundleOutcomeUnknown {
-                sent,
-                source: Box::new(ClientError::Host(ProtocolError::new(
-                    ErrorCode::PermissionDenied,
-                    "the service refused the write as signed before its cutoff, and ran nothing",
-                ))),
-            }),
+            Ok(SyncDispatch::Answered(SyncExchanged::SignedBeforeCutoff)) => {
+                Err(RecoveryError::BundleOutcomeUnknown {
+                    sent,
+                    source: Box::new(ClientError::Host(ProtocolError::new(
+                        ErrorCode::PermissionDenied,
+                        "the service refused the write as signed before its cutoff, and ran nothing",
+                    ))),
+                })
+            }
             // Anything else stopped the exchange from being answered at all, and an exchange that
             // was not answered may still have been executed. This device concludes nothing from it
             // and says so, which is the safe direction.
@@ -896,7 +952,9 @@ impl BundleStore {
     /// [`RecoveryError::DestinationHoldsABundle`] when the destination store has read a bundle
     /// there, [`RecoveryError::BundleConflict`] when the old location has moved on,
     /// [`RecoveryError::BundleNotAuthentic`] when the bundle does not read back at the new
-    /// location, and whatever [`Self::commit`] returns for the write itself.
+    /// location, and whatever [`Self::commit`] returns for the write itself: among it
+    /// [`RecoveryError::BundleNotSent`] for a destination write refused before anything left,
+    /// which leaves both locations and both stores as they were, so the move can be made again.
     pub async fn migrate(
         &mut self,
         seed: &RecoverySeed,
@@ -1371,7 +1429,7 @@ pub(super) async fn read_bundle(
     seed: &RecoverySeed,
 ) -> Result<Baseline> {
     let (position, ciphertext) = match service
-        .fetch(bundle_collection(context))
+        .fetch(&bundle_collection(context))
         .await
         .map_err(RecoveryError::Service)?
     {

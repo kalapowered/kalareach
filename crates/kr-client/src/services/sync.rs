@@ -31,6 +31,24 @@
 //! Such a collection belongs to the installation whose key signs for it, because the service
 //! derives it from that key, and it is what [`SyncBackupService`] addresses.
 //!
+//! # The recovery bundle
+//!
+//! One more name reaches [`SyncBackupService`]: [`crate::recovery::bundle_collection`] names the
+//! owner's recovery bundle by its kind and the stable locator the recovery kit prints. Its
+//! collection is the origin's rather than an installation's, because a device restoring from the
+//! kit has nothing else to find it by: every request about it names the locator and no
+//! collection or home, and the service keeps one collection at each locator, owned by the account
+//! whose first write applied there. So each of its requests carries a second authorisation beside
+//! the signature, the account token for the scope this client was given with
+//! [`ManagedSyncService::presenting`]: `backup.write` for a device that writes it, and
+//! `backup.restore` for one that only reads it. A client that presents no account sends no
+//! request about a bundle.
+//!
+//! The bundle is one `secretstream` object, not a [`SealedSyncObject`], and it travels as a
+//! [`SealedRecoveryBundle`] with a bound of its own. What a caller hands over and what a fetch hands
+//! back are the stream's bytes. A service keeps no copy of a refused bundle write, so a bundle
+//! has nothing to resolve, and it is never an object of a shared collection.
+//!
 //! A collection two or more devices share is named by a [`CollectionRef`] instead: it lives in the
 //! namespace of the installation that started it, its home, and holds several objects, each named
 //! inside it by the same per-object name. Every request about it names the home, every write names
@@ -107,14 +125,17 @@ use kr_protocol::ids::{DraftId, InstallationId, SyncCollectionId, SyncConflictId
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, U64, Uuid};
 use kr_protocol::service::GatewayOrigin;
-use kr_protocol::sync::{SealedSyncObject, SyncObjectKind};
+use kr_protocol::sync::{SealedRecoveryBundle, SealedSyncObject, SyncObjectKind};
 use serde::{Deserialize, Serialize};
 
+use super::account::AccountTokenSource;
 use super::relay::{ServiceHttp, ServiceSigner};
-use super::signed::{Answer, Refusal, SignedService, malformed, unreadable_answer};
+use super::signed::{
+    AccountAuthorisation, Answer, Refusal, SignedService, Unanswered, malformed, unreadable_answer,
+};
 use super::{
-    KeyHead, Keyed, ServiceFuture, SyncBackupService, SyncExchanged, SyncFetched, SyncPosition,
-    SyncRecoveryId, SyncRequestFence, SyncRequestStatus, SyncRevision,
+    KeyHead, Keyed, ServiceFuture, SyncBackupService, SyncDispatch, SyncExchanged, SyncFetched,
+    SyncPosition, SyncRecoveryId, SyncRequestFence, SyncRequestStatus, SyncRevision,
 };
 use crate::error::{ClientError, Result};
 use crate::sync::membership::{
@@ -203,7 +224,7 @@ impl Collection {
     fn named(collection: &str) -> Result<Self> {
         let refused = || {
             malformed(
-                "that collection is not one settings sync names: settings, a client's position or a draft",
+                "that collection is not one settings sync names: settings, a client's position, a draft or the recovery bundle",
             )
         };
         let (_, identity) = collection.split_once('/').ok_or_else(refused)?;
@@ -212,16 +233,30 @@ impl Collection {
         let kind = if collection == crate::drafts::draft_collection(DraftId::new(identity)) {
             SyncObjectKind::Draft
         } else {
-            [SyncObjectKind::Settings, SyncObjectKind::ClientSelection]
-                .into_iter()
-                .find(|kind| collection == crate::sync::sync_collection(*kind, object_id))
-                .ok_or_else(refused)?
+            [
+                SyncObjectKind::Settings,
+                SyncObjectKind::ClientSelection,
+                SyncObjectKind::RecoveryBundle,
+            ]
+            .into_iter()
+            .find(|kind| collection == crate::sync::sync_collection(*kind, object_id))
+            .ok_or_else(refused)?
         };
         Ok(Self {
             id: SyncCollectionId::new(identity),
             kind,
             object_id,
         })
+    }
+
+    /// Whether this is the recovery bundle's collection, which its locator names.
+    fn is_the_bundle(&self) -> bool {
+        self.kind == SyncObjectKind::RecoveryBundle
+    }
+
+    /// The locator of the recovery bundle this collection holds.
+    const fn locator(&self) -> Uuid {
+        self.object_id.get()
     }
 }
 
@@ -260,6 +295,9 @@ impl Address {
 /* -------------------------------------------------------------------------- */
 
 /// One settings-sync request: exactly one member.
+///
+/// The recovery bundle's requests are four of the same members, addressed by its locator rather
+/// than by a collection and a home, so each has a variant of its own under the member's name.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum SyncRequest<'a> {
@@ -271,6 +309,14 @@ enum SyncRequest<'a> {
     Keys(KeysBody),
     Rekey(RekeyBody<'a>),
     Memberships(MembershipsBody),
+    #[serde(rename = "exchange")]
+    BundleExchange(BundleExchangeBody<'a>),
+    #[serde(rename = "compare")]
+    BundleCompare(BundleCompareBody),
+    #[serde(rename = "status")]
+    BundleStatus(BundleStatusBody),
+    #[serde(rename = "fence")]
+    BundleFence(BundleFenceBody),
 }
 
 /// Write one object, if the service still holds the revision the writer expects.
@@ -386,6 +432,57 @@ struct RekeyBody<'a> {
 struct MembershipsBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     after: Option<String>,
+}
+
+/// Write the recovery bundle at its locator, if the service still holds the revision the writer
+/// expects.
+#[derive(Serialize)]
+struct BundleExchangeBody<'a> {
+    request_id: Uuid,
+    locator: Uuid,
+    /// Always [`SyncObjectKind::RecoveryBundle`], which is what a request naming a locator is
+    /// about.
+    kind: SyncObjectKind,
+    /// The revision this write replaces, or null when it names no bundle, present either way.
+    expected_revision: Option<SyncRevision>,
+    object: &'a SealedRecoveryBundle,
+}
+
+impl fmt::Debug for BundleExchangeBody<'_> {
+    /// What the object is, how long its stream is and whether the write names a revision. Never
+    /// the stream.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BundleExchangeBody")
+            .field("kind", &self.kind)
+            .field("ciphertext_bytes", &self.object.ciphertext.len())
+            .field("expects_a_bundle", &self.expected_revision.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Read the recovery bundle at its locator.
+#[derive(Debug, Serialize)]
+struct BundleCompareBody {
+    locator: Uuid,
+    kind: SyncObjectKind,
+}
+
+/// Ask what the service recorded about one request identity at a recovery bundle's locator.
+#[derive(Debug, Serialize)]
+struct BundleStatusBody {
+    locator: Uuid,
+    request_id: Uuid,
+}
+
+/// End one request identity at a recovery bundle's locator, naming the instants its attempts were
+/// signed at.
+#[derive(Debug, Serialize)]
+struct BundleFenceBody {
+    locator: Uuid,
+    request_id: Uuid,
+    first_signed_at_ms: U64,
+    last_signed_at_ms: U64,
 }
 
 /* -------------------------------------------------------------------------- */
@@ -657,6 +754,28 @@ struct MembershipsAnswer {
     memberships: Vec<MembershipEntry>,
     more: bool,
     next_after: Nullable<String>,
+}
+
+/// The recovery bundle, with its stream, as a read of it answers.
+#[derive(Deserialize)]
+struct BundleRecord {
+    kind: SyncObjectKind,
+    object_id: SyncObjectId,
+    revision: SyncRevision,
+    write_sequence: U64,
+    object: SealedRecoveryBundle,
+    #[expect(dead_code, reason = "held to its schema and never read")]
+    updated_at: String,
+}
+
+/// What `sync.compare_exchange` answers for a read of the recovery bundle: the bundle, or nothing,
+/// and the history either is in. A service keeps no copy of a refused bundle write, so the copies
+/// are none.
+#[derive(Deserialize)]
+struct BundleCompareAnswer {
+    changed: Vec<BundleRecord>,
+    conflicts: Vec<serde::de::IgnoredAny>,
+    recovery_id: Nullable<SyncRecoveryId>,
 }
 
 /// One object a collection holds, as a comparison read it.
@@ -993,6 +1112,9 @@ enum Reply<T> {
 #[derive(Clone, Debug)]
 pub struct ManagedSyncService {
     call: SignedService,
+    /// The account token every request about a recovery bundle carries, when this client was given
+    /// one.
+    account: Option<AccountAuthorisation>,
 }
 
 impl ManagedSyncService {
@@ -1009,7 +1131,21 @@ impl ManagedSyncService {
     ) -> Self {
         Self {
             call: SignedService::new(origin, http, signer),
+            account: None,
         }
+    }
+
+    /// The same client, presenting the account token `tokens` holds for `scope` beside the
+    /// signature of every request about a recovery bundle.
+    ///
+    /// The bundle's collection belongs to an account, and the service admits a request about it
+    /// only with that account's token: `backup.write` for a device that writes the bundle, and
+    /// `backup.restore` for a device restoring from the kit, which only reads it. Requests about
+    /// settings, a client's position, drafts and shared collections carry no token either way.
+    #[must_use]
+    pub fn presenting(mut self, tokens: Arc<dyn AccountTokenSource>, scope: &'static str) -> Self {
+        self.account = Some(AccountAuthorisation::new(tokens, scope));
+        self
     }
 
     /// The gateway this client addresses.
@@ -1036,6 +1172,11 @@ impl ManagedSyncService {
         after: Option<u64>,
     ) -> Result<SyncComparison> {
         let named = Collection::named(collection)?;
+        if named.is_the_bundle() {
+            return Err(malformed(
+                "a recovery bundle is read with a fetch of its locator, not compared",
+            ));
+        }
         let data = self
             .ask(
                 &self.compare_body(Address::own(named), None, with_copies, after, Vec::new())?,
@@ -1162,6 +1303,11 @@ impl ManagedSyncService {
         ciphertext: &[u8],
     ) -> Result<Keyed<SyncExchanged>> {
         let named = Collection::named(object)?;
+        if named.is_the_bundle() {
+            return Err(malformed(
+                "a recovery bundle is kept at its own locator, never in a shared collection",
+            ));
+        }
         a_counter("a key epoch", epoch)?;
         let sealed = sealed_object(ciphertext)?;
         let request = exchange_body(
@@ -1399,7 +1545,7 @@ impl ManagedSyncService {
                     sequence: copy.sequence.get(),
                     conflict_id: copy.conflict_id,
                     object_id: copy.object_id,
-                    kind: copy.kind,
+                    kind: a_collections_kind(copy.kind)?,
                     epoch: epoch_in(head, copy.key_epoch)?,
                 });
             }
@@ -1486,29 +1632,44 @@ impl ManagedSyncService {
     /// Sends one request, signed at the instant the caller states or now, and returns what was
     /// answered, a refusal included.
     async fn ask(&self, request: &SyncRequest<'_>, signed_at_ms: Option<u64>) -> Result<Answer> {
-        match signed_at_ms {
-            Some(signed_at_ms) => {
-                self.call
-                    .answer_at(
-                        SYNC_EXCHANGE_PATH,
-                        Method::SyncCompareExchange,
-                        request,
-                        MAX_SYNC_REQUEST_BYTES,
-                        signed_at_ms,
-                    )
-                    .await
-            }
-            None => {
-                self.call
-                    .answer(
-                        SYNC_EXCHANGE_PATH,
-                        Method::SyncCompareExchange,
-                        request,
-                        MAX_SYNC_REQUEST_BYTES,
-                    )
-                    .await
-            }
-        }
+        Ok(self.dispatch(request, signed_at_ms, None).await?)
+    }
+
+    /// Sends one request about the recovery bundle, with the account token beside its signature,
+    /// and says whether a request that went unanswered left this device.
+    ///
+    /// A client that presents no account refuses it here, and nothing is sent.
+    async fn ask_bundle(
+        &self,
+        request: &SyncRequest<'_>,
+        signed_at_ms: Option<u64>,
+    ) -> std::result::Result<Answer, Unanswered> {
+        let Some(account) = &self.account else {
+            return Err(Unanswered::NotSent(ClientError::Host(ProtocolError::new(
+                ErrorCode::HostNotConfigured,
+                "a recovery bundle is reached with an account token, and this client presents no account",
+            ))));
+        };
+        self.dispatch(request, signed_at_ms, Some(account)).await
+    }
+
+    /// Sends one request, and returns what was answered or why nothing was.
+    async fn dispatch(
+        &self,
+        request: &SyncRequest<'_>,
+        signed_at_ms: Option<u64>,
+        account: Option<&AccountAuthorisation>,
+    ) -> std::result::Result<Answer, Unanswered> {
+        self.call
+            .dispatch(
+                SYNC_EXCHANGE_PATH,
+                Method::SyncCompareExchange,
+                request,
+                MAX_SYNC_REQUEST_BYTES,
+                signed_at_ms,
+                account,
+            )
+            .await
     }
 
     /// The request one comparison makes.
@@ -1541,7 +1702,11 @@ impl ManagedSyncService {
     /* A collection only its home writes                                       */
     /* ---------------------------------------------------------------------- */
 
-    /// One exchange: the write, under the identity and the instant the caller states.
+    /// One exchange: the write, under the identity and the instant the caller states, and whether
+    /// a request that went unanswered left this device.
+    ///
+    /// Everything refused before the request is sent, the name, the object, the account token, the
+    /// signature and its clock window, and the size, is [`SyncDispatch::NotSent`].
     async fn exchange(
         &self,
         collection: &str,
@@ -1549,36 +1714,86 @@ impl ManagedSyncService {
         signed_at_ms: u64,
         expected: Option<SyncPosition>,
         ciphertext: &[u8],
-    ) -> Result<SyncExchanged> {
-        let named = Collection::named(collection)?;
-        let object = sealed_object(ciphertext)?;
-        let request = exchange_body(
-            Address::own(named),
-            named,
-            None,
-            request_id,
-            expected,
-            &object,
-        );
-        let answer = self.ask(&request, Some(signed_at_ms)).await?;
+    ) -> Result<SyncDispatch> {
+        let named = match Collection::named(collection) {
+            Ok(named) => named,
+            Err(refused) => return Ok(SyncDispatch::NotSent(refused)),
+        };
+        let answer = if named.is_the_bundle() {
+            let bundle = match sealed_bundle(ciphertext) {
+                Ok(bundle) => bundle,
+                Err(refused) => return Ok(SyncDispatch::NotSent(refused)),
+            };
+            let request = SyncRequest::BundleExchange(BundleExchangeBody {
+                request_id,
+                locator: named.locator(),
+                kind: SyncObjectKind::RecoveryBundle,
+                // The comparison is about identity, as an object's is: the revision and only the
+                // revision.
+                expected_revision: expected.and_then(|position| position.revision.0),
+                object: &bundle,
+            });
+            self.ask_bundle(&request, Some(signed_at_ms)).await
+        } else {
+            let object = match sealed_object(ciphertext) {
+                Ok(object) => object,
+                Err(refused) => return Ok(SyncDispatch::NotSent(refused)),
+            };
+            let request = exchange_body(
+                Address::own(named),
+                named,
+                None,
+                request_id,
+                expected,
+                &object,
+            );
+            self.dispatch(&request, Some(signed_at_ms), None).await
+        };
+        let answer = match answer {
+            Ok(answer) => answer,
+            Err(Unanswered::NotSent(refused)) => return Ok(SyncDispatch::NotSent(refused)),
+            Err(Unanswered::Sent(error)) => return Err(error),
+        };
         if signed_before_cutoff(&answer) {
-            return Ok(SyncExchanged::SignedBeforeCutoff);
+            return Ok(SyncDispatch::Answered(SyncExchanged::SignedBeforeCutoff));
         }
-        exchanged(
+        let exchanged = exchanged(
             read(answer.data()?, "what an exchange answered")?,
             named.object_id,
-        )
+        )?;
+        if named.is_the_bundle()
+            && matches!(
+                exchanged,
+                SyncExchanged::Refused {
+                    retained: Some(_),
+                    ..
+                }
+            )
+        {
+            return Err(contrary(
+                "a refused recovery bundle write with a copy, which a service never keeps",
+            ));
+        }
+        Ok(SyncDispatch::Answered(exchanged))
     }
 
     /// One status query: what the service recorded about one request identity.
     async fn status(&self, collection: &str, request_id: Uuid) -> Result<SyncRequestStatus> {
         let named = Collection::named(collection)?;
-        let request = SyncRequest::Status(StatusBody {
-            collection_id: named.id,
-            home: None,
-            request_id,
-        });
-        let data = self.ask(&request, None).await?.data()?;
+        let data = if named.is_the_bundle() {
+            let request = SyncRequest::BundleStatus(BundleStatusBody {
+                locator: named.locator(),
+                request_id,
+            });
+            self.ask_bundle(&request, None).await?.data()?
+        } else {
+            let request = SyncRequest::Status(StatusBody {
+                collection_id: named.id,
+                home: None,
+                request_id,
+            });
+            self.ask(&request, None).await?.data()?
+        };
         let answer = status_answer(data, request_id, "what a status query answered")?;
         let recovery = answer.recovery_id.0;
         Ok(match answer.state {
@@ -1609,13 +1824,25 @@ impl ManagedSyncService {
         last_signed_at_ms: u64,
     ) -> Result<SyncRequestFence> {
         let named = Collection::named(collection)?;
-        let request = fence_body(
-            Address::own(named),
-            request_id,
-            first_signed_at_ms,
-            last_signed_at_ms,
-        )?;
-        let data = self.ask(&request, None).await?.data()?;
+        let data = if named.is_the_bundle() {
+            let (first_signed_at_ms, last_signed_at_ms) =
+                fence_instants(first_signed_at_ms, last_signed_at_ms)?;
+            let request = SyncRequest::BundleFence(BundleFenceBody {
+                locator: named.locator(),
+                request_id,
+                first_signed_at_ms,
+                last_signed_at_ms,
+            });
+            self.ask_bundle(&request, None).await?.data()?
+        } else {
+            let request = fence_body(
+                Address::own(named),
+                request_id,
+                first_signed_at_ms,
+                last_signed_at_ms,
+            )?;
+            self.ask(&request, None).await?.data()?
+        };
         let answer = status_answer(data, request_id, "what a fence answered")?;
         let recovery = answer.recovery_id.0;
         Ok(match answer.state {
@@ -1641,6 +1868,11 @@ impl ManagedSyncService {
     /// One resolution: drops the copy one refusal kept.
     async fn drop_copy(&self, collection: &str, retained: SyncConflictId) -> Result<bool> {
         let named = Collection::named(collection)?;
+        if named.is_the_bundle() {
+            return Err(malformed(
+                "a recovery bundle keeps no copies, so there is none to resolve",
+            ));
+        }
         let request = resolve_body(Address::own(named), retained);
         dropped(self.ask(&request, None).await?.data()?)
     }
@@ -1649,6 +1881,17 @@ impl ManagedSyncService {
     /// that holds none.
     async fn held(&self, collection: &str) -> Result<SyncFetched> {
         let named = Collection::named(collection)?;
+        if named.is_the_bundle() {
+            let request = SyncRequest::BundleCompare(BundleCompareBody {
+                locator: named.locator(),
+                kind: SyncObjectKind::RecoveryBundle,
+            });
+            let data = self.ask_bundle(&request, None).await?.data()?;
+            return bundle_fetched(
+                read(data, "what a read of a recovery bundle answered")?,
+                named.object_id,
+            );
+        }
         // A read for one kind, which is the whole of what section 20 lets the service know about
         // an object it cannot read.
         let request = self.compare_body(
@@ -1875,6 +2118,26 @@ impl SyncBackupService for ManagedSyncService {
         expected: Option<SyncPosition>,
         ciphertext: &'a [u8],
     ) -> ServiceFuture<'a, SyncExchanged> {
+        Box::pin(async move {
+            match self
+                .exchange(collection, request_id, signed_at_ms, expected, ciphertext)
+                .await?
+            {
+                SyncDispatch::Answered(answer) => Ok(answer),
+                SyncDispatch::NotSent(refused) => Err(refused),
+            }
+        })
+    }
+
+    /// This client knows which of its refusals were made before anything left, so it says so.
+    fn compare_exchange_dispatched<'a>(
+        &'a self,
+        collection: &'a str,
+        request_id: Uuid,
+        signed_at_ms: u64,
+        expected: Option<SyncPosition>,
+        ciphertext: &'a [u8],
+    ) -> ServiceFuture<'a, SyncDispatch> {
         Box::pin(self.exchange(collection, request_id, signed_at_ms, expected, ciphertext))
     }
 
@@ -2000,6 +2263,20 @@ fn fence_body(
     first_signed_at_ms: u64,
     last_signed_at_ms: u64,
 ) -> Result<SyncRequest<'static>> {
+    let (first_signed_at_ms, last_signed_at_ms) =
+        fence_instants(first_signed_at_ms, last_signed_at_ms)?;
+    Ok(SyncRequest::Fence(FenceBody {
+        collection_id: address.collection_id,
+        home: address.home,
+        request_id,
+        first_signed_at_ms,
+        last_signed_at_ms,
+    }))
+}
+
+/// The earliest and latest signing instants a fence names, held to the rules the service reads
+/// them by.
+fn fence_instants(first_signed_at_ms: u64, last_signed_at_ms: u64) -> Result<(U64, U64)> {
     a_counter("the earliest signing time", first_signed_at_ms)?;
     a_counter("the latest signing time", last_signed_at_ms)?;
     if first_signed_at_ms > last_signed_at_ms {
@@ -2007,13 +2284,7 @@ fn fence_body(
             "a fence names the earliest signing time no later than the latest",
         ));
     }
-    Ok(SyncRequest::Fence(FenceBody {
-        collection_id: address.collection_id,
-        home: address.home,
-        request_id,
-        first_signed_at_ms: U64::new(first_signed_at_ms),
-        last_signed_at_ms: U64::new(last_signed_at_ms),
-    }))
+    Ok((U64::new(first_signed_at_ms), U64::new(last_signed_at_ms)))
 }
 
 /// The request one resolution makes.
@@ -2140,7 +2411,7 @@ fn comparison(answer: CompareAnswer) -> Result<SyncComparison> {
         .map(|held| {
             Ok(SyncHeldObject {
                 object_id: held.object_id,
-                kind: held.kind,
+                kind: a_collections_kind(held.kind)?,
                 position: SyncPosition::at(held.write_sequence.get(), held.revision, recovery),
                 epoch: epoch_in(head, held.key_epoch)?,
                 ciphertext: encoded(&held.object)?,
@@ -2165,7 +2436,7 @@ fn comparison(answer: CompareAnswer) -> Result<SyncComparison> {
                 sequence: copy.sequence.get(),
                 conflict_id: copy.conflict_id,
                 object_id: copy.object_id,
-                kind: copy.kind,
+                kind: a_collections_kind(copy.kind)?,
                 expected_revision: copy.expected_revision,
                 current: copy_position(
                     &copy.current_revision,
@@ -2356,6 +2627,64 @@ fn sealed_object(ciphertext: &[u8]) -> Result<SealedSyncObject> {
 fn encoded(object: &SealedSyncObject) -> Result<Vec<u8>> {
     kr_cbor::to_canonical_vec(object)
         .map_err(|_| contrary("a sealed object this client cannot encode as one"))
+}
+
+/// Holds the stream a caller asked to publish as the recovery bundle to the bound a service keeps.
+///
+/// Refused here rather than sent, naming a length and nothing of the stream. The bytes travel as
+/// they are: the stream carries its own header, and only the key it was sealed under opens it.
+fn sealed_bundle(ciphertext: &[u8]) -> Result<SealedRecoveryBundle> {
+    let bundle = SealedRecoveryBundle {
+        ciphertext: kr_protocol::scalars::Bytes::new(ciphertext.to_vec()),
+    };
+    bundle.check_structure().map_err(|rule| {
+        malformed(format!(
+            "that recovery bundle is not one a service admits: {rule}"
+        ))
+    })?;
+    Ok(bundle)
+}
+
+/// What a read of the recovery bundle found: the bundle and where it stands, or the history of a
+/// locator that holds none.
+///
+/// One bundle is kept at one locator, so the answer carries it, or nothing; it names this locator
+/// and this kind; and a service keeps no copy of a refused bundle write, so it carries no copy.
+fn bundle_fetched(answer: BundleCompareAnswer, locator: SyncObjectId) -> Result<SyncFetched> {
+    let recovery = answer.recovery_id.0;
+    if !answer.conflicts.is_empty() {
+        return Err(contrary(
+            "a copy of a recovery bundle write, which a service never keeps",
+        ));
+    }
+    let mut changed = answer.changed.into_iter();
+    match (changed.next(), changed.next()) {
+        (None, _) => Ok(SyncFetched::Absent { recovery }),
+        (Some(held), None)
+            if held.kind == SyncObjectKind::RecoveryBundle && held.object_id == locator =>
+        {
+            Ok(SyncFetched::Held {
+                position: SyncPosition::at(held.write_sequence.get(), held.revision, recovery),
+                ciphertext: held.object.ciphertext.into_vec(),
+            })
+        }
+        (Some(_), None) => Err(contrary("a read of a recovery bundle with another object")),
+        (Some(_), Some(_)) => Err(contrary("a read of one recovery bundle with two")),
+    }
+}
+
+/// Holds an object or a copy a collection's answer names to one of the kinds a collection holds.
+///
+/// A recovery bundle is kept at its own locator and never in a collection, so one named among a
+/// collection's objects is an answer about something else.
+fn a_collections_kind(kind: SyncObjectKind) -> Result<SyncObjectKind> {
+    if kind.holds_a_sealed_object() {
+        Ok(kind)
+    } else {
+        Err(contrary(
+            "a recovery bundle among a collection's objects or copies",
+        ))
+    }
 }
 
 /// Where the object stood when a copy was kept, as the service wrote it down.

@@ -2139,5 +2139,7 @@ fn a_rendering_of_a_request_an_object_or_a_copy_carries_nothing_sealed() {
     }
 }
 
+/// The recovery bundle at its locator, against the contract a real service keeps for it.
+mod bundle;
 /// The calls about collections two or more devices share.
 mod shared;

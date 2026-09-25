@@ -763,6 +763,20 @@ pub fn nothing_held(what: &str) -> ClientError {
     ))
 }
 
+/// What became of one exchange, for a caller that has to know whether a request that went
+/// unanswered ever left this device.
+///
+/// An error beside it is a request that may have left: its answer never came back, or came back in
+/// a form nobody can read, and the service may have run it.
+#[derive(Debug)]
+pub enum SyncDispatch {
+    /// The service answered.
+    Answered(SyncExchanged),
+    /// Refused on this device before anything was sent, so nothing can run under the request's
+    /// identity.
+    NotSent(ClientError),
+}
+
 /// Where a shared collection's key records stood when a service answered: the newest record's key
 /// epoch and its revision.
 ///
@@ -885,6 +899,32 @@ pub trait SyncBackupService: Send + Sync + std::fmt::Debug {
         expected: Option<SyncPosition>,
         ciphertext: &'a [u8],
     ) -> ServiceFuture<'a, SyncExchanged>;
+
+    /// Publishes an encrypted object as [`Self::compare_exchange`] does, and says when the request
+    /// never left this device.
+    ///
+    /// A caller that records a write before it sends it needs one fact more than the answer:
+    /// whether a request that went unanswered was sent at all. One refused on this device before
+    /// anything left cannot run, so its record can be put back as it was; one that may have left
+    /// cannot be taken back, and stays outstanding until the service ends it.
+    ///
+    /// An implementation that can tell answers [`SyncDispatch::NotSent`] for a request it refused
+    /// before anything left. The default cannot tell, so it counts every failure as possibly sent,
+    /// which is the safe direction.
+    fn compare_exchange_dispatched<'a>(
+        &'a self,
+        collection: &'a str,
+        request_id: Uuid,
+        signed_at_ms: u64,
+        expected: Option<SyncPosition>,
+        ciphertext: &'a [u8],
+    ) -> ServiceFuture<'a, SyncDispatch> {
+        Box::pin(async move {
+            self.compare_exchange(collection, request_id, signed_at_ms, expected, ciphertext)
+                .await
+                .map(SyncDispatch::Answered)
+        })
+    }
 
     /// Returns what the service recorded about one request.
     ///
@@ -1194,6 +1234,22 @@ impl SyncBackupService for NullService {
         unconfigured(ManagedService::SyncBackup.as_str())
     }
 
+    /// Nothing is configured, so nothing is sent.
+    fn compare_exchange_dispatched<'a>(
+        &'a self,
+        _collection: &'a str,
+        _request_id: Uuid,
+        _signed_at_ms: u64,
+        _expected: Option<SyncPosition>,
+        _ciphertext: &'a [u8],
+    ) -> ServiceFuture<'a, SyncDispatch> {
+        Box::pin(async move {
+            Ok(SyncDispatch::NotSent(ClientError::ServiceNotConfigured(
+                ManagedService::SyncBackup.as_str(),
+            )))
+        })
+    }
+
     fn request_status<'a>(
         &'a self,
         _collection: &'a str,
@@ -1277,6 +1333,27 @@ mod tests {
             .await
             .expect_err("nothing is configured");
         assert!(error.to_string().contains("relay leases"));
+    }
+
+    /// A client with no sync service sends nothing, so an exchange it is asked for says it never
+    /// left, and a caller that recorded the write before sending can take the record back.
+    #[tokio::test]
+    async fn the_null_service_sends_no_exchange_and_says_so() {
+        let dispatched = NullService
+            .compare_exchange_dispatched(
+                "settings/00000000-0000-4000-8000-000000000001",
+                Uuid::from_bytes([1; 16]),
+                1,
+                None,
+                b"sealed",
+            )
+            .await
+            .expect("an answer about the request");
+        let SyncDispatch::NotSent(refused) = dispatched else {
+            panic!("nothing is configured, so nothing was sent: {dispatched:?}");
+        };
+        assert_eq!(refused.code(), ErrorCode::HostNotConfigured);
+        assert!(refused.to_string().contains("sync and backup"));
     }
 
     #[test]

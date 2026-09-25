@@ -10,8 +10,10 @@
 //!   [`BundleStore::enable_writer`] returns the evidence, and the evidence cannot be built without
 //!   the commit having landed.
 //! * **Service access is not decryption.** A fresh restore obtains access through the configured
-//!   retrieval policy and then authenticates the bundle with the kit. Signing in gets a restore to
-//!   the ciphertext and no further: [`FreshRestore`] will not open a bundle it has only access to.
+//!   retrieval policy and then authenticates the bundle with the kit. The access is the reader the
+//!   policy gave the device, and the service decides what that reader reaches; signing in gets a
+//!   restore to the ciphertext and no further: [`FreshRestore`] will not open a bundle it has only
+//!   access to.
 //! * **Substituting the origin or the locator fails authentication.** The bundle's key is derived
 //!   from the seed *and* its retrieval context, so a bundle served from somewhere else does not
 //!   open. It does not fall back to a writer key the archive supplied, because nothing here reads
@@ -45,7 +47,7 @@ use crate::services::SyncPosition;
 
 pub use crate::recovery::bundle::{
     BundleStore, LostWrite, Migrated, MigrationRecord, OfflineExport, WriterEnabled,
-    bundle_collection,
+    bundle_collection, fresh_locator,
 };
 pub use crate::recovery::kit::{
     MAX_RECOVERY_KIT_BYTES, RECOVERY_KIT_FORMAT, parse as parse_kit, qr_payload,
@@ -188,6 +190,29 @@ pub enum RecoveryError {
         /// Why no answer came back.
         #[source]
         source: Box<crate::error::ClientError>,
+    },
+    /// A bundle write was refused on this device before anything was sent.
+    ///
+    /// Nothing can run under the request's identity, so the store is as the call found it and the
+    /// next write goes out. What refused it is the source: no account token for the bundle, a
+    /// signing instant outside the service's window, a locator the service cannot address.
+    #[error("the recovery bundle write was not sent: {source}")]
+    BundleNotSent {
+        /// Why it was not sent.
+        #[source]
+        source: Box<crate::error::ClientError>,
+    },
+    /// The sealed bundle is larger than a service keeps one.
+    ///
+    /// Refused before anything is recorded or sent.
+    #[error(
+        "the sealed recovery bundle is {len} bytes, over the {limit}-byte limit a service keeps"
+    )]
+    BundleTooLarge {
+        /// The sealed length.
+        len: usize,
+        /// The limit.
+        limit: u64,
     },
     /// A write whose answer never came back is still outstanding.
     ///
