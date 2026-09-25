@@ -21,6 +21,7 @@ A Cargo workspace and a pnpm workspace share one tree.
 | `crates/kr-worker` | The session worker: pseudo-terminal, canonical grid, lifecycle, attachments, input lease and receipt journal |
 | `crates/kr-controller` | The control daemon: registry, create admission, worker supervision, the local service and the network |
 | `crates/kr-cli` | The `kr` command line and its terminal restoration guard |
+| `crates/kr-hook` | The forwarder: the native bridge an application starts beside its unchanged terminal, and the relay a launched agent reaches its worker through |
 | `crates/kr-crypto` | Cryptography: a narrow libsodium wrapper, purpose-separated device keys, encrypted objects and secret storage |
 | `crates/kr-pairing` | Pairing: the short-code SPAKE2 and direct QR state machines, their budgets and their transcripts |
 | `crates/kr-transport` | Transport: iroh endpoints, the connection handshake, stream kinds, actor envelopes, action windows and dispatch leases |
@@ -36,24 +37,20 @@ A Cargo workspace and a pnpm workspace share one tree.
 | `crates/kr-transfer` | The transfer service: uploads, verified downloads, handle-based filesystem authority and bounded previews |
 | `crates/kr-project` | The project service: repositories, workspaces, the restricted Git execution profile and staged publish |
 | `crates/kr-changeset` | The change-set service: immutable captured versions, their content store, independent materialisations and the apply outcome classes |
+| `crates/kr-attention` | The attention engine: the rule set, quiet hours and escalation, review and visit acknowledgements, and the feature store they are rebuilt from |
+| `crates/kr-automation` | The automation engine: workflow definitions, runs, causal budgets and admission |
+| `crates/kr-delivery` | The delivery producer: the delivery journal, notification previews, the push outbox and external notification destinations |
+| `crates/kr-describe` | The description service: deterministic session titles, one shared CPU-only inference process per environment, its signed model profiles, the scheduler and resource policy, and the names, pins and provenance store |
+| `crates/kr-voice` | The voice coordinator: context selection, delegation, the voice grant and the unlocked-screen confirmation |
 | `skills/kalareach-contact` | The installable contact skill: what an agent reads, its tool reference and its installation manifest |
+| `apps/companion` | The Tauri companion application for desktops and phones: the React interface, its native backend in `src-tauri`, the native platform services in `native/platform`, and the iOS and Android sources beside them |
 | `packages/protocol` | The generated TypeScript package: types, a byte-compatible codec and the JSON adapter |
 | `packages/plugin-sdk` | The generated plugin SDK package: types, the package contract as data and the published WIT file |
 | `bundled-plugins/` | The plugin package that ships with the host, and the lock that names every byte of it |
 | `fixtures/` | Cross-language conformance vectors and fixture packages that both languages test against |
-| `docs/protocol/` | The protocol reference |
-| `docs/host/` | The host: process topology, directories, descriptors, supervision, the terminal, action windows, journals and recovery |
-| `docs/cli/` | The command line: commands, exit codes and the `--json` shapes |
-| `docs/crypto/` | The cryptography reference |
-| `docs/pairing/` | The pairing reference |
-| `docs/transport/` | The transport reference |
-| `docs/plugins/` | The plugin reference |
-| `docs/terminal/` | The terminal reference |
-| `docs/shell-integration/` | The root-editor bridge contract for shell packages, the host side of it, and what each managed package changes |
-| `docs/releases/` | How the generated packages are released, and how a consumer pins one |
-| `docs/transfer/` | The transfer reference |
-| `docs/project/` | The project reference |
-| `docs/contact/` | Agent contact: the skill, the tools, the question ledger and installation |
+| `tests/` | Suites that span crates: the cross-boundary checkpoint in `tests/e2e/m1b`, the legs against a deployment in `tests/integration`, and the shell qualification corpus in `tests/shells` |
+| `scripts/` | Builds and checks that span crates: the test components, the shell packages, the bundled package, the end-to-end, performance and device runs, the package release and the clean-checkout check |
+| `docs/` | The documentation; [docs/README.md](docs/README.md) lists every document |
 
 Rust is canonical. The JSON Schema in `packages/protocol/schema/` and `packages/plugin-sdk/schema/`
 comes from the Rust types, and the TypeScript types come from those schemas. Every step has a check
@@ -240,21 +237,5 @@ protected.
   does](docs/host/platforms.md#what-a-reboot-does) and [What logout
   does](docs/host/platforms.md#what-logout-does).
 
-[docs/protocol/README.md](docs/protocol/README.md) explains the encoding, the framing, the
-envelopes, the receipt contract, the error codes and the authority table.
-[docs/host/README.md](docs/host/README.md) explains how the host runs sessions, and
-[docs/cli/README.md](docs/cli/README.md) is the command-line reference.
-[docs/crypto/README.md](docs/crypto/README.md) explains the cryptographic boundary: the key
-purposes, the domains, the encrypted object formats and the secret store.
-[docs/pairing/README.md](docs/pairing/README.md) explains the two pairing flows, their budgets, the
-PAKE profile and the review gate it carries.
-[docs/transport/README.md](docs/transport/README.md) explains the network layer: endpoint
-configuration, the connection handshake, stream kinds and limits, reconnect behaviour, actor
-envelopes, action windows, the dispatch lease and the self-hosting fields.
-[docs/plugins/README.md](docs/plugins/README.md) explains the package contract, the manifests, the
-effect classes, the node union, the predicate grammar and the limits.
-[docs/terminal/README.md](docs/terminal/README.md) explains the kr-vt/1 profile, the sequence class
-table, the byte policy, the query broker, snapshots and the probe contract.
-[docs/shell-integration/README.md](docs/shell-integration/README.md) explains what a managed shell
-package implements: the bridge endpoint and handshake, the reader events, the reader-thread rules,
-the fence and detach state machine, the qualification rules and the cross-shell scenarios.
+[docs/README.md](docs/README.md) indexes the documentation: the protocol reference and its method
+index, and one reference for each part of the host, the clients and the plugins.

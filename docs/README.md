@@ -65,7 +65,8 @@ Releases:
 | [releases/packages.md](releases/packages.md) | How the generated protocol and plugin SDK packages are released and pinned, and the managed shell packages' update target |
 | [releases/windows-signing.md](releases/windows-signing.md) | How Windows executables and PowerShell packages are signed, and the identity behind the signatures |
 
-The [repository README](../README.md) says how to build and test this repository.
+The [repository README](../README.md) says how to build and test this repository, how it is
+released and how a host recovers.
 
 ## Three repositories
 
