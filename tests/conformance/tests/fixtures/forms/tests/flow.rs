@@ -4,7 +4,7 @@
 #[test]
 fn documented() {}
 
-// KR-REQ-03.03: a plain comment directly above a test.
+// KR-REQ-03.03, and KR-REQ-03.01 again: a plain comment directly above a test.
 #[test]
 fn commented() {}
 

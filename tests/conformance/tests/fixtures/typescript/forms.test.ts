@@ -18,4 +18,10 @@ describe('the forms', () => {
   // KR-REQ-06.06: a comment with a blank line after it keys no test.
 
   it('is not keyed by the note above', () => {})
+
+  // KR-REQ-06.07: a table of cases, which a run reports where its arguments open.
+  it.each([
+    ['one'],
+    ['two']
+  ])('holds %s', () => {})
 })

@@ -5,7 +5,8 @@
 //! * `passed` or `failed`, from a step that ran it;
 //! * `ignored`, with the reason its attribute gives, when every step that listed it left it out;
 //! * `not_run`, with the reason, when no step of this run ran it here: a step left it out by name,
-//!   no selected group runs its target on this platform, or its lane is another toolchain's;
+//!   no selected group runs its target on this platform, its lane is another toolchain's, or it
+//!   returned early and said why;
 //! * `not_built`, when a step ran its target and this platform's build of it has no such test.
 //!
 //! An identifier has failed when any of its tests failed, has passed when at least one ran and
@@ -322,6 +323,9 @@ pub enum Stopped {
     Refused(Vec<map::Refused>),
     /// The map cannot be trusted.
     Problems(Vec<String>),
+    /// The evidence directory cannot take this run: it holds an earlier run's report, or the
+    /// report's own directory in it could not be made.
+    Evidence(String),
 }
 
 /// Builds the map for a run of `options`.
@@ -363,7 +367,35 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
         .selection
         .clone()
         .unwrap_or_else(|| Group::ALL.to_vec());
-    let before = evidence::before(&options.evidence);
+    // The report's own files are all made new for this run, so nothing an earlier run left can be
+    // read as this run's: a directory that already holds a report is refused.
+    let own = options.evidence.join("conformance");
+    if let Err(error) = std::fs::create_dir(&own) {
+        return Err(Stopped::Evidence(
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                format!(
+                    "{} holds an earlier run's report; each run takes an evidence directory of its \
+                     own",
+                    own.display()
+                )
+            } else {
+                format!("{} could not be made: {error}", own.display())
+            },
+        ));
+    }
+    for part in ["logs", "vitest"] {
+        std::fs::create_dir(own.join(part)).map_err(|error| {
+            Stopped::Evidence(format!(
+                "{} could not be made: {error}",
+                own.join(part).display()
+            ))
+        })?;
+    }
+    let mut problems = Vec::new();
+    let before = evidence::before(&options.evidence).unwrap_or_else(|problem| {
+        problems.push(problem);
+        evidence::Before::default()
+    });
     let evidence_text = options.evidence.to_string_lossy().replace('\\', "/");
     let applications_plan = options
         .applications
@@ -391,7 +423,6 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
             applications_plan.as_ref(),
         )
     });
-    let _ = std::fs::create_dir_all(options.evidence.join("conformance").join("vitest"));
     let mut executed = Vec::new();
     for (index, step) in steps.iter().enumerate() {
         progress(&format!(
@@ -423,12 +454,16 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
         ));
         executed.push(done);
     }
-    let (known, problems) = match evidence::known_differences(&options.evidence, &before) {
-        Ok(known) => (known, Vec::new()),
-        Err(problem) => (Vec::new(), vec![problem]),
-    };
+    let known = evidence::known_differences(&options.evidence, &before).unwrap_or_else(|problem| {
+        problems.push(problem);
+        Vec::new()
+    });
+    let figures = evidence::figures(&options.evidence, &before).unwrap_or_else(|problem| {
+        problems.push(problem);
+        BTreeMap::new()
+    });
     let gathered = Gathered {
-        figures: evidence::figures(&options.evidence, &before),
+        figures,
         known,
         problems,
     };
@@ -474,9 +509,14 @@ pub fn assemble(
     let mut summary = Summary::default();
     for identifier in all {
         let mut tests = Vec::new();
+        // A test keyed twice, by its own comment and by its module's, is one test: the first
+        // key, the most particular, is the one recorded.
+        let mut seen = BTreeSet::new();
         for (place, key) in map.keys.get(&identifier).into_iter().flatten() {
             for record in resolver.resolve(place, key) {
-                if options.selection.is_none() || resolver.selected(place) {
+                if (options.selection.is_none() || resolver.selected(place))
+                    && seen.insert(record.test.clone())
+                {
                     tests.push(record);
                 }
             }
@@ -696,7 +736,7 @@ impl<'a> Resolver<'a> {
                 file,
                 line,
                 title,
-            } => vec![self.typescript(package, file, *line, title, key)],
+            } => self.typescript(package, file, *line, title, key),
             Place::Lane { file, reason } => vec![TestRecord {
                 test: file.clone(),
                 source: key.source.clone(),
@@ -769,6 +809,11 @@ impl<'a> Resolver<'a> {
                                 .clone()
                                 .unwrap_or_else(|| "ignored without a reason".to_owned()),
                         ),
+                    },
+                    LibtestOutcome::Skipped(line) => RunRecord {
+                        step: index + 1,
+                        outcome: Outcome::NotRun,
+                        reason: Some(format!("it returned early and said why: {line}")),
                     },
                 }
             } else if let Some((_, reason)) = step
@@ -914,7 +959,7 @@ impl<'a> Resolver<'a> {
                     "--skip" => {
                         after.next();
                     }
-                    "--exact" => {}
+                    "--exact" | "--show-output" => {}
                     flag if flag.starts_with("--") => test_arguments.push(flag.to_owned()),
                     _ => {}
                 }
@@ -940,6 +985,9 @@ impl<'a> Resolver<'a> {
             .join(" ")
     }
 
+    /// The records of one keyed TypeScript test: one for each test the run reported at its
+    /// location, each under the titles the run gave it, since a table of tests declared by one
+    /// call is several tests; or one record, when the run reported none there.
     fn typescript(
         &self,
         package: &str,
@@ -947,91 +995,135 @@ impl<'a> Resolver<'a> {
         line: usize,
         title: &str,
         key: &map::Key,
-    ) -> TestRecord {
-        let lane = self
-            .options
-            .lanes
-            .iter()
-            .find(|lane| plan::matches(lane.files, file));
-        let mut runs = Vec::new();
-        if lane.is_none() {
-            for (index, step) in self.executed.iter().enumerate() {
-                let plan::Reading::Vitest { directory } = &step.step.reading else {
-                    continue;
-                };
-                if directory != package {
-                    continue;
-                }
-                match &step.vitest {
-                    Some(results) => match results.get(&(file.to_owned(), line)) {
-                        Some(outcomes) => {
-                            for outcome in outcomes {
-                                runs.push(match outcome {
-                                    LibtestOutcome::Passed => RunRecord {
-                                        step: index + 1,
-                                        outcome: Outcome::Passed,
-                                        reason: None,
-                                    },
-                                    LibtestOutcome::Failed => RunRecord {
-                                        step: index + 1,
-                                        outcome: Outcome::Failed,
-                                        reason: None,
-                                    },
-                                    LibtestOutcome::Ignored(reason) => RunRecord {
-                                        step: index + 1,
-                                        outcome: Outcome::Ignored,
-                                        reason: reason.clone(),
-                                    },
-                                });
-                            }
-                        }
-                        None => runs.push(RunRecord {
-                            step: index + 1,
-                            outcome: Outcome::NotRun,
-                            reason: Some(
-                                "the package's test script did not report this test".to_owned(),
-                            ),
-                        }),
-                    },
-                    None => runs.push(RunRecord {
-                        step: index + 1,
-                        outcome: Outcome::Failed,
-                        reason: Some(format!(
-                            "the package's tests did not report: {}",
-                            step.error.clone().unwrap_or_default()
-                        )),
-                    }),
-                }
-            }
-        }
-        let default_reason = lane.map_or_else(
-            || {
-                plan::group_absent_reason(Group::TypeScript, self.options.platform)
-                    .unwrap_or("no step of this run's selection runs the TypeScript suites")
-                    .to_owned()
-            },
-            |lane| lane.reason.to_owned(),
-        );
-        let (outcome, reason) = combine(&runs).unwrap_or((Outcome::NotRun, Some(default_reason)));
+    ) -> Vec<TestRecord> {
         let relative = file.strip_prefix(&format!("{package}/")).unwrap_or(file);
-        TestRecord {
-            test: format!("{file} {title}"),
+        let record = |test: String,
+                      outcome: Outcome,
+                      reason: Option<String>,
+                      runs: Vec<RunRecord>,
+                      command: Option<String>| TestRecord {
+            test,
             source: key.source.clone(),
             keyed_by: key.binding,
             outcome,
             reason,
-            command: lane.is_none().then(|| {
-                format!(
-                    "pnpm --dir {} exec vitest run {} -t {}",
-                    plan::quote(package),
-                    plan::quote(relative),
-                    plan::quote(&escape_pattern(title))
-                )
-            }),
+            command,
             needs: Vec::new(),
             runs,
             known_differences: Vec::new(),
+        };
+        let command = |pattern: String| {
+            format!(
+                "pnpm --dir {} exec vitest run {} -t {}",
+                plan::quote(package),
+                plan::quote(relative),
+                plan::quote(&pattern)
+            )
+        };
+        let unreported = command(escape_pattern(title));
+        if let Some(lane) = self
+            .options
+            .lanes
+            .iter()
+            .find(|lane| plan::matches(lane.files, file))
+        {
+            return vec![record(
+                format!("{file} {title}"),
+                Outcome::NotBuilt,
+                Some(lane.reason.to_owned()),
+                Vec::new(),
+                None,
+            )];
         }
+        let step = self.executed.iter().enumerate().find(|(_, step)| {
+            matches!(&step.step.reading, plan::Reading::Vitest { directory } if directory == package)
+        });
+        let Some((index, step)) = step else {
+            let reason = plan::group_absent_reason(Group::TypeScript, self.options.platform)
+                .unwrap_or("no step of this run's selection runs the TypeScript suites")
+                .to_owned();
+            return vec![record(
+                format!("{file} {title}"),
+                Outcome::NotRun,
+                Some(reason),
+                Vec::new(),
+                Some(unreported),
+            )];
+        };
+        let Some(results) = &step.vitest else {
+            let run = RunRecord {
+                step: index + 1,
+                outcome: Outcome::Failed,
+                reason: Some(format!(
+                    "the package's tests did not report: {}",
+                    step.error.clone().unwrap_or_default()
+                )),
+            };
+            return vec![record(
+                format!("{file} {title}"),
+                Outcome::Failed,
+                run.reason.clone(),
+                vec![run],
+                Some(unreported),
+            )];
+        };
+        let Some(cases) = results.get(&(file.to_owned(), line)) else {
+            let run = RunRecord {
+                step: index + 1,
+                outcome: Outcome::NotRun,
+                reason: Some("the package's test script did not report this test".to_owned()),
+            };
+            return vec![record(
+                format!("{file} {title}"),
+                Outcome::NotRun,
+                run.reason.clone(),
+                vec![run],
+                Some(unreported),
+            )];
+        };
+        cases
+            .iter()
+            .map(|case| {
+                let run = match &case.outcome {
+                    LibtestOutcome::Passed => RunRecord {
+                        step: index + 1,
+                        outcome: Outcome::Passed,
+                        reason: None,
+                    },
+                    LibtestOutcome::Failed => RunRecord {
+                        step: index + 1,
+                        outcome: Outcome::Failed,
+                        reason: None,
+                    },
+                    LibtestOutcome::Ignored(reason) => RunRecord {
+                        step: index + 1,
+                        outcome: Outcome::Ignored,
+                        reason: reason.clone(),
+                    },
+                    LibtestOutcome::Skipped(line) => RunRecord {
+                        step: index + 1,
+                        outcome: Outcome::NotRun,
+                        reason: Some(format!("it returned early and said why: {line}")),
+                    },
+                };
+                // Vitest matches a pattern against the titles joined by ` > `, outermost first.
+                let pattern = format!(
+                    "^{}$",
+                    case.titles
+                        .iter()
+                        .map(|title| escape_pattern(title))
+                        .collect::<Vec<_>>()
+                        .join(" > ")
+                );
+                record(
+                    format!("{file} {}", case.titles.join(" > ")),
+                    run.outcome.clone(),
+                    run.reason.clone(),
+                    vec![run],
+                    Some(command(pattern)),
+                )
+            })
+            .collect()
     }
 
     /// Tests that failed in some step and are keyed to no identifier.
@@ -1078,13 +1170,17 @@ impl<'a> Resolver<'a> {
                 }
             }
             if let Some(results) = &step.vitest {
-                for ((file, line), outcomes) in results {
-                    if outcomes.contains(&LibtestOutcome::Failed) {
-                        let covered = map.keys.values().flat_map(|places| places.keys()).any(|place| {
-                            matches!(place, Place::TypeScript { file: f, line: l, .. } if f == file && l == line)
-                        });
-                        if !covered {
-                            failed.insert(format!("step {}: {file}:{line}", index + 1));
+                for ((file, line), cases) in results {
+                    let covered = map.keys.values().flat_map(|places| places.keys()).any(|place| {
+                        matches!(place, Place::TypeScript { file: f, line: l, .. } if f == file && l == line)
+                    });
+                    for case in cases {
+                        if case.outcome == LibtestOutcome::Failed && !covered {
+                            failed.insert(format!(
+                                "step {}: {file}:{line} {}",
+                                index + 1,
+                                case.titles.join(" > ")
+                            ));
                         }
                     }
                 }

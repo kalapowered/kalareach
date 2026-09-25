@@ -108,6 +108,9 @@ for (const file of files) {
           line: line(start),
           column: source.getLineAndCharacterOfPosition(start).character + 1,
           end: line(node.getEnd()),
+          // The line vitest reports the test at: where its callee ends and its arguments open,
+          // which for `it.each(table)(title, ...)` is the line after the table, not the `it`.
+          reported: line(node.expression.getEnd()),
           parent
         })
         own = calls.length - 1

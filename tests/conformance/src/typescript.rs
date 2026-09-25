@@ -32,6 +32,8 @@ pub struct Call {
     pub column: usize,
     /// The line the call ends on.
     pub end: usize,
+    /// The line a test run reports the call at: where its callee ends and its arguments open.
+    pub reported: usize,
     /// The suite call this one is inside, by index.
     pub parent: Option<usize>,
 }
@@ -229,6 +231,7 @@ mod tests {
                     line: 5,
                     column: 1,
                     end: 30,
+                    reported: 5,
                     parent: None,
                 },
                 Call {
@@ -238,6 +241,7 @@ mod tests {
                     line: 7,
                     column: 3,
                     end: 12,
+                    reported: 7,
                     parent: Some(0),
                 },
                 Call {
@@ -247,6 +251,7 @@ mod tests {
                     line: 15,
                     column: 3,
                     end: 20,
+                    reported: 15,
                     parent: Some(0),
                 },
             ],

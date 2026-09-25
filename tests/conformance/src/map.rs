@@ -61,7 +61,7 @@ pub enum Place {
         package: String,
         /// The file, relative to the repository.
         file: String,
-        /// The line the test call starts on.
+        /// The line a test run reports the call at, which is where its arguments open.
         line: usize,
         /// Its full title.
         title: String,
@@ -746,7 +746,7 @@ fn typescript_sources(map: &mut Map, root: &Path, directories: &[&str], lanes: &
             let place = |index: usize| Place::TypeScript {
                 package: (*directory).to_owned(),
                 file: file.file.clone(),
-                line: file.calls[index].line,
+                line: file.calls[index].reported,
                 title: file.full_title(index),
             };
             for comment in &file.comments {

@@ -185,6 +185,10 @@ fn run(
             }
             return ExitCode::from(2);
         }
+        Err(Stopped::Evidence(problem)) => {
+            eprintln!("kr-conformance: refused: {problem}");
+            return ExitCode::from(2);
+        }
     };
     let path = report::result_path(&evidence);
     let written = serde_json::to_string_pretty(&document)
