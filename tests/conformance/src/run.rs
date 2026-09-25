@@ -5,8 +5,12 @@
 //! its verdict lands with the result. A `cargo test` step is built once with `--no-run` first,
 //! which is how the report learns which package and target each test binary is: two packages can
 //! both have a test target called `fixtures`, and only the executable tells them apart.
+//!
+//! What the build names is what the run is held to. Every test binary it built is listed, and has
+//! to be run and read; a listing that fails, a binary the log never ran, and a log that cannot be
+//! read are each the step's error, so a step can never pass on less output than it was built for.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -35,7 +39,7 @@ pub struct Executed {
     /// Every test each binary it built holds, as the binary lists them: a test a step's filters
     /// left out is listed here and absent from the outcomes, and one this platform's build does
     /// not have is absent from both.
-    pub listed: BTreeMap<TargetId, std::collections::BTreeSet<String>>,
+    pub listed: BTreeMap<TargetId, BTreeSet<String>>,
     /// A vitest step's results.
     pub vitest: Option<vitest::Results>,
     /// Why it could not be run or read, when it could not.
@@ -61,6 +65,7 @@ impl Place<'_> {
             .args(&words[1..])
             .current_dir(self.root)
             .env("KR_TEST_ARTIFACTS_DIR", self.evidence)
+            .env("CARGO_TERM_COLOR", "never")
             .envs(self.environment.iter().map(|(name, value)| (name, value)));
         command
     }
@@ -113,13 +118,16 @@ pub fn execute(step: &Step, number: usize, place: &Place<'_>, packages: &[Packag
     }
     let started = Instant::now();
     let mut executables: BTreeMap<String, TargetId> = BTreeMap::new();
-    if step.reading == Reading::Cargo && step.command.get(1).is_some_and(|word| word == "test") {
-        match build_first(step, place, &log_path, packages) {
-            Ok((built, map)) => {
-                executed.built = built;
-                executed.listed = list(step, place, &map);
-                executables = map;
-            }
+    let tests =
+        step.reading == Reading::Cargo && step.command.get(1).is_some_and(|word| word == "test");
+    if tests {
+        let listed = build_first(step, place, &log_path, packages).and_then(|(built, map)| {
+            executed.built = built;
+            executables = map;
+            list(step, place, &executables)
+        });
+        match listed {
+            Ok(listed) => executed.listed = listed,
             Err(error) => {
                 executed.seconds = started.elapsed().as_secs();
                 executed.error = Some(error);
@@ -136,14 +144,21 @@ pub fn execute(step: &Step, number: usize, place: &Place<'_>, packages: &[Packag
             return executed;
         }
     }
-    let output = std::fs::read(&log_path)
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .unwrap_or_default();
+    let output = match std::fs::read(&log_path) {
+        Ok(bytes) => libtest::plain(&String::from_utf8_lossy(&bytes)),
+        Err(error) => {
+            executed.error = Some(format!("the step's log could not be read: {error}"));
+            return executed;
+        }
+    };
     match &step.reading {
         Reading::Cargo => {
             for binary in libtest::read(&output) {
                 let target = executables.get(&file_name(&binary.executable)).cloned();
                 executed.binaries.push((target, binary));
+            }
+            if tests {
+                executed.error = reconcile(&executables, &executed.binaries, executed.exit);
             }
         }
         Reading::Build => {}
@@ -163,6 +178,46 @@ pub fn execute(step: &Step, number: usize, place: &Place<'_>, packages: &[Packag
     executed
 }
 
+/// Holds what a step's log ran against what its build made: every test binary built is run once,
+/// and nothing else is. Returns the step's error when they differ.
+fn reconcile(
+    executables: &BTreeMap<String, TargetId>,
+    binaries: &[(Option<TargetId>, Binary)],
+    exit: Option<i32>,
+) -> Option<String> {
+    let ran: BTreeSet<String> = binaries
+        .iter()
+        .filter(|(_, binary)| !binary.executable.starts_with("doc-tests "))
+        .map(|(_, binary)| file_name(&binary.executable))
+        .collect();
+    let missing: Vec<String> = executables
+        .iter()
+        .filter(|(executable, _)| !ran.contains(*executable))
+        .map(|(_, target)| target.to_string())
+        .collect();
+    if !missing.is_empty() {
+        return Some(if exit == Some(0) {
+            format!(
+                "the step's log shows no run of {}, which its build made",
+                missing.join(", ")
+            )
+        } else {
+            format!("the step ended before it ran {}", missing.join(", "))
+        });
+    }
+    let unknown: Vec<&str> = ran
+        .iter()
+        .filter(|executable| !executables.contains_key(*executable))
+        .map(String::as_str)
+        .collect();
+    (!unknown.is_empty()).then(|| {
+        format!(
+            "the step's log runs {}, which its build did not make",
+            unknown.join(", ")
+        )
+    })
+}
+
 /// The last component of an executable's path, which carries Cargo's hash and so names one build
 /// of one target.
 fn file_name(path: &str) -> String {
@@ -170,13 +225,17 @@ fn file_name(path: &str) -> String {
 }
 
 /// Every test each binary of a step holds, as the binaries list them through Cargo, whatever the
-/// step's own filters are. A binary that could not list is left out, and its tests are judged
-/// from the run alone.
+/// step's own filters are.
+///
+/// # Errors
+///
+/// Returns why the listing failed or could not be paired with the binaries the build made: a
+/// binary the listing leaves out would have its tests judged from the run alone.
 fn list(
     step: &Step,
     place: &Place<'_>,
     executables: &BTreeMap<String, TargetId>,
-) -> BTreeMap<TargetId, std::collections::BTreeSet<String>> {
+) -> Result<BTreeMap<TargetId, BTreeSet<String>>, String> {
     let mut command: Vec<String> = step
         .command
         .iter()
@@ -184,22 +243,26 @@ fn list(
         .cloned()
         .collect();
     command.extend(["--".to_owned(), "--list".to_owned()]);
-    let Ok(output) = place
+    let output = place
         .command(&command)
         .stdin(Stdio::null())
         .stderr(Stdio::piped())
         .output()
-    else {
-        return BTreeMap::new();
-    };
-    let mut listed = BTreeMap::new();
+        .map_err(|error| format!("the step's tests could not be listed: {error}"))?;
     if !output.status.success() {
-        return listed;
+        return Err(format!(
+            "`{}` did not list the step's tests (exit {})",
+            command.join(" "),
+            output
+                .status
+                .code()
+                .map_or_else(|| "by a signal".to_owned(), |code| code.to_string())
+        ));
     }
     // Cargo's lines are on standard error and the binaries' on standard output, so the two are
     // read apart and paired in order: each section Cargo announces, a binary or a crate's
     // documentation tests, prints one list, which ends with its count line.
-    let sections: Vec<Option<String>> = String::from_utf8_lossy(&output.stderr)
+    let sections: Vec<Option<String>> = libtest::plain(&String::from_utf8_lossy(&output.stderr))
         .lines()
         .filter_map(|line| {
             let line = line.trim_start();
@@ -211,9 +274,9 @@ fn list(
             Some(Some(file_name(executable.strip_suffix(')')?)))
         })
         .collect();
-    let mut lists: Vec<std::collections::BTreeSet<String>> = Vec::new();
-    let mut current = std::collections::BTreeSet::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
+    let mut lists: Vec<BTreeSet<String>> = Vec::new();
+    let mut current = BTreeSet::new();
+    for line in libtest::plain(&String::from_utf8_lossy(&output.stdout)).lines() {
         if let Some(name) = line
             .strip_suffix(": test")
             .or_else(|| line.strip_suffix(": bench"))
@@ -224,14 +287,34 @@ fn list(
         }
     }
     if lists.len() != sections.len() {
-        return listed;
+        return Err(format!(
+            "the listing printed {} lists for the {} binaries Cargo announced",
+            lists.len(),
+            sections.len()
+        ));
     }
+    let mut listed = BTreeMap::new();
     for (section, names) in sections.into_iter().zip(lists) {
-        if let Some(target) = section.and_then(|executable| executables.get(&executable)) {
-            listed.insert(target.clone(), names);
-        }
+        let Some(executable) = section else {
+            continue;
+        };
+        let target = executables.get(&executable).ok_or_else(|| {
+            format!("the listing names {executable}, which the step's build did not make")
+        })?;
+        listed.insert(target.clone(), names);
     }
-    listed
+    let unlisted: Vec<String> = executables
+        .values()
+        .filter(|target| !listed.contains_key(*target))
+        .map(ToString::to_string)
+        .collect();
+    if !unlisted.is_empty() {
+        return Err(format!(
+            "the listing leaves out {}, which the step's build made",
+            unlisted.join(", ")
+        ));
+    }
+    Ok(listed)
 }
 
 /// Whether `line` is the count a test binary ends its list with: `3 tests, 0 benchmarks`.
@@ -292,7 +375,9 @@ fn build_first(
         let Ok(message) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        if message["reason"] != "compiler-artifact" {
+        // A test binary is a target built with the test profile; a program the tests launch is
+        // built too, as itself, and is not one.
+        if message["reason"] != "compiler-artifact" || message["profile"]["test"] != true {
             continue;
         }
         let Some(executable) = message["executable"].as_str() else {
@@ -343,7 +428,67 @@ fn run_logged(
 
 #[cfg(test)]
 mod tests {
-    use super::{file_name, is_count};
+    use std::collections::BTreeMap;
+
+    use super::{Binary, file_name, is_count, reconcile};
+    use crate::workspace::{TargetId, TargetKind};
+
+    #[test]
+    fn a_step_is_held_to_every_test_binary_its_build_made() {
+        let target = TargetId {
+            package: "p".to_owned(),
+            kind: TargetKind::Test,
+            name: "t".to_owned(),
+        };
+        let executables = BTreeMap::from([("t-1".to_owned(), target.clone())]);
+        let ran = |executable: &str| {
+            (
+                Some(target.clone()),
+                Binary {
+                    executable: executable.to_owned(),
+                    ..Binary::default()
+                },
+            )
+        };
+        assert_eq!(
+            reconcile(&executables, &[ran("target/debug/deps/t-1")], Some(0)),
+            None
+        );
+        assert!(
+            reconcile(&executables, &[], Some(0)).is_some_and(|error| error.contains("no run of")),
+            "a log with no run of a built binary"
+        );
+        assert!(
+            reconcile(&executables, &[], Some(101))
+                .is_some_and(|error| error.contains("ended before")),
+            "a step that stopped at a failure"
+        );
+        assert!(
+            reconcile(
+                &executables,
+                &[ran("target/debug/deps/t-1"), ran("target/debug/deps/u-2")],
+                Some(0)
+            )
+            .is_some_and(|error| error.contains("did not make")),
+            "a binary the build did not make"
+        );
+        let doctests = (
+            None,
+            Binary {
+                executable: "doc-tests p".to_owned(),
+                ..Binary::default()
+            },
+        );
+        assert_eq!(
+            reconcile(
+                &executables,
+                &[ran("target/debug/deps/t-1"), doctests],
+                Some(0)
+            ),
+            None,
+            "a crate's documentation tests are no binary of the build's"
+        );
+    }
 
     #[test]
     fn a_list_ends_with_its_count() {

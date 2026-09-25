@@ -117,7 +117,13 @@ fn every_comment_form_and_a_case_table_key_their_tests() {
         "KR-REQ-02.03",
         &[("forms tests::*", Binding::ModuleComment)],
     );
-    expect("KR-REQ-03.01", &[("flow ::*", Binding::ModuleComment)]);
+    expect(
+        "KR-REQ-03.01",
+        &[
+            ("flow commented", Binding::AttachedComment),
+            ("flow ::*", Binding::ModuleComment),
+        ],
+    );
     expect(
         "KR-REQ-03.02",
         &[("flow documented", Binding::AttachedComment)],
@@ -177,8 +183,16 @@ fn a_tree_with_nothing_ignored_reports_every_identifier_as_run() {
             record.tests
         );
     }
-    // The module comment of the test file keys every test in it, each by its own name.
-    assert_eq!(document.identifiers["KR-REQ-03.01"].tests.len(), 12);
+    // The module comment of the test file keys every test in it, each by its own name, and a test
+    // its own comment keys as well is recorded once, by that comment.
+    let module = &document.identifiers["KR-REQ-03.01"].tests;
+    assert_eq!(module.len(), 12);
+    let commented: Vec<_> = module
+        .iter()
+        .filter(|test| test.test == "forms --test flow commented")
+        .collect();
+    assert_eq!(commented.len(), 1);
+    assert_eq!(commented[0].keyed_by, Binding::AttachedComment);
     assert!(document.passed());
 }
 
@@ -208,6 +222,14 @@ fn an_ignored_test_is_not_counted_and_a_failing_test_fails_its_identifier() {
     );
     assert!(!document.passed(), "a failing test fails the run");
     assert_eq!(document.summary.failed, 1);
+    // A test that returned early and said why passed without doing what it is for.
+    let early = &document.identifiers["KR-REQ-04.05"];
+    assert_eq!(early.verdict, Verdict::NotRun);
+    assert_eq!(early.tests[0].outcome, Outcome::NotRun);
+    assert_eq!(
+        early.tests[0].reason.as_deref(),
+        Some("it returned early and said why: skipped: OUTCOMES_DEVICE names no device to drive")
+    );
 }
 
 #[test]
@@ -296,7 +318,7 @@ fn the_result_names_every_command_and_no_path_of_the_checkout() {
     );
     assert_eq!(
         document.steps[0].command,
-        "cargo test --locked --workspace --no-fail-fast"
+        "cargo test --locked --workspace --no-fail-fast -- --show-output"
     );
     assert!(document.steps[0].log.starts_with("conformance/logs/"));
     assert!(evidence.path().join(&document.steps[0].log).is_file());
@@ -306,6 +328,34 @@ fn the_result_names_every_command_and_no_path_of_the_checkout() {
         document.run.terminal_profile.profile, "unknown",
         "this tree has no terminal profile"
     );
+}
+
+#[test]
+fn an_evidence_directory_that_holds_an_earlier_report_is_refused() {
+    let (_, evidence) = run("forms").unwrap_or_else(|stopped| panic!("{stopped:?}"));
+    let target = std::env::temp_dir().join("kr-conformance-fixture-target-forms");
+    let again = Options {
+        root: tree("forms"),
+        evidence: kr_conformance::evidence::check_directory(evidence.path()).expect("inside"),
+        selection: Some(vec![Group::Rust]),
+        platform: Platform::current(),
+        case_tables: &[],
+        lanes: &[],
+        applications: None,
+        steps: Some(vec![Step::cargo(
+            Group::Rust,
+            "the tree's tests",
+            &["test", "--locked", "--workspace", "--no-fail-fast"],
+        )]),
+        environment: vec![(
+            "CARGO_TARGET_DIR".to_owned(),
+            target.to_string_lossy().into_owned(),
+        )],
+    };
+    match report::run(&again, &mut |_| {}) {
+        Err(Stopped::Evidence(problem)) => assert!(problem.contains("earlier run"), "{problem}"),
+        other => panic!("a second run in one evidence directory: {other:?}"),
+    }
 }
 
 #[test]
@@ -424,6 +474,116 @@ fn the_end_to_end_group_runs_what_the_end_to_end_script_runs() {
     );
 }
 
+/// The `cargo test` commands a job of the landing workflow runs, each as one line: a folded value
+/// is joined, and each line of a literal block is its own command.
+fn workflow_tests(job: &str) -> Vec<String> {
+    let workflow = std::fs::read_to_string(
+        repository()
+            .join(".github")
+            .join("workflows")
+            .join("core-ci.yml"),
+    )
+    .expect("the landing workflow");
+    let lines: Vec<&str> = workflow.lines().collect();
+    let header = format!("  {job}:");
+    let start = lines
+        .iter()
+        .position(|line| *line == header)
+        .unwrap_or_else(|| panic!("the workflow has a {job} job"));
+    let is_job = |line: &str| {
+        line.len() > 3
+            && line.starts_with("  ")
+            && !line.starts_with("   ")
+            && line.trim_end().ends_with(':')
+    };
+    let end = lines[start + 1..]
+        .iter()
+        .position(|line| is_job(line))
+        .map_or(lines.len(), |offset| start + 1 + offset);
+    let mut commands = Vec::new();
+    let mut at = start;
+    while at < end {
+        let line = lines[at];
+        at += 1;
+        let Some(value) = line.trim_start().strip_prefix("run:") else {
+            continue;
+        };
+        let indent = line.len() - line.trim_start().len();
+        let value = value.trim();
+        let mut block = Vec::new();
+        while at < end
+            && (lines[at].trim().is_empty()
+                || lines[at].len() - lines[at].trim_start().len() > indent)
+        {
+            block.push(lines[at].trim());
+            at += 1;
+        }
+        let found: Vec<String> = match value {
+            ">-" | ">" => vec![block.join(" ")],
+            "|" | "|-" => block.iter().map(|line| (*line).to_owned()).collect(),
+            quoted if quoted.starts_with('"') => vec![quoted.trim_matches('"').to_owned()],
+            plain => vec![plain.to_owned()],
+        };
+        commands.extend(
+            found
+                .into_iter()
+                .filter(|command| command.starts_with("cargo test")),
+        );
+    }
+    commands
+}
+
+/// A command with the flags that only say how output is shown taken out, a `--` left with nothing
+/// after it as well, and its words spaced once.
+fn without_display(command: &str) -> String {
+    let mut words: Vec<&str> = command
+        .split_whitespace()
+        .filter(|word| !matches!(*word, "--nocapture" | "--show-output"))
+        .collect();
+    if words.last() == Some(&"--") {
+        words.pop();
+    }
+    words.join(" ")
+}
+
+#[test]
+fn the_platform_plans_run_what_the_landing_workflow_runs_there() {
+    // Windows: every `cargo test` of the workflow's Windows job is a step, and every step is one.
+    let mut workflow: Vec<String> = workflow_tests("windows")
+        .iter()
+        .map(|command| without_display(command))
+        .collect();
+    let mut planned: Vec<String> = plan::steps(Platform::Windows, &Group::ALL, "/tmp/e", None)
+        .iter()
+        .map(|step| without_display(&step.line()))
+        .collect();
+    workflow.sort();
+    workflow.dedup();
+    planned.sort();
+    assert_eq!(planned, workflow, "the Windows job's tests");
+
+    // macOS: the workspace step leaves out what the workflow's macOS job leaves out, by name.
+    let workspace = workflow_tests("macos")
+        .into_iter()
+        .find(|command| command.starts_with("cargo test --locked --workspace"))
+        .expect("the macOS job's workspace run");
+    let mut left_out: Vec<String> = workspace
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .filter(|pair| pair[0] == "--skip")
+        .map(|pair| pair[1].to_owned())
+        .collect();
+    let mut skipped: Vec<String> = plan::steps(Platform::MacOs, &[Group::Rust], "/tmp/e", None)[0]
+        .skips
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect();
+    left_out.sort();
+    skipped.sort();
+    assert_eq!(skipped, left_out, "the macOS job's workspace run");
+}
+
 #[test]
 fn the_performance_group_takes_what_the_performance_script_takes() {
     let script = std::fs::read_to_string(repository().join("scripts").join("performance.sh"))
@@ -460,6 +620,7 @@ fn typescript_comment_forms_and_titles_key_their_tests() {
     let keyed = keyed(&map);
     let all = [
         "the forms has a comment inside",
+        "the forms holds %s",
         "the forms is attached",
         "the forms is not keyed by the note above",
         "the forms KR-REQ-06.05 is named in its title",
@@ -492,4 +653,14 @@ fn typescript_comment_forms_and_titles_key_their_tests() {
     );
     assert!(!map.keys.contains_key(&identifier("KR-REQ-06.06")));
     assert!(map.references.contains_key(&identifier("KR-REQ-06.06")));
+    // A table of cases is keyed at the line a run reports each of its rows at: where the call that
+    // takes the title opens its arguments, after the table.
+    let table: Vec<usize> = map.keys[&identifier("KR-REQ-06.07")]
+        .keys()
+        .filter_map(|place| match place {
+            Place::TypeScript { line, .. } => Some(*line),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(table, [26]);
 }
