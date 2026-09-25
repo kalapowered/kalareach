@@ -231,16 +231,22 @@ fn supervise(daemon: &Path) {
         .parent()
         .expect("the state tree is inside the test's own tree")
         .to_path_buf();
-    // One write of the whole line: supervisors append to the same record at once, and a line
-    // written in two pieces could be split by another's.
+    // Each process with its start identity, so the test can tell it from whatever holds its
+    // number later. One write of the whole line: supervisors append to the same record at once,
+    // and a line written in two pieces could be split by another's.
     let record = |name: &str, pid: u32| {
+        let identity =
+            kr_ipc::identity::process_start_identity(pid).expect("the process's start identity");
+        let line = format!(
+            "{pid}\t{}\n",
+            serde_json::to_string(&identity).expect("encodes the identity")
+        );
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(tree.join(name))
             .expect("opens a record");
-        file.write_all(format!("{pid}\n").as_bytes())
-            .expect("records a process");
+        file.write_all(line.as_bytes()).expect("records a process");
     };
     // Read without waiting, so a closed lifeline is seen as its end rather than waited on.
     let lifeline = std::fs::OpenOptions::new()
@@ -272,21 +278,34 @@ fn supervise(daemon: &Path) {
     if closed(&lifeline) {
         return;
     }
-    let mut child = Command::new(daemon)
-        .arg("--secret-store")
-        .arg("file")
-        .args(&arguments)
-        .env_remove(SUPERVISE)
-        .env_remove(SUPERVISED_ARGUMENTS)
-        .spawn()
-        .expect("starts the daemon");
-    record(LAUNCHED, child.id());
+    // Held from the moment it starts, so it is ended and collected however this supervisor's run
+    // ends, a failure to record it included.
+    let daemon = Supervised(
+        Command::new(daemon)
+            .arg("--secret-store")
+            .arg("file")
+            .args(&arguments)
+            .env_remove(SUPERVISE)
+            .env_remove(SUPERVISED_ARGUMENTS)
+            .spawn()
+            .expect("starts the daemon"),
+    );
+    record(LAUNCHED, daemon.0.id());
     while !closed(&lifeline) {
         std::thread::sleep(Duration::from_millis(50));
     }
-    // This process's own child, not collected yet, so the number is still its.
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(daemon);
+}
+
+/// A daemon a supervisor started.
+struct Supervised(Child);
+
+impl Drop for Supervised {
+    fn drop(&mut self) {
+        // This process's own child, not collected yet, so the number is still its.
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 /// Whether nothing holds the lifeline open any more, which is how a supervisor learns the test has
@@ -316,28 +335,29 @@ struct Standalone {
 
 impl Drop for Standalone {
     fn drop(&mut self) {
-        // Every supervisor and every daemon, named by its start identity while it still holds its
-        // number: a supervisor has not ended while the lifeline is open, and a daemon has not been
-        // collected. A number given to something else afterwards is then not mistaken for either.
-        let mut started = Vec::new();
-        for pid in self
-            .recorded(STARTS)
-            .into_iter()
-            .chain(self.recorded(LAUNCHED))
-        {
-            match kr_ipc::identity::query_process(pid) {
-                ProcessQuery::Present(identity) => started.push(identity),
-                ProcessQuery::Gone => {}
-                ProcessQuery::CannotEstablish(error) => self.tree.hold(format!(
-                    "whether the process {pid} this test started has ended cannot be established: \
-                     {error}"
-                )),
-            }
-        }
-        // The cue for every supervisor to end the daemon it started, collect it and end.
+        self.end_what_was_started();
+    }
+}
+
+impl Standalone {
+    /// Ends every supervisor this test's commands started, and with it every daemon, and waits for
+    /// them; what cannot be established as ended keeps the tree.
+    ///
+    /// The lifeline closes first, which is what closes admission: a supervisor that has not started
+    /// its daemon by then starts none, and one that has ends it. Every supervisor records itself,
+    /// with its start identity, before it can start anything, and ends only after its daemon has
+    /// been ended and collected, so waiting for the recorded supervisors waits for every daemon too;
+    /// the daemons' own records are waited for as well. A supervisor that has not recorded itself
+    /// when the records are read finds the lifeline closed and starts nothing. Each process is
+    /// named by its start identity, so a number given to something else is not mistaken for it.
+    fn end_what_was_started(&mut self) {
         drop(self.lifeline.take());
         let begun = Instant::now();
-        for identity in started {
+        for identity in self
+            .identities(STARTS)
+            .into_iter()
+            .chain(self.identities(LAUNCHED))
+        {
             loop {
                 match kr_ipc::identity::process_state(&identity) {
                     ProcessState::Ended => break,
@@ -364,9 +384,17 @@ impl Drop for Standalone {
             }
         }
     }
-}
 
-impl Standalone {
+    /// The start identities one record in this tree names, in the order they were recorded.
+    fn identities(&self, name: &str) -> Vec<kr_protocol::identity::ProcessStartIdentity> {
+        std::fs::read_to_string(self.tree.root().join(name))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.split_once('\t'))
+            .map(|(_, identity)| serde_json::from_str(identity).expect("a recorded identity"))
+            .collect()
+    }
+
     fn create() -> Self {
         let tree = teardown::Tree::create();
         let home = tree.root().join("home");
@@ -473,7 +501,7 @@ impl Standalone {
         std::fs::read_to_string(self.tree.root().join(name))
             .unwrap_or_default()
             .lines()
-            .filter_map(|line| line.trim().parse().ok())
+            .filter_map(|line| line.split('\t').next()?.trim().parse().ok())
             .collect()
     }
 
@@ -1594,4 +1622,40 @@ fn status_reports_the_session_when_its_worker_withholds_the_attachments() {
         started.elapsed()
     );
     drop(runtime);
+}
+
+/// KR-REQ-07.12: a supervisor still waiting to start its daemon when its test ends starts nothing,
+/// and the test's teardown waits for it.
+///
+/// The daemon is held back past the command's bound, and the test ends while it is held: what a
+/// failing test's teardown does, run here on purpose. The supervisor sees the lifeline close, starts
+/// no daemon and ends, and teardown has waited for it by the time it returns. The command then gives
+/// up at its bound as it would with no daemon.
+#[test]
+fn a_supervisor_still_waiting_when_its_test_ends_starts_nothing() {
+    let mut host = Standalone::create();
+    host.select_standalone();
+    host.ask_the_scripts(DELAY, "40");
+    let running = start(host.new_session());
+    let begun = Instant::now();
+    while host.identities(STARTS).is_empty() {
+        assert!(
+            begun.elapsed() < LIVENESS_DEADLINE,
+            "the supervisor recorded itself"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let supervisor = host.identities(STARTS).remove(0);
+
+    host.end_what_was_started();
+    assert_eq!(
+        kr_ipc::identity::process_state(&supervisor),
+        ProcessState::Ended,
+        "the supervisor ended with its test"
+    );
+    assert!(host.launched().is_empty(), "and started no daemon");
+
+    let output = running.finish("kr new");
+    let failure = document(&output, "kr new");
+    assert_eq!(failure["code"], "ENVIRONMENT_UNAVAILABLE", "{failure}");
 }
