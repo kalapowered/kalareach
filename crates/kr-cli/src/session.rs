@@ -136,6 +136,24 @@ impl AttachOutcome {
     }
 }
 
+/// How an attachment ends when its session's closure arrives.
+///
+/// A closure this build cannot read is still the end of the session, and it is not a lost
+/// connection. What it would have said is not known, so it is not reported as a success, and why it
+/// could not be read is the rule it broke and where, never what it held.
+fn closed(payload: &kr_protocol::envelope::ParamsValue, undelivered: bool) -> AttachOutcome {
+    match payload.to_typed::<ClosureRecord>() {
+        Ok(record) => AttachOutcome::Closed {
+            record: Box::new(record),
+            undelivered,
+        },
+        Err(error) => AttachOutcome::ClosureUnreadable {
+            detail: Shown::cbor(&error),
+            undelivered,
+        },
+    }
+}
+
 /// Whether a session closed the way the person meant it to.
 ///
 /// Two closures are clean: a shell that exited with status 0, which is what `exit` and the end of
@@ -981,19 +999,7 @@ async fn drive(
                         // carries, after every byte this terminal was owed, and it ends the
                         // attachment with the status the closure implies.
                         if notification.event_type.as_str() == SESSION_CLOSED_EVENT {
-                            return match notification.payload.to_typed::<ClosureRecord>() {
-                                Ok(record) => AttachOutcome::Closed {
-                                    record: Box::new(record),
-                                    undelivered,
-                                },
-                                // A closure this build cannot read is still the end of the
-                                // session, and it is not a lost connection. What it would have
-                                // said is not known, so it is not reported as a success.
-                                Err(error) => AttachOutcome::ClosureUnreadable {
-                                    detail: Shown::cbor(&error),
-                                    undelivered,
-                                },
-                            };
+                            return closed(&notification.payload, undelivered);
                         }
                         if notification.event_type.as_str() == "session.output"
                             && let Ok(event) = notification
@@ -1947,6 +1953,62 @@ mod tests {
             "the session closed, and how it closed could not be read (an unknown field)"
         );
         assert_eq!(outcome.closure(), None);
+    }
+
+    /// A closure that cannot be read is reported by the rule it broke, never by what it held.
+    #[test]
+    fn a_closure_that_cannot_be_read_does_not_repeat_what_it_held() {
+        use crate::shown::marker::{MARKER, assert_unmarked, failure_renderings};
+
+        let payload = kr_protocol::envelope::ParamsValue::from_typed(
+            &std::collections::BTreeMap::from([(MARKER, 1_u64)]),
+        )
+        .expect("a map");
+        // The negative control: the decoder's own message, which the outcome carried whole,
+        // quotes the key.
+        let unread = payload
+            .to_typed::<ClosureRecord>()
+            .expect_err("not a closure");
+        assert!(unread.to_string().contains(MARKER), "{unread}");
+
+        let outcome = super::closed(&payload, false);
+        assert!(matches!(outcome, AttachOutcome::ClosureUnreadable { .. }));
+        assert_eq!(status(&outcome), 1);
+        assert_unmarked(
+            "an unreadable closure",
+            &[outcome.detail().into_string(), format!("{outcome:?}")],
+        );
+        assert_unmarked(
+            "an unreadable closure, as the command reports it",
+            &failure_renderings(outcome.into_error().expect("a failure")),
+        );
+
+        let record = closure(ClosureReason::RootExit, Some(0), None);
+        let read = super::closed(
+            &kr_protocol::envelope::ParamsValue::from_typed(&record).expect("a closure"),
+            false,
+        );
+        assert_eq!(read.closure(), Some(&record));
+    }
+
+    /// A signal name is said as the host recorded it, unless it holds what no platform's signal
+    /// name holds.
+    #[test]
+    fn a_signal_name_with_control_characters_is_not_repeated() {
+        let spoken = closure(ClosureReason::RootSignal, None, Some("Killed: 9"));
+        assert_eq!(
+            super::how_it_closed(&spoken).as_str(),
+            "a signal ended its shell (Killed: 9)"
+        );
+        let hostile = closure(
+            ClosureReason::RootSignal,
+            None,
+            Some("\u{1b}]0;title\u{7}Killed"),
+        );
+        assert_eq!(
+            super::how_it_closed(&hostile).as_str(),
+            "a signal ended its shell ([a signal name])"
+        );
     }
 
     /// A connection that ends without a closure still ends the command as a lost connection.

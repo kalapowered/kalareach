@@ -95,7 +95,9 @@ pub fn usage(error: &clap::Error) -> Usage {
             ContextKind::PriorArg => "given with",
             ContextKind::ValidValue => "it takes",
             ContextKind::ValidSubcommand => "the subcommands are",
-            ContextKind::SuggestedArg | ContextKind::SuggestedSubcommand => "did you mean",
+            ContextKind::SuggestedArg
+            | ContextKind::SuggestedSubcommand
+            | ContextKind::SuggestedValue => "did you mean",
             _ => continue,
         };
         if let Some(value) = text(value) {
@@ -383,3 +385,249 @@ pub fn errno(error: rustix::io::Errno) -> Shown {
 // The command line's own failures, each held to saying only `Shown` and `Plain` values.
 impl Plain for crate::error::CliError {}
 impl Plain for crate::bridge::pipe::PipeError {}
+
+#[cfg(test)]
+pub(crate) mod marker;
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser as _;
+
+    use super::*;
+    use crate::error::CliError;
+    use marker::{MARKER, assert_unmarked, failure_renderings};
+
+    /// A usage failure never repeats what was typed. An argument this command does not take, a
+    /// value where none goes, a subcommand it does not have, a value outside a declared set and a
+    /// value that cannot be read are each said by their kind and the command's own declarations.
+    #[test]
+    fn a_usage_failure_never_repeats_what_was_typed() {
+        let cases: [(&str, &[&str]); 6] = [
+            ("an unknown argument", &["kr", "attach", "--kr-marker-7c1e"]),
+            (
+                "an unexpected value",
+                &["kr", "attach", "one", "kr-marker-7c1e"],
+            ),
+            ("an unknown subcommand", &["kr", "kr-marker-7c1e"]),
+            (
+                "a value outside a declared set",
+                &[
+                    "kr",
+                    "workspace",
+                    "create",
+                    "project",
+                    "--kind",
+                    "kr-marker-7c1e",
+                ],
+            ),
+            (
+                "a value that cannot be read",
+                &["kr", "pair", "invite", "--view", "kr-marker-7c1e"],
+            ),
+            (
+                "an unknown argument with a value, under --json",
+                &["kr", "--json", "attach", "--kr-marker-7c1e=kr-marker-7c1e"],
+            ),
+        ];
+        for (class, line) in cases {
+            let error = crate::cli::Cli::try_parse_from(line).expect_err(class);
+            // The negative control: clap's own rendering, which the command wrote on standard
+            // error and into its failure document, repeats what was typed.
+            assert!(
+                error.render().to_string().contains(MARKER),
+                "{class}: {}",
+                error.render()
+            );
+            let said = usage(&error).to_string();
+            assert!(
+                said.starts_with("error: ")
+                    && said.ends_with("For more information, try '--help'."),
+                "{class}: {said}"
+            );
+            assert_unmarked(class, std::slice::from_ref(&said));
+            assert_unmarked(
+                class,
+                &failure_renderings(CliError::Usage(shown!("{}", usage(&error)))),
+            );
+        }
+    }
+
+    /// What the command declares is said: the argument, the values it takes and the usage line.
+    #[test]
+    fn a_usage_failure_says_what_the_command_declares() {
+        let error = crate::cli::Cli::try_parse_from([
+            "kr",
+            "workspace",
+            "create",
+            "project",
+            "--kind",
+            "neither",
+        ])
+        .expect_err("not a kind");
+        let said = usage(&error).to_string();
+        assert!(said.contains("--kind <KIND>"), "{said}");
+        assert!(said.contains("it takes shared, isolated"), "{said}");
+        assert!(!said.contains("neither"), "{said}");
+
+        let error = crate::cli::Cli::try_parse_from(["kr", "attach"]).expect_err("no session");
+        let said = usage(&error).to_string();
+        assert!(said.contains("Usage: kr attach"), "{said}");
+    }
+
+    /// A value typed where an identifier, a selector or a choice goes is not repeated when it is
+    /// none of them. Each of these failures began with the value as it was typed.
+    #[test]
+    fn a_typed_value_that_is_not_read_is_not_repeated() {
+        let startup = match crate::cli::Cli::try_parse_from(["kr", "new", "--startup", MARKER])
+            .expect("the line parses")
+            .command
+        {
+            crate::cli::Command::New(arguments) => arguments
+                .launch_profile()
+                .expect_err("not a startup selection"),
+            _ => unreachable!("the line is kr new"),
+        };
+        let failures: [(&str, CliError); 7] = [
+            (
+                "a session selector",
+                crate::resolve::SessionSelector::parse(MARKER).expect_err("not a selector"),
+            ),
+            (
+                "an identifier",
+                crate::daemon::identifier::<kr_protocol::ids::EnvironmentId>(
+                    MARKER,
+                    "an environment",
+                )
+                .expect_err("not an identifier"),
+            ),
+            (
+                "a palette",
+                crate::create::PaletteChoice::parse(MARKER).expect_err("not a palette"),
+            ),
+            (
+                "an agent",
+                crate::skill::parse(MARKER, "user", None).expect_err("not an agent"),
+            ),
+            (
+                "a scope",
+                crate::skill::parse("codex", MARKER, None).expect_err("not a scope"),
+            ),
+            (
+                "a shell",
+                crate::shell::shells(Some(MARKER)).expect_err("not a shell"),
+            ),
+            ("a startup selection", startup),
+        ];
+        for (class, error) in failures {
+            assert_unmarked(class, &failure_renderings(error));
+        }
+    }
+
+    /// A shell package failure says its kind and the package's directory, never a manifest's text
+    /// or what a request asked for.
+    #[test]
+    fn a_package_failure_says_its_kind_and_not_what_it_read() {
+        use kr_shell_integration::host::package::PackageFault;
+
+        for fault in [
+            PackageFault::Unreadable {
+                path: "/opt/kalareach/shells/zsh".to_owned(),
+                detail: MARKER.to_owned(),
+            },
+            PackageFault::Unqualified {
+                requested: MARKER.to_owned(),
+            },
+            PackageFault::NotInteractive {
+                detail: MARKER.to_owned(),
+            },
+        ] {
+            // The negative control: the fault's own text carries what it read.
+            assert!(fault.to_string().contains(MARKER), "{fault}");
+            assert_unmarked(
+                "a package failure",
+                &failure_renderings(CliError::ShellIntegrationUnsupported(package_fault(&fault))),
+            );
+        }
+    }
+
+    /// A terminal library failure never repeats a colour specification the terminal sent.
+    #[test]
+    fn a_terminal_failure_does_not_repeat_what_the_terminal_sent() {
+        let error = kr_term::TermError::ColourSpec {
+            spec: MARKER.to_owned(),
+        };
+        assert!(error.to_string().contains(MARKER), "{error}");
+        assert_unmarked(
+            "a colour specification",
+            &failure_renderings(CliError::Terminal(term(&error))),
+        );
+    }
+
+    /// A pairing failure never repeats what a rendezvous service, a store or a refusal said.
+    #[test]
+    fn a_pairing_failure_does_not_repeat_what_a_service_said() {
+        use kr_pairing::PairingError;
+
+        for error in [
+            PairingError::RendezvousUnavailable {
+                reason: MARKER.to_owned(),
+            },
+            PairingError::RendezvousConfiguration {
+                reason: MARKER.to_owned(),
+            },
+            PairingError::Store {
+                reason: MARKER.to_owned(),
+            },
+            PairingError::Refused {
+                code: kr_protocol::error::ErrorCode::PermissionDenied,
+                reason: MARKER.to_owned(),
+            },
+        ] {
+            assert!(error.to_string().contains(MARKER), "{error}");
+            assert_unmarked(
+                "a pairing failure",
+                &failure_renderings(CliError::Other(pairing(&error))),
+            );
+        }
+    }
+
+    /// The tool server's failures say their kind: what a client sent, and what a task's panic
+    /// said, are not repeated.
+    #[test]
+    fn a_tool_server_failure_says_its_kind() {
+        let closed = rmcp::service::ServerInitializeError::ConnectionClosed(MARKER.to_owned());
+        assert!(closed.to_string().contains(MARKER), "{closed}");
+        assert_unmarked(
+            "a tool server that could not start",
+            &failure_renderings(CliError::Other(tool_server(&closed))),
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a runtime");
+        let panicked = runtime
+            .block_on(async {
+                tokio::spawn(async {
+                    std::panic::panic_any(MARKER.to_owned());
+                })
+                .await
+            })
+            .expect_err("the task panics");
+        assert!(panicked.is_panic());
+        // The negative control: the join failure's own text quotes what the panic said.
+        assert!(panicked.to_string().contains(MARKER), "{panicked}");
+        assert_unmarked(
+            "a task that panicked",
+            &failure_renderings(CliError::Other(task(&panicked))),
+        );
+    }
+
+    /// An operating system error number is said as any input or output failure is: its kind and its
+    /// number.
+    #[cfg(unix)]
+    #[test]
+    fn an_error_number_is_its_kind_and_number() {
+        let said = errno(rustix::io::Errno::NOENT).to_string();
+        assert!(said.contains("(os error 2)"), "{said}");
+    }
+}

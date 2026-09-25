@@ -87,3 +87,36 @@ fn refusal(refused: &configuration::EditRefused) -> CliError {
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use kr_protocol::hostinfo::export::Sentence;
+
+    use super::*;
+    use crate::shown::marker::{MARKER, assert_unmarked, failure_renderings};
+
+    /// A refused edit says the configuration's own sentences, and a sentence that arrived from a
+    /// document rather than being composed here is said by its class and length.
+    #[test]
+    fn a_refused_edit_does_not_repeat_a_sentence_that_arrived() {
+        let arrived: Sentence =
+            serde_json::from_value(serde_json::json!(MARKER)).expect("a sentence on the wire");
+        for refused in [
+            configuration::EditRefused::NotOurs(arrived.clone()),
+            configuration::EditRefused::Invalid(vec![arrived.clone()]),
+            configuration::EditRefused::Busy(MARKER.to_owned()),
+        ] {
+            // The negative control: the refusal's own text, which the command reported whole,
+            // repeats it.
+            assert!(refused.to_string().contains(MARKER), "{refused}");
+            assert_unmarked("a refused edit", &failure_renderings(refusal(&refused)));
+        }
+        let composed = Sentence::new()
+            .stated("this document is at version ")
+            .number(99);
+        assert_eq!(
+            refusal(&configuration::EditRefused::NotOurs(composed)).to_string(),
+            "this document is at version 99"
+        );
+    }
+}

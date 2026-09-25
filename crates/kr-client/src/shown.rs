@@ -1086,4 +1086,76 @@ mod tests {
             );
         }
     }
+
+    /// A terminal type is said when it is a terminfo name, and replaced when it holds anything a
+    /// terminfo name does not.
+    #[test]
+    fn a_terminal_type_is_said_only_when_it_is_a_terminfo_name() {
+        for name in ["xterm-256color", "screen.xterm-256color", "vt100+pc"] {
+            assert_eq!(Shown::terminfo(name).as_str(), name);
+        }
+        for name in [
+            "",
+            "Xterm",
+            "xterm 256",
+            "xterm\u{1b}[31m",
+            "a/path",
+            &"x".repeat(65),
+        ] {
+            assert_eq!(
+                Shown::terminfo(name).as_str(),
+                "[a terminal type]",
+                "{name:?}"
+            );
+        }
+    }
+
+    /// A closure record's signal is said as the platform names it, and replaced when it holds a
+    /// control character or is longer than any platform's name for a signal.
+    #[test]
+    fn a_signal_is_said_only_as_a_platform_names_one() {
+        let record = |signal: Option<&str>| kr_protocol::session::ClosureRecord {
+            session_id: kr_protocol::ids::SessionId::new(kr_protocol::scalars::Uuid::from_bytes(
+                [7; 16],
+            )),
+            session_epoch: kr_protocol::ids::SessionEpoch::V1,
+            reason: kr_protocol::session::ClosureReason::RootSignal,
+            root_exit_code: kr_protocol::scalars::Nullable::null(),
+            root_signal: kr_protocol::scalars::Nullable(signal.map(ToOwned::to_owned)),
+            terminated: Vec::new(),
+            surviving: Vec::new(),
+            ownership_coverage: kr_protocol::session::OwnershipCoverage::Incomplete,
+            durability: kr_protocol::session::Durability::Durable,
+            closed_at_ms: kr_protocol::scalars::TimestampMs::new(1),
+        };
+        assert!(Shown::signal(&record(None)).is_none());
+        for name in ["Killed: 9", "Terminated", "Real-time signal 3", "SIGTERM"] {
+            assert_eq!(
+                Shown::signal(&record(Some(name))).map(Shown::into_string),
+                Some(name.to_owned())
+            );
+        }
+        for name in ["\u{1b}]0;title\u{7}", "Killed\n9", &"K".repeat(65), ""] {
+            assert_eq!(
+                Shown::signal(&record(Some(name))).map(Shown::into_string),
+                Some("[a signal name]".to_owned()),
+                "{name:?}"
+            );
+        }
+    }
+
+    /// A host sentence composed here is said in its words; one that arrived from a document is said
+    /// by its class and length, which is the host's own export rule.
+    #[test]
+    fn a_sentence_that_arrived_is_said_by_its_class_and_length() {
+        let composed = kr_protocol::hostinfo::export::Sentence::new()
+            .stated("revision ")
+            .number(7);
+        assert_eq!(Shown::sentence(&composed).as_str(), "revision 7");
+        let arrived: kr_protocol::hostinfo::export::Sentence =
+            serde_json::from_value(serde_json::json!(MARKER)).expect("a sentence on the wire");
+        let said = Shown::sentence(&arrived);
+        assert!(!said.as_str().contains(MARKER), "{said}");
+        assert!(said.as_str().contains("14 bytes"), "{said}");
+    }
 }
