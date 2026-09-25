@@ -65,28 +65,19 @@ const SENTINELS: &str = ".git/kr-boundary-sentinels";
 /// Writes a program that records its own name and exits zero, with no other program involved.
 ///
 /// A shell redirection and nothing else: a recorder that had to run a second program would make
-/// "no sentinel" ambiguous between the recorder being refused and the helper being refused.
+/// "no sentinel" ambiguous between the recorder being refused and the helper being refused. It is
+/// placed rather than written, so no other test's child can hold it open for writing when Git
+/// starts it.
 fn recorder(path: &Path, repository: &Path, name: &str) {
     let sentinels = repository.join(SENTINELS);
     std::fs::create_dir_all(&sentinels).expect("the sentinel directory");
-    std::fs::write(
+    support::place_script(
         path,
-        format!(
+        &format!(
             "#!/bin/sh\necho ran >> \"{}/{name}\"\nexit 0\n",
             sentinels.display()
         ),
-    )
-    .expect("the program is written");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let mut permissions = std::fs::metadata(path)
-            .expect("the program's metadata")
-            .permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(path, permissions).expect("the program is executable");
-    }
+    );
 }
 
 /// Returns the sentinels one repository holds, which must be none.

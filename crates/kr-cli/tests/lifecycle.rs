@@ -220,6 +220,29 @@ fn worker() -> &'static Path {
     })
 }
 
+/// Puts a program whose text is `text` at `destination`, runnable, without this process ever
+/// holding it open for writing.
+///
+/// This binary's tests run on threads of one process, and a child another test starts is handed a
+/// copy of every descriptor open at that moment, a descriptor this process is writing a program
+/// through included. The child holds its copy until it starts its own program, and until then
+/// Linux refuses to start the program that is still open for writing. The programs placed here are
+/// started by a session's shell, not by this process, so no retry of this process's own could
+/// cover them. So the text goes to a file nothing starts, and a separate process copies it into
+/// place: no descriptor of this process is ever open on the program for writing, and no child can
+/// inherit one.
+fn place_script(destination: &Path, text: &str) {
+    let mut name = destination
+        .file_name()
+        .expect("a program has a name")
+        .to_owned();
+    name.push(".text");
+    let text_file = destination.with_file_name(name);
+    std::fs::write(&text_file, text).expect("the program's text is written");
+    kr_ipc::testing::place_program(&text_file, destination);
+    std::fs::remove_file(&text_file).expect("the program's text goes once it is in place");
+}
+
 /// Quotes a path for the POSIX shell lines this test writes.
 fn quoted(path: &Path) -> String {
     let text = path.display().to_string();
@@ -342,10 +365,7 @@ impl Host {
             std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
                 .expect("makes it the owner's alone");
         }
-        let agent = work.join("agent");
-        std::fs::write(&agent, SCRIPTED_AGENT).expect("writes the scripted agent");
-        std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755))
-            .expect("makes the agent runnable");
+        place_script(&work.join("agent"), SCRIPTED_AGENT);
         // The agent's tool configuration: which `kr` to start, and the host it belongs to.
         std::fs::write(
             work.join("agent.conf"),
@@ -357,10 +377,7 @@ impl Host {
             ),
         )
         .expect("writes the agent's configuration");
-        let job = work.join("stubborn");
-        std::fs::write(&job, STUBBORN_JOB).expect("writes the stubborn job");
-        std::fs::set_permissions(&job, std::fs::Permissions::from_mode(0o755))
-            .expect("makes the job runnable");
+        place_script(&work.join("stubborn"), STUBBORN_JOB);
         for gate in ["go-on", "finish"] {
             make_fifo(&work.join(gate));
         }
