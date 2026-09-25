@@ -61,6 +61,15 @@ fn binding(number: u8) -> BrokerBindingId {
     BrokerBindingId::new(Uuid::from_bytes([100 + number; 16]))
 }
 
+/// A declarative package installed beside the channel's, which pins its own tables.
+fn installed() -> kr_worker::broker::PackageIdentity {
+    kr_worker::broker::PackageIdentity {
+        plugin_id: kr_protocol::ids::PluginId::new("kalareach.codex").expect("valid"),
+        publisher_id: PublisherId::new("kalareach").expect("valid"),
+        package_digest: Digest256::from_bytes([5; 32]),
+    }
+}
+
 /// Registers one launched instance on a broker, as the command backend's launch does.
 fn register(broker: &Broker, number: u8) {
     let managed = ManagedProcess::new(
@@ -1231,7 +1240,7 @@ async fn kr_req_12_18_a_channels_identifier_is_not_restored_as_another_connectio
         }],
     };
     broker
-        .pin_table(instance(2), table, rich)
+        .pin_table(instance(2), installed(), table, rich)
         .expect("a declarative table is pinned");
     let refused = broker
         .restore_native_connection(

@@ -720,6 +720,15 @@ impl UpstreamDispatch for CountingUpstream {
     }
 }
 
+/// The installed package this suite's tables are pinned with and its bindings run.
+fn installed() -> kr_worker::broker::PackageIdentity {
+    kr_worker::broker::PackageIdentity {
+        plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+        publisher_id: PublisherId::new("kalareach").expect("valid"),
+        package_digest: Digest256::from_bytes([5; 32]),
+    }
+}
+
 fn approval_table() -> kr_protocol::gateway::DeclarativeTable {
     let mut table = kr_protocol::gateway::DeclarativeTable {
         plugin_id: PluginId::new("kalareach.codex").expect("valid"),
@@ -795,6 +804,7 @@ fn offer_approval<U: UpstreamDispatch + 'static>(
     broker
         .pin_table(
             instance(),
+            installed(),
             approval_table(),
             kr_protocol::gateway::RichMethodTable {
                 table_version: kr_protocol::ids::MethodTableVersion::new(1),
@@ -1601,7 +1611,7 @@ async fn kr_req_09_a_request_that_went_and_was_never_answered_leaves_an_unknown_
     register(&host, None);
     let broker = host.service.broker();
     broker
-        .pin_table(instance(), upstream_table(), upstream_rich())
+        .pin_table(instance(), installed(), upstream_table(), upstream_rich())
         .expect("the installed tables are pinned");
     broker
         .open_native_connection(
@@ -1902,6 +1912,7 @@ fn offer_elsewhere(host: &Host) -> kr_protocol::ids::PendingResourceId {
     broker
         .pin_table(
             elsewhere,
+            installed(),
             approval_table(),
             kr_protocol::gateway::RichMethodTable {
                 table_version: kr_protocol::ids::MethodTableVersion::new(1),

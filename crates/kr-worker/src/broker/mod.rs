@@ -170,6 +170,35 @@ pub const MAX_RETAINED_FRAMES: usize = 64;
 /// How many bytes of unconsumed source frames one instance holds.
 pub const MAX_RETAINED_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
+/// One installed package, as its installation names it: the package, its publisher and the
+/// installed hash.
+///
+/// The hash is the digest of the package's manifest, and the manifest names every other file of
+/// the package by digest, so the hash names the component too where the package ships one. Two
+/// packages are one package only when all three agree: the same identifier at other bytes, or from
+/// another publisher, is another package.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackageIdentity {
+    /// The package.
+    pub plugin_id: PluginId,
+    /// Its publisher.
+    pub publisher_id: PublisherId,
+    /// The installed package's hash.
+    pub package_digest: Digest256,
+}
+
+impl PackageIdentity {
+    /// Returns the package a decoder entry records as the one that interpreted its request.
+    #[must_use]
+    pub fn of_entry(entry: &DecoderLedgerEntry) -> Self {
+        Self {
+            plugin_id: entry.plugin_id.clone(),
+            publisher_id: entry.publisher_id.clone(),
+            package_digest: entry.package_digest,
+        }
+    }
+}
+
 /// One component bound to one application instance.
 #[derive(Clone, Debug)]
 pub struct Binding {
@@ -181,7 +210,8 @@ pub struct Binding {
     pub plugin_id: PluginId,
     /// That package's publisher, shown beside anything this binding produced.
     pub publisher_id: PublisherId,
-    /// The digest of the exact component bytes.
+    /// The installed package's hash: the digest of its manifest, which names the component and
+    /// every other file of the package by digest.
     pub package_digest: Digest256,
     /// The three grants, held separately.
     pub grants: BrokerGrants,
@@ -197,6 +227,16 @@ pub struct Binding {
 }
 
 impl Binding {
+    /// Returns the package this binding runs.
+    #[must_use]
+    pub fn package(&self) -> PackageIdentity {
+        PackageIdentity {
+            plugin_id: self.plugin_id.clone(),
+            publisher_id: self.publisher_id.clone(),
+            package_digest: self.package_digest,
+        }
+    }
+
     /// Returns true when this binding may decode the named method into a pending resource.
     ///
     /// Three things must hold together: the approval-interpreter grant, a recorded trust record,
@@ -654,6 +694,11 @@ pub struct PinnedTable {
     pub table: kr_protocol::gateway::DeclarativeTable,
     /// The closed rich method table for its upstream version.
     pub rich: kr_protocol::gateway::RichMethodTable,
+    /// The installed package the tables came from.
+    ///
+    /// A request a connection records with these tables is that package's request, and only that
+    /// package's decoder gives it a meaning.
+    pub package: PackageIdentity,
 }
 
 /// The trusted broker.
@@ -2756,23 +2801,38 @@ impl Broker {
     ///
     /// The declarative table's recorded digest is checked against the digest of what it declares,
     /// so the qualification names the semantics that were qualified rather than a label beside
-    /// them.
+    /// them. The tables are pinned with the installed package they came from, and a connection
+    /// opened with them records its requests as that package's.
     ///
     /// # Errors
     ///
     /// Returns [`BrokerError::Table`] when either table is not one the core will interpret, which
-    /// includes a declarative table whose digest is not the digest of its own content.
+    /// includes a declarative table whose digest is not the digest of its own content, and
+    /// [`BrokerError::InvalidArgument`] when the declarative table names another package or
+    /// publisher than the one it is pinned with.
     pub fn pin_table(
         &self,
         application_instance_id: ApplicationInstanceId,
+        package: PackageIdentity,
         table: kr_protocol::gateway::DeclarativeTable,
         rich: kr_protocol::gateway::RichMethodTable,
     ) -> Result<()> {
         table.validate()?;
         rich.qualify(&table.upstream_protocol_version)?;
+        if table.plugin_id != package.plugin_id || table.publisher_id != package.publisher_id {
+            return Err(BrokerError::invalid(format!(
+                "this table is {} from {}, and it is pinned with {} from {}: a table is pinned \
+                 with the installed package it came from",
+                table.plugin_id, table.publisher_id, package.plugin_id, package.publisher_id
+            )));
+        }
         self.state().pinned_tables.insert(
             (application_instance_id, table.plugin_id.clone()),
-            PinnedTable { table, rich },
+            PinnedTable {
+                table,
+                rich,
+                package,
+            },
         );
         Ok(())
     }

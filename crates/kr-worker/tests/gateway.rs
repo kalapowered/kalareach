@@ -110,6 +110,15 @@ fn package() -> PluginId {
     PluginId::new("kalareach.codex").expect("valid")
 }
 
+/// The installed package this suite's tables are pinned with and its bindings run.
+fn installed() -> kr_worker::broker::PackageIdentity {
+    kr_worker::broker::PackageIdentity {
+        plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+        publisher_id: PublisherId::new("kalareach").expect("valid"),
+        package_digest: Digest256::from_bytes([5; 32]),
+    }
+}
+
 fn table() -> DeclarativeTable {
     let mut table = DeclarativeTable {
         plugin_id: PluginId::new("kalareach.codex").expect("valid"),
@@ -350,7 +359,7 @@ fn gateway_built(
         )
         .expect("the binding is recorded");
     broker
-        .pin_table(instance(2), declarative, rich())
+        .pin_table(instance(2), installed(), declarative, rich())
         .expect("the installed tables are pinned");
     broker
         .open_native_connection(
@@ -641,7 +650,7 @@ fn kr_req_12_13_downstream_identifiers_are_namespaced_and_transition_once() {
         )
         .expect("the instance is registered");
     broker
-        .pin_table(instance(3), table(), rich())
+        .pin_table(instance(3), installed(), table(), rich())
         .expect("the installed tables are pinned");
     broker
         .open_native_connection(
@@ -717,7 +726,7 @@ fn kr_req_12_11_both_mutators_are_admitted_by_the_gateway_and_observers_are_list
         .open_connection(instance(2), ConnectionOrigin::RichClient, &package(), "1")
         .expect("a rich client connects");
     broker
-        .pin_table(instance(3), table(), rich())
+        .pin_table(instance(3), installed(), table(), rich())
         .expect("the installed tables are pinned");
     broker
         .open_connection(instance(3), ConnectionOrigin::RichClient, &package(), "1")
@@ -1263,7 +1272,7 @@ async fn a_recovery_waits_for_every_upstream_that_owed_it_a_reconciliation() {
         )
         .expect("the instance is registered");
     broker
-        .pin_table(instance(3), table(), rich())
+        .pin_table(instance(3), installed(), table(), rich())
         .expect("the installed tables are pinned");
     broker
         .open_native_connection(
@@ -1581,7 +1590,7 @@ async fn kr_req_11_37_a_reconciliation_names_its_recovery_and_a_new_scope_joins_
     // what it holds either, so it joins what this recovery owes and finishing the first one does
     // not lift the fence.
     broker
-        .pin_table(instance(2), table(), rich())
+        .pin_table(instance(2), installed(), table(), rich())
         .expect("the installed tables are pinned");
     broker
         .open_native_connection(
@@ -1673,7 +1682,7 @@ fn kr_req_11_25_a_tables_digest_names_the_semantics_it_declares() {
             "{what} is part of what the digest covers"
         );
         let refusal = broker
-            .pin_table(instance(2), altered, rich())
+            .pin_table(instance(2), installed(), altered, rich())
             .expect_err("a table whose digest is not its own content is refused");
         assert_eq!(
             refusal.code(),

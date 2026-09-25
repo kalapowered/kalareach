@@ -38,6 +38,7 @@ use kr_protocol::broker::{DecodingTrust, OfferedDecision};
 use kr_protocol::ids::{PluginId, PublisherId, UpstreamMethod};
 use kr_protocol::scalars::{CanonicalSet, Digest256, TimestampMs, U64};
 
+use crate::broker::PackageIdentity;
 use crate::broker::bridge::{BridgeSurface, InstalledBridge};
 
 /// The command an integration resolves, and the flags it adds to an invocation of it.
@@ -113,6 +114,7 @@ pub struct InstalledConnector {
     source: ConnectorSource,
     manifest: PluginManifest,
     table: ConnectorManifest,
+    package: PackageIdentity,
 }
 
 impl InstalledConnector {
@@ -123,9 +125,9 @@ impl InstalledConnector {
     /// Returns [`ConnectorRefusal`] naming the first thing that does not hold: the package fails
     /// the SDK's package check (a file that is not the bytes the manifest names, or a table for
     /// another package, among them), its manifest does not hash to the installed hash, it carries
-    /// no table, no match rule of the package recognises the command the integration resolves, or
+    /// no table, no match rule of the package recognises the command the integration resolves,
     /// the installation describes a native bridge the package does not declare or was not
-    /// granted.
+    /// granted, or its publisher is not one this host can record.
     pub fn read(source: ConnectorSource) -> Result<Self, ConnectorRefusal> {
         let validated = kr_plugin_sdk::validate::validate_package_directory(&source.package_dir);
         if !validated.report.is_valid() {
@@ -212,10 +214,22 @@ impl InstalledConnector {
                 )));
             }
         }
+        let publisher_id =
+            PublisherId::new(package.manifest.publisher_id.as_str()).map_err(|error| {
+                ConnectorRefusal::new(format!(
+                    "{plugin_id}'s publisher is not one this host can record: {error}"
+                ))
+            })?;
+        let identity = PackageIdentity {
+            plugin_id,
+            publisher_id,
+            package_digest: source.package_digest,
+        };
         Ok(Self {
             source,
             manifest: package.manifest,
             table,
+            package: identity,
         })
     }
 
@@ -229,6 +243,14 @@ impl InstalledConnector {
     #[must_use]
     pub const fn package_digest(&self) -> Digest256 {
         self.source.package_digest
+    }
+
+    /// Returns the installed package: its identifier, its publisher and its hash.
+    ///
+    /// This is what the package's tables are pinned with, and what a binding of it runs.
+    #[must_use]
+    pub const fn package(&self) -> &PackageIdentity {
+        &self.package
     }
 
     /// Returns the package's manifest, as the installed hash names it.
@@ -718,6 +740,12 @@ pub mod fixture {
         source
     }
 
+    /// The bytes the fixture ships as its component: a Wasm component's preamble.
+    ///
+    /// Nothing here runs a component, and the package check executes nothing, so the fixture's
+    /// component is the bytes the manifest names by digest and no more.
+    pub const COMPONENT: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00];
+
     /// Writes the package under `root` as the store extracts it, and returns what an installation
     /// hands over for it, with every capability the package declares granted.
     ///
@@ -725,7 +753,28 @@ pub mod fixture {
     ///
     /// Returns what writing a file returned.
     pub fn claude_code_package(root: &Path, forwarder: &Path) -> std::io::Result<ConnectorSource> {
-        let files: Vec<(&str, &str, Vec<u8>)> = vec![
+        write_package(root, forwarder, false)
+    }
+
+    /// Writes the same package with a Wasm component in it too, and returns what an installation
+    /// hands over for it, with every capability the package declares granted.
+    ///
+    /// # Errors
+    ///
+    /// Returns what writing a file returned.
+    pub fn claude_code_package_with_component(
+        root: &Path,
+        forwarder: &Path,
+    ) -> std::io::Result<ConnectorSource> {
+        write_package(root, forwarder, true)
+    }
+
+    fn write_package(
+        root: &Path,
+        forwarder: &Path,
+        component: bool,
+    ) -> std::io::Result<ConnectorSource> {
+        let mut files: Vec<(&str, &str, Vec<u8>)> = vec![
             ("connector", "connector.json", connector_json().into_bytes()),
             (
                 "presentation",
@@ -740,6 +789,13 @@ pub mod fixture {
                 PLUGIN.to_vec(),
             ),
         ];
+        if component {
+            files.push((
+                "component",
+                kr_plugin_sdk::package::COMPONENT_FILE,
+                COMPONENT.to_vec(),
+            ));
+        }
         let manifest = manifest_json(&files);
         let digest = PayloadDigest::of(manifest.as_bytes());
         let directory: PathBuf = root.join("packages").join(digest.to_string());

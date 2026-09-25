@@ -2021,6 +2021,15 @@ mod tests {
         )
     }
 
+    /// The installed package the test tables are pinned with and the test binding runs.
+    fn installed() -> crate::broker::PackageIdentity {
+        crate::broker::PackageIdentity {
+            plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+            publisher_id: PublisherId::new("kalareach").expect("valid"),
+            package_digest: Digest256::from_bytes([5; 32]),
+        }
+    }
+
     fn trust() -> DecodingTrust {
         DecodingTrust {
             plugin_id: PluginId::new("kalareach.codex").expect("valid"),
@@ -2200,7 +2209,12 @@ mod tests {
             )
             .expect("instance registered");
         broker
-            .pin_table(instance(), test_declarative_table(), test_rich_table())
+            .pin_table(
+                instance(),
+                installed(),
+                test_declarative_table(),
+                test_rich_table(),
+            )
             .expect("table pinned");
         let connection = broker
             .open_native_connection(

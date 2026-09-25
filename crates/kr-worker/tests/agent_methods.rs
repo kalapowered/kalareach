@@ -119,6 +119,15 @@ fn package() -> PluginId {
     PluginId::new("kalareach.codex").expect("valid")
 }
 
+/// The installed package this suite's tables are pinned with and its bindings run.
+fn installed() -> kr_worker::broker::PackageIdentity {
+    kr_worker::broker::PackageIdentity {
+        plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+        publisher_id: PublisherId::new("kalareach").expect("valid"),
+        package_digest: Digest256::from_bytes([5; 32]),
+    }
+}
+
 fn table() -> DeclarativeTable {
     let mut table = DeclarativeTable {
         plugin_id: PluginId::new("kalareach.codex").expect("valid"),
@@ -329,7 +338,7 @@ fn agent_broker_on(health: std::sync::Arc<JournalHealth>) -> Broker {
         )
         .expect("the binding is recorded");
     broker
-        .pin_table(instance(), table(), rich())
+        .pin_table(instance(), installed(), table(), rich())
         .expect("the installed tables are pinned");
     broker
         .open_native_connection(

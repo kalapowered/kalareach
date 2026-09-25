@@ -198,6 +198,15 @@ fn package() -> PluginId {
     PluginId::new("kalareach.codex").expect("valid")
 }
 
+/// The installed package this suite's tables are pinned with and its bindings run.
+fn installed() -> kr_worker::broker::PackageIdentity {
+    kr_worker::broker::PackageIdentity {
+        plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+        publisher_id: PublisherId::new("kalareach").expect("valid"),
+        package_digest: Digest256::from_bytes([5; 32]),
+    }
+}
+
 fn declarative_table() -> DeclarativeTable {
     let mut table = DeclarativeTable {
         plugin_id: PluginId::new("kalareach.codex").expect("valid"),
@@ -428,7 +437,7 @@ fn broker_recording(
         )
         .expect("the binding is recorded");
     broker
-        .pin_table(instance(2), declarative_table(), rich_table())
+        .pin_table(instance(2), installed(), declarative_table(), rich_table())
         .expect("the installed tables are pinned");
     broker
         .open_native_connection(
@@ -711,7 +720,7 @@ fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_
             )
             .expect("the binding is recorded");
         broker
-            .pin_table(instance(2), declarative_table(), rich_table())
+            .pin_table(instance(2), installed(), declarative_table(), rich_table())
             .expect("the installed tables are pinned");
         broker
             .open_native_connection(
@@ -726,7 +735,7 @@ fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_
         // Binding: a request of another application is not this binding's to interpret. The
         // frame is not a thing a caller names at all: the broker recorded it with the request.
         broker
-            .pin_table(instance(3), declarative_table(), rich_table())
+            .pin_table(instance(3), installed(), declarative_table(), rich_table())
             .expect("the installed tables are pinned");
         broker
             .open_native_connection(
@@ -1836,7 +1845,7 @@ async fn kr_req_11_37_a_committed_gap_records_what_happened_inside_it_and_restor
             .expect("the binding is recorded");
 
         broker
-            .pin_table(instance(2), declarative_table(), rich_table())
+            .pin_table(instance(2), installed(), declarative_table(), rich_table())
             .expect("the installed tables are pinned");
         broker
             .open_native_connection(
