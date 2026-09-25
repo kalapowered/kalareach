@@ -126,7 +126,7 @@ export function AppProvider({
         }
         setToast((current) =>
           current?.topic === CONFIRMATIONS_TOPIC
-            ? { ...current, text, action }
+            ? { ...current, text, action, said: (current.said ?? 0) + 1 }
             : { id: Date.now() + Math.random(), text, tone: 'pending', action, topic: CONFIRMATIONS_TOPIC }
         )
       })

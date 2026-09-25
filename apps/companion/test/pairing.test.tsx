@@ -449,9 +449,7 @@ describe("the owner's confirmations", () => {
     })
     await userEvent.click(await screen.findByTestId('confirm-request'))
     expect(
-      await screen.findByText(
-        'studio did not say whether it took the confirmation. While the request is listed here, it is not confirmed.'
-      )
+      await screen.findByText('studio did not say whether it took the confirmation.')
     ).toBeInTheDocument()
     expect(screen.queryByText('Not confirmed. Nothing changed.')).toBeNull()
   })
@@ -545,6 +543,36 @@ describe("the owner's confirmations", () => {
     })
     expect(await screen.findByText('2 requests need your confirmation')).toBeInTheDocument()
     expect(document.activeElement).toBe(review)
+  })
+
+  it('says a new arrival again though the number waiting stays the same, keeping its Review button', async () => {
+    const { controls } = start({ view: 'sessions' })
+    const invitation = request({ reference: 'r-2', title: 'Issue an invitation', value: null })
+    act(() => {
+      controls.setConfirmations({ ceremony: 'touch_id', requests: [request({ reference: 'r-1' }), invitation] })
+    })
+    const said = await screen.findByText('2 requests need your confirmation')
+    const toast = said.closest<HTMLElement>('[role="status"]')!
+    const review = within(toast).getByRole('button', { name: 'Review' })
+    act(() => {
+      controls.setConfirmations({
+        ceremony: 'touch_id',
+        requests: [
+          invitation,
+          request({ reference: 'r-3', title: 'Widen what devices may do', value: null })
+        ]
+      })
+    })
+    // The words are said again, as a new text in the live region, though they read the same.
+    await waitFor(() => {
+      expect(screen.getByText('2 requests need your confirmation')).not.toBe(said)
+    })
+    expect(within(toast).getByRole('button', { name: 'Review' })).toBe(review)
+    await userEvent.click(review)
+    const newest = (await screen.findByText('Widen what devices may do')).closest('li')
+    await waitFor(() => {
+      expect(document.activeElement).toBe(newest)
+    })
   })
 
   it('keeps an announcement while the pointer is on it or focus is in it, in either order', async () => {

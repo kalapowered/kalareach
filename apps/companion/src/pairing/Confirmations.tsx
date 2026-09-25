@@ -68,7 +68,7 @@ function outcomeWords(outcome: ReviewOutcome, host: string): string {
     case 'no_ceremony':
       return 'This computer cannot check it is you. Confirm on your phone.'
     case 'unknown':
-      return `${host} did not say whether it took the confirmation. While the request is listed here, it is not confirmed.`
+      return `${host} did not say whether it took the confirmation.`
   }
 }
 
