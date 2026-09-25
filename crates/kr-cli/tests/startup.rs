@@ -854,13 +854,13 @@ struct Recorded {
 /// made it in `calls`, and fails the way a host with no service manager and no privilege tool
 /// would.
 fn recording_tools(tools: &Path, calls: &Path) {
-    use std::os::unix::fs::PermissionsExt as _;
-
     std::fs::create_dir_all(tools).expect("a directory for the recording tools");
     for tool in RECORDING_TOOLS {
-        let path = tools.join(tool);
+        // Written aside as text and placed by a process of its own, so that no child another test
+        // starts meanwhile holds a tool open for writing when the daemon starts it.
+        let text = tools.join(format!("{tool}.text"));
         std::fs::write(
-            &path,
+            &text,
             format!(
                 "#!/bin/sh\n\
                  {{\n\
@@ -873,8 +873,7 @@ fn recording_tools(tools: &Path, calls: &Path) {
             ),
         )
         .expect("writes a recording tool");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .expect("makes it runnable");
+        kr_ipc::testing::place_program(&text, &tools.join(tool));
     }
 }
 

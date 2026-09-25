@@ -1117,25 +1117,14 @@ mod tests {
         let directory = std::env::temp_dir().join(format!("kr-image-{}", kr_ipc::new_uuid()));
         std::fs::create_dir_all(&directory).expect("a directory");
         let program = directory.join("program");
-        std::fs::copy("/bin/bash", &program).expect("a copy of bash");
-        let started = std::time::Instant::now();
-        let child = loop {
-            match std::process::Command::new(&program)
-                .args(["-c", "read line"])
-                .stdin(std::process::Stdio::piped())
-                .spawn()
-            {
-                Ok(child) => break child,
-                // The copy stays busy while a child that another test forked holds it open.
-                Err(error)
-                    if error.raw_os_error() == Some(libc::ETXTBSY)
-                        && started.elapsed() < std::time::Duration::from_secs(10) =>
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(error) => panic!("the copy runs: {error}"),
-            }
-        };
+        // Placed by a process of its own, so that no child another test starts meanwhile holds the
+        // copy open for writing when it is started here.
+        kr_ipc::testing::place_program(std::path::Path::new("/bin/bash"), &program);
+        let child = std::process::Command::new(&program)
+            .args(["-c", "read line"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("the copy runs");
         (program, child)
     }
 

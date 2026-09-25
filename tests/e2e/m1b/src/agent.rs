@@ -8,7 +8,6 @@
 //! the foreground, which is what typing into an agent is. The device types those lines, holding the
 //! input lease.
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::host::{Host, quoted};
@@ -62,10 +61,11 @@ impl Agent {
     pub fn place_as(run: &Run, host: &Host<'_>, name: &str, program: &str) -> Self {
         let directory = run.work().join(name);
         kr_ipc::paths::create_private_tree(run.root(), &directory).expect("the agent's directory");
-        let path = directory.join(program);
-        std::fs::write(&path, SCRIPTED_AGENT).expect("writes the agent");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .expect("makes the agent runnable");
+        // Written aside as text and placed by a process of its own, so that no child this process
+        // starts meanwhile holds the agent open for writing when the session's shell starts it.
+        let text = directory.join(format!("{program}.text"));
+        std::fs::write(&text, SCRIPTED_AGENT).expect("writes the agent");
+        kr_ipc::testing::place_program(&text, &directory.join(program));
         std::fs::write(
             directory.join("agent.conf"),
             format!(
