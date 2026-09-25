@@ -2790,9 +2790,29 @@ impl WorkerService {
     /// answered by then leaves an outcome nobody can establish, which section 9 records as unknown
     /// rather than as a refusal the caller would read as "nothing happened".
     async fn finish_upstream(&self, pending: PendingUpstream) -> ControlFrame {
-        let carried = tokio::time::timeout(UPSTREAM_SUBMIT_DEADLINE, pending.handoff.carry()).await;
-        let outcome = carried.unwrap_or_else(|_| {
-            Err(WorkerError::Broker(
+        // The transmission runs on a thread of its own. Handing an operation to its transport is a
+        // call into the transport, and one that blocks there would hold whatever runs it: on this
+        // task the deadline below could never fire. On its own thread it waits for its outcome or
+        // for the word to stop, so the deadline ends the caller's wait whatever the transport
+        // does, and a transmission still waiting for its outcome is dropped at the deadline, as
+        // it always was.
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let handoff = pending.handoff;
+        let runtime = tokio::runtime::Handle::current();
+        let carrying = tokio::task::spawn_blocking(move || {
+            runtime.block_on(async move {
+                tokio::select! {
+                    biased;
+                    carried = handoff.carry() => Some(carried),
+                    _ = stopped => None,
+                }
+            })
+        });
+        let carried = tokio::time::timeout(UPSTREAM_SUBMIT_DEADLINE, carrying).await;
+        drop(stop);
+        let outcome = match carried {
+            Ok(Ok(Some(outcome))) => outcome,
+            Ok(Ok(None) | Err(_)) | Err(_) => Err(WorkerError::Broker(
                 crate::broker::BrokerError::UpstreamUnavailable {
                     detail: format!(
                         "the upstream did not answer within {} seconds, so whether the operation \
@@ -2800,8 +2820,8 @@ impl WorkerService {
                         UPSTREAM_SUBMIT_DEADLINE.as_secs()
                     ),
                 },
-            ))
-        });
+            )),
+        };
         self.settle_upstream(&pending.actor_id, pending.action_id, outcome.as_ref());
         match outcome {
             Ok(value) => ControlFrame::Response(Response {

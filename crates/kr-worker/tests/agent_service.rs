@@ -2313,3 +2313,70 @@ async fn kr_req_12_18_a_plugin_answer_goes_out_on_the_channel_and_reports_the_ac
         ReceiptState::Rejected
     );
 }
+
+/// A transport whose `submit` blocks until it is let go: one whose queue is held somewhere this
+/// host cannot see.
+#[derive(Debug)]
+struct BlockingUpstream {
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl UpstreamDispatch for BlockingUpstream {
+    fn admit(&self, _request: &UpstreamRequest) -> Result<(), BrokerError> {
+        Ok(())
+    }
+
+    fn submit(&self, _request: &UpstreamRequest) -> Result<PendingTransmission, BrokerError> {
+        let _ = self
+            .release
+            .lock()
+            .expect("the release is not poisoned")
+            .recv_timeout(std::time::Duration::from_secs(120));
+        Ok(PendingTransmission::settled(Ok(UpstreamOutcome {
+            upstream_request_id: None,
+            turn_id: None,
+            provenance: kr_protocol::broker::ActionProvenance::UpstreamTypedRpc,
+        })))
+    }
+}
+
+/// KR-REQ-09: an admitted operation whose transport blocks while it takes the operation is answered
+/// when the upstream deadline passes, as an outcome nobody can establish, and not whenever the
+/// transport lets go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transport_that_blocks_as_it_takes_an_operation_meets_the_upstream_deadline() {
+    let host = host().await;
+    let (release, held) = std::sync::mpsc::channel();
+    register(
+        &host,
+        Some(Arc::new(BlockingUpstream {
+            release: std::sync::Mutex::new(held),
+        }) as Arc<dyn UpstreamDispatch>),
+    );
+    let mut client = cli(&host).await;
+    let mutation = prompt_mutation(&client, &host, 70);
+    let action_id = mutation.action_id;
+    let started = tokio::time::Instant::now();
+    let deadline = kr_worker::service::UPSTREAM_SUBMIT_DEADLINE;
+    let outcome = tokio::time::timeout(
+        deadline + std::time::Duration::from_secs(30),
+        send(&mut client, mutation),
+    )
+    .await
+    .expect("the caller is answered at the deadline, not when the transport lets go");
+    let waited = started.elapsed();
+    let _ = release.send(());
+    let Outcome::Error(error) = outcome else {
+        panic!("a transmission that never finished is not applied: {outcome:?}");
+    };
+    assert_eq!(error.code, ErrorCode::UpstreamUnavailable);
+    assert!(
+        waited < deadline + std::time::Duration::from_secs(20),
+        "answered after {waited:?}, at a deadline of {deadline:?}"
+    );
+    assert_eq!(
+        receipt(&mut client, action_id).await.state,
+        ReceiptState::Unknown,
+        "whether it reached the upstream cannot be established"
+    );
+}
