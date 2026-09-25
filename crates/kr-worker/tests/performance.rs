@@ -480,7 +480,8 @@ struct Idle {
 }
 
 /// KR-PERF-003: idle local terminal resources, the daemon and twenty idle sessions' workers and root
-/// shells together, resident memory and processor use averaged over five minutes.
+/// shells together: processor use averaged over five minutes, and resident memory read once at the
+/// end of that window.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "runs for five minutes by design; scripts/performance.sh runs it"]
 async fn idle_resources_for_twenty_sessions_and_thirty_two_views() {
