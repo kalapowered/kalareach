@@ -4,6 +4,7 @@
 //! target Cargo discovers on its own, one a manifest declares with its own path and one that sets
 //! `test = false` are all what Cargo says they are.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -83,6 +84,9 @@ pub struct Package {
     pub targets: Vec<Target>,
     /// Its manifest.
     pub manifest: PathBuf,
+    /// The crates it depends on from the registry under their own names, with no other dependency
+    /// renamed to any of them: a path such as `tokio::test` names the crate it says only then.
+    pub registry_crates: BTreeSet<String>,
 }
 
 /// Reads the workspace whose manifest is at `root`, through `cargo metadata`.
@@ -241,11 +245,32 @@ pub fn parse(value: &Value) -> Result<Vec<Package>, String> {
                 harness: true,
             });
         }
+        let dependencies = package["dependencies"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let renamed: BTreeSet<&str> = dependencies
+            .iter()
+            .filter_map(|dependency| dependency["rename"].as_str())
+            .collect();
+        let registry_crates = dependencies
+            .iter()
+            .filter(|dependency| {
+                dependency["rename"].is_null()
+                    && dependency["source"]
+                        .as_str()
+                        .is_some_and(|source| source.starts_with("registry+"))
+            })
+            .filter_map(|dependency| dependency["name"].as_str())
+            .filter(|name| !renamed.contains(name))
+            .map(str::to_owned)
+            .collect();
         packages.push(Package {
             name,
             version,
             targets,
             manifest,
+            registry_crates,
         });
     }
     packages.sort_by(|a, b| a.name.cmp(&b.name));
@@ -255,6 +280,31 @@ pub fn parse(value: &Value) -> Result<Vec<Package>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_crate_is_the_registrys_only_under_its_own_name() {
+        let value = serde_json::json!({
+            "workspace_members": ["path+file:///w/a#0.1.0"],
+            "packages": [{
+                "id": "path+file:///w/a#0.1.0",
+                "name": "a",
+                "version": "0.1.0",
+                "manifest_path": "/w/a/Cargo.toml",
+                "targets": [],
+                "dependencies": [
+                    { "name": "tokio", "rename": null, "source": "registry+https://github.com/rust-lang/crates.io-index" },
+                    { "name": "serde", "rename": null, "source": "registry+https://github.com/rust-lang/crates.io-index" },
+                    { "name": "other-serde", "rename": "serde", "source": "registry+https://github.com/rust-lang/crates.io-index" },
+                    { "name": "local", "rename": null, "source": null }
+                ]
+            }]
+        });
+        let packages = parse(&value).expect("parses");
+        assert_eq!(
+            packages[0].registry_crates,
+            BTreeSet::from(["tokio".to_owned()])
+        );
+    }
 
     #[test]
     fn members_and_their_targets_are_read_and_a_build_script_is_not_a_target() {

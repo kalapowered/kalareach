@@ -202,6 +202,7 @@ fn a_call_a_macro_or_attribute_may_rewrite_move_or_rename_keys_nothing() {
         ("KR-REQ-03.28", "which no test calls"),
         ("KR-REQ-03.29", "which no test calls"),
         ("KR-REQ-03.30", "which its module defines more than once"),
+        ("KR-REQ-03.32", "which no test calls"),
     ] {
         let row = identifier(row);
         assert!(
