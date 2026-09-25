@@ -255,6 +255,9 @@ impl CatalogueModule {
             .map_err(unavailable)?;
         let bridges = Arc::new(native_bridge::NativeBridges::new(bridges));
         let environment_id = paths.environment_id();
+        for plugin_id in bridge_subjects(&catalogue, &bridges, environment_id) {
+            follow_bridge(&catalogue, &bridges, environment_id, &plugin_id);
+        }
         Ok(Self {
             catalogue: Arc::new(Mutex::new(catalogue)),
             environment_id,
@@ -575,18 +578,36 @@ impl CatalogueModule {
                 key.clone(),
             )
             .await;
-        let Err(error) = outcome else {
-            return outcome;
+        let answer = match outcome {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                // Refused only when nothing of the action committed; anything else is unknown, and
+                // the answer names what the action left behind. The caller is told the same thing
+                // every later resubmission is told.
+                let failure = recording.failure(&error);
+                // A settlement this host cannot record leaves the claim dispatching, and every
+                // later reader is told that is unknown: the action is never performed again, and
+                // nobody is told it had no effect on the strength of a record that was never
+                // written.
+                let _ = catalogue.settle_failure(&key, &failure, kr_ipc::now_ms().get());
+                Err(failure.into_answer())
+            }
         };
-        // Refused only when nothing of the action committed; anything else is unknown, and the
-        // answer names what the action left behind. The caller is told the same thing every later
-        // resubmission is told.
-        let failure = recording.failure(&error);
-        // A settlement this host cannot record leaves the claim dispatching, and every later
-        // reader is told that is unknown: the action is never performed again, and nobody is told
-        // it had no effect on the strength of a record that was never written.
-        let _ = catalogue.settle_failure(&key, &failure, kr_ipc::now_ms().get());
-        Err(failure.into_answer())
+        // The package's native bridge follows what the change left its installation wanting,
+        // under the same lock and after the change's commit. What it does is its own journal's and
+        // never changes the answer the change recorded.
+        if let Some(plugin_id) = plugin_named(method, &mutation.params) {
+            let bridges = Arc::clone(&self.bridges);
+            let wanted = wanted_bridge(&catalogue, self.environment_id, &plugin_id);
+            let followed = tokio::task::spawn_blocking(move || {
+                reconcile_bridge(&bridges, &plugin_id, wanted);
+            })
+            .await;
+            if let Err(error) = followed {
+                eprintln!("kr-controller: a native bridge was not reconciled: {error}");
+            }
+        }
+        answer
     }
 
     async fn perform_write(
@@ -962,6 +983,134 @@ impl CatalogueModule {
             ErrorCode::InvalidArgument,
             format!("this daemon owns environment {}", self.environment_id),
         ))
+    }
+}
+
+/// The package a plugin mutation names, where it names one.
+fn plugin_named(method: Method, params: &ParamsValue) -> Option<PluginId> {
+    match method {
+        Method::PluginInstall => typed::<wire::PluginInstallParams>(params)
+            .ok()
+            .map(|params| params.plugin_id),
+        Method::PluginRemove => typed::<wire::PluginRemoveParams>(params)
+            .ok()
+            .map(|params| params.plugin_id),
+        Method::PluginPin => typed::<wire::PluginPinParams>(params)
+            .ok()
+            .map(|params| params.plugin_id),
+        Method::PluginEnable | Method::PluginDisable => typed::<wire::PluginEnableParams>(params)
+            .ok()
+            .map(|params| params.plugin_id),
+        Method::PluginGrant => typed::<wire::PluginGrantParams>(params)
+            .ok()
+            .map(|params| params.plugin_id),
+        _ => None,
+    }
+}
+
+/// Every package whose bridge may need bringing to what its installation wants: each installed
+/// one whose manifest carries a recipe, and each with a journal.
+fn bridge_subjects(
+    catalogue: &Catalogue,
+    bridges: &native_bridge::NativeBridges,
+    environment_id: EnvironmentId,
+) -> Vec<PluginId> {
+    let mut subjects = std::collections::BTreeSet::new();
+    match catalogue.installations() {
+        Ok(installations) => subjects.extend(
+            installations
+                .into_iter()
+                .filter(|installation| installation.environment_id == environment_id)
+                .map(|installation| installation.plugin_id),
+        ),
+        Err(error) => eprintln!("kr-controller: the installations could not be read: {error}"),
+    }
+    match bridges.journaled() {
+        Ok(journaled) => subjects.extend(journaled),
+        Err(error) => {
+            eprintln!("kr-controller: the native bridge journals could not be read: {error}")
+        }
+    }
+    subjects.into_iter().collect()
+}
+
+/// Brings one package's bridge to what its installation wants, where that can be read.
+fn follow_bridge(
+    catalogue: &Catalogue,
+    bridges: &native_bridge::NativeBridges,
+    environment_id: EnvironmentId,
+    plugin_id: &PluginId,
+) {
+    reconcile_bridge(
+        bridges,
+        plugin_id,
+        wanted_bridge(catalogue, environment_id, plugin_id),
+    );
+}
+
+/// What one package's installation wants of its bridge: `Ok(Some(None))` for nothing,
+/// `Ok(Some(Some(_)))` for a release's recipe, and `Ok(None)` when the installed package is not
+/// whole here, so what it wants cannot be read and its bridge is left as it is.
+fn wanted_bridge(
+    catalogue: &Catalogue,
+    environment_id: EnvironmentId,
+    plugin_id: &PluginId,
+) -> CatalogueResult<Option<Option<native_bridge::BridgeTarget>>> {
+    let Some(installation) = catalogue.installation(environment_id, plugin_id)? else {
+        return Ok(Some(None));
+    };
+    // The grant is what permits the bridge: a release installed without it, or an installation
+    // that withdrew it, wants none.
+    if !catalogue
+        .effective_capabilities(environment_id, plugin_id)?
+        .contains(&PluginCapability::NativeBridgeInstall)
+    {
+        return Ok(Some(None));
+    }
+    let store = catalogue.store_of(&installation);
+    let package = match store.check_package(installation.package_digest)? {
+        kr_plugin_catalogue::PackageCheck::Complete(package) => package,
+        kr_plugin_catalogue::PackageCheck::Missing { .. }
+        | kr_plugin_catalogue::PackageCheck::Corrupt { .. } => return Ok(None),
+    };
+    let manifest = package.manifest();
+    let Some(recipe) = manifest.native_bridge.as_ref().cloned() else {
+        return Ok(Some(None));
+    };
+    Ok(Some(Some(native_bridge::BridgeTarget {
+        plugin_id: plugin_id.clone(),
+        package_digest: installation.package_digest,
+        package_dir: store.package_dir(installation.package_digest),
+        recipe,
+        match_rules: manifest.match_rules.clone(),
+        // A catalogue qualification result names a capability, the subject it was qualified
+        // against and its profile, and no executable's digest, so no signed record here says which
+        // version an executable is. The recipe's version requirement then refuses the recipe
+        // rather than guessing.
+        qualified: Vec::new(),
+    })))
+}
+
+/// Runs one reconciliation and says what went wrong, where something did.
+fn reconcile_bridge(
+    bridges: &native_bridge::NativeBridges,
+    plugin_id: &PluginId,
+    wanted: CatalogueResult<Option<Option<native_bridge::BridgeTarget>>>,
+) {
+    match wanted {
+        Ok(Some(wanted)) => {
+            if let Err(error) = bridges.reconcile(plugin_id, wanted.as_ref()) {
+                eprintln!(
+                    "kr-controller: the native bridge of {plugin_id} was not reconciled, and is \
+                     reconciled again when this daemon next starts: {error}"
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(error) => eprintln!(
+            "kr-controller: what the installation of {plugin_id} wants of its native bridge \
+             could not be read: {error}"
+        ),
     }
 }
 
