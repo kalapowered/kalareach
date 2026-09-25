@@ -214,7 +214,15 @@ pub fn take_claim(
     for request in requests {
         let path = directory.join(format!("{request}.{CLAIM}"));
         let marker = directory.join(format!("{request}.{TAKEN}"));
-        let claim = read_claim(&path)?;
+        let claim = match read_claim(&path) {
+            Ok(claim) => claim,
+            // Another starter removed it, as an earlier boot's, while this one was looking: the
+            // other claims are still looked at.
+            Err(IpcError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if claim.boot != *boot {
             // An earlier boot's request: its deadline is on a clock that has restarted, and
             // nothing can act on it now.
@@ -332,9 +340,9 @@ pub fn clear_recorded_session(environment: &EnvironmentPaths) -> Result<()> {
 
 #[cfg(windows)]
 pub use self::windows::{
-    ChildCommand, ChildRefusal, LaunchListener, LaunchStream, MAX_LAUNCH_FRAME, PeerProcess,
-    Reached, StartedChild, account_sid, connect, current_session, current_user_sid, in_any_job,
-    process_facts, start_child,
+    ChildCommand, ChildRefusal, LaunchListener, LaunchStream, MAX_LAUNCH_FRAME, NamedLock,
+    PeerProcess, Reached, StartedChild, account_sid, connect, current_session, current_user_sid,
+    in_any_job, process_facts, start_child,
 };
 
 #[cfg(all(windows, any(test, feature = "testing")))]
@@ -770,6 +778,69 @@ mod windows {
             session: token.session()?,
             same_user: token.same_user_as(&own)?,
         })
+    }
+
+    /// A lock every process of this user on the machine can take by one name, held until dropped.
+    ///
+    /// A named mutex: the operating system gives it to one holder at a time and hands it on when
+    /// its holder ends, however it ends. It belongs to the thread that took it, so it is not
+    /// passed to another.
+    #[derive(Debug)]
+    pub struct NamedLock {
+        mutex: OwnedHandle,
+        _thread: std::marker::PhantomData<*const ()>,
+    }
+
+    impl NamedLock {
+        /// Takes the lock named `name` within `bound`.
+        ///
+        /// A name in the `Global\` namespace is one lock for every session on the machine. A lock
+        /// another account made first cannot be opened, and is refused rather than waited for.
+        ///
+        /// # Errors
+        ///
+        /// Returns a timeout when another holder keeps it past `bound`, and the operating
+        /// system's error when it cannot be made or opened.
+        pub fn acquire(name: &str, bound: std::time::Duration) -> io::Result<Self> {
+            use windows_sys::Win32::Foundation::WAIT_ABANDONED;
+            use windows_sys::Win32::System::Threading::CreateMutexW;
+
+            let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+            // SAFETY: no attributes, not owned on creation, and a terminated name; the call returns
+            // a new handle to the one mutex of that name, or null.
+            let handle = unsafe { CreateMutexW(std::ptr::null(), 0, wide.as_ptr()) };
+            if handle.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: the call above returned a new handle that nothing else owns.
+            let mutex = unsafe { OwnedHandle::from_raw_handle(handle) };
+            let wait = u32::try_from(bound.as_millis())
+                .unwrap_or(u32::MAX)
+                .min(u32::MAX - 1);
+            // SAFETY: the handle is open for the length of the wait.
+            match unsafe { WaitForSingleObject(mutex.as_raw_handle(), wait) } {
+                // A holder that ended without releasing it leaves it abandoned, and the wait takes it.
+                WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Self {
+                    mutex,
+                    _thread: std::marker::PhantomData,
+                }),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("{name} was held by another process for {bound:?}"),
+                )),
+            }
+        }
+    }
+
+    impl Drop for NamedLock {
+        fn drop(&mut self) {
+            use windows_sys::Win32::System::Threading::ReleaseMutex;
+
+            // SAFETY: the mutex is open and owned by this thread, which took it.
+            unsafe {
+                ReleaseMutex(self.mutex.as_raw_handle());
+            }
+        }
     }
 
     /// Whether process `pid` runs inside any job.
@@ -1741,6 +1812,43 @@ mod tests {
         assert_eq!(taken, 1);
     }
 
+    /// Starters racing over a directory that holds claims of an earlier boot as well as a live one
+    /// all finish their look, whichever of them removes the stale claims, and one takes the live
+    /// claim.
+    #[test]
+    fn starters_racing_past_an_earlier_boots_claims_still_find_the_live_one() {
+        let host = TempHost::create();
+        let environment = host.environment();
+        for _ in 0..16 {
+            let stale = StartClaim {
+                boot: boot(9),
+                ..claim(60_000)
+            };
+            leave_claim(&environment, &stale).expect("an earlier boot's claim");
+        }
+        let live = claim(60_000);
+        leave_claim(&environment, &live).expect("the live claim");
+        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let takers: Vec<_> = (0..8)
+            .map(|_| {
+                let environment = environment.clone();
+                let start = std::sync::Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    take_claim(&environment, &boot(1), 5_000)
+                })
+            })
+            .collect();
+        let mut taken = Vec::new();
+        for taker in takers {
+            let look = taker.join().expect("the taker finishes");
+            let found = look.expect("a look that races another starter's removal still succeeds");
+            taken.extend(found);
+        }
+        assert_eq!(taken.len(), 1, "one starter took the live claim");
+        assert_eq!(taken[0].claim(), &live);
+    }
+
     /// The recorded session survives being read back, is replaced by a later record, and goes when
     /// it is cleared.
     #[test]
@@ -2027,6 +2135,39 @@ mod tests {
                 account_sid("kalareach-no-such-account-4f1c").is_err(),
                 "an unknown name names no account"
             );
+        }
+
+        /// A named lock has one holder at a time: a second taker waits while it is held, and takes
+        /// it once it is let go.
+        #[test]
+        fn a_named_lock_has_one_holder_at_a_time() {
+            let name = format!("Global\\kalareach-test-{}", crate::new_uuid());
+            let held = NamedLock::acquire(&name, Duration::from_secs(5)).expect("the first holder");
+            let waiting = {
+                let name = name.clone();
+                std::thread::spawn(move || {
+                    NamedLock::acquire(&name, Duration::from_millis(300)).map(|_| ())
+                })
+            };
+            assert_eq!(
+                waiting
+                    .join()
+                    .expect("the second taker finishes")
+                    .expect_err("it is held")
+                    .kind(),
+                std::io::ErrorKind::TimedOut
+            );
+            drop(held);
+            let later = {
+                let name = name.clone();
+                std::thread::spawn(move || {
+                    NamedLock::acquire(&name, Duration::from_secs(5)).map(|_| ())
+                })
+            };
+            later
+                .join()
+                .expect("the later taker finishes")
+                .expect("it is taken once it is let go");
         }
 
         /// What a started process is given to run: long enough to be looked at, and it ends by
