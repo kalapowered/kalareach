@@ -840,6 +840,53 @@ fn a_settings_document_edited_meanwhile_is_read_again() {
     );
 }
 
+/// A settings document that keeps changing refuses the recipe part way, and the files already put
+/// in place are taken out again: an application finishes or is undone.
+#[test]
+fn a_document_that_keeps_changing_refuses_the_recipe_and_leaves_nothing_of_it() {
+    let site = Site::new();
+    let before = site.tree();
+    let bridges = site.bridges();
+    let document = site.application().join("settings.json");
+    {
+        let document = document.clone();
+        let edits = std::sync::atomic::AtomicUsize::new(0);
+        bridges.before_publishing(move |destination: &Path| {
+            if destination.ends_with("settings.json") {
+                let edit = edits.fetch_add(1, Ordering::SeqCst);
+                let text = std::fs::read_to_string(&document).expect("reads");
+                std::fs::write(
+                    &document,
+                    text.replacen('{', &format!("{{\"edit{edit}\": 1, "), 1),
+                )
+                .expect("somebody edits it again");
+            }
+        });
+    }
+
+    let settled = bridges
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("reconciles");
+
+    assert!(refused(&settled).contains("kept changing"), "{settled:?}");
+    let mut after = site.tree();
+    let edited = after.remove("settings.json").expect("the document");
+    let mut expected = before.clone();
+    expected.remove("settings.json");
+    assert_eq!(after, expected, "the files put in place were taken out");
+    assert_eq!(
+        edited,
+        Node::File(std::fs::read(&document).expect("reads")),
+        "and the document holds the edits and not the key"
+    );
+    assert!(
+        !std::fs::read_to_string(&document)
+            .expect("reads")
+            .contains("kalareach-channels@skills-dir"),
+        "the key is not in it"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // Stopped at each boundary
 // ---------------------------------------------------------------------------------------------
