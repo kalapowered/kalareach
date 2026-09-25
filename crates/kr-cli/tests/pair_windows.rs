@@ -32,6 +32,32 @@ use support::kr;
 /// How long a wait for the daemon is given before the test calls it a failure.
 const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
 
+/// How long a process this test told to stop is given to go before the test moves on without it.
+const STOP_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Stops a process this test started and waits a bounded time for it to go, so a process that
+/// will not stop is never waited on for good. Returns what happened, for a failure message.
+fn stop(child: &mut std::process::Child) -> String {
+    let killed = child.kill();
+    let asked = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return format!("it stopped ({status})"),
+            Ok(None) if asked.elapsed() < STOP_DEADLINE => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                return format!(
+                    "it was still running {STOP_DEADLINE:?} after it was told to stop ({killed:?})"
+                );
+            }
+            Err(error) => {
+                return format!("its state could not be read after it was told to stop: {error}");
+            }
+        }
+    }
+}
+
 /// The build identity `kr` and this test present to the daemon.
 fn build() -> BuildId {
     BuildId::new("kr-test/0").expect("a build identifier")
@@ -62,8 +88,7 @@ struct Host {
 impl Drop for Host {
     fn drop(&mut self) {
         if let Some(mut daemon) = self.daemon.take() {
-            let _ = daemon.kill();
-            let _ = daemon.wait();
+            stop(&mut daemon);
         }
     }
 }
@@ -241,10 +266,10 @@ impl Host {
                 break status;
             }
             if started.elapsed() >= LIVENESS_DEADLINE {
-                let _ = child.kill();
-                let _ = child.wait();
+                let stopped = stop(&mut child);
                 panic!(
-                    "kr did not finish within {LIVENESS_DEADLINE:?}; its standard error says: {}",
+                    "kr did not finish within {LIVENESS_DEADLINE:?} and was told to stop, and \
+                     {stopped}; its standard error says: {}",
                     String::from_utf8_lossy(&stderr.so_far())
                 );
             }
@@ -262,7 +287,7 @@ impl Host {
 /// `kr` up.
 struct Drained {
     seen: Arc<Mutex<Vec<u8>>>,
-    reader: std::thread::JoinHandle<()>,
+    reader: std::thread::JoinHandle<std::io::Result<()>>,
 }
 
 impl Drained {
@@ -271,12 +296,16 @@ impl Drained {
         let collected = Arc::clone(&seen);
         let reader = std::thread::spawn(move || {
             let mut buffer = [0_u8; 4096];
-            while let Ok(read) = pipe.read(&mut buffer) {
-                if read == 0 {
-                    break;
-                }
-                if let Ok(mut seen) = collected.lock() {
-                    seen.extend_from_slice(&buffer[..read]);
+            loop {
+                match pipe.read(&mut buffer) {
+                    Ok(0) => return Ok(()),
+                    Ok(read) => {
+                        if let Ok(mut seen) = collected.lock() {
+                            seen.extend_from_slice(&buffer[..read]);
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error),
                 }
             }
         });
@@ -290,7 +319,8 @@ impl Drained {
             .unwrap_or_default()
     }
 
-    /// Everything the pipe carried, once it has closed, which it does when `kr` has ended.
+    /// Everything the pipe carried, once it has closed, which it does when `kr` has ended. A read
+    /// that failed fails the test rather than passing part of the output off as all of it.
     fn finish(self) -> Vec<u8> {
         let started = Instant::now();
         while !self.reader.is_finished() {
@@ -300,7 +330,12 @@ impl Drained {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
-        self.so_far()
+        let Self { seen, reader } = self;
+        reader
+            .join()
+            .expect("the thread reading kr's pipe")
+            .expect("kr's pipe is read to its end");
+        seen.lock().expect("kr's output is not poisoned").to_vec()
     }
 }
 
