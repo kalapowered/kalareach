@@ -53,6 +53,13 @@ struct Arguments {
     #[cfg(unix)]
     #[arg(long)]
     own_session: bool,
+    /// Run as the environment's starter rather than as its daemon.
+    ///
+    /// Windows only, where the environment's scheduled task runs this: it takes the one launch
+    /// the daemon has handed over, or a request to start the daemon, creates that process outside
+    /// this one's job, and exits. The environment is the one the two roots hold.
+    #[arg(long, requires_all = ["runtime_dir", "state_dir"])]
+    starter: bool,
 }
 
 /// The store a daemon was told to keep its device keys in, as the command line spells it.
@@ -83,6 +90,9 @@ fn main() -> ExitCode {
     {
         eprintln!("kr-controller: could not start a session of its own: {error}");
         return ExitCode::FAILURE;
+    }
+    if arguments.starter {
+        return starter(&arguments);
     }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -206,6 +216,25 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         result = tokio::signal::ctrl_c() => result?,
     }
     Ok(())
+}
+
+/// Runs this process as the environment's starter.
+#[cfg(windows)]
+fn starter(arguments: &Arguments) -> ExitCode {
+    let (Some(runtime), Some(state)) = (&arguments.runtime_dir, &arguments.state_dir) else {
+        return ExitCode::FAILURE;
+    };
+    ExitCode::from(kr_controller::supervision::windows::run_starter(runtime, state) as u8)
+}
+
+/// A starter exists only where a scheduled task starts each worker.
+#[cfg(not(windows))]
+fn starter(_arguments: &Arguments) -> ExitCode {
+    eprintln!(
+        "kr-controller: --starter runs only on Windows, where the environment's scheduled task \
+         starts it"
+    );
+    ExitCode::FAILURE
 }
 
 fn default_worker_program() -> PathBuf {

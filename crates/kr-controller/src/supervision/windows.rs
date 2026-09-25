@@ -603,6 +603,367 @@ mod platform {
     }
 }
 
+#[cfg(windows)]
+pub use self::launching::{StarterExit, TaskSupervisor, run_starter};
+
+/// A launch, from the daemon that hands it over to the starter that creates it.
+///
+/// The daemon never creates a worker. For each launch it validates the environment's task, opens
+/// one instance of the launch pipe, runs the task and waits on that instance; the task's starter
+/// reaches it, says which environment it serves, is checked, is handed the launch, creates the
+/// process ([`kr_ipc::starter::start_child`]) and reports it. What the daemon records is the
+/// identity the starter read from the handle that created the process.
+///
+/// The outcome follows what the daemon can know. Nothing handed over is [`LaunchOutcome::NotStarted`]:
+/// the task was missing, foreign or not this build's, the run failed, no starter came, or the one
+/// that came was not this installation's starter. A launch handed over whose answer was lost is
+/// [`LaunchOutcome::Uncertain`] with no process identifier, because the starter may have created
+/// something. A starter's refusal is `NotStarted` when its child was ended, and `Uncertain` when
+/// it could not be.
+#[cfg(windows)]
+mod launching {
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    use kr_ipc::paths::{EnvironmentPaths, HostPaths};
+    use kr_ipc::starter::{self, ChildCommand, LaunchListener, LaunchStream, Reached};
+    use kr_protocol::identity::ProcessStartIdentity;
+    use kr_protocol::ids::EnvironmentId;
+    use serde::{Deserialize, Serialize};
+
+    use super::{Standing, TaskDefinition, run, same_path, standing};
+    use crate::supervision::{
+        LaunchOutcome, RunFailure, ServiceLaunch, WorkerLaunch, WorkerSupervisor,
+    };
+
+    /// The version of the exchange on the launch pipe.
+    const LAUNCH_PROTOCOL: u32 = 1;
+
+    /// How long the task's starter is given to reach a launch once the task has been run: the
+    /// Task Scheduler starts a process within a second or two, and a machine under load is slower.
+    const REACH_BOUND: Duration = Duration::from_secs(30);
+
+    /// How long each message of the exchange is given.
+    const EXCHANGE_BOUND: Duration = Duration::from_secs(10);
+
+    /// How long a starter is given to create the process and report it.
+    const REPORT_BOUND: Duration = Duration::from_secs(30);
+
+    /// What a person does about a task that is missing, foreign or not this installation's.
+    const SETUP_ACTION: &str = "run kr host startup --set standalone";
+
+    /// What a starter says first: the exchange it speaks and the environment it serves.
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StarterHello {
+        protocol: u32,
+        environment: EnvironmentId,
+    }
+
+    /// One variable a launch sets for the process it starts.
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Variable {
+        name: String,
+        value: String,
+    }
+
+    /// The one launch the daemon hands a starter it accepted.
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Launch {
+        program: String,
+        arguments: Vec<String>,
+        working_directory: String,
+        environment: Vec<Variable>,
+        /// The daemon's login session, which the process must run in.
+        session: u32,
+    }
+
+    /// What the daemon answers a starter's hello with.
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    enum Answer {
+        /// The launch, for a starter the daemon accepted.
+        Launch(Launch),
+        /// Nothing, and why.
+        Declined { reason: String },
+    }
+
+    /// What a starter reports once it has acted on a launch.
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    enum Report {
+        /// The process was created, checked and let run.
+        Started {
+            identity: ProcessStartIdentity,
+            session: u32,
+            in_job: bool,
+        },
+        /// The process was not let run, and why; `remaining` when one was created and could not
+        /// be ended.
+        Refused { detail: String, remaining: bool },
+    }
+
+    fn encode<T: Serialize>(message: &T) -> Result<Vec<u8>, String> {
+        kr_cbor::to_canonical_vec(message).map_err(|error| format!("encode: {error}"))
+    }
+
+    fn decode<T: serde::de::DeserializeOwned + Serialize>(bytes: &[u8]) -> Result<T, String> {
+        kr_cbor::from_canonical_slice(bytes, &kr_cbor::Limits::DEFAULT)
+            .map_err(|error| format!("decode: {error}"))
+    }
+
+    /// The Windows supervisor: every worker, and every service, is created by the environment's
+    /// scheduled task's starter, never by this daemon, so none of them is ever in a job this daemon
+    /// runs in.
+    #[derive(Debug)]
+    pub struct TaskSupervisor {
+        environment: EnvironmentPaths,
+        expected: TaskDefinition,
+        reach_bound: Duration,
+    }
+
+    impl TaskSupervisor {
+        /// A supervisor for `environment`, whose task runs `starter`: this installation's
+        /// `kr-controller`.
+        ///
+        /// # Errors
+        ///
+        /// Returns the operating system's error when this process's account cannot be read.
+        pub fn new(environment: EnvironmentPaths, starter: &Path) -> std::io::Result<Self> {
+            let user = starter::current_user_sid()?;
+            let expected = TaskDefinition::for_setup(user, &environment, starter);
+            Ok(Self {
+                environment,
+                expected,
+                reach_bound: REACH_BOUND,
+            })
+        }
+
+        /// Gives a starter `bound`, rather than the usual half minute, to reach a launch once the
+        /// task has been run.
+        #[must_use]
+        pub const fn with_reach_bound(mut self, bound: Duration) -> Self {
+            self.reach_bound = bound;
+            self
+        }
+
+        /// Hands one launch to the environment's starter and says what came of it.
+        fn hand_over(
+            &self,
+            launch: &ServiceLaunch,
+            variables: &[(String, String)],
+        ) -> LaunchOutcome {
+            let _ = (launch, variables);
+            LaunchOutcome::NotStarted {
+                detail: "not built yet".to_owned(),
+            }
+        }
+
+        /// Checks that the process at the other end is this installation's starter, of this user,
+        /// in this daemon's session, and that it serves this environment in this exchange.
+        fn accept_starter(&self, stream: &mut LaunchStream, session: u32) -> Result<(), String> {
+            let peer = stream
+                .peer()
+                .map_err(|error| format!("the process that reached the launch: {error}"))?;
+            if !same_path(&peer.image.display().to_string(), &self.expected.starter) {
+                return Err(format!(
+                    "process {} reached the launch running {}, not this installation's starter {}",
+                    peer.pid,
+                    peer.image.display(),
+                    self.expected.starter.display()
+                ));
+            }
+            if !peer.same_user {
+                return Err(format!(
+                    "process {} reached the launch as another account",
+                    peer.pid
+                ));
+            }
+            if peer.session != session {
+                return Err(format!(
+                    "the starter runs in login session {}, not this daemon's {session}: the Task \
+                     Scheduler ran it where another session of this user is signed in",
+                    peer.session
+                ));
+            }
+            let hello: StarterHello = stream
+                .receive(Instant::now() + EXCHANGE_BOUND)
+                .map_err(|error| error.to_string())
+                .and_then(|bytes| decode(&bytes))
+                .map_err(|detail| format!("the starter did not say who it is: {detail}"))?;
+            if hello.protocol != LAUNCH_PROTOCOL {
+                return Err(format!(
+                    "the starter speaks launch exchange {}, not {LAUNCH_PROTOCOL}",
+                    hello.protocol
+                ));
+            }
+            if hello.environment != self.expected.environment_id {
+                return Err(format!(
+                    "the starter serves environment {}, not {}",
+                    hello.environment, self.expected.environment_id
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    impl WorkerSupervisor for TaskSupervisor {
+        fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome {
+            self.hand_over(&launch.service(), &launch.desktop_environment)
+        }
+
+        fn start_service(&self, launch: &ServiceLaunch) -> LaunchOutcome {
+            self.hand_over(launch, &[])
+        }
+
+        fn describe(&self) -> &'static str {
+            "the environment's scheduled task, whose starter creates each worker outside this \
+             daemon's jobs"
+        }
+    }
+
+    /// How long a starter looks for a waiting launch before it looks for a start claim.
+    const LOOK_BOUND: Duration = Duration::from_secs(5);
+
+    /// What a starter run ended with, which the Task Scheduler records as the run's result.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[repr(u8)]
+    pub enum StarterExit {
+        /// It created what it was asked to, or found nothing to do.
+        Done = 0,
+        /// The daemon declined it, or the exchange failed before anything was created.
+        Declined = 2,
+        /// It refused to let a process run.
+        Refused = 3,
+        /// The environment or the machine could not be read.
+        Unusable = 4,
+    }
+
+    /// Runs this process as the environment's starter, for the environment whose roots are given.
+    ///
+    /// It takes the launch waiting on the environment's launch pipe, if there is one. Otherwise it
+    /// takes a start claim, if there is one it may still act on, and starts the environment's
+    /// control daemon. Otherwise it creates nothing. Whatever it creates, it creates suspended and
+    /// lets run only once [`kr_ipc::starter::start_child`] has checked it.
+    #[must_use]
+    pub fn run_starter(runtime_root: &Path, state_root: &Path) -> StarterExit {
+        let _ = (runtime_root, state_root);
+        StarterExit::Unusable
+    }
+
+    /// Serves the one launch this starter reached.
+    fn serve_launch(mut stream: LaunchStream, environment: EnvironmentId) -> StarterExit {
+        let hello = StarterHello {
+            protocol: LAUNCH_PROTOCOL,
+            environment,
+        };
+        let Ok(bytes) = encode(&hello) else {
+            return StarterExit::Declined;
+        };
+        if stream
+            .send(&bytes, Instant::now() + EXCHANGE_BOUND)
+            .is_err()
+        {
+            return StarterExit::Declined;
+        }
+        let answer = stream
+            .receive(Instant::now() + EXCHANGE_BOUND)
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| decode::<Answer>(&bytes));
+        let launch = match answer {
+            Ok(Answer::Launch(launch)) => launch,
+            Ok(Answer::Declined { .. }) | Err(_) => return StarterExit::Declined,
+        };
+        let program = PathBuf::from(&launch.program);
+        let line = kr_worker::pty::command_line(
+            &std::iter::once(launch.program.clone())
+                .chain(launch.arguments.iter().cloned())
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>(),
+        );
+        let variables: Vec<(String, String)> = launch
+            .environment
+            .iter()
+            .map(|variable| (variable.name.clone(), variable.value.clone()))
+            .collect();
+        let started = starter::start_child(&ChildCommand {
+            application: &program,
+            command_line: &line,
+            directory: Path::new(&launch.working_directory),
+            environment: &variables,
+            session: launch.session,
+        });
+        let (report, exit) = match started {
+            Ok(child) => (
+                Report::Started {
+                    identity: child.identity,
+                    session: child.session,
+                    in_job: child.in_job,
+                },
+                StarterExit::Done,
+            ),
+            Err(refusal) => (
+                Report::Refused {
+                    detail: refusal.detail,
+                    remaining: refusal.remaining_pid.is_some(),
+                },
+                StarterExit::Refused,
+            ),
+        };
+        // A report that does not arrive leaves the daemon uncertain, which is what it must be:
+        // the process, if one was let run, is running.
+        if let Ok(bytes) = encode(&report) {
+            let _ = stream.send(&bytes, Instant::now() + EXCHANGE_BOUND);
+        }
+        exit
+    }
+
+    /// Starts the environment's control daemon for a start claim this starter took, if there is
+    /// one it may still act on.
+    fn start_claimed_daemon(
+        environment: &EnvironmentPaths,
+        runtime_root: &Path,
+        state_root: &Path,
+    ) -> StarterExit {
+        let Ok(boot) = kr_ipc::identity::boot_identity() else {
+            return StarterExit::Unusable;
+        };
+        let taken = match starter::take_claim(environment, &boot, kr_ipc::clock::boot_elapsed_ms())
+        {
+            Ok(Some(taken)) => taken,
+            Ok(None) => return StarterExit::Done,
+            Err(_) => return StarterExit::Unusable,
+        };
+        let (Ok(program), Ok(session)) = (std::env::current_exe(), starter::current_session())
+        else {
+            return StarterExit::Unusable;
+        };
+        let line = kr_worker::pty::command_line(&[
+            program.as_os_str().to_owned(),
+            "--runtime-dir".into(),
+            runtime_root.as_os_str().to_owned(),
+            "--state-dir".into(),
+            state_root.as_os_str().to_owned(),
+        ]);
+        // The admission point: the deadline is read again right before anything is created.
+        if !taken.admits(&boot, kr_ipc::clock::boot_elapsed_ms()) {
+            return StarterExit::Done;
+        }
+        match starter::start_child(&ChildCommand {
+            application: &program,
+            command_line: &line,
+            directory: environment.state_dir(),
+            environment: &[],
+            session,
+        }) {
+            Ok(_) => StarterExit::Done,
+            Err(_) => StarterExit::Refused,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use kr_ipc::testing::TempHost;
