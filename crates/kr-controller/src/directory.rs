@@ -188,37 +188,27 @@ impl Directory {
         }
     }
 
-    /// Returns a worker in the directory whose description of its session this daemon does not
-    /// have: one it has not heard from since it started.
-    #[must_use]
-    pub fn undescribed(&self, session_id: SessionId) -> Option<KnownWorker> {
-        let described = self
-            .heard
-            .get(&session_id)
-            .is_some_and(|heard| heard.session.is_some());
-        (!described)
-            .then(|| self.verified.get(&session_id).cloned())
-            .flatten()
-    }
-
-    /// Describes a session whose worker has stopped answering, where its end is under way.
+    /// Says what this daemon holds of a session whose worker has stopped answering, where the
+    /// session's end is under way.
     ///
     /// A worker that has finished its closure stops answering before the kernel says its process
     /// has ended, and until the kernel says so this daemon neither takes the session over from
-    /// its worker nor writes a closure of its own for it. The session is what its worker last said
-    /// it was, and `closing` where the worker had not said so but had accepted a close this daemon
-    /// passed to it: what is left of the closure is this daemon's to record. The rest of a read is
-    /// left unsaid. The endpoint, the launch profile and the launches waiting on the worker are how
-    /// a client reaches a worker that no longer answers, and the last command block is the
-    /// session's content, which only its worker hands out.
+    /// its worker nor writes a closure of its own for it. The session is then closing, or closed
+    /// where its worker said so, and what is left of the closure is this daemon's to record.
     ///
-    /// Nothing is described where no end is under way, or where the worker has not answered this
-    /// daemon since it started. That is a worker this daemon cannot reach, and nothing here says
-    /// what its session is now.
+    /// Nothing is said where no end is under way: the worker has said nothing of one, and no
+    /// close this daemon passed to it was accepted. That is a worker this daemon cannot reach, and
+    /// nothing here says what its session is now.
     #[must_use]
-    pub fn ending(&self, session_id: SessionId) -> Option<SessionReadResult> {
+    pub fn ending(&self, session_id: SessionId) -> Option<Ending> {
         let heard = self.heard.get(&session_id)?;
-        let mut session = heard.session.clone()?;
+        let Some(mut session) = heard.session.clone() else {
+            return heard
+                .closing
+                .then(|| self.verified.get(&session_id).cloned())
+                .flatten()
+                .map(Ending::Accepted);
+        };
         match session.state {
             SessionState::Closing | SessionState::Closed => {}
             SessionState::Creating | SessionState::Live if heard.closing => {
@@ -226,14 +216,31 @@ impl Directory {
             }
             SessionState::Creating | SessionState::Live => return None,
         }
-        Some(SessionReadResult {
+        Some(Ending::Described(Box::new(SessionReadResult {
             session,
             endpoint: Nullable::null(),
             launch_profile: Nullable::null(),
             last_command_block: Nullable::null(),
             outstanding_launches: Nullable::null(),
-        })
+        })))
     }
+}
+
+/// What this daemon holds of a session whose worker has stopped answering while its end is under
+/// way ([`Directory::ending`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Ending {
+    /// The session as its worker last described it, `closing` where the worker had not said so
+    /// but had accepted a close this daemon passed to it since.
+    ///
+    /// The rest of a read is left unsaid. The endpoint, the launch profile and the launches waiting
+    /// on the worker are how a client reaches a worker that no longer answers, and the last command
+    /// block is the session's content, which only its worker hands out.
+    Described(Box<SessionReadResult>),
+    /// A session whose worker accepted a close this daemon passed to it before describing the
+    /// session to this daemon, as after a start that found the worker running. The session is
+    /// closing, and the worker this daemon verified is what it has to describe it by.
+    Accepted(KnownWorker),
 }
 
 /// Where a state is in the session lifecycle, which only moves forward: creating, live, closing,

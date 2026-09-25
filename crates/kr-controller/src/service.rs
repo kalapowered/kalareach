@@ -54,7 +54,7 @@ use kr_transport::window::{AcceptedDeadline, ActionWindowIssuer, MAX_WINDOW_VALI
 use tokio::sync::{Mutex, oneshot};
 
 use crate::desktop::power::{self, Demand, Inhibitor};
-use crate::directory::{Directory, KnownWorker, Reconnect};
+use crate::directory::{Directory, Ending, KnownWorker, Reconnect};
 use crate::error::{ControllerError, Result};
 use crate::registry::{LaunchPhase, Registry, WorkerRecord};
 use crate::singleton::SingletonLock;
@@ -148,13 +148,6 @@ enum Review {
 
 /// How long one worker is given to say what it has outstanding.
 pub const DEMAND_PATIENCE: std::time::Duration = std::time::Duration::from_millis(500);
-
-/// How long a worker that has just accepted a close is given to describe its session.
-///
-/// A closure keeps its worker answering for at least the drain it runs after the acceptance
-/// ([`kr_worker::session::DRAIN_PERIOD`]), so a worker that answers at all answers well inside
-/// this.
-pub const DESCRIPTION_PATIENCE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// How long the whole scan of what this host has outstanding may take.
 pub const DEMAND_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
@@ -352,6 +345,40 @@ struct Debts {
 /// barrier that could not be raised it tries again.
 pub const DEBT_PASS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// A point in a read that this host's own tests can stop it at: the read says it has arrived and
+/// waits there until the test lets it go. Armed once, it fires once.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct ReadPause(std::sync::Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>);
+
+#[cfg(test)]
+impl ReadPause {
+    /// Arms the pause. Returns the end that says the read has arrived, and the end that lets it
+    /// go.
+    fn arm(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (arrived, arrival) = oneshot::channel();
+        let (go, going) = oneshot::channel();
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, going));
+        (arrival, go)
+    }
+
+    /// Waits here when the pause is armed.
+    async fn wait(&self) {
+        let armed = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            let _ = go.await;
+        }
+    }
+}
+
 /// The control daemon.
 pub struct Controller {
     /// This daemon, as something a task started from a method that has no counted reference can
@@ -477,6 +504,11 @@ pub struct Controller {
     /// waits for the policy's lock. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     before_presentation_lock: crate::attention::Pause,
+    /// Where this host's own tests stop a read whose worker has stopped answering, once it has
+    /// asked the kernel and before it looks at what this daemon holds of the session. Compiled
+    /// away in every shipped build.
+    #[cfg(test)]
+    before_the_record: ReadPause,
     /// The environment's transfer service, whose methods this daemon admits and dispatches.
     transfer: Arc<crate::transfer::TransferModule>,
     /// The environment's project service, whose methods this daemon admits and dispatches.
@@ -1001,6 +1033,8 @@ impl Controller {
             debts: Arc::new(std::sync::Mutex::new(Debts::default())),
             #[cfg(feature = "testing")]
             before_presentation_lock: crate::attention::Pause::default(),
+            #[cfg(test)]
+            before_the_record: ReadPause::default(),
             boot_identity: setup.boot_identity,
             boot_epoch,
             windows: ActionWindowIssuer::with_default_validity(Arc::clone(&clock) as Arc<_>),
@@ -7887,7 +7921,9 @@ impl Controller {
                         let ending = self.directory.lock().await.ending(session_id);
                         let recorded = self.registry.lock().await.closure(session_id);
                         match (recorded, ending) {
-                            (Ok(None), Some(read)) => Some(read.session),
+                            (Ok(None), Some(ending)) => {
+                                self.ending_read(ending).await.ok().map(|read| read.session)
+                            }
                             _ => None,
                         }
                     } else {
@@ -7950,9 +7986,8 @@ impl Controller {
                 // answering before the kernel says it has ended, and a read that meets it on its
                 // way out is owed the session's state: its closure where one was recorded
                 // meanwhile, by the close's watcher or another path, and otherwise the session
-                // closing, as its worker last described it (`Directory::ending`). Only where this
-                // daemon has no word of an end is there nothing to answer with, and that read is
-                // refused as one to try again.
+                // closing (`Directory::ending`). Only where this daemon has no word of an end is
+                // there nothing to answer with, and that read is refused as one to try again.
                 //
                 // The directory is asked before the registry. A closure is written to the registry
                 // before its worker leaves the directory, so a worker found gone from the
@@ -7960,11 +7995,13 @@ impl Controller {
                 // the closure is the answer wherever there is one.
                 Err(error) => {
                     if self.reconcile(params.session_id).await?.is_none() {
+                        #[cfg(test)]
+                        self.before_the_record.wait().await;
                         let ending = self.directory.lock().await.ending(params.session_id);
                         let recorded = self.registry.lock().await.closure(params.session_id)?;
                         if recorded.is_none() {
                             return match ending {
-                                Some(read) => encode(&read),
+                                Some(ending) => encode(&self.ending_read(ending).await?),
                                 None => Err(error),
                             };
                         }
@@ -8718,25 +8755,14 @@ impl Controller {
     /// Settles what follows a worker's acceptance of a close this daemon passed to it.
     ///
     /// The session is closing from here until its closure is recorded, which is what a read that
-    /// meets the worker on its way out is answered with (`Directory::ending`). That answer is the
-    /// session as its worker described it, so a worker this daemon has not heard from since it
-    /// started is asked now, before the caller has the acceptance: the worker does not begin
-    /// stopping anything until then, and it goes on answering through the drain after that. Where
-    /// it does not answer in time there is no description, and a read that meets its end is
-    /// refused as one to try again. Something also has to notice when the worker finishes, so the
+    /// meets the worker on its way out is answered with (`Directory::ending`). Nothing is asked of
+    /// the worker here: the link the acceptance came over is the one the worker is holding its
+    /// close on until the caller has the acceptance, and an exchange that ended that link would
+    /// start the close early. Something also has to notice when the worker finishes, so the
     /// tombstone is written and the descriptor removed rather than left pointing at a process that
     /// has gone.
     pub(crate) async fn close_accepted(self: &Arc<Self>, session_id: SessionId) {
-        let undescribed = {
-            let mut directory = self.directory.lock().await;
-            directory.accepted_close(session_id);
-            directory.undescribed(session_id)
-        };
-        if let Some(worker) = undescribed {
-            let _ = self
-                .read_from_worker_within(&worker, Some(DESCRIPTION_PATIENCE))
-                .await;
-        }
+        self.directory.lock().await.accepted_close(session_id);
         tokio::spawn(Arc::clone(self).watch_closure(session_id, ClosureReason::CloseRequested));
     }
 
@@ -9204,6 +9230,36 @@ impl Controller {
                 summary
             },
         )
+    }
+
+    /// Answers a read of a session whose worker has stopped answering while its end is under way
+    /// (`Directory::ending`).
+    ///
+    /// A session its worker described is answered as described. One whose worker accepted a close
+    /// before describing the session to this daemon is described from what this daemon holds of
+    /// it ([`accepted_summary`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be read.
+    async fn ending_read(&self, ending: Ending) -> Result<SessionReadResult> {
+        match ending {
+            Ending::Described(read) => Ok(*read),
+            Ending::Accepted(worker) => {
+                let reservation = self
+                    .registry
+                    .lock()
+                    .await
+                    .reservation_for_session(worker.descriptor.session_id)?;
+                Ok(SessionReadResult {
+                    session: accepted_summary(&worker.descriptor, reservation.as_ref()),
+                    endpoint: Nullable::null(),
+                    launch_profile: Nullable::null(),
+                    last_command_block: Nullable::null(),
+                    outstanding_launches: Nullable::null(),
+                })
+            }
+        }
     }
 
     /// Records a closure from outside this daemon's own bookkeeping, unless one is already
@@ -9854,6 +9910,54 @@ fn closed_summary(
         application_state: Nullable::null(),
         root_process: Nullable::null(),
         closure: Nullable::some(closure.clone()),
+    }
+}
+
+/// Describes a closing session from what this daemon holds of it, for a worker that accepted a
+/// close before it described the session to this daemon.
+///
+/// The descriptor this daemon verified says which session it is, and the create this daemon
+/// recorded says what was asked for: the shell mode, the execution context, the directory and the
+/// size it was to start in, and when it was asked for. What neither says is left as a closure with
+/// nothing surviving leaves it ([`closed_summary`]) rather than guessed: no executable, no desktop,
+/// no attachment, no application state and no root process.
+fn accepted_summary(
+    descriptor: &kr_protocol::worker::WorkerDescriptor,
+    reservation: Option<&crate::registry::Reservation>,
+) -> SessionSummary {
+    let requested = reservation
+        .and_then(|reservation| reservation.create_intent.as_deref())
+        .and_then(|recorded| recorded_create(recorded).ok());
+    SessionSummary {
+        session_id: descriptor.session_id,
+        session_epoch: descriptor.session_epoch,
+        environment_id: descriptor.environment_id,
+        display_number: descriptor.display_number,
+        state: SessionState::Closing,
+        shell_mode: requested
+            .as_ref()
+            .map_or(kr_protocol::session::ShellMode::NativeCompat, |create| {
+                create.shell_mode
+            }),
+        shell_path: String::new(),
+        cwd: requested
+            .as_ref()
+            .and_then(|create| create.cwd.0.clone())
+            .unwrap_or_default(),
+        worker_profile: requested
+            .as_ref()
+            .map_or(descriptor.worker_profile, |create| create.worker_profile),
+        desktop: kr_protocol::identity::DesktopBinding::none(),
+        created_at_ms: reservation.map_or(descriptor.published_at_ms, |reservation| {
+            reservation.created_at_ms
+        }),
+        dimensions: requested
+            .and_then(|create| create.dimensions.0)
+            .unwrap_or(kr_protocol::session::INVISIBLE_DEFAULT_DIMENSIONS),
+        attachment_count: U64::ZERO,
+        application_state: Nullable::null(),
+        root_process: Nullable::null(),
+        closure: Nullable::null(),
     }
 }
 
@@ -13098,7 +13202,7 @@ mod a_read_that_meets_a_worker_on_its_way_out {
     //! registry names that process as the session's worker, as it names a real one.
 
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use kr_ipc::endpoint::Listener;
     use kr_ipc::framed::split;
@@ -13106,15 +13210,17 @@ mod a_read_that_meets_a_worker_on_its_way_out {
     use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Response};
     use kr_protocol::error::ErrorCode;
     use kr_protocol::frame::StreamKind;
+    use kr_protocol::identity::DesktopBinding;
     use kr_protocol::identity::WorkerProfile;
     use kr_protocol::ids::{AuthorityRevision, ConnectionId, RequestId, SessionEpoch, SessionId};
     use kr_protocol::method::Method;
     use kr_protocol::root::{CwdRevision, PromptGeneration, RootCommandBlockParams};
-    use kr_protocol::scalars::{Nullable, U64};
+    use kr_protocol::scalars::{Nullable, TimestampMs, U64};
     use kr_protocol::session::{
-        ClosureReason, ClosureRecord, Durability, OwnershipCoverage, SessionCloseResult,
-        SessionListParams, SessionListResult, SessionReadParams, SessionReadResult, SessionState,
-        SessionSummary,
+        ClosureReason, ClosureRecord, Dimensions, DisplayNumber, Durability,
+        INVISIBLE_DEFAULT_DIMENSIONS, OwnershipCoverage, Presentation, SessionCloseResult,
+        SessionCreateParams, SessionListParams, SessionListResult, SessionReadParams,
+        SessionReadResult, SessionState, SessionSummary, ShellMode,
     };
     use tokio::sync::{Notify, oneshot};
 
@@ -13131,6 +13237,8 @@ mod a_read_that_meets_a_worker_on_its_way_out {
     struct Scripted {
         /// The state its session is in.
         state: std::sync::Mutex<SessionState>,
+        /// How many reads have reached it.
+        reads: AtomicUsize,
         /// The read it goes at, once a test has set one.
         end: std::sync::Mutex<Option<End>>,
         /// Tells the endpoint to stop accepting.
@@ -13152,6 +13260,7 @@ mod a_read_that_meets_a_worker_on_its_way_out {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 state: std::sync::Mutex::new(SessionState::Live),
+                reads: AtomicUsize::new(0),
                 end: std::sync::Mutex::new(None),
                 going: Notify::new(),
                 gone: Notify::new(),
@@ -13269,6 +13378,7 @@ mod a_read_that_meets_a_worker_on_its_way_out {
                             (None, ControlFrame::Request(request))
                                 if request.method == Method::SessionRead.into() =>
                             {
+                                script.reads.fetch_add(1, Ordering::AcqRel);
                                 let end = script
                                     .end
                                     .lock()
@@ -13470,31 +13580,117 @@ mod a_read_that_meets_a_worker_on_its_way_out {
         world.serving.abort();
     }
 
-    /// A worker this daemon has not heard from since it started is asked to describe its session
-    /// when it accepts a close, so a read that meets its end is answered from its own description
-    /// even though no read reached it before.
+    /// A worker that accepts a close before it has described its session to this daemon, as after
+    /// a start that found it running, leaves the session closing all the same: a read that meets
+    /// its end is answered from what this daemon holds of the session, and nothing is asked of the
+    /// worker at the close, whose link the worker is holding the close on.
+    ///
+    /// The worker here goes at the first read it is sent after the close, whoever sends it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_read_that_meets_the_end_of_a_worker_never_read_before_its_close_answers_closing() {
         let script = Scripted::new();
         let world = scripted(&script).await;
-        assert_eq!(close(&world).await.state, SessionState::Closing);
-
         let (_arrived, go) = script.end_at_next_read();
         drop(go);
+        assert_eq!(close(&world).await.state, SessionState::Closing);
+        assert_eq!(
+            script.reads.load(Ordering::Acquire),
+            0,
+            "the close asks the worker nothing"
+        );
+
         let answer = read(&world)
             .await
             .expect("a closing session is answered for from this daemon's own record");
+        let descriptor = &world.worker.descriptor;
         assert_eq!(
             answer.session,
             SessionSummary {
+                session_id: descriptor.session_id,
+                session_epoch: descriptor.session_epoch,
+                environment_id: descriptor.environment_id,
+                display_number: descriptor.display_number,
                 state: SessionState::Closing,
-                created_at_ms: answer.session.created_at_ms,
-                ..fake::read_result(world.session_id).session
+                shell_mode: ShellMode::NativeCompat,
+                shell_path: String::new(),
+                cwd: String::new(),
+                worker_profile: descriptor.worker_profile,
+                desktop: DesktopBinding::none(),
+                created_at_ms: descriptor.published_at_ms,
+                dimensions: INVISIBLE_DEFAULT_DIMENSIONS,
+                attachment_count: U64::ZERO,
+                application_state: Nullable::null(),
+                root_process: Nullable::null(),
+                closure: Nullable::null(),
             },
-            "the session as its worker described it when it accepted the close"
+            "the session this daemon verified, closing, with no create recorded to say more"
         );
+        assert!(answer.endpoint.0.is_none());
         assert!(!recorded(&world).await);
         world.serving.abort();
+    }
+
+    /// What this daemon holds of a session whose worker accepted a close before describing it is
+    /// the descriptor it verified and the create it recorded, and the create says what was asked
+    /// for; nothing the create does not say is made up.
+    #[test]
+    fn a_session_described_from_this_daemons_records_says_what_its_create_asked_for() {
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let descriptor = kr_protocol::worker::WorkerDescriptor {
+            session_id,
+            session_epoch: SessionEpoch::V1,
+            environment_id: kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid()),
+            display_number: DisplayNumber::new(7),
+            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+            process_start_identity: kr_ipc::identity::process_start_identity(std::process::id())
+                .expect("this process's start identity"),
+            protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
+            endpoint: "/tmp/kr-worker-7".to_owned(),
+            worker_public_key: kr_protocol::scalars::AuthorisationKey::from_bytes([7; 32]),
+            worker_profile: WorkerProfile::HeadlessUser,
+            published_at_ms: TimestampMs::new(2_000),
+        };
+        let create = SessionCreateParams {
+            environment_id: descriptor.environment_id,
+            presentation: Presentation::Invisible,
+            shell: Nullable::some("/bin/zsh".to_owned()),
+            shell_mode: ShellMode::Managed,
+            cwd: Nullable::some("/work".to_owned()),
+            dimensions: Nullable::some(Dimensions::new(132, 40)),
+            worker_profile: WorkerProfile::DesktopBound,
+            palette: Nullable::null(),
+            environment_snapshot: Vec::new(),
+            launch_profile: kr_protocol::session::LaunchProfile::default(),
+            terminal: Nullable::null(),
+        };
+        let reservation = crate::registry::Reservation {
+            reservation_id: kr_protocol::worker::ReservationId::new(kr_ipc::new_uuid()),
+            actor_id: kr_protocol::ids::ActorId::new("local:test").expect("a principal"),
+            create_token: kr_ipc::new_uuid(),
+            payload_digest: kr_protocol::scalars::Digest256::from_bytes([1; 32]),
+            create_intent: Some(kr_cbor::to_canonical_vec(&create).expect("encodes")),
+            session_id,
+            display_number: descriptor.display_number,
+            phase: crate::registry::LaunchPhase::Live,
+            launcher_identity: None,
+            claimed_key: None,
+            created_at_ms: TimestampMs::new(1_000),
+        };
+
+        let described = super::accepted_summary(&descriptor, Some(&reservation));
+        assert_eq!(described.state, SessionState::Closing);
+        assert_eq!(described.shell_mode, ShellMode::Managed);
+        assert_eq!(described.worker_profile, WorkerProfile::DesktopBound);
+        assert_eq!(described.cwd, "/work");
+        assert_eq!(described.dimensions, Dimensions::new(132, 40));
+        assert_eq!(described.created_at_ms, TimestampMs::new(1_000));
+        assert_eq!(
+            described.shell_path, "",
+            "the executable a managed create launched is the worker's to say"
+        );
+        assert_eq!(described.desktop, DesktopBinding::none());
+        assert_eq!(described.attachment_count, U64::ZERO);
+        assert!(described.root_process.0.is_none() && described.closure.0.is_none());
     }
 
     /// A session that began closing on its own is answered for the same way: its worker said it
@@ -13586,32 +13782,23 @@ mod a_read_that_meets_a_worker_on_its_way_out {
     /// A read whose worker goes while the session's closure is being recorded answers the
     /// closure, however the recording and the read's look at what this daemon holds interleave.
     ///
-    /// The directory is held here from before the worker goes, so the read, once it has met the
-    /// worker's end and asked the kernel, waits for it. The closure is then recorded as a closure's
-    /// recording does it, the registry first and the worker out of the directory after, and only
-    /// then may the read look at either.
+    /// The read is stopped once it has met the worker's end and asked the kernel, before it looks
+    /// at what this daemon holds of the session. The closure is recorded then, as a closure's
+    /// recording does it, the registry first and the worker out of the directory after, and the
+    /// read goes on.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_read_that_meets_the_end_of_a_worker_as_its_closure_is_recorded_answers_it() {
         let script = Scripted::new();
         let world = scripted(&script).await;
         assert_eq!(close(&world).await.state, SessionState::Closing);
 
-        let (arrived, go) = script.end_at_next_read();
+        let (_at_the_worker, worker_goes) = script.end_at_next_read();
+        drop(worker_goes);
+        let (at_the_record, read_goes) = world.controller.before_the_record.arm();
         let reading = read_in_turn(&world);
-        arrived.await.expect("the read reaches the worker");
-        let mut directory = world.controller.directory.lock().await;
-        drop(go);
-        // The read has met the worker's end once it gives up the worker's control path.
-        let started = std::time::Instant::now();
-        while !world.controller.leases.is_fenced(world.session_id) {
-            assert!(
-                started.elapsed() < Duration::from_secs(30),
-                "the read did not meet the worker's end"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        // Long enough for it to have asked the kernel and to be waiting on what is held here.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        at_the_record
+            .await
+            .expect("the read meets the worker's end and asks the kernel");
         let record = closure_of(world.session_id);
         world
             .controller
@@ -13620,8 +13807,13 @@ mod a_read_that_meets_a_worker_on_its_way_out {
             .await
             .record_closure(&record)
             .expect("the closure is recorded");
-        directory.remove(world.session_id);
-        drop(directory);
+        world
+            .controller
+            .directory
+            .lock()
+            .await
+            .remove(world.session_id);
+        let _ = read_goes.send(());
 
         let answer = reading
             .await
