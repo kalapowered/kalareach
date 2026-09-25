@@ -1872,12 +1872,11 @@ mod windows {
         Ok(())
     }
 
-    /// Sets the discretionary list of a file or a directory, written as SDDL with its control bits,
-    /// without carrying it to anything a directory already holds: the older call used here changes
-    /// the one object it names, and keeps the protection and inheritance bits it is given.
+    /// Sets a directory's discretionary list, written as SDDL, without carrying it to anything the
+    /// directory already holds: the older call used here changes the one object it names.
     ///
-    /// For this crate's tests of a file that inherited its list before its directory's changed, and
-    /// of the bits a descriptor states where there is no list. The product writes no list.
+    /// For this crate's tests of a file that inherited its list before its directory's changed.
+    /// The product writes no list.
     ///
     /// # Errors
     ///
@@ -3191,25 +3190,10 @@ mod tests {
             absent,
             "the same absent list reads the same"
         );
-        // Creation works out a new file's control bits itself, so the bit is set afterwards, on two
-        // files alike but for it.
-        let set = |name: &str, descriptor: &str| {
-            let path = directory.file(name);
-            set_list_without_propagation(&path, descriptor)
-                .unwrap_or_else(|error| panic!("{name} is given {descriptor}: {error}"));
-            access(&path)
-        };
-        let unrecorded = set("set-no-list", "D:NO_ACCESS_CONTROL");
-        assert_eq!(
-            set("set-no-list-again", "D:NO_ACCESS_CONTROL"),
-            unrecorded,
-            "the same absent list set twice reads the same"
-        );
-        assert_ne!(
-            set("set-no-list-recorded", "D:AINO_ACCESS_CONTROL"),
-            unrecorded,
-            "an absent list that records inheritance"
-        );
+        // Where there is no list, whether the descriptor records inheritance is read and compared
+        // as well (the library's own unit case). Windows keeps that bit on no file without a list
+        // that a test can make: creation works it out itself, and the older call that sets a list
+        // drops it.
         assert_ne!(
             access(&directory.described("no-list-protected", "D:PNO_ACCESS_CONTROL")),
             absent,
