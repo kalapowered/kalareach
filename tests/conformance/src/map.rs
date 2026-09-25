@@ -14,8 +14,8 @@
 //!   module;
 //! * in test code, a comment on a function keys every test of the same target whose body calls it,
 //!   which is how a case that thin per-shell or per-platform tests share is keyed where it is
-//!   written; a call is resolved by its path, so a local of the same name, a method and a function
-//!   of the same name in another module key nothing;
+//!   written; a call is resolved as the compiler resolves it, through `use` declarations and
+//!   globs, and one the reading cannot follow to that one function keys nothing;
 //! * a `const` or `static` case table names identifiers in its `covers` fields, and those key every
 //!   test of the same package whose body names the table.
 //!
@@ -34,7 +34,7 @@ use serde::Serialize;
 
 use crate::id::{self, Identifier, Refusal};
 use crate::plan::{CaseTable, Lane, matches};
-use crate::rust_items::{self, Entry, Module, Sources};
+use crate::rust_items::{self, Entry, Import, Module, Sources};
 use crate::typescript::{self, FileFacts, Keys, TsBinding};
 use crate::workspace::{self, Package, TargetId, TargetKind};
 
@@ -255,13 +255,15 @@ struct Helper {
     mentions: Vec<(Identifier, String)>,
 }
 
-/// A test and what its body names: the functions it calls and the case tables it reads.
+/// A test and what its body names: the functions it calls, the names its own `use` declarations
+/// bring in, and the case tables it reads.
 struct Use {
     target: TargetId,
     name: String,
     module: Vec<String>,
     uses: BTreeSet<String>,
     calls: BTreeSet<Vec<String>>,
+    imports: Vec<Import>,
 }
 
 fn rust_package(map: &mut Map, sources: &mut Sources, root: &Path, package: &Package) {
@@ -276,6 +278,7 @@ fn rust_package(map: &mut Map, sources: &mut Sources, root: &Path, package: &Pac
         let mut scope = Scope {
             modules: BTreeSet::new(),
             functions: BTreeSet::new(),
+            imports: BTreeMap::new(),
         };
         let first_use = uses.len();
         let test_target = matches!(target.id.kind, TargetKind::Test | TargetKind::Bench);
@@ -295,15 +298,16 @@ fn rust_package(map: &mut Map, sources: &mut Sources, root: &Path, package: &Pac
         }
         map.rust_tests.entry(target.id.clone()).or_default();
         for module in &modules {
-            rust_module(
-                map,
-                &target.id,
-                module,
-                &mut tables,
-                &mut helpers,
-                &mut uses,
-            );
+            rust_module(map, target, module, &mut tables, &mut helpers, &mut uses);
             scope.modules.insert(module.path.clone());
+            scope
+                .imports
+                .entry(module.path.clone())
+                .or_default()
+                .extend(module.entries.iter().flat_map(|entry| match entry {
+                    Entry::Item(item) => item.imports.clone(),
+                    _ => Vec::new(),
+                }));
             scope
                 .functions
                 .extend(module.entries.iter().filter_map(|entry| match entry {
@@ -321,7 +325,7 @@ fn rust_package(map: &mut Map, sources: &mut Sources, root: &Path, package: &Pac
                 .filter(|test| {
                     test.calls
                         .iter()
-                        .any(|path| reaches(path, &test.module, &scope, &helper))
+                        .any(|path| reaches(path, &test.module, &test.imports, &scope, &helper))
                 })
                 .map(|test| test.name.clone())
                 .collect();
@@ -389,87 +393,200 @@ fn rust_package(map: &mut Map, sources: &mut Sources, root: &Path, package: &Pac
     }
 }
 
-/// The modules and functions of one target, which is what a call is resolved against.
+/// The modules, functions and `use` declarations of one target: what a call is resolved against.
 struct Scope {
     modules: BTreeSet<Vec<String>>,
     functions: BTreeSet<(Vec<String>, String)>,
+    imports: BTreeMap<Vec<String>, Vec<Import>>,
 }
 
+/// What a called name comes to, as far as the target's own source says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Resolved {
+    /// The function of that name in this module.
+    Function(Vec<String>),
+    /// Nothing the target's own modules hold that this reading can prove: the prelude, another
+    /// crate, a name two globs both bring in, or one it cannot follow.
+    Unproved,
+}
+
+/// How far one name is followed through `use` declarations before the reading gives up on it.
+const DEPTH: usize = 8;
+
 impl Scope {
-    /// How many functions called `name` the modules under `within` hold, `within` included.
-    fn count_under(&self, within: &[String], name: &str) -> usize {
-        self.functions
+    /// The declarations that bring names into `module`: the calling body's own first, then the
+    /// module's.
+    fn imports_of<'a>(
+        &'a self,
+        module: &[String],
+        local: &'a [Import],
+    ) -> impl Iterator<Item = &'a Import> {
+        local
             .iter()
-            .filter(|(module, function)| function == name && module.starts_with(within))
-            .count()
+            .chain(self.imports.get(module).into_iter().flatten())
     }
+
+    /// The module `path` names when it is written in `from`: from the crate's root after `crate`,
+    /// from `from` after `self`, up one module for each `super`, and otherwise from a first name
+    /// that is a child module of `from` or a module a `use` there brings in.
+    fn module(
+        &self,
+        from: &[String],
+        path: &[String],
+        local: &[Import],
+        depth: usize,
+    ) -> Option<Vec<String>> {
+        if depth > DEPTH {
+            return None;
+        }
+        let (mut at, rest) = match path.first().map(String::as_str) {
+            None => return Some(from.to_vec()),
+            Some("crate") => (Vec::new(), &path[1..]),
+            Some("self" | "super") => (from.to_vec(), path),
+            Some(first) => (self.named_module(from, first, local, depth)?, &path[1..]),
+        };
+        for segment in rest {
+            match segment.as_str() {
+                "self" => {}
+                "super" => {
+                    at.pop()?;
+                }
+                name => {
+                    at.push(name.to_owned());
+                    if !self.modules.contains(&at) {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(at)
+    }
+
+    /// The module one name refers to in `from`: a child module, a module a `use` brings in by that
+    /// name, or a child of a module a glob brings in.
+    fn named_module(
+        &self,
+        from: &[String],
+        name: &str,
+        local: &[Import],
+        depth: usize,
+    ) -> Option<Vec<String>> {
+        let child: Vec<String> = from.iter().cloned().chain([name.to_owned()]).collect();
+        if self.modules.contains(&child) {
+            return Some(child);
+        }
+        for import in self.imports_of(from, local) {
+            if let Import::Name {
+                name: imported,
+                path,
+            } = import
+                && imported == name
+            {
+                return self.module(from, path, &[], depth + 1);
+            }
+        }
+        self.imports_of(from, local)
+            .find_map(|import| match import {
+                Import::Glob { path } => {
+                    let mut child = self.module(from, path, &[], depth + 1)?;
+                    child.push(name.to_owned());
+                    self.modules.contains(&child).then_some(child)
+                }
+                Import::Name { .. } => None,
+            })
+    }
+
+    /// What calling `name` in `from` calls. The calling body's own `use` comes first; then a
+    /// function of the module itself, or a name a `use` of the module brings in, followed to where
+    /// it is defined; then the modules its globs bring in, where exactly one of them must have it.
+    fn function(&self, from: &[String], name: &str, local: &[Import], depth: usize) -> Resolved {
+        if depth > DEPTH {
+            return Resolved::Unproved;
+        }
+        let follow = |path: Vec<String>| {
+            let Some((last, modules)) = path.split_last() else {
+                return Resolved::Unproved;
+            };
+            self.module(from, modules, local, depth + 1)
+                .map_or(Resolved::Unproved, |module| {
+                    self.function(&module, last, &[], depth + 1)
+                })
+        };
+        if let Some(path) = imported(local.iter(), name) {
+            return follow(path);
+        }
+        if self.functions.contains(&(from.to_vec(), name.to_owned())) {
+            return Resolved::Function(from.to_vec());
+        }
+        if let Some(path) = imported(self.imports.get(from).into_iter().flatten(), name) {
+            return follow(path);
+        }
+        let mut found = BTreeSet::new();
+        for import in self.imports_of(from, local) {
+            if let Import::Glob { path } = import
+                && let Some(module) = self.module(from, path, &[], depth + 1)
+                && let Resolved::Function(defined) = self.function(&module, name, &[], depth + 1)
+            {
+                found.insert(defined);
+            }
+        }
+        match found.len() {
+            1 => Resolved::Function(found.into_iter().next().unwrap_or_default()),
+            _ => Resolved::Unproved,
+        }
+    }
+}
+
+/// The path a `use` among `imports` brings `name` in by.
+fn imported<'a>(mut imports: impl Iterator<Item = &'a Import>, name: &str) -> Option<Vec<String>> {
+    imports.find_map(|import| match import {
+        Import::Name {
+            name: imported,
+            path,
+        } if imported == name => Some(path.clone()),
+        _ => None,
+    })
 }
 
 /// Whether a call written in the module `from` by `path` reaches `helper`.
 ///
-/// A path of one name reaches the nearest function of that name in `from` or one of its parents,
-/// the way a test module's `use super::*` reaches the helpers of its file; where none of them has
-/// one, it reaches the target's only function of that name, which a `use` brought in. A longer path
-/// names a module, read from `crate`, `self` or `super` where it starts with one, and otherwise
-/// from `from` and then from the root of the target. It reaches that module's own function of the
-/// name, or, where the module has none, the only function of the name below it, which a
-/// `pub use` of a child module brought up.
-fn reaches(path: &[String], from: &[String], scope: &Scope, helper: &Helper) -> bool {
+/// Only a call the target's own source proves is one: the path is resolved the way the compiler
+/// resolves it, through the calling body's `use` declarations, the module's functions, its `use`
+/// declarations and its globs, and a call this reading cannot follow to one function keys nothing.
+fn reaches(
+    path: &[String],
+    from: &[String],
+    local: &[Import],
+    scope: &Scope,
+    helper: &Helper,
+) -> bool {
     let Some((name, qualifier)) = path.split_last() else {
         return false;
     };
     if *name != helper.name {
         return false;
     }
-    if qualifier.is_empty() {
-        let nearest = (0..=from.len())
-            .rev()
-            .map(|depth| &from[..depth])
-            .find(|module| scope.functions.contains(&(module.to_vec(), name.clone())));
-        return match nearest {
-            Some(module) => module == helper.module.as_slice(),
-            None => scope.count_under(&[], name) == 1,
-        };
-    }
-    let candidates: Vec<Vec<String>> = match qualifier[0].as_str() {
-        "crate" => vec![qualifier[1..].to_vec()],
-        "self" | "super" => {
-            let mut base = from.to_vec();
-            let mut rest = &qualifier[usize::from(qualifier[0] == "self")..];
-            while let Some((first, tail)) = rest.split_first()
-                && first == "super"
-            {
-                base.pop();
-                rest = tail;
-            }
-            base.extend_from_slice(rest);
-            vec![base]
-        }
-        _ => vec![
-            from.iter().chain(qualifier).cloned().collect(),
-            qualifier.to_vec(),
-        ],
+    let resolved = if qualifier.is_empty() {
+        scope.function(from, name, local, 0)
+    } else {
+        scope
+            .module(from, qualifier, local, 0)
+            .map_or(Resolved::Unproved, |module| {
+                scope.function(&module, name, &[], 0)
+            })
     };
-    let Some(module) = candidates
-        .into_iter()
-        .find(|candidate| scope.modules.contains(candidate))
-    else {
-        return false;
-    };
-    if scope.functions.contains(&(module.clone(), name.clone())) {
-        return module == helper.module;
-    }
-    helper.module.starts_with(&module) && scope.count_under(&module, name) == 1
+    resolved == Resolved::Function(helper.module.clone())
 }
 
 fn rust_module(
     map: &mut Map,
-    target: &TargetId,
+    whole: &workspace::Target,
     module: &Module,
     tables: &mut Vec<Table>,
     helpers: &mut Vec<Helper>,
     uses: &mut Vec<Use>,
 ) {
+    let target = &whole.id;
     let prefix = module.path.join("::");
     let full = |name: &str| {
         if prefix.is_empty() {
@@ -480,7 +597,15 @@ fn rust_module(
     };
     for comment in &module.docs {
         for (identifier, source) in map.mentions(&comment.text, &module.file, comment.line) {
-            if module.test_code {
+            if !whole.harness {
+                // A target with a harness of its own reports no test by name, so there is no
+                // outcome of its to key.
+                map.reference(
+                    identifier,
+                    source,
+                    "the documentation of a target with a harness of its own, whose outcomes the report cannot read",
+                );
+            } else if module.test_code {
                 map.key(
                     identifier,
                     Place::RustModule {
@@ -573,6 +698,7 @@ fn rust_module(
                     module: module.path.clone(),
                     uses: test.uses.clone(),
                     calls: test.calls.clone(),
+                    imports: test.imports.clone(),
                 });
             }
             Entry::Item(item) => {

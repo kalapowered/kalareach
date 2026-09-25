@@ -61,6 +61,26 @@ pub struct Test {
     /// `shellpkg::helper()` is `[shellpkg, helper]`. A method call, a macro and a name that is
     /// not called are not calls.
     pub calls: BTreeSet<Vec<String>>,
+    /// The names its body's own `use` declarations bring in.
+    pub imports: Vec<Import>,
+}
+
+/// One name, or every name of a module, that a `use` declaration brings into scope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Import {
+    /// `use a::b::c;` brings `c`, and `use a::b::c as d;` brings `d`: `name` is the item at `path`
+    /// (`[a, b, c]`).
+    Name {
+        /// The name it is known by here.
+        name: String,
+        /// Its path, as written.
+        path: Vec<String>,
+    },
+    /// `use a::b::*;` brings every name of the module at `path` (`[a, b]`).
+    Glob {
+        /// The module's path, as written.
+        path: Vec<String>,
+    },
 }
 
 /// Any item that is not a test function.
@@ -78,6 +98,8 @@ pub struct Item {
     pub inside: Vec<Comment>,
     /// Its `covers` fields, for a `const` or `static` case table.
     pub covers: Vec<Covers>,
+    /// What a `use` declaration brings into its module.
+    pub imports: Vec<Import>,
 }
 
 /// One module: a file, or an inline `mod` block.
@@ -638,6 +660,7 @@ fn classify(
                     .collect()
             });
             let calls = body.map_or_else(BTreeSet::new, |(from, to)| calls(&tokens[from..to]));
+            let imports = body.map_or_else(Vec::new, |(from, to)| body_imports(&tokens[from..to]));
             Classified::Test(Test {
                 name: name.unwrap_or_default(),
                 line: tokens[at].line,
@@ -645,6 +668,7 @@ fn classify(
                 inside: comments_in(body),
                 uses,
                 calls,
+                imports,
             })
         }
         "mod" => {
@@ -669,6 +693,7 @@ fn classify(
                 attached,
                 inside: comments_in(range),
                 covers: range.map_or_else(Vec::new, |(from, to)| covers(&tokens[from..to])),
+                imports: Vec::new(),
             })
         }
         _ => {
@@ -688,7 +713,88 @@ fn classify(
                 attached,
                 inside: comments_in(body),
                 covers: Vec::new(),
+                imports: if keyword == "use" {
+                    let mut found = Vec::new();
+                    use_tree(tokens, at + 1, &[], &mut found);
+                    found
+                } else {
+                    Vec::new()
+                },
             })
+        }
+    }
+}
+
+/// The `use` declarations written inside a function's body, each as what it brings in.
+fn body_imports(tokens: &[Token]) -> Vec<Import> {
+    let mut found = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if token.ident() == Some("use") {
+            use_tree(tokens, index + 1, &[], &mut found);
+        }
+    }
+    found
+}
+
+/// Reads one use tree from `at`: a path, then `*`, a group in braces, or a last name with an
+/// optional `as`. Returns where it stopped.
+fn use_tree(tokens: &[Token], mut at: usize, prefix: &[String], found: &mut Vec<Import>) -> usize {
+    let mut path = prefix.to_vec();
+    loop {
+        let Some(token) = tokens.get(at) else {
+            return at;
+        };
+        if token.is_punct(':') {
+            // The `::` of a path that starts at the crate roots.
+            at += 1;
+        } else if token.is_punct('*') {
+            found.push(Import::Glob { path });
+            return at + 1;
+        } else if token.is_punct('{') {
+            at += 1;
+            while tokens.get(at).is_some_and(|token| !token.is_punct('}')) {
+                let next = use_tree(tokens, at, &path, found);
+                at = if tokens.get(next).is_some_and(|token| token.is_punct(',')) {
+                    next + 1
+                } else if next == at {
+                    // Nothing this reading understands: step over it rather than stop here.
+                    at + 1
+                } else {
+                    next
+                };
+            }
+            return at + 1;
+        } else if let Some(segment) = token.ident() {
+            let segment = segment.to_owned();
+            at += 1;
+            if tokens.get(at).is_some_and(|token| token.is_punct(':'))
+                && tokens.get(at + 1).is_some_and(|token| token.is_punct(':'))
+            {
+                path.push(segment);
+                at += 2;
+                continue;
+            }
+            let mut name = segment.clone();
+            path.push(segment);
+            if tokens.get(at).and_then(Token::ident) == Some("as") {
+                name = tokens
+                    .get(at + 1)
+                    .and_then(Token::ident)
+                    .unwrap_or("_")
+                    .to_owned();
+                at += 2;
+            }
+            // `use a::{self}` brings the module `a` in, by its own name.
+            if name == "self" && path.len() > 1 {
+                path.pop();
+                name = path.last().cloned().unwrap_or_default();
+            }
+            if name != "_" {
+                found.push(Import::Name { name, path });
+            }
+            return at;
+        } else {
+            return at;
         }
     }
 }
@@ -883,6 +989,29 @@ mod tests {
         assert_eq!(item.covers.len(), 2);
         assert_eq!(item.covers[1].text, "KR-ACC-001 KR-REQ-08.21");
         assert_eq!(item.inside[0].text, " KR-REQ-08.21: queries.");
+    }
+
+    #[test]
+    fn a_use_declaration_is_read_as_the_names_it_brings_in() {
+        let tokens =
+            lex("use a::b::{self as _, c, d as e, f::*}; use ::g; use super::h;").expect("lexes");
+        let found = body_imports(&tokens);
+        let name = |name: &str, path: &[&str]| Import::Name {
+            name: name.to_owned(),
+            path: path.iter().map(|segment| (*segment).to_owned()).collect(),
+        };
+        assert_eq!(
+            found,
+            [
+                name("c", &["a", "b", "c"]),
+                name("e", &["a", "b", "d"]),
+                Import::Glob {
+                    path: vec!["a".to_owned(), "b".to_owned(), "f".to_owned()]
+                },
+                name("g", &["g"]),
+                name("h", &["super", "h"]),
+            ]
+        );
     }
 
     #[test]

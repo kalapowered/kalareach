@@ -19,8 +19,8 @@
 # The applications group runs programs this script fetches once, each pinned by URL and SHA-256 in
 # tests/conformance/applications.lock, into a cache outside the repository
 # (KR_CONFORMANCE_APPLICATIONS, or the platform's cache directory). The cache is named by an
-# absolute path without `..`, and is refused inside the repository; nothing in it is replaced
-# through a link. A program whose project publishes source only is built there from that
+# absolute path without `..`, and is refused inside the repository; nothing in it is read, written
+# or replaced through a link. A program whose project publishes source only is built there from that
 # release's source. A release this host cannot fetch or build is recorded as not installed, with
 # the reason, and never taken from the system's package manager.
 #
@@ -131,6 +131,14 @@ fetch_applications() {
     local lock="$root/tests/conformance/applications.lock"
     local cache="$1"
     local archives="$cache/archives"
+    # Nothing is written through a link: not the archives, not the index.
+    local place
+    for place in "$archives" "$cache/index.json"; do
+        if [ -L "$place" ]; then
+            echo "run-conformance: $place is a link, and the application cache writes through none" >&2
+            return 1
+        fi
+    done
     mkdir -p "$archives"
     for tool in curl tar python3 make; do
         if ! command -v "$tool" > /dev/null 2>&1; then
@@ -223,6 +231,11 @@ PYTHON
         local extension="${url##*/}"
         extension="${extension#*.tar}"
         local kept="$archives/$sha.tar$extension"
+        if [ -L "$kept" ] || [ -L "$kept.part" ]; then
+            echo "    its archive in the cache is a link, so nothing is read or written there"
+            records+=("$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "$id" "$version" "$role" unavailable "$url" "$sha" "$kind" - "its archive in the application cache is a link")")
+            continue
+        fi
         if [ ! -f "$kept" ] || [ "$(digest "$kept")" != "$sha" ]; then
             echo "  $id $version: fetching $url"
             # Several attempts with a pause between them: a release host that answers a burst
@@ -350,11 +363,13 @@ if selected applications && [ "$family" != windows ]; then
     cache="$(application_cache "${KR_CONFORMANCE_APPLICATIONS:-$default_cache}")" || exit 2
     export KR_CONFORMANCE_APPLICATIONS="$cache"
     echo "run-conformance: applications in $KR_CONFORMANCE_APPLICATIONS"
-    fetch_applications "$KR_CONFORMANCE_APPLICATIONS"
+    fetch_applications "$KR_CONFORMANCE_APPLICATIONS" || exit 2
     arguments+=(--applications "$KR_CONFORMANCE_APPLICATIONS")
 fi
 
-if selected typescript && [ "$family" != windows ]; then
+# The report reads the TypeScript tests with the packages' own compiler wherever that group is
+# selected, on Windows as well, where it lists them without running them.
+if selected typescript; then
     pnpm install --frozen-lockfile
 fi
 

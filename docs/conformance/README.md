@@ -55,7 +55,9 @@ Every `cargo test` step that keeps each test's output captured runs with `--show
 prints what every passing test wrote under its name. A step that shows the output as it is written,
 with `--nocapture`, keeps its script's command. Before a step runs, its tests are built and listed:
 every test binary the build made has to be listed, run and read, and a listing that fails, a binary
-the log never ran, and a log that cannot be read are each the step's error.
+the log never ran, and a log that cannot be read are each the step's error. A target whose manifest
+gives it a harness of its own (`harness = false`) is a program that prints neither a list nor
+verdicts: it is run, its exit status is the step's, and a comment on it is a reference.
 
 A test that no selected group runs on this platform is reported as not run, with the reason. It is
 never reported as passed.
@@ -98,7 +100,7 @@ row that does not exist.
 | A test function whose name spells an identifier in snake case: `kr_req_11_07_...`, `kr_acc_004_...` | That test. A name that spells no accepted form is only a name |
 | A module comment (`//!`) of test code | Every test in that module and the modules inside it |
 | In test code, a comment block with a blank line after it | Every test from there to the next such block, or the end of the module |
-| In test code, a comment on a function | Every test of the same target whose body calls that function by a path that reaches it. A local of the same name, a method, and a function of the same name in another module are not that function |
+| In test code, a comment on a function | Every test of the same target whose body calls that function, the call resolved as the compiler resolves it: through the body's own `use` declarations, the module's functions, its `use` declarations and its globs. A local of the same name, a method, and a function of the same name elsewhere are not that function, and a call the report cannot follow to one function keys nothing |
 | A `covers` field of a `const` or `static` case table | Every test of the same package whose body names the table |
 
 Test code is a test or bench target, or a module compiled under `cfg(test)`. A comment on product
@@ -133,6 +135,8 @@ text is never taken for a comment.
 
 A test declared once for a table of cases (`it.each`, `test.each`) is as many tests as the table
 has rows. Each is recorded under the title the run gave it, with a command that runs that one row.
+Rows that share a title are told apart by their place among the rows with that title, and the
+command that selects the title runs them all.
 
 ### Tests another toolchain builds
 
@@ -160,10 +164,10 @@ Each keyed test has one outcome on this platform:
 | `known_difference` | It ran and held what the profile defines, and it recorded that the application it is about reads the same thing differently |
 
 A test that returns early, because what it needs is absent, passes as far as the harness is
-concerned. The suites say so on a line that starts `skipped:`, `skipping:` or `not exercised`, and
-the report finds that line in what the test wrote and reports the test as not run, with the line as
-its reason. A line of that kind the report cannot give to one test makes its binary's output
-unreadable, which fails the step.
+concerned. The suites say so on a line that starts `skipped:`, `skipping:` or `not exercised`, or
+that names the suite and then says `: skipped, because`, and the report finds that line in what the
+test wrote and reports the test as not run, with the line as its reason. A line of that kind the
+report cannot give to one test makes its binary's output unreadable, which fails the step.
 
 A test that several steps list takes the strongest outcome among them: failed, then passed, then
 ignored, then not run, then not built. A test keyed to one identifier twice, by its own comment and
@@ -277,8 +281,10 @@ screen the program itself says it is showing, and shows that no query the progra
 attached terminal: the stream the attachment was sent is searched for every request a terminal
 answers, independently of the engine's own class table. That search waits until the attachment has
 provably been sent everything up to the end of the program's last query: the worker sends each event
-with the position in the stream it starts at or describes, in order, so once an event from past that
-point has arrived, nothing before it is still on its way. An attachment the worker tells to
+with the position in the stream it starts at or describes, in order, so once a delivery from past
+that point has arrived whole, nothing before it is still on its way. A delivery that takes several
+events, a screen in chunks or a projected screen in pages, is whole only once its last event has
+arrived. An attachment the worker tells to
 resynchronise subscribes again, as the product's own client does, and is sent a fresh screen from
 the session's position; one the worker moves to a projection is sent screens rather than bytes, so
 nothing the program writes reaches it at all. A capture that broke, through a lost connection, an
@@ -288,7 +294,7 @@ event it could not decode, a refused subscription or a detach, fails the case.
 script fetches each release once into a cache outside the repository (`KR_CONFORMANCE_APPLICATIONS`,
 or the platform's cache directory), checks its digest, and writes the cache's `index.json`. The cache
 is named by an absolute path without `..`, resolved through its links before anything is made in it,
-and refused inside the repository; a program's place in it that is a link is never used or replaced. A
+and refused inside the repository; nothing in it is read, written or replaced through a link. A
 program whose project publishes source only is built there from that release's source, with the
 flags the lock records, against the system's own curses library; tmux is built against a pinned
 libevent built the same way. A release that cannot be fetched or built is recorded as not installed,

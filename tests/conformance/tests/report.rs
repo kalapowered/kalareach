@@ -187,7 +187,7 @@ fn a_tree_with_nothing_ignored_reports_every_identifier_as_run() {
     // The module comment of the test file keys every test in it, each by its own name, and a test
     // its own comment keys as well is recorded once, by that comment.
     let module = &document.identifiers["KR-REQ-03.01"].tests;
-    assert_eq!(module.len(), 12);
+    assert_eq!(module.len(), 14);
     let commented: Vec<_> = module
         .iter()
         .filter(|test| test.test == "forms --test flow commented")
@@ -223,6 +223,18 @@ fn an_ignored_test_is_not_counted_and_a_failing_test_fails_its_identifier() {
     );
     assert!(!document.passed(), "a failing test fails the run");
     assert_eq!(document.summary.failed, 1);
+    // A program with a harness of its own was run, and its failure would be the step's; it
+    // reports no test by name, so its documentation keys none.
+    assert!(document.steps[0].error.is_none(), "{:?}", document.steps[0]);
+    assert!(
+        document
+            .identifiers
+            .get("KR-REQ-04.06")
+            .is_none_or(|own| own.tests.is_empty())
+    );
+    let map = map_of("outcomes", false);
+    assert!(!map.keys.contains_key(&identifier("KR-REQ-04.06")));
+    assert!(map.references.contains_key(&identifier("KR-REQ-04.06")));
     // A test that returned early and said why passed without doing what it is for.
     let early = &document.identifiers["KR-REQ-04.05"];
     assert_eq!(early.verdict, Verdict::NotRun);
