@@ -1762,14 +1762,14 @@ impl ManagedSyncService {
         if signed_before_cutoff(&answer) {
             return Ok(SyncDispatch::Answered(SyncExchanged::SignedBeforeCutoff));
         }
-        let exchanged = exchanged(
-            read(answer.data()?, "what an exchange answered")?,
-            named.object_id,
+        let answer: ExchangeAnswer = read(answer.data()?, "what an exchange answered")?;
+        // Whatever state it names, an answer about a bundle write names no copy: one that did would
+        // be read as a write applied or refused while it said something else beside it.
+        no_copy_of_a_bundle(
+            named,
+            answer.conflict.0.as_ref().map(|copy| copy.conflict_id),
         )?;
-        if let SyncExchanged::Refused { retained, .. } = exchanged {
-            no_copy_of_a_bundle(named, retained)?;
-        }
-        Ok(SyncDispatch::Answered(exchanged))
+        Ok(SyncDispatch::Answered(exchanged(answer, named.object_id)?))
     }
 
     /// One status query: what the service recorded about one request identity.

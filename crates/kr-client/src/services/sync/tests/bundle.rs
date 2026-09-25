@@ -110,6 +110,8 @@ struct Web {
     /// A status query or a fence about a refused write names a copy, which no service keeps of a
     /// bundle.
     names_copies_in_receipts: AtomicBool,
+    /// An applied write is answered naming a copy as well, which no service keeps of a bundle.
+    names_a_copy_on_writes: AtomicBool,
 }
 
 impl Web {
@@ -225,13 +227,16 @@ impl Web {
         };
         let history = self.history();
         let names_a_copy = self.names_copies_in_receipts.load(Ordering::SeqCst);
+        let copy_on_writes = self.names_a_copy_on_writes.load(Ordering::SeqCst);
         let mut collections = self.collections.lock().expect("the collections");
         let held = collections.entry(served).or_default();
         if held.owner.is_some_and(|owner| owner != issued.account) {
             return absent();
         }
         match member.as_str() {
-            "exchange" => Self::exchange(held, issued.account, at_ms, asked, &history),
+            "exchange" => {
+                Self::exchange(held, issued.account, at_ms, asked, &history, copy_on_writes)
+            }
             "compare" => Self::compare(held, &locator, &history),
             "status" => {
                 let request = asked["request_id"].as_str().expect("an identity");
@@ -267,6 +272,7 @@ impl Web {
         at_ms: u64,
         asked: &serde_json::Value,
         history: &serde_json::Value,
+        copy_on_writes: bool,
     ) -> ServiceHttpAnswer {
         if at_ms < held.cutoff_ms {
             return refusal(409, "SIGNED_BEFORE_CUTOFF", "signed before the cutoff");
@@ -347,7 +353,19 @@ impl Web {
             },
             "current_revision": kept.revision,
             "current_write_sequence": kept.write_sequence.to_string(),
-            "conflict": null,
+            "conflict": if copy_on_writes {
+                serde_json::json!({
+                    "sequence": "1",
+                    "conflict_id": identity(0xef).to_string(),
+                    "object_id": asked["locator"],
+                    "expected_revision": asked["expected_revision"],
+                    "current_revision": kept.revision,
+                    "current_write_sequence": kept.write_sequence.to_string(),
+                    "recorded_at": "2026-09-25T10:00:00.000Z",
+                })
+            } else {
+                serde_json::Value::Null
+            },
             "recovery_id": history,
             "stored": stored(true),
         });
@@ -1354,6 +1372,69 @@ async fn a_fault_after_the_request_left_leaves_the_write_unknown() {
     );
 }
 
+/// An answer about a bundle write names no copy in any state: a write answered as applied and
+/// naming a copy beside it is an answer about something else, and an unknown outcome, where the
+/// same answer naming none is read as it always is.
+#[tokio::test]
+async fn a_bundle_write_answered_as_applied_with_a_copy_is_not_an_answer_this_client_reads() {
+    let owner = owner_with_a_writer().await;
+    let collection = bundle_collection(&at(ORIGIN, &owner.locator));
+    let key = owner
+        .seed
+        .bundle_key_for(&at(ORIGIN, &owner.locator))
+        .expect("a key");
+    let sealed = kr_crypto::archive::encrypt_recovery_bundle(&key, &owner.bundle).expect("sealed");
+    let at_two = owner.store.position();
+
+    owner
+        .web
+        .names_a_copy_on_writes
+        .store(true, Ordering::SeqCst);
+    let refused = owner
+        .client
+        .compare_exchange(&collection, identity(0xd3), now_ms(), at_two, &sealed)
+        .await
+        .expect_err("applied, and a copy beside it");
+    assert_eq!(refused.code(), ErrorCode::OutcomeUnknown);
+
+    owner
+        .web
+        .names_a_copy_on_writes
+        .store(false, Ordering::SeqCst);
+    let at_three = owner
+        .client
+        .compare_exchange(&collection, identity(0xd4), now_ms(), None, &sealed)
+        .await;
+    assert!(
+        matches!(at_three, Ok(SyncExchanged::Refused { retained: None, .. })),
+        "the same kind of answer naming no copy is read: {at_three:?}"
+    );
+    // Read on its own, so the service's lock is released before the write asks for it.
+    let third: SyncRevision = {
+        let collections = owner.web.collections.lock().expect("the collections");
+        let kept = collections[&owner.locator]
+            .kept
+            .as_ref()
+            .expect("the bundle");
+        SyncRevision::new(kept.revision.parse().expect("a revision"))
+    };
+    let applied = owner
+        .client
+        .compare_exchange(
+            &collection,
+            identity(0xd5),
+            now_ms(),
+            Some(SyncPosition::at(3, third, None)),
+            &sealed,
+        )
+        .await
+        .expect("the write applied");
+    assert!(
+        matches!(applied, SyncExchanged::Applied { position } if position.write_sequence == 4),
+        "{applied:?}"
+    );
+}
+
 /// Where a device's account token comes from while a refresh is in flight: it waits until the test
 /// lets it through.
 #[derive(Debug)]
@@ -1459,6 +1540,14 @@ async fn a_bundle_receipt_that_names_a_copy_is_not_an_answer_this_client_reads()
             .await
             .expect("a receipt"),
         SyncRequestStatus::Refused { retained: None, .. }
+    ));
+    assert!(matches!(
+        owner
+            .client
+            .fence_request(&collection, refused_write, now_ms(), now_ms())
+            .await
+            .expect("a receipt"),
+        SyncRequestFence::Refused { retained: None, .. }
     ));
 
     owner
