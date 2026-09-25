@@ -182,7 +182,8 @@ impl Authority for Confirmed<'_> {
 /// trust and through `proxy`, or directly when that is `None`. A host whose certificate
 /// verification cannot be set up still reads the repositories on its own disk, and says why
 /// whenever it is asked to fetch one.
-fn repository_transport(proxy: Option<&kr_transport::config::ProxyUrl>) -> RepositoryTransport {
+#[must_use]
+pub fn repository_transport(proxy: Option<&kr_transport::config::ProxyUrl>) -> RepositoryTransport {
     match kr_client::services::http::client_builder(proxy) {
         Ok(builder) => RepositoryTransport::over(builder),
         Err(error) => {
