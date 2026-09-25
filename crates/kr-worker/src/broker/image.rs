@@ -14,9 +14,10 @@
 //!   is one the hashed file's signature carries executes the hashed code, and a process that only
 //!   maps that file does not match.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::scalars::Digest256;
@@ -108,16 +109,19 @@ pub(crate) type HashedFiles = Mutex<BTreeMap<FileIdentity, HashedFile>>;
 /// On macOS the file's own code directories are read first, and the one pass that hashes the file
 /// also hashes each directory's pages: only a directory whose every code slot matches the page it
 /// names is kept, so a kept hash describes the code this file holds, not a directory copied into it.
-pub(crate) fn read_identity(path: &Path, cache: &HashedFiles) -> Result<HashedFile, String> {
-    use sha2::Digest as _;
-    use std::io::Read as _;
+///
+/// The work is bounded whatever is at the path: the file is opened without waiting and refused
+/// unless the opened descriptor is a regular file, no more than the size read at the start is read,
+/// and the reading stops as soon as `stop` is set.
+pub(crate) fn read_identity(
+    path: &Path,
+    cache: &HashedFiles,
+    stop: &AtomicBool,
+) -> Result<HashedFile, String> {
     for _ in 0..IDENTITY_ATTEMPTS {
-        let mut file = std::fs::File::open(path)
+        let file = open_without_waiting(path)
             .map_err(|error| format!("{} cannot be read: {error}", path.display()))?;
-        let before = file
-            .metadata()
-            .map(|metadata| FileIdentity::of(&metadata))
-            .map_err(|error| format!("{} cannot be read: {error}", path.display()))?;
+        let before = regular_identity(&file, path)?;
         let cached = cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -126,44 +130,20 @@ pub(crate) fn read_identity(path: &Path, cache: &HashedFiles) -> Result<HashedFi
         if let Some(hashed) = cached {
             return Ok(hashed);
         }
-        let mut directories = directories_of(&file, before.size);
-        let mut hasher = sha2::Sha256::new();
-        let mut buffer = vec![0_u8; 1 << 20];
-        let mut offset = 0_u64;
-        loop {
-            let read = file
-                .read(&mut buffer)
-                .map_err(|error| format!("{} cannot be read: {error}", path.display()))?;
-            if read == 0 {
-                break;
-            }
-            let chunk = buffer.get(..read).unwrap_or_default();
-            if offset == 0 && chunk.starts_with(b"#!") {
-                return Err(format!(
-                    "{} is a script, and the program it runs is its interpreter",
-                    path.display()
-                ));
-            }
-            hasher.update(chunk);
-            for directory in &mut directories {
-                directory.feed(offset, chunk);
-            }
-            offset = offset.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
-        }
-        let after = file
-            .metadata()
-            .map(|metadata| FileIdentity::of(&metadata))
-            .map_err(|error| format!("{} cannot be read: {error}", path.display()))?;
+        let directories = directories_of(&file, before.size);
+        let Some((digest, code_directories)) =
+            hash_file(&file, path, before.size, directories, stop)?
+        else {
+            continue;
+        };
+        let after = regular_identity(&file, path)?;
         if before != after {
             continue;
         }
         let hashed = HashedFile {
             file: before,
-            digest: Digest256::from_bytes(hasher.finalize().into()),
-            code_directories: directories
-                .into_iter()
-                .filter_map(|directory| directory.kept())
-                .collect(),
+            digest,
+            code_directories,
         };
         cache
             .lock()
@@ -175,6 +155,88 @@ pub(crate) fn read_identity(path: &Path, cache: &HashedFiles) -> Result<HashedFi
         "{} kept changing while it was read",
         path.display()
     ))
+}
+
+/// Opens a file to read without waiting for it, whatever the file is: a FIFO or a device in its
+/// place cannot hold the reader, and what it is decides afterwards.
+fn open_without_waiting(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    options.open(path)
+}
+
+/// The identity of an opened file that is a regular file, and a refusal for anything else.
+fn regular_identity(file: &std::fs::File, path: &Path) -> Result<FileIdentity, String> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("{} cannot be read: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    Ok(FileIdentity::of(&metadata))
+}
+
+/// Hashes the first `size` bytes of an opened file, feeding each code directory its pages, and
+/// returns the digest and the directories that matched; `None` when the file held fewer bytes than
+/// that, so it changed.
+///
+/// # Errors
+///
+/// Returns why it could not be read: a read that failed, a script, or a stop.
+fn hash_file<D: PageCheck>(
+    mut file: &std::fs::File,
+    path: &Path,
+    size: u64,
+    mut directories: Vec<D>,
+    stop: &AtomicBool,
+) -> Result<Option<(Digest256, Vec<CodeDirectoryHash>)>, String> {
+    use sha2::Digest as _;
+    use std::io::Read as _;
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = vec![0_u8; 1 << 20];
+    let mut offset = 0_u64;
+    while offset < size {
+        if stop.load(Ordering::Relaxed) {
+            return Err(format!("the reading of {} was stopped", path.display()));
+        }
+        let wanted = usize::try_from((size - offset).min(1 << 20)).unwrap_or(1 << 20);
+        let read = file
+            .read(buffer.get_mut(..wanted).unwrap_or_default())
+            .map_err(|error| format!("{} cannot be read: {error}", path.display()))?;
+        if read == 0 {
+            return Ok(None);
+        }
+        let chunk = buffer.get(..read).unwrap_or_default();
+        if offset == 0 && chunk.starts_with(b"#!") {
+            return Err(format!(
+                "{} is a script, and the program it runs is its interpreter",
+                path.display()
+            ));
+        }
+        hasher.update(chunk);
+        for directory in &mut directories {
+            directory.feed(offset, chunk);
+        }
+        offset = offset.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+    }
+    Ok(Some((
+        Digest256::from_bytes(hasher.finalize().into()),
+        directories
+            .into_iter()
+            .filter_map(PageCheck::kept)
+            .collect(),
+    )))
+}
+
+/// What checks a code directory's pages as the file streams past.
+trait PageCheck {
+    fn feed(&mut self, offset: u64, chunk: &[u8]);
+    fn kept(self) -> Option<CodeDirectoryHash>;
 }
 
 #[cfg(target_os = "macos")]
@@ -192,7 +254,7 @@ fn directories_of(_file: &std::fs::File, _size: u64) -> Vec<NoDirectory> {
 enum NoDirectory {}
 
 #[cfg(not(target_os = "macos"))]
-impl NoDirectory {
+impl PageCheck for NoDirectory {
     fn feed(&mut self, _offset: u64, _chunk: &[u8]) {
         match *self {}
     }
@@ -202,11 +264,18 @@ impl NoDirectory {
     }
 }
 
+/// The identities of executables already shown to hold the digest that was hashed, so each is
+/// hashed at most once.
+pub type VerifiedFiles = Mutex<BTreeSet<FileIdentity>>;
+
 /// Checks, from the kernel's record of the process's main executable, that a registered process
-/// executes the file object that was hashed.
+/// executes the code that was hashed.
 ///
-/// Linux compares the whole identity of `/proc/<pid>/exe`, change time included, so a rewrite of
-/// the same inode after it was hashed does not pass.
+/// Linux reads the file `/proc/<pid>/exe` names, which is the one the process executes even after
+/// its path is replaced or removed. It passes when its whole identity, change time included, is the
+/// one that was hashed or one already shown to hold the same digest; any other identity is hashed,
+/// and passes when its digest is the one that was hashed. An upgrade that unlinks the running file
+/// changes its metadata and not its code, and passes; a rewrite of its code does not.
 ///
 /// # Errors
 ///
@@ -215,21 +284,37 @@ impl NoDirectory {
 pub fn verify_image(
     process: &ProcessStartIdentity,
     identity: &ExecutableIdentity,
+    verified: &VerifiedFiles,
+    stop: &AtomicBool,
 ) -> Result<(), String> {
-    let link = format!("/proc/{}/exe", process.pid.get());
-    let executed = std::fs::metadata(&link).map_err(|error| {
+    let link = std::path::PathBuf::from(format!("/proc/{}/exe", process.pid.get()));
+    let file = open_without_waiting(&link).map_err(|error| {
         format!(
             "the image of process {} cannot be read: {error}",
             process.pid
         )
     })?;
-    let same = FileIdentity::of(&executed) == identity.hashed.file;
+    let before = regular_identity(&file, &link)?;
+    let known = before == identity.hashed.file
+        || verified
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&before);
+    let same = known || {
+        let hashed = hash_file(&file, &link, before.size, Vec::<NoDirectory>::new(), stop)?;
+        let after = regular_identity(&file, &link)?;
+        hashed.is_some_and(|(digest, _)| digest == identity.hashed.digest) && after == before
+    };
     still_registered(process)?;
     if same {
+        verified
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(before);
         Ok(())
     } else {
         Err(format!(
-            "process {} executes another file than the one its launch presented",
+            "process {} executes other code than the file its launch presented",
             process.pid
         ))
     }
@@ -248,6 +333,8 @@ pub fn verify_image(
 pub fn verify_image(
     process: &ProcessStartIdentity,
     identity: &ExecutableIdentity,
+    _verified: &VerifiedFiles,
+    _stop: &AtomicBool,
 ) -> Result<(), String> {
     let pid = i32::try_from(process.pid.get())
         .map_err(|_| format!("{} is not a process identifier", process.pid))?;
@@ -272,6 +359,8 @@ pub fn verify_image(
 pub fn verify_image(
     process: &ProcessStartIdentity,
     _identity: &ExecutableIdentity,
+    _verified: &VerifiedFiles,
+    _stop: &AtomicBool,
 ) -> Result<(), String> {
     Err(format!(
         "this platform keeps no record of the image process {} runs",
@@ -415,10 +504,10 @@ mod code_signature {
         valid: bool,
     }
 
-    impl Directory {
+    impl super::PageCheck for Directory {
         /// Hashes the part of `chunk`, which starts at `offset` in the file, that this directory's
         /// code covers.
-        pub(super) fn feed(&mut self, offset: u64, chunk: &[u8]) {
+        fn feed(&mut self, offset: u64, chunk: &[u8]) {
             let chunk_end = offset.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
             let mut from = offset.max(self.start);
             let until = chunk_end.min(self.end);
@@ -458,7 +547,7 @@ mod code_signature {
         }
 
         /// The directory's hash, when every page was read and matched its slot.
-        pub(super) fn kept(self) -> Option<CodeDirectoryHash> {
+        fn kept(self) -> Option<CodeDirectoryHash> {
             (self.valid && self.at == self.slots.len()).then_some(self.hash)
         }
     }
@@ -743,7 +832,8 @@ mod tests {
     fn identity_of(path: &Path) -> ExecutableIdentity {
         let cache = HashedFiles::default();
         ExecutableIdentity {
-            hashed: read_identity(path, &cache).expect("its identity is read"),
+            hashed: read_identity(path, &cache, &AtomicBool::new(false))
+                .expect("its identity is read"),
             version: None,
         }
     }
@@ -756,10 +846,22 @@ mod tests {
         let exe = std::env::current_exe().expect("this test's executable");
         let identity = identity_of(&exe);
         let me = kr_ipc::identity::current_process_start_identity().expect("this process");
-        verify_image(&me, &identity).expect("this process executes its own executable");
+        verify_image(
+            &me,
+            &identity,
+            &VerifiedFiles::default(),
+            &AtomicBool::new(false),
+        )
+        .expect("this process executes its own executable");
         let other = identity_of(Path::new("/bin/sh"));
         assert!(
-            verify_image(&me, &other).is_err(),
+            verify_image(
+                &me,
+                &other,
+                &VerifiedFiles::default(),
+                &AtomicBool::new(false)
+            )
+            .is_err(),
             "and not a file it was not started from"
         );
     }
@@ -776,15 +878,56 @@ mod tests {
         let process =
             kr_ipc::identity::process_start_identity(child.id()).expect("the child is identified");
         let bash = identity_of(Path::new("/bin/bash"));
-        let result = verify_image(&process, &bash);
+        let result = verify_image(
+            &process,
+            &bash,
+            &VerifiedFiles::default(),
+            &AtomicBool::new(false),
+        );
         let other = verify_image(
             &process,
             &identity_of(&std::env::current_exe().expect("exe")),
+            &VerifiedFiles::default(),
+            &AtomicBool::new(false),
         );
         let _ = child.kill();
         let _ = child.wait();
         result.expect("the child executes bash");
         assert!(other.is_err(), "and not this test's executable");
+    }
+
+    /// A FIFO and a character device at the path are refused at once, by the opened descriptor's
+    /// type: neither waits for a writer nor reads without end.
+    #[cfg(unix)]
+    #[test]
+    fn what_is_not_a_regular_file_is_refused_at_once() {
+        let directory = std::env::temp_dir().join(format!("kr-fifo-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(&directory).expect("a directory");
+        let fifo = directory.join("claude");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo runs");
+        assert!(made.success());
+        let started = std::time::Instant::now();
+        let cache = HashedFiles::default();
+        let refused =
+            read_identity(&fifo, &cache, &AtomicBool::new(false)).expect_err("a FIFO is refused");
+        assert!(refused.contains("not a regular file"), "{refused}");
+        let refused = read_identity(Path::new("/dev/zero"), &cache, &AtomicBool::new(false))
+            .expect_err("a device is refused");
+        assert!(refused.contains("not a regular file"), "{refused}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A reading that is told to stop stops.
+    #[test]
+    fn a_stopped_reading_stops() {
+        let exe = std::env::current_exe().expect("this test's executable");
+        let refused = read_identity(&exe, &HashedFiles::default(), &AtomicBool::new(true))
+            .expect_err("stopped");
+        assert!(refused.contains("stopped"), "{refused}");
     }
 
     #[test]
@@ -794,7 +937,8 @@ mod tests {
         let script = directory.join("claude");
         std::fs::write(&script, b"#!/bin/sh\nexec true\n").expect("a script");
         let cache = HashedFiles::default();
-        let refused = read_identity(&script, &cache).expect_err("a script is refused");
+        let refused = read_identity(&script, &cache, &AtomicBool::new(false))
+            .expect_err("a script is refused");
         assert!(refused.contains("script"), "{refused}");
         let _ = std::fs::remove_dir_all(&directory);
     }
@@ -866,7 +1010,8 @@ mod tests {
     fn a_code_directory_that_matches_its_pages_is_kept() {
         let (file, hash) = signed(None, &[0]);
         let (directory, path) = written(&file);
-        let read = read_identity(&path, &HashedFiles::default()).expect("read");
+        let read =
+            read_identity(&path, &HashedFiles::default(), &AtomicBool::new(false)).expect("read");
         let _ = std::fs::remove_dir_all(&directory);
         assert_eq!(read.code_directories, vec![hash]);
     }
@@ -878,7 +1023,8 @@ mod tests {
     fn a_code_directory_that_does_not_match_its_pages_is_not_kept() {
         let (file, _) = signed(Some([7; 32]), &[0]);
         let (directory, path) = written(&file);
-        let read = read_identity(&path, &HashedFiles::default()).expect("read");
+        let read =
+            read_identity(&path, &HashedFiles::default(), &AtomicBool::new(false)).expect("read");
         let _ = std::fs::remove_dir_all(&directory);
         assert!(
             read.code_directories.is_empty(),
@@ -894,7 +1040,8 @@ mod tests {
     fn a_signature_that_repeats_a_slot_yields_nothing() {
         let (file, _) = signed(None, &[0; 40]);
         let (directory, path) = written(&file);
-        let read = read_identity(&path, &HashedFiles::default()).expect("read");
+        let read =
+            read_identity(&path, &HashedFiles::default(), &AtomicBool::new(false)).expect("read");
         let _ = std::fs::remove_dir_all(&directory);
         assert!(
             read.code_directories.is_empty(),
@@ -925,7 +1072,8 @@ mod tests {
         // A byte inside the slice's first page, in its load commands.
         bytes[offset + 40] ^= 0xff;
         let (directory, path) = written(&bytes);
-        let read = read_identity(&path, &HashedFiles::default()).expect("read");
+        let read =
+            read_identity(&path, &HashedFiles::default(), &AtomicBool::new(false)).expect("read");
         let _ = std::fs::remove_dir_all(&directory);
         assert_eq!(original.len(), 2, "bash is universal: {original:?}");
         assert_eq!(

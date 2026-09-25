@@ -52,6 +52,11 @@ if [ -n "$HOOK" ]; then
   if [ -n "$WAIT_FOR" ]; then while [ ! -f "$WAIT_FOR" ]; do sleep 0.02; done; fi
   printf '%s' "$HOOK_EVENT" | "$HOOK" claude-code hook > "$report.hook" 2>&1
   echo done > "$report.hooked"
+  if [ -n "$AGAIN_AFTER" ]; then
+    while [ ! -f "$AGAIN_AFTER" ]; do sleep 0.02; done
+    printf '%s' "$HOOK_EVENT_2" | "$HOOK" claude-code hook > "$report.hook2" 2>&1
+    echo done > "$report.hooked2"
+  fi
   if [ -n "$THEN_EXEC" ]; then
     exec "$THEN_EXEC" -c 'printf "%s" "$HOOK_EVENT_2" | "$HOOK" claude-code hook > "$REPORT.hook2" 2>&1; echo done > "$REPORT.hooked2"; sleep 1; exit 0'
   fi
@@ -1121,8 +1126,9 @@ fn kr_req_05_09_a_replacement_that_maps_the_hashed_program_is_refused() {
     let _ = finish(held);
 }
 
-/// KR-REQ-05.09: on Linux, the program rewritten in place with its own bytes after it was hashed,
-/// its modification time put back, is refused: its change time says it was written since.
+/// KR-REQ-05.09: on Linux, the program rewritten in place after it was hashed, one byte changed and
+/// its modification time put back, is refused: its change time says it was written since, and its
+/// bytes are no longer the ones that were hashed.
 #[cfg(target_os = "linux")]
 #[test]
 fn kr_req_05_09_a_program_rewritten_in_place_after_it_was_hashed_is_refused() {
@@ -1146,7 +1152,11 @@ fn kr_req_05_09_a_program_rewritten_in_place_after_it_was_hashed_is_refused() {
     );
     let held = held.spawn().expect("the launcher starts");
     eventually("the launch is admitted", || registration.exists());
-    let bytes = std::fs::read(&program).expect("the program's bytes");
+    let mut bytes = std::fs::read(&program).expect("the program's bytes");
+    // The file's last byte, in its section headers, which nothing reads to run it.
+    if let Some(last) = bytes.last_mut() {
+        *last ^= 0xff;
+    }
     let modified = std::fs::metadata(&program)
         .and_then(|metadata| metadata.modified())
         .expect("its modification time");
@@ -1155,7 +1165,8 @@ fn kr_req_05_09_a_program_rewritten_in_place_after_it_was_hashed_is_refused() {
             .write(true)
             .open(&program)
             .expect("the same inode, opened to write");
-        file.write_all(&bytes).expect("its own bytes written back");
+        file.write_all(&bytes)
+            .expect("its bytes written back, one changed");
         file.set_modified(modified)
             .expect("its modification time put back");
         file.sync_all().expect("written");
@@ -1335,4 +1346,63 @@ fn kr_req_05_09_a_code_directory_copied_into_changed_code_vouches_for_nothing() 
         "the hook of a program only a copied directory vouched for moves nothing"
     );
     let _ = finish(held);
+}
+
+/// KR-REQ-12.07: an upgrade of the executable while the program runs, between its first hook and
+/// its second, leaves the running program its bridges: the upgrade affects new launches. On Linux
+/// the running file is replaced at its path, which unlinks it and changes its metadata but not its
+/// code; on macOS the path's link is pointed at another program.
+#[test]
+fn kr_req_12_07_an_upgrade_while_the_program_runs_leaves_it_its_bridges() {
+    let shell = Shell::new();
+    let hook = shell.placed.forwarder.display().to_string();
+    let (program, another) = shells();
+    let path = shell.placed.host.root().join("bin").join("upgraded");
+    if cfg!(target_os = "linux") {
+        std::fs::copy(program, &path).expect("a copy of the program, which Linux runs anywhere");
+    } else {
+        std::os::unix::fs::symlink(program, &path).expect("the program");
+    }
+    let second = SESSION_START.replace(THREAD, SECOND_THREAD);
+    let again = shell.placed.host.root().join("go-upgraded");
+    let again_text = again.display().to_string();
+    let answer = shell.establish_for(&path);
+    let mut command = shell.launcher(&path, &Shell::answered(), None);
+    shell.prepare(
+        &mut command,
+        Some(&answer),
+        "upgraded",
+        &[
+            ("HOOK", hook.as_str()),
+            ("HOOK_EVENT", SESSION_START),
+            ("HOOK_EVENT_2", second.as_str()),
+            ("AGAIN_AFTER", again_text.as_str()),
+            ("LINGER", "1"),
+        ],
+    );
+    let child = command.spawn().expect("the launcher starts");
+    let instance = instance_of(&shell.report("upgraded"));
+    hooked(&shell, "upgraded");
+    assert_eq!(
+        selected(&shell, instance).as_deref(),
+        Some(THREAD),
+        "the first hook is admitted"
+    );
+    if cfg!(target_os = "linux") {
+        let staged = path.with_extension("next");
+        std::fs::copy(another, &staged).expect("the new version");
+        std::fs::rename(&staged, &path).expect("installed over the running one");
+    } else {
+        retarget(&path, another);
+    }
+    std::fs::write(&again, "").expect("the second hook may run");
+    eventually("the second hook has run", || {
+        shell.reports.join("upgraded.hooked2").exists()
+    });
+    assert_eq!(
+        selected(&shell, instance).as_deref(),
+        Some(SECOND_THREAD),
+        "the running program's second hook is admitted after the upgrade"
+    );
+    let _ = finish(child);
 }

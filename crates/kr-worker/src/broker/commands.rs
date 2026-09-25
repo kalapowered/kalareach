@@ -189,6 +189,10 @@ struct Backend {
     /// Why a bridge of this instance was refused for the image its process runs, once one was:
     /// every later bridge is refused too.
     image_refused: Mutex<Option<String>>,
+    /// The executables already shown to hold the digest that was hashed.
+    image_verified: crate::broker::image::VerifiedFiles,
+    /// Set when the backend is retired, so a reading of the executable in progress stops.
+    stopped: Arc<AtomicBool>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     #[cfg(feature = "testing")]
     confirm_pause: Arc<Mutex<Option<ConfirmPause>>>,
@@ -600,6 +604,8 @@ impl CommandBackends {
             lifecycle: Lifecycle::new(BackendState::Unbound),
             identity,
             image_refused: Mutex::new(None),
+            image_verified: crate::broker::image::VerifiedFiles::default(),
+            stopped: Arc::new(AtomicBool::new(false)),
             tasks: Mutex::new(Vec::new()),
             #[cfg(feature = "testing")]
             confirm_pause: Arc::clone(&self.confirm_pause),
@@ -608,13 +614,15 @@ impl CommandBackends {
             let path = PathBuf::from(&backend.invocation.executable);
             let hashed = Arc::clone(&self.hashed);
             let connector = Arc::clone(&backend.connector);
+            let stopped = Arc::clone(&backend.stopped);
             self.handle.spawn_blocking(move || {
-                let read = crate::broker::image::read_identity(&path, &hashed).map(|hashed| {
-                    let version = connector
-                        .qualified_version(&hashed.digest)
-                        .map(str::to_owned);
-                    ExecutableIdentity { hashed, version }
-                });
+                let read =
+                    crate::broker::image::read_identity(&path, &hashed, &stopped).map(|hashed| {
+                        let version = connector
+                            .qualified_version(&hashed.digest)
+                            .map(str::to_owned);
+                        ExecutableIdentity { hashed, version }
+                    });
                 let _ = identity_sender.send(Some(read));
             })
         };
@@ -649,6 +657,7 @@ impl Backend {
     /// any guard it holds. A launcher that looks later finds nothing and runs what was typed, which
     /// its variable's file name tells it.
     fn retire(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
         self.lifecycle.retire();
         for task in self
             .tasks
@@ -784,7 +793,13 @@ async fn admit(
             else {
                 return;
             };
-            if let Err(_refused) = verify(&backend, &registration) {
+            // Off the runtime's threads: an executable whose metadata changed is hashed again.
+            let verdict = {
+                let backend = Arc::clone(&backend);
+                let registration = Arc::clone(&registration);
+                tokio::task::spawn_blocking(move || verify(&backend, &registration)).await
+            };
+            if !matches!(verdict, Ok(Ok(()))) {
                 return;
             }
             let Ok(admitted) = authenticated.admit().await else {
@@ -849,7 +864,12 @@ fn verify(backend: &Backend, registration: &Registration) -> std::result::Result
         .clone()
         .unwrap_or_else(|| Err("the executable's identity was never read".to_owned()));
     let verified = identity.and_then(|identity| {
-        crate::broker::image::verify_image(&registration.expected_process, &identity)
+        crate::broker::image::verify_image(
+            &registration.expected_process,
+            &identity,
+            &backend.image_verified,
+            &backend.stopped,
+        )
     });
     if let Err(why) = &verified {
         *refused = Some(why.clone());
