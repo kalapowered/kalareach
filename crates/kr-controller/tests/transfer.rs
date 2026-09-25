@@ -747,12 +747,12 @@ async fn the_daemon_sweeps_under_its_registrys_view_of_its_sessions() {
     assert_eq!(sweep.expired_snapshots, 0);
 }
 
-/// The daemon's own sweep does not keep the daemon, and with it the environment's lock, once the
-/// daemon's owner has let it go.
+/// A sweep waiting for its blocking thread keeps nothing of the daemon, and with it the
+/// environment's lock, once the daemon's owner has let it go; when its turn comes, it finds the
+/// daemon gone and does nothing.
 ///
-/// The sweep runs on a blocking thread, and here the runtime has one, which this test takes. A
-/// sweep the daemon starts then waits for that thread; the daemon is let go while it waits, and is
-/// gone at once, so another daemon can take the environment.
+/// The runtime here has one blocking thread, which this test takes. A sweep is queued as it is
+/// asked for, so from then on it waits for that thread.
 #[test]
 fn a_sweep_waiting_to_run_does_not_keep_its_daemon() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -776,18 +776,10 @@ fn a_sweep_waiting_to_run_does_not_keep_its_daemon() {
         });
         taking.await.expect("the blocking thread is taken");
 
-        // A sweep, started the way the daemon starts its own, which waits for that thread. A sweep
-        // that holds the daemon while it waits shows as a second reference; one that does not
-        // shows nothing, and is given a moment to get as far as the wait.
-        kr_controller::transfer::serve(&controller).expect("starts the sweep");
-        let started = std::time::Instant::now();
-        while Arc::strong_count(&controller) == 1
-            && started.elapsed() < std::time::Duration::from_secs(2)
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-
+        // Queued as it is asked for: from here the sweep waits for the thread.
         let daemon = Arc::downgrade(&controller);
+        let swept = controller.transfer().sweep(&daemon);
+
         drop(controller);
         let dropped = std::time::Instant::now();
         while daemon.strong_count() > 0 && dropped.elapsed() < std::time::Duration::from_secs(5) {
@@ -799,9 +791,15 @@ fn a_sweep_waiting_to_run_does_not_keep_its_daemon() {
             "a sweep waiting for its thread keeps nothing of the daemon"
         );
 
-        // The environment is free: another daemon takes it on its first try.
+        // Its turn comes after the daemon has gone: it does nothing, and says why.
         let _ = release.send(());
         occupied.await.expect("the blocking thread is let go");
+        let refused = swept
+            .await
+            .expect_err("a sweep whose daemon has gone does nothing");
+        assert_eq!(refused.code, ErrorCode::ResourceUnavailable);
+
+        // The environment is free: another daemon takes it on its first try.
         let replacement = Controller::start(setup(&environment, environment_id))
             .await
             .expect("another daemon takes the environment at once");
