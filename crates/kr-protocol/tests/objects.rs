@@ -100,7 +100,10 @@ fn a_machine_an_environment_an_endpoint_and_a_session_are_distinct_objects() {
     assert_object(&schema, "session_id", "SessionId", Shape::Uuid);
     let endpoint_definition = &schema["$defs"]["EndpointKey"];
     assert_eq!(endpoint_definition["contentEncoding"], "base64url");
-    assert_eq!(endpoint_definition["pattern"], "^[A-Za-z0-9_-]{43}$");
+    assert_eq!(
+        endpoint_definition["pattern"],
+        "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$"
+    );
 
     let machine = MachineId::new(uuid("11111111-2222-4333-8444-555555555555"));
     let environment = EnvironmentId::new(uuid("3de5e6cb-bf21-49c1-8d34-b9a8729539da"));

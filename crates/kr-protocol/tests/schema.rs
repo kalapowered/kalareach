@@ -100,7 +100,12 @@ fn scalars_declare_their_json_representation() {
         definitions["AuthorityRevision"]["pattern"],
         "^(0|[1-9][0-9]*)$"
     );
-    assert_eq!(definitions["Digest256"]["pattern"], "^[A-Za-z0-9_-]{43}$");
+    // Canonical base64url only: 43 symbols, the last of which leaves the two bits past the 32nd
+    // byte zero.
+    assert_eq!(
+        definitions["Digest256"]["pattern"],
+        "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$"
+    );
 }
 
 /// KR-REQ-23.14: the published mutation schemas are closed.

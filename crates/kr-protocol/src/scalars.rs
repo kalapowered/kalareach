@@ -591,14 +591,35 @@ impl<'de> Visitor<'de> for VariableBytesVisitor {
     }
 }
 
+/// Any base64url symbol.
+const SYMBOL: &str = "[A-Za-z0-9_-]";
+
+/// The last symbol of an encoding that ends one byte past a multiple of three: its low four bits
+/// are past the last byte, so they are zero.
+const LAST_OF_ONE: &str = "[AQgw]";
+
+/// The last symbol of an encoding that ends two bytes past a multiple of three: its low two bits
+/// are past the last byte, so they are zero.
+const LAST_OF_TWO: &str = "[AEIMQUYcgkosw048]";
+
+/// The schema of bytes in the JSON representation: unpadded base64url, of exactly `length` bytes
+/// when it is given and of any length when it is not.
+///
+/// The pattern admits the canonical encodings and nothing else, which is what the decoders read:
+/// a length an encoding has, and a last symbol whose bits past the last byte are zero. Every
+/// other spelling of the same bytes is refused by both, so the schema admits none of them either.
 fn base64url_schema(description: &str, length: Option<usize>) -> Schema {
     let pattern = match length {
-        // base64url without padding encodes N bytes in ceil(N / 3) * 4 - padding characters.
-        Some(len) => format!(
-            "^[A-Za-z0-9_-]{{{}}}$",
-            len.div_ceil(3) * 4 - (3 - len % 3) % 3
-        ),
-        None => "^[A-Za-z0-9_-]*$".to_owned(),
+        // Four symbols for every three bytes, then two symbols for one byte left over or three for
+        // two.
+        Some(len) => match len % 3 {
+            0 => format!("^{SYMBOL}{{{}}}$", len / 3 * 4),
+            1 => format!("^{SYMBOL}{{{}}}{LAST_OF_ONE}$", len / 3 * 4 + 1),
+            _ => format!("^{SYMBOL}{{{}}}{LAST_OF_TWO}$", len / 3 * 4 + 2),
+        },
+        None => {
+            format!("^({SYMBOL}{{4}})*({SYMBOL}{LAST_OF_ONE}|{SYMBOL}{{2}}{LAST_OF_TWO})?$")
+        }
     };
     json_schema!({
         "type": "string",

@@ -3531,7 +3531,7 @@
     "AuthorisationKey": {
       "contentEncoding": "base64url",
       "description": "A 32-byte Ed25519 authorisation public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
-      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$",
       "type": "string"
     },
     "AuthorisedLocation": {
@@ -4252,7 +4252,7 @@
     "Bytes": {
       "contentEncoding": "base64url",
       "description": "An opaque byte string. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
-      "pattern": "^[A-Za-z0-9_-]*$",
+      "pattern": "^([A-Za-z0-9_-]{4})*([A-Za-z0-9_-][AQgw]|[A-Za-z0-9_-]{2}[AEIMQUYcgkosw048])?$",
       "type": "string"
     },
     "CallerToken": {
@@ -9916,7 +9916,7 @@
     "Digest256": {
       "contentEncoding": "base64url",
       "description": "A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
-      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$",
       "type": "string"
     },
     "Dimensions": {
@@ -11219,7 +11219,7 @@
     "EndpointKey": {
       "contentEncoding": "base64url",
       "description": "A 32-byte iroh endpoint public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
-      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$",
       "type": "string"
     },
     "EnvelopeId": {
@@ -15226,7 +15226,7 @@
     "KeyId": {
       "contentEncoding": "base64url",
       "description": "A 32-byte key identifier: the SHA-256 of the domain-separated encoding of a key purpose and public key.",
-      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$",
       "type": "string"
     },
     "KeyQueueSnapshot": {
@@ -15888,7 +15888,7 @@
     "Mac256": {
       "contentEncoding": "base64url",
       "description": "A 32-byte HMAC-SHA-256 tag. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
-      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$",
       "type": "string"
     },
     "MachineId": {
@@ -18060,7 +18060,7 @@
     "Nonce256": {
       "contentEncoding": "base64url",
       "description": "A 32-byte nonce. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
-      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$",
       "type": "string"
     },
     "Notification": {
@@ -18101,7 +18101,7 @@
     "NotificationPreviewKey": {
       "contentEncoding": "base64url",
       "description": "A 32-byte X25519 notification-preview public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
-      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$",
       "type": "string"
     },
     "NotificationState": {
@@ -25369,7 +25369,7 @@
     "RelayInstanceKey": {
       "contentEncoding": "base64url",
       "description": "A 32-byte Ed25519 relay instance public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
-      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$",
       "type": "string"
     },
     "RelayInstanceRegistration": {
@@ -28077,7 +28077,7 @@
     "SecretBytes32": {
       "contentEncoding": "base64url",
       "description": "Thirty-two secret bytes. The Rust representation clears them when it is dropped and redacts them in diagnostics; a consumer in another language must apply its own handling, because a JSON string carries no such guarantee.",
-      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$",
       "type": "string"
     },
     "SecretReference": {
@@ -28274,7 +28274,7 @@
     "ServiceAdmissionKey": {
       "contentEncoding": "base64url",
       "description": "A 32-byte Ed25519 service admission public key, which signs relay leases. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
-      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$",
       "type": "string"
     },
     "ServiceRequestPayload": {
@@ -29316,7 +29316,7 @@
     "Signature64": {
       "contentEncoding": "base64url",
       "description": "A 64-byte Ed25519 detached signature. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
-      "pattern": "^[A-Za-z0-9_-]{86}$",
+      "pattern": "^[A-Za-z0-9_-]{85}[AQgw]$",
       "type": "string"
     },
     "SignedArchiveManifest": {
@@ -29665,7 +29665,7 @@
     "StoredEnvelopeKey": {
       "contentEncoding": "base64url",
       "description": "A 32-byte X25519 stored-envelope public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
-      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$",
       "type": "string"
     },
     "StreamCursor": {
