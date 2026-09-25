@@ -2746,12 +2746,6 @@ impl DaemonProcess {
         unreachable!("the loop returns or panics")
     }
 
-    fn pid(&self) -> rustix::process::Pid {
-        let child = self.0.as_ref().expect("the daemon is running");
-        rustix::process::Pid::from_raw(i32::try_from(child.id()).expect("a process identifier"))
-            .expect("a process identifier")
-    }
-
     /// Ends it now, as a crash or a power cut would, without giving it a chance to tidy up.
     fn kill(&mut self) {
         let Some(mut child) = self.0.take() else {
@@ -2884,49 +2878,71 @@ fn chain_progress(journal: &Path, root: kr_protocol::ids::CausalRootId) -> Optio
     Some((completed, under_way))
 }
 
-/// Ends the daemon process once at least `completed` runs of the chain have completed, at a moment
-/// no action of the chain is under way: the process is frozen, and once the kernel reports it
-/// stopped the journal is read, and the process killed if nothing was dispatched, or let go on and
-/// asked again if something was. A run killed
-/// between two of its nodes is taken up by the next daemon; one killed during an action is not
-/// known to have happened, which would end the chain rather than test its budget.
+/// A gate on the workflow journal that holds every chain at a set number of runs, for as long as
+/// the test keeps it.
+///
+/// The gate is a trigger on the journal that refuses to record a chain's next run once the chain
+/// has `runs` of them. The host takes a refused write for a journal it could not write, which says
+/// nothing about the trigger that asked for the run: nothing of that admission is kept, the event
+/// that asked for it stays unread, and the process that reads the journal next decides it again.
+/// A daemon running the chain therefore stops between two of its actions once `runs` runs have
+/// completed, however fast or slow the machine is, and nothing of the chain is under way while it
+/// is held. A run killed between two actions is taken up by the next daemon; one killed during an
+/// action is not known to have happened, which would end the chain rather than test its budget.
 #[cfg(unix)]
-async fn end_between_actions(
-    daemon: &mut DaemonProcess,
-    journal: &Path,
-    root: kr_protocol::ids::CausalRootId,
-    completed: i64,
-) -> i64 {
-    let pid = daemon.pid();
+struct ChainGate {
+    journal: PathBuf,
+}
+
+#[cfg(unix)]
+impl ChainGate {
+    /// The trigger's name in the journal.
+    const TRIGGER: &str = "kr_test_chain_gate";
+
+    /// Puts the gate on `journal`, holding each chain at `runs` runs.
+    fn hold(journal: &Path, runs: i64) -> Self {
+        let connection = rusqlite::Connection::open(journal).expect("opens the workflow journal");
+        connection
+            .execute_batch(&format!(
+                "CREATE TRIGGER {trigger} BEFORE INSERT ON workflow_runs
+                 WHEN (SELECT COUNT(*) FROM workflow_runs
+                       WHERE causal_root_id = NEW.causal_root_id) >= {runs}
+                 BEGIN SELECT RAISE(ABORT, 'the chain is held at its gate'); END;",
+                trigger = Self::TRIGGER
+            ))
+            .expect("the gate is put on the journal");
+        Self {
+            journal: journal.to_path_buf(),
+        }
+    }
+
+    /// Takes the gate off again, for a daemon that is not running, so the next one to start goes
+    /// on with the chain.
+    fn lift(self) {
+        let connection =
+            rusqlite::Connection::open(&self.journal).expect("opens the workflow journal");
+        connection
+            .execute_batch(&format!("DROP TRIGGER {};", Self::TRIGGER))
+            .expect("the gate is taken off the journal");
+    }
+}
+
+/// Waits until the chain stands at the gate: exactly `runs` of its runs completed and no action of
+/// it under way, which the gate keeps true until it is lifted. Returns the runs completed.
+#[cfg(unix)]
+async fn held_at_the_gate(journal: &Path, root: kr_protocol::ids::CausalRootId, runs: i64) -> i64 {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     loop {
+        let progress = chain_progress(journal, root);
+        if progress == Some((runs, 0)) {
+            return runs;
+        }
         assert!(
             std::time::Instant::now() < deadline,
-            "the chain reached {completed} runs between two actions within two minutes"
+            "the chain stood at its gate of {runs} runs, with nothing under way, within two \
+             minutes: {progress:?} (completed, under way)"
         );
-        rustix::process::kill_process(pid, rustix::process::Signal::STOP)
-            .expect("the daemon can be frozen");
-        // Sending the signal is not the process stopping: its threads can still commit until the
-        // kernel reports it stopped, so the journal is read only after that report.
-        let reported = rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::UNTRACED)
-            .expect("the daemon's state can be waited for")
-            .expect("the daemon changed state");
-        assert!(
-            reported.1.stopped(),
-            "the daemon stopped rather than ended: {:?}",
-            reported.1
-        );
-        match chain_progress(journal, root) {
-            Some((done, 0)) if done >= completed => {
-                daemon.kill();
-                return done;
-            }
-            _ => {
-                rustix::process::kill_process(pid, rustix::process::Signal::CONT)
-                    .expect("the daemon can be let go on");
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
-        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
 
@@ -2934,10 +2950,11 @@ async fn end_between_actions(
 /// service. Two workflows, each a single node and neither cyclic on its own, trigger one another:
 /// a capture's success triggers a materialisation of a version, and a materialisation's success
 /// triggers a capture. The chain they make starts under one root the host mints. The daemon's
-/// process is killed part way through the chain, and a new process on the same state goes on with
-/// the same chain and the same budget, whose count the first process had spent part of, until the
-/// depth ceiling refuses the next descendant: one chain, one budget, exhausted once, with one
-/// attention item.
+/// process is killed part way through the chain, where a gate on the journal holds it after its
+/// third run with nothing under way, and a new process on the same state goes on with the same
+/// chain and the same budget, whose count the first process had spent part of, until the depth
+/// ceiling refuses the next descendant: one chain, one budget, exhausted once, with one attention
+/// item. Where the restart comes is the gate's to say, not the machine's speed.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mutually_triggering_workflows_exhaust_one_budget_across_a_daemon_process_restart() {
@@ -3044,6 +3061,10 @@ async fn mutually_triggering_workflows_exhaust_one_budget_across_a_daemon_proces
         );
     }
 
+    // The gate goes on before the chain begins, so the chain stops after its third run however
+    // quickly the first process gets there.
+    let gate = ChainGate::hold(&journal, 3);
+
     // The external trigger: the host mints the root.
     let root_run: WorkflowRunResult = typed(
         &control
@@ -3070,9 +3091,12 @@ async fn mutually_triggering_workflows_exhaust_one_budget_across_a_daemon_proces
     );
     let root = root_run.causal_root_id;
 
-    // The first process goes on with the chain on its own, and is killed part way through it.
+    // The first process goes on with the chain on its own until the gate holds it, and is killed
+    // there. The gate comes off only once that process has gone, so it never admits the next run.
     drop(control);
-    let before = end_between_actions(&mut first, &journal, root, 3).await;
+    let before = held_at_the_gate(&journal, root, 3).await;
+    first.kill();
+    gate.lift();
     let depth_limit =
         i64::try_from(kr_protocol::automation::DEFAULT_CAUSAL_DEPTH_LIMIT).expect("a small limit");
     assert!(
