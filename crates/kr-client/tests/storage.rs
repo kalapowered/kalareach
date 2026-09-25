@@ -19,7 +19,7 @@ use kr_client::services::storage::{
     STORAGE_PART_SIZE_BYTES, StoragePrincipal, UploadPart, UploadProgress, upload_parts,
 };
 use kr_client::services::{
-    BackupManifestService, NullService, ServiceFuture, ServiceSigner, StorageService,
+    BackupManifestService, Dispatched, NullService, ServiceFuture, ServiceSigner, StorageService,
 };
 use kr_crypto::backup::{
     ArchivePlan, ArchiveRecipients, CollectionKind, KeyRotation, ObjectSource, SealedArchive,
@@ -490,6 +490,29 @@ async fn each_storage_method_meets_a_refusal_the_service_sends() {
         ArchiveAnswer::UploadGone,
         "an upload the service never made"
     );
+
+    // A completion whose parts do not add up is refused however often it is asked for.
+    let two_parts = ciphertext(STORAGE_PART_SIZE_BYTES + 1);
+    let mut halfway = created(&client, 2, &two_parts).await;
+    halfway.table = PartTable::for_total(STORAGE_PART_SIZE_BYTES).expect("a table");
+    upload_parts(
+        &client,
+        &mut halfway,
+        &two_parts[..usize::try_from(STORAGE_PART_SIZE_BYTES).expect("a length")],
+        &mut forget,
+    )
+    .await
+    .expect("the first part");
+    let whole = PartTable::for_total(two_parts.len() as u64).expect("a table");
+    let short = client
+        .complete_upload(&halfway.upload_id, &whole)
+        .await
+        .expect("an answer");
+    let ArchiveAnswer::Refused { error, action } = short else {
+        panic!("refused: {short:?}");
+    };
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+    assert_eq!(action, UserAction::Update);
 
     let absent = client
         .read_object(archive_id(), object_id(0x44), 0, 16)
@@ -1002,14 +1025,21 @@ async fn a_publication_sent_again_is_a_duplicate_and_other_content_for_it_is_ref
     assert!(again.duplicate);
     assert_eq!(web.generations(&archive_id().to_string()), [1]);
 
+    // Other content for a generation already published is refused however often it is sent, so
+    // it is an answer rather than an error that may pass.
     let other = publisher
         .publish(&archive.publication_at(3_000))
         .await
-        .expect_err("other content for a generation already published");
-    refused(
-        &other,
-        ErrorCode::PermissionDenied,
-        UserAction::FixConfiguration,
+        .expect("an answer");
+    let ArchiveAnswer::Refused { error, action } = other else {
+        panic!("refused: {other:?}");
+    };
+    assert_eq!(error.code, ErrorCode::PermissionDenied);
+    assert_eq!(action, UserAction::FixConfiguration);
+    assert!(
+        error.message.contains("different content"),
+        "{}",
+        error.message
     );
 
     let stranger = Device::generate();
@@ -1166,4 +1196,51 @@ async fn a_client_with_no_storage_service_answers_as_the_null_service_does() {
         assert_eq!(error.code(), ErrorCode::HostNotConfigured);
         assert!(error.to_string().contains("sync and backup"), "{error}");
     }
+    let dispatched = manifest
+        .publish_dispatched(&archive.publication())
+        .await
+        .expect("an answer about the request");
+    let Dispatched::NotSent(error) = dispatched else {
+        panic!("nothing is configured, so nothing was sent: {dispatched:?}");
+    };
+    assert_eq!(error.code(), ErrorCode::HostNotConfigured);
+}
+
+/// A publisher learns whether a publication that went unanswered left this device: one refused
+/// here, for want of an account, cannot have landed; one the transport was given may have, and is an
+/// error; one the service answered is its answer.
+#[tokio::test]
+async fn a_publication_says_whether_it_left_this_device() {
+    let web = Arc::new(StorageWeb::new());
+    let device = Device::generate();
+    let archive = Archive::sealed(&device, 1);
+    manifest(&web, &device, None)
+        .enrol(&archive.enrolment(1))
+        .await
+        .expect("an enrolment");
+
+    let dispatched = manifest(&web, &device, None)
+        .publish_dispatched(&archive.publication())
+        .await
+        .expect("an answer about the request");
+    assert!(
+        matches!(dispatched, Dispatched::NotSent(_)),
+        "{dispatched:?}"
+    );
+    assert!(web.generations(&archive_id().to_string()).is_empty());
+
+    let publisher = manifest(&web, &device, Some(&Tokens::signed_in()));
+    web.fail("/api/backup/manifest", 1, Moment::After);
+    publisher
+        .publish_dispatched(&archive.publication())
+        .await
+        .expect_err("it may have landed");
+    let again = publisher
+        .publish_dispatched(&archive.publication())
+        .await
+        .expect("an answer");
+    let Dispatched::Answered(ArchiveAnswer::Done(published)) = again else {
+        panic!("answered: {again:?}");
+    };
+    assert!(published.duplicate, "it had landed");
 }

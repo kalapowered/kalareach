@@ -789,6 +789,19 @@ pub fn nothing_held(what: impl Into<crate::shown::Shown>) -> ClientError {
     )
 }
 
+/// What became of one request, for a caller that has to know whether one that went unanswered
+/// ever left this device.
+///
+/// An error beside it is a request that may have left: its answer never came back, or came back in
+/// a form nobody can read, and the service may have acted on it.
+#[derive(Debug)]
+pub enum Dispatched<T> {
+    /// The service answered.
+    Answered(T),
+    /// Refused on this device before anything was sent, so the service cannot have acted on it.
+    NotSent(ClientError),
+}
+
 /// What became of one exchange, for a caller that has to know whether a request that went
 /// unanswered ever left this device.
 ///
@@ -1122,6 +1135,21 @@ pub trait BackupManifestService: Send + Sync + std::fmt::Debug {
         &'a self,
         publication: &'a BackupGenerationPublication,
     ) -> ServiceFuture<'a, storage::ArchiveAnswer<backup::Published>>;
+
+    /// Publishes as [`Self::publish`] does, and says when the request never left this device.
+    ///
+    /// A publisher that went unanswered has one question: can the publication have landed? One
+    /// refused on this device before anything left cannot have, so it is sent again as the first
+    /// time; one that may have left is an outcome to establish with a fetch, never by sending it
+    /// again in the dark. An implementation that can tell answers [`Dispatched::NotSent`] for a
+    /// publication it refused before anything left. The default cannot tell, so it counts every
+    /// failure as possibly sent, which is the safe direction.
+    fn publish_dispatched<'a>(
+        &'a self,
+        publication: &'a BackupGenerationPublication,
+    ) -> ServiceFuture<'a, Dispatched<storage::ArchiveAnswer<backup::Published>>> {
+        Box::pin(async move { self.publish(publication).await.map(Dispatched::Answered) })
+    }
 
     /// Fetches one generation, or the newest, held to the checkpoint the caller already has.
     ///
@@ -1488,6 +1516,18 @@ impl BackupManifestService for NullService {
         _publication: &'a BackupGenerationPublication,
     ) -> ServiceFuture<'a, storage::ArchiveAnswer<backup::Published>> {
         unconfigured(ManagedService::SyncBackup.as_str())
+    }
+
+    /// Nothing is configured, so nothing is sent.
+    fn publish_dispatched<'a>(
+        &'a self,
+        _publication: &'a BackupGenerationPublication,
+    ) -> ServiceFuture<'a, Dispatched<storage::ArchiveAnswer<backup::Published>>> {
+        Box::pin(async {
+            Ok(Dispatched::NotSent(ClientError::ServiceNotConfigured(
+                ManagedService::SyncBackup.as_str(),
+            )))
+        })
     }
 
     fn fetch<'a>(

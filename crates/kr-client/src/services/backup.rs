@@ -50,9 +50,9 @@ use serde::{Deserialize, Serialize};
 
 use super::account::{AccountTokenSource, BACKUP_WRITE_SCOPE};
 use super::relay::{ServiceHttp, ServiceSigner};
-use super::signed::{AccountAuthorisation, Answer, SignedService, unreadable_answer};
-use super::storage::ArchiveAnswer;
-use super::{BackupManifestService, ServiceFuture};
+use super::signed::{AccountAuthorisation, Answer, SignedService, Unanswered, unreadable_answer};
+use super::storage::{ArchiveAnswer, declined};
+use super::{BackupManifestService, Dispatched, ServiceFuture};
 use crate::error::{ClientError, Result};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 
@@ -361,21 +361,52 @@ impl ManagedBackupManifestService {
         &self,
         publication: &BackupGenerationPublication,
     ) -> Result<ArchiveAnswer<Published>> {
+        match self.publish_dispatched(publication).await? {
+            Dispatched::Answered(answer) => Ok(answer),
+            Dispatched::NotSent(error) => Err(error),
+        }
+    }
+
+    async fn publish_dispatched(
+        &self,
+        publication: &BackupGenerationPublication,
+    ) -> Result<Dispatched<ArchiveAnswer<Published>>> {
         let Some(account) = &self.account else {
-            return Err(ClientError::Host(ProtocolError::new(
+            return Ok(Dispatched::NotSent(ClientError::Host(ProtocolError::new(
                 ErrorCode::HostNotConfigured,
                 "a publication spends an account's backup storage, and this client presents no \
                  account"
                     .to_owned(),
-            )));
+            ))));
         };
-        let data = match self
-            .ask(&ManifestRequest::Publish { publication }, Some(account))
-            .await?
+        let answer = match self
+            .call
+            .dispatch(
+                BACKUP_MANIFEST_PATH,
+                Method::BackupManifest,
+                &ManifestRequest::Publish { publication },
+                MAX_BACKUP_REQUEST_BYTES,
+                None,
+                Some(account),
+            )
+            .await
         {
+            Ok(answer) => answer,
+            Err(Unanswered::NotSent(error)) => return Ok(Dispatched::NotSent(error)),
+            Err(Unanswered::Sent(error)) => return Err(error),
+        };
+        let data = match answer {
             Answer::Data(data) => data,
             Answer::Refused(refusal) if refusal.code() == "COLLECTION_DELETED" => {
-                return Ok(ArchiveAnswer::CollectionDeleted);
+                return Ok(Dispatched::Answered(ArchiveAnswer::CollectionDeleted));
+            }
+            // Another writer, other content for a generation already published, a generation
+            // behind the checkpoint, or a publication the service cannot read: refused however
+            // often it is sent.
+            Answer::Refused(refusal)
+                if matches!(refusal.code(), "FORBIDDEN" | "INVALID_REQUEST") =>
+            {
+                return Ok(Dispatched::Answered(declined(refusal)));
             }
             Answer::Refused(refusal) => return Err(refusal.into_error()),
         };
@@ -388,7 +419,7 @@ impl ManagedBackupManifestService {
         {
             return Err(contrary("a publication of another archive or generation"));
         }
-        Ok(ArchiveAnswer::Done(Published {
+        Ok(Dispatched::Answered(ArchiveAnswer::Done(Published {
             duplicate: answer.state == PublishState::Duplicate,
             generation: GenerationSummary {
                 backup_generation: answer.generation.backup_generation,
@@ -399,7 +430,7 @@ impl ManagedBackupManifestService {
             },
             collection: answer.collection.summary(),
             dropped: answer.dropped.into_iter().map(U64::get).collect(),
-        }))
+        })))
     }
 
     async fn fetch(
@@ -449,6 +480,13 @@ impl BackupManifestService for ManagedBackupManifestService {
         publication: &'a BackupGenerationPublication,
     ) -> ServiceFuture<'a, ArchiveAnswer<Published>> {
         Box::pin(self.publish(publication))
+    }
+
+    fn publish_dispatched<'a>(
+        &'a self,
+        publication: &'a BackupGenerationPublication,
+    ) -> ServiceFuture<'a, Dispatched<ArchiveAnswer<Published>>> {
+        Box::pin(self.publish_dispatched(publication))
     }
 
     fn fetch<'a>(
