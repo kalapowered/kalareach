@@ -1173,6 +1173,22 @@ pub struct Dispatch {
     method_field: String,
 }
 
+/// Returns the rights the effect class of one prepared operation carries, as the package contract
+/// states them for that class.
+fn class_rights(
+    operation: kr_protocol::broker::PreparedOperation,
+) -> &'static [kr_protocol::rights::ActionRight] {
+    use kr_plugin_sdk::effect::EffectClass;
+    use kr_protocol::broker::PreparedOperation;
+    match operation {
+        PreparedOperation::UpstreamSubmit => EffectClass::UpstreamPrompt,
+        PreparedOperation::UpstreamCancel => EffectClass::UpstreamCancel,
+        PreparedOperation::UpstreamAttachment => EffectClass::UpstreamAttachment,
+        PreparedOperation::TerminalText => EffectClass::TerminalInput,
+    }
+    .required_rights()
+}
+
 impl Dispatch {
     /// Returns the connection this dispatch writes to.
     #[must_use]
@@ -1186,21 +1202,43 @@ impl Dispatch {
     /// turn need one right between them, so choosing by right would send any of the three as
     /// whichever the table happened to list first. A plugin action is named by the action the
     /// package declared: the table still has to list it, so an unknown rich mutation is rejected
-    /// rather than guessed at.
+    /// rather than guessed at, and once a plan names the operation, the right the listed method
+    /// needs has to be one the class of that operation carries.
     ///
     /// Either way the method passes the closed table's own admission, so a method the table lists
     /// as unsupported is refused here rather than written to the socket.
     fn method_for(&self, request: &UpstreamRequest) -> Result<kr_protocol::ids::UpstreamMethod> {
-        if let UpstreamBody::PluginAction { action, .. } = &request.body {
+        if let UpstreamBody::PluginAction {
+            action, operation, ..
+        } = &request.body
+        {
             let method =
                 kr_protocol::ids::UpstreamMethod::new(action.as_str()).map_err(|error| {
                     BrokerError::invalid(format!("this action is not a method name: {error}"))
                 })?;
-            return self
-                .rich
-                .admit(&method)
-                .map(|entry| entry.method.clone())
-                .map_err(BrokerError::from);
+            let entry = self.rich.admit(&method).map_err(BrokerError::from)?;
+            // The entry an action's name selects is the upstream's own method, with the right the
+            // upstream asks of whoever calls it. The action goes as that method only when the
+            // right is one the class of the operation it prepares carries: a prompt named like
+            // the table's cancellation would otherwise cancel the turn. Before a plan names the
+            // operation, the table listing the method is all there is to ask.
+            if let Some(operation) = operation {
+                let carried = class_rights(*operation);
+                if !carried.contains(&entry.required_right) {
+                    return Err(BrokerError::denied(format!(
+                        "{action} would go out as {}, which needs {}, and the {operation} it \
+                         prepares carries {}",
+                        entry.method,
+                        entry.required_right.as_str(),
+                        carried
+                            .iter()
+                            .map(|right| right.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" and ")
+                    )));
+                }
+            }
+            return Ok(entry.method.clone());
         }
         self.rich
             .for_operation(request.operation)

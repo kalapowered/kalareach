@@ -1912,9 +1912,15 @@ impl Broker {
         // checked, rather than an operation beside a flag saying a plan was seen.
         let mut held = admitted.held();
         let permit = held.as_mut().ok_or(BrokerError::AlreadyTransmitted)?;
-        if let UpstreamBody::PluginAction { operation, .. } = &mut permit.request.body {
+        let mut prepared = permit.request.clone();
+        if let UpstreamBody::PluginAction { operation, .. } = &mut prepared.body {
             *operation = Some(effect.operation);
         }
+        // The transport is asked about the operation it will be given, now that the plan names
+        // it: what the connection carries for this action has to be what the action's class
+        // declares. A transport that refuses it leaves the permit with no plan to carry.
+        permit.dispatch.admit(&prepared)?;
+        permit.request = prepared;
         permit.plan = Some(effect.clone());
         Ok(())
     }
