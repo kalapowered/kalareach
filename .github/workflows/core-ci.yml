@@ -409,8 +409,9 @@ jobs:
       # access-control lists here), every local store's directory flush, the persistence suite, the
       # decision a worker start makes about breaking away from the daemon's job, the environment's
       # scheduled task and the starter it runs, the real-worker host tests under cargo through that
-      # task and from the built executable as the shipping daemon starts a worker, and the
-      # first-owner pairing against a real control daemon on loopback. "The attach client" means the part of it that runs
+      # task and from the built executable as the shipping daemon starts a worker, the first-owner
+      # pairing against a real control daemon on loopback, and the contact skill's installation and
+      # removal with the access reader it compares a replacement with. "The attach client" means the part of it that runs
       # here - `crates/kr-cli/tests/attach.rs` is a Unix file, so what passes is that crate's library
       # and its path tests rather than a real attachment. The contact tools run in
       # `crates/kr-cli/tests/contact_windows.rs`, beside the Unix suite, with the tool server
@@ -491,10 +492,46 @@ jobs:
       # half, so a waiter polls rather than parking and a fresh pipe answers the first offer as
       # pending, and both tests now assert that pipe-granularity behaviour by condition. The cost of
       # the poll and the rule that every caller bounds it are on `Readiness::ready` and in
-      # `docs/transport/README.md`.
+      # `docs/transport/README.md`. Among them too is the reader of a file's whole access that the
+      # contact skill's installation compares a replacement with: files made by icacls, cipher and
+      # descriptors of their own, each case beside one that reads equal or passes.
       - name: Test the local IPC library
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-ipc --lib
+
+      # The one directory flush every local store makes a changed name durable with: through a
+      # handle holding the right the change used, and for a directory a store holds, through a second
+      # handle opened from that one. Its tests hold the directory open without shared writing, so a
+      # flush that did nothing would pass where these fail.
+      - name: Test the shared directory flush
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-flush
+
+      # The contact skill installed and removed on this platform: the installer's own tests, the
+      # crash accounting among them, and a configuration refused before anything is written where
+      # it carries an entry set on it or is encrypted, replaced with the same access where its
+      # directory made it, and refused at the replacement where it was moved in from elsewhere.
+      - name: Test the contact skill's installer
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-controller --lib agent_tools
+
+      # The same through the daemon: a daemon process of its own installs, reports and removes the
+      # skill at both scopes by its removal record, and a refused change leaves no dispatch marker.
+      - name: Install and remove the contact skill through the daemon
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-controller --test agent_tools --test contact_skill
+
+      # The machine group record's directory is flushed after the link that first names it and after
+      # each rename that replaces it; a flush refused while the directory is held says so.
+      - name: Test the machine group record
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-controller --lib machine
+
+      # The directory secret store a test run or `--secret-store file` names flushes each name it
+      # writes. Its library only: `tests/libsodium.rs` compares a source path with `/` separators.
+      - name: Test the directory secret store
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-crypto --lib
 
       # What the originating agent may do with a question on this platform's identities: a caller
       # token works only for the helper it was issued to.
@@ -546,11 +583,12 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-attention
 
-      # Every local store flushes the directory it changes a name in through one shared handle in
-      # kr-ipc, opened with the right the change used and passing over a directory on the path this
-      # account may not add to. The flush itself is checked in "Test the local IPC library" above;
-      # this runs the client's own stores that call it - the drafts store, the offline-answer store,
-      # the settings-sync store and its membership file, and the recovery-bundle record.
+      # Every local store flushes the directory it changes a name in through the one shared flush,
+      # opened with the right the change used; kr-ipc's walk of a path passes over a directory on
+      # the way this account may not add to. The flush itself is checked in "Test the shared
+      # directory flush" above; this runs the client's own stores that call it - the drafts store,
+      # the offline-answer store, the settings-sync store and its membership file, and the
+      # recovery-bundle record.
       - name: Test the client's stores and their directory flush
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-client --lib
