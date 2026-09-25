@@ -337,6 +337,37 @@ fn rust_package(map: &mut Map, sources: &mut Sources, root: &Path, package: &Pac
         }
         // A keyed function of test code keys the tests of this target that call it: a case a
         // family of thin tests shares, one per shell or per platform, is keyed where it is written.
+        // A module that defines a function twice, under `cfg`s that keep one of them on each
+        // platform, compiles only one of them in a build: no call can be proved to reach the
+        // commented one.
+        let mut definitions: BTreeMap<(Vec<String>, String), usize> = BTreeMap::new();
+        for module in &modules {
+            for entry in &module.entries {
+                if let Entry::Item(item) = entry
+                    && item.kind == "fn"
+                    && let Some(name) = &item.name
+                {
+                    *definitions
+                        .entry((module.path.clone(), name.clone()))
+                        .or_default() += 1;
+                }
+            }
+        }
+        let (twice, helpers): (Vec<Helper>, Vec<Helper>) =
+            helpers.into_iter().partition(|helper| {
+                definitions
+                    .get(&(helper.module.clone(), helper.name.clone()))
+                    .is_some_and(|count| *count > 1)
+            });
+        for helper in twice {
+            let context = format!(
+                "a comment on fn {} in {}, which its module defines more than once",
+                helper.name, helper.file
+            );
+            for (identifier, source) in helper.mentions {
+                map.reference(identifier, source, &context);
+            }
+        }
         // A test's calls prove nothing where the target may give a macro or attribute its reading
         // took on trust another meaning.
         let (claimed, unlisted) = claimed_names(&modules, &scope);
