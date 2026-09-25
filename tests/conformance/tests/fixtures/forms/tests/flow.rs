@@ -114,22 +114,44 @@ mod hidden {
     fn check() {}
 }
 
+mod sealed {
+    mod inner {
+        /// KR-REQ-03.08: a case its module's re-export cannot carry past its module.
+        #[allow(dead_code)]
+        pub(super) fn probe() {}
+    }
+
+    #[allow(unused_imports)]
+    pub use self::inner::*;
+}
+
 mod actual {
     /// A case of this module's own, which names no row.
     pub fn other() {}
+
+    /// Another, which names no row either.
+    pub fn another() {}
 }
 
 mod facade {
+    pub use crate::actual::another as probe;
     pub use crate::actual::other as check;
 }
 
 #[allow(unused_imports)]
 use hidden::*;
+#[allow(unused_imports)]
+use sealed::*;
 use facade::*;
 
 #[test]
 fn calls_the_name_a_glob_brings_in_for_another_case() {
     check();
+}
+
+#[test]
+fn calls_the_name_a_re_export_cannot_carry_out_of_its_module() {
+    probe();
 }
 
 mod cases {
