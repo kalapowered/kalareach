@@ -646,6 +646,76 @@ impl RemoteConnection {
         }
     }
 
+    /// A connection for `device` that writes nothing anywhere, registered at the revision in
+    /// force, for a test that drives this door's own methods.
+    #[cfg(test)]
+    pub(crate) fn for_test(controller: &Arc<Controller>, device: DeviceRecord) -> Self {
+        /// A control stream that takes every frame and sends it nowhere.
+        #[derive(Debug)]
+        struct Nowhere;
+
+        impl FrameSink for Nowhere {
+            fn send_while<'a>(
+                &'a self,
+                _frame: &'a ControlFrame,
+                _admits: &'a (dyn Fn() -> bool + Send + Sync),
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = kr_transport::Result<bool>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(true) })
+            }
+
+            fn close(&self) {}
+        }
+
+        let connection_id = ConnectionId::new(kr_ipc::new_uuid());
+        controller.admitted_table().insert(
+            connection_id,
+            crate::service::AdmittedConnection {
+                actor_id: device.principal(),
+                admitted_revision: controller.policy().authority_revision(),
+            },
+        );
+        let authority = Arc::new(Authorisation {
+            grant_deadline: None,
+            controller: Arc::clone(controller),
+            device_id: device.device_id,
+            devices: Arc::clone(controller.devices()),
+            pending: Arc::new(super::devices::PendingExpiry::default()),
+            clock: Arc::new(super::devices::ClockTrust::default()),
+            connection_id,
+            expired: AtomicBool::new(false),
+            recorded: AtomicBool::new(false),
+        });
+        let (notifications, _) = tokio::sync::mpsc::channel(1);
+        Self {
+            controller: Arc::clone(controller),
+            devices: Arc::clone(controller.devices()),
+            actor: ConnectionActor::network_device(
+                device.principal(),
+                device.device_id,
+                controller.generation,
+                connection_id,
+            ),
+            device,
+            connection_id,
+            output: Arc::new(RemoteOutput::writing_to(
+                Box::new(Nowhere),
+                Arc::clone(&authority),
+            )),
+            authority,
+            proxy: tokio::sync::Mutex::new(None),
+            notifications,
+            budget: Arc::new(RelayBudget::new(RELAY_QUEUED_BYTES)),
+            lost: Arc::new(tokio::sync::Notify::new()),
+            windows: Arc::new(
+                kr_transport::window::ActionWindowIssuer::with_default_validity(Arc::clone(
+                    &controller.clock,
+                )),
+            ),
+        }
+    }
+
     /// Returns what records this device's grant expiry, for work that outlives this connection.
     #[must_use]
     pub fn expiry_observer(&self) -> ExpiryObserver {
@@ -3000,64 +3070,294 @@ mod tests {
         );
     }
 
-    /// No frame a worker receives carries a voice right, whatever the method, which is why a
-    /// voice grant's withdrawal owes no fence. A forwarded mutation carries the rights its decision
-    /// permitted, cut from the grant this door decides under, and a forwarded read or input
-    /// carries none. For a device whose pairing grant carries every right, `voice.use` included,
-    /// and which holds a live voice grant, that grant carries `voice.use` only for a method that
-    /// requires it, and every such method is one the daemon's voice module serves itself, so none
-    /// of them is forwarded.
-    #[test]
-    fn no_frame_a_worker_receives_carries_a_voice_right() {
-        use kr_protocol::authority::RequiredAuthority;
-        use kr_protocol::rights::ActionRight;
+    /// No frame a worker receives carries a voice right, whichever way work reaches it, which is
+    /// why a voice grant's withdrawal owes no fence. The device's pairing grant carries every
+    /// right, `voice.use` included, and it holds a live voice grant; its session's worker records
+    /// every frame it is sent and refuses each.
+    ///
+    /// - Every method this door decides for it (`check_grant`, the decision a forwarded mutation's
+    ///   rights are cut from) carries `voice.use` only when the method requires it, and each such
+    ///   method is a voice method the daemon serves itself.
+    /// - Its forwarded mutation and its close reach the worker carrying exactly the rights decided
+    ///   for them, and a local close carries none.
+    /// - Every voice effect is performed here or not at all: the one the daemon performs, a
+    ///   session read, reaches the worker as the daemon's own request, which carries no rights.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn no_frame_a_worker_receives_carries_a_voice_right() {
+        use std::sync::Arc;
 
-        let (mut paired, _) = crate::service::net::tests::granted(
-            kr_protocol::grant::GrantExpiry::Never,
-            kr_protocol::ids::AuthorityRevision::new(1),
+        use kr_protocol::actor::ActorIngress;
+        use kr_protocol::authority::RequiredAuthority;
+        use kr_protocol::envelope::ControlFrame;
+        use kr_protocol::rights::ActionRight;
+        use kr_protocol::voice::VoiceAction;
+
+        use crate::service::a_close_a_worker_never_answers as fake;
+
+        let recorded: fake::Recorded = Arc::default();
+        let world = fake::fake_worker(Some(Arc::clone(&recorded))).await;
+        let controller = &world.controller;
+        fake::acknowledged(controller, world.session_id);
+        let revision = controller.policy().authority_revision();
+
+        // A device paired under `actions`, holding a live voice grant of its own.
+        let pair = |byte: u8, actions: kr_protocol::scalars::CanonicalSet<ActionRight>| {
+            let (mut paired, _) = crate::service::net::tests::granted(
+                kr_protocol::grant::GrantExpiry::Never,
+                revision,
+            );
+            paired.actions = actions;
+            let device = crate::service::net::devices::DeviceRecord {
+                device_id: paired.recipient_device_id,
+                endpoint_id: kr_protocol::scalars::EndpointKey::from_bytes([byte; 32]),
+                device_key_revision: kr_protocol::ids::DeviceKeyRevision::new(1),
+                authorisation: kr_protocol::scalars::AuthorisationKey::from_bytes([byte; 32]),
+                stored_envelope: None,
+                notification_preview: None,
+                device_name: kr_protocol::pairing::DeviceName::new("A phone").expect("a name"),
+                platform: kr_protocol::pairing::DevicePlatform::Ios,
+                grant: paired.clone(),
+                paired_at_ms: kr_protocol::scalars::TimestampMs::new(1),
+                revoked_at_ms: None,
+                committed_invitation_id: None,
+                expired_at_ms: None,
+            };
+            controller.devices().commit(&device).expect("paired");
+            let voice_grant = kr_protocol::grant::Grant {
+                grant_id: kr_protocol::ids::GrantId::new(kr_ipc::new_uuid()),
+                issuer_device_id: controller.sharing().host_device_id(),
+                actions: [ActionRight::VoiceUse, ActionRight::SessionView]
+                    .into_iter()
+                    .collect(),
+                ..paired
+            };
+            controller
+                .sharing()
+                .grants()
+                .issue(
+                    &crate::grants::GrantRecord {
+                        grant: voice_grant.clone(),
+                        session_id: None,
+                        issued_at_ms: 1,
+                        activated_at_ms: Some(1),
+                        revoked_at_ms: None,
+                        revoked_by_parent: None,
+                    },
+                    || Ok(()),
+                )
+                .expect("a live voice grant");
+            (device, voice_grant)
+        };
+        // For the door, a pairing grant that carries every right, `voice.use` included.
+        let (device, _) = pair(7, ActionRight::ALL.iter().copied().collect());
+        // For the voice module, whose ordinary authority is a grant that carries no voice right.
+        let (voice_device, voice_grant) = pair(
+            8,
+            ActionRight::ALL
+                .iter()
+                .copied()
+                .filter(|right| *right != ActionRight::VoiceUse)
+                .collect(),
         );
-        paired.actions = ActionRight::ALL.iter().copied().collect();
-        let mut voice_methods = 0;
+        let connection = super::RemoteConnection::for_test(controller, device.clone());
+
+        // Every method, as this door decides it.
+        let mut decided_with_voice = 0;
         for method in Method::ALL {
             let entry = method.entry();
-            let decided = super::decided_with_voice(&paired, entry, || true);
-            let requires_voice = entry.required_rights.iter().any(|required| {
-                matches!(
-                    required.authority,
-                    RequiredAuthority::Right {
-                        right: ActionRight::VoiceUse
-                    }
-                )
-            });
-            assert_eq!(
-                decided.permits(ActionRight::VoiceUse),
-                requires_voice,
-                "{method:?} is decided with voice.use exactly when it requires it"
-            );
-            if requires_voice {
-                voice_methods += 1;
+            if !entry.ingress.contains(&ActorIngress::PairedDevice) {
+                continue;
+            }
+            let Ok(decision) = connection.check_grant(Some(world.session_id), entry, false) else {
+                continue;
+            };
+            if decision
+                .decided
+                .permitted
+                .rights
+                .contains(&ActionRight::VoiceUse)
+            {
+                decided_with_voice += 1;
+                assert!(
+                    entry.required_rights.iter().any(|required| matches!(
+                        required.authority,
+                        RequiredAuthority::Right {
+                            right: ActionRight::VoiceUse
+                        }
+                    )),
+                    "{method:?} is decided with voice.use although it does not require it"
+                );
                 assert!(
                     crate::voice::VoiceModule::serves(*method),
-                    "{method:?} requires voice.use, so the daemon serves it and never forwards it"
+                    "{method:?} is decided with voice.use and is not served here"
                 );
             }
-            // Every other right the pairing grant carries is decided as it stands.
+        }
+        assert!(
+            decided_with_voice > 0,
+            "the device holds voice.use for the methods that need it"
+        );
+
+        // A forwarded mutation and a device's close, through this door's own paths.
+        let decided = |method: Method| {
+            connection
+                .check_grant(Some(world.session_id), method.entry(), false)
+                .expect("decided")
+                .decided
+                .permitted
+                .rights
+        };
+        let submit_rights = decided(Method::AgentPromptSubmit);
+        let mut submit = fake::close_request(world.environment_id, world.session_id);
+        submit.method = Method::AgentPromptSubmit.into();
+        let _ = connection
+            .proxied_mutation(&submit, world.accepted, revision, submit_rights.clone())
+            .await;
+        let close_rights = decided(Method::SessionClose);
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        let (tell, delivered) = tokio::sync::oneshot::channel();
+        let _ = tell.send(());
+        let envelope = connection.envelope(revision);
+        controller
+            .close_remote_session(
+                &fake::close_request(world.environment_id, world.session_id),
+                super::super::proxy::Vouched {
+                    actor: &envelope,
+                    grant_rights: &close_rights,
+                },
+                world.accepted,
+                &connection.expiry_observer(),
+                answer,
+                delivered,
+            )
+            .await;
+        let _ = answered.await;
+
+        // A local close.
+        let carried = fake::admission(controller, world.accepted).await;
+        let _ = controller
+            .session_close(
+                &fake::close_request(world.environment_id, world.session_id),
+                &world.actor,
+                Some(world.accepted),
+                carried,
+            )
+            .await;
+
+        // Every voice effect. What reaches the worker from here on is the voice module's.
+        let before_voice = recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        let voice_session_id = kr_protocol::ids::VoiceSessionId::new(kr_ipc::new_uuid());
+        let delegation_id =
+            kr_protocol::voice::VoiceDelegationId::new("a-delegation").expect("an identifier");
+        for action in VoiceAction::ALL {
+            let Some(method) = crate::voice::method_for(*action) else {
+                continue;
+            };
+            let proposal = kr_voice::Proposal {
+                voice_session_id,
+                device_id: voice_device.device_id,
+                voice_grant_id: voice_grant.grant_id,
+                environment_id: world.environment_id,
+                action: *action,
+                action_id: kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+                session_id: Some(world.session_id),
+                delegation_id: delegation_id.clone(),
+                plan: kr_protocol::voice::VoiceActionPlan {
+                    voice_session_id,
+                    action: *action,
+                    session_id: kr_protocol::scalars::Nullable::some(world.session_id),
+                    delegation_id: kr_protocol::scalars::Nullable::some(delegation_id.clone()),
+                    payload_digest: kr_protocol::scalars::Digest256::from_bytes([3; 32]),
+                },
+                approval: None,
+                turn_id: None,
+                destination: None,
+            };
+            let _ = controller.voice_perform(method, &proposal).await;
+        }
+
+        let frames = recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let forwarded: Vec<kr_protocol::local::ForwardedMutation> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                ControlFrame::Forwarded(mutation) => Some(mutation.as_ref().clone()),
+                _ => None,
+            })
+            .collect();
+        for mutation in &forwarded {
             assert!(
-                paired
-                    .actions
-                    .iter()
-                    .filter(|right| **right != ActionRight::VoiceUse)
-                    .all(|right| decided.permits(*right)),
-                "{method:?}"
+                !mutation.grant_rights.contains(&ActionRight::VoiceUse),
+                "{:?} reached the worker carrying voice.use",
+                mutation.mutation.method
             );
         }
-        assert!(voice_methods > 0, "the registry has voice methods");
-        // Without a live voice grant not even a voice method is decided with it.
-        let voice_start = Method::VoiceStart.entry();
         assert!(
-            !super::decided_with_voice(&paired, voice_start, || false)
-                .permits(ActionRight::VoiceUse)
+            !frames
+                .iter()
+                .any(|frame| matches!(frame, ControlFrame::ForwardedRead(_))),
+            "nothing here forwards a read"
         );
+
+        // The door's paths: exactly the rights decided for each, and none for a local close.
+        let rights_of = |method: Method| {
+            forwarded
+                .iter()
+                .filter(|mutation| mutation.mutation.method == method.into())
+                .map(|mutation| mutation.grant_rights.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            rights_of(Method::AgentPromptSubmit),
+            vec![submit_rights],
+            "the forwarded mutation carries exactly the rights decided for it"
+        );
+        let closes = rights_of(Method::SessionClose);
+        assert_eq!(
+            closes.len(),
+            2,
+            "the device's close and the local one: {closes:?}"
+        );
+        assert!(
+            closes.contains(&close_rights),
+            "the device's close: {closes:?}"
+        );
+        assert!(
+            closes
+                .iter()
+                .any(kr_protocol::scalars::CanonicalSet::is_empty),
+            "the local close carries no rights: {closes:?}"
+        );
+
+        // The voice module's: no forwarded work at all, and its session read as the daemon's own
+        // request.
+        let mut session_reads = 0;
+        for frame in &frames[before_voice..] {
+            match frame {
+                ControlFrame::Forwarded(_) | ControlFrame::ForwardedRead(_) => {
+                    panic!("a voice effect reached the worker as forwarded work: {frame:?}");
+                }
+                ControlFrame::Request(request) => {
+                    assert_eq!(
+                        request.method,
+                        Method::SessionRead.into(),
+                        "the daemon's own request is its session read"
+                    );
+                    session_reads += 1;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            session_reads >= 1,
+            "the voice read reached the worker as the daemon's own request"
+        );
+        world.serving.abort();
     }
 }
 

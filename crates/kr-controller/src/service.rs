@@ -12410,16 +12410,22 @@ mod a_close_a_worker_never_answers {
         }
     }
 
-    /// An endpoint that proves itself as a worker and then answers nothing.
+    /// Every frame a recording worker was sent after its handshake, in arrival order.
+    pub(super) type Recorded = Arc<std::sync::Mutex<Vec<ControlFrame>>>;
+
+    /// An endpoint that proves itself as a worker and then performs nothing.
     ///
     /// It completes the handshake the daemon makes before it will speak to a worker at all (the
-    /// version exchange, the challenge over the descriptor's key and the controller generation)
-    /// and then reads whatever arrives without replying. That is a worker that has stopped
-    /// answering, which is different from one that has gone: the connection stays open.
-    fn serve_silent_worker(
+    /// version exchange, the challenge over the descriptor's key and the controller generation).
+    /// A silent one (`recorded` absent) then reads whatever arrives without replying. That is a
+    /// worker that has stopped answering, which is different from one that has gone: the
+    /// connection stays open. A recording one keeps every frame it is sent and refuses each
+    /// request and forwarded frame at once, so a test can read exactly what reached a worker.
+    fn serve_fake_worker(
         listener: Listener,
         identity: Arc<WorkerIdentity>,
         endpoint_text: String,
+        recorded: Option<Recorded>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             loop {
@@ -12428,6 +12434,7 @@ mod a_close_a_worker_never_answers {
                 };
                 let identity = Arc::clone(&identity);
                 let endpoint_text = endpoint_text.clone();
+                let recorded = recorded.clone();
                 tokio::spawn(async move {
                     let (mut reader, mut writer) = split(connection, StreamKind::Control);
                     let connection_id = ConnectionId::new(kr_ipc::new_uuid());
@@ -12472,8 +12479,33 @@ mod a_close_a_worker_never_answers {
                                     fenced_previous: false,
                                 })]
                             }
-                            // The close arrives here and is never answered.
-                            _ => Vec::new(),
+                            // A proxy link says what it is for, and the worker agrees.
+                            ControlFrame::ControllerRole(role) => {
+                                vec![ControlFrame::ControllerRole(role)]
+                            }
+                            // A recording worker installs the revision announced to it, with
+                            // nothing to fence, so this daemon may dispatch to it.
+                            ControlFrame::AuthorityRevision(notice) if recorded.is_some() => {
+                                vec![ControlFrame::AuthorityRevisionAck(
+                                    kr_protocol::worker::AuthorityRevisionAck {
+                                        session_id: identity.session_id(),
+                                        revision: notice.revision,
+                                        fence: None,
+                                    },
+                                )]
+                            }
+                            // A silent worker never answers what arrives here, a close among it.
+                            other => match &recorded {
+                                None => Vec::new(),
+                                Some(recorded) => {
+                                    let refusal = refusal_of(&other);
+                                    recorded
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .push(other);
+                                    refusal.into_iter().collect()
+                                }
+                            },
                         };
                         for answer in answers {
                             if writer.write_message(&answer).await.is_err() {
@@ -12486,6 +12518,23 @@ mod a_close_a_worker_never_answers {
         })
     }
 
+    /// What a recording worker answers a request or a forwarded frame with: a refusal naming it.
+    fn refusal_of(frame: &ControlFrame) -> Option<ControlFrame> {
+        let request_id = match frame {
+            ControlFrame::Request(request) => request.request_id,
+            ControlFrame::Forwarded(forwarded) => forwarded.mutation.request_id,
+            ControlFrame::ForwardedRead(forwarded) => forwarded.request.request_id,
+            _ => return None,
+        };
+        Some(ControlFrame::Response(kr_protocol::envelope::Response {
+            request_id,
+            outcome: kr_protocol::envelope::Outcome::Error(kr_protocol::error::ProtocolError::new(
+                ErrorCode::ResourceUnavailable,
+                "this worker records what it is sent and performs none of it",
+            )),
+        }))
+    }
+
     /// The environment the fake worker's acknowledgement names.
     ///
     /// The daemon does not compare it with its own, so any identity does; this keeps one value in
@@ -12494,7 +12543,7 @@ mod a_close_a_worker_never_answers {
         kr_protocol::ids::EnvironmentId::new(kr_protocol::scalars::Uuid::NIL)
     }
 
-    fn close_request(
+    pub(super) fn close_request(
         environment_id: kr_protocol::ids::EnvironmentId,
         session_id: SessionId,
     ) -> MutationRequest {
@@ -12521,7 +12570,7 @@ mod a_close_a_worker_never_answers {
     /// A daemon with one silent worker in its directory, and everything a close needs.
     /// Registers one caller and returns the admission its close carries: the connection it
     /// arrived on, the revision in force and the deadline this host accepted.
-    async fn admission(
+    pub(super) async fn admission(
         controller: &Controller,
         accepted: AcceptedDeadline,
     ) -> crate::authority::AdmittedMutation {
@@ -12546,18 +12595,25 @@ mod a_close_a_worker_never_answers {
         }
     }
 
-    struct Silent {
-        _temp: kr_ipc::testing::TempHost,
-        controller: Arc<Controller>,
-        environment_id: kr_protocol::ids::EnvironmentId,
-        session_id: SessionId,
-        worker: KnownWorker,
-        actor: kr_protocol::actor::ActorEnvelope,
-        accepted: AcceptedDeadline,
-        serving: tokio::task::JoinHandle<()>,
+    pub(super) struct Silent {
+        pub(super) _temp: kr_ipc::testing::TempHost,
+        pub(super) controller: Arc<Controller>,
+        pub(super) environment_id: kr_protocol::ids::EnvironmentId,
+        pub(super) session_id: SessionId,
+        pub(super) worker: KnownWorker,
+        pub(super) actor: kr_protocol::actor::ActorEnvelope,
+        pub(super) accepted: AcceptedDeadline,
+        pub(super) serving: tokio::task::JoinHandle<()>,
     }
 
+    /// A daemon with one silent worker in its directory, and everything a close needs.
     async fn silent_worker() -> Silent {
+        fake_worker(None).await
+    }
+
+    /// A daemon with one fake worker in its directory, silent or recording
+    /// ([`serve_fake_worker`]), and everything a close needs.
+    pub(super) async fn fake_worker(recorded: Option<Recorded>) -> Silent {
         let temp = kr_ipc::testing::TempHost::create();
         let environment = temp.environment();
         let environment_id = temp.environment_id();
@@ -12613,8 +12669,12 @@ mod a_close_a_worker_never_answers {
             published_at_ms: kr_ipc::now_ms(),
         };
         let listener = Listener::bind(&worker_endpoint).expect("binds the worker endpoint");
-        let serving =
-            serve_silent_worker(listener, Arc::clone(&identity), worker_endpoint.as_text());
+        let serving = serve_fake_worker(
+            listener,
+            Arc::clone(&identity),
+            worker_endpoint.as_text(),
+            recorded,
+        );
         let worker = KnownWorker {
             descriptor,
             endpoint: worker_endpoint,
@@ -12652,7 +12712,7 @@ mod a_close_a_worker_never_answers {
     }
 
     /// Records that this worker has acknowledged the revision in force, so its leases renew.
-    fn acknowledged(controller: &Controller, session_id: SessionId) {
+    pub(super) fn acknowledged(controller: &Controller, session_id: SessionId) {
         let binding = controller.leases.binding(session_id);
         controller.leases.acknowledge(
             session_id,
