@@ -1170,9 +1170,14 @@ fn detached_command(
 /// already outlives the daemon or could not break away in any case, and asking would be refused.
 ///
 /// The reading is of the immediate job only; the operating system does not report an ancestor job's
-/// flags through this query. The one case it cannot see is an immediate job that forbids breakaway
-/// under an ancestor that kills on close: there the worker cannot be made independent by breakaway
-/// at all, and this returns false because breakaway would only be refused.
+/// flags through this query, and breakaway stops at the first ancestor that forbids it rather than
+/// leaving the whole hierarchy. So where an ancestor forbids breakaway while some ancestor kills on
+/// close, no decision made here can make the worker independent: the start may succeed and the worker
+/// still die when that ancestor closes, and neither the ancestor's flags nor the fact of it is
+/// visible to this query. Making a worker independent of the daemon's job in every such hierarchy is
+/// not a thing breakaway can do; it is what the per-user service supervisor of section 7 is for, and
+/// it is a task of its own. This decision does the most breakaway can: it asks to break away whenever
+/// the immediate job kills on close or permits it.
 #[cfg(not(unix))]
 #[must_use]
 fn worker_must_break_away(job_flags: Option<u32>) -> bool {
