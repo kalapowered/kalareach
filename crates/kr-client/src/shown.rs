@@ -253,10 +253,10 @@ impl Shown {
 
     /// What a local connection's failure says.
     ///
-    /// The paths are this program's own: the runtime and state directories and the names it gives
-    /// the files in them. What a peer offered, what a marker on disk named and what the operating
-    /// system described are not said; I/O goes through [`Self::io`] and frames through
-    /// [`Self::frame`].
+    /// A path is said as [`Self::host_path`] says it: the configured roots whole, and below them
+    /// only the names this installation's tree writes. What a peer offered, what a marker on disk
+    /// named and what the operating system described are not said; I/O goes through [`Self::io`]
+    /// and frames through [`Self::frame`].
     #[must_use]
     pub fn ipc(error: &IpcError) -> Self {
         match error {
@@ -264,7 +264,12 @@ impl Shown {
                 operation,
                 path,
                 source,
-            } => crate::shown!("{} {}: {}", *operation, Self::root(path), Self::io(source)),
+            } => crate::shown!(
+                "{} {}: {}",
+                *operation,
+                Self::host_path(path),
+                Self::io(source)
+            ),
             IpcError::Socket { operation, source } => {
                 crate::shown!("{}: {}", *operation, Self::io(source))
             }
@@ -275,17 +280,17 @@ impl Shown {
                 found_mode,
             } => crate::shown!(
                 "{} must be owned by user {} with mode 0700, found owner {} and mode {}",
-                Self::root(path),
+                Self::host_path(path),
                 *expected_uid,
                 *found_uid,
                 Self::decided(format!("{found_mode:04o}"))
             ),
             IpcError::DirectoryAccessRefused { path, .. } => {
-                crate::shown!("{} is not owner-only", Self::root(path))
+                crate::shown!("{} is not owner-only", Self::host_path(path))
             }
             IpcError::SocketPathTooLong { path, len, limit } => crate::shown!(
                 "socket path {} is {} bytes, over the {}-byte platform limit",
-                Self::root(path),
+                Self::host_path(path),
                 *len,
                 *limit
             ),
@@ -309,7 +314,7 @@ impl Shown {
             }
             IpcError::EnvironmentPrefixCollision { path, .. } => crate::shown!(
                 "{} belongs to another environment than the one asked for",
-                Self::root(path)
+                Self::host_path(path)
             ),
             IpcError::TruncatedFrame { received, expected } => crate::shown!(
                 "the stream ended after {} of {} bytes of a frame",
@@ -317,7 +322,7 @@ impl Shown {
                 *expected
             ),
             IpcError::UntrustedFile { path, reason } => {
-                crate::shown!("{}: {}", Self::root(path), *reason)
+                crate::shown!("{}: {}", Self::host_path(path), *reason)
             }
             IpcError::IdentityUnavailable { what, .. } => {
                 crate::shown!("{} is not available", *what)
@@ -464,54 +469,56 @@ impl Shown {
         }
     }
 
-    /// A name this program or a service made, such as a collection's: each `/`-separated part that
-    /// is an identifier or a lowercase word, and a placeholder for any other.
+    /// A sync collection's name as a diagnostic may say it: the object's kind, one of the
+    /// protocol's own, and its identifier. Any other name is replaced.
     #[must_use]
-    pub fn identifier(name: &str) -> Self {
-        Self::route(name)
+    pub fn collection(name: &str) -> Self {
+        name.split_once('/')
+            .and_then(|(kind, object)| {
+                let kind = kr_protocol::sync::SyncObjectKind::ALL
+                    .into_iter()
+                    .find(|known| known.as_str() == kind)?;
+                identifier(object)
+                    .then(|| crate::shown!("{}/{}", kind, Self::decided(object.to_owned())))
+            })
+            .unwrap_or_else(|| Self::said("[a collection name]"))
     }
 
-    /// A terminal type as the environment names one (`TERM`): said when it is a terminfo name, at
-    /// most 64 bytes of lowercase letters, digits and `-+._`, and a placeholder otherwise.
+    /// A terminal type as the environment names one (`TERM`): said when it is one of the terminfo
+    /// names this build lists, and replaced otherwise.
+    ///
+    /// A terminal type is text the environment holds, so what may be said of one is a closed list
+    /// rather than a shape: a shape would pass whatever was put there in that shape.
     #[must_use]
     pub fn terminfo(name: &str) -> Self {
-        let terminfo = !name.is_empty()
-            && name.len() <= 64
-            && name.bytes().all(|byte| {
-                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"-+._".contains(&byte)
-            });
-        if terminfo {
-            Self::decided(name.to_owned())
-        } else {
-            Self::said("[a terminal type]")
-        }
+        TERMINFO_NAMES
+            .iter()
+            .find(|known| **known == name)
+            .map_or_else(
+                || Self::said("[a terminal type this build does not list]"),
+                |known| Self::said(known),
+            )
     }
 
-    /// The path of a request this client makes: each segment that is an identifier or a lowercase
-    /// word, and a placeholder for any other.
-    ///
-    /// The paths are the adapters' own, and a segment an adapter fills in is an identifier a service
-    /// issued. Anything else in one is not said.
+    /// The path of a request this client makes: each segment that is a word of the adapters' own
+    /// paths or an identifier, and a placeholder for any other.
     #[must_use]
     pub fn route(path: &str) -> Self {
         let segments = path
             .split('/')
             .map(|segment| {
-                let word = segment.len() <= 40
-                    && segment.bytes().all(|byte| {
-                        byte.is_ascii_lowercase()
-                            || byte.is_ascii_digit()
-                            || byte == b'-'
-                            || byte == b'_'
-                    });
-                if word || identifier(segment) {
-                    segment
+                if segment.is_empty() {
+                    Self::said("")
+                } else if let Some(word) = route_word(segment) {
+                    Self::said(word)
+                } else if identifier(segment) {
+                    Self::decided(segment.to_owned())
                 } else {
-                    "[a segment]"
+                    Self::said("[a segment]")
                 }
             })
             .collect::<Vec<_>>();
-        Self::decided(segments.join("/"))
+        Self::joined(segments, "/")
     }
 
     /* ---------------------------------------------------------------------- */
@@ -537,15 +544,16 @@ impl Shown {
     /// A file in a store: said whole when its name is one the store writes, and otherwise as its
     /// directory and a placeholder.
     ///
-    /// A name the store writes is one of its `fixed` names, or an identifier (a UUID, hexadecimal or
-    /// decimal digits) with short extensions after it. Anything else in a store's directory was put
-    /// there by something other than the store, and its name is whatever that was.
+    /// A name the store writes is one of its fixed `names`, or an identifier (a UUID, hexadecimal or
+    /// decimal digits) followed by the store's own `extensions`, each of them one of that list, with
+    /// a leading dot for a partial file. Anything else in a store's directory was put there by
+    /// something other than the store, and its name is whatever that was.
     #[must_use]
-    pub fn stored(path: &Path, fixed: &[&'static str]) -> Self {
+    pub fn stored(path: &Path, names: &[&'static str], extensions: &[&'static str]) -> Self {
         let named = path
             .file_name()
             .and_then(OsStr::to_str)
-            .is_some_and(|name| fixed.contains(&name) || written_by_a_store(name));
+            .is_some_and(|name| names.contains(&name) || written_by_a_store(name, extensions));
         if named {
             return Self::root(path);
         }
@@ -556,6 +564,46 @@ impl Shown {
             )),
             None => Self::said("[a name this store did not write]"),
         }
+    }
+
+    /// A path in this installation's tree, as a failure of a local connection names it.
+    ///
+    /// A directory this installation is configured with, its runtime root or its state root, is said
+    /// whole, because where the installation keeps its state is what somebody diagnosing it needs.
+    /// Below it, and anywhere outside it, each name is said only when it is an identifier or one the
+    /// tree writes; any other is replaced, because a directory listing can have found it.
+    #[must_use]
+    pub fn host_path(path: &Path) -> Self {
+        let roots = kr_ipc::paths::HostPaths::discover()
+            .map(|paths| {
+                vec![
+                    paths.runtime_root().to_path_buf(),
+                    paths.state_root().to_path_buf(),
+                ]
+            })
+            .unwrap_or_default();
+        let root = roots
+            .iter()
+            .filter(|root| path.starts_with(root))
+            .max_by_key(|root| root.components().count());
+        let (mut said, rest) = match root {
+            Some(root) => (root.clone(), path.strip_prefix(root).unwrap_or(path)),
+            None => (std::path::PathBuf::new(), path),
+        };
+        for component in rest.components() {
+            match component {
+                std::path::Component::Normal(name) => said.push(
+                    name.to_str()
+                        .filter(|name| {
+                            HOST_TREE_NAMES.contains(name)
+                                || written_by_a_store(name, HOST_TREE_EXTENSIONS)
+                        })
+                        .unwrap_or("[a name]"),
+                ),
+                other => said.push(other.as_os_str()),
+            }
+        }
+        Self::decided(said.display().to_string())
     }
 
     /* ---------------------------------------------------------------------- */
@@ -593,25 +641,37 @@ impl Shown {
         Self::decided(kr_protocol::hostinfo::export::stated(sentence))
     }
 
-    /// The signal a closure record says ended a session's shell, as the platform names it, which
-    /// the host's worker records to be shown to the person whose session it was.
+    /// The signal a closure record says ended a session's shell, as the platform names it: one of
+    /// the descriptions platforms give signals, or a signal's own name, with the number a platform
+    /// puts after it. Anything else is replaced.
     ///
-    /// Only a record's own field can be said here. Text longer than 64 bytes, or holding anything
-    /// but letters, digits, spaces and `:/()-+.`, is not how a platform names a signal, and is
-    /// replaced.
+    /// The record's field holds what the host's worker wrote, so what may be said of it is the
+    /// closed list of names a platform uses rather than a shape a name could be written in.
     #[must_use]
     pub fn signal(record: &kr_protocol::session::ClosureRecord) -> Option<Self> {
         let name = record.root_signal.as_ref()?;
-        let named = !name.is_empty()
-            && name.len() <= 64
-            && name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b" :/()-+.".contains(&byte));
-        Some(if named {
-            Self::decided(name.clone())
+        let known = |text: &str| SIGNAL_NAMES.iter().find(|known| **known == text).copied();
+        let number = |text: &str| {
+            (!text.is_empty() && text.len() <= 3 && text.bytes().all(|byte| byte.is_ascii_digit()))
+                .then(|| text.parse::<u16>().ok())
+                .flatten()
+        };
+        let said = if let Some(word) = known(name) {
+            Some(Self::said(word))
+        } else if let Some((word, count)) = name.split_once(": ") {
+            known(word)
+                .zip(number(count))
+                .map(|(word, count)| crate::shown!("{}: {}", word, count))
+        } else if let Some((word, count)) = name.rsplit_once(' ') {
+            NUMBERED_SIGNAL_NAMES
+                .iter()
+                .find(|known| **known == word)
+                .zip(number(count))
+                .map(|(word, count)| crate::shown!("{} {}", *word, count))
         } else {
-            Self::said("[a signal name]")
-        })
+            None
+        };
+        Some(said.unwrap_or_else(|| Self::said("[a signal name this build does not list]")))
     }
 }
 
@@ -636,27 +696,197 @@ impl fmt::Debug for Shown {
 /// A `Shown` can be the payload of an I/O failure this program makes, which [`Shown::io`] says.
 impl std::error::Error for Shown {}
 
-/// Whether a name is one a store writes: an identifier, then extensions.
+/// Whether a name is one a store writes: an identifier, then identifiers or `extensions`.
 ///
 /// A leading dot is allowed, for a store's partial files. The first part after it has to be an
 /// identifier: a UUID, at least eight hexadecimal digits, or decimal digits. Every later part is an
-/// identifier or an extension of at most twenty-four lowercase letters and dashes.
-fn written_by_a_store(name: &str) -> bool {
+/// identifier or one of the store's own extensions.
+fn written_by_a_store(name: &str, extensions: &[&str]) -> bool {
     let name = name.strip_prefix('.').unwrap_or(name);
     let mut parts = name.split('.');
     let Some(first) = parts.next() else {
         return false;
     };
-    identifier(first)
-        && parts.all(|part| {
-            identifier(part)
-                || (!part.is_empty()
-                    && part.len() <= 24
-                    && part
-                        .bytes()
-                        .all(|byte| byte.is_ascii_lowercase() || byte == b'-'))
-        })
+    identifier(first) && parts.all(|part| identifier(part) || extensions.contains(&part))
 }
+
+/// The word `segment` is in one of the paths the service adapters call, if it is one.
+fn route_word(segment: &str) -> Option<&'static str> {
+    use crate::services::{account, authority, mailbox, relay, sync, voice};
+
+    const PATHS: [&str; 15] = [
+        sync::SYNC_EXCHANGE_PATH,
+        authority::AUTHORITY_SYNC_PATH,
+        mailbox::MAILBOX_DELIVER_PATH,
+        mailbox::MAILBOX_READ_PATH,
+        mailbox::MAILBOX_ACKNOWLEDGE_PATH,
+        account::AUTHORIZE_PATH,
+        account::TOKEN_PATH,
+        account::REVOKE_PATH,
+        account::USERINFO_PATH,
+        account::USAGE_PATH,
+        relay::RELAY_LEASE_PATH,
+        relay::RELAY_LEASE_REVOKE_PATH,
+        voice::VOICE_SESSIONS_PATH,
+        voice::VOICE_METADATA_PATH,
+        // What the voice adapter adds after a call's identifier.
+        "/control/close",
+    ];
+    PATHS
+        .iter()
+        .flat_map(|path| path.split('/'))
+        .find(|word| !word.is_empty() && *word == segment)
+}
+
+/// The terminfo names a terminal type is said as. Any other is replaced.
+const TERMINFO_NAMES: &[&str] = &[
+    "alacritty",
+    "ansi",
+    "contour",
+    "cygwin",
+    "dumb",
+    "foot",
+    "foot-direct",
+    "gnome",
+    "gnome-256color",
+    "iterm2",
+    "konsole",
+    "konsole-256color",
+    "linux",
+    "mintty",
+    "ms-terminal",
+    "putty",
+    "putty-256color",
+    "rxvt",
+    "rxvt-256color",
+    "rxvt-unicode",
+    "rxvt-unicode-256color",
+    "screen",
+    "screen-256color",
+    "screen.xterm-256color",
+    "st",
+    "st-256color",
+    "tmux",
+    "tmux-256color",
+    "vt100",
+    "vt102",
+    "vt220",
+    "vt320",
+    "wezterm",
+    "xterm",
+    "xterm-16color",
+    "xterm-256color",
+    "xterm-color",
+    "xterm-direct",
+    "xterm-ghostty",
+    "xterm-kitty",
+    "xterm-new",
+];
+
+/// How platforms describe the signals that end a process, and the signals' own names.
+const SIGNAL_NAMES: &[&str] = &[
+    "Abort trap",
+    "Aborted",
+    "Alarm clock",
+    "Bad system call",
+    "Broken pipe",
+    "Bus error",
+    "CPU time limit exceeded",
+    "Child exited",
+    "Continued",
+    "Cputime limit exceeded",
+    "EMT trap",
+    "File size limit exceeded",
+    "Filesize limit exceeded",
+    "Floating point exception",
+    "Hangup",
+    "I/O possible",
+    "IOT trap",
+    "Illegal instruction",
+    "Information request",
+    "Interrupt",
+    "Killed",
+    "Power failure",
+    "Profiling timer expired",
+    "Quit",
+    "Resource lost",
+    "Segmentation fault",
+    "Stack fault",
+    "Stopped",
+    "Stopped (signal)",
+    "Stopped (tty input)",
+    "Stopped (tty output)",
+    "Suspended",
+    "Suspended (signal)",
+    "Terminated",
+    "Trace/BPT trap",
+    "Trace/breakpoint trap",
+    "Urgent I/O condition",
+    "User defined signal 1",
+    "User defined signal 2",
+    "Virtual timer expired",
+    "Window changed",
+    "Window size changes",
+    "SIGABRT",
+    "SIGALRM",
+    "SIGBUS",
+    "SIGCHLD",
+    "SIGCONT",
+    "SIGEMT",
+    "SIGFPE",
+    "SIGHUP",
+    "SIGILL",
+    "SIGINFO",
+    "SIGINT",
+    "SIGIO",
+    "SIGKILL",
+    "SIGPIPE",
+    "SIGPROF",
+    "SIGPWR",
+    "SIGQUIT",
+    "SIGSEGV",
+    "SIGSTKFLT",
+    "SIGSTOP",
+    "SIGSYS",
+    "SIGTERM",
+    "SIGTRAP",
+    "SIGTSTP",
+    "SIGTTIN",
+    "SIGTTOU",
+    "SIGURG",
+    "SIGUSR1",
+    "SIGUSR2",
+    "SIGVTALRM",
+    "SIGWINCH",
+    "SIGXCPU",
+    "SIGXFSZ",
+];
+
+/// The descriptions a platform gives with a signal's number after them, such as the name a signal
+/// has when the platform has no description for it.
+const NUMBERED_SIGNAL_NAMES: &[&str] = &["Real-time signal", "Signal", "Unknown signal"];
+
+/// The names this installation's tree writes under its roots.
+const HOST_TREE_NAMES: &[&str] = &[
+    "run",
+    "state",
+    "environments",
+    "environment",
+    "environment-id",
+    "sessions",
+    "workers",
+    "jobs",
+    "spool",
+    "secrets",
+    "registry.sqlite",
+    "controller.lock",
+    "c.sock",
+    "r.sock",
+    "account-token.json",
+];
+
+/// The extensions a file named by an identifier carries in this installation's tree.
+const HOST_TREE_EXTENSIONS: &[&str] = &["kr", "log", "sock", "lock", "json"];
 
 /// A UUID, eight or more hexadecimal digits, or decimal digits.
 fn identifier(part: &str) -> bool {
@@ -1060,26 +1290,31 @@ mod tests {
         let root = Path::new("/state/answers");
         let written = root.join("0e1f9a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b.answer");
         assert_eq!(
-            Shown::stored(&written, &[]).as_str(),
+            Shown::stored(&written, &[], &["answer", "partial"]).as_str(),
             written.display().to_string()
         );
         let partial = root.join(
             ".0e1f9a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b.0e1f9a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b.partial",
         );
         assert_eq!(
-            Shown::stored(&partial, &[]).as_str(),
+            Shown::stored(&partial, &[], &["answer", "partial"]).as_str(),
             partial.display().to_string()
         );
         assert_eq!(
-            Shown::stored(&root.join("lock"), &["lock"]).as_str(),
+            Shown::stored(&root.join("lock"), &["lock"], &[]).as_str(),
             "/state/answers/lock"
         );
+        // An extension the store does not write is not said, whatever its letters: a name is only
+        // an identifier followed by the store's own extensions.
         for planted in [
             format!("{MARKER}.answer"),
             format!("0e1f9a2b.{MARKER}.answer"),
+            "123.private-password.answer".to_owned(),
+            "0e1f9a2b.answer.kr-marker".to_owned(),
         ] {
-            let said = Shown::stored(&root.join(&planted), &["lock"]);
+            let said = Shown::stored(&root.join(&planted), &["lock"], &["answer", "partial"]);
             assert!(!said.as_str().contains(MARKER), "{said}");
+            assert!(!said.as_str().contains("password"), "{said}");
             assert_eq!(
                 said.as_str(),
                 "/state/answers/[a name this store did not write]"
@@ -1087,31 +1322,87 @@ mod tests {
         }
     }
 
-    /// A terminal type is said when it is a terminfo name, and replaced when it holds anything a
-    /// terminfo name does not.
+    /// A path in this installation's tree is said by its configured root and the names the tree
+    /// writes; a name a listing could have found is replaced, below the root and outside it.
     #[test]
-    fn a_terminal_type_is_said_only_when_it_is_a_terminfo_name() {
-        for name in ["xterm-256color", "screen.xterm-256color", "vt100+pc"] {
+    fn a_host_path_says_only_its_root_and_the_names_the_tree_writes() {
+        let tree = std::path::PathBuf::from("/nowhere/configured")
+            .join("environments")
+            .join(MARKER)
+            .join("environment");
+        let said = Shown::host_path(&tree);
+        assert!(!said.as_str().contains(MARKER), "{said}");
+        assert_eq!(
+            said.as_str(),
+            "/[a name]/[a name]/environments/[a name]/environment"
+        );
+        let descriptor = std::path::PathBuf::from("/[a name]")
+            .join("sessions")
+            .join("0e1f9a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b.kr");
+        assert!(
+            Shown::host_path(&descriptor)
+                .as_str()
+                .ends_with("sessions/0e1f9a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b.kr")
+        );
+    }
+
+    /// A terminal type is said when it is a terminfo name this build lists, and replaced otherwise,
+    /// however it is spelled.
+    #[test]
+    fn a_terminal_type_is_said_only_when_this_build_lists_it() {
+        for name in [
+            "xterm-256color",
+            "screen.xterm-256color",
+            "tmux-256color",
+            "dumb",
+        ] {
             assert_eq!(Shown::terminfo(name).as_str(), name);
         }
         for name in [
             "",
+            MARKER,
             "Xterm",
             "xterm 256",
             "xterm\u{1b}[31m",
-            "a/path",
-            &"x".repeat(65),
+            "xterm-256color2",
         ] {
             assert_eq!(
                 Shown::terminfo(name).as_str(),
-                "[a terminal type]",
+                "[a terminal type this build does not list]",
                 "{name:?}"
             );
         }
     }
 
-    /// A closure record's signal is said as the platform names it, and replaced when it holds a
-    /// control character or is longer than any platform's name for a signal.
+    /// A request path is said by the adapters' own words and identifiers; any other segment is
+    /// replaced, however it is spelled.
+    #[test]
+    fn a_route_says_only_the_adapters_words_and_identifiers() {
+        assert_eq!(
+            Shown::route("/api/voice/sessions/0e1f9a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b/close").as_str(),
+            "/api/voice/sessions/0e1f9a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b/close"
+        );
+        assert_eq!(
+            Shown::route("/auth/oauth2/token").as_str(),
+            "/auth/oauth2/token"
+        );
+        let said = Shown::route(&format!("/api/voice/sessions/{MARKER}/close"));
+        assert_eq!(said.as_str(), "/api/voice/sessions/[a segment]/close");
+        assert_eq!(
+            Shown::collection("settings/0e1f9a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b").as_str(),
+            "settings/0e1f9a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b"
+        );
+        for name in [
+            format!("settings/{MARKER}"),
+            format!("{MARKER}/0e1f9a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b"),
+            MARKER.to_owned(),
+        ] {
+            assert_eq!(Shown::collection(&name).as_str(), "[a collection name]");
+        }
+    }
+
+    /// A closure record's signal is said when it is a name platforms give a signal, with the number
+    /// a platform puts after one, and replaced otherwise, however it is spelled.
     #[test]
     fn a_signal_is_said_only_as_a_platform_names_one() {
         let record = |signal: Option<&str>| kr_protocol::session::ClosureRecord {
@@ -1129,16 +1420,31 @@ mod tests {
             closed_at_ms: kr_protocol::scalars::TimestampMs::new(1),
         };
         assert!(Shown::signal(&record(None)).is_none());
-        for name in ["Killed: 9", "Terminated", "Real-time signal 3", "SIGTERM"] {
+        for name in [
+            "Killed: 9",
+            "Killed",
+            "Terminated: 15",
+            "Real-time signal 3",
+            "Signal 64",
+            "SIGTERM",
+        ] {
             assert_eq!(
                 Shown::signal(&record(Some(name))).map(Shown::into_string),
                 Some(name.to_owned())
             );
         }
-        for name in ["\u{1b}]0;title\u{7}", "Killed\n9", &"K".repeat(65), ""] {
+        for name in [
+            MARKER,
+            "\u{1b}]0;title\u{7}",
+            "Killed\n9",
+            "Killed: nine",
+            "Killed: 12345",
+            "Signal kr-marker",
+            "",
+        ] {
             assert_eq!(
                 Shown::signal(&record(Some(name))).map(Shown::into_string),
-                Some("[a signal name]".to_owned()),
+                Some("[a signal name this build does not list]".to_owned()),
                 "{name:?}"
             );
         }

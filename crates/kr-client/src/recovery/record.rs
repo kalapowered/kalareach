@@ -59,6 +59,15 @@ const PARTIAL_EXTENSION: &str = "bundle-write-partial";
 /// The extension of the lock a store holds while it is open.
 const LOCK_EXTENSION: &str = "bundle-lock";
 
+/// A write record's file as a failure may name it: whole when this store wrote its name.
+fn stored(path: &Path) -> Shown {
+    Shown::stored(
+        path,
+        &[],
+        &[RECORD_EXTENSION, PARTIAL_EXTENSION, LOCK_EXTENSION],
+    )
+}
+
 /// The last write a bundle store sent, as the store records it.
 ///
 /// It holds what settling and recognising that write take and nothing else. A read recognises the
@@ -162,16 +171,16 @@ impl RecordFile {
             .create(true)
             .truncate(false)
             .open(&lock_path)
-            .map_err(|source| storage(Shown::stored(&lock_path, &[]), source))?;
+            .map_err(|source| storage(stored(&lock_path), source))?;
         match lock.try_lock() {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => {
                 return Err(RecoveryError::BundleStoreInUse {
-                    path: Shown::stored(&lock_path, &[]),
+                    path: stored(&lock_path),
                 });
             }
             Err(std::fs::TryLockError::Error(source)) => {
-                return Err(storage(Shown::stored(&lock_path, &[]), source));
+                return Err(storage(stored(&lock_path), source));
             }
         }
         let file = Self {
@@ -183,7 +192,7 @@ impl RecordFile {
         match std::fs::remove_file(&file.partial) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => return Err(storage(Shown::stored(&file.partial, &[]), source)),
+            Err(source) => return Err(storage(stored(&file.partial), source)),
         }
         let record = file.read(context)?;
         Ok((file, record))
@@ -194,10 +203,10 @@ impl RecordFile {
         let bytes = match std::fs::read(&self.path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(source) => return Err(storage(Shown::stored(&self.path, &[]), source)),
+            Err(source) => return Err(storage(stored(&self.path), source)),
         };
         let unreadable = || RecoveryError::UnreadableWriteRecord {
-            path: Shown::stored(&self.path, &[]),
+            path: stored(&self.path),
         };
         // A record this build cannot read is refused rather than ignored: it may be the only
         // account of a write that can still land, and a store that dropped it would write again
@@ -223,7 +232,7 @@ impl RecordFile {
         let bytes = kr_cbor::to_canonical_vec(record)?;
         if bytes.len() > MAX_RECORD_BYTES {
             return Err(RecoveryError::UnreadableWriteRecord {
-                path: Shown::stored(&self.path, &[]),
+                path: stored(&self.path),
             });
         }
         // A partial file an earlier failure in this process could not remove is not a record, and
@@ -232,15 +241,15 @@ impl RecordFile {
         match std::fs::remove_file(&self.partial) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => return Err(storage(Shown::stored(&self.partial, &[]), source)),
+            Err(source) => return Err(storage(stored(&self.partial), source)),
         }
         write_whole(&self.partial, &bytes)
-            .map_err(|source| storage(Shown::stored(&self.partial, &[]), source))?;
+            .map_err(|source| storage(stored(&self.partial), source))?;
         // A rename within one directory replaces the name in one step, so a reader finds the old
         // record or the new one and never a record half written.
         if let Err(source) = std::fs::rename(&self.partial, &self.path) {
             let _ = std::fs::remove_file(&self.partial);
-            return Err(storage(Shown::stored(&self.path, &[]), source));
+            return Err(storage(stored(&self.path), source));
         }
         kr_ipc::paths::flush_directory(&self.directory, kr_ipc::paths::NameKind::File)
             .map_err(|source| storage(Shown::root(&self.directory), source))
@@ -263,7 +272,7 @@ impl RecordFile {
         match std::fs::remove_file(&self.path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => return Err(storage(Shown::stored(&self.path, &[]), source)),
+            Err(source) => return Err(storage(stored(&self.path), source)),
         }
         kr_ipc::paths::flush_directory(&self.directory, kr_ipc::paths::NameKind::File)
             .map_err(|source| storage(Shown::root(&self.directory), source))

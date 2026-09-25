@@ -70,7 +70,7 @@ fn no_key(collection: &str, epoch: u64) -> ClientError {
         ErrorCode::HostNotConfigured,
         crate::shown!(
             "this device does not hold the key for collection {} at epoch {}, so it can neither read nor write it",
-            Shown::identifier(collection),
+            Shown::collection(collection),
             epoch
         ),
     )
@@ -113,7 +113,7 @@ fn corrupt_stored_key(collection: &str, epoch: u64) -> ClientError {
         ErrorCode::StorageUnavailable,
         crate::shown!(
             "what this device holds for collection {} at epoch {} is not a key of the length one has",
-            Shown::identifier(collection),
+            Shown::collection(collection),
             epoch
         ),
     )

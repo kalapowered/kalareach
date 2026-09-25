@@ -168,5 +168,5 @@ fn storage(path: Shown, source: std::io::Error) -> MembershipError {
 /// A file of the membership store's own, as a failure may name it: whole when the store wrote its
 /// name.
 fn stored(path: &Path) -> Shown {
-    Shown::stored(path, &[FACTS_NAME, LOCK_NAME])
+    Shown::stored(path, &[FACTS_NAME, LOCK_NAME], &[PARTIAL_EXTENSION])
 }

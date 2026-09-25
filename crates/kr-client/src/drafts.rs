@@ -1179,7 +1179,11 @@ fn storage(path: Shown, source: std::io::Error) -> DraftError {
 
 /// A file of the store's own, as a failure may name it: whole when the store wrote its name.
 fn stored(path: &Path) -> Shown {
-    Shown::stored(path, &[LOCK_NAME])
+    Shown::stored(
+        path,
+        &[LOCK_NAME],
+        &[DRAFT_EXTENSION, CHECKPOINT_EXTENSION, PARTIAL_EXTENSION],
+    )
 }
 
 pub(crate) fn fresh_uuid() -> Result<Uuid> {

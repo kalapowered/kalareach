@@ -356,10 +356,13 @@ pub fn pairing(error: &kr_pairing::PairingError) -> Shown {
     }
 }
 
-/// What a shell package failure says: its kind and the package's directory, never a manifest's
-/// text or what a request asked for.
+/// What a shell package failure says: its kind and the package root it was found under, never a
+/// manifest's text, a name the root's listing or a pointer file gave, or what a request asked for.
 #[must_use]
-pub fn package_fault(fault: &kr_shell_integration::host::package::PackageFault) -> Shown {
+pub fn package_fault(
+    fault: &kr_shell_integration::host::package::PackageFault,
+    root: &Path,
+) -> Shown {
     use kr_shell_integration::host::package::{PACKAGE_ROOT_VARIABLE, PackageFault as Fault};
 
     match fault {
@@ -371,18 +374,42 @@ pub fn package_fault(fault: &kr_shell_integration::host::package::PackageFault) 
             "the shell asked for has no qualified KalaReach package, so it cannot claim the \
              managed contract",
         ),
-        Fault::Unreadable { path, .. } => shown!(
-            "the package at {} cannot be read",
-            Shown::root(Path::new(path))
-        ),
-        Fault::MissingExecutable { path } => shown!(
-            "the package at {} names an executable that is not installed",
-            Shown::root(Path::new(path))
+        Fault::Unreadable { .. } => shown!("a package under {} cannot be read", Shown::root(root)),
+        Fault::MissingExecutable { .. } => shown!(
+            "a package under {} names an executable that is not installed",
+            Shown::root(root)
         ),
         Fault::NotInteractive { .. } => {
             Shown::said("a script invocation is not an interactive root shell")
         }
     }
+}
+
+/// The terminal applications the terminal catalogue names, which a failure may repeat.
+const TERMINAL_APPLICATIONS: &[&str] = &[
+    "alacritty",
+    "apple-terminal",
+    "gnome-terminal",
+    "iterm2",
+    "kitty",
+    "konsole",
+    "windows-console",
+    "windows-terminal",
+    "xfce4-terminal",
+    "xterm",
+];
+
+/// What a terminal application's identifier says: the identifier when it is one the terminal
+/// catalogue gives, and a placeholder otherwise.
+#[must_use]
+pub fn terminal_application(id: &str) -> Shown {
+    TERMINAL_APPLICATIONS
+        .iter()
+        .find(|known| **known == id)
+        .map_or_else(
+            || Shown::said("[a terminal this build does not list]"),
+            |known| Shown::said(known),
+        )
 }
 
 /// What an operating system error number says: its kind and its number, as [`Shown::io`] says any
@@ -533,31 +560,73 @@ mod tests {
         }
     }
 
-    /// A shell package failure says its kind and the package's directory, never a manifest's text
-    /// or what a request asked for.
+    /// A shell package failure says its kind and the package root it was found under, never a
+    /// manifest's text, a name a listing gave, or what a request asked for.
     #[test]
     fn a_package_failure_says_its_kind_and_not_what_it_read() {
         use kr_shell_integration::host::package::PackageFault;
 
-        for fault in [
-            PackageFault::Unreadable {
-                path: "/opt/kalareach/shells/zsh".to_owned(),
-                detail: MARKER.to_owned(),
-            },
-            PackageFault::Unqualified {
-                requested: MARKER.to_owned(),
-            },
-            PackageFault::NotInteractive {
-                detail: MARKER.to_owned(),
-            },
+        let root = Path::new("/opt/kalareach/shells");
+        for (fault, expected) in [
+            (
+                PackageFault::Unreadable {
+                    path: format!("/opt/kalareach/shells/{MARKER}"),
+                    detail: MARKER.to_owned(),
+                },
+                "a package under /opt/kalareach/shells cannot be read",
+            ),
+            (
+                PackageFault::MissingExecutable {
+                    path: format!("/opt/kalareach/shells/{MARKER}/current"),
+                },
+                "a package under /opt/kalareach/shells names an executable that is not installed",
+            ),
+            (
+                PackageFault::Unqualified {
+                    requested: MARKER.to_owned(),
+                },
+                "the shell asked for has no qualified KalaReach package, so it cannot claim the \
+                 managed contract",
+            ),
+            (
+                PackageFault::NotInteractive {
+                    detail: MARKER.to_owned(),
+                },
+                "a script invocation is not an interactive root shell",
+            ),
         ] {
             // The negative control: the fault's own text carries what it read.
             assert!(fault.to_string().contains(MARKER), "{fault}");
+            // The neutral control: what is said is the kind and the root, and nothing else.
+            assert_eq!(package_fault(&fault, root).as_str(), expected);
             assert_unmarked(
                 "a package failure",
-                &failure_renderings(CliError::ShellIntegrationUnsupported(package_fault(&fault))),
+                &failure_renderings(CliError::ShellIntegrationUnsupported(package_fault(
+                    &fault, root,
+                ))),
             );
         }
+    }
+
+    /// A terminal application is named when the terminal catalogue names it, and replaced
+    /// otherwise.
+    #[test]
+    fn a_terminal_application_is_named_only_as_the_catalogue_names_it() {
+        assert_eq!(terminal_application("iterm2").as_str(), "iterm2");
+        assert_eq!(
+            terminal_application(MARKER).as_str(),
+            "[a terminal this build does not list]"
+        );
+    }
+
+    /// The usage a failure prints names the command as it declares itself, never as the caller
+    /// invoked it.
+    #[test]
+    fn a_usage_failure_names_the_command_as_it_declares_itself() {
+        let error = crate::cli::Cli::try_parse_from([MARKER, "attach"]).expect_err("no session");
+        let said = usage(&error).to_string();
+        assert!(said.contains("Usage: kr attach"), "{said}");
+        assert_unmarked("the usage line", &[said]);
     }
 
     /// A terminal library failure never repeats a colour specification the terminal sent.
@@ -567,6 +636,11 @@ mod tests {
             spec: MARKER.to_owned(),
         };
         assert!(error.to_string().contains(MARKER), "{error}");
+        // The neutral control: the kind of failure is said.
+        assert_eq!(
+            term(&error).as_str(),
+            "a colour specification is not a form kr-vt/1 accepts"
+        );
         assert_unmarked(
             "a colour specification",
             &failure_renderings(CliError::Terminal(term(&error))),
@@ -578,22 +652,36 @@ mod tests {
     fn a_pairing_failure_does_not_repeat_what_a_service_said() {
         use kr_pairing::PairingError;
 
-        for error in [
-            PairingError::RendezvousUnavailable {
-                reason: MARKER.to_owned(),
-            },
-            PairingError::RendezvousConfiguration {
-                reason: MARKER.to_owned(),
-            },
-            PairingError::Store {
-                reason: MARKER.to_owned(),
-            },
-            PairingError::Refused {
-                code: kr_protocol::error::ErrorCode::PermissionDenied,
-                reason: MARKER.to_owned(),
-            },
+        for (error, expected) in [
+            (
+                PairingError::RendezvousUnavailable {
+                    reason: MARKER.to_owned(),
+                },
+                "the rendezvous service is unavailable",
+            ),
+            (
+                PairingError::RendezvousConfiguration {
+                    reason: MARKER.to_owned(),
+                },
+                "the rendezvous origin is not configured correctly",
+            ),
+            (
+                PairingError::Store {
+                    reason: MARKER.to_owned(),
+                },
+                "the pairing store failed",
+            ),
+            (
+                PairingError::Refused {
+                    code: kr_protocol::error::ErrorCode::PermissionDenied,
+                    reason: MARKER.to_owned(),
+                },
+                "the pairing was refused: PERMISSION_DENIED",
+            ),
         ] {
             assert!(error.to_string().contains(MARKER), "{error}");
+            // The neutral control: the kind of failure, and a refusal's code, are said.
+            assert_eq!(pairing(&error).as_str(), expected);
             assert_unmarked(
                 "a pairing failure",
                 &failure_renderings(CliError::Other(pairing(&error))),

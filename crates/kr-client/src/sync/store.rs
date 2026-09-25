@@ -3851,7 +3851,20 @@ fn storage(path: Shown, source: std::io::Error) -> SyncError {
 
 /// A file of the store's own, as a failure may name it: whole when the store wrote its name.
 fn stored(path: &Path) -> Shown {
-    Shown::stored(path, &[LOCK_NAME, LABELS_NAME, PRIVACY_NAME])
+    Shown::stored(
+        path,
+        &[LOCK_NAME, LABELS_NAME, PRIVACY_NAME],
+        &[
+            OBJECT_EXTENSION,
+            CHECKPOINT_EXTENSION,
+            REQUEST_EXTENSION,
+            CONFLICT_EXTENSION,
+            PUBLICATION_EXTENSION,
+            HISTORY_EXTENSION,
+            CALLOUT_EXTENSION,
+            PARTIAL_EXTENSION,
+        ],
+    )
 }
 
 /// The collection one object is published in, as a failure names it.

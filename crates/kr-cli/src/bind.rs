@@ -167,7 +167,7 @@ pub async fn membership(build_id: &BuildId) -> Membership {
                 Err(_) => {
                     undecided.get_or_insert(shown!(
                         "the session descriptor {} cannot be read",
-                        Shown::stored(&entry.path, &[])
+                        Shown::stored(&entry.path, &[], &["kr"])
                     ));
                     continue;
                 }
@@ -253,14 +253,14 @@ fn every_environment(
         let kind = entry.file_type().map_err(|error| {
             shown!(
                 "{} cannot be inspected: {}",
-                Shown::stored(&path, &[]),
+                Shown::stored(&path, &[], &[]),
                 Shown::io(&error)
             )
         })?;
         if kind.is_symlink() {
             return Err(shown!(
                 "{} is a link where an environment's directory would be",
-                Shown::stored(&path, &[])
+                Shown::stored(&path, &[], &[])
             ));
         }
         if !kind.is_dir() {
@@ -269,7 +269,7 @@ fn every_environment(
         let environment_id = kr_ipc::paths::read_environment_marker(&path).map_err(|error| {
             shown!(
                 "the environment at {} cannot be identified: {}",
-                Shown::stored(&path, &[]),
+                Shown::stored(&path, &[], &[]),
                 Shown::ipc(&error)
             )
         })?;

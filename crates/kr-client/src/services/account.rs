@@ -1466,7 +1466,9 @@ impl fmt::Debug for StoredGrant {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("StoredGrant")
-            .field("grant_id", &Shown::identifier(&self.grant_id))
+            // The grant's identifier is drawn like a secret and read back from the file, so it is
+            // counted rather than repeated.
+            .field("grant_id_bytes", &self.grant_id.len())
             .field("revision", &self.revision)
             .field("client", &self.client)
             .field("scopes", &scope_summary(&self.scopes))
@@ -2388,7 +2390,7 @@ mod tests {
         stored.subject = NEVER_RENDERED.to_owned();
         renders_only(
             &stored,
-            "StoredGrant{grant_id:\"a-grant\",revision:0,client:Mobile,scopes:\"openid,billing.read\",..}",
+            "StoredGrant{grant_id_bytes:7,revision:0,client:Mobile,scopes:\"openid,billing.read\",..}",
         );
 
         renders_only(

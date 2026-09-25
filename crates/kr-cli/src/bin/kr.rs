@@ -1079,7 +1079,7 @@ fn describe_terminals(
     Shown::joined(
         available
             .iter()
-            .map(|application| Shown::identifier(&application.id)),
+            .map(|application| kr_cli::shown::terminal_application(&application.id)),
         ", ",
     )
 }

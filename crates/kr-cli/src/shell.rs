@@ -67,8 +67,13 @@ pub struct EntryReport {
 ///
 /// Returns a configuration failure when a package's manifest cannot be read.
 pub fn packages() -> Result<PackageSet> {
-    PackageSet::installed(&default_package_root())
-        .map_err(|fault| CliError::ShellIntegrationUnsupported(crate::shown::package_fault(&fault)))
+    let default = default_package_root();
+    PackageSet::installed(&default).map_err(|fault| {
+        // The root the package set read, as it chose it: the variable when it is set.
+        let root =
+            std::env::var_os(PACKAGE_ROOT_VARIABLE).map_or(default, std::path::PathBuf::from);
+        CliError::ShellIntegrationUnsupported(crate::shown::package_fault(&fault, &root))
+    })
 }
 
 /// Returns the packages one selector names.

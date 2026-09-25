@@ -13,6 +13,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 #[derive(Debug, Parser)]
 #[command(
     name = "kr",
+    // The usage a failure prints names the command by this, never by how it was invoked: the
+    // invocation's first argument is whatever the caller put there.
+    bin_name = "kr",
     version,
     about = "KalaReach: persistent terminal sessions",
     disable_help_subcommand = true

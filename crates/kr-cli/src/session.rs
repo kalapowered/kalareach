@@ -2007,7 +2007,7 @@ mod tests {
         );
         assert_eq!(
             super::how_it_closed(&hostile).as_str(),
-            "a signal ended its shell ([a signal name])"
+            "a signal ended its shell ([a signal name this build does not list])"
         );
     }
 

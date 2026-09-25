@@ -195,6 +195,11 @@ impl std::fmt::Debug for Answered {
     }
 }
 
+/// A kept answer's file as a failure may name it: whole when this store wrote its name.
+fn stored(path: &std::path::Path) -> Shown {
+    Shown::stored(path, &[], &[EXTENSION, "partial"])
+}
+
 /// A failure of this module.
 #[derive(thiserror::Error)]
 pub enum AnswerError {
@@ -382,7 +387,7 @@ impl AnswerDrafts {
         })?;
         let path = self.path(draft.question_id);
         let store = |error| AnswerError::Store {
-            path: Shown::stored(&path, &[]),
+            path: stored(&path),
             fault: IoFault::from(error),
         };
         // A name of this write's own, so a second writer of the same question writes a file of its
@@ -446,7 +451,7 @@ impl AnswerDrafts {
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(AnswerError::Store {
-                path: Shown::stored(&path, &[]),
+                path: stored(&path),
                 fault: IoFault::from(error),
             }),
         }
@@ -463,12 +468,12 @@ impl AnswerDrafts {
 /// store writes: whatever else is in the directory was put there by something else.
 fn read_draft(path: &Path) -> Result<AnswerDraft> {
     let bytes = std::fs::read(path).map_err(|error| AnswerError::Store {
-        path: Shown::stored(path, &[]),
+        path: stored(path),
         fault: IoFault::from(error),
     })?;
     kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT).map_err(|error| {
         AnswerError::Unreadable {
-            path: Shown::stored(path, &[]),
+            path: stored(path),
             detail: Shown::cbor(&error),
         }
     })
