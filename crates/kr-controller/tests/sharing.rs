@@ -2640,8 +2640,9 @@ async fn an_end_whose_tombstone_could_not_be_written_is_not_answered_as_an_expir
 }
 
 /// A redemption decides only a grant it anchored before its transaction. An invitation this host
-/// does not hold when the redemption begins is refused then, although another writer commits it
-/// while the redemption would have waited for the store, so an expiring grant is never redeemed
+/// does not hold when the redemption begins is refused then, at once and while another writer
+/// still holds the store with the invitation's rows uncommitted, so the redemption never waits for
+/// the store to decide a grant it did not anchor and an expiring grant is never redeemed
 /// unanchored while the clock is distrusted. The invitation stays open, its grant unredeemed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_invitation_written_while_its_redemption_waits_is_not_redeemed_unanchored() {
@@ -2701,13 +2702,26 @@ async fn an_invitation_written_while_its_redemption_waits_is_not_redeemed_unanch
                 .redeem(invitation_id, device_id(0xf1), now + 1)
         })
     };
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Answered while the other writer's transaction is still open. A redemption that went on to its
+    // own transaction would wait there for the store's lock and end refused as busy, or, once the
+    // rows were committed, decide the grant it never anchored; neither is the refusal below.
+    let outcome = tokio::time::timeout(Duration::from_secs(30), redeeming)
+        .await
+        .expect("the redemption answers while the other writer holds the store")
+        .expect("the redemption ends");
+    match outcome {
+        Err(kr_controller::error::ControllerError::InvalidArgument(detail)) => {
+            assert_eq!(detail, "this host holds no such invitation");
+        }
+        other => panic!(
+            "an invitation this host did not hold when the redemption began is refused as \
+             missing, not {other:?}"
+        ),
+    }
     registry
         .execute_batch("COMMIT;")
         .expect("the rows are committed");
-    let outcome = redeeming.await.expect("the redemption ends");
 
-    outcome.expect_err("an invitation this host did not hold when the redemption began");
     let proposal = controller
         .sharing()
         .grants()
