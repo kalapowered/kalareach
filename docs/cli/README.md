@@ -1049,18 +1049,53 @@ confirmation waiting.
 ## `kr host startup`
 
 ```sh
-kr host startup                        # what is chosen, and where it was chosen
+kr host startup                        # what is chosen, where it was chosen, and the definition
+kr host startup --set service          # your own service manager starts the control daemon
 kr host startup --set standalone       # kr new starts the control daemon itself when none runs
 kr host startup --clear                # choose nothing; kr new says what to set up instead
 ```
 
 The choice is the `startup.controller` selection of the versioned per-user host configuration
 document, and `--set` and `--clear` each apply one validated revision of it, making the
-environment's own directories first on a host where no daemon has run yet. No daemon is asked and
-none is started: `kr new` reads the choice the next time it finds no daemon running, which is why
-`kr doctor` reports it as applying at the next start. Writing it installs no service, enables no
-lingering and obtains no privilege. `standalone` is the one way this build knows. The standalone
-start runs the daemon in a session of its own, which Windows does not have, so there it is refused.
+environment's own directories first on a host where no daemon has run yet. No daemon is asked,
+started or ended: `kr new` reads the choice the next time it finds no daemon running, which is why
+`kr doctor` reports it as applying at the next start. Neither choice enables lingering or obtains a
+privilege.
+
+`service` is for a host whose own per-user service manager should start the daemon. `--set service`
+writes that manager a definition of the daemon, records exactly what it wrote in the environment's
+state directory, and has the manager load it. From then on, `kr new` asks the manager to start the
+daemon when none answers, and the manager is the daemon's parent. It starts one process however
+many commands ask at once. `kr new` itself installs nothing: a definition that has gone, that kr did
+not write, or that was changed after kr wrote it stops the command with `HOST_NOT_CONFIGURED`, names
+the file, and says to run `kr host startup --set service`. The command never writes it again.
+
+| Platform | The definition | Where it is loaded |
+| --- | --- | --- |
+| macOS | a launchd job, `~/Library/LaunchAgents/kr-controller-<environment>.plist` | your graphical domain when the environment's sessions are desktop-bound by default, your background domain when they are headless |
+| Linux | a systemd user unit, `kr-controller-<environment>.service` in `$XDG_CONFIG_HOME/systemd/user`, `~/.config/systemd/user` by default | the user manager, with no `[Install]` section, so nothing enables it |
+
+The daemon is the `kr-controller` installed beside `kr`, told this installation's runtime and state
+roots, working in the environment's state directory and writing to its `controller.log`. The
+manager starts it only when a command asks, never at login, and never again after it ends. It runs
+in the manager's environment rather than the command's, as every service the manager starts does.
+A launchd domain is a login context, so the daemon of a desktop host runs in the graphical login,
+keychain and all, and ends with it; a headless host's daemon runs outside that login and outlives
+it. `--set service` refuses a definition already under that label that kr did not write, or one
+changed since kr wrote it, and leaves it exactly as it is.
+
+`--clear` and `--set standalone` remove exactly what `--set service` wrote, the definition and its
+record, and end nothing. A daemon the manager is running keeps serving, and the manager keeps its
+job until that daemon has ended. A definition changed after kr wrote it is no longer kr's to remove,
+so it stays where it is and the command says so. `kr doctor` reports whether the definition matches
+what kr wrote.
+
+`standalone` is for a host with no service manager set up to start the daemon: `kr new` runs the
+`kr-controller` installed beside it, detached from the command, as
+[When no control daemon is running](#when-no-control-daemon-is-running) describes. On Windows both
+are refused, and the daemon is started by hand: the standalone start runs the daemon in a session of
+its own, which Windows does not have, and this build writes service definitions for launchd and
+systemd only.
 
 ## `kr host power`
 
