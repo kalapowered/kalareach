@@ -2479,7 +2479,7 @@ a deletion of such an object down. From the moment a deletion is written down no
 admits names that object, so neither the request, a later one for the same object, nor one delayed
 on its way can reach an object admitted after it. Nothing is deleted under privacy mode's line,
 whose retained artifacts go only by the person's own action, and nothing of a collection deleted
-from the account console.
+from the account console. Privacy mode is read again after each answer the service gives.
 
 An attempt ends on evidence about its own work. A collection deleted from the account console
 stops the attempt, retires this host's writer for that archive and cancels what it was still

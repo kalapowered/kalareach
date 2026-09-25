@@ -7493,6 +7493,79 @@ async fn no_generation_admitted_while_a_deletion_is_on_its_way_names_that_object
     }
 }
 
+/// Privacy mode drawn while the service is asked about an unknown generation keeps everything it
+/// left there: what happens after the answer reads privacy mode afresh.
+#[tokio::test]
+async fn a_fence_raised_while_the_service_is_asked_keeps_the_unknown_generation_whole() {
+    let (host, mut uploader) = a_host_with_an_unknown_generation(&[(member_of(1, 0), 64)]).await;
+    host.admit(2, &[64]);
+    steps_until(&mut uploader, 30_000, "published").await;
+    let service = Arc::clone(&host.service);
+    let mut fence = Some(PrivacyGeneration::new(1));
+    host.web.when_asked(move |asked| {
+        if *asked == Asked::Fetch(BackupGeneration::new(1))
+            && let Some(generation) = fence.take()
+        {
+            service
+                .raise_fence(generation, TimestampMs::new(30_500))
+                .expect("the fence is raised");
+        }
+    });
+    passes(&mut uploader, 31_000).await;
+    assert_eq!(deletions(&host), 0);
+    for object in host
+        .service
+        .objects(archive_id(), BackupGeneration::new(1))
+        .expect("a read")
+    {
+        assert!(
+            host.web.stored_bytes(object.object_id).is_some(),
+            "{object:?}"
+        );
+        assert_eq!(object.released_at_ms, None);
+    }
+}
+
+/// The report of an unknown generation reads privacy mode after the service answered, so a fence
+/// raised while this host asked is named in it, and no later generation is said to carry it.
+#[tokio::test]
+async fn an_unknown_generation_given_up_while_a_fence_goes_up_names_privacy_modes_line() {
+    let mut host = Host::open();
+    let publication = host.admit(1, &[64]) + 1;
+    stop_between_dispatch_and_send(&host, publication).await;
+    let (mut uploader, _) = host.restart(20_000).await;
+    passes(&mut uploader, 20_000).await;
+    let service = Arc::clone(&host.service);
+    let mut fence = Some(PrivacyGeneration::new(1));
+    host.web.when_asked(move |asked| {
+        if matches!(asked, Asked::Fetch(_))
+            && let Some(generation) = fence.take()
+        {
+            service
+                .raise_fence(generation, TimestampMs::new(20_000 + ADMISSIBLE_MS))
+                .expect("the fence is raised");
+        }
+    });
+    let given_up = uploader
+        .pass(TimestampMs::new(20_000 + ADMISSIBLE_MS))
+        .await
+        .expect("a pass");
+    assert_eq!(kinds(&given_up.steps), ["unknown"]);
+    let said = given_up.describe();
+    assert!(
+        said.iter().any(|line| line.contains(
+            "no later generation carries its content, because privacy mode stopped backup \
+             production at privacy generation 1"
+        )),
+        "{said:?}"
+    );
+    assert!(
+        said.iter()
+            .all(|line| !line.contains("the next generation")),
+        "{said:?}"
+    );
+}
+
 /// An object is deleted only when no generation this host still holds names it. This host's store
 /// keys each object by its generation, so nothing stops two generations of one archive naming the
 /// same object, and the service holds one object under that name: deleting it for one generation

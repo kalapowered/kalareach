@@ -87,7 +87,8 @@
 //! admits names that object, so neither that request, a later one, nor one delayed on its way can
 //! reach an object admitted after it. Nothing is deleted under privacy mode's line, whose
 //! retained artifacts go only by the person's own action, nor from a collection deleted from the
-//! account console, which the service empties itself.
+//! account console, which the service empties itself; privacy mode is read again after every
+//! answer the service gives, since it may have moved while this host waited.
 //!
 //! # A restart with a publication on its way
 //!
@@ -668,7 +669,7 @@ impl Uploader {
         if let Some(stepped) = self.abandon_what_was_left(&outbox, &privacy, turn).await? {
             return Ok(Some(stepped));
         }
-        self.reclaim(&outbox, &privacy, now, turn).await
+        self.reclaim(now, turn).await
     }
 
     /* ---------------------------------------------------------------------- */
@@ -1221,7 +1222,11 @@ impl Uploader {
             }
             return self.stop(attempt, production_over(generation, privacy), now);
         };
-        match self.held(generation).await {
+        let held = self.held(generation).await;
+        // What is said about the generation is read after the service answered: privacy mode may
+        // have drawn its line while this host asked.
+        let privacy = &self.backup.privacy_status()?;
+        match held {
             Ok(true) => self.published(attempt, now),
             Ok(false) if now.get() >= since.saturating_add(WAITS_FOR_AN_ANSWER_MS) => {
                 // The note that it may have left goes only once the stop is written down: a stop
@@ -1431,16 +1436,17 @@ impl Uploader {
     /// publication landed before the newer one, and it is written down as published and keeps
     /// everything. One the service does not hold never will, so each of its objects that no other
     /// generation still names is deleted, and the answer written down.
-    async fn reclaim(
-        &mut self,
-        outbox: &[Attempt],
-        privacy: &PrivacyStatus,
-        now: TimestampMs,
-        turn: &mut Turn,
-    ) -> Result<Option<Stepped>> {
+    async fn reclaim(&mut self, now: TimestampMs, turn: &mut Turn) -> Result<Option<Stepped>> {
         loop {
+            // Read afresh each time round: asking the service takes time, and privacy mode, or
+            // the store, may have moved while it did.
+            if self.backup.unready().is_some() {
+                return Ok(None);
+            }
+            let outbox = self.backup.outbox()?;
+            let privacy = self.backup.privacy_status()?;
             let Some(work) = self
-                .reclaimable(outbox, privacy)?
+                .reclaimable(&outbox, &privacy)?
                 .into_iter()
                 .find(|work| !turn.unreclaimed.contains(&work.generation_key()))
             else {
