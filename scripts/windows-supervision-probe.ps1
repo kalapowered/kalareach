@@ -30,7 +30,9 @@ $schtasks = Join-Path $env:SystemRoot 'System32\schtasks.exe'
 $tasks = [System.Collections.Generic.List[string]]::new()
 $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 
-function Say([string]$Line) { Write-Output ('== ' + $Line) }
+# To the host, never the pipeline: a function that says something and returns a value must return
+# only the value.
+function Say([string]$Line) { Write-Host ('== ' + $Line) }
 
 function New-Start([string]$Arguments) {
   # A plain create, never Start-Process -Wait, which can put what it starts in a job of its own.
@@ -112,7 +114,11 @@ function Build-Probe {
   New-Item -ItemType Directory -Force -Path $dir, (Join-Path $dir 'out dir') | Out-Null
   $source = Join-Path $dir 'krprobe.cs'
   [System.IO.File]::WriteAllText($source, $probeSource, [System.Text.UTF8Encoding]::new($false))
-  $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+  $csc = @(
+    (Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'),
+    (Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\csc.exe')
+  ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+  if (-not $csc) { throw 'no .NET Framework csc.exe under Microsoft.NET' }
   $said = & $csc /nologo /target:winexe /platform:x64 /optimize+ /r:System.Management.dll "/out:$exe" $source 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "csc failed ($LASTEXITCODE): $said" }
   Say "probe built with $csc"
