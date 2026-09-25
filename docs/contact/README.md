@@ -264,12 +264,17 @@ on a host, and the authority behind it and the deadline it was admitted under ar
 immediately before anything durable happens.
 
 That contract rests on a change reaching the disk before the record that accounts for it, which
-rests in turn on making a directory's own entries durable. This host has no way to do that on
-Windows: flushing a directory there needs write access to a handle that cannot be opened for
-writing. So `kr skill install` and `kr skill remove` refuse on Windows, before anything is changed,
-and say to add the server with the agent's own command. `kr skill status` still reports whatever is
-there. The refusal goes when the Windows qualification supplies a durable barrier; until then this
-host does not make a change it could not account for after a crash.
+rests in turn on making a directory's own entries durable: every change, and every write of the
+record, flushes the directory that names it before the next step begins.
+
+On Windows `kr skill install` and `kr skill remove` refuse before anything is changed, and say to
+add the server with the agent's own command; `kr skill status` still reports whatever is there.
+Every file an installation writes over, its own record included, is replaced by a new file renamed
+into place, and the access-control check above decides whether that replacement would change who
+can read it. This host reads access-control lists on macOS and Linux only. Windows gives every file
+a list, so there the check would refuse every replacement and an installation would stop part way
+through, once its record had been written; the host makes no change rather than one it would have
+to abandon.
 
 Each change is noted in the record before it happens and recorded after it, and the record is marked
 complete only when the last one is. An installation interrupted part way through is therefore not

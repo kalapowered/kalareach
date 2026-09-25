@@ -22,6 +22,7 @@
 
 use std::path::{Path, PathBuf};
 
+use kr_ipc::paths::{NameKind, flush_directory};
 use kr_protocol::scalars::{Digest256, Nullable};
 use kr_protocol::skill::{
     AgentTarget, AgentToolsInstallResult, AgentToolsParams, AgentToolsRemoveResult,
@@ -564,7 +565,7 @@ impl Installer {
                         Some(_) => {
                             std::fs::remove_file(path).map_err(storage)?;
                             if let Some(parent) = Path::new(path).parent() {
-                                sync_directory(parent)?;
+                                sync_directory(parent, NameKind::File)?;
                             }
                             removed.push(operation.clone());
                         }
@@ -596,7 +597,7 @@ impl Installer {
                     match std::fs::remove_dir(path) {
                         Ok(()) => {
                             if let Some(parent) = Path::new(path).parent() {
-                                sync_directory(parent)?;
+                                sync_directory(parent, NameKind::Directory)?;
                             }
                             removed.push(operation.clone());
                         }
@@ -608,7 +609,7 @@ impl Installer {
         let record = self.record_path(params);
         if record.exists() {
             std::fs::remove_file(&record).map_err(storage)?;
-            sync_directory(&self.records)?;
+            sync_directory(&self.records, NameKind::File)?;
         }
         Ok(AgentToolsRemoveResult {
             agent: params.agent,
@@ -1129,7 +1130,7 @@ impl Installer {
                 // This host created the document and nothing else was ever added to it.
                 std::fs::remove_file(path).map_err(storage)?;
                 if let Some(parent) = path.parent() {
-                    sync_directory(parent)?;
+                    sync_directory(parent, NameKind::File)?;
                 }
                 return Ok(Removal::Removed);
             }
@@ -1384,7 +1385,7 @@ impl Installer {
             return Ok(());
         };
         std::fs::rename(only, &path).map_err(storage)?;
-        sync_directory(&self.records)
+        sync_directory(&self.records, NameKind::File)
     }
 
     fn recorded(&self, params: &AgentToolsParams) -> Result<Option<InstallationRecord>> {
@@ -1721,7 +1722,7 @@ fn create_directory_durably(path: &Path) -> Result<bool> {
         // The parent's own entry for it, not the new directory's contents: what has to survive is
         // the name, because everything written inside it is reached through that name.
         if let Some(parent) = directory.parent() {
-            sync_directory(parent)?;
+            sync_directory(parent, NameKind::Directory)?;
         }
     }
     Ok(created)
@@ -1761,23 +1762,26 @@ fn is_digest_name(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-/// Refuses a change to an agent's installation on a platform this host cannot make one safely on.
+/// Refuses a change to an agent's installation on a platform where this host cannot check that a
+/// replacement keeps who may read the file it replaces.
 ///
-/// Section 24 asks an effect to be durable before the record that accounts for it, and section 9
-/// asks a dispatch marker to survive the crash it exists for. Both rest on making a directory's own
-/// entries durable, which this host cannot do on Windows (see [`sync_directory`]). Rather than make
-/// a change it cannot account for after a crash, it makes none: `kr skill status` still reports
-/// what is there, and the agent's own command adds the server until the Windows qualification
-/// supplies a durable barrier.
+/// Every file an installation rewrites, its own record included, is replaced by a new file renamed
+/// over it, and the new file carries whatever access-control list its directory gives it. Before
+/// one takes an existing file's place this host compares the two, and it reads those lists on
+/// macOS and Linux only (see [`guard_access_controls`] and [`write_atomically`]). Windows gives
+/// every file a list, so there every replacement would be refused, the first of them part way
+/// through, once the installation's record had been written. Rather than begin a change it would
+/// have to abandon, this host makes none on Windows: `kr skill status` still reports what is
+/// there, and the agent's own command adds the server.
 fn supported_platform() -> Result<()> {
     // A compile-time value rather than a conditional body, so both answers are checked on every
     // platform this crate builds for.
     if cfg!(windows) {
         return Err(ControllerError::PermissionDenied {
             detail: format!(
-                "this host cannot yet install or remove {SKILL_NAME} on Windows, because it has no \
-                 way to make the directory entries behind an installation durable; add the server \
-                 with the agent's own command instead"
+                "this host does not install or remove {SKILL_NAME} on Windows, because it does not \
+                 read access-control lists there and so cannot tell whether replacing a file would \
+                 change who can read it; add the server with the agent's own command instead"
             ),
         });
     }
@@ -1909,26 +1913,12 @@ fn inheritable_access_controls(directory: &Path) -> Result<bool> {
 
 /// Makes a directory's own entries durable.
 ///
-/// A rename or an unlink is not on disk until the directory holding it is. On Unix that is an
-/// `fsync` of the directory itself; Windows offers no equivalent for a directory handle, and a
-/// record written there is durable only as far as the platform's own ordering makes it.
-fn sync_directory(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let directory = std::fs::File::open(path).map_err(storage)?;
-        directory.sync_all().map_err(storage)?;
-    }
-    // Windows has no equivalent this crate can reach: flushing a handle's buffers there needs
-    // write access, and a directory handle cannot be opened for writing. An installation on
-    // Windows is therefore as durable as the platform's own ordering makes it, which is a gap the
-    // Windows qualification has to close rather than one this code can paper over. It is named
-    // here and in the contact documentation instead of being claimed as durability it does not
-    // have.
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-    Ok(())
+/// A rename or an unlink is not on disk until the directory holding it is. `kind` is the name that
+/// changed in it, a file's or a directory's, which is the right the flush's handle asks for on
+/// Windows: a directory this host removed is flushed for a directory's name, the right it was
+/// created under.
+fn sync_directory(path: &Path, kind: NameKind) -> Result<()> {
+    flush_directory(path, kind).map_err(storage)
 }
 
 /// Returns true when two operations are about the same thing.
@@ -2132,7 +2122,7 @@ fn write_atomically(path: &Path, bytes: &[u8], default_mode: u32) -> Result<()> 
     // The rename is not on disk until the directory holding it is. A failure here is reported
     // rather than swallowed: a record that claims durability it does not have is worse than one
     // that says it could not be written.
-    sync_directory(parent)
+    sync_directory(parent, NameKind::File)
 }
 
 fn file_name(path: &Path) -> String {
