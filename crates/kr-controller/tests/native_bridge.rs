@@ -2679,6 +2679,71 @@ fn a_missing_application_directory_keeps_what_was_placed_recorded() {
     );
 }
 
+/// A second link to the published file at its former temporary name does not hide the
+/// publication: taking the link back still leaves the destination to be settled, and the removal
+/// takes out what was published.
+#[cfg(unix)]
+#[test]
+fn a_second_link_at_a_temporary_name_does_not_hide_what_was_published() {
+    let before = Site::new().tree();
+    let apply =
+        |site: &Site, bridges: &NativeBridges| bridges.reconcile(&plugin(), Some(&site.release()));
+    let rename = |site: &Site| {
+        format!(
+            "rename {}",
+            site.application().join("settings.json").display()
+        )
+    };
+    let stopped = (1..)
+        .map_while(|step| stopped_at(step, &|_| {}, &apply))
+        .find(|stopped| stopped.steps.last() == Some(&rename(&stopped.site)))
+        .expect("the settings document's rename was reached");
+    let site = &stopped.site;
+    let staged = stopped
+        .steps
+        .iter()
+        .rev()
+        .find_map(|step| step.strip_prefix("stage "))
+        .map(PathBuf::from)
+        .expect("the staged copy");
+    std::fs::hard_link(site.application().join("settings.json"), &staged)
+        .expect("somebody links the document at its former temporary name");
+
+    assert_eq!(
+        site.bridges()
+            .reconcile(&plugin(), None)
+            .expect("reconciles"),
+        Settled::Removed
+    );
+    assert_eq!(site.tree(), before, "the key is taken out, and the link");
+}
+
+/// A settings document somebody put in the place of the one this host created, with the same
+/// bytes, is not deleted by the removal: it keeps its file, and loses only the key.
+#[test]
+fn a_document_put_in_the_place_of_the_created_one_keeps_its_file() {
+    let site = Site::with_settings(None);
+    let bridges = site.bridges();
+    bridges
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("applies");
+    let document = site.application().join("settings.json");
+    let copy = site.root.join("settings-copy.json");
+    std::fs::copy(&document, &copy).expect("a copy");
+    std::fs::rename(&copy, &document).expect("put in its place");
+
+    assert_eq!(
+        bridges.reconcile(&plugin(), None).expect("reconciles"),
+        Settled::Removed
+    );
+
+    let text = std::fs::read_to_string(&document).expect("the document is still there");
+    assert!(
+        !text.contains("kalareach-channels@skills-dir"),
+        "the key is taken out of it: {text}"
+    );
+}
+
 /// Lets a directory's entries be changed, or stops that.
 #[cfg(unix)]
 fn set_writable(directory: &Path, writable: bool) {

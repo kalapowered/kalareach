@@ -1488,11 +1488,12 @@ impl NativeBridges {
             Publication::Staged { identity } => Some(identity),
             Publication::Noted => None,
         };
-        // While the staged object is at its temporary name, it was never renamed into place.
-        let beside = match self.clear_staged(directory, temporary, kind, staged)? {
-            Cleared::Removed => return Ok((Settlement::Absent, None)),
-            Cleared::Left(reason) => Some(reason),
-            Cleared::Absent => None,
+        // What is at the temporary name is settled first. The staged object still there means it
+        // was never renamed into place, unless the destination holds it too, as a second link.
+        let (taken_back, beside) = match self.clear_staged(directory, temporary, kind, staged)? {
+            Cleared::Removed => (true, None),
+            Cleared::Left(reason) => (false, Some(reason)),
+            Cleared::Absent => (false, None),
         };
         // Only a staged object is ever renamed into place.
         let Some(staged) = staged else {
@@ -1504,6 +1505,7 @@ impl NativeBridges {
                 self.flush(directory).map_err(halted)?;
                 Ok((Settlement::Placed(staged), beside))
             }
+            _ if taken_back => Ok((Settlement::Absent, beside)),
             _ => Ok((Settlement::NotOurs, beside)),
         }
     }
@@ -1696,6 +1698,9 @@ impl NativeBridges {
             value,
             created_members,
             created_document,
+            publication: Publication::Published {
+                identity: published,
+            },
             ..
         } = journal.changes[index].clone()
         else {
@@ -1728,7 +1733,11 @@ impl NativeBridges {
                     }
                     Err(outcome) => return Ok(outcome),
                 };
+            // A document this host created, left with nothing in it, goes, while it is the document
+            // this host created. Another one somebody put in its place keeps its file and loses only
+            // the key.
             let delete = created_document
+                && read.identity.same_object(&published)
                 && json::Document::read(&edited).is_ok_and(|document| document.is_empty());
             let temporary = tree::temporary_name(name);
             let mut staged = None;

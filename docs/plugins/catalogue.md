@@ -408,12 +408,14 @@ every change is in place and nothing is unsettled.
 
 A removal takes out each file only while it is the file the host installed and still holds the bytes
 installed: a copy with the same bytes put in its place is somebody's own, and is left. The key goes
-only while it holds the value written, then the directories the host made once they hold nothing
-else. Whatever changed since is left in place and named in the journal. A release applied in a
-directory the host no longer keeps the application's plugins in is taken out of it before the
-release is applied in the new one. The journal also says what an applied release yields for the
-sessions that launch its application: the application name its registration invokes the forwarder
-for, the registrations it makes and the forwarder it is expected to start.
+only while it holds the value written, and a settings document the host created goes with it only
+while it is still that document: one put in its place keeps its file and loses only the key. Then
+the directories the host made go, once they hold nothing else. Whatever changed since is left in
+place and named in the journal. A release applied in a directory the host no longer keeps the
+application's plugins in is taken out of it before the release is applied in the new one. The
+journal also says what an applied release yields for the sessions that launch its application: the
+application name its registration invokes the forwarder for, the registrations it makes and the
+forwarder it is expected to start.
 
 ## The transport, and the broker
 
