@@ -10,7 +10,7 @@ publish.workspace = true
 
 [[bin]]
 name = "kr-protocol-gen"
-path = "src/bin/kr-protocol-gen.rs"
+path = "src/bin/kr-protocol-gen/main.rs"
 
 [dependencies]
 base64.workspace = true

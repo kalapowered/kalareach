@@ -1,14 +1,19 @@
 //! Writes the generated JSON Schema, the method table and the cross-language vectors.
 //!
 //! Two output roots, because the two are consumed differently: the schema and the method table
-//! feed the TypeScript build, and the vectors are conformance material both languages read.
+//! feed the TypeScript build, and the vectors are conformance material both languages read. The
+//! check also reads the documentation root, and fails when a method in the table is named in no
+//! document there.
 //!
 //! ```text
 //! kr-protocol-gen                   write the files
-//! kr-protocol-gen --check           fail when the committed files differ
+//! kr-protocol-gen --check           fail when the committed files differ or a method is undocumented
 //! kr-protocol-gen --out-dir P       write the schema to P instead of packages/protocol/schema
 //! kr-protocol-gen --fixtures-dir P  write the vectors to P instead of fixtures
+//! kr-protocol-gen --docs-dir P      read the documentation from P instead of docs
 //! ```
+
+mod method_index;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -22,6 +27,10 @@ fn default_out_dir() -> PathBuf {
 
 fn default_fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures")
+}
+
+fn default_docs_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs")
 }
 
 /// Every generated vector file, with the directory it belongs in under the fixtures root.
@@ -45,6 +54,7 @@ fn main() -> ExitCode {
     let mut check = false;
     let mut out_dir = default_out_dir();
     let mut fixtures_dir = default_fixtures_dir();
+    let mut docs_dir = default_docs_dir();
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -63,8 +73,18 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             },
+            "--docs-dir" => match arguments.next() {
+                Some(value) => docs_dir = PathBuf::from(value),
+                None => {
+                    eprintln!("--docs-dir needs a path");
+                    return ExitCode::FAILURE;
+                }
+            },
             "--help" | "-h" => {
-                println!("kr-protocol-gen [--check] [--out-dir <path>] [--fixtures-dir <path>]");
+                println!(
+                    "kr-protocol-gen [--check] [--out-dir <path>] [--fixtures-dir <path>] \
+                     [--docs-dir <path>]"
+                );
                 return ExitCode::SUCCESS;
             }
             other => {
@@ -85,13 +105,13 @@ fn main() -> ExitCode {
         .collect();
 
     if check {
-        run_check(&files)
+        run_check(&files, &docs_dir)
     } else {
         run_write(&files)
     }
 }
 
-fn run_check(files: &[(PathBuf, String)]) -> ExitCode {
+fn run_check(files: &[(PathBuf, String)], docs_dir: &Path) -> ExitCode {
     let mut differences = 0usize;
     for (path, expected) in files {
         let expected = expected.as_str();
@@ -115,9 +135,28 @@ fn run_check(files: &[(PathBuf, String)]) -> ExitCode {
     }
     if differences > 0 {
         eprintln!("run `cargo run -p kr-protocol --bin kr-protocol-gen` and commit the result");
+    }
+    let undocumented = match method_index::unnamed_methods(docs_dir) {
+        Ok(undocumented) => undocumented,
+        Err(error) => {
+            eprintln!("{}: {error}", docs_dir.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    if !undocumented.is_empty() {
+        eprintln!(
+            "{} registry methods are named in no document under {}:",
+            undocumented.len(),
+            docs_dir.display()
+        );
+        for name in &undocumented {
+            eprintln!("  {name}");
+        }
+    }
+    if differences > 0 || !undocumented.is_empty() {
         return ExitCode::FAILURE;
     }
-    println!("generated files are up to date");
+    println!("generated files are up to date and every method is documented");
     ExitCode::SUCCESS
 }
 
