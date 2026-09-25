@@ -4404,6 +4404,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kr-conformance"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "kr-controller"
 version = "0.1.0"
 dependencies = [
