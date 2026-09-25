@@ -3708,12 +3708,14 @@ pub mod configuration {
         },
         UngovernedVariable {
             variable: "LOGNAME",
-            selects: "the same, where USER is not set, for a worker or a bridge helper",
+            selects: "the same, for a worker or a bridge helper whose USER is missing, not valid \
+                      Unicode or empty (for a worker, also only whitespace)",
         },
         UngovernedVariable {
             variable: "USERNAME",
-            selects: "the same, where USER is not set (nor, for a worker or a bridge helper, \
-                      LOGNAME), as Windows names the account",
+            selects: "the same, as Windows names the account: for a host whose USER is missing or \
+                      not valid Unicode, and for a worker or a bridge helper that passed over USER \
+                      and LOGNAME in that way",
         },
         UngovernedVariable {
             variable: "HTTPS_PROXY",
