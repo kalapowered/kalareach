@@ -53,7 +53,7 @@ use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
 
-use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId, InstallationId};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{Digest256, Nullable, U64, Uuid};
@@ -69,6 +69,7 @@ use super::signed::{
 use super::{ServiceFuture, StorageService};
 use crate::error::{ClientError, Result};
 use crate::retry::UserAction;
+use crate::shown::Shown;
 
 /// The route every managed storage method is served under.
 pub const STORAGE_ROUTE_PREFIX: &str = "/api/storage";
@@ -208,12 +209,6 @@ impl UploadId {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
-    }
-}
-
-impl fmt::Display for UploadId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
     }
 }
 
@@ -362,10 +357,10 @@ impl<T> ArchiveAnswer<T> {
         match self {
             Self::Done(answer) => Ok(answer),
             Self::CollectionDeleted => Err(collection_deleted()),
-            Self::UploadGone => Err(ClientError::Host(ProtocolError::new(
+            Self::UploadGone => Err(ClientError::refusal(
                 ErrorCode::StaleSession,
-                "the service holds no such upload; upload the object again".to_owned(),
-            ))),
+                Shown::said("the service holds no such upload; upload the object again"),
+            )),
         }
     }
 }
@@ -377,11 +372,12 @@ impl<T> ArchiveAnswer<T> {
 #[must_use]
 pub fn collection_deleted() -> ClientError {
     ClientError::Refused {
-        error: ProtocolError::new(
+        error: crate::error::refusal(
             ErrorCode::PermissionDenied,
-            "that backup collection was deleted from the account console; to back up again, \
-             enrol a new collection"
-                .to_owned(),
+            Shown::said(
+                "that backup collection was deleted from the account console; to back up again, \
+                 enrol a new collection",
+            ),
         ),
         retry_after_seconds: None,
         action: UserAction::FixConfiguration,
@@ -908,12 +904,13 @@ impl ManagedStorageService {
     /// The account this client presents, or the refusal of a request it cannot send without one.
     fn account(&self) -> std::result::Result<&AccountAuthorisation, Unanswered> {
         self.account.as_ref().ok_or_else(|| {
-            Unanswered::NotSent(ClientError::Host(ProtocolError::new(
+            Unanswered::NotSent(ClientError::refusal(
                 ErrorCode::HostNotConfigured,
-                "managed storage is reached with an account token for backup.write, and this \
-                 client presents no account"
-                    .to_owned(),
-            )))
+                Shown::said(
+                    "managed storage is reached with an account token for backup.write, and this \
+                     client presents no account",
+                ),
+            ))
         })
     }
 
@@ -1418,21 +1415,21 @@ const MAX_SAFE_COUNTER: u64 = (1 << 53) - 1;
 ///
 /// A tombstoned object reads the same as one that never existed, so this says neither.
 fn not_held() -> ClientError {
-    ClientError::Host(ProtocolError::new(
+    ClientError::refusal(
         ErrorCode::UnknownSession,
-        "the service holds no stored object under that identity".to_owned(),
-    ))
+        Shown::said("the service holds no stored object under that identity"),
+    )
 }
 
 /// An answer that was read and says something the service's contract does not allow.
 ///
 /// The service answered, so whatever it did is done; what this client lacks is an answer it can
 /// act on, which is an unknown outcome like any other answer it could not read.
-fn contrary(what: &str) -> ClientError {
-    ClientError::Host(ProtocolError::new(
+fn contrary(what: &'static str) -> ClientError {
+    ClientError::refusal(
         ErrorCode::OutcomeUnknown,
-        format!("the service answered {what}"),
-    ))
+        crate::shown!("the service answered {}", what),
+    )
 }
 
 #[cfg(test)]

@@ -41,6 +41,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use kr_protocol::archive::{BackupGenerationPublication, BackupWriterRecord};
+use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{ArchiveId, BackupGeneration};
 use kr_protocol::method::Method;
 use kr_protocol::pairing::GenerationCheckpoint;
@@ -54,7 +55,7 @@ use super::signed::{AccountAuthorisation, Answer, SignedService, Unanswered, unr
 use super::storage::ArchiveAnswer;
 use super::{BackupManifestService, Dispatched, ServiceFuture};
 use crate::error::{ClientError, Result};
-use kr_protocol::error::{ErrorCode, ProtocolError};
+use crate::shown::Shown;
 
 /// Where every backup-manifest request is served.
 pub const BACKUP_MANIFEST_PATH: &str = "/api/backup/manifest";
@@ -383,12 +384,13 @@ impl ManagedBackupManifestService {
         publication: &BackupGenerationPublication,
     ) -> Result<Dispatched<ArchiveAnswer<Published>>> {
         let Some(account) = &self.account else {
-            return Ok(Dispatched::NotSent(ClientError::Host(ProtocolError::new(
+            return Ok(Dispatched::NotSent(ClientError::refusal(
                 ErrorCode::HostNotConfigured,
-                "a publication spends an account's backup storage, and this client presents no \
-                 account"
-                    .to_owned(),
-            ))));
+                Shown::said(
+                    "a publication spends an account's backup storage, and this client presents \
+                     no account",
+                ),
+            )));
         };
         let answer = match self
             .call
@@ -511,11 +513,11 @@ fn read<T: for<'de> Deserialize<'de>>(data: serde_json::Value, what: &'static st
 }
 
 /// An answer that was read and says something the service's contract does not allow.
-fn contrary(what: &str) -> ClientError {
-    ClientError::Host(ProtocolError::new(
+fn contrary(what: &'static str) -> ClientError {
+    ClientError::refusal(
         ErrorCode::OutcomeUnknown,
-        format!("the service answered {what}"),
-    ))
+        crate::shown!("the service answered {}", what),
+    )
 }
 
 #[cfg(test)]

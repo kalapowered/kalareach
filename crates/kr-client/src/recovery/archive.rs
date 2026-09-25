@@ -65,7 +65,7 @@ use kr_protocol::archive::{
     BackupGenerationPublicationPayload, BackupWriterRecord, BackupWriterRecordPayload,
     CollectionLocator, RecoveryBundle, TrustedProducer, TrustedWriter,
 };
-use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{
     ArchiveId, BackupGeneration, BackupObjectId, BackupWriterRevision, DeviceId, SyncObjectId,
 };
@@ -661,10 +661,10 @@ impl ServiceHttp for PrivacyGate {
 /// What a request the privacy gate kept fails with. Nothing reads it: the generation takes the
 /// reason from the gate.
 fn kept_here() -> ClientError {
-    ClientError::Host(ProtocolError::new(
+    ClientError::refusal(
         ErrorCode::PermissionDenied,
-        "privacy mode kept this request on this device".to_owned(),
-    ))
+        Shown::said("privacy mode kept this request on this device"),
+    )
 }
 
 /// The bounds the record of sent objects is written within and read back under.
@@ -848,11 +848,11 @@ fn fresh_object_id() -> Result<BackupObjectId> {
 }
 
 /// An answer that was read and says something the service's contract does not allow.
-fn contrary(what: &str) -> ClientError {
-    ClientError::Host(ProtocolError::new(
+fn contrary(what: &'static str) -> ClientError {
+    ClientError::refusal(
         ErrorCode::OutcomeUnknown,
-        format!("the service answered {what}"),
-    ))
+        crate::shown!("the service answered {}", what),
+    )
 }
 
 #[cfg(test)]
