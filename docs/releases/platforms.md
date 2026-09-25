@@ -3,8 +3,9 @@
 A KalaReach release runs on Windows 11, macOS 14 or later and Linux with glibc 2.35 or later, each
 on x86-64 and ARM64, and its companion application runs on iOS and iPadOS 17 and Android 10. Those
 are the baselines. Every executable the host ships is built for every one of those desktop targets,
-and each one's own headers are read back to confirm it says it runs on its baseline and on nothing
-older.
+and each one's own headers are read back to confirm it runs on its baseline. A macOS executable has
+to declare exactly the baseline; a Linux or Windows one may need less than its baseline, and never
+more.
 
 ## The baselines
 

@@ -40,10 +40,11 @@ PowerShell script here is never signed without a timestamp, and why the gate ref
 
 The certificates chain to the `Microsoft Identity Verification Root Certificate Authority 2020`,
 which is included in the Microsoft Trusted Root Certificate Program, so Windows accepts them with
-nothing installed. Timestamps chain to the `Microsoft Time-Stamp Root Authority` (via Microsoft
-Time-Stamp PCA). `signtool verify /pa /v` prints the whole chain it walked, and `signatures.txt`
-records the signer certificate chain root-first and the timestamp certificate subject from the
-release run.
+nothing installed. Timestamps come from `Microsoft Public RSA Time Stamping Authority` and chain
+through `Microsoft Public RSA Timestamping CA 2020` to the same root. That is the chain observed
+when this was written, and Microsoft can change it, so each release's own record is what counts:
+`signtool verify /pa /v` prints the whole chain it walked, and `signatures.txt` records the signer
+certificate chain root-first and the timestamp certificate subject from the release run.
 
 ## What a release carries
 
