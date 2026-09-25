@@ -33,6 +33,11 @@ function attempt(controls: FakeHostControls, state: AttemptState): void {
 
 const IN_FIVE_MINUTES = Date.now() + 5 * 60_000
 
+/** A code attempt through the configured service that ended as `kind`. */
+function ended(kind: FailureKind, tries_left: number | null): AttemptState {
+  return { state: 'ended', failure: { kind, tries_left }, mode: 'code', service: null }
+}
+
 describe('pairing with a host', () => {
   it('starts at the code field, focused, and takes a code exactly as typed', async () => {
     start()
@@ -158,25 +163,64 @@ describe('pairing with a host', () => {
     const { controls } = start()
     await screen.findByLabelText('Pairing code')
     for (const kind of kinds) {
-      attempt(controls, { state: 'ended', failure: { kind, tries_left: 3 } })
+      attempt(controls, ended(kind, 3))
       const sentence = await screen.findByTestId('failure-sentence')
       expect(sentence.textContent).toBe(
         `${failureWords(kind, 'reach.kala.to').sentence} 3 tries left on this device.`
       )
     }
-    attempt(controls, { state: 'ended', failure: { kind: 'declined', tries_left: null } })
+    attempt(controls, ended('declined', null))
     expect((await screen.findByTestId('failure-sentence')).textContent).toBe(
       'The owner declined this device on the host.'
     )
   })
 
-  it('names an unknown failure kind only as not finished, with the generic action', async () => {
+  it('names the service a pasted code went through when that attempt fails', async () => {
     const { controls } = start()
     await screen.findByLabelText('Pairing code')
     attempt(controls, {
       state: 'ended',
-      failure: { kind: 'a_kind_from_a_newer_build' as FailureKind, tries_left: null }
+      failure: { kind: 'service_unreachable', tries_left: 4 },
+      mode: 'code',
+      service: 'pair.example.org'
     })
+    expect((await screen.findByTestId('failure-sentence')).textContent).toBe(
+      "pair.example.org could not be reached. Check this device's connection and try again. 4 tries left on this device."
+    )
+  })
+
+  it('gives a direct invitation that failed its own words, and asks for it again', async () => {
+    const { controls } = start()
+    await screen.findByLabelText('Pairing code')
+    attempt(controls, {
+      state: 'ended',
+      failure: { kind: 'not_authenticated', tries_left: null },
+      mode: 'direct',
+      service: null
+    })
+    expect((await screen.findByTestId('failure-sentence')).textContent).toBe(
+      'The invitation did not work. Ask the host for a new one.'
+    )
+    const action = screen.getByTestId('failure-action')
+    expect(action.textContent).toBe('Paste again')
+    await userEvent.click(action)
+    // Pasting again reads the clipboard, which holds nothing now.
+    expect((await screen.findByTestId('paste-failure')).textContent).toMatch(
+      /^The clipboard holds no invitation\./
+    )
+    attempt(controls, {
+      state: 'ended',
+      failure: { kind: 'did_not_finish', tries_left: null },
+      mode: 'direct',
+      service: null
+    })
+    expect((await screen.findByTestId('failure-action')).textContent).toBe('Paste again')
+  })
+
+  it('names an unknown failure kind only as not finished, with the generic action', async () => {
+    const { controls } = start()
+    await screen.findByLabelText('Pairing code')
+    attempt(controls, ended('a_kind_from_a_newer_build' as FailureKind, null))
     expect(await screen.findByRole('heading', { name: 'Pairing did not finish' })).toBeInTheDocument()
     expect(screen.getByTestId('failure-sentence').textContent).toMatch(/^Pairing did not finish/)
     expect(screen.getByTestId('failure-action').textContent).toBe('Try again')
@@ -186,7 +230,7 @@ describe('pairing with a host', () => {
     const { controls } = start()
     const field = await screen.findByLabelText('Pairing code')
     await userEvent.type(field, 'aB3x-Yz7-9Qw')
-    attempt(controls, { state: 'ended', failure: { kind: 'not_authenticated', tries_left: 4 } })
+    attempt(controls, ended('not_authenticated', 4))
     await userEvent.click(await screen.findByTestId('failure-action'))
     const again = await screen.findByLabelText('Pairing code')
     await waitFor(() => {
@@ -234,7 +278,7 @@ describe('pairing with a host', () => {
     // Ended in a way no second try of the same code can mend.
     for (const kind of ['host_tries_used', 'declined', 'expired'] as const) {
       await typed()
-      attempt(controls, { state: 'ended', failure: { kind, tries_left: 2 } })
+      attempt(controls, ended(kind, 2))
       await userEvent.click(await screen.findByTestId('failure-action'))
       expect(await shown(), kind).toBe('')
     }
@@ -242,7 +286,7 @@ describe('pairing with a host', () => {
     // Ended in a way the same code may mend: it waits in the field.
     for (const kind of ['service_unreachable', 'no_host_answered', 'service_not_pairing'] as const) {
       await typed()
-      attempt(controls, { state: 'ended', failure: { kind, tries_left: 2 } })
+      attempt(controls, ended(kind, 2))
       await userEvent.click(await screen.findByTestId('failure-action'))
       expect(await shown(), kind).toBe(CODE)
     }

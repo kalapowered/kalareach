@@ -65,6 +65,7 @@ use tokio::sync::{oneshot, watch};
 
 use super::BoxFuture;
 use super::failure::{FailureKind, PairingFailure, consumed, refused_by_host};
+use super::invitation::origin_host;
 use super::link::{ConnectionPeer, HostLink, LinkError, Preauth};
 use super::paired::{AttemptMode, PairedHost, PairedHosts, PendingAttempt};
 use super::room::{RoomConnector, RoomError, RoomRole, RoomSocket};
@@ -284,6 +285,13 @@ pub enum AttemptState {
     Ended {
         /// How.
         failure: PairingFailure,
+        /// How the attempt was made, which decides what a person can do next: a direct
+        /// invitation is tried again only by pasting it again.
+        mode: AttemptMode,
+        /// The host name of the pairing service a code attempt went through, which its failures
+        /// name. None for a direct invitation, which reaches no service, and for an attempt taken
+        /// up after a restart, whose endings are the host's.
+        service: Option<String>,
     },
 }
 
@@ -352,7 +360,12 @@ impl Pairing {
         progress: &watch::Sender<AttemptState>,
     ) -> Result<PairedHost, PairingFailure> {
         let outcome = self.code_attempt(origin, code, progress).await;
-        ended(progress, outcome)
+        ended(
+            progress,
+            outcome,
+            AttemptMode::Code,
+            Some(origin_host(origin).to_owned()),
+        )
     }
 
     /// Takes up an attempt that was waiting for the owner when this device last ran.
@@ -365,17 +378,17 @@ impl Pairing {
         let pending = match self.hosts.waiting_attempt() {
             Ok(Some(pending)) => pending,
             Ok(None) => return None,
-            Err(failure) => return Some(ended(progress, Err(failure))),
+            // Nothing says how the attempt was made; the ending this can be is the same either way.
+            Err(failure) => return Some(ended(progress, Err(failure), AttemptMode::Code, None)),
         };
+        let mode = pending.mode;
         progress.send_replace(reconnecting(&pending));
         // Nothing this device does for another host may close the endpoint the attempt uses.
         let _held = match within(WAIT_STEP, self.link.hold(&pending.network_config)).await {
             Ok(held) => held,
             Err(error) => {
-                return Some(ended(
-                    progress,
-                    Err(link_failed(&error, pending.tries_left)),
-                ));
+                let failure = link_failed(&error, pending.tries_left);
+                return Some(ended(progress, Err(failure), mode, None));
             }
         };
         // The host may have committed this device already, and this device recorded it and
@@ -384,7 +397,8 @@ impl Pairing {
         let recorded = match self.hosts.by_device(pending.host_device_id) {
             Ok(recorded) => recorded,
             Err(failure) => {
-                return Some(ended(progress, Err(failure.or_tries(pending.tries_left))));
+                let failure = failure.or_tries(pending.tries_left);
+                return Some(ended(progress, Err(failure), mode, None));
             }
         };
         let outcome = match recorded {
@@ -394,7 +408,7 @@ impl Pairing {
                 .map_err(|failure| failure.or_tries(pending.tries_left)),
             _ => self.await_approval(pending, None, progress).await,
         };
-        Some(ended(progress, outcome))
+        Some(ended(progress, outcome, mode, None))
     }
 
     async fn code_attempt(
@@ -1182,13 +1196,17 @@ fn reconnecting(pending: &PendingAttempt) -> AttemptState {
 }
 
 /// Publishes how an attempt ended, and passes it on.
-fn ended(
+pub(crate) fn ended(
     progress: &watch::Sender<AttemptState>,
     outcome: Result<PairedHost, PairingFailure>,
+    mode: AttemptMode,
+    service: Option<String>,
 ) -> Result<PairedHost, PairingFailure> {
     if let Err(failure) = &outcome {
         progress.send_replace(AttemptState::Ended {
             failure: failure.clone(),
+            mode,
+            service,
         });
     }
     outcome

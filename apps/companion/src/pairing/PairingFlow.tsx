@@ -23,6 +23,7 @@ import {
   type FailureKind,
   type HostRow,
   type InvitationSummary,
+  type PairingFailure,
   type PairingView
 } from '../host/port'
 import { VerificationValue } from './VerificationValue'
@@ -36,6 +37,7 @@ import {
   minutesLeft,
   timeLeft,
   triesTheCodeAgain,
+  type AttemptMode,
   type NextAction
 } from './words'
 
@@ -69,7 +71,9 @@ function spends(view: PairingView): boolean {
   return (
     state.state === 'paired' ||
     (state.state === 'ended' &&
-      !triesTheCodeAgain(failureWords(state.failure.kind, view.origin.host).action))
+      !triesTheCodeAgain(
+        failureWords(state.failure.kind, state.service ?? view.origin.host, state.mode).action
+      ))
   )
 }
 
@@ -474,31 +478,58 @@ export function PairingFlow(): ReactNode {
       ) : null}
 
       {screen === 'ended' && view.state.state === 'ended' ? (
-        <section aria-labelledby="pairing-ended" className="pairing-section">
-          <h1 id="pairing-ended" ref={heading} tabIndex={-1}>
-            Pairing did not finish
-          </h1>
-          <p role="alert" data-testid="failure-sentence">
-            {failureSentence(view.state.failure, service)}
-          </p>
-          <div className="row">
-            <Button
-              tone="primary"
-              data-testid="failure-action"
-              onClick={() => {
-                if (view.state.state === 'ended') {
-                  next(failureWords(view.state.failure.kind, service).action)
-                }
-              }}
-            >
-              {actionLabel(failureWords(view.state.failure.kind, service).action)}
-            </Button>
-          </div>
-        </section>
+        <Ended
+          failure={view.state.failure}
+          mode={view.state.mode}
+          service={view.state.service ?? service}
+          heading={heading}
+          onAction={next}
+        />
       ) : null}
 
       {screen === 'entry' && view.hosts.length > 0 ? <PairedHosts hosts={view.hosts} /> : null}
     </div>
+  )
+}
+
+/**
+ * How an attempt ended, in the words for how it was made and the service it went through, with
+ * the one thing the person can do next.
+ */
+function Ended({
+  failure,
+  mode,
+  service,
+  heading,
+  onAction
+}: {
+  readonly failure: PairingFailure
+  readonly mode: AttemptMode
+  readonly service: string
+  readonly heading: RefObject<HTMLHeadingElement | null>
+  readonly onAction: (action: NextAction) => void
+}): ReactNode {
+  const { action } = failureWords(failure.kind, service, mode)
+  return (
+    <section aria-labelledby="pairing-ended" className="pairing-section">
+      <h1 id="pairing-ended" ref={heading} tabIndex={-1}>
+        Pairing did not finish
+      </h1>
+      <p role="alert" data-testid="failure-sentence">
+        {failureSentence(failure, service, mode)}
+      </p>
+      <div className="row">
+        <Button
+          tone="primary"
+          data-testid="failure-action"
+          onClick={() => {
+            onAction(action)
+          }}
+        >
+          {actionLabel(action)}
+        </Button>
+      </div>
+    </section>
   )
 }
 
