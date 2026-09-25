@@ -332,12 +332,27 @@ export function Banner({
 
 /* ---- The toast ------------------------------------------------------------------------------- */
 
-/** One passing message. */
+/** The one thing a passing message offers to do. */
+export interface ToastAction {
+  /** The name of its button. */
+  readonly label: string
+  readonly act: () => void
+}
+
+/** One passing message, and what it offers to do, if anything. */
 export interface ToastMessage {
   readonly id: number
   readonly text: string
   readonly tone: 'success' | 'danger' | 'pending'
+  readonly action?: ToastAction
 }
+
+/**
+ * How long a message stays once nothing holds it: long enough to read, and longer when it offers
+ * something to do, which takes a decision as well as a reading.
+ */
+const TOAST_MS = 4200
+const TOAST_WITH_ACTION_MS = 8000
 
 /** Shows the newest message, and takes it away. */
 export function Toast({
@@ -347,17 +362,52 @@ export function Toast({
   readonly message: ToastMessage | null
   readonly onDismiss: () => void
 }): ReactNode {
+  if (!message) return null
+  return <ToastBody key={message.id} message={message} onDismiss={onDismiss} />
+}
+
+/**
+ * One message. It stays while the pointer rests on it or focus is inside it, so its action can
+ * always be reached before it goes, and it goes its time after both have left.
+ */
+function ToastBody({
+  message,
+  onDismiss
+}: {
+  readonly message: ToastMessage
+  readonly onDismiss: () => void
+}): ReactNode {
+  const [held, setHeld] = useState(false)
   useEffect(() => {
-    if (!message) return
-    const handle = setTimeout(onDismiss, 4200)
+    if (held) return
+    const handle = setTimeout(
+      onDismiss,
+      message.action === undefined ? TOAST_MS : TOAST_WITH_ACTION_MS
+    )
     return () => {
       clearTimeout(handle)
     }
-  }, [message, onDismiss])
+  }, [held, message, onDismiss])
 
-  if (!message) return null
+  const { action } = message
   return (
-    <div className="toast" role="status" aria-live="polite" key={message.id}>
+    <div
+      className="toast"
+      role="status"
+      aria-live="polite"
+      onPointerEnter={() => {
+        setHeld(true)
+      }}
+      onPointerLeave={() => {
+        setHeld(false)
+      }}
+      onFocus={() => {
+        setHeld(true)
+      }}
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget)) setHeld(false)
+      }}
+    >
       <span
         className={
           message.tone === 'danger'
@@ -371,6 +421,16 @@ export function Toast({
         {message.tone === 'danger' ? '!' : message.tone === 'pending' ? '…' : '✓'}
       </span>
       <span>{message.text}</span>
+      {action === undefined ? null : (
+        <Button
+          onClick={() => {
+            action.act()
+            onDismiss()
+          }}
+        >
+          {action.label}
+        </Button>
+      )}
       <IconButton label="Dismiss" onClick={onDismiss}>
         ×
       </IconButton>

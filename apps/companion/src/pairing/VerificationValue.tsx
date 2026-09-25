@@ -28,3 +28,16 @@ export function VerificationValue({ value }: { readonly value: string }): ReactN
     </p>
   )
 }
+
+/**
+ * The value inside a sentence, as an owner's request shows it: grouped, monospace with tabular
+ * figures, and spelled out for a screen reader, which reads only the spelled form.
+ */
+export function SpelledValue({ value }: { readonly value: string }): ReactNode {
+  return (
+    <span className="mono tabular">
+      <span className="visually-hidden">{spelledValue(value)}</span>
+      <span aria-hidden="true">{value}</span>
+    </span>
+  )
+}

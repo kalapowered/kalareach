@@ -9,7 +9,14 @@
  * and offers nothing to press.
  */
 
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type ReactNode
+} from 'react'
 
 import { Button, CommitButton } from '../components/ui'
 import { useApp } from '../app/state'
@@ -17,9 +24,9 @@ import {
   failureMessage,
   type CeremonyKind,
   type ConfirmationRequest,
-  type OwnerView,
   type ReviewOutcome
 } from '../host/port'
+import { SpelledValue } from './VerificationValue'
 import { secondsLeft } from './words'
 
 /** How long a row that has gone stays on screen while it fades. */
@@ -55,77 +62,104 @@ function outcomeWords(outcome: ReviewOutcome, host: string): string {
   }
 }
 
-/** The confirmations this computer's hosts ask for, kept current. */
-export function useConfirmations(): OwnerView | null {
-  const { port } = useApp()
-  const [view, setView] = useState<OwnerView | null>(null)
+/** The confirmations this computer's hosts ask for, as every screen reads them. */
+export function useConfirmations(): {
+  readonly ceremony: CeremonyKind
+  readonly requests: readonly ConfirmationRequest[]
+} | null {
+  const { confirmations } = useApp()
+  const { view, shown } = useSyncExternalStore(confirmations.subscribe, confirmations.current)
+  return view === null ? null : { ceremony: view.ceremony, requests: shown }
+}
+
+/** A row, and whether it is leaving. */
+interface Row {
+  readonly request: ConfirmationRequest
+  readonly leaving: boolean
+}
+
+/** The rows for `shown`, after `before`: each keeps its place, and those that went are leaving. */
+function arrange(before: readonly Row[], shown: readonly ConfirmationRequest[]): readonly Row[] {
+  const current = new Map(shown.map((request) => [request.reference, request]))
+  const kept = before.map((row) => {
+    const now = current.get(row.request.reference)
+    return now === undefined ? { request: row.request, leaving: true } : { request: now, leaving: false }
+  })
+  const drawn = new Set(before.map((row) => row.request.reference))
+  const arrived = shown
+    .filter((request) => !drawn.has(request.reference))
+    .map((request) => ({ request, leaving: false }))
+  return [...kept, ...arrived]
+}
+
+/**
+ * The rows for `shown`, and those that just went, each fading in its own place for
+ * {@link LEAVING_MS} before it is taken off. A row keeps its identity while it leaves, and its
+ * removal is its own: later changes neither cancel nor restart it.
+ */
+function useRows(shown: readonly ConfirmationRequest[]): readonly Row[] {
+  const [rows, setRows] = useState<readonly Row[]>(() =>
+    shown.map((request) => ({ request, leaving: false }))
+  )
+  const [drawnFrom, setDrawnFrom] = useState(shown)
+  if (drawnFrom !== shown) {
+    setDrawnFrom(shown)
+    setRows((before) => arrange(before, shown))
+  }
+  const removals = useRef(new Map<string, ReturnType<typeof setTimeout>>())
   useEffect(() => {
-    let watching = true
-    let stop: (() => void) | null = null
-    // The requests are read once the listener is registered, so none can fall between the two.
-    // An event heard before the read answers is at least as new, so the read is let go then.
-    let heard = false
-    port
-      .onConfirmations((next) => {
-        heard = true
-        if (watching) setView(next)
-      })
-      .then(async (unlisten) => {
-        if (!watching) {
-          unlisten()
-          return
-        }
-        stop = unlisten
-        const current = await port.ownerConfirmations()
-        if (watching && !heard) setView(current)
-      })
-      .catch(() => {
-        // A computer that cannot pair has no confirmations to show.
-      })
-    return () => {
-      watching = false
-      stop?.()
+    const pending = removals.current
+    for (const { request, leaving } of rows) {
+      const removal = pending.get(request.reference)
+      if (leaving && removal === undefined) {
+        pending.set(
+          request.reference,
+          setTimeout(() => {
+            pending.delete(request.reference)
+            setRows((before) =>
+              before.filter((row) => !(row.leaving && row.request.reference === request.reference))
+            )
+          }, LEAVING_MS)
+        )
+      } else if (!leaving && removal !== undefined) {
+        // It came back before it was taken off.
+        clearTimeout(removal)
+        pending.delete(request.reference)
+      }
     }
-  }, [port])
-  return view
+  }, [rows])
+  useEffect(() => {
+    const pending = removals.current
+    return () => {
+      for (const removal of pending.values()) clearTimeout(removal)
+    }
+  }, [])
+  return rows
 }
 
 /** The requests, as rows. */
 export function Confirmations(): ReactNode {
-  const { port, say } = useApp()
-  const view = useConfirmations()
-  const [hidden, setHidden] = useState<ReadonlySet<string>>(new Set())
-  const [leaving, setLeaving] = useState<readonly ConfirmationRequest[]>([])
+  const { port, say, confirmations } = useApp()
+  const { view, shown, focusing } = useSyncExternalStore(
+    confirmations.subscribe,
+    confirmations.current
+  )
+  const rows = useRows(shown)
   const [reviewing, setReviewing] = useState<string | null>(null)
   const [now, setNow] = useState(() => Date.now())
-  const shown = useRef<ReadonlyMap<string, ConfirmationRequest>>(new Map())
-  const announced = useRef<Set<string>>(new Set())
+  const placed = useRef(new Map<string, HTMLLIElement>())
 
-  // A row that went away fades before it is taken off, and a new one is announced once.
+  // A request a "Review" asked for takes focus once its row is drawn, so a screen reader reads it
+  // and the next Tab reaches its buttons.
   useEffect(() => {
-    if (view === null) return
-    const current = new Map(view.requests.map((request) => [request.reference, request]))
-    const gone = [...shown.current.values()].filter(
-      (request) => !current.has(request.reference)
-    )
-    shown.current = current
-    for (const request of view.requests) {
-      if (!announced.current.has(request.reference)) {
-        announced.current.add(request.reference)
-        say(`${request.host_name} needs your confirmation`, 'pending')
-      }
-    }
-    if (gone.length === 0) return
-    setLeaving((before) => [...before, ...gone])
-    const taken = setTimeout(() => {
-      setLeaving((before) => before.filter((request) => !gone.includes(request)))
-    }, LEAVING_MS)
-    return () => {
-      clearTimeout(taken)
-    }
-  }, [view, say])
+    if (focusing === null) return
+    const row = placed.current.get(focusing)
+    if (row === undefined) return
+    row.focus()
+    confirmations.focused()
+  }, [focusing, rows, confirmations])
 
-  const counting = (view?.requests.length ?? 0) > 0
+  const counting = shown.length > 0
   useEffect(() => {
     if (!counting) return
     const tick = setInterval(() => {
@@ -154,26 +188,36 @@ export function Confirmations(): ReactNode {
     [port, say]
   )
 
-  if (view === null) return null
-  const rows = view.requests.filter((request) => !hidden.has(request.reference))
-  if (rows.length === 0 && leaving.length === 0) return null
+  if (view === null || rows.length === 0) return null
   const label = confirmLabel(view.ceremony)
 
   return (
     <section aria-labelledby="owner-confirmations" className="confirmations" data-testid="confirmations">
       <h2 id="owner-confirmations">Your hosts need your confirmation</h2>
       <ul className="confirmation-list">
-        {rows.map((request) => (
-          <li key={request.reference} className="confirmation-row" data-testid="confirmation-row">
+        {rows.map(({ request, leaving }) => (
+          <li
+            key={request.reference}
+            ref={(row) => {
+              if (row === null) placed.current.delete(request.reference)
+              else placed.current.set(request.reference, row)
+            }}
+            className="confirmation-row"
+            data-testid="confirmation-row"
+            data-leaving={leaving ? 'true' : undefined}
+            inert={leaving}
+            tabIndex={-1}
+            aria-labelledby={`confirmation-${request.reference}`}
+          >
             <div className="spacer">
-              <p className="confirmation-title">
+              <p className="confirmation-title" id={`confirmation-${request.reference}`}>
                 <strong>{request.title}</strong>
                 <span className="small muted"> · {request.host_name}</span>
               </p>
               {request.detail !== null ? <p className="small">{request.detail}</p> : null}
               {request.value !== null ? (
-                <p className="small">
-                  It should show <span className="mono tabular">{request.value}</span>.
+                <p className="small" data-testid="confirmation-value">
+                  It should show <SpelledValue value={request.value} />.
                 </p>
               ) : null}
               {!request.checkable ? (
@@ -204,25 +248,11 @@ export function Confirmations(): ReactNode {
                 tone="quiet"
                 data-testid="not-now"
                 onClick={() => {
-                  setHidden((before) => new Set([...before, request.reference]))
+                  confirmations.setAside(request)
                 }}
               >
                 Not now
               </Button>
-            </div>
-          </li>
-        ))}
-        {leaving.map((request) => (
-          <li
-            key={`leaving-${request.reference}`}
-            className="confirmation-row"
-            data-leaving="true"
-            aria-hidden="true"
-          >
-            <div className="spacer">
-              <p className="confirmation-title">
-                <strong>{request.title}</strong>
-              </p>
             </div>
           </li>
         ))}
