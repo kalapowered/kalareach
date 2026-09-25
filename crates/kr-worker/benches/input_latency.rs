@@ -1269,10 +1269,14 @@ fn draining_a_connection_the_host_closed_ends_and_says_so() {
 #[test]
 fn draining_a_connection_that_never_goes_quiet_ends_at_its_bound() {
     let within = Duration::from_millis(600);
+    let quiet = Duration::from_millis(200);
+    // What the drain may take past its own bound: the last wait for a frame, which is at most
+    // `quiet`, and the scheduler's delay in waking it, which is allowed a generous second here.
+    let allowance = quiet + Duration::from_secs(1);
     let (drained, took) = drained_within(
         Duration::from_secs(10),
         Afterwards::NeverGoesQuiet,
-        Duration::from_millis(200),
+        quiet,
         within,
     )
     .expect("the drain of a connection that never goes quiet ends");
@@ -1284,5 +1288,10 @@ fn draining_a_connection_that_never_goes_quiet_ends_at_its_bound() {
     assert!(
         took >= within,
         "the drain gave up after {took:?}, before its bound of {within:?}"
+    );
+    assert!(
+        took <= within + allowance,
+        "the drain took {took:?}, past its bound of {within:?} and the {allowance:?} allowed \
+         around it"
     );
 }
