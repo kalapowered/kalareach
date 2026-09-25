@@ -13,6 +13,7 @@
 //! kr-protocol-gen --docs-dir P      write the index to, and read the documentation from, P
 //! ```
 
+mod markdown;
 mod method_index;
 
 use std::path::{Path, PathBuf};

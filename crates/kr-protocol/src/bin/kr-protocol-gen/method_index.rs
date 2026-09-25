@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 
 use kr_protocol::method::{Method, MethodGroup, REGISTRY};
 
+use crate::markdown;
+
 /// Where the index is written, relative to the documentation root.
 pub(crate) const INDEX_PATH: &str = "protocol/methods.md";
 
@@ -39,6 +41,10 @@ pub(crate) struct Section {
 const PROTOCOL: Document = Document {
     path: "protocol/README.md",
     label: "Protocol",
+};
+const PLATFORMS: Document = Document {
+    path: "host/platforms.md",
+    label: "Platforms",
 };
 const PAIRING: Document = Document {
     path: "pairing/README.md",
@@ -86,12 +92,12 @@ pub(crate) const fn described_in(method: Method) -> Option<Section> {
     match method {
         Method::HostInfo
         | Method::EnvironmentList
-        | Method::EnvironmentCapabilities
         | Method::HostDoctor
         | Method::EnvironmentEnrol
         | Method::EnvironmentForget
         | Method::EnvironmentInventory
         | Method::EnvironmentRefresh => None,
+        Method::EnvironmentCapabilities => at(PLATFORMS, "What may be done on a desktop"),
         Method::DeliveryDestinationSecretSet => at(DELIVERY, "Credentials"),
 
         Method::PairInvite | Method::PairFinish | Method::PairConfirm => {
@@ -252,70 +258,6 @@ pub(crate) const fn described_in(method: Method) -> Option<Section> {
     }
 }
 
-/// Returns the anchor a heading gets on the page it is rendered on.
-///
-/// Letters, digits, hyphens and underscores are kept, spaces become hyphens, and everything else
-/// is dropped, after lower-casing. A second heading with the same anchor on one page gets a
-/// numbered one instead, which [`broken_links`] refuses to point at.
-pub(crate) fn anchor(heading: &str) -> String {
-    heading
-        .to_lowercase()
-        .chars()
-        .filter_map(|character| match character {
-            ' ' => Some('-'),
-            '-' | '_' => Some(character),
-            other if other.is_alphanumeric() => Some(other),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Returns the text of every heading in a Markdown document, in order.
-///
-/// Only headings written with `#` count, and a line inside a fenced code block is not a heading.
-pub(crate) fn headings(text: &str) -> Vec<&str> {
-    let mut found = Vec::new();
-    let mut fence: Option<&str> = None;
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        let indent = line.len() - trimmed.len();
-        if indent <= 3 {
-            let marker = ["```", "~~~"]
-                .into_iter()
-                .find(|marker| trimmed.starts_with(marker));
-            match (fence, marker) {
-                (None, Some(marker)) => {
-                    fence = Some(marker);
-                    continue;
-                }
-                (Some(open), Some(marker)) if open == marker => {
-                    fence = None;
-                    continue;
-                }
-                _ => {}
-            }
-        }
-        if fence.is_some() || indent > 3 {
-            continue;
-        }
-        let level = trimmed.bytes().take_while(|byte| *byte == b'#').count();
-        if !(1..=6).contains(&level) {
-            continue;
-        }
-        let rest = &trimmed[level..];
-        if !(rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\t')) {
-            continue;
-        }
-        let mut heading = rest.trim();
-        let closing = heading.trim_end_matches('#');
-        if closing.is_empty() || closing.ends_with(' ') || closing.ends_with('\t') {
-            heading = closing.trim_end();
-        }
-        found.push(heading);
-    }
-    found
-}
-
 /// Returns a link from the index to a section.
 fn link(section: &Section) -> String {
     let target = match section.document.path.strip_prefix("protocol/") {
@@ -326,7 +268,7 @@ fn link(section: &Section) -> String {
         "[{}: {}]({target}#{})",
         section.document.label,
         section.heading,
-        anchor(section.heading)
+        markdown::anchor(section.heading)
     )
 }
 
@@ -398,44 +340,59 @@ pub(crate) fn render() -> String {
     out
 }
 
-/// Returns a description of every index link whose document or heading is not there.
+/// Returns a description of every index link that does not land on the heading it names.
 ///
-/// A link is sound when its document exists under `docs` and the first heading there with the
-/// link's anchor is the heading the link names. An earlier heading with the same anchor would take
-/// the anchor, and the link would land on it instead.
+/// A link is sound when its document exists under `docs`, the heading it names is plain text and
+/// is there exactly once, and the page gives that heading the plain anchor the link carries. An
+/// earlier heading with the same anchor would take it, and the link would land there instead.
 pub(crate) fn broken_links(docs: &Path) -> Vec<String> {
-    let mut texts: BTreeMap<&str, Option<String>> = BTreeMap::new();
+    let mut documents: BTreeMap<&str, Option<Vec<markdown::Heading>>> = BTreeMap::new();
     let mut broken = Vec::new();
     for entry in REGISTRY {
         let Some(section) = described_in(entry.method) else {
             continue;
         };
-        let text = texts
-            .entry(section.document.path)
-            .or_insert_with(|| std::fs::read_to_string(docs.join(section.document.path)).ok());
-        let Some(text) = text else {
+        let path = section.document.path;
+        let headings = documents.entry(path).or_insert_with(|| {
+            std::fs::read_to_string(docs.join(path))
+                .ok()
+                .map(|text| markdown::headings(&text))
+        });
+        let Some(headings) = headings else {
             broken.push(format!(
-                "{}: {} is not a document under {}",
+                "{}: {path} is not a document under {}",
                 entry.name,
-                section.document.path,
                 docs.display()
             ));
             continue;
         };
-        let wanted = anchor(section.heading);
-        match headings(text)
-            .into_iter()
-            .find(|heading| anchor(heading) == wanted)
-        {
-            Some(heading) if heading == section.heading => {}
-            Some(heading) => broken.push(format!(
-                "{}: #{wanted} in {} is the anchor of \"{heading}\", not of \"{}\"",
-                entry.name, section.document.path, section.heading
-            )),
-            None => broken.push(format!(
-                "{}: {} has no heading \"{}\"",
-                entry.name, section.document.path, section.heading
-            )),
+        let wanted = markdown::anchor(section.heading);
+        let named: Vec<&markdown::Heading> = headings
+            .iter()
+            .filter(|heading| heading.source == section.heading)
+            .collect();
+        let problem = if !markdown::is_plain(section.heading) {
+            Some(format!(
+                "\"{}\" is not plain text, so its anchor is not its words",
+                section.heading
+            ))
+        } else {
+            match named.as_slice() {
+                [] => Some(format!("{path} has no heading \"{}\"", section.heading)),
+                [heading] if heading.anchor == wanted => None,
+                [heading] => Some(format!(
+                    "\"{}\" in {path} is anchored #{}, because an earlier heading takes #{wanted}",
+                    section.heading, heading.anchor
+                )),
+                _ => Some(format!(
+                    "{path} has {} headings \"{}\", so a link to one is ambiguous",
+                    named.len(),
+                    section.heading
+                )),
+            }
+        };
+        if let Some(problem) = problem {
+            broken.push(format!("{}: {problem}", entry.name));
         }
     }
     broken
@@ -500,10 +457,7 @@ pub(crate) fn unnamed_methods(docs: &Path) -> std::io::Result<Vec<&'static str>>
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{
-        INDEX_PATH, anchor, broken_links, headings, markdown_documents, names, render,
-        unnamed_methods,
-    };
+    use super::{INDEX_PATH, broken_links, markdown_documents, names, render, unnamed_methods};
 
     fn docs() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs")
@@ -557,43 +511,6 @@ mod tests {
     }
 
     #[test]
-    fn an_anchor_is_the_heading_lower_cased_with_punctuation_dropped() {
-        assert_eq!(anchor("What a reboot does"), "what-a-reboot-does");
-        assert_eq!(anchor("The `kr` command line"), "the-kr-command-line");
-        assert_eq!(
-            anchor("An owner's confirmations"),
-            "an-owners-confirmations"
-        );
-        assert_eq!(
-            anchor("Two activations, each atomic on its own"),
-            "two-activations-each-atomic-on-its-own"
-        );
-        assert_eq!(
-            anchor("Shown before a call (KR-REQ-15.19)"),
-            "shown-before-a-call-kr-req-1519"
-        );
-        assert_eq!(anchor("Café — déjà vu"), "café--déjà-vu");
-        assert_eq!(anchor("snake_case stays"), "snake_case-stays");
-    }
-
-    #[test]
-    fn a_heading_is_a_hash_line_outside_a_fence() {
-        let text = "# Title\n\
-                    text\n\
-                    ## Section ##\n\
-                    ```bash\n\
-                    # a comment\n\
-                    ```\n\
-                    ~~~\n\
-                    ## Also code\n\
-                    ~~~\n\
-                    #hashtag\n    \
-                    ## indented code\n\
-                    ### Last\n";
-        assert_eq!(headings(text), ["Title", "Section", "Last"]);
-    }
-
-    #[test]
     fn the_committed_index_is_what_the_registry_generates() {
         let path = docs().join(INDEX_PATH);
         let committed = std::fs::read_to_string(&path)
@@ -643,8 +560,25 @@ mod tests {
         assert_eq!(
             broken_links(copy.path()),
             [
-                "catalogue.sync: #what-a-sync-does in plugins/catalogue.md is the anchor of \
-                 \"What a sync does?\", not of \"What a sync does\""
+                "catalogue.sync: \"What a sync does\" in plugins/catalogue.md is anchored \
+                 #what-a-sync-does-1, because an earlier heading takes #what-a-sync-does"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_link_to_a_heading_the_document_repeats_is_broken() {
+        let copy = DocsCopy::of_the_documentation("repeated-heading");
+        copy.edit(
+            "plugins/catalogue.md",
+            "## When a payload is fetched\n",
+            "## What a sync does\n\n## When a payload is fetched\n",
+        );
+        assert_eq!(
+            broken_links(copy.path()),
+            [
+                "catalogue.sync: plugins/catalogue.md has 2 headings \"What a sync does\", so a \
+                 link to one is ambiguous"
             ]
         );
     }
