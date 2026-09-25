@@ -71,6 +71,8 @@ pub struct Target {
     /// `harness = false` is a program of its own: it prints no list and no verdicts the report can
     /// read, and only its exit status says anything.
     pub harness: bool,
+    /// Its edition, as Cargo gives it: `2015` where the manifest names none.
+    pub edition: String,
 }
 
 /// One package of the workspace.
@@ -286,6 +288,7 @@ pub fn parse(value: &Value) -> Result<Vec<Package>, String> {
                 src_path,
                 tested_by_default: tested,
                 harness: true,
+                edition: target["edition"].as_str().unwrap_or("2015").to_owned(),
             });
         }
         let dependencies = package["dependencies"]
