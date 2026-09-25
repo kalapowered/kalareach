@@ -232,8 +232,10 @@ impl RecordFile {
     /// # Errors
     ///
     /// Returns [`RecoveryError::Storage`] when the disk will not take it back. The record of the
-    /// write that never left then stays, saying the write is outstanding, which a store opened over
-    /// it ends with one fence: nothing ran under that identity, so the fence settles it.
+    /// write that never left then stays, saying the write is outstanding, and a store opened over
+    /// it ends that write as it ends any lost one, once the service can be asked: a fence, and a
+    /// read after it where the fence cannot say the write never ran. Nothing ran under that identity,
+    /// so whatever the fence answers, the write left nothing behind.
     pub(super) fn restore(&self, previous: Option<&WriteRecord>) -> Result<()> {
         if let Some(previous) = previous {
             return self.save(previous);

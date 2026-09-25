@@ -1514,6 +1514,11 @@ impl ManagedSyncService {
             };
             let recovery = answer.recovery_id.0;
             one_history(&mut history, recovery)?;
+            // The objects a page carries are read for their listing only, and each is still held to
+            // the kinds a collection holds.
+            for object in &answer.changed {
+                a_collections_kind(object.kind)?;
+            }
             let head = head_of(answer.key_epoch, answer.key_revision, recovery)?;
             inventory.recovery = recovery;
             inventory.objects = answer
@@ -1761,18 +1766,8 @@ impl ManagedSyncService {
             read(answer.data()?, "what an exchange answered")?,
             named.object_id,
         )?;
-        if named.is_the_bundle()
-            && matches!(
-                exchanged,
-                SyncExchanged::Refused {
-                    retained: Some(_),
-                    ..
-                }
-            )
-        {
-            return Err(contrary(
-                "a refused recovery bundle write with a copy, which a service never keeps",
-            ));
+        if let SyncExchanged::Refused { retained, .. } = exchanged {
+            no_copy_of_a_bundle(named, retained)?;
         }
         Ok(SyncDispatch::Answered(exchanged))
     }
@@ -1795,6 +1790,7 @@ impl ManagedSyncService {
             self.ask(&request, None).await?.data()?
         };
         let answer = status_answer(data, request_id, "what a status query answered")?;
+        no_copy_of_a_bundle(named, answer.conflict_id.0)?;
         let recovery = answer.recovery_id.0;
         Ok(match answer.state {
             StatusState::Applied => SyncRequestStatus::Applied {
@@ -1844,6 +1840,7 @@ impl ManagedSyncService {
             self.ask(&request, None).await?.data()?
         };
         let answer = status_answer(data, request_id, "what a fence answered")?;
+        no_copy_of_a_bundle(named, answer.conflict_id.0)?;
         let recovery = answer.recovery_id.0;
         Ok(match answer.state {
             StatusState::Applied => SyncRequestFence::Applied {
@@ -2671,6 +2668,20 @@ fn bundle_fetched(answer: BundleCompareAnswer, locator: SyncObjectId) -> Result<
         (Some(_), None) => Err(contrary("a read of a recovery bundle with another object")),
         (Some(_), Some(_)) => Err(contrary("a read of one recovery bundle with two")),
     }
+}
+
+/// Holds what an answer says a service kept of a refused write to the bundle's contract.
+///
+/// A service keeps no copy of a refused bundle write, so an exchange, a status query or a fence
+/// about one that names a copy is an answer about something else, and a copy named there would be
+/// one no resolution could reach.
+fn no_copy_of_a_bundle(named: Collection, retained: Option<SyncConflictId>) -> Result<()> {
+    if named.is_the_bundle() && retained.is_some() {
+        return Err(contrary(
+            "a copy of a recovery bundle write, which a service never keeps",
+        ));
+    }
+    Ok(())
 }
 
 /// Holds an object or a copy a collection's answer names to one of the kinds a collection holds.

@@ -6,8 +6,13 @@
 //! Every request carries an account token: `backup.write` for a writer, and for a read either that
 //! or `backup.restore`. A caller the collection does not admit is answered as for a collection
 //! that does not exist. Receipts, fences and request identities belong to the collection rather
-//! than to whoever presented them, and a request signed before the collection's cutoff runs
+//! than to whoever presented them, and a write signed before the collection's cutoff runs
 //! nothing. It checks no signature; the deployed legs hold the client to the service itself.
+//!
+//! What it does not model is stated, so nothing here is read as evidence of it: it sweeps no
+//! receipt, so a fence that finds none always says the request never ran, where a service works that
+//! out from the signing instants and what it has swept; and its cutoff refuses writes only, where a
+//! service's refuses every request signed before it.
 //!
 //! Each suite drives `BundleStore` and `FreshRestore` through `ManagedSyncService`, which is the
 //! path a device takes to a real service.
@@ -102,6 +107,9 @@ struct Web {
     fault_the_next_exchange: AtomicBool,
     /// A read of the first locator is served the second locator's bundle.
     substitution: Mutex<Option<(String, String)>>,
+    /// A status query or a fence about a refused write names a copy, which no service keeps of a
+    /// bundle.
+    names_copies_in_receipts: AtomicBool,
 }
 
 impl Web {
@@ -216,6 +224,7 @@ impl Web {
             _ => locator.clone(),
         };
         let history = self.history();
+        let names_a_copy = self.names_copies_in_receipts.load(Ordering::SeqCst);
         let mut collections = self.collections.lock().expect("the collections");
         let held = collections.entry(served).or_default();
         if held.owner.is_some_and(|owner| owner != issued.account) {
@@ -228,7 +237,7 @@ impl Web {
                 let request = asked["request_id"].as_str().expect("an identity");
                 held.receipts.get(request).map_or_else(
                     || answered(Self::unknown(request, &history)),
-                    |receipt| answered(Self::receipt(request, receipt, &history)),
+                    |receipt| answered(Self::receipt(request, receipt, &history, names_a_copy)),
                 )
             }
             "fence" => {
@@ -244,7 +253,7 @@ impl Web {
                     current_write_sequence: None,
                     never_ran: true,
                 });
-                answered(Self::receipt(&request, receipt, &history))
+                answered(Self::receipt(&request, receipt, &history, names_a_copy))
             }
             other => panic!("a bundle is written, read, asked about and fenced, not {other}"),
         }
@@ -397,17 +406,21 @@ impl Web {
         answer
     }
 
-    /// What a status query and a fence are answered about one receipt.
+    /// What a status query and a fence are answered about one receipt, naming a copy of a refused
+    /// write where the test asks for one.
     fn receipt(
         request: &str,
         receipt: &Recorded,
         history: &serde_json::Value,
+        names_a_copy: bool,
     ) -> serde_json::Value {
         let state = match receipt.outcome {
             "written" => "applied",
             "conflict" => "refused",
             _ => "fenced",
         };
+        let conflict_id =
+            (names_a_copy && receipt.outcome == "conflict").then(|| identity(0xee).to_string());
         serde_json::json!({
             "request_id": request,
             "state": state,
@@ -416,7 +429,7 @@ impl Web {
             "record": null,
             "current_revision": receipt.current_revision,
             "current_write_sequence": receipt.current_write_sequence,
-            "conflict_id": null,
+            "conflict_id": conflict_id,
             "recovery_id": history,
             "recorded_at": "2026-09-25T10:00:00.000Z",
         })
@@ -1341,36 +1354,135 @@ async fn a_fault_after_the_request_left_leaves_the_write_unknown() {
     );
 }
 
-/// Two writes made at once through one client each say whether their own request left: the one
-/// refused here is not sent, and the one whose answer was lost may have run.
+/// Where a device's account token comes from while a refresh is in flight: it waits until the test
+/// lets it through.
+#[derive(Debug)]
+struct Refreshing {
+    through: tokio::sync::Semaphore,
+}
+
+impl AccountTokenSource for Refreshing {
+    fn token<'a>(&'a self, _scope: &'a str) -> ServiceFuture<'a, AccountToken> {
+        Box::pin(async move {
+            self.through
+                .acquire()
+                .await
+                .expect("the source stays open")
+                .forget();
+            AccountToken::new("owner-write")
+        })
+    }
+}
+
+/// Two writes in flight at once each say whether their own request left. One waits for its token,
+/// as a refresh makes it wait, while the other's request leaves and its answer is lost; the waiting
+/// one is then refused here, its instant out of the service's window, and reaches the service not at
+/// all. The one refused here is not sent and leaves its store as it was; the lost one may have run
+/// and stays outstanding.
 #[tokio::test]
-async fn two_writes_at_once_each_say_whether_their_own_request_left() {
+async fn two_writes_in_flight_at_once_each_say_whether_their_own_request_left() {
     let web = Web::open();
     web.issue("owner-write", "owner", &[BACKUP_WRITE_SCOPE]);
-    let owner = client(&web, &SignIn::holding("owner-write"), BACKUP_WRITE_SCOPE);
+    let refreshing = Arc::new(Refreshing {
+        through: tokio::sync::Semaphore::new(0),
+    });
+    let waiting = Arc::new(unsigned_client(&web).presenting(
+        Arc::clone(&refreshing) as Arc<dyn AccountTokenSource>,
+        BACKUP_WRITE_SCOPE,
+    ));
+    let answering = client(&web, &SignIn::holding("owner-write"), BACKUP_WRITE_SCOPE);
     let seed = RecoverySeed::generate().expect("a seed");
-    let mut first = store(&owner, at(ORIGIN, &fresh_locator().expect("a locator")));
-    let mut second = store(&owner, at(ORIGIN, &fresh_locator().expect("a locator")));
+    let mut first = store(&waiting, at(ORIGIN, &fresh_locator().expect("a locator")));
+    let mut second = store(&answering, at(ORIGIN, &fresh_locator().expect("a locator")));
     let (mut one, mut two) = (BundleStore::empty(now()), BundleStore::empty(now()));
     web.lose_the_next_answer.store(true, Ordering::SeqCst);
     let stale = TimestampMs::new(now_ms() - 2 * SERVICE_REQUEST_FRESHNESS_MS);
-    let (refused, lost) = tokio::join!(
-        first.commit(&seed, &mut one, stale),
-        second.commit(&seed, &mut two, now()),
-    );
-    assert!(
-        matches!(refused, Err(RecoveryError::BundleNotSent { .. })),
-        "{refused:?}"
-    );
+    let meanwhile = async {
+        let lost = second.commit(&seed, &mut two, now()).await;
+        assert_eq!(
+            web.members(),
+            ["exchange"],
+            "the write waiting for its token has sent nothing"
+        );
+        refreshing.through.add_permits(1);
+        lost
+    };
+    let (refused, lost) = tokio::join!(first.commit(&seed, &mut one, stale), meanwhile);
+    match refused {
+        Err(RecoveryError::BundleNotSent { source }) => {
+            assert_eq!(source.code(), ErrorCode::ClockUntrusted);
+        }
+        other => panic!("refused here once its token came: {other:?}"),
+    }
     assert!(
         matches!(lost, Err(RecoveryError::BundleOutcomeUnknown { .. })),
         "{lost:?}"
+    );
+    assert_eq!(
+        web.members(),
+        ["exchange"],
+        "only the lost write reached the service"
     );
     assert_eq!(first.lost_write(), None);
     assert!(matches!(
         second.lost_write(),
         Some(LostWrite::Unsettled { .. })
     ));
+}
+
+/// A service keeps no copy of a refused bundle write, so a status query or a fence about one whose
+/// answer names a copy is an answer about something else, and an unknown outcome; the same answers
+/// naming none are read as the refusal they are.
+#[tokio::test]
+async fn a_bundle_receipt_that_names_a_copy_is_not_an_answer_this_client_reads() {
+    let owner = owner_with_a_writer().await;
+    let collection = bundle_collection(&at(ORIGIN, &owner.locator));
+    let key = owner
+        .seed
+        .bundle_key_for(&at(ORIGIN, &owner.locator))
+        .expect("a key");
+    let sealed = kr_crypto::archive::encrypt_recovery_bundle(&key, &owner.bundle).expect("sealed");
+    let refused_write = identity(0xd1);
+    let refused = owner
+        .client
+        .compare_exchange(&collection, refused_write, now_ms(), None, &sealed)
+        .await
+        .expect("an answer");
+    assert!(matches!(
+        refused,
+        SyncExchanged::Refused { retained: None, .. }
+    ));
+    assert!(matches!(
+        owner
+            .client
+            .request_status(&collection, refused_write)
+            .await
+            .expect("a receipt"),
+        SyncRequestStatus::Refused { retained: None, .. }
+    ));
+
+    owner
+        .web
+        .names_copies_in_receipts
+        .store(true, Ordering::SeqCst);
+    assert_eq!(
+        owner
+            .client
+            .request_status(&collection, refused_write)
+            .await
+            .expect_err("a copy no service keeps")
+            .code(),
+        ErrorCode::OutcomeUnknown
+    );
+    assert_eq!(
+        owner
+            .client
+            .fence_request(&collection, refused_write, now_ms(), now_ms())
+            .await
+            .expect_err("a copy no service keeps")
+            .code(),
+        ErrorCode::OutcomeUnknown
+    );
 }
 
 /// A locator the service cannot address, and a request the bundle's contract does not have, are

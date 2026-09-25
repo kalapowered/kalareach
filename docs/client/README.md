@@ -1052,8 +1052,9 @@ account token, for a signing instant outside the service's window or for a locat
 cannot address can never run, so `commit` puts back the record the call found, reports
 `BundleNotSent`, and the next write goes out. A migration whose destination write is refused that
 way leaves both locations and both stores as they were. A record the disk will not take back
-reads, after a restart, as a write outstanding, which one fence ends. Everything after the request
-left stays unknown, a fault with no envelope included.
+reads, after a restart, as a write outstanding, and `end_lost_write` ends it once the service can
+be asked: a fence, and a read after it where the fence cannot say the write never ran. Everything
+after the request left stays unknown, a fault with no envelope included.
 
 Two things end it. A read that finds the very bytes this device sent, which the record's digest
 establishes, settles the write as applied: it landed, and it cannot land twice, because a service

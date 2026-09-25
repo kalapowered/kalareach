@@ -52,8 +52,10 @@
 //! instant outside the service's window or for any other reason of its own. Nothing can run under
 //! that identity, so the store puts back what the call found, the record on the disk included as
 //! far as the disk allows, reports [`RecoveryError::BundleNotSent`], and the next write goes out. A
-//! record the disk would not take back is a write that never left and still reads as outstanding,
-//! which a restart ends with one fence. Everything after the request left stays unknown.
+//! record the disk would not take back is a write that never left and still reads as outstanding
+//! after a restart, and [`BundleStore::end_lost_write`] ends it once the service can be asked: a
+//! fence, and a read after it where the fence cannot say the write never ran. Everything after the
+//! request left stays unknown.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -685,8 +687,8 @@ impl BundleStore {
         {
             // Refused before anything left: nothing can run under the identity, so the store is put
             // back as the call found it. The record on the disk goes back too, as far as the disk
-            // allows; one it would not take back reads as a write outstanding, which a restart ends
-            // with one fence, and this process goes on from the record it had.
+            // allows; one it would not take back reads after a restart as a write outstanding,
+            // which ending the lost write settles, and this process goes on from the record it had.
             Ok(SyncDispatch::NotSent(refused)) => {
                 let _ = self.file.restore(previous.as_ref());
                 self.last_write = previous;
