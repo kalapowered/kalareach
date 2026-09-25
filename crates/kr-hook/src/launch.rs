@@ -55,6 +55,10 @@ const CONNECT_RETRY: Duration = Duration::from_millis(10);
 /// The variables that name a backend, taken out of a program that runs without one.
 const LAUNCH_VARIABLES: [&str; 2] = [REGISTRATION_VARIABLE, "KR_CREDENTIAL"];
 
+/// The flag that opens a file without waiting for it, whatever the file is.
+#[cfg(unix)]
+const NONBLOCK: i32 = rustix::fs::OFlags::NONBLOCK.bits().cast_signed();
+
 /// The exit code of a launcher that runs nothing because its variable names no launch it could
 /// have been given.
 const EXIT_NOT_A_LAUNCH: u8 = 126;
@@ -190,6 +194,13 @@ fn read_no_follow(
     use std::io::Read as _;
     let mut options = cap_std::fs::OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
+    // Opened without waiting, so a FIFO or a device put in the file's place cannot hold the
+    // launcher before its deadline applies; anything but a regular file is refused below.
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt as _;
+        options.custom_flags(NONBLOCK);
+    }
     let file = directory
         .open_with(name, &options)
         .map_err(|error| format!("{}: {error}", name.display()))?;
@@ -331,13 +342,9 @@ fn connect_by(
         rustix::io::ioctl_fionbio(&socket, true)
             .map_err(|error| format!("the socket cannot be made non-blocking: {error}"))?;
         match rustix::net::connect(&socket, &address) {
-            Ok(()) => {
-                let stream = std::os::unix::net::UnixStream::from(socket);
-                stream
-                    .set_nonblocking(false)
-                    .map_err(|error| format!("the connection cannot be read: {error}"))?;
-                return Ok(stream);
-            }
+            // The socket stays non-blocking: every read and write waits for readiness, bounded
+            // by the deadline, and none can wait past it.
+            Ok(()) => return Ok(std::os::unix::net::UnixStream::from(socket)),
             // The endpoint's queue is full: the same connect is tried again until the deadline.
             Err(Errno::AGAIN | Errno::INPROGRESS) => {
                 let left = remaining(deadline).ok_or_else(|| {
@@ -350,7 +357,33 @@ fn connect_by(
     }
 }
 
-/// Writes all of `bytes` by `deadline`, each write given only the time left.
+/// Waits until the stream is ready for `events`, by `deadline`.
+#[cfg(unix)]
+fn ready_by(
+    stream: &std::os::unix::net::UnixStream,
+    events: rustix::event::PollFlags,
+    deadline: Instant,
+    late: &str,
+) -> Result<(), String> {
+    loop {
+        let left = remaining(deadline).ok_or_else(|| late.to_owned())?;
+        let timeout = rustix::event::Timespec {
+            tv_sec: i64::try_from(left.as_secs()).unwrap_or(i64::MAX),
+            tv_nsec: i64::from(left.subsec_nanos()),
+        };
+        let mut waiting = [rustix::event::PollFd::new(stream, events)];
+        match rustix::event::poll(&mut waiting, Some(&timeout)) {
+            Ok(0) => return Err(late.to_owned()),
+            // Ready, or closed or failed, which the read or write that follows says.
+            Ok(_) => return Ok(()),
+            Err(rustix::io::Errno::INTR) => {}
+            Err(error) => return Err(format!("the endpoint cannot be waited on: {error}")),
+        }
+    }
+}
+
+/// Writes all of `bytes` by `deadline`, on a non-blocking socket, each write waiting for readiness
+/// only as long as is left.
 #[cfg(unix)]
 fn write_all_by(
     stream: &mut std::os::unix::net::UnixStream,
@@ -359,30 +392,28 @@ fn write_all_by(
 ) -> Result<(), String> {
     let mut written = 0;
     while let Some(rest) = bytes.get(written..).filter(|rest| !rest.is_empty()) {
-        let left = remaining(deadline).ok_or_else(|| "the deadline passed".to_owned())?;
-        stream
-            .set_write_timeout(Some(left))
-            .map_err(|error| format!("the endpoint cannot be bounded: {error}"))?;
+        ready_by(
+            stream,
+            rustix::event::PollFlags::OUT,
+            deadline,
+            "the deadline passed",
+        )?;
         match stream.write(rest) {
             Ok(0) => return Err("the endpoint closed".to_owned()),
             Ok(count) => written += count,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error)
                 if matches!(
                     error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                return Err("the deadline passed".to_owned());
-            }
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) => {}
             Err(error) => return Err(format!("the endpoint cannot be written: {error}")),
         }
     }
     Ok(())
 }
 
-/// Reads one line by `deadline`, each read given only the time left, so an answer that trickles
-/// in cannot hold the launcher past it.
+/// Reads one line by `deadline`, on a non-blocking socket, each read waiting for readiness only as
+/// long as is left, so an answer that trickles in cannot hold the launcher past it.
 #[cfg(unix)]
 fn read_line_by(
     stream: &mut std::os::unix::net::UnixStream,
@@ -391,11 +422,12 @@ fn read_line_by(
     let mut line = Vec::new();
     let mut buffer = [0_u8; 512];
     loop {
-        let left =
-            remaining(deadline).ok_or_else(|| "the backend did not answer in time".to_owned())?;
-        stream
-            .set_read_timeout(Some(left))
-            .map_err(|error| format!("the endpoint cannot be bounded: {error}"))?;
+        ready_by(
+            stream,
+            rustix::event::PollFlags::IN,
+            deadline,
+            "the backend did not answer in time",
+        )?;
         match stream.read(&mut buffer) {
             Ok(0) if line.is_empty() => return Err("the backend refused it".to_owned()),
             Ok(0) => return Err("the endpoint closed in the middle of an answer".to_owned()),
@@ -410,15 +442,11 @@ fn read_line_by(
                     return Err("the backend's answer is too long".to_owned());
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error)
                 if matches!(
                     error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                return Err("the backend did not answer in time".to_owned());
-            }
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) => {}
             Err(error) => return Err(format!("the endpoint cannot be read: {error}")),
         }
     }

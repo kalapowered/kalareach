@@ -539,6 +539,13 @@ fn read_bounded(
     use std::io::Read as _;
     let mut options = cap_std::fs::OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
+    // Opened without waiting, so a FIFO or a device put in the file's place cannot hold the
+    // forwarder; anything but a regular file is refused below.
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt as _;
+        options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits().cast_signed());
+    }
     let file = directory.open_with(name, &options)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {

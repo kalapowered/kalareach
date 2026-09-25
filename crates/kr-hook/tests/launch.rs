@@ -52,6 +52,9 @@ if [ -n "$HOOK" ]; then
   if [ -n "$WAIT_FOR" ]; then while [ ! -f "$WAIT_FOR" ]; do sleep 0.02; done; fi
   printf '%s' "$HOOK_EVENT" | "$HOOK" claude-code hook > "$report.hook" 2>&1
   echo done > "$report.hooked"
+  if [ -n "$THEN_EXEC" ]; then
+    exec "$THEN_EXEC" -c 'printf "%s" "$HOOK_EVENT_2" | "$HOOK" claude-code hook > "$REPORT.hook2" 2>&1; echo done > "$REPORT.hooked2"; sleep 1; exit 0'
+  fi
 fi
 sleep "${LINGER:-0}"
 exit 0
@@ -740,6 +743,16 @@ fn kr_req_05_09_admissions_run_beside_each_other_up_to_their_bound() {
 /// A backend directory made by hand around `endpoint`: its credential, its launch record, and an
 /// answer naming a registration whose file name places the two added flags after the typed vector.
 fn hand_made_backend(shell: &Shell, directory: &Path, endpoint: &Path) -> CommandBackend {
+    hand_made_backend_at(shell, directory, endpoint, Shell::typed().len())
+}
+
+/// The same, for a typed vector of `typed` arguments.
+fn hand_made_backend_at(
+    shell: &Shell,
+    directory: &Path,
+    endpoint: &Path,
+    typed: usize,
+) -> CommandBackend {
     kr_ipc::paths::create_new_owner_only_file(
         &directory.join("credential"),
         "09".repeat(32).as_bytes(),
@@ -757,7 +770,7 @@ fn hand_made_backend(shell: &Shell, directory: &Path, endpoint: &Path) -> Comman
         environment: vec![EnvironmentVariable {
             name: "KR_REGISTRATION".to_owned(),
             value: directory
-                .join(format!("registration.{}.2", Shell::typed().len()))
+                .join(format!("registration.{typed}.2"))
                 .display()
                 .to_string(),
         }],
@@ -1155,6 +1168,171 @@ fn kr_req_05_09_a_program_rewritten_in_place_after_it_was_hashed_is_refused() {
         selected(&shell, instance),
         None,
         "the hook of a program written since it was hashed moves nothing"
+    );
+    let _ = finish(held);
+}
+
+/// A thread a program starts a new session with after it execs another program.
+const SECOND_THREAD: &str = "9b2e6f10-7c4d-4e8a-a1f3-2d5c8b0e4f22";
+
+/// KR-REQ-05.09: a program whose first hook was admitted, and which then execs another program in
+/// its own process, gets no bridge for the other: every bridge is checked against the kernel's
+/// record of what the process executes now.
+#[test]
+fn kr_req_05_09_a_program_that_execs_another_gets_no_bridge_for_it() {
+    let shell = Shell::new();
+    let hook = shell.placed.forwarder.display().to_string();
+    let (_, another) = shells();
+    let second = SESSION_START.replace(THREAD, SECOND_THREAD);
+    let then_exec = another.display().to_string();
+    let answer = shell.establish();
+    let child = shell.launch(
+        &answer,
+        "execs",
+        &[
+            ("HOOK", hook.as_str()),
+            ("HOOK_EVENT", SESSION_START),
+            ("HOOK_EVENT_2", second.as_str()),
+            ("THEN_EXEC", then_exec.as_str()),
+        ],
+    );
+    let instance = instance_of(&shell.report("execs"));
+    hooked(&shell, "execs");
+    assert_eq!(
+        selected(&shell, instance).as_deref(),
+        Some(THREAD),
+        "the program's own hook is admitted"
+    );
+    eventually("the other program's hook has run", || {
+        shell.reports.join("execs.hooked2").exists()
+    });
+    assert_eq!(
+        selected(&shell, instance).as_deref(),
+        Some(THREAD),
+        "the hook of the program it execed moves nothing"
+    );
+    let _ = finish(child);
+}
+
+/// KR-REQ-12.07: a backend that drains the launcher's presentation a byte at a time cannot hold it
+/// past its deadline, however large the presentation: every write waits for readiness only as long
+/// as is left.
+#[test]
+fn kr_req_12_07_a_slowly_drained_presentation_cannot_hold_the_launcher() {
+    use std::io::Read as _;
+    let shell = Shell::new();
+    let directory = private(&shell, "d");
+    let endpoint = directory.join("e.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&endpoint).expect("an endpoint");
+    let serving = std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut byte = [0_u8; 1];
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(20) && matches!(stream.read(&mut byte), Ok(1))
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+    // Six arguments of 96 KiB each: more than any socket buffer holds, and inside every
+    // platform's bound on one argument and on all of them.
+    let mut typed = Shell::typed();
+    typed.extend((0..6).map(|index| format!("{index}{}", "x".repeat(96 * 1024))));
+    let answer = hand_made_backend_at(&shell, &directory, &endpoint, typed.len());
+    let mut command = shell.launcher(&shell.executable, &Shell::answered_for(&typed), None);
+    shell.prepare(&mut command, Some(&answer), "drained", &[]);
+    let started = Instant::now();
+    let (_, said) = finish(command.spawn().expect("the launcher starts"));
+    let took = started.elapsed();
+    assert!(
+        took < kr_hook::launch::ADMISSION_DEADLINE + Duration::from_secs(3),
+        "it gave up by its deadline: {took:?}, {}",
+        said.lines().last().unwrap_or_default()
+    );
+    let report = shell.report("drained");
+    assert_eq!(report["registered"], "no", "not admitted");
+    assert_eq!(report["variable"], "none", "without the variable");
+    assert!(
+        !report["args"].contains("--dangerously-load-development-channels"),
+        "and without the added flags"
+    );
+    let _ = serving.join();
+}
+
+/// KR-REQ-12.07: a launch record replaced by a FIFO cannot hold the launcher: it is opened without
+/// waiting, refused for not being a regular file, and the launcher runs what was typed.
+#[test]
+fn kr_req_12_07_a_fifo_in_place_of_the_launch_record_cannot_hold_the_launcher() {
+    let shell = Shell::new();
+    let answer = shell.establish();
+    let record = Shell::directory(&answer).join("launch");
+    std::fs::remove_file(&record).expect("the record goes");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&record)
+        .status()
+        .expect("mkfifo runs");
+    assert!(made.success(), "a FIFO in its place");
+    let started = Instant::now();
+    let (_, said) = finish(shell.launch(&answer, "fifo", &[]));
+    assert!(
+        started.elapsed() < kr_hook::launch::ADMISSION_DEADLINE + Duration::from_secs(3),
+        "it did not wait on the FIFO: {:?}, {said}",
+        started.elapsed()
+    );
+    assert_typed(&shell.report("fifo"), "a launch record that is a FIFO");
+}
+
+/// KR-REQ-05.09: on macOS, a file whose code was changed and which kept another file's code
+/// directory, established and then replaced by that other file before the exec, is refused: a code
+/// directory is kept only when its pages match the file that was hashed.
+#[cfg(target_os = "macos")]
+#[test]
+fn kr_req_05_09_a_code_directory_copied_into_changed_code_vouches_for_nothing() {
+    let shell = Shell::new();
+    let hook = shell.placed.forwarder.display().to_string();
+    let (program, _) = shells();
+    // Bash, with one byte of its arm64 slice's first page changed and its signature left as it was.
+    let mut bytes = std::fs::read(program).expect("the program's bytes");
+    let count = usize::try_from(u32::from_be_bytes(bytes[4..8].try_into().expect("four")))
+        .expect("a slice count");
+    let record = (0..count)
+        .map(|slice| 8 + slice * 20)
+        .find(|at| u32::from_be_bytes(bytes[*at..*at + 4].try_into().expect("four")) == 0x0100_000c)
+        .expect("an arm64 slice");
+    let offset = usize::try_from(u32::from_be_bytes(
+        bytes[record + 8..record + 12].try_into().expect("four"),
+    ))
+    .expect("an offset");
+    bytes[offset + 40] ^= 0xff;
+    let changed = shell.placed.host.root().join("bin").join("changed");
+    std::fs::write(&changed, &bytes).expect("the changed copy, which is hashed and never run");
+    let path = shell.placed.host.root().join("bin").join("stale");
+    std::os::unix::fs::symlink(&changed, &path).expect("the program");
+    let answer = shell.establish_for(&path);
+    let registration = Shell::registration(&answer);
+    let mut held = shell.launcher(&path, &Shell::answered(), Some(1000));
+    shell.prepare(
+        &mut held,
+        Some(&answer),
+        "stale",
+        &[
+            ("HOOK", hook.as_str()),
+            ("HOOK_EVENT", SESSION_START),
+            ("LINGER", "2"),
+        ],
+    );
+    let held = held.spawn().expect("the launcher starts");
+    eventually("the launch is admitted", || registration.exists());
+    retarget(&path, program);
+    let report = shell.report("stale");
+    assert_eq!(report["registered"], "yes", "the launch went ahead");
+    let instance = instance_of(&report);
+    hooked(&shell, "stale");
+    assert_eq!(
+        selected(&shell, instance),
+        None,
+        "the hook of a program only a copied directory vouched for moves nothing"
     );
     let _ = finish(held);
 }
