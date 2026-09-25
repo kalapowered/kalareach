@@ -1,0 +1,256 @@
+{
+  "account_id": "3c9f2b7a-5d18-4a62-9c07-1f5b8e2d4a90",
+  "authority": {
+    "chain": [
+      {
+        "payload": {
+          "key_revision": "1",
+          "not_before_ms": "1767139200000",
+          "organisation_id": "8f14e45f-ea1e-4b9e-9f3a-0a3a9b0d2f61",
+          "previous_key_revision": null,
+          "public_key": "4v4qObcyZkKCfW2C1JdiLNbCl_54Jw6qQ2sB8Ia288s"
+        },
+        "signature": "GcRsp_ekDf0UjK1vr7sPUBC1lEDSWlkf15n8zuFR7RILRgQqor9N_EhAdiQAO9vUaUYU5zAUEcVY82ikbwcZCw"
+      },
+      {
+        "payload": {
+          "key_revision": "2",
+          "not_before_ms": "1767182400000",
+          "organisation_id": "8f14e45f-ea1e-4b9e-9f3a-0a3a9b0d2f61",
+          "previous_key_revision": "1",
+          "public_key": "W2SJycf9Dc9QVF58FkiG70BJHsBsfxsSMEF5foEXU14"
+        },
+        "signature": "aM-BQCFkKj27RR6-4okyLxERM-Ey3FSmtqgNG3eO2wSidVL0WL-QcUreuLEcP_W3mPLRYzAzFtii7glCCL85Cw"
+      },
+      {
+        "payload": {
+          "key_revision": "3",
+          "not_before_ms": "1767225600000",
+          "organisation_id": "8f14e45f-ea1e-4b9e-9f3a-0a3a9b0d2f61",
+          "previous_key_revision": "2",
+          "public_key": "_sFChnP2r-iSZLOAc0SuiyadElpQOFUgJofbWnEoV58"
+        },
+        "signature": "fi77zffBx82xR8HOIF2tN36zzh9mL0vGFvS4jSEjCZkNEhtdRkln_Tl9-N63jf9alQzNI5sDPjYvVtQ_TcKZDg"
+      }
+    ],
+    "head": {
+      "payload": {
+        "expires_at_ms": "1767226800000",
+        "issued_at_ms": "1767225900000",
+        "key_revision": "3",
+        "organisation_id": "8f14e45f-ea1e-4b9e-9f3a-0a3a9b0d2f61"
+      },
+      "signature": "f0btMSXFoJ439BPNgXE6YT9oFPwg-F912M55KlpSTEYScmKQEPHdN1sck2YC0IDTOiXQBXndJEFylKOVjp8_BQ"
+    },
+    "organisation_id": "8f14e45f-ea1e-4b9e-9f3a-0a3a9b0d2f61"
+  },
+  "cases": [
+    {
+      "description": "Revision 1 of the policy-signing key, signed by itself: the revision a host pins.",
+      "domain": "kr-policy-authority/1",
+      "id": "link_revision_1",
+      "json": {
+        "payload": {
+          "key_revision": "1",
+          "not_before_ms": "1767139200000",
+          "organisation_id": "8f14e45f-ea1e-4b9e-9f3a-0a3a9b0d2f61",
+          "previous_key_revision": null,
+          "public_key": "4v4qObcyZkKCfW2C1JdiLNbCl_54Jw6qQ2sB8Ia288s"
+        },
+        "signature": "GcRsp_ekDf0UjK1vr7sPUBC1lEDSWlkf15n8zuFR7RILRgQqor9N_EhAdiQAO9vUaUYU5zAUEcVY82ikbwcZCw"
+      },
+      "message_hex": "82756b722d706f6c6963792d617574686f726974792f31a56a7075626c69635f6b65795820e2fe2a39b7326642827d6d82d497622cd6c297fe78270eaa436b01f086b6f3cb6c6b65795f7265766973696f6e016d6e6f745f6265666f72655f6d731b0000019b71b44c006f6f7267616e69736174696f6e5f6964508f14e45fea1e4b9e9f3a0a3a9b0d2f617570726576696f75735f6b65795f7265766973696f6ef6",
+      "message_sha256": "460401a927b882dc98bf5471141492b3f093703d055bbe4e2dc4e0ec61c815e3",
+      "signature_hex": "19c46ca7f7a40dfd148cad6fafbb0f5010b59440d25a591fd799fccee151ed120b46042aa2bf4dfc48407624003bdbd4694614e7301411c558f368a46f07190b",
+      "signer": "revision_1"
+    },
+    {
+      "description": "Revision 2, signed by revision 1 and taking over twelve hours after it.",
+      "domain": "kr-policy-authority/1",
+      "id": "link_revision_2",
+      "json": {
+        "payload": {
+          "key_revision": "2",
+          "not_before_ms": "1767182400000",
+          "organisation_id": "8f14e45f-ea1e-4b9e-9f3a-0a3a9b0d2f61",
+          "previous_key_revision": "1",
+          "public_key": "W2SJycf9Dc9QVF58FkiG70BJHsBsfxsSMEF5foEXU14"
+        },
+        "signature": "aM-BQCFkKj27RR6-4okyLxERM-Ey3FSmtqgNG3eO2wSidVL0WL-QcUreuLEcP_W3mPLRYzAzFtii7glCCL85Cw"
+      },
+      "message_hex": "82756b722d706f6c6963792d617574686f726974792f31a56a7075626c69635f6b657958205b6489c9c7fd0dcf50545e7c164886ef40491ec06c7f1b123041797e8117535e6c6b65795f7265766973696f6e026d6e6f745f6265666f72655f6d731b0000019b74477a006f6f7267616e69736174696f6e5f6964508f14e45fea1e4b9e9f3a0a3a9b0d2f617570726576696f75735f6b65795f7265766973696f6e01",
+      "message_sha256": "5bfcf9e1adfa3fea14ce3cbc35dba87ed7e63e655986b840b179a1a29d07d2f0",
+      "signature_hex": "68cf814021642a3dbb451ebee289322f111133e132dc54a6b6a80d1b778edb04a27552f458bf90714adeb8b11c3ff5b798f2d163303316d8a2ee094208bf390b",
+      "signer": "revision_1"
+    },
+    {
+      "description": "Revision 3, signed by revision 2 and taking over twelve hours after it.",
+      "domain": "kr-policy-authority/1",
+      "id": "link_revision_3",
+      "json": {
+        "payload": {
+          "key_revision": "3",
+          "not_before_ms": "1767225600000",
+          "organisation_id": "8f14e45f-ea1e-4b9e-9f3a-0a3a9b0d2f61",
+          "previous_key_revision": "2",
+          "public_key": "_sFChnP2r-iSZLOAc0SuiyadElpQOFUgJofbWnEoV58"
+        },
+        "signature": "fi77zffBx82xR8HOIF2tN36zzh9mL0vGFvS4jSEjCZkNEhtdRkln_Tl9-N63jf9alQzNI5sDPjYvVtQ_TcKZDg"
+      },
+      "message_hex": "82756b722d706f6c6963792d617574686f726974792f31a56a7075626c69635f6b65795820fec1428673f6afe89264b3807344ae8b269d125a503855202687db5a7128579f6c6b65795f7265766973696f6e036d6e6f745f6265666f72655f6d731b0000019b76daa8006f6f7267616e69736174696f6e5f6964508f14e45fea1e4b9e9f3a0a3a9b0d2f617570726576696f75735f6b65795f7265766973696f6e02",
+      "message_sha256": "0f79f9bbde03cc4e2c2231b899d3c53610c9a5da89ef055211b129159a7e53a8",
+      "signature_hex": "7e2efbcdf7c1c7cdb147c1ce205dad377eb3ce1f662f4bc616f4b88d212309990d121b5d464967fd397df8deb78dff5a950ccd239b033e362f56d43f4dc2990e",
+      "signer": "revision_2"
+    },
+    {
+      "description": "The statement that revision 3 signs now, signed by revision 3, five minutes after it took over.",
+      "domain": "kr-policy-authority-head/1",
+      "id": "head_revision_3",
+      "json": {
+        "payload": {
+          "expires_at_ms": "1767226800000",
+          "issued_at_ms": "1767225900000",
+          "key_revision": "3",
+          "organisation_id": "8f14e45f-ea1e-4b9e-9f3a-0a3a9b0d2f61"
+        },
+        "signature": "f0btMSXFoJ439BPNgXE6YT9oFPwg-F912M55KlpSTEYScmKQEPHdN1sck2YC0IDTOiXQBXndJEFylKOVjp8_BQ"
+      },
+      "message_hex": "82781a6b722d706f6c6963792d617574686f726974792d686561642f31a46c6973737565645f61745f6d731b0000019b76df3be06c6b65795f7265766973696f6e036d657870697265735f61745f6d731b0000019b76ecf7806f6f7267616e69736174696f6e5f6964508f14e45fea1e4b9e9f3a0a3a9b0d2f61",
+      "message_sha256": "a00aa78c0a4984cd1234cd6ba885c9fedfb24801ff68b9845658862e536fd858",
+      "signature_hex": "7f46ed3125c5a09e37f413cd81713a613f6814fc20f85f75d8ce792a5a524c461272629010f1dd375b1c936602d080d33a25d00579dd24417294a3958e9f3f05",
+      "signer": "revision_3"
+    },
+    {
+      "description": "A fifteen-minute controller lease for the member device, signed by revision 2 while it was the signing revision.",
+      "domain": "kr-membership-lease/2",
+      "id": "lease_by_revision_2",
+      "json": {
+        "payload": {
+          "account_id": "3c9f2b7a-5d18-4a62-9c07-1f5b8e2d4a90",
+          "device_key": "VV9GnCIYjpABW92FuIlnjUWfhr349700lxsQubOFhgk",
+          "expires_at_ms": "1767204900000",
+          "issued_at_ms": "1767204000000",
+          "key_revision": "2",
+          "maximum_grants": [
+            "files.read",
+            "question.respond",
+            "session.view",
+            "terminal.input"
+          ],
+          "organisation_id": "8f14e45f-ea1e-4b9e-9f3a-0a3a9b0d2f61",
+          "role": "controller"
+        },
+        "signature": "a2A90LDh6hOJdgBAYq0VOoOIo6bQVtjs8NErl1wuoixH8uRPzovpkEabWv2THZ_qV_zk2DDvpGOyaqtwCg_fDw"
+      },
+      "message_hex": "82756b722d6d656d626572736869702d6c656173652f32a864726f6c656a636f6e74726f6c6c65726a6163636f756e745f6964782433633966326237612d356431382d346136322d396330372d3166356238653264346139306a6465766963655f6b65795820555f469c22188e90015bdd85b889678d459f86bdf8f7bd34971b10b9b38586096c6973737565645f61745f6d731b0000019b759111006c6b65795f7265766973696f6e026d657870697265735f61745f6d731b0000019b759ecca06e6d6178696d756d5f6772616e7473846a66696c65732e72656164707175657374696f6e2e726573706f6e646c73657373696f6e2e766965776e7465726d696e616c2e696e7075746f6f7267616e69736174696f6e5f6964508f14e45fea1e4b9e9f3a0a3a9b0d2f61",
+      "message_sha256": "3625b3db4742d2af14e3dc47af52d632efcd5acf52d60df3c7d4cc2f0f296730",
+      "signature_hex": "6b603dd0b0e1ea138976004062ad153a8388a3a6d056d8ecf0d12b975c2ea22c47f2e44fce8be990469b5afd931d9fea57fce4d830efa463b26aab700a0fdf0f",
+      "signer": "revision_2"
+    },
+    {
+      "description": "The next lease for the same device, signed by revision 3 after the rotation.",
+      "domain": "kr-membership-lease/2",
+      "id": "lease_by_revision_3",
+      "json": {
+        "payload": {
+          "account_id": "3c9f2b7a-5d18-4a62-9c07-1f5b8e2d4a90",
+          "device_key": "VV9GnCIYjpABW92FuIlnjUWfhr349700lxsQubOFhgk",
+          "expires_at_ms": "1767226800000",
+          "issued_at_ms": "1767225900000",
+          "key_revision": "3",
+          "maximum_grants": [
+            "files.read",
+            "question.respond",
+            "session.view",
+            "terminal.input"
+          ],
+          "organisation_id": "8f14e45f-ea1e-4b9e-9f3a-0a3a9b0d2f61",
+          "role": "controller"
+        },
+        "signature": "roO1K2bCaFhKTuaOHGp1q4BwdEcXWCyXBaQJZ9vK9tyX3cRmFI77w0kq2CxTYMBjUCgnpdEQjSxkwqUk2ClHAA"
+      },
+      "message_hex": "82756b722d6d656d626572736869702d6c656173652f32a864726f6c656a636f6e74726f6c6c65726a6163636f756e745f6964782433633966326237612d356431382d346136322d396330372d3166356238653264346139306a6465766963655f6b65795820555f469c22188e90015bdd85b889678d459f86bdf8f7bd34971b10b9b38586096c6973737565645f61745f6d731b0000019b76df3be06c6b65795f7265766973696f6e036d657870697265735f61745f6d731b0000019b76ecf7806e6d6178696d756d5f6772616e7473846a66696c65732e72656164707175657374696f6e2e726573706f6e646c73657373696f6e2e766965776e7465726d696e616c2e696e7075746f6f7267616e69736174696f6e5f6964508f14e45fea1e4b9e9f3a0a3a9b0d2f61",
+      "message_sha256": "329d2c3e480935d9ba47556afa4ce6be27987ec8d7873bedb2fcdb0ae6639c0b",
+      "signature_hex": "ae83b52b66c268584a4ee68e1c6a75ab8070744717582c9705a40967dbcaf6dc97ddc466148efbc3492ad82c5360c063502827a5d1108d2c64c2a524d8294700",
+      "signer": "revision_3"
+    }
+  ],
+  "description": "Ed25519 signatures over an organisation's policy-signing chain, its head statement and two device-bound membership leases, plus the negative cases a verifier must reject.",
+  "devices": {
+    "member": {
+      "public_key_hex": "555f469c22188e90015bdd85b889678d459f86bdf8f7bd34971b10b9b3858609",
+      "seed_hex": "7474747474747474747474747474747474747474747474747474747474747474"
+    },
+    "other": {
+      "public_key_hex": "2c9b9a42d57adffd50e6eb1da543de93ad97d36d976d2a2b9735e7142f3fb859",
+      "seed_hex": "7575757575757575757575757575757575757575757575757575757575757575"
+    }
+  },
+  "name": "organisation",
+  "negative_cases": [
+    {
+      "description": "Revision 3's lease offered against revision 2's key. Verification must fail.",
+      "domain": "kr-membership-lease/2",
+      "id": "wrong_key",
+      "message_hex": "82756b722d6d656d626572736869702d6c656173652f32a864726f6c656a636f6e74726f6c6c65726a6163636f756e745f6964782433633966326237612d356431382d346136322d396330372d3166356238653264346139306a6465766963655f6b65795820555f469c22188e90015bdd85b889678d459f86bdf8f7bd34971b10b9b38586096c6973737565645f61745f6d731b0000019b76df3be06c6b65795f7265766973696f6e036d657870697265735f61745f6d731b0000019b76ecf7806e6d6178696d756d5f6772616e7473846a66696c65732e72656164707175657374696f6e2e726573706f6e646c73657373696f6e2e766965776e7465726d696e616c2e696e7075746f6f7267616e69736174696f6e5f6964508f14e45fea1e4b9e9f3a0a3a9b0d2f61",
+      "public_key_hex": "5b6489c9c7fd0dcf50545e7c164886ef40491ec06c7f1b123041797e8117535e",
+      "signature_hex": "ae83b52b66c268584a4ee68e1c6a75ab8070744717582c9705a40967dbcaf6dc97ddc466148efbc3492ad82c5360c063502827a5d1108d2c64c2a524d8294700"
+    },
+    {
+      "description": "Revision 3's lease with the last byte of its signing input flipped. Verification must fail.",
+      "domain": "kr-membership-lease/2",
+      "id": "flipped_message_bit",
+      "message_hex": "82756b722d6d656d626572736869702d6c656173652f32a864726f6c656a636f6e74726f6c6c65726a6163636f756e745f6964782433633966326237612d356431382d346136322d396330372d3166356238653264346139306a6465766963655f6b65795820555f469c22188e90015bdd85b889678d459f86bdf8f7bd34971b10b9b38586096c6973737565645f61745f6d731b0000019b76df3be06c6b65795f7265766973696f6e036d657870697265735f61745f6d731b0000019b76ecf7806e6d6178696d756d5f6772616e7473846a66696c65732e72656164707175657374696f6e2e726573706f6e646c73657373696f6e2e766965776e7465726d696e616c2e696e7075746f6f7267616e69736174696f6e5f6964508f14e45fea1e4b9e9f3a0a3a9b0d2f60",
+      "public_key_hex": "fec1428673f6afe89264b3807344ae8b269d125a503855202687db5a7128579f",
+      "signature_hex": "ae83b52b66c268584a4ee68e1c6a75ab8070744717582c9705a40967dbcaf6dc97ddc466148efbc3492ad82c5360c063502827a5d1108d2c64c2a524d8294700"
+    },
+    {
+      "description": "Revision 3's lease with the last byte of its signature flipped. Verification must fail.",
+      "domain": "kr-membership-lease/2",
+      "id": "flipped_signature_bit",
+      "message_hex": "82756b722d6d656d626572736869702d6c656173652f32a864726f6c656a636f6e74726f6c6c65726a6163636f756e745f6964782433633966326237612d356431382d346136322d396330372d3166356238653264346139306a6465766963655f6b65795820555f469c22188e90015bdd85b889678d459f86bdf8f7bd34971b10b9b38586096c6973737565645f61745f6d731b0000019b76df3be06c6b65795f7265766973696f6e036d657870697265735f61745f6d731b0000019b76ecf7806e6d6178696d756d5f6772616e7473846a66696c65732e72656164707175657374696f6e2e726573706f6e646c73657373696f6e2e766965776e7465726d696e616c2e696e7075746f6f7267616e69736174696f6e5f6964508f14e45fea1e4b9e9f3a0a3a9b0d2f61",
+      "public_key_hex": "fec1428673f6afe89264b3807344ae8b269d125a503855202687db5a7128579f",
+      "signature_hex": "ae83b52b66c268584a4ee68e1c6a75ab8070744717582c9705a40967dbcaf6dc97ddc466148efbc3492ad82c5360c063502827a5d1108d2c64c2a524d8294701"
+    },
+    {
+      "description": "Revision 2's link checked under the key it establishes rather than its predecessor's. Verification must fail.",
+      "domain": "kr-policy-authority/1",
+      "id": "link_under_its_own_key",
+      "message_hex": "82756b722d706f6c6963792d617574686f726974792f31a56a7075626c69635f6b657958205b6489c9c7fd0dcf50545e7c164886ef40491ec06c7f1b123041797e8117535e6c6b65795f7265766973696f6e026d6e6f745f6265666f72655f6d731b0000019b74477a006f6f7267616e69736174696f6e5f6964508f14e45fea1e4b9e9f3a0a3a9b0d2f617570726576696f75735f6b65795f7265766973696f6e01",
+      "public_key_hex": "5b6489c9c7fd0dcf50545e7c164886ef40491ec06c7f1b123041797e8117535e",
+      "signature_hex": "68cf814021642a3dbb451ebee289322f111133e132dc54a6b6a80d1b778edb04a27552f458bf90714adeb8b11c3ff5b798f2d163303316d8a2ee094208bf390b"
+    },
+    {
+      "description": "The head naming revision 3, checked under retired revision 2's key. Verification must fail.",
+      "domain": "kr-policy-authority-head/1",
+      "id": "head_under_a_retired_key",
+      "message_hex": "82781a6b722d706f6c6963792d617574686f726974792d686561642f31a46c6973737565645f61745f6d731b0000019b76df3be06c6b65795f7265766973696f6e036d657870697265735f61745f6d731b0000019b76ecf7806f6f7267616e69736174696f6e5f6964508f14e45fea1e4b9e9f3a0a3a9b0d2f61",
+      "public_key_hex": "5b6489c9c7fd0dcf50545e7c164886ef40491ec06c7f1b123041797e8117535e",
+      "signature_hex": "7f46ed3125c5a09e37f413cd81713a613f6814fc20f85f75d8ce792a5a524c461272629010f1dd375b1c936602d080d33a25d00579dd24417294a3958e9f3f05"
+    },
+    {
+      "description": "Revision 3's lease with its device key replaced by another device's, under the original signature. Verification must fail.",
+      "domain": "kr-membership-lease/2",
+      "id": "lease_for_another_device",
+      "message_hex": "82756b722d6d656d626572736869702d6c656173652f32a864726f6c656a636f6e74726f6c6c65726a6163636f756e745f6964782433633966326237612d356431382d346136322d396330372d3166356238653264346139306a6465766963655f6b657958202c9b9a42d57adffd50e6eb1da543de93ad97d36d976d2a2b9735e7142f3fb8596c6973737565645f61745f6d731b0000019b76df3be06c6b65795f7265766973696f6e036d657870697265735f61745f6d731b0000019b76ecf7806e6d6178696d756d5f6772616e7473846a66696c65732e72656164707175657374696f6e2e726573706f6e646c73657373696f6e2e766965776e7465726d696e616c2e696e7075746f6f7267616e69736174696f6e5f6964508f14e45fea1e4b9e9f3a0a3a9b0d2f61",
+      "public_key_hex": "fec1428673f6afe89264b3807344ae8b269d125a503855202687db5a7128579f",
+      "signature_hex": "ae83b52b66c268584a4ee68e1c6a75ab8070744717582c9705a40967dbcaf6dc97ddc466148efbc3492ad82c5360c063502827a5d1108d2c64c2a524d8294700"
+    }
+  ],
+  "note": "Each signature covers the signing input the object's own payload produces, CBOR([domain, payload]), and is deterministic. A link verifies under its predecessor's key (the first under its own), the head and a lease under the key of the revision they name, and a host takes a lease only from the connection that proves its device_key. The seeds are test material.",
+  "organisation_id": "8f14e45f-ea1e-4b9e-9f3a-0a3a9b0d2f61",
+  "signers": {
+    "revision_1": {
+      "public_key_hex": "e2fe2a39b7326642827d6d82d497622cd6c297fe78270eaa436b01f086b6f3cb",
+      "seed_hex": "7171717171717171717171717171717171717171717171717171717171717171"
+    },
+    "revision_2": {
+      "public_key_hex": "5b6489c9c7fd0dcf50545e7c164886ef40491ec06c7f1b123041797e8117535e",
+      "seed_hex": "7272727272727272727272727272727272727272727272727272727272727272"
+    },
+    "revision_3": {
+      "public_key_hex": "fec1428673f6afe89264b3807344ae8b269d125a503855202687db5a7128579f",
+      "seed_hex": "7373737373737373737373737373737373737373737373737373737373737373"
+    }
+  }
+}

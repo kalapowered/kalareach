@@ -60,6 +60,9 @@ pub const RELAY_FILE_NAME: &str = "relay.json";
 /// The collection-key vectors: key wraps and signed key records.
 pub const COLLECTION_KEYS_FILE_NAME: &str = "collection-keys.json";
 
+/// The organisation vectors: a policy-signing chain, its head, and device-bound leases.
+pub const ORGANISATION_FILE_NAME: &str = "organisation.json";
+
 /// The test authorisation seed of the host side.
 const HOST_AUTHORISATION_SEED: [u8; 32] = [0xa1; 32];
 /// The test authorisation seed of the client side.
@@ -88,6 +91,21 @@ const OBJECT_KEY: [u8; 32] = [0xe8; 32];
 const COLLECTION_KEY: [u8; 32] = [0xe9; 32];
 /// The fixed nonces of the collection-key wraps: the first record's, then the second record's two.
 const COLLECTION_WRAP_NONCES: [[u8; 24]; 3] = [[0xca; 24], [0xcb; 24], [0xcc; 24]];
+/// The test seeds of an organisation's policy-signing key, revisions 1 to 3 in order.
+const ORGANISATION_REVISION_SEEDS: [[u8; 32]; 3] = [[0x71; 32], [0x72; 32], [0x73; 32]];
+/// The test authorisation seed of the member device the leases are for.
+const MEMBER_DEVICE_SEED: [u8; 32] = [0x74; 32];
+/// The test authorisation seed of a device no lease names.
+const OTHER_DEVICE_SEED: [u8; 32] = [0x75; 32];
+/// The organisation the vectors speak for.
+const ORGANISATION_ID: &str = "8f14e45f-ea1e-4b9e-9f3a-0a3a9b0d2f61";
+/// The member account the leases name.
+const MEMBER_ACCOUNT_ID: &str = "3c9f2b7a-5d18-4a62-9c07-1f5b8e2d4a90";
+/// When revision 1 took over signing, in UTC milliseconds. Each later revision follows twelve
+/// hours after the one before it.
+const FIRST_ACTIVATION_MS: u64 = 1_767_139_200_000;
+/// The step between two activations, in milliseconds.
+const ROTATION_STEP_MS: u64 = 12 * 60 * 60 * 1000;
 
 /// The host's authorisation keypair in the vectors.
 ///
@@ -113,6 +131,31 @@ pub fn client_authorisation_key() -> Result<AuthorisationKeyPair> {
     AuthorisationKeyPair::from_seed(AuthorisationSeed::from_stored_bytes(
         &CLIENT_AUTHORISATION_SEED,
     )?)
+}
+
+/// One revision of the organisation's policy-signing keypair in the vectors, revisions 1 to 3.
+///
+/// # Errors
+///
+/// Returns an error for a revision the vectors do not carry, or when libsodium is unavailable.
+pub fn organisation_revision_key(revision: u64) -> Result<AuthorisationKeyPair> {
+    let seed = usize::try_from(revision)
+        .ok()
+        .and_then(|revision| revision.checked_sub(1))
+        .and_then(|index| ORGANISATION_REVISION_SEEDS.get(index))
+        .ok_or_else(|| CryptoError::SecretStore {
+            message: format!("the organisation vectors carry no revision {revision}"),
+        })?;
+    AuthorisationKeyPair::from_seed(AuthorisationSeed::from_stored_bytes(seed)?)
+}
+
+/// The authorisation keypair of the member device the organisation vectors' leases are for.
+///
+/// # Errors
+///
+/// Returns an error when libsodium is unavailable.
+pub fn member_device_key() -> Result<AuthorisationKeyPair> {
+    AuthorisationKeyPair::from_seed(AuthorisationSeed::from_stored_bytes(&MEMBER_DEVICE_SEED)?)
 }
 
 /// The envelope sender's stored-envelope keypair in the vectors.
@@ -161,6 +204,7 @@ pub fn generated_files(repository_root: &Path) -> Result<Vec<(&'static str, Stri
         (KDF_FILE_NAME, render(&derivations()?)),
         (RELAY_FILE_NAME, render(&relay_signatures(repository_root)?)),
         (COLLECTION_KEYS_FILE_NAME, render(&collection_keys()?)),
+        (ORGANISATION_FILE_NAME, render(&organisation()?)),
     ])
 }
 
@@ -349,6 +393,307 @@ fn relay_signatures(repository_root: &Path) -> Result<Value> {
         },
         "cases": cases,
     }))
+}
+
+/// Signs one organisation object's signing input under `domain`.
+fn organisation_signature(
+    key: &AuthorisationKeyPair,
+    domain: &str,
+    signing_input: Vec<u8>,
+) -> Result<Signature64> {
+    crate::sign::sign(
+        key,
+        &SigningTranscript::from_canonical_bytes(domain, signing_input)?,
+    )
+}
+
+/// One signed organisation object as the vectors publish it: the object, the bytes signed and the
+/// signature, with the revision that signed it.
+fn organisation_case(
+    id: &str,
+    description: &str,
+    domain: &str,
+    signer: u64,
+    json: Value,
+    message: &[u8],
+    signature: &Signature64,
+) -> Value {
+    json!({
+        "id": id,
+        "description": description,
+        "domain": domain,
+        "signer": format!("revision_{signer}"),
+        "json": json,
+        "message_hex": hex::encode(message),
+        "message_sha256": hex::encode(kr_cbor::sha256(message)),
+        "signature_hex": hex::encode(signature.as_bytes()),
+    })
+}
+
+/// A case a verifier must reject: a message, a public key and a signature that do not belong
+/// together.
+fn organisation_negative(
+    id: &str,
+    description: &str,
+    domain: &str,
+    message: &[u8],
+    public: &kr_protocol::scalars::AuthorisationKey,
+    signature: &[u8],
+) -> Value {
+    json!({
+        "id": id,
+        "description": description,
+        "domain": domain,
+        "message_hex": hex::encode(message),
+        "public_key_hex": hex::encode(public.as_bytes()),
+        "signature_hex": hex::encode(signature),
+    })
+}
+
+/// The organisation vectors: a policy-signing chain of three revisions, the head statement by the
+/// third, and two leases for one member device, one signed by the second revision before the third
+/// took over and one by the third after.
+///
+/// Every object is built from its typed payload and signed over that payload's own signing input,
+/// so a verifier in either language checks the bytes its own builders produce. The negative cases
+/// are the mistakes a host must not make: a wrong key, a flipped byte of the message or of the
+/// signature, a link checked under its own key rather than its predecessor's, the head checked
+/// under a retired revision, and a lease offered for another device.
+fn organisation() -> Result<Value> {
+    use std::str::FromStr as _;
+
+    use kr_protocol::account::{
+        MEMBERSHIP_LEASE_DOMAIN, MEMBERSHIP_LEASE_MAX_LIFETIME_MS, MembershipLease,
+        MembershipLeasePayload, POLICY_AUTHORITY_DOMAIN, POLICY_AUTHORITY_HEAD_DOMAIN,
+        POLICY_AUTHORITY_HEAD_MAX_LIFETIME_MS, PolicyAuthority, PolicyAuthorityHead,
+        PolicyAuthorityHeadPayload, PolicyAuthorityLink, PolicyAuthorityLinkPayload, TeamRole,
+    };
+    use kr_protocol::ids::{AccountId, OrganisationId, PolicyKeyRevision};
+
+    let invalid = |what: &str| CryptoError::SecretStore {
+        message: format!("the organisation vectors' {what} is malformed"),
+    };
+    let organisation_id = OrganisationId::new(
+        Uuid::from_str(ORGANISATION_ID).map_err(|_| invalid("organisation identifier"))?,
+    );
+    let account_id =
+        AccountId::new(MEMBER_ACCOUNT_ID).map_err(|_| invalid("account identifier"))?;
+    let keys = [
+        organisation_revision_key(1)?,
+        organisation_revision_key(2)?,
+        organisation_revision_key(3)?,
+    ];
+    let member = member_device_key()?;
+    let other =
+        AuthorisationKeyPair::from_seed(AuthorisationSeed::from_stored_bytes(&OTHER_DEVICE_SEED)?)?;
+    let activation = |revision: u64| FIRST_ACTIVATION_MS + (revision - 1) * ROTATION_STEP_MS;
+
+    let mut chain = Vec::with_capacity(keys.len());
+    let mut cases = Vec::new();
+    for (index, key) in keys.iter().enumerate() {
+        let revision = (1_u64..).nth(index).ok_or_else(|| invalid("revision"))?;
+        let payload = PolicyAuthorityLinkPayload {
+            organisation_id,
+            key_revision: PolicyKeyRevision::new(revision),
+            previous_key_revision: if index == 0 {
+                Nullable::null()
+            } else {
+                Nullable::some(PolicyKeyRevision::new(revision - 1))
+            },
+            public_key: *key.public(),
+            not_before_ms: TimestampMs::new(activation(revision)),
+        };
+        // The first revision signs its own link. Every later one is signed by the revision it names
+        // as its predecessor, which is what lets a host walk forward from the revision it pinned.
+        let (signer, signer_key) = if index == 0 {
+            (revision, key)
+        } else {
+            (revision - 1, &keys[index - 1])
+        };
+        let message = payload.signing_input()?;
+        let signature =
+            organisation_signature(signer_key, POLICY_AUTHORITY_DOMAIN, message.clone())?;
+        let link = PolicyAuthorityLink { payload, signature };
+        let description = if index == 0 {
+            "Revision 1 of the policy-signing key, signed by itself: the revision a host pins."
+                .to_owned()
+        } else {
+            format!(
+                "Revision {revision}, signed by revision {signer} and taking over twelve hours after \
+                 it."
+            )
+        };
+        cases.push(organisation_case(
+            &format!("link_revision_{revision}"),
+            &description,
+            POLICY_AUTHORITY_DOMAIN,
+            signer,
+            to_json(&link)?,
+            &message,
+            &link.signature,
+        ));
+        chain.push(link);
+    }
+
+    let head_issued_ms = activation(3) + 5 * 60 * 1000;
+    let head_payload = PolicyAuthorityHeadPayload {
+        organisation_id,
+        key_revision: PolicyKeyRevision::new(3),
+        issued_at_ms: TimestampMs::new(head_issued_ms),
+        expires_at_ms: TimestampMs::new(head_issued_ms + POLICY_AUTHORITY_HEAD_MAX_LIFETIME_MS),
+    };
+    let head_message = head_payload.signing_input()?;
+    let head = PolicyAuthorityHead {
+        payload: head_payload,
+        signature: organisation_signature(
+            &keys[2],
+            POLICY_AUTHORITY_HEAD_DOMAIN,
+            head_message.clone(),
+        )?,
+    };
+    cases.push(organisation_case(
+        "head_revision_3",
+        "The statement that revision 3 signs now, signed by revision 3, five minutes after it took over.",
+        POLICY_AUTHORITY_HEAD_DOMAIN,
+        3,
+        to_json(&head)?,
+        &head_message,
+        &head.signature,
+    ));
+
+    let lease = |revision: u64, issued_at_ms: u64| -> Result<(MembershipLease, Vec<u8>)> {
+        let payload = MembershipLeasePayload {
+            organisation_id,
+            account_id: account_id.clone(),
+            device_key: *member.public(),
+            role: TeamRole::Controller,
+            maximum_grants: TeamRole::Controller.maximum_grants(),
+            issued_at_ms: TimestampMs::new(issued_at_ms),
+            expires_at_ms: TimestampMs::new(issued_at_ms + MEMBERSHIP_LEASE_MAX_LIFETIME_MS),
+            key_revision: PolicyKeyRevision::new(revision),
+        };
+        let signer = usize::try_from(revision - 1)
+            .ok()
+            .and_then(|index| keys.get(index))
+            .ok_or_else(|| invalid("lease revision"))?;
+        let message = payload.signing_input()?;
+        let signature = organisation_signature(signer, MEMBERSHIP_LEASE_DOMAIN, message.clone())?;
+        Ok((MembershipLease { payload, signature }, message))
+    };
+    // Revision 2's lease is issued six hours after it took over and ends long before revision 3
+    // does; revision 3's is issued with the head.
+    let (by_second, by_second_message) = lease(2, activation(2) + 6 * 60 * 60 * 1000)?;
+    let (by_third, by_third_message) = lease(3, head_issued_ms)?;
+    cases.push(organisation_case(
+        "lease_by_revision_2",
+        "A fifteen-minute controller lease for the member device, signed by revision 2 while it was the signing revision.",
+        MEMBERSHIP_LEASE_DOMAIN,
+        2,
+        to_json(&by_second)?,
+        &by_second_message,
+        &by_second.signature,
+    ));
+    cases.push(organisation_case(
+        "lease_by_revision_3",
+        "The next lease for the same device, signed by revision 3 after the rotation.",
+        MEMBERSHIP_LEASE_DOMAIN,
+        3,
+        to_json(&by_third)?,
+        &by_third_message,
+        &by_third.signature,
+    ));
+
+    let mut elsewhere = by_third.payload.clone();
+    elsewhere.device_key = *other.public();
+    let link_two = &chain[1];
+    let negative = vec![
+        organisation_negative(
+            "wrong_key",
+            "Revision 3's lease offered against revision 2's key. Verification must fail.",
+            MEMBERSHIP_LEASE_DOMAIN,
+            &by_third_message,
+            keys[1].public(),
+            by_third.signature.as_bytes(),
+        ),
+        organisation_negative(
+            "flipped_message_bit",
+            "Revision 3's lease with the last byte of its signing input flipped. Verification must fail.",
+            MEMBERSHIP_LEASE_DOMAIN,
+            &flip_last(&by_third_message),
+            keys[2].public(),
+            by_third.signature.as_bytes(),
+        ),
+        organisation_negative(
+            "flipped_signature_bit",
+            "Revision 3's lease with the last byte of its signature flipped. Verification must fail.",
+            MEMBERSHIP_LEASE_DOMAIN,
+            &by_third_message,
+            keys[2].public(),
+            &flip_last(by_third.signature.as_bytes()),
+        ),
+        organisation_negative(
+            "link_under_its_own_key",
+            "Revision 2's link checked under the key it establishes rather than its predecessor's. Verification must fail.",
+            POLICY_AUTHORITY_DOMAIN,
+            &link_two.payload.signing_input()?,
+            &link_two.payload.public_key,
+            link_two.signature.as_bytes(),
+        ),
+        organisation_negative(
+            "head_under_a_retired_key",
+            "The head naming revision 3, checked under retired revision 2's key. Verification must fail.",
+            POLICY_AUTHORITY_HEAD_DOMAIN,
+            &head_message,
+            keys[1].public(),
+            head.signature.as_bytes(),
+        ),
+        organisation_negative(
+            "lease_for_another_device",
+            "Revision 3's lease with its device key replaced by another device's, under the original signature. Verification must fail.",
+            MEMBERSHIP_LEASE_DOMAIN,
+            &elsewhere.signing_input()?,
+            keys[2].public(),
+            by_third.signature.as_bytes(),
+        ),
+    ];
+
+    let authority = PolicyAuthority {
+        organisation_id,
+        chain,
+        head,
+    };
+    let key_entry = |seed: &[u8; 32], pair: &AuthorisationKeyPair| {
+        json!({
+            "seed_hex": hex::encode(seed),
+            "public_key_hex": hex::encode(pair.public().as_bytes()),
+        })
+    };
+    Ok(json!({
+        "name": "organisation",
+        "description": "Ed25519 signatures over an organisation's policy-signing chain, its head statement and two device-bound membership leases, plus the negative cases a verifier must reject.",
+        "note": "Each signature covers the signing input the object's own payload produces, CBOR([domain, payload]), and is deterministic. A link verifies under its predecessor's key (the first under its own), the head and a lease under the key of the revision they name, and a host takes a lease only from the connection that proves its device_key. The seeds are test material.",
+        "organisation_id": ORGANISATION_ID,
+        "account_id": MEMBER_ACCOUNT_ID,
+        "signers": {
+            "revision_1": key_entry(&ORGANISATION_REVISION_SEEDS[0], &keys[0]),
+            "revision_2": key_entry(&ORGANISATION_REVISION_SEEDS[1], &keys[1]),
+            "revision_3": key_entry(&ORGANISATION_REVISION_SEEDS[2], &keys[2]),
+        },
+        "devices": {
+            "member": key_entry(&MEMBER_DEVICE_SEED, &member),
+            "other": key_entry(&OTHER_DEVICE_SEED, &other),
+        },
+        "authority": to_json(&authority)?,
+        "cases": cases,
+        "negative_cases": negative,
+    }))
+}
+
+/// The JSON representation of an organisation object, as the managed service carries it.
+fn to_json<T: serde::Serialize>(value: &T) -> Result<Value> {
+    serde_json::to_value(value).map_err(|error| CryptoError::SecretStore {
+        message: format!("an organisation object does not serialise: {error}"),
+    })
 }
 
 fn render(value: &Value) -> String {

@@ -3,9 +3,13 @@
 //! A managed account identifies a person. It never creates host authority, and a host never
 //! decrypts anything because somebody signed in. What crosses the boundary is a [`MembershipLease`]:
 //! a short-lived signed statement that one account held one role in one organisation, naming the
-//! most that role may ever carry. A host intersects that ceiling with its own policy and with the
-//! grants the issuer actually holds, so widening a role in the service can never widen a session
-//! that is already running.
+//! most that role may ever carry and the one device it is for. A host intersects that ceiling with
+//! its own policy and with the grants the issuer actually holds, so widening a role in the service
+//! can never widen a session that is already running.
+//!
+//! The device is named by its authorisation key, the key its `kr-connect/1` proof is made with on
+//! every connection. A host takes a lease only from the connection that proves that key, so a host
+//! that receives a member's lease cannot pass it to a device it controls.
 //!
 //! The signature is made by the organisation's policy-signing key, which is separate from billing
 //! and rotates on its own schedule. A host pins one revision of that key once, and follows
@@ -57,7 +61,7 @@ use crate::scalars::{
 };
 
 /// The domain a membership lease signature covers.
-pub const MEMBERSHIP_LEASE_DOMAIN: &str = "kr-membership-lease/1";
+pub const MEMBERSHIP_LEASE_DOMAIN: &str = "kr-membership-lease/2";
 
 /// The domain one policy-signing authority link covers.
 pub const POLICY_AUTHORITY_DOMAIN: &str = "kr-policy-authority/1";
@@ -162,6 +166,11 @@ pub struct MembershipLeasePayload {
     pub organisation_id: OrganisationId,
     /// The account it names as a member.
     pub account_id: AccountId,
+    /// The authorisation key of the device the lease is for.
+    ///
+    /// A host accepts the lease only from a connection that proves this key, so the membership it
+    /// states reaches that device and no other.
+    pub device_key: AuthorisationKey,
     /// The role that account held when the lease was signed.
     pub role: TeamRole,
     /// The most the role may carry. A host intersects this with its own policy.

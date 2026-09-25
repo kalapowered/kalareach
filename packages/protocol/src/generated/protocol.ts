@@ -13564,6 +13564,13 @@ export interface MembershipLeasePayload {
    */
   account_id: string
   /**
+   * The authorisation key of the device the lease is for.
+   *
+   * A host accepts the lease only from a connection that proves this key, so the membership it
+   * states reaches that device and no other.
+   */
+  device_key: string
+  /**
    * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
   expires_at_ms: string

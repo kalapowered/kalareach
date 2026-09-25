@@ -1,13 +1,14 @@
 {
   "cases": [
     {
-      "cbor_hex": "82756b722d6d656d626572736869702d6c656173652f31a764726f6c65656f776e65726a6163636f756e745f6964782433633966326237612d356431382d346136322d396330372d3166356238653264346139306c6973737565645f61745f6d731b0000019b76daa8006c6b65795f7265766973696f6e026d657870697265735f61745f6d731b0000019b76e863a06e6d6178696d756d5f6772616e7473866a66696c65732e72656164707175657374696f6e2e726573706f6e646d73657373696f6e2e636c6f73656d73657373696f6e2e73686172656c73657373696f6e2e766965776e7465726d696e616c2e696e7075746f6f7267616e69736174696f6e5f6964508f14e45fea1e4b9e9f3a0a3a9b0d2f61",
-      "description": "A fifteen-minute owner lease, signed by the revision the head names.",
-      "domain": "kr-membership-lease/1",
+      "cbor_hex": "82756b722d6d656d626572736869702d6c656173652f32a864726f6c65656f776e65726a6163636f756e745f6964782433633966326237612d356431382d346136322d396330372d3166356238653264346139306a6465766963655f6b657958204d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d6c6973737565645f61745f6d731b0000019b76daa8006c6b65795f7265766973696f6e026d657870697265735f61745f6d731b0000019b76e863a06e6d6178696d756d5f6772616e7473866a66696c65732e72656164707175657374696f6e2e726573706f6e646d73657373696f6e2e636c6f73656d73657373696f6e2e73686172656c73657373696f6e2e766965776e7465726d696e616c2e696e7075746f6f7267616e69736174696f6e5f6964508f14e45fea1e4b9e9f3a0a3a9b0d2f61",
+      "description": "A fifteen-minute owner lease for one device, signed by the revision the head names.",
+      "domain": "kr-membership-lease/2",
       "id": "membership_lease",
       "json": {
         "payload": {
           "account_id": "3c9f2b7a-5d18-4a62-9c07-1f5b8e2d4a90",
+          "device_key": "TU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU0",
           "expires_at_ms": "1767226500000",
           "issued_at_ms": "1767225600000",
           "key_revision": "2",
@@ -24,11 +25,11 @@
         },
         "signature": "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWg"
       },
-      "sha256": "8f264ac2796ca9f584fa37fa780c895c7283914f951270b70525147319342833",
+      "sha256": "bcb30dcc58d2627a179cda4010794e8bd2219ee3d4eae8e9e6f6f221b438eb25",
       "value": {
         "array": [
           {
-            "text": "kr-membership-lease/1"
+            "text": "kr-membership-lease/2"
           },
           {
             "map": [
@@ -42,6 +43,12 @@
                 "account_id",
                 {
                   "text": "3c9f2b7a-5d18-4a62-9c07-1f5b8e2d4a90"
+                }
+              ],
+              [
+                "device_key",
+                {
+                  "bytes": "4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d"
                 }
               ],
               [
@@ -99,13 +106,14 @@
       }
     },
     {
-      "cbor_hex": "82756b722d6d656d626572736869702d6c656173652f31a764726f6c656872657669657765726a6163636f756e745f6964782433633966326237612d356431382d346136322d396330372d3166356238653264346139306c6973737565645f61745f6d731b0000019b76daa8006c6b65795f7265766973696f6e026d657870697265735f61745f6d731b0000019b76df3be06e6d6178696d756d5f6772616e7473826a66696c65732e726561646c73657373696f6e2e766965776f6f7267616e69736174696f6e5f6964508f14e45fea1e4b9e9f3a0a3a9b0d2f61",
-      "description": "A five-minute reviewer lease naming less than the role's ceiling.",
-      "domain": "kr-membership-lease/1",
+      "cbor_hex": "82756b722d6d656d626572736869702d6c656173652f32a864726f6c656872657669657765726a6163636f756e745f6964782433633966326237612d356431382d346136322d396330372d3166356238653264346139306a6465766963655f6b657958204d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d6c6973737565645f61745f6d731b0000019b76daa8006c6b65795f7265766973696f6e026d657870697265735f61745f6d731b0000019b76df3be06e6d6178696d756d5f6772616e7473826a66696c65732e726561646c73657373696f6e2e766965776f6f7267616e69736174696f6e5f6964508f14e45fea1e4b9e9f3a0a3a9b0d2f61",
+      "description": "A five-minute reviewer lease for the same device, naming less than the role's ceiling.",
+      "domain": "kr-membership-lease/2",
       "id": "membership_lease_narrowed",
       "json": {
         "payload": {
           "account_id": "3c9f2b7a-5d18-4a62-9c07-1f5b8e2d4a90",
+          "device_key": "TU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU0",
           "expires_at_ms": "1767225900000",
           "issued_at_ms": "1767225600000",
           "key_revision": "2",
@@ -118,11 +126,11 @@
         },
         "signature": "a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2traw"
       },
-      "sha256": "c4ec549d6b47fc32065dabf95639338d6274b4467f8a398bb03cde0d8f2461d6",
+      "sha256": "62c444833096bb9b6e5dc349eccab35a0ef3da1deca351bcf32e11e221524a27",
       "value": {
         "array": [
           {
-            "text": "kr-membership-lease/1"
+            "text": "kr-membership-lease/2"
           },
           {
             "map": [
@@ -136,6 +144,12 @@
                 "account_id",
                 {
                   "text": "3c9f2b7a-5d18-4a62-9c07-1f5b8e2d4a90"
+                }
+              ],
+              [
+                "device_key",
+                {
+                  "bytes": "4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d"
                 }
               ],
               [
@@ -355,7 +369,7 @@
     "policy_authority_head_maximum": "900000"
   },
   "name": "leases",
-  "note": "Values use the same description grammar as fixtures/cbor. cbor_hex is the canonical KR-CBOR-1 encoding of CBOR([domain, payload]), the bytes a signature covers; sha256 is its digest. json is the managed HTTP representation of the whole record, signature included. The signatures in json are fixed test bytes, not verifiable signatures: signature vectors need a signing implementation and live with the cryptography fixtures. Every case belongs to the chain in published_authority, whose revision 2 has been signing since twelve hours before the leases were issued.",
+  "note": "Values use the same description grammar as fixtures/cbor. cbor_hex is the canonical KR-CBOR-1 encoding of CBOR([domain, payload]), the bytes a signature covers; sha256 is its digest. json is the managed HTTP representation of the whole record, signature included. The signatures in json are fixed test bytes, not verifiable signatures: signature vectors need a signing implementation and live with the cryptography fixtures (fixtures/crypto/organisation.json). Every case belongs to the chain in published_authority, whose revision 2 has been signing since twelve hours before the leases were issued.",
   "published_authority": {
     "chain": [
       {

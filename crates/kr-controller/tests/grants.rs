@@ -623,6 +623,7 @@ fn lease_for(
         payload: MembershipLeasePayload {
             organisation_id,
             account_id,
+            device_key: kr_protocol::scalars::AuthorisationKey::from_bytes([0x4d; 32]),
             role: TeamRole::Controller,
             maximum_grants: maximum.iter().copied().collect(),
             issued_at_ms: TimestampMs::new(0),

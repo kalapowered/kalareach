@@ -16,7 +16,12 @@ use kr_crypto::vectors::{
     host_authorisation_key, recovery_seed,
 };
 use kr_crypto::{archive, envelope, kdf, relay, sign};
+use kr_protocol::account::{
+    MEMBERSHIP_LEASE_DOMAIN, MembershipLease, POLICY_AUTHORITY_DOMAIN,
+    POLICY_AUTHORITY_HEAD_DOMAIN, PolicyAuthority, PolicyAuthorityHead, PolicyAuthorityLink,
+};
 use kr_protocol::archive::{KeyWrapContext, SealedKeyWrap};
+use kr_protocol::ids::PolicyKeyRevision;
 use kr_protocol::mailbox::{SealedEnvelope, mailbox_size_bucket, notification_size_bucket};
 use kr_protocol::pairing::KeyPurpose;
 use kr_protocol::relay::{
@@ -526,4 +531,85 @@ fn relay_object_json(id: &str) -> Value {
         .find(|entry| entry["id"] == name)
         .unwrap_or_else(|| panic!("no relay case {name} in {file}"))["json"]
         .clone()
+}
+
+/// The signing input an organisation object's own typed payload produces, by the domain it is
+/// signed under. Rebuilding it from the representation, rather than reading the bytes the document
+/// publishes, is what makes a verified case a statement about that object.
+fn organisation_signing_input(id: &str, domain: &str, json: Value) -> Vec<u8> {
+    match domain {
+        MEMBERSHIP_LEASE_DOMAIN => parsed::<MembershipLease>(id, json).payload.signing_input(),
+        POLICY_AUTHORITY_DOMAIN => parsed::<PolicyAuthorityLink>(id, json)
+            .payload
+            .signing_input(),
+        POLICY_AUTHORITY_HEAD_DOMAIN => parsed::<PolicyAuthorityHead>(id, json)
+            .payload
+            .signing_input(),
+        other => panic!("{id}: no organisation object signs under {other}"),
+    }
+    .unwrap_or_else(|error| panic!("{id}: {error}"))
+}
+
+fn parsed<T: serde::de::DeserializeOwned>(id: &str, json: Value) -> T {
+    serde_json::from_value(json)
+        .unwrap_or_else(|error| panic!("{id}: the object does not parse: {error}"))
+}
+
+/// The organisation vectors: every link, the head and both device-bound leases verify under the
+/// revision that signed them, over the bytes their own payloads produce, and every negative case
+/// fails: a wrong key, a flipped byte of the message or of the signature, a link verified under its
+/// own key, the head under a retired key, and a lease offered for another device.
+#[test]
+fn every_organisation_vector_verifies_and_every_negative_case_fails() {
+    let document = fixture("organisation.json");
+    let signers = &document["signers"];
+
+    let cases = document["cases"].as_array().expect("signed cases");
+    assert!(!cases.is_empty());
+    for case in cases {
+        let id = case["id"].as_str().expect("an identifier");
+        let domain = case["domain"].as_str().expect("a domain");
+        let message = bytes(case, "/message_hex");
+        assert_eq!(
+            organisation_signing_input(id, domain, case["json"].clone()),
+            message,
+            "{id}: the published bytes are the object's own signing input"
+        );
+        let signer = case["signer"].as_str().expect("a signer");
+        let public =
+            AuthorisationKey::from_bytes(fixed(signers, &format!("/{signer}/public_key_hex")));
+        let signature = Signature64::from_bytes(fixed(case, "/signature_hex"));
+        let transcript =
+            SigningTranscript::from_canonical_bytes(domain, message).expect("a signing transcript");
+        sign::verify(&public, &transcript, &signature)
+            .unwrap_or_else(|error| panic!("{id} does not verify: {error}"));
+    }
+
+    let negative = document["negative_cases"]
+        .as_array()
+        .expect("negative cases");
+    assert!(!negative.is_empty());
+    for case in negative {
+        let id = case["id"].as_str().expect("an identifier");
+        let domain = case["domain"].as_str().expect("a domain");
+        let public = AuthorisationKey::from_bytes(fixed(case, "/public_key_hex"));
+        let signature = Signature64::from_bytes(fixed(case, "/signature_hex"));
+        // A message that no longer decodes as a transcript is refused before its signature is
+        // looked at, which is a refusal too.
+        let verified = SigningTranscript::from_canonical_bytes(domain, bytes(case, "/message_hex"))
+            .and_then(|transcript| sign::verify(&public, &transcript, &signature));
+        assert!(verified.is_err(), "{id} must not verify");
+    }
+
+    // The objects belong to one chain, which is a chain, and a host that pinned its first revision
+    // reaches all three.
+    let authority: PolicyAuthority =
+        serde_json::from_value(document["authority"].clone()).expect("the published authority");
+    assert_eq!(authority.check_structure(), Ok(()));
+    assert_eq!(
+        authority
+            .authenticated_from(PolicyKeyRevision::new(1))
+            .map(<[_]>::len),
+        Some(3)
+    );
 }

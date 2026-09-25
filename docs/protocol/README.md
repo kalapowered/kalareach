@@ -593,7 +593,7 @@ builds the same bytes in TypeScript.
 
 | Domain | Payload | What it says |
 | --- | --- | --- |
-| `kr-membership-lease/1` | `MembershipLeasePayload` | One account held one role in one organisation until a stated time |
+| `kr-membership-lease/2` | `MembershipLeasePayload` | One account held one role in one organisation until a stated time, for one device |
 | `kr-policy-authority/1` | `PolicyAuthorityLinkPayload` | One revision of an organisation's policy-signing key, signed by the revision it follows |
 | `kr-policy-authority-head/1` | `PolicyAuthorityHeadPayload` | Which revision signs leases now, signed by that revision |
 
@@ -607,6 +607,13 @@ grants it already understands rather than with a second set of names. The role i
 ceiling: `TeamRole::maximum_grants` is the most a role may ever carry, a lease may name less, and
 `MembershipLeasePayload::grants_within_role` is the check that it names no more. Authority still
 comes from the grants, never from the label.
+
+A lease names the device it is for by that device's authorisation public key, `device_key`: the
+key the device's `kr-connect/1` proof is made with on every connection. A host takes a lease only
+from the connection that proves that key, so a host that receives a member's lease cannot pass it
+to a device it controls. The member's client asks the service for a lease naming its own key.
+`fixtures/crypto/organisation.json` publishes a signed chain, its head and two device-bound leases,
+with the negative cases a verifier must reject.
 
 The first revision of a chain signs itself and names no predecessor, which is what a host pins.
 Every later revision names the revision whose key signed it, so a host walks forward from the

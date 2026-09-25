@@ -91,11 +91,17 @@ fn account() -> AccountId {
     AccountId::new("3c9f2b7a-5d18-4a62-9c07-1f5b8e2d4a90").expect("account identifier")
 }
 
+/// The authorisation key of the device the leases are for.
+fn device_key() -> AuthorisationKey {
+    AuthorisationKey::from_bytes([0x4d; 32])
+}
+
 fn owner_lease() -> MembershipLease {
     MembershipLease {
         payload: MembershipLeasePayload {
             organisation_id: organisation(),
             account_id: account(),
+            device_key: device_key(),
             role: TeamRole::Owner,
             maximum_grants: TeamRole::Owner.maximum_grants(),
             issued_at_ms: TimestampMs::new(1_767_225_600_000),
@@ -111,6 +117,7 @@ fn narrowed_lease() -> MembershipLease {
         payload: MembershipLeasePayload {
             organisation_id: organisation(),
             account_id: account(),
+            device_key: device_key(),
             role: TeamRole::Reviewer,
             maximum_grants: [ActionRight::SessionView, ActionRight::FilesRead]
                 .into_iter()
@@ -280,6 +287,45 @@ fn a_domain_separates_one_statement_from_another() {
     assert_ne!(lease, head);
     assert!(lease.starts_with(&[0x82]), "an array of two elements");
     assert!(head.starts_with(&[0x82]), "an array of two elements");
+}
+
+#[test]
+fn a_lease_names_the_device_it_is_for() {
+    // A lease binds a membership to one device's authorisation key, and a host takes it only from
+    // the connection that proves that key. The key is therefore inside the signed bytes: a lease
+    // for one device cannot be read as a lease for another.
+    assert_eq!(MEMBERSHIP_LEASE_DOMAIN, "kr-membership-lease/2");
+    let lease = owner_lease();
+    let signed = lease.payload.signing_input().expect("signing input");
+    assert!(
+        signed
+            .windows(AuthorisationKey::LEN)
+            .any(|window| window == device_key().as_bytes()),
+        "the device key is among the signed bytes"
+    );
+
+    let mut elsewhere = owner_lease();
+    elsewhere.payload.device_key = AuthorisationKey::from_bytes([0x4e; 32]);
+    assert_ne!(
+        signed,
+        elsewhere.payload.signing_input().expect("signing input"),
+        "the same membership for another device is another statement"
+    );
+}
+
+#[test]
+fn a_lease_that_names_no_device_is_not_the_closed_schema() {
+    let json = serde_json::to_value(owner_lease()).expect("serialise");
+    let parsed: MembershipLease = serde_json::from_value(json.clone()).expect("the lease parses");
+    assert_eq!(parsed, owner_lease(), "the control: the whole lease parses");
+
+    let mut without = json;
+    without["payload"]
+        .as_object_mut()
+        .expect("the payload is an object")
+        .remove("device_key");
+    let parsed: Result<MembershipLease, _> = serde_json::from_value(without);
+    assert!(parsed.is_err(), "a lease that names no device is refused");
 }
 
 #[test]

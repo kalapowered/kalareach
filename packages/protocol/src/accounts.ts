@@ -33,7 +33,7 @@ import type {
 } from './generated/protocol.js'
 
 /** The domain a membership lease signature covers. */
-export const MEMBERSHIP_LEASE_DOMAIN = 'kr-membership-lease/1'
+export const MEMBERSHIP_LEASE_DOMAIN = 'kr-membership-lease/2'
 
 /** The domain one policy-signing authority link covers. */
 export const POLICY_AUTHORITY_DOMAIN = 'kr-policy-authority/1'
@@ -206,6 +206,7 @@ function signingInput (domain: string, payload: CanonicalValue): Uint8Array {
 
 const LEASE_FIELDS = [
   'account_id',
+  'device_key',
   'expires_at_ms',
   'issued_at_ms',
   'key_revision',
@@ -285,11 +286,12 @@ export function canonicalRights (value: readonly ActionRight[]): ActionRight[] {
 /**
  * The bytes a membership lease is signed over.
  *
- * `CBOR(["kr-membership-lease/1", the payload as a canonical map])`.
+ * `CBOR(["kr-membership-lease/2", the payload as a canonical map])`.
  *
  * Everything a standalone authorisation object must cover is here: the type through the domain,
- * the issuing organisation and the key revision that signed it, the account it names, the authority
- * it carries, and when it ends.
+ * the issuing organisation and the key revision that signed it, the account it names, the device it
+ * is for, the authority it carries, and when it ends. The device is named by its authorisation
+ * public key, and a host takes the lease only from the connection that proves that key.
  */
 export function membershipLeaseSigningInput (payload: MembershipLeasePayload): Uint8Array {
   const record = closed('a membership lease', payload, LEASE_FIELDS)
@@ -301,6 +303,7 @@ export function membershipLeaseSigningInput (payload: MembershipLeasePayload): U
     MEMBERSHIP_LEASE_DOMAIN,
     krMap([
       ['account_id', opaqueIdentifier('an account identifier', record['account_id'])],
+      ['device_key', krBytes(scalar('a device key', record['device_key'], ED25519_PUBLIC_KEY_BYTES))],
       ['expires_at_ms', counter('a lease expiry', record['expires_at_ms'])],
       ['issued_at_ms', counter('a lease issue time', record['issued_at_ms'])],
       ['key_revision', counter('a key revision', record['key_revision'])],

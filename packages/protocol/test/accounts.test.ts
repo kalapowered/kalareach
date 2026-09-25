@@ -7,7 +7,7 @@
  * agreement over the exact input a policy-signing key covers.
  */
 
-import { createHash } from 'node:crypto'
+import { createHash, createPublicKey, verify } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -33,12 +33,15 @@ import {
   publicKeyBytes,
   signatureBytes,
   type MembershipLease,
+  type MembershipLeasePayload,
   type PolicyAuthority,
   type PolicyAuthorityHead,
-  type PolicyAuthorityLink
+  type PolicyAuthorityHeadPayload,
+  type PolicyAuthorityLink,
+  type PolicyAuthorityLinkPayload
 } from '../src/index.js'
 
-import { bytesToHex, parseValue } from './fixtures.js'
+import { bytesToHex, hexToBytes, parseValue } from './fixtures.js'
 
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
 
@@ -84,6 +87,66 @@ function sha256 (bytes: Uint8Array): string {
   return createHash('sha256').update(bytes).digest('hex')
 }
 
+/** Wraps a raw 32-byte Ed25519 public key in the SPKI encoding Node reads. */
+function ed25519PublicKey (raw: Uint8Array): ReturnType<typeof createPublicKey> {
+  const spki = new Uint8Array([
+    // SEQUENCE { SEQUENCE { OID 1.3.101.112 } BIT STRING { key } }
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+    ...raw
+  ])
+  return createPublicKey({ key: Buffer.from(spki), format: 'der', type: 'spki' })
+}
+
+interface SignedCase {
+  id: string
+  description: string
+  domain: string
+  signer: string
+  json: { payload: unknown, signature: string }
+  message_hex: string
+  message_sha256: string
+  signature_hex: string
+}
+
+interface NegativeCase {
+  id: string
+  description: string
+  domain: string
+  message_hex: string
+  public_key_hex: string
+  signature_hex: string
+}
+
+interface OrganisationFixture {
+  signers: Record<string, { seed_hex: string, public_key_hex: string }>
+  devices: Record<string, { seed_hex: string, public_key_hex: string }>
+  authority: PolicyAuthority
+  cases: SignedCase[]
+  negative_cases: NegativeCase[]
+}
+
+const organisation = JSON.parse(
+  readFileSync(join(repositoryRoot, 'fixtures', 'crypto', 'organisation.json'), 'utf8')
+) as OrganisationFixture
+
+/** The bytes this package builds for one signed object, by the domain it is signed under. */
+function rebuilt (domain: string, payload: unknown): Uint8Array {
+  switch (domain) {
+    case MEMBERSHIP_LEASE_DOMAIN:
+      return membershipLeaseSigningInput(payload as MembershipLeasePayload)
+    case POLICY_AUTHORITY_DOMAIN:
+      return policyAuthorityLinkSigningInput(payload as PolicyAuthorityLinkPayload)
+    case POLICY_AUTHORITY_HEAD_DOMAIN:
+      return policyAuthorityHeadSigningInput(payload as PolicyAuthorityHeadPayload)
+    default:
+      throw new Error(`no builder signs under ${domain}`)
+  }
+}
+
+function verifies (message: Uint8Array, publicKeyHex: string, signature: Uint8Array): boolean {
+  return verify(null, Buffer.from(message), ed25519PublicKey(hexToBytes(publicKeyHex)), Buffer.from(signature))
+}
+
 function assertVector (id: string, bytes: Uint8Array): void {
   const entry = findCase(id)
   expect(bytesToHex(bytes), `${id}: bytes`).toBe(entry.cbor_hex)
@@ -125,6 +188,12 @@ describe('membership leases', () => {
     const { role, ...withoutRole } = lease.payload
     expect(role).toBe('owner')
     expect(() => membershipLeaseSigningInput(withoutRole as never)).toThrow(AccountSchemaError)
+    // A lease that names no device, or a key that is not one, is not the closed schema.
+    const { device_key: deviceKey, ...withoutDevice } = lease.payload
+    expect(publicKeyBytes(deviceKey)).toHaveLength(32)
+    expect(() => membershipLeaseSigningInput(withoutDevice as never)).toThrow(AccountSchemaError)
+    expect(() => membershipLeaseSigningInput({ ...lease.payload, device_key: 'AAAA' }))
+      .toThrow(AccountSchemaError)
     expect(() => membershipLeaseSigningInput({ ...lease.payload, role: 'admin' } as never))
       .toThrow(AccountSchemaError)
     expect(() => membershipLeaseSigningInput({ ...lease.payload, key_revision: '01' } as never))
@@ -214,5 +283,60 @@ describe('the policy-signing authority', () => {
     const head = findCase('policy_authority_head').json as PolicyAuthorityHead
     expect(() => policyAuthorityHeadSigningInput({ ...head.payload, expires_at_ms: -1 } as never))
       .toThrow(AccountSchemaError)
+  })
+})
+
+// The organisation vectors under `fixtures/crypto/organisation.json`: a chain of three revisions, a
+// head, and leases signed by the second and third revisions for one device. Each signing input is
+// rebuilt here by this package's own builders and each signature verified by the Node runtime.
+describe('the organisation signature vectors', () => {
+  it('verifies every signed object over the bytes this package builds', () => {
+    expect(organisation.cases.length).toBeGreaterThan(0)
+    for (const entry of organisation.cases) {
+      const message = rebuilt(entry.domain, entry.json.payload)
+      expect(bytesToHex(message), `${entry.id}: bytes`).toBe(entry.message_hex)
+      expect(sha256(message), `${entry.id}: digest`).toBe(entry.message_sha256)
+      const signature = signatureBytes(entry.json.signature)
+      expect(bytesToHex(signature), `${entry.id}: signature`).toBe(entry.signature_hex)
+      const signer = organisation.signers[entry.signer]
+      expect(signer, `${entry.id}: signer`).toBeDefined()
+      expect(verifies(message, signer?.public_key_hex ?? '', signature), entry.id).toBe(true)
+    }
+  })
+
+  it('fails every signed object whose payload has one field changed', () => {
+    for (const entry of organisation.cases) {
+      const changed = {
+        ...(entry.json.payload as Record<string, unknown>),
+        organisation_id: '00000000-0000-4000-8000-000000000000'
+      }
+      const message = rebuilt(entry.domain, changed)
+      expect(bytesToHex(message), `${entry.id}: bytes`).not.toBe(entry.message_hex)
+      const signer = organisation.signers[entry.signer]
+      expect(verifies(message, signer?.public_key_hex ?? '', signatureBytes(entry.json.signature)), entry.id)
+        .toBe(false)
+    }
+  })
+
+  it('rejects every negative case', () => {
+    expect(organisation.negative_cases.length).toBeGreaterThan(0)
+    for (const entry of organisation.negative_cases) {
+      expect(verifies(hexToBytes(entry.message_hex), entry.public_key_hex, hexToBytes(entry.signature_hex)), entry.id)
+        .toBe(false)
+    }
+  })
+
+  it('binds both leases to the member device and the chain they belong to', () => {
+    const member = organisation.devices.member?.public_key_hex
+    const leases = organisation.cases.filter((entry) => entry.domain === MEMBERSHIP_LEASE_DOMAIN)
+    expect(leases).toHaveLength(2)
+    for (const entry of leases) {
+      const payload = entry.json.payload as MembershipLeasePayload
+      expect(bytesToHex(publicKeyBytes(payload.device_key)), entry.id).toBe(member)
+    }
+    const links = organisation.cases.filter((entry) => entry.domain === POLICY_AUTHORITY_DOMAIN)
+    expect(organisation.authority.chain.map((link) => link.payload)).toEqual(links.map((entry) => entry.json.payload))
+    const head = organisation.cases.find((entry) => entry.domain === POLICY_AUTHORITY_HEAD_DOMAIN)
+    expect(organisation.authority.head.payload).toEqual(head?.json.payload)
   })
 })
