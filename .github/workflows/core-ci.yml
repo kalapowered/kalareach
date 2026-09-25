@@ -393,137 +393,6 @@ jobs:
           & "$env:ProgramFiles\Git\usr\bin\sh.exe" -c 'echo the POSIX shell the test scripts use is here'
           whoami /priv
 
-      # Temporary: the job this runner's steps run in and whether a start may break away from it,
-      # and what a directory narrowed to reading answers an open that asks to add a file.
-      - name: Diagnose the job and a narrowed directory
-        run: |
-          $ErrorActionPreference = 'Continue'
-          Add-Type -TypeDefinition @'
-          using System;
-          using System.Runtime.InteropServices;
-          using Microsoft.Win32.SafeHandles;
-          public static class KrDiag {
-            [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
-            public static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr sa, uint disposition, uint flags, IntPtr template);
-            [DllImport("kernel32.dll", SetLastError=true)]
-            public static extern bool FlushFileBuffers(SafeFileHandle handle);
-            [DllImport("kernel32.dll", SetLastError=true)]
-            public static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool result);
-            [DllImport("kernel32.dll")]
-            public static extern IntPtr GetCurrentProcess();
-            [StructLayout(LayoutKind.Sequential)]
-            public struct BASIC { public long a; public long b; public uint LimitFlags; public UIntPtr c; public UIntPtr d; public uint e; public UIntPtr f; public uint g; public uint h; }
-            [StructLayout(LayoutKind.Sequential)]
-            public struct IOC { public ulong a, b, c, d, e, f; }
-            [StructLayout(LayoutKind.Sequential)]
-            public struct EXT { public BASIC Basic; public IOC Io; public UIntPtr p1, p2, p3, p4; }
-            [DllImport("kernel32.dll", SetLastError=true)]
-            public static extern bool QueryInformationJobObject(IntPtr job, int cls, ref EXT info, uint size, out uint ret);
-            [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
-            public struct SI { public uint cb; public string r, d, t; public uint x, y, xs, ys, xc, yc, fill, flags; public ushort show, r2; public IntPtr r3, i, o, e; }
-            [StructLayout(LayoutKind.Sequential)]
-            public struct PI { public IntPtr p, t; public uint pid, tid; }
-            [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
-            public static extern bool CreateProcessW(string app, System.Text.StringBuilder cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string cwd, ref SI si, out PI pi);
-            [DllImport("kernel32.dll")]
-            public static extern bool CloseHandle(IntPtr h);
-            public static string Job() {
-              bool inJob;
-              if (!IsProcessInJob(GetCurrentProcess(), IntPtr.Zero, out inJob)) return "IsProcessInJob failed " + Marshal.GetLastWin32Error();
-              if (!inJob) return "in no job";
-              EXT info = new EXT(); uint ret;
-              if (!QueryInformationJobObject(IntPtr.Zero, 9, ref info, (uint)Marshal.SizeOf(typeof(EXT)), out ret)) return "in a job; its limits could not be read: " + Marshal.GetLastWin32Error();
-              uint f = info.Basic.LimitFlags;
-              return String.Format("in a job; limit flags 0x{0:x}: breakaway_ok={1} silent_breakaway_ok={2} kill_on_job_close={3}", f, (f & 0x800) != 0, (f & 0x1000) != 0, (f & 0x2000) != 0);
-            }
-            public static string Breakaway() {
-              SI si = new SI(); si.cb = (uint)Marshal.SizeOf(typeof(SI)); PI pi;
-              var cmd = new System.Text.StringBuilder("cmd.exe /d /c exit 0");
-              uint flags = 0x01000000 | 0x00000200 | 0x00000008;
-              if (!CreateProcessW(null, cmd, IntPtr.Zero, IntPtr.Zero, false, flags, IntPtr.Zero, null, ref si, out pi)) return "a start that breaks away is refused: error " + Marshal.GetLastWin32Error();
-              CloseHandle(pi.p); CloseHandle(pi.t);
-              return "a start that breaks away succeeds";
-            }
-            public static string Open(string path, uint access, uint share) {
-              using (var h = CreateFileW(path, access, share, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero)) {
-                if (h.IsInvalid) return "open refused: error " + Marshal.GetLastWin32Error();
-                if (!FlushFileBuffers(h)) return "opened; flush refused: error " + Marshal.GetLastWin32Error();
-                return "opened and flushed";
-              }
-            }
-            [DllImport("kernel32.dll", SetLastError=true)]
-            public static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
-            public static string InJob(int pid) {
-              IntPtr p = OpenProcess(0x1000, false, pid);
-              if (p == IntPtr.Zero) return "cannot be asked: error " + Marshal.GetLastWin32Error();
-              bool inJob; bool asked = IsProcessInJob(p, IntPtr.Zero, out inJob); CloseHandle(p);
-              if (!asked) return "cannot be asked: error " + Marshal.GetLastWin32Error();
-              return inJob ? "in a job" : "in no job";
-            }
-            public static SafeFileHandle Hold(string path, uint access, uint share) {
-              return CreateFileW(path, access, share, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);
-            }
-          }
-          '@
-          function Sddl($path) { (Get-Acl -LiteralPath $path).Sddl }
-          '== context: ' + [KrDiag]::Job()
-          '== context start: ' + [KrDiag]::Breakaway()
-          '== account: ' + (whoami /user /fo csv /nh)
-          '== logged on:'
-          quser 2>&1
-          foreach ($name in 'explorer', 'sshd', 'sshd-session', 'taskhostw', 'svchost', 'pwsh', 'cargo') {
-            foreach ($p in @(Get-Process -Name $name -ErrorAction SilentlyContinue | Select-Object -First 3)) {
-              "== process $name $($p.Id) session $($p.SessionId): " + [KrDiag]::InJob($p.Id)
-            }
-          }
-          $me = Get-CimInstance Win32_Process -Filter "ProcessId = $PID"
-          $chain = @()
-          $cursor = $me
-          while ($cursor -and $chain.Count -lt 8) {
-            $chain += "$($cursor.Name)($($cursor.ProcessId)): " + [KrDiag]::InJob([int]$cursor.ProcessId)
-            $cursor = Get-CimInstance Win32_Process -Filter "ProcessId = $($cursor.ParentProcessId)"
-          }
-          '== this process and its parents: ' + ($chain -join ' <- ')
-          '== temp: ' + $env:TEMP
-          '== temp list: ' + (Sddl $env:TEMP)
-          $root = Join-Path $env:TEMP ('kr-t-win2-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
-          New-Item -ItemType Directory -Path $root | Out-Null
-          '== root list: ' + (Sddl $root)
-          $sid = ((whoami /user /fo csv /nh) -split ',')[-1].Trim('"')
-
-          # The narrowing the removed store test made, under a parent that inherits normally.
-          $fixed = Join-Path $root 'fixed'
-          New-Item -ItemType Directory -Path (Join-Path $fixed 'inner') | Out-Null
-          icacls (Join-Path $fixed 'inner') /inheritance:d | Out-Null
-          icacls $fixed /inheritance:r /grant:r "*${sid}:(RX)" | Out-Null
-          '== ordinary parent, narrowed list: ' + (Sddl $fixed)
-          '== ordinary parent, FILE_ADD_FILE: ' + [KrDiag]::Open($fixed, 0x2, 7)
-          '== ordinary parent, FILE_ADD_SUBDIRECTORY: ' + [KrDiag]::Open($fixed, 0x4, 7)
-
-          '== privileges:'
-          whoami /priv /fo csv /nh
-          '== groups:'
-          whoami /groups /fo csv /nh
-
-          # Which operations a handle on a directory that shares no writing stops.
-          $held = Join-Path $root 'held'
-          New-Item -ItemType Directory -Path $held | Out-Null
-          [IO.File]::WriteAllText((Join-Path $held 'before'), 'x')
-          $handle = [KrDiag]::Hold($held, 0x1, 5)
-          '== held with list-directory access, sharing reading and deletion: invalid=' + $handle.IsInvalid
-          try { [IO.File]::WriteAllText((Join-Path $held 'created'), 'x'); '== create a file: done' } catch { '== create a file: ' + $_.Exception.Message }
-          try { [IO.File]::Move((Join-Path $held 'created'), (Join-Path $held 'renamed')); '== rename within it: done' } catch { '== rename within it: ' + $_.Exception.Message }
-          try { [IO.File]::Move((Join-Path $held 'renamed'), (Join-Path $held 'before'), $true); '== rename over a file in it: done' } catch { '== rename over a file in it: ' + $_.Exception.Message }
-          try { [IO.File]::Delete((Join-Path $held 'before')); '== delete in it: done' } catch { '== delete in it: ' + $_.Exception.Message }
-          '== flush with FILE_ADD_FILE while held: ' + [KrDiag]::Open($held, 0x2, 7)
-          '== flush with FILE_ADD_SUBDIRECTORY while held: ' + [KrDiag]::Open($held, 0x4, 7)
-          $handle.Dispose()
-          '== flush with FILE_ADD_FILE once let go: ' + [KrDiag]::Open($held, 0x2, 7)
-
-          icacls $fixed /grant "*${sid}:(OI)(CI)F" | Out-Null
-          Remove-Item -LiteralPath $root -Recurse -Force
-          '== removed: ' + (-not (Test-Path -LiteralPath $root))
-
       # Everything the workspace compiles for this target, including the test targets: a test that
       # only builds on Unix is a Windows failure, and this is where it is caught.
       - name: Compile the workspace and its tests
@@ -534,23 +403,25 @@ jobs:
       # worker's own library, the suite that drives a real pseudo-console, a real PowerShell and a
       # real job object and hosts a worker on its own pipe, where a launched agent's helper is
       # placed, what a question's caller token reaches, a controller's and the local command
-      # line's authority at a worker's pipe, and the local endpoint, descriptors and process
-      # identity the host rests on. "The attach client" means the part of it that runs here -
-      # `crates/kr-cli/tests/attach.rs` is a Unix file, so what passes is that crate's library and
-      # its path tests rather than a real attachment. The contact tools run in
+      # line's authority at a worker's pipe, the local endpoint, descriptors and process identity
+      # the host rests on (the descriptor reader checks both the directory's and the file's
+      # access-control lists here), every local store's directory flush, the persistence suite, the
+      # decision a worker start makes about breaking away from the daemon's job, and the real-worker
+      # host tests from the built executable. "The attach client" means the part of it that runs
+      # here - `crates/kr-cli/tests/attach.rs` is a Unix file, so what passes is that crate's library
+      # and its path tests rather than a real attachment. The contact tools run in
       # `crates/kr-cli/tests/contact_windows.rs`, beside the Unix suite, with the tool server
       # started by a root shell inside the session's job.
       #
-      # The worker's other integration suites are **not** run here. They drive a session the way a
-      # Unix pseudo-terminal behaves - a process group, a shell that answers a signal, a stream
-      # with no console repainting it - and on Windows a good many of them fail. What each of
-      # those failures means has not been established. What one whole run printed was a
-      # `kr-worker.exe` copied to a temporary directory that Windows refused to start, a POSIX
-      # shell that sometimes would not start, and a console that painted a screen and set a window
-      # title before the shell wrote a byte. Running them here and calling the result a Windows
-      # failure would say something this project has not established; compiling them, which the
-      # step above does with `--all-targets`, is what this job owes them until somebody qualifies
-      # them.
+      # The persistence suite runs with PowerShell 7 as each session's root shell rather than the
+      # `/bin/sh` this platform has not got. The host tests that start a real worker are run from the
+      # built test executable rather than through `cargo test`, because cargo's own job kills its
+      # members on close and forbids breakaway, so a worker started under it cannot be made the
+      # independent process it must be; the executable, run directly, is not inside that job, and the
+      # worker starts. Three of those tests are held back, named at their step: two need the worker's
+      # rendezvous to complete on this platform, which it does not yet, and one uses a POSIX shell
+      # binary this platform has not got. `docs/host/README.md` and the task's records carry the
+      # evidence.
       #
       # What this runner cannot do at all is qualify a console interactively. The pseudo-console
       # tests open a console of their own and drive it, which works here; what needs a real machine
@@ -631,6 +502,13 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-controller --lib registry
 
+      # A Windows worker must be independent of the daemon's kill-on-close job, so the start asks to
+      # break away from that job only when the daemon's own job would kill it on close. This checks
+      # that decision for the four job contexts the product can be started in.
+      - name: Decide a worker's breakaway from the daemon's job
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-controller --lib supervision::tests::a_worker_breaks_away_only_from_a_kill_on_close_job
+
       # The environment feature store on this platform, among its tests the claim a controller of
       # the previous release wrote on it with its start in whole seconds, which the next owner
       # reads and replaces.
@@ -638,11 +516,14 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-attention
 
-      # The settings-sync store flushes the directory it changes a name in, through a handle of
-      # the directory's own, and passes over a directory on its path this account may not add to.
-      - name: Test the settings-sync store's directory flush
+      # Every local store flushes the directory it changes a name in through one shared handle in
+      # kr-ipc, opened with the right the change used and passing over a directory on the path this
+      # account may not add to. The flush itself is checked in "Test the local IPC library" above;
+      # this runs the client's own stores that call it - the drafts store, the offline-answer store,
+      # the settings-sync store and its membership file, and the recovery-bundle record.
+      - name: Test the client's stores and their directory flush
         if: ${{ !cancelled() }}
-        run: cargo test --locked -p kr-client --lib sync::store
+        run: cargo test --locked -p kr-client --lib
 
       # The root editor's own transport on this platform. The bridge endpoint is a named pipe
       # rather than a socket, so the client keeps one asynchronous read in flight and collects it
@@ -671,8 +552,12 @@ jobs:
           cargo test --locked -p kr-project --test boundary -- --nocapture
 
       # What a change set carries across a replacement, on the platform whose access-control lists
-      # have no counterpart on the others. The cases that need a checkout state that this host runs
-      # no repository tool; what runs here is the rest, and `--nocapture` is what prints both.
+      # have no counterpart on the others. No apply case runs here: the platform-independent cases
+      # are Unix-only, and the three that check what an apply carries across a Windows access-control
+      # list each need a repository tool, which the Windows repository boundary refuses to run, so
+      # they are ignored. `--all-targets` above compiles them; each runs with `--ignored` on a
+      # Windows host whose boundary runs a repository tool, which no host does yet. `--nocapture`
+      # prints that nothing ran rather than hiding it.
       - name: Test what an apply carries across
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-changeset --test apply -- --nocapture
@@ -695,6 +580,42 @@ jobs:
         env:
           KR_TEST_PLATFORM_SECRET_STORE: "1"
         run: cargo test --locked -p kr-client --lib -- --nocapture --exact sync::keys::tests::a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again
+
+      # Section 24 at the worker: the durability contract, the outbox, retention, the journal-fault
+      # seam, local state and forward-only migration. The root shell each session runs is PowerShell
+      # 7 here rather than the `/bin/sh` this platform has not got, and the owner-only check reads
+      # each state directory's access-control list. One test is Unix-only and absent here: its root
+      # program is a POSIX script that turns off echo, traps the interrupt signal and reads a line at
+      # a time, and its store-side halves run in the tests below it.
+      - name: Test the persistence suite
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-worker --test persistence
+
+      # A Windows worker start inside a job that kills on close and forbids breakaway is refused with
+      # a named failure, which `cargo test`'s own job is, so this runs under cargo. The real-worker
+      # host tests are ignored here for that reason; they run from the built executable in the next
+      # step, outside cargo's job.
+      - name: The named breakaway failure inside cargo's job
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-worker --test host
+
+      # The real-worker host tests, run from the built executable directly rather than through cargo,
+      # so they are not inside cargo's kill-on-close job and the worker starts. This runner's own job
+      # does not kill on close, so no breakaway is asked for. Three are held back: two need the
+      # worker's rendezvous to complete on this platform, which it does not yet (the worker does not
+      # report itself in time), and one places a POSIX `/bin/cat` as a stand-in shell binary, which
+      # this platform has not got; `docs/host/README.md` and the task's records name them.
+      - name: The real-worker host tests, from the built executable
+        if: ${{ !cancelled() }}
+        run: |
+          cargo test --locked -p kr-worker --test host --no-run
+          $exe = Get-ChildItem target\debug\deps\host-*.exe |
+            Sort-Object LastWriteTime | Select-Object -Last 1
+          & $exe.FullName --ignored --test-threads=1 --nocapture `
+            --skip a_daemon_restart_keeps_the_session_and_its_shell `
+            --skip the_descriptor_is_published_whole_and_owner_only_and_names_the_worker `
+            --skip a_worker_that_reports_it_could_not_start_leaves_no_directory
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # The other Windows target the product ships on. Nothing is executed for it here; this is
       # the compile the release baseline asks for.
