@@ -59,6 +59,20 @@ function outcomeWords(outcome: ReviewOutcome, host: string): string {
       return 'This request could not be checked, so it cannot be confirmed here.'
     case 'no_ceremony':
       return 'This computer cannot check it is you. Confirm on your phone.'
+    case 'unknown':
+      return `${host} did not say whether it took the confirmation. While the request is listed here, it is not confirmed.`
+  }
+}
+
+/** How a review's outcome is shown: done, not known yet, or not done. */
+function outcomeTone(outcome: ReviewOutcome): 'success' | 'pending' | 'danger' {
+  switch (outcome) {
+    case 'confirmed':
+      return 'success'
+    case 'unknown':
+      return 'pending'
+    default:
+      return 'danger'
   }
 }
 
@@ -176,7 +190,7 @@ export function Confirmations(): ReactNode {
       port
         .ownerConfirmationReview(request.reference)
         .then((outcome) => {
-          say(outcomeWords(outcome, request.host_name), outcome === 'confirmed' ? 'success' : 'danger')
+          say(outcomeWords(outcome, request.host_name), outcomeTone(outcome))
         })
         .catch((error: unknown) => {
           say(failureMessage(error), 'danger')
