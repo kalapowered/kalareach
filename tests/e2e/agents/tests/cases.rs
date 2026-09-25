@@ -1307,7 +1307,7 @@ fn a_session_started_with_a_persons_own_home_keeps_their_login_keychain_as_its_d
             return;
         }
     };
-    let run = Run::start("the person's own home");
+    let run = Run::start("person's own home");
     let host = Host::start(
         &run,
         &HostOptions {
