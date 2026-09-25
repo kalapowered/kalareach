@@ -1086,7 +1086,15 @@ async fn asking_whether_the_desktop_has_gone_takes_no_reading() {
 /// blocking thread, and this runtime has one, which this test occupies. The probe is therefore
 /// outstanding for the whole of what follows, and what follows is the fence releasing what it held
 /// at the deadline A-17 gives it.
+///
+/// It needs a graphical login for the session to be bound to: a person logged in at the console,
+/// as on a macOS workstation and continuous integration's macOS job. Where there is none it fails
+/// and says so; elsewhere than macOS it is left out of an ordinary run.
 #[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "needs a graphical login for a desktop-bound session to watch; it runs on macOS with a person logged in at the console, and with --ignored on another desktop with one"
+)]
 fn held_input_reaches_the_writer_while_a_desktop_reading_is_outstanding() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -1116,13 +1124,12 @@ fn held_input_reaches_the_writer_while_a_desktop_reading_is_outstanding() {
         {
             // A host with no graphical login has nothing for a desktop-bound session to watch, so
             // there is no reading for this test to hold outstanding.
-            eprintln!(
-                "skipped: this host has no graphical login, so a desktop-bound session wants no \
-                 reading"
-            );
             holding.abort();
             wired.close().await;
-            return;
+            panic!(
+                "this host has no graphical login, so a desktop-bound session wants no reading and \
+                 this check cannot run here"
+            );
         }
         let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
             .await
@@ -1390,17 +1397,13 @@ fn wired_ready(runtime: &Arc<SessionRuntime>) -> bool {
 /// Everything this test touches is on the internal disk: the package is the installed build, and
 /// the session's home, runtime directory, endpoint and working directory are all under the
 /// platform temporary directory. Nothing a launched process opens is in the workspace.
+///
+/// It needs a built package, which only a run that built one has, so an ordinary run leaves it
+/// out; see [`package_root`].
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the built shell packages that KR_SHELL_PACKAGES names; it runs with --ignored in a run that has built them, as the build box's verification does"]
 async fn a_real_qualified_package_registers_and_qualifies_on_this_hosts_endpoint() {
-    let Some(package) = installed_package() else {
-        // The machine's package cache is not this suite's to depend on. A run that names
-        // KR_SHELL_PACKAGES has the built packages and drives one; a run that does not, skips.
-        eprintln!(
-            "skipped: {PACKAGE_ROOT_VARIABLE} names no directory with a qualified package, so \
-             there is no built package to launch"
-        );
-        return;
-    };
+    let package = installed_package();
     let shell = RealShell::start(
         &package,
         kr_protocol::session::LaunchProfile::default(),
@@ -1823,16 +1826,14 @@ impl RealProbes {
 /// This host establishes no command backend yet, so every answer here is a bypass: `not_integrated`
 /// for a session created with no integration, and `backend_unavailable` for one created with an
 /// integration for the name.
+///
+/// It needs the built Zsh and Bash packages, which only a run that built them has, so an ordinary
+/// run leaves it out; see [`package_root`].
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the built shell packages that KR_SHELL_PACKAGES names; it runs with --ignored in a run that has built them, as the build box's verification does"]
 async fn a_real_package_asks_the_real_worker_before_each_command_and_runs_a_bypass_as_typed() {
-    let Some(root) = std::env::var_os(PACKAGE_ROOT_VARIABLE) else {
-        eprintln!(
-            "skipped: {PACKAGE_ROOT_VARIABLE} names no directory with a qualified package, so \
-             there is no built package to launch"
-        );
-        return;
-    };
+    let root = package_root();
     let set =
         kr_shell_integration::host::package::PackageSet::discover(std::path::Path::new(&root))
             .unwrap_or_else(|fault| panic!("{PACKAGE_ROOT_VARIABLE} names {root:?}: {fault}"));
@@ -1980,20 +1981,31 @@ async fn asks_the_real_worker_before_each_command(
     }
 }
 
-/// Returns the qualified package this run may launch, or nothing.
+/// Returns the root of the built packages this run named.
 ///
-/// Only a run that names [`PACKAGE_ROOT_VARIABLE`] launches one: the machine's own package cache is
-/// not this suite's to depend on, and an ordinary acceptance run must not vary with it.
-fn installed_package() -> Option<kr_shell_integration::host::package::ShellPackage> {
-    let root = std::env::var_os(PACKAGE_ROOT_VARIABLE)?;
+/// Only a run that names [`PACKAGE_ROOT_VARIABLE`] launches a package: the machine's own package
+/// cache is not this suite's to depend on, and an ordinary acceptance run must not vary with it. So
+/// the cases that launch one are left out of an ordinary run, and a run that built the packages
+/// names their root and runs them with `--ignored`, as the build box's verification does. Run
+/// without that variable, they fail and say so.
+fn package_root() -> std::ffi::OsString {
+    std::env::var_os(PACKAGE_ROOT_VARIABLE).unwrap_or_else(|| {
+        panic!(
+            "{PACKAGE_ROOT_VARIABLE} names no directory with a qualified package, so there is no \
+             built package for this check to launch; build the packages and name their root in it"
+        )
+    })
+}
+
+/// Returns the qualified package this run named, the first the installation there has.
+fn installed_package() -> kr_shell_integration::host::package::ShellPackage {
+    let root = package_root();
     let set =
         kr_shell_integration::host::package::PackageSet::discover(std::path::Path::new(&root))
             .unwrap_or_else(|fault| panic!("{PACKAGE_ROOT_VARIABLE} names {root:?}: {fault}"));
-    let package = set
-        .select(None)
+    set.select(None)
         .unwrap_or_else(|fault| panic!("{PACKAGE_ROOT_VARIABLE} names {root:?}: {fault}"))
-        .clone();
-    Some(package)
+        .clone()
 }
 
 // --------------------------------------------------------------------------------------------
