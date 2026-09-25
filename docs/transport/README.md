@@ -198,12 +198,13 @@ when it is no longer a home relay. A refusal by a home relay that is not on the 
 about the connection. A route relay that is not the endpoint's home relay leaves no reason to read,
 and a failure through it is reported as `TransportError::Connect`.
 
-A refusal is reported only for an attempt that was made and then timed out before any connection
-was established. A request that could not be made at all, a peer that answered and refused, and an
-endpoint that was closing are each their own reason and are reported as `TransportError::Connect`,
-whatever a relay said at the time. The timeout alone does not prove the refusal caused it: a peer
-that began the handshake and then fell silent times out the same way. What the failure reports is
-that the status showed a relay on the route turning this endpoint away when the attempt ran out.
+A refusal is reported only for an attempt that was made and did not connect: one that timed out
+before any connection was established, or one that an endpoint with no IP transport ends early,
+below. A request that could not be made at all, a peer that answered and refused, and an endpoint
+that was closing are each their own reason and are reported as `TransportError::Connect`, whatever
+a relay said at the time. The timeout alone does not prove the refusal caused it: a peer that began
+the handshake and then fell silent times out the same way. What a timeout's failure reports is that
+the status showed a relay on the route turning this endpoint away when the attempt ran out.
 
 An endpoint with no IP transport, one built with `relay_only`, has nothing but relays to try, so
 once the status shows every relay on its route refusing it the attempt ends at once rather than at

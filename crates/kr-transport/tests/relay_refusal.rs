@@ -274,8 +274,9 @@ async fn each_kind_of_refusal_ends_a_relay_only_attempt_at_once_as_itself() {
 ///
 /// The refusal is the reason only while the status shows it. By the end of the attempt iroh dials
 /// the refusing relay again only after five seconds or more, and each dial shows no refusal for the
-/// few milliseconds it takes, so an attempt that ends inside one is a timeout. The device then
-/// dials once more.
+/// few milliseconds it takes, so an attempt that ends inside one is a plain timeout. When the first
+/// attempt runs to its end and times out, the device dials once more, and the second attempt has to
+/// fail as the refusal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_device_with_a_direct_transport_is_told_of_the_refusal_when_its_attempt_ends() {
     const SPENT: &str = "allowance_spent: the reserved bytes for this endpoint are spent";
@@ -286,8 +287,13 @@ async fn a_device_with_a_direct_transport_is_told_of_the_refusal_when_its_attemp
 
     let route = EndpointAddr::new(host.endpoint.id()).with_relay_url(relay.url.clone());
     let (mut took, mut outcome) = dial(&device, route.clone()).await;
-    if took >= AT_ONCE && matches!(outcome, Err(TransportError::Connect(_))) {
-        eprintln!("the attempt ended while the relay was being dialled again; dialling once more");
+    let timed_out =
+        matches!(&outcome, Err(TransportError::Connect(message)) if message == "timed out");
+    if took >= AT_ONCE && timed_out {
+        eprintln!(
+            "the first attempt timed out after {took:?}, possibly while iroh was dialling the \
+             relay again; dialling once more"
+        );
         (took, outcome) = dial(&device, route).await;
     }
     let error = outcome.expect_err("the host can be reached only through the refusing relay");
