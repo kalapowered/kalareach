@@ -9,6 +9,7 @@ import {
   encodeCanonical,
   krInt,
   krMap,
+  krMapFromSorted,
   krText,
   limitsFromFixture,
   sha256,
@@ -255,5 +256,79 @@ describe('empty collections', () => {
       expect(() => decodeCanonical(hexToBytes(hex), limits)).not.toThrowError()
     }
     expect(() => decodeCanonical(hexToBytes('8100'), limits)).toThrowError(/depth_limit/)
+  })
+})
+
+// A failure says the rule it broke and where, in the words the Rust decoder uses, and never text
+// it read from the message: a message can carry anything its sender put in it, a secret included.
+describe('what a failure says', () => {
+  const MARKER = 'kr-marker-7c1e'
+
+  function refused (action: () => unknown): KrCborError {
+    try {
+      action()
+    } catch (error) {
+      expect(error).toBeInstanceOf(KrCborError)
+      return error as KrCborError
+    }
+    throw new Error('nothing was refused')
+  }
+
+  function unmarked (error: KrCborError): void {
+    for (const rendering of [error.message, String(error)]) {
+      expect(rendering).not.toContain(MARKER)
+    }
+  }
+
+  const key = (text: string): number[] => {
+    const bytes = new TextEncoder().encode(text)
+    return [0x60 | bytes.length, ...bytes]
+  }
+
+  it('holds no map key the message carried', () => {
+    const duplicate = refused(() =>
+      decodeCanonical(Uint8Array.from([0xa2, ...key(MARKER), 0x00, ...key(MARKER), 0x01]))
+    )
+    expect(duplicate.rule).toBe('duplicate_key')
+    unmarked(duplicate)
+    const unsorted = refused(() =>
+      decodeCanonical(
+        Uint8Array.from([0xa2, ...key(`${MARKER}b`), 0x00, ...key(`${MARKER}a`), 0x01])
+      )
+    )
+    expect(unsorted.rule).toBe('unsorted_map_keys')
+    unmarked(unsorted)
+
+    for (const error of [
+      refused(() => krMap([[MARKER, krInt(1n)], [MARKER, krInt(2n)]])),
+      refused(() => krMapFromSorted([[MARKER, krInt(1n)], [MARKER, krInt(2n)]])),
+      refused(() => krMapFromSorted([[`${MARKER}b`, krInt(1n)], [`${MARKER}a`, krInt(2n)]])),
+      refused(() =>
+        encodeCanonical({ kind: 'map', entries: [[MARKER, krInt(1n)], [MARKER, krInt(2n)]] })
+      ),
+      refused(() =>
+        encodeCanonical({
+          kind: 'map',
+          entries: [[`${MARKER}b`, krInt(1n)], [`${MARKER}a`, krInt(2n)]]
+        })
+      )
+    ]) {
+      unmarked(error)
+    }
+  })
+
+  it('still says the rule and the place', () => {
+    const duplicate = refused(() =>
+      decodeCanonical(Uint8Array.from([0xa2, ...key('a'), 0x00, ...key('a'), 0x01]))
+    )
+    expect(duplicate.message).toBe('duplicate_key: duplicate map key')
+    expect(duplicate.offset).toBe(4)
+    const unsorted = refused(() =>
+      decodeCanonical(Uint8Array.from([0xa2, ...key('b'), 0x00, ...key('a'), 0x01]))
+    )
+    expect(unsorted.message).toBe('unsorted_map_keys: map keys are not in canonical order')
+    expect(unsorted.offset).toBe(4)
+    const trailing = refused(() => decodeCanonical(Uint8Array.from([0x01, 0x02, 0x03])))
+    expect(trailing.message).toContain('2 trailing')
   })
 })
