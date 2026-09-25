@@ -406,8 +406,9 @@ jobs:
       # line's authority at a worker's pipe, the local endpoint, descriptors and process identity
       # the host rests on (the descriptor reader checks both the directory's and the file's
       # access-control lists here), every local store's directory flush, the persistence suite, the
-      # decision a worker start makes about breaking away from the daemon's job, and the real-worker
-      # host tests from the built executable. "The attach client" means the part of it that runs
+      # decision a worker start makes about breaking away from the daemon's job, the real-worker
+      # host tests from the built executable, and the first-owner pairing against a real control
+      # daemon on loopback. "The attach client" means the part of it that runs
       # here - `crates/kr-cli/tests/attach.rs` is a Unix file, so what passes is that crate's library
       # and its path tests rather than a real attachment. The contact tools run in
       # `crates/kr-cli/tests/contact_windows.rs`, beside the Unix suite, with the tool server
@@ -430,7 +431,16 @@ jobs:
       # One command per step. Three in one script would run under a shell that carries on after a
       # native command fails, and the step would then report whatever the last one returned: a
       # failure in the first two could pass.
-      - name: Test the terminal engine, the repository boundary and the attach client
+      # The pairing tests below run `kr` against a real control daemon they find built beside them,
+      # so the daemon's binary is built before the kr-cli suites run.
+      - name: Build the control daemon the pairing tests use
+        run: cargo build --locked -p kr-controller
+
+      # kr-cli's suites include the first-owner pairing tests in `crates/kr-cli/tests/pair_windows.rs`,
+      # which start the daemon on loopback (its network listener comes up on this platform), confirm
+      # the first owner at a pseudo-console outside every session, and refuse it with no console,
+      # inside a session, and where session membership cannot be established.
+      - name: Test the terminal engine, the repository boundary, the attach client and pairing
         run: cargo test --locked -p kr-term -p kr-project -p kr-cli
 
       - name: Test the worker's library
