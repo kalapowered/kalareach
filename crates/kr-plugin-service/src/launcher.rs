@@ -2,7 +2,8 @@
 //!
 //! The controller owns this. It is here rather than in the control daemon because the daemon's only
 //! interest in the plugin host is that one exists when a binding needs it, and everything else
-//! about starting one belongs with the runtime that defines what it does.
+//! about starting one belongs with the protocol the host speaks. It is not in the plugin runtime
+//! either: the control daemon may not link the engine, and this crate links none.
 //!
 //! # Lazily
 //!
@@ -59,7 +60,7 @@ use kr_protocol::ids::EnvironmentId;
 use kr_protocol::scalars::{AuthorisationKey, Nonce256};
 use kr_protocol::worker::ReservationId;
 
-use crate::service::protocol::{
+use crate::protocol::{
     self, HostDescriptor, HostRendezvous, HostVerifyProof, RENDEZVOUS_DOMAIN, RendezvousAccepted,
     VERIFY_DOMAIN,
 };
@@ -358,7 +359,7 @@ async fn retire_ended_hosts(environment: &EnvironmentPaths, supervisor: &Arc<dyn
     let _ = tokio::task::spawn_blocking(move || {
         for label in defined {
             if let HostJobRetirement::Unsettled(detail) = supervisor.retire(&jobs, &label) {
-                eprintln!("kr-plugin-runtime: the job {label} could not be removed: {detail}");
+                eprintln!("kr-plugin-service: the job {label} could not be removed: {detail}");
             }
         }
     })
@@ -453,11 +454,11 @@ fn retire_when_ended(
         match left {
             None | Some(HostJobRetirement::Gone) => {}
             Some(HostJobRetirement::StillRunning) => eprintln!(
-                "kr-plugin-runtime: the job {label} still had a process {RETIREMENT_WINDOW:?} \
+                "kr-plugin-service: the job {label} still had a process {RETIREMENT_WINDOW:?} \
                  after its host was last known to run, so it is left for the next launch to look at"
             ),
             Some(HostJobRetirement::Unsettled(detail)) => {
-                eprintln!("kr-plugin-runtime: the job {label} could not be removed: {detail}");
+                eprintln!("kr-plugin-service: the job {label} could not be removed: {detail}");
             }
         }
     });

@@ -185,18 +185,6 @@ pub enum RuntimeError {
     /// to another call, another binding or another generation.
     #[error("the source event handle is not one this call was given")]
     UnscopedHandle,
-    /// The plugin-host process is unreachable.
-    #[error("the plugin runtime service is unavailable: {detail}")]
-    ServiceUnavailable {
-        /// What the connection reported.
-        detail: String,
-    },
-    /// The service answered something this client cannot read.
-    #[error("the plugin runtime service answered with {detail}")]
-    ServiceProtocol {
-        /// What was wrong with the answer.
-        detail: String,
-    },
     /// This host cannot enforce an elapsed deadline.
     ///
     /// The engine's epoch thread did not start, so nothing would stop a call at its deadline. This

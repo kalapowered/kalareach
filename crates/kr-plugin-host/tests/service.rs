@@ -22,17 +22,17 @@ use kr_controller::supervision::{
 use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::WorkerIdentity;
-use kr_plugin_runtime::runtime::host::{
-    BindingActivity, BindingFacts, ScopedSourceEvent, SourceProvenance,
-};
-use kr_plugin_runtime::service::client::{PluginClient, new_binding_id};
-use kr_plugin_runtime::service::launcher::{
-    self, HostJobRetirement, HostLaunchPlan, HostStartOutcome, HostSupervisor, host_endpoint,
-};
-use kr_plugin_runtime::service::protocol::{ComponentSource, HostDescriptor, Notice};
 use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::identity::PluginIdentity;
 use kr_plugin_sdk::version::PackageVersion;
+use kr_plugin_service::client::{PluginClient, new_binding_id};
+use kr_plugin_service::launcher::{
+    self, HostJobRetirement, HostLaunchPlan, HostStartOutcome, HostSupervisor, host_endpoint,
+};
+use kr_plugin_service::protocol::{ComponentSource, HostDescriptor, Notice};
+use kr_plugin_service::vocabulary::{
+    BindingActivity, BindingFacts, ScopedSourceEvent, SourceProvenance,
+};
 use kr_protocol::attachment::{
     AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult,
 };
@@ -879,8 +879,8 @@ async fn kr_req_05_07_a_plugin_host_crash_kills_no_worker_and_loses_no_request()
     assert!(
         matches!(
             error,
-            kr_plugin_runtime::RuntimeError::ServiceUnavailable { .. }
-                | kr_plugin_runtime::RuntimeError::CallerDeadline { .. }
+            kr_plugin_service::error::ServiceError::Unavailable { .. }
+                | kr_plugin_service::error::ServiceError::CallerDeadline { .. }
         ),
         "the worker was told {error}"
     );
@@ -979,8 +979,8 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
         assert!(
             matches!(
                 handoff,
-                kr_plugin_runtime::service::client::Handoff::Accepted
-                    | kr_plugin_runtime::service::client::Handoff::Refused { .. }
+                kr_plugin_service::client::Handoff::Accepted
+                    | kr_plugin_service::client::Handoff::Refused { .. }
             ),
             "the handoff was {handoff:?}"
         );
@@ -1104,8 +1104,8 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
     assert!(
         matches!(
             handed_back,
-            kr_plugin_runtime::service::client::Handoff::Accepted
-                | kr_plugin_runtime::service::client::Handoff::Refused { .. }
+            kr_plugin_service::client::Handoff::Accepted
+                | kr_plugin_service::client::Handoff::Refused { .. }
         ),
         "the drained output could not be handed to the runtime: {handed_back:?}"
     );

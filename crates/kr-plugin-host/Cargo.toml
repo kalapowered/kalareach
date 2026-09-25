@@ -19,6 +19,7 @@ kr-crypto.workspace = true
 kr-ipc.workspace = true
 kr-plugin-runtime.workspace = true
 kr-plugin-sdk.workspace = true
+kr-plugin-service.workspace = true
 kr-protocol.workspace = true
 serde.workspace = true
 thiserror.workspace = true

@@ -3,18 +3,19 @@
 //! The plugin SDK states the contract: what a package carries, what a component exports, what the
 //! host imports supply and what limits everything runs under. This crate is the half that runs it.
 //! It holds the component engine, the per-instance bounds, the compiled-code cache, the binding
-//! lifecycle, and the client and protocol of the per-environment service that owns the instances.
+//! lifecycle, and the plugin host's side of the per-environment service that owns the instances.
 //!
 //! # The two halves
 //!
 //! | Module | What it owns |
 //! | --- | --- |
 //! | [`runtime`] | The engine, the generated bindings, the four host imports, the limiter, fuel and deadlines, the fault counter, the cache, lazy compilation and the binding lifecycle |
-//! | [`service`] | The protocol a worker speaks to the plugin-host process, both ends of it, and the launcher that starts the host |
+//! | [`service`] | The plugin host serving workers, over the protocol `kr_plugin_service` defines |
 //!
-//! A worker never links the engine. It registers a binding with the plugin host over [`service`],
-//! and the host runs the component in its own process. That is what makes a component fault
-//! survivable: a plugin-host crash invalidates rich bindings and nothing else.
+//! A worker never links the engine, so it never links this crate. What it may link to reach the
+//! plugin host is `kr_plugin_service`, which holds the protocol, the client and the launcher and
+//! links no engine; the host runs the component in its own process. That is what makes a component
+//! fault survivable: a plugin-host crash invalidates rich bindings and nothing else.
 //!
 //! # What a component can reach
 //!

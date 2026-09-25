@@ -22,13 +22,12 @@ use kr_plugin_runtime::runtime::budget::{CallBudget, CallKind};
 use kr_plugin_runtime::runtime::compile::{CompileBudget, CompileOrigin, compile_or_load};
 use kr_plugin_runtime::runtime::engine::RuntimeEngine;
 use kr_plugin_runtime::runtime::error::ExhaustedBound;
-use kr_plugin_runtime::runtime::host::{BindingFacts, MAX_NODE_BYTES};
 use kr_plugin_runtime::runtime::instance::{CallOutcome, Instance};
 use kr_plugin_runtime::runtime::limits::InstanceLimiter;
-use kr_plugin_runtime::runtime::queue::Admission;
 use kr_plugin_sdk::limits::{
     FAULTS_BEFORE_DISABLE, INSTANCE_MEMORY_BYTES, OBSERVATION_QUEUE_BYTES, OUTPUT_BYTES_PER_CALL,
 };
+use kr_plugin_service::vocabulary::{Admission, BindingFacts, MAX_NODE_BYTES};
 
 /// How long a test waits for a compile. Generous: a machine under load is not the case under test.
 const COMPILE_WAIT: core::time::Duration = core::time::Duration::from_secs(60);
@@ -1181,7 +1180,7 @@ async fn kr_req_06_06_a_binding_names_the_plugin_the_bytes_and_the_generation() 
     // And it binds under its own identifier, beside the first: an upgrade is a new binding rather
     // than a mutation of a live one.
     let mut second = upgraded.clone();
-    second.binding_id = kr_plugin_runtime::service::client::new_binding_id();
+    second.binding_id = kr_plugin_service::client::new_binding_id();
     let (second_events, _second_received) = events();
     let upgraded_handle = host
         .runtime
@@ -1293,9 +1292,9 @@ async fn a_replacement_after_a_fault_is_bound_to_the_current_revision() {
     // The binding moves on, and an attachment arrives.
     let mut facts = components::facts("well-behaved");
     facts.binding_revision = 11;
-    facts.activity = kr_plugin_runtime::runtime::host::BindingActivity::AwaitingPerson;
+    facts.activity = kr_plugin_service::vocabulary::BindingActivity::AwaitingPerson;
     instance.set_binding_facts(facts);
-    instance.set_attachments(vec![kr_plugin_runtime::runtime::host::AttachmentFact {
+    instance.set_attachments(vec![kr_plugin_service::vocabulary::AttachmentFact {
         attachment_id: "a-1".to_owned(),
         name: "diagram.png".to_owned(),
         media_type: "image/png".to_owned(),

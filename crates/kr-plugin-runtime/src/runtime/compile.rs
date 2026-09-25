@@ -52,6 +52,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use kr_plugin_sdk::digest::PayloadDigest;
+use kr_plugin_service::vocabulary::COMPILE_DEADLINE_MS;
 
 use crate::runtime::cache::{CacheKey, CompiledCache};
 use crate::runtime::engine::RuntimeEngine;
@@ -64,9 +65,6 @@ use crate::runtime::imports;
 /// 16 MiB of Wasm is already a second or more of work; past that the sensible answer is that the
 /// package is not one this host runs.
 pub const MAX_COMPONENT_BYTES: u64 = 16 * 1024 * 1024;
-
-/// How long a compile may take before its result is discarded.
-pub const COMPILE_DEADLINE_MS: u64 = 30_000;
 
 /// How many components may be compiling at once.
 pub const COMPILE_THREADS: usize = 2;

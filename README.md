@@ -27,7 +27,8 @@ A Cargo workspace and a pnpm workspace share one tree.
 | `crates/kr-client` | The native client library: network and local connections, typed calls, cursors, receipts and replaceable service clients |
 | `crates/kr-plugin-sdk` | The plugin package contract: manifests, the WIT package, effect classes, the catalogue index and the package validator |
 | `crates/kr-plugin-catalogue` | The plugin catalogue client: repository enrolment and budgets, the signed metadata snapshot and its verification, offline search, package activation and what an installed package may do |
-| `crates/kr-plugin-runtime` | Component hosting: the engine, the per-instance limits, the compiled-code cache, the binding lifecycle and the plugin-host protocol |
+| `crates/kr-plugin-runtime` | Component hosting: the engine, the per-instance limits, the compiled-code cache and the binding lifecycle |
+| `crates/kr-plugin-service` | Reaching the plugin host without the engine: its protocol, the worker's client and the launcher |
 | `crates/kr-plugin-host` | The plugin-runtime service: one lazily started per-environment process that owns component instances |
 | `crates/kr-term` | The terminal engine: the kr-vt/1 profile, sequence classes, canonical grid, query broker and snapshots |
 | `crates/kr-shell-integration` | The root-editor bridge contract: the handshake, the reader events, the fence and detach state machine and the cross-shell scenarios |

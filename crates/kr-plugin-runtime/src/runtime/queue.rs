@@ -35,31 +35,7 @@
 use std::collections::VecDeque;
 
 use kr_plugin_sdk::limits::OBSERVATION_QUEUE_BYTES;
-
-use crate::runtime::host::ScopedSourceEvent;
-
-/// What happened to an event offered to the queue.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Admission {
-    /// The event is queued, and nothing was lost.
-    Queued,
-    /// The event is queued, and older observations were evicted to make room.
-    QueuedWithGap {
-        /// How many observations were evicted.
-        events: u32,
-        /// How many bytes they held.
-        bytes: u64,
-    },
-    /// The event was not queued.
-    ///
-    /// Only an authoritative request reaches this, and only when the queue is full of other
-    /// authoritative requests. The broker keeps the request; what is unavailable is the rich
-    /// interpretation of it, not the request.
-    Refused {
-        /// How many bytes the queue holds.
-        held_bytes: u64,
-    },
-}
+use kr_plugin_service::vocabulary::{Admission, ScopedSourceEvent};
 
 /// A gap in the observation stream.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -320,7 +296,7 @@ impl Default for ObservationQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::host::SourceProvenance;
+    use kr_plugin_service::vocabulary::SourceProvenance;
     use kr_protocol::ids::SourceEventHandle;
 
     fn scrape(name: &str, bytes: usize) -> ScopedSourceEvent {

@@ -1,6 +1,6 @@
 [package]
 name = "kr-plugin-runtime"
-description = "KalaReach component hosting: the Wasmtime engine, per-instance limits, the compiled-code cache, the binding lifecycle and the plugin-host service client"
+description = "KalaReach component hosting: the Wasmtime engine, per-instance limits, the compiled-code cache, the binding lifecycle and the plugin host that serves them"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,6 +15,7 @@ kr-cbor.workspace = true
 kr-crypto.workspace = true
 kr-ipc.workspace = true
 kr-plugin-sdk.workspace = true
+kr-plugin-service.workspace = true
 kr-protocol.workspace = true
 schemars.workspace = true
 serde.workspace = true

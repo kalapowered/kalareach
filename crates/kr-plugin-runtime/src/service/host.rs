@@ -32,23 +32,23 @@ use kr_protocol::frame::StreamKind;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::Uuid;
 
+use kr_plugin_service::launcher::{HostIdentity, LaunchError, LaunchResult};
+use kr_plugin_service::notices::{NoticeSink, NoticeStream, Offered, node_bytes};
+use kr_plugin_service::protocol::{
+    BindingRegistration, CallValue, ComponentSource, Frame, HostHealth, Notice, Request,
+    RequestBody, ResponseBody, WireNode,
+};
+use kr_plugin_service::vocabulary::{
+    Admission, BindingId, COMPILE_DEADLINE_MS, MAX_NODE_BYTES, event_of, facts_of,
+};
+
 use crate::runtime::binding::{
-    BindingEvent, BindingHandle, BindingId, BindingOwner, BindingRequest, DEFAULT_EVENT_QUEUE,
-    Runtime, RuntimeConfig, Unbound, remaining_of,
+    BindingEvent, BindingHandle, BindingOwner, BindingRequest, DEFAULT_EVENT_QUEUE, Runtime,
+    RuntimeConfig, Unbound, remaining_of,
 };
 use crate::runtime::budget::CallKind;
 use crate::runtime::compile::CompileOrigin;
 use crate::runtime::error::RuntimeError;
-use crate::runtime::host::{
-    BindingActivity, BindingFacts, MAX_NODE_BYTES, ScopedSourceEvent, SourceProvenance,
-};
-use crate::runtime::queue::Admission;
-use crate::service::launcher::{HostIdentity, LaunchError, LaunchResult};
-use crate::service::notices::{NoticeSink, NoticeStream, Offered, node_bytes};
-use crate::service::protocol::{
-    BindingRegistration, CallValue, ComponentSource, Frame, HostHealth, Notice, Request,
-    RequestBody, ResponseBody, WireFacts, WireNode, WireSourceEvent,
-};
 
 /// How long a registration may keep a worker waiting.
 ///
@@ -59,7 +59,7 @@ use crate::service::protocol::{
 /// deadline is a little longer again, so the answer a worker gets is the host's own rather than its
 /// patience running out first.
 pub const REGISTER_DEADLINE: core::time::Duration =
-    core::time::Duration::from_millis(crate::runtime::compile::COMPILE_DEADLINE_MS);
+    core::time::Duration::from_millis(COMPILE_DEADLINE_MS);
 
 /// How many bindings one worker connection may hold.
 ///
@@ -253,7 +253,7 @@ impl PluginHost {
     async fn serve_connection(self: Arc<Self>, connection: kr_ipc::endpoint::Connection) {
         let (reader, writer) = split(connection, StreamKind::Control);
         let writer = Arc::new(tokio::sync::Mutex::new(writer));
-        let (sink, stream) = crate::service::notices::channel();
+        let (sink, stream) = kr_plugin_service::notices::channel();
         let conversation = Arc::new(Conversation::new());
         let served = Arc::new(Served {
             owner: BindingOwner::next(),
@@ -420,17 +420,17 @@ impl PluginHost {
     ) -> Result<ResponseBody, (String, bool)> {
         match body {
             RequestBody::Hello { protocol } => {
-                if protocol != crate::service::protocol::PROTOCOL {
+                if protocol != kr_plugin_service::protocol::PROTOCOL {
                     return Err((
                         format!(
                             "this host speaks {} and the caller offered {protocol}",
-                            crate::service::protocol::PROTOCOL
+                            kr_plugin_service::protocol::PROTOCOL
                         ),
                         false,
                     ));
                 }
                 Ok(ResponseBody::Hello {
-                    protocol: crate::service::protocol::PROTOCOL.to_owned(),
+                    protocol: kr_plugin_service::protocol::PROTOCOL.to_owned(),
                     descriptor: Box::new(self.descriptor()),
                 })
             }
@@ -674,9 +674,9 @@ impl PluginHost {
         })
     }
 
-    fn descriptor(&self) -> crate::service::protocol::HostDescriptor {
-        crate::service::protocol::HostDescriptor {
-            protocol: crate::service::protocol::PROTOCOL.to_owned(),
+    fn descriptor(&self) -> kr_plugin_service::protocol::HostDescriptor {
+        kr_plugin_service::protocol::HostDescriptor {
+            protocol: kr_plugin_service::protocol::PROTOCOL.to_owned(),
             environment_id: self.identity.environment_id(),
             reservation_id: kr_protocol::worker::ReservationId::new(
                 kr_protocol::scalars::Uuid::from_bytes([0; 16]),
@@ -1187,82 +1187,6 @@ fn node_of(node: &crate::runtime::host::EmittedNode) -> WireNode {
     }
 }
 
-/// Turns the facts a worker sent into the facts a component reads.
-#[must_use]
-pub fn facts_of(facts: &WireFacts) -> BindingFacts {
-    BindingFacts {
-        plugin_id: facts.plugin_id.clone(),
-        binding_revision: facts.binding_revision,
-        activity: activity_of(&facts.activity),
-        thread_id: facts.thread_id.clone(),
-        turn_id: facts.turn_id.clone(),
-        updated_at_ms: facts.updated_at_ms,
-        held_rights: facts.held_rights.clone(),
-    }
-}
-
-/// Turns the facts a component reads into the facts that travel.
-#[must_use]
-pub fn wire_facts(facts: &BindingFacts) -> WireFacts {
-    WireFacts {
-        plugin_id: facts.plugin_id.clone(),
-        binding_revision: facts.binding_revision,
-        activity: facts.activity.as_str().to_owned(),
-        thread_id: facts.thread_id.clone(),
-        turn_id: facts.turn_id.clone(),
-        updated_at_ms: facts.updated_at_ms,
-        held_rights: facts.held_rights.clone(),
-    }
-}
-
-/// Reads an activity name, treating anything unrecognised as idle.
-///
-/// An activity is presentation, not authority: a name this host does not know means the component
-/// is told the execution is idle rather than being told something invented.
-fn activity_of(name: &str) -> BindingActivity {
-    match name {
-        "running" => BindingActivity::Running,
-        "awaiting_person" => BindingActivity::AwaitingPerson,
-        "ended" => BindingActivity::Ended,
-        _ => BindingActivity::Idle,
-    }
-}
-
-/// Turns an event that travelled into one a component can be given.
-///
-/// # Errors
-///
-/// Returns the reason the event was refused: an unrecognised provenance. Provenance decides whether
-/// an event can establish native approval authority, so a name this host does not know is a refusal
-/// rather than a default.
-pub fn event_of(event: &WireSourceEvent) -> Result<ScopedSourceEvent, String> {
-    let provenance = SourceProvenance::from_wire(&event.provenance).ok_or_else(|| {
-        format!(
-            "{} is not a provenance this host knows, and provenance decides what an event can establish",
-            event.provenance
-        )
-    })?;
-    Ok(ScopedSourceEvent::new(
-        event.handle.clone(),
-        provenance,
-        event.observed_at_ms,
-        event.request_id.clone(),
-        event.bytes.clone(),
-    ))
-}
-
-/// Turns an event a host holds into one that travels.
-#[must_use]
-pub fn wire_event(event: &ScopedSourceEvent) -> WireSourceEvent {
-    WireSourceEvent {
-        handle: event.handle.clone(),
-        provenance: event.provenance.as_str().to_owned(),
-        observed_at_ms: event.observed_at_ms,
-        request_id: event.request_id.clone(),
-        bytes: event.bytes.to_vec(),
-    }
-}
-
 /// Returns the call kinds a worker may ask the host for over the protocol.
 ///
 /// `observe` is not one of them: an observation is a queue push rather than a call, which is what
@@ -1423,60 +1347,14 @@ fn inside_packages(root: &Path, named: &str) -> Result<PathBuf, String> {
 
 #[cfg(test)]
 mod tests {
+    use kr_plugin_service::protocol::WireSourceEvent;
+
     use super::*;
 
-    fn wire() -> WireFacts {
-        WireFacts {
-            plugin_id: "kalareach/example".to_owned(),
-            binding_revision: 5,
-            activity: "running".to_owned(),
-            thread_id: Some("t".to_owned()),
-            turn_id: None,
-            updated_at_ms: 9,
-            held_rights: vec![ActionRight::SessionView],
-        }
-    }
-
     #[test]
-    fn the_facts_round_trip_through_the_wire() {
-        let facts = facts_of(&wire());
-        assert_eq!(facts.activity, BindingActivity::Running);
-        assert_eq!(wire_facts(&facts), wire());
-    }
-
-    #[test]
-    fn an_activity_this_host_does_not_know_reads_as_idle() {
-        let mut wire = wire();
-        wire.activity = "thinking-hard".to_owned();
-        assert_eq!(facts_of(&wire).activity, BindingActivity::Idle);
-    }
-
-    #[test]
-    fn a_provenance_this_host_does_not_know_is_refused() {
-        let event = WireSourceEvent {
-            handle: kr_protocol::ids::SourceEventHandle::new("se-1").expect("a bounded handle"),
-            provenance: "trustworthy".to_owned(),
-            observed_at_ms: 1,
-            request_id: None,
-            bytes: b"{}".to_vec(),
-        };
-        let error = event_of(&event).expect_err("an unknown provenance is refused");
-        assert!(error.contains("trustworthy"));
-        assert!(error.contains("provenance decides"));
-    }
-
-    #[test]
-    fn an_event_round_trips_through_the_wire() {
-        let event = WireSourceEvent {
-            handle: kr_protocol::ids::SourceEventHandle::new("se-1").expect("a bounded handle"),
-            provenance: "native_protocol".to_owned(),
-            observed_at_ms: 1,
-            request_id: Some("req-1".to_owned()),
-            bytes: b"{}".to_vec(),
-        };
-        let scoped = event_of(&event).expect("the event is admitted");
-        assert!(scoped.is_authoritative());
-        assert_eq!(wire_event(&scoped), event);
+    fn a_registration_is_given_longer_by_the_client_than_the_host_gives_itself() {
+        // A client that gave up first would report its own patience as the host's failure.
+        assert!(kr_plugin_service::client::REGISTER_DEADLINE > REGISTER_DEADLINE);
     }
 
     #[test]

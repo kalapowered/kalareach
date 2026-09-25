@@ -26,7 +26,7 @@
 //! # What a plugin-host crash costs this worker
 //!
 //! Its rich bindings, and nothing else. The connection fails, the calls in flight return
-//! [`crate::RuntimeError::ServiceUnavailable`], and the worker's own ledger is untouched because
+//! [`crate::error::ServiceError::Unavailable`], and the worker's own ledger is untouched because
 //! it was never in the other process. Re-registering the bindings is the whole of the recovery.
 
 use std::collections::HashMap;
@@ -42,16 +42,16 @@ use tokio::sync::oneshot;
 
 use kr_plugin_sdk::identity::PluginIdentity;
 
-use crate::runtime::binding::BindingId;
-use crate::runtime::error::{RuntimeError, RuntimeResult};
-use crate::runtime::host::{BindingFacts, ScopedSourceEvent};
-use crate::runtime::queue::Admission;
-use crate::service::host::{wire_event, wire_facts};
-use crate::service::launcher::{self, LaunchError};
-use crate::service::notices::{self, MAX_NOTICE_BYTES, NoticeSink, NoticeStream, Offered};
-use crate::service::protocol::{
+use crate::error::{ServiceError, ServiceResult};
+use crate::launcher::{self, LaunchError};
+use crate::notices::{self, MAX_NOTICE_BYTES, NoticeSink, NoticeStream, Offered};
+use crate::protocol::{
     BindingRegistration, CallValue, ComponentSource, Frame, HostDescriptor, HostHealth, Notice,
     Request, RequestBody, ResponseBody,
+};
+use crate::vocabulary::{
+    Admission, BindingFacts, BindingId, COMPILE_DEADLINE_MS, MAX_NODE_BYTES, ScopedSourceEvent,
+    wire_event, wire_facts,
 };
 
 /// How long a worker waits for an answer before it stops waiting.
@@ -67,7 +67,7 @@ pub const DEFAULT_DEADLINE: core::time::Duration = core::time::Duration::from_se
 /// It is deliberately longer than the host's own registration deadline: a client that gave up
 /// first would report its own patience as the host's failure.
 pub const REGISTER_DEADLINE: core::time::Duration =
-    core::time::Duration::from_millis(crate::runtime::compile::COMPILE_DEADLINE_MS + 5_000);
+    core::time::Duration::from_millis(COMPILE_DEADLINE_MS + 5_000);
 
 /// How much longer than a component's own deadline a caller waits for the answer.
 ///
@@ -82,7 +82,7 @@ pub const ROUND_TRIP_ALLOWANCE: core::time::Duration = core::time::Duration::fro
 /// A control frame carries a mebibyte including its envelope, so an event larger than this is one
 /// the writer could never deliver. Refusing it at the handoff is what keeps one oversized event
 /// from ending every delivery that would have followed it.
-pub const MAX_OFFERED_EVENT_BYTES: u64 = crate::runtime::host::MAX_NODE_BYTES;
+pub const MAX_OFFERED_EVENT_BYTES: u64 = MAX_NODE_BYTES;
 
 /// What one offered event costs of the handoff's allowance before its bytes are counted.
 const OFFER_OVERHEAD_BYTES: u64 = 128;
@@ -306,25 +306,26 @@ impl PluginClient {
     ///
     /// # Errors
     ///
-    /// Returns [`RuntimeError::ServiceUnavailable`] when there is no descriptor or the endpoint
-    /// cannot be reached, and [`RuntimeError::ServiceProtocol`] when the host answers with
+    /// Returns [`ServiceError::Unavailable`] when there is no descriptor or the endpoint
+    /// cannot be reached, and [`ServiceError::Protocol`] when the host answers with
     /// something this client cannot read or cannot verify.
-    pub async fn connect(environment: &EnvironmentPaths) -> RuntimeResult<Self> {
+    pub async fn connect(environment: &EnvironmentPaths) -> ServiceResult<Self> {
         let descriptor = launcher::read_descriptor(environment)
             .map_err(unavailable)?
-            .ok_or_else(|| RuntimeError::ServiceUnavailable {
+            .ok_or_else(|| ServiceError::Unavailable {
                 detail: "this environment has no plugin host".to_owned(),
             })?;
         let endpoint = Endpoint::from_path(&descriptor.endpoint).map_err(|error| {
-            RuntimeError::ServiceUnavailable {
+            ServiceError::Unavailable {
                 detail: error.to_string(),
             }
         })?;
-        let connection = Connection::connect(&endpoint).await.map_err(|error| {
-            RuntimeError::ServiceUnavailable {
-                detail: error.to_string(),
-            }
-        })?;
+        let connection =
+            Connection::connect(&endpoint)
+                .await
+                .map_err(|error| ServiceError::Unavailable {
+                    detail: error.to_string(),
+                })?;
         Self::over(connection, descriptor).await
     }
 
@@ -333,7 +334,7 @@ impl PluginClient {
     /// # Errors
     ///
     /// Returns the handshake or verification failure.
-    pub async fn over(connection: Connection, descriptor: HostDescriptor) -> RuntimeResult<Self> {
+    pub async fn over(connection: Connection, descriptor: HostDescriptor) -> ServiceResult<Self> {
         let (reader, writer) = split(connection, StreamKind::Control);
         let writer: Writer = Arc::new(tokio::sync::Mutex::new(Some(writer)));
         let pending = Arc::new(Pending::default());
@@ -375,14 +376,14 @@ impl PluginClient {
 
         let hello = client
             .request(RequestBody::Hello {
-                protocol: crate::service::protocol::PROTOCOL.to_owned(),
+                protocol: crate::protocol::PROTOCOL.to_owned(),
             })
             .await?;
         let ResponseBody::Hello { protocol, .. } = hello else {
             return Err(protocol_error(&hello));
         };
-        if protocol != crate::service::protocol::PROTOCOL {
-            return Err(RuntimeError::ServiceProtocol {
+        if protocol != crate::protocol::PROTOCOL {
+            return Err(ServiceError::Protocol {
                 detail: format!("the host speaks {protocol}"),
             });
         }
@@ -394,7 +395,7 @@ impl PluginClient {
             return Err(protocol_error(&verified));
         };
         launcher::check_proof(&client.descriptor, &nonce, &proof).map_err(|error| {
-            RuntimeError::ServiceProtocol {
+            ServiceError::Protocol {
                 detail: error.to_string(),
             }
         })?;
@@ -412,7 +413,7 @@ impl PluginClient {
     /// # Errors
     ///
     /// Returns the host's refusal, including a component that imports something outside the
-    /// contract, or [`RuntimeError::ServiceUnavailable`] when the host is gone.
+    /// contract, or [`ServiceError::Unavailable`] when the host is gone.
     pub async fn register(
         &self,
         binding_id: BindingId,
@@ -420,7 +421,7 @@ impl PluginClient {
         facts: &BindingFacts,
         executable: &str,
         component: &ComponentSource,
-    ) -> RuntimeResult<Registration> {
+    ) -> ServiceResult<Registration> {
         let body = self
             .request_within(
                 RequestBody::RegisterBinding(Box::new(BindingRegistration {
@@ -438,7 +439,7 @@ impl PluginClient {
                 cached: origin == "cached",
                 elapsed_ms,
             }),
-            ResponseBody::Refused { detail, .. } => Err(RuntimeError::ServiceProtocol { detail }),
+            ResponseBody::Refused { detail, .. } => Err(ServiceError::Protocol { detail }),
             other => Err(protocol_error(&other)),
         }
     }
@@ -521,12 +522,12 @@ impl PluginClient {
     ///
     /// # Errors
     ///
-    /// Returns the host's refusal or [`RuntimeError::ServiceUnavailable`].
+    /// Returns the host's refusal or [`ServiceError::Unavailable`].
     pub async fn deliver(
         &self,
         binding_id: BindingId,
         event: &ScopedSourceEvent,
-    ) -> RuntimeResult<Admission> {
+    ) -> ServiceResult<Admission> {
         let body = self
             .request(RequestBody::Event {
                 binding_id: binding_id.get(),
@@ -547,11 +548,11 @@ impl PluginClient {
                 "refused" => Ok(Admission::Refused {
                     held_bytes: lost_bytes,
                 }),
-                other => Err(RuntimeError::ServiceProtocol {
+                other => Err(ServiceError::Protocol {
                     detail: format!("{other} is not an admission this client knows"),
                 }),
             },
-            ResponseBody::Refused { detail, .. } => Err(RuntimeError::ServiceProtocol { detail }),
+            ResponseBody::Refused { detail, .. } => Err(ServiceError::Protocol { detail }),
             other => Err(protocol_error(&other)),
         }
     }
@@ -560,12 +561,12 @@ impl PluginClient {
     ///
     /// # Errors
     ///
-    /// Returns the host's refusal or [`RuntimeError::ServiceUnavailable`].
+    /// Returns the host's refusal or [`ServiceError::Unavailable`].
     pub async fn snapshot(
         &self,
         binding_id: BindingId,
         deadline: core::time::Duration,
-    ) -> RuntimeResult<Called> {
+    ) -> ServiceResult<Called> {
         self.call(
             RequestBody::Snapshot {
                 binding_id: binding_id.get(),
@@ -580,12 +581,12 @@ impl PluginClient {
     ///
     /// # Errors
     ///
-    /// Returns the host's refusal or [`RuntimeError::ServiceUnavailable`].
+    /// Returns the host's refusal or [`ServiceError::Unavailable`].
     pub async fn checkpoint(
         &self,
         binding_id: BindingId,
         deadline: core::time::Duration,
-    ) -> RuntimeResult<Called> {
+    ) -> ServiceResult<Called> {
         self.call(
             RequestBody::Checkpoint {
                 binding_id: binding_id.get(),
@@ -600,13 +601,13 @@ impl PluginClient {
     ///
     /// # Errors
     ///
-    /// Returns the host's refusal or [`RuntimeError::ServiceUnavailable`].
+    /// Returns the host's refusal or [`ServiceError::Unavailable`].
     pub async fn restore(
         &self,
         binding_id: BindingId,
         state: Vec<u8>,
         deadline: core::time::Duration,
-    ) -> RuntimeResult<Called> {
+    ) -> ServiceResult<Called> {
         self.call(
             RequestBody::Restore {
                 binding_id: binding_id.get(),
@@ -622,8 +623,8 @@ impl PluginClient {
     ///
     /// # Errors
     ///
-    /// Returns [`RuntimeError::ServiceUnavailable`] when the host is gone.
-    pub async fn unbind(&self, binding_id: BindingId) -> RuntimeResult<bool> {
+    /// Returns [`ServiceError::Unavailable`] when the host is gone.
+    pub async fn unbind(&self, binding_id: BindingId) -> ServiceResult<bool> {
         let body = self
             .request(RequestBody::Unbind {
                 binding_id: binding_id.get(),
@@ -644,8 +645,8 @@ impl PluginClient {
     ///
     /// # Errors
     ///
-    /// Returns [`RuntimeError::ServiceUnavailable`] when the host is gone.
-    pub async fn health(&self) -> RuntimeResult<HostHealth> {
+    /// Returns [`ServiceError::Unavailable`] when the host is gone.
+    pub async fn health(&self) -> ServiceResult<HostHealth> {
         let body = self.request(RequestBody::Health).await?;
         match body {
             ResponseBody::Health(health) => Ok(*health),
@@ -667,7 +668,7 @@ impl PluginClient {
         &self,
         body: RequestBody,
         deadline: core::time::Duration,
-    ) -> RuntimeResult<Called> {
+    ) -> ServiceResult<Called> {
         // The component's own deadline plus the round trip, rather than a fixed figure: a caller
         // that allowed ten milliseconds for a component did not mean to wait five seconds for the
         // answer when the host stops answering.
@@ -691,16 +692,16 @@ impl PluginClient {
                 detail, disabled, ..
             } => {
                 if disabled {
-                    Err(RuntimeError::Disabled { reason: detail })
+                    Err(ServiceError::Disabled { reason: detail })
                 } else {
-                    Err(RuntimeError::ServiceProtocol { detail })
+                    Err(ServiceError::Protocol { detail })
                 }
             }
             other => Err(protocol_error(&other)),
         }
     }
 
-    async fn request(&self, body: RequestBody) -> RuntimeResult<ResponseBody> {
+    async fn request(&self, body: RequestBody) -> ServiceResult<ResponseBody> {
         self.request_within(body, DEFAULT_DEADLINE).await
     }
 
@@ -713,22 +714,22 @@ impl PluginClient {
     ///
     /// # Errors
     ///
-    /// Returns [`RuntimeError::ServiceUnavailable`] when the connection is gone,
-    /// [`RuntimeError::CallerDeadline`] when the deadline passes first.
+    /// Returns [`ServiceError::Unavailable`] when the connection is gone,
+    /// [`ServiceError::CallerDeadline`] when the deadline passes first.
     async fn request_within(
         &self,
         body: RequestBody,
         deadline: core::time::Duration,
-    ) -> RuntimeResult<ResponseBody> {
+    ) -> ServiceResult<ResponseBody> {
         if self.pending.is_closed() {
-            return Err(RuntimeError::ServiceUnavailable {
+            return Err(ServiceError::Unavailable {
                 detail: "the plugin host closed the connection".to_owned(),
             });
         }
         let request_id = self.next_request.fetch_add(1, Ordering::Relaxed);
         let (answer, reply) = oneshot::channel();
         if !self.pending.wait_for(request_id, answer) {
-            return Err(RuntimeError::ServiceUnavailable {
+            return Err(ServiceError::Unavailable {
                 detail: "the plugin host closed the connection".to_owned(),
             });
         }
@@ -751,13 +752,13 @@ impl PluginClient {
                 // closed is dropped rather than used, which is what makes the one narrow order --
                 // a frame put back at the instant of closure -- harmless.
                 let Some(mut writer) = held.take() else {
-                    return Err(RuntimeError::ServiceUnavailable {
+                    return Err(ServiceError::Unavailable {
                         detail: "the plugin host closed the connection".to_owned(),
                     });
                 };
                 if self.pending.is_closed() {
                     drop(writer);
-                    return Err(RuntimeError::ServiceUnavailable {
+                    return Err(ServiceError::Unavailable {
                         detail: "the plugin host closed the connection".to_owned(),
                     });
                 }
@@ -787,21 +788,21 @@ impl PluginClient {
                 {
                     let _closed = slot.take();
                 }
-                written.map_err(|error| RuntimeError::ServiceUnavailable {
+                written.map_err(|error| ServiceError::Unavailable {
                     detail: error.to_string(),
                 })?;
             }
             match reply.await {
                 Ok(body) => Ok(body),
                 // The reader dropped the sender, which means the connection is gone.
-                Err(_closed) => Err(RuntimeError::ServiceUnavailable {
+                Err(_closed) => Err(ServiceError::Unavailable {
                     detail: "the plugin host closed the connection".to_owned(),
                 }),
             }
         };
         match tokio::time::timeout(deadline, exchange).await {
             Ok(outcome) => outcome,
-            Err(_elapsed) => Err(RuntimeError::CallerDeadline {
+            Err(_elapsed) => Err(ServiceError::CallerDeadline {
                 deadline_ms: millis(deadline),
             }),
         }
@@ -950,7 +951,7 @@ fn release(held: &AtomicU64, cost: u64) {
 ///
 /// The bytes it carries, the handle that names it, and a fixed cost for the record itself: a
 /// request number, a binding identifier and the envelope that carries them.
-fn offered_cost(event: &crate::service::protocol::WireSourceEvent) -> u64 {
+fn offered_cost(event: &crate::protocol::WireSourceEvent) -> u64 {
     OFFER_OVERHEAD_BYTES
         + event.bytes.len() as u64
         + event.handle.as_str().len() as u64
@@ -970,14 +971,14 @@ fn millis(duration: core::time::Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn unavailable(error: LaunchError) -> RuntimeError {
-    RuntimeError::ServiceUnavailable {
+fn unavailable(error: LaunchError) -> ServiceError {
+    ServiceError::Unavailable {
         detail: error.to_string(),
     }
 }
 
-fn protocol_error(body: &ResponseBody) -> RuntimeError {
-    RuntimeError::ServiceProtocol {
+fn protocol_error(body: &ResponseBody) -> ServiceError {
+    ServiceError::Protocol {
         detail: format!("an answer of the wrong kind: {body:?}"),
     }
 }
@@ -1007,12 +1008,6 @@ mod tests {
     fn a_deadline_is_carried_in_whole_milliseconds() {
         assert_eq!(millis(core::time::Duration::from_millis(250)), 250);
         assert_eq!(millis(DEFAULT_DEADLINE), 5_000);
-    }
-
-    #[test]
-    fn a_registration_is_given_longer_than_the_host_gives_itself() {
-        // A client that gave up first would report its own patience as the host's failure.
-        assert!(REGISTER_DEADLINE > crate::service::host::REGISTER_DEADLINE);
     }
 
     #[test]

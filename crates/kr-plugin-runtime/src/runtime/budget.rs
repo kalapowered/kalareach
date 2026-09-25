@@ -47,7 +47,7 @@ pub const FUEL_PER_DEADLINE_MS: u64 = 100_000_000;
 /// thread for ever. The figure is the compilation budget, because preparation is what both belong
 /// to and a host that accepted a compile of up to that long has to be willing to wait for the
 /// instantiation that follows it.
-pub const SETUP_DEADLINE_MS: u64 = crate::runtime::compile::COMPILE_DEADLINE_MS;
+pub const SETUP_DEADLINE_MS: u64 = kr_plugin_service::vocabulary::COMPILE_DEADLINE_MS;
 
 /// The work allowance instantiation and `bind` run under.
 ///
@@ -222,7 +222,7 @@ mod tests {
         // Bounded all the same, by the preparation deadline rather than by a call's.
         assert_eq!(
             SETUP_DEADLINE_MS,
-            crate::runtime::compile::COMPILE_DEADLINE_MS
+            kr_plugin_service::vocabulary::COMPILE_DEADLINE_MS
         );
         const { assert!(SETUP_DEADLINE_MS > SNAPSHOT_DEADLINE_MS) }
         // And its work allowance is the setup one, whatever the call fuel rate is. A host that

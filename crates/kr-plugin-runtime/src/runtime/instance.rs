@@ -40,6 +40,8 @@
 //! component's own presentation state does not survive, which is what `snapshot` is for, so the
 //! binding asks it for one before it delivers anything else.
 
+use kr_plugin_service::vocabulary::{AttachmentFact, BindingFacts, ScopedSourceEvent};
+
 use crate::runtime::bindings::{
     Binding as WireBinding, DecodedRequest, EffectPlan, EncodedResponse, Fault, Plugin,
     RequestSnapshot,
@@ -47,9 +49,7 @@ use crate::runtime::bindings::{
 use crate::runtime::budget::{CallBudget, CallKind};
 use crate::runtime::engine::RuntimeEngine;
 use crate::runtime::error::{ExhaustedBound, RuntimeError, RuntimeResult};
-use crate::runtime::host::{
-    AttachmentFact, BindingFacts, EmittedNode, HostState, ScopedSourceEvent,
-};
+use crate::runtime::host::{EmittedNode, HostState};
 use crate::runtime::limits::InstanceLimiter;
 
 /// The epoch deadline instantiation and `bind` run under.
@@ -551,7 +551,7 @@ impl Instance {
                 Ok(value) => value.output_size(),
                 Err(fault) => fault.output_size(),
             };
-            if size > crate::runtime::host::MAX_NODE_BYTES {
+            if size > kr_plugin_service::vocabulary::MAX_NODE_BYTES {
                 oversized = Some(size);
             }
             // The refusal is recorded in the sink, which is what `overran` reads below.
@@ -583,7 +583,7 @@ impl Instance {
                 } else if let Some(bytes) = oversized {
                     Err(RuntimeError::NodeTooLarge {
                         bytes,
-                        limit: crate::runtime::host::MAX_NODE_BYTES,
+                        limit: kr_plugin_service::vocabulary::MAX_NODE_BYTES,
                     })
                 } else {
                     Ok(answer)

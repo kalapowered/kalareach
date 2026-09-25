@@ -55,7 +55,9 @@ use std::sync::{Arc, Mutex};
 
 use kr_ipc::clock::{SharedClock, SystemSharedClock};
 use kr_plugin_sdk::identity::PluginIdentity;
-use kr_protocol::scalars::Uuid;
+use kr_plugin_service::vocabulary::{
+    Admission, AttachmentFact, BindingFacts, BindingId, ScopedSourceEvent,
+};
 
 use crate::runtime::bindings::{
     ActionToken, Binding as WireBinding, DecodedRequest, EffectPlan, EncodedResponse, Fault,
@@ -67,10 +69,10 @@ use crate::runtime::compile::{CompileBudget, CompilePool, Compiled};
 use crate::runtime::engine::RuntimeEngine;
 use crate::runtime::error::{RuntimeError, RuntimeResult};
 use crate::runtime::faults::{FaultCounter, FaultVerdict};
-use crate::runtime::host::{AttachmentFact, BindingFacts, EmittedNode, ScopedSourceEvent};
+use crate::runtime::host::EmittedNode;
 use crate::runtime::instance::{CallOutcome, Instance, OutputSize};
 use crate::runtime::limits::InstanceLimiter;
-use crate::runtime::queue::{Admission, ObservationGap, ObservationQueue};
+use crate::runtime::queue::{ObservationGap, ObservationQueue};
 
 /// How many observations one pump pass delivers before it looks at its commands again.
 ///
@@ -122,30 +124,6 @@ const FAULT_DELIVERY_WAIT: core::time::Duration = core::time::Duration::from_sec
 
 /// How long preparing a binding may take before the caller is told it has not finished.
 pub const DEFAULT_PREPARE_DEADLINE: core::time::Duration = core::time::Duration::from_secs(10);
-
-/// The identifier of one binding.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct BindingId(Uuid);
-
-impl BindingId {
-    /// Wraps a raw identifier.
-    #[must_use]
-    pub const fn new(value: Uuid) -> Self {
-        Self(value)
-    }
-
-    /// Returns the raw identifier.
-    #[must_use]
-    pub const fn get(self) -> Uuid {
-        self.0
-    }
-}
-
-impl core::fmt::Display for BindingId {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        core::fmt::Display::fmt(&self.0, formatter)
-    }
-}
 
 /// What a broker asks for when it prepares a binding.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1763,6 +1741,7 @@ mod tests {
     use kr_plugin_sdk::digest::PayloadDigest;
     use kr_plugin_sdk::version::PackageVersion;
     use kr_protocol::ids::{PluginId, RepositoryGeneration};
+    use kr_protocol::scalars::Uuid;
 
     fn config() -> (tempfile::TempDir, RuntimeConfig) {
         let directory = tempfile::tempdir().expect("a temporary directory");
@@ -1836,7 +1815,7 @@ mod tests {
             facts: BindingFacts {
                 plugin_id: "kalareach/example".to_owned(),
                 binding_revision: 1,
-                activity: crate::runtime::host::BindingActivity::Idle,
+                activity: kr_plugin_service::vocabulary::BindingActivity::Idle,
                 thread_id: None,
                 turn_id: None,
                 updated_at_ms: 0,

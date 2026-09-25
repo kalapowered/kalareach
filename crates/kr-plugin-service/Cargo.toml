@@ -1,0 +1,28 @@
+[package]
+name = "kr-plugin-service"
+description = "Reaching the KalaReach plugin host: its protocol, the worker's client and the launcher, with no component engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Nothing here may reach a Wasm engine or the plugin runtime: this is the part of the plugin host a
+# worker and the control daemon can link. crates/kr-worker/tests/trusted_core.rs checks it.
+[dependencies]
+kr-cbor.workspace = true
+kr-crypto.workspace = true
+kr-ipc.workspace = true
+kr-plugin-sdk.workspace = true
+kr-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+kr-ipc = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

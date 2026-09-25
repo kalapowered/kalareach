@@ -18,13 +18,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use kr_plugin_runtime::runtime::binding::{BindingId, BindingRequest};
-use kr_plugin_runtime::runtime::host::{
-    BindingActivity, BindingFacts, ScopedSourceEvent, SourceProvenance,
-};
+use kr_plugin_runtime::runtime::binding::BindingRequest;
 use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::identity::PluginIdentity;
 use kr_plugin_sdk::version::PackageVersion;
+use kr_plugin_service::vocabulary::{
+    BindingActivity, BindingFacts, BindingId, ScopedSourceEvent, SourceProvenance,
+};
 use kr_protocol::ids::{PluginId, RepositoryGeneration, SourceEventHandle};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::Uuid;

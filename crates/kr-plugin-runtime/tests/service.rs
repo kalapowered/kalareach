@@ -11,15 +11,15 @@ mod components;
 
 use std::sync::Arc;
 
-use kr_plugin_runtime::RuntimeError;
-use kr_plugin_runtime::runtime::queue::Admission;
-use kr_plugin_runtime::service::client::{PluginClient, new_binding_id};
 use kr_plugin_runtime::service::host::{HostConfig, PluginHost};
-use kr_plugin_runtime::service::launcher::{HostIdentity, host_endpoint};
-use kr_plugin_runtime::service::protocol::{
+use kr_plugin_sdk::digest::PayloadDigest;
+use kr_plugin_service::client::{PluginClient, new_binding_id};
+use kr_plugin_service::error::ServiceError;
+use kr_plugin_service::launcher::{HostIdentity, host_endpoint};
+use kr_plugin_service::protocol::{
     ComponentSource, Frame, HostDescriptor, Notice, PROTOCOL, RequestBody, ResponseBody,
 };
-use kr_plugin_sdk::digest::PayloadDigest;
+use kr_plugin_service::vocabulary::Admission;
 
 /// A plugin host serving in this process, with a client connected to it.
 struct Served {
@@ -131,9 +131,9 @@ impl Drop for Served {
 /// a test passing for the wrong reason.
 async fn documents_until(
     client: &mut PluginClient,
-    binding_id: kr_plugin_runtime::runtime::binding::BindingId,
+    binding_id: kr_plugin_service::vocabulary::BindingId,
     call: &str,
-) -> Option<Vec<kr_plugin_runtime::service::protocol::WireNode>> {
+) -> Option<Vec<kr_plugin_service::protocol::WireNode>> {
     let deadline = std::time::Instant::now() + core::time::Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
         match tokio::time::timeout(core::time::Duration::from_millis(200), client.notice()).await {
@@ -192,10 +192,7 @@ async fn a_client_that_verifies_against_the_wrong_key_is_refused() {
     let error = PluginClient::over(connection, wrong)
         .await
         .expect_err("a host that cannot answer for that key is refused");
-    assert!(
-        matches!(error, RuntimeError::ServiceProtocol { .. }),
-        "{error}"
-    );
+    assert!(matches!(error, ServiceError::Protocol { .. }), "{error}");
 }
 
 // KR-REQ-06.06, KR-REQ-11.38: a registration, a delivery and a call, over the protocol.
@@ -742,7 +739,7 @@ async fn kr_req_11_39_an_observation_and_a_call_on_one_connection_are_both_answe
         Err(error) => assert!(
             matches!(
                 error,
-                RuntimeError::CallerDeadline { .. } | RuntimeError::ServiceProtocol { .. }
+                ServiceError::CallerDeadline { .. } | ServiceError::Protocol { .. }
             ),
             "the snapshot came back as none of the outcomes this case allows: {error}"
         ),
@@ -755,8 +752,8 @@ async fn kr_req_11_39_an_observation_and_a_call_on_one_connection_are_both_answe
     assert!(
         matches!(
             handoff,
-            kr_plugin_runtime::service::client::Handoff::Accepted
-                | kr_plugin_runtime::service::client::Handoff::Refused { .. }
+            kr_plugin_service::client::Handoff::Accepted
+                | kr_plugin_service::client::Handoff::Refused { .. }
         ),
         "the handoff was {handoff:?}"
     );
@@ -781,10 +778,7 @@ async fn an_event_no_frame_could_carry_is_refused_at_the_handoff() {
     let enormous = "x".repeat(2 * 1024 * 1024);
     let handoff = client.offer(binding_id, &components::scrape("se-big", &enormous));
     assert!(
-        matches!(
-            handoff,
-            kr_plugin_runtime::service::client::Handoff::TooLarge { .. }
-        ),
+        matches!(handoff, kr_plugin_service::client::Handoff::TooLarge { .. }),
         "the handoff was {handoff:?}"
     );
 
@@ -822,7 +816,7 @@ async fn a_client_whose_connection_failed_is_told_without_waiting() {
             let (mut reader, mut writer) =
                 kr_ipc::framed::split(connection, kr_protocol::frame::StreamKind::Control);
             for _ in 0..2 {
-                let request: kr_plugin_runtime::service::protocol::Request = reader
+                let request: kr_plugin_service::protocol::Request = reader
                     .read_message_without_schema()
                     .await
                     .expect("a request");
@@ -865,7 +859,7 @@ async fn a_client_whose_connection_failed_is_told_without_waiting() {
         .expect_err("a host that is gone cannot report itself");
     let waited = asked.elapsed();
     assert!(
-        matches!(error, RuntimeError::ServiceUnavailable { .. }),
+        matches!(error, ServiceError::Unavailable { .. }),
         "the failure was {error}"
     );
     assert!(
@@ -880,7 +874,7 @@ async fn a_client_whose_connection_failed_is_told_without_waiting() {
         .unbind(new_binding_id())
         .await
         .expect_err("the connection is gone");
-    assert!(matches!(error, RuntimeError::ServiceUnavailable { .. }));
+    assert!(matches!(error, ServiceError::Unavailable { .. }));
     assert!(asked.elapsed() < core::time::Duration::from_millis(500));
 }
 

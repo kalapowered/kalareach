@@ -398,10 +398,11 @@ push. Everything that can enter a component runs in a task of its own, so readin
 never waits for the last one to finish. A connection holds up to sixteen such calls at once and up
 to sixty-four bindings; past either, the next request is refused rather than queued.
 
-The rich calls a broker makes in process -- `prepare-action`, `decode-request`, `encode-response`,
-and revising a binding's facts and attachments -- are not in this protocol yet. They are in the
-runtime crate's own API, which is where the broker task will find them; what travels between a worker
-and the host today is the set above.
+The rich calls -- `prepare-action`, `decode-request`, `encode-response`, and revising a binding's
+facts and attachments -- are in the runtime's own API, inside the plugin host, and are not in this
+protocol. A worker cannot make them in process: it may link `kr-plugin-service`, which holds the
+protocol, the client and the launcher and no engine, and never `kr-plugin-runtime`. What travels
+between a worker and the host is the set above.
 
 A component's bytes travel as a location rather than as a payload: a control frame is bounded at
 1 MiB and a component may be sixteen times that. The worker sends the payload's path and the digest
@@ -419,10 +420,10 @@ declared effect class, and claims and dispatches. Pending and dispatch state liv
 broker ledger, never in a component and never in the plugin host, which is why a plugin-host crash
 cannot destroy an approval ledger.
 
-The broker lives in `crates/kr-worker/src/broker`, and it builds on the API in
-`crates/kr-plugin-runtime`: prepare a binding, offer events to its queue, invoke a control, ask for
-an interpretation, take a checkpoint, unbind. `docs/host/README.md` has its whole contract; what
-matters from this side is the order:
+The broker lives in `crates/kr-worker/src/broker`. Its way to a component is the plugin host,
+through the client in `crates/kr-plugin-service`: register a binding, offer events to its queue,
+make a call, take a checkpoint, unbind. `docs/host/README.md` has its whole contract; what matters
+from this side is the order:
 
 1. The broker records the opaque native request **before** it forwards it, and forwards it whether
    or not any component is healthy.

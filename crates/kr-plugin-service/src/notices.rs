@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 
 use kr_protocol::scalars::Uuid;
 
-use crate::service::protocol::{Notice, WireNode};
+use crate::protocol::{Notice, WireNode};
 
 /// How many bytes of notices one connection may hold.
 ///
@@ -49,7 +49,7 @@ const NOTICE_OVERHEAD_BYTES: u64 = 64;
 ///
 /// The runtime charges the same fixed cost per node against a call's output budget, so a document
 /// that fitted that budget fits this queue's accounting too.
-const NODE_OVERHEAD_BYTES: u64 = crate::runtime::host::NODE_OVERHEAD_BYTES;
+const NODE_OVERHEAD_BYTES: u64 = crate::vocabulary::NODE_OVERHEAD_BYTES;
 
 /// How many dropped documents this queue remembers the identity of at once.
 ///

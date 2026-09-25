@@ -21,10 +21,8 @@ use kr_ipc::endpoint::{Connection, Listener};
 use kr_ipc::framed::split;
 use kr_ipc::paths::HostPaths;
 use kr_plugin_runtime::service::host::{HostConfig, PluginHost};
-use kr_plugin_runtime::service::launcher::{
-    HostIdentity, LaunchError, LaunchResult, host_endpoint,
-};
-use kr_plugin_runtime::service::protocol::RendezvousAccepted;
+use kr_plugin_service::launcher::{HostIdentity, LaunchError, LaunchResult, host_endpoint};
+use kr_plugin_service::protocol::RendezvousAccepted;
 use kr_protocol::frame::StreamKind;
 
 use crate::options::Options;
