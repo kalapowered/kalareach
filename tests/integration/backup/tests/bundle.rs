@@ -7,8 +7,11 @@
 //! against a service written for it, which stores any bytes under any name. These legs prove it
 //! against the web service, through the same client every other managed call uses.
 //!
-//! The device that reads the bundle is not the device that wrote it. It is a new installation,
-//! with a key of its own and the printed kit, which is what a device restoring from the kit is.
+//! The bundle belongs to an account. The device that writes it presents the account's
+//! `backup.write` token beside its signature; the device that reads it is not the device that wrote
+//! it but a new installation, with a key of its own, the printed kit and a token the same account
+//! issued for the restore alone, `backup.restore`, which is what a device restoring from the kit
+//! is. The run's token file names both for each origin ([`kr_backup_integration::TOKENS_VARIABLE`]).
 //!
 //! | Row | What proves it |
 //! | --- | --- |
@@ -17,18 +20,21 @@
 //!
 //! # What they leave
 //!
-//! Against a deployment: the bundle collection under the run's locator, in the writing
-//! installation's namespace; the empty collections the reading installations' requests reached in
-//! their own namespaces; and the receipts and spent nonces the service keeps by its own rules. No
-//! client operation removes a bundle, because a bundle is the only thing a restore takes a writer key
-//! from. Every key that signed is discarded with the run.
+//! Against a deployment: the bundle collection at the run's locator, owned by the account whose
+//! tokens the run was given, and the receipts and spent nonces the service keeps by its own rules.
+//! No client operation removes a bundle, because a bundle is the only thing a restore takes a writer
+//! key from. Every key that signed is discarded with the run.
 
 use std::sync::Arc;
 
-use kr_backup_integration::{RunDirectory, Watched, skipped, variable};
-use kr_client::recovery::{
-    BundleStore, FreshRestore, RecoveryError, RetrievalPolicy, ServiceAccess, parse_kit, render_kit,
+use kr_backup_integration::{
+    RunDirectory, TOKENS_VARIABLE, Watched, account_tokens, skipped, variable,
 };
+use kr_client::recovery::{
+    BundleStore, FreshRestore, RecoveryError, RetrievalPolicy, ServiceAccess, bundle_collection,
+    fresh_locator, parse_kit, render_kit,
+};
+use kr_client::services::account::{AccountTokenSource, BACKUP_RESTORE_SCOPE, BACKUP_WRITE_SCOPE};
 use kr_client::services::relay::{ServiceHttp, ServiceSigner};
 use kr_client::services::sync::ManagedSyncService;
 use kr_client::services::{
@@ -36,11 +42,11 @@ use kr_client::services::{
     SyncRequestStatus,
 };
 use kr_crypto::kdf::RecoverySeed;
-use kr_protocol::archive::{RecoveryKit, TrustedWriter};
+use kr_protocol::archive::{RecoveryContext, RecoveryKit, TrustedWriter};
 use kr_protocol::ids::SyncConflictId;
 use kr_protocol::scalars::{TimestampMs, Uuid};
 use kr_protocol::service::GatewayOrigin;
-use kr_sync_integration::{Deployment, RunKey, fresh_uuid, now_ms, proved};
+use kr_sync_integration::{Deployment, RunKey, now_ms, proved};
 
 /// The variable naming the second local service a kit may name.
 const SECOND_VARIABLE: &str = "KR_BACKUP_SECOND_ORIGIN";
@@ -53,23 +59,28 @@ fn now() -> TimestampMs {
     TimestampMs::new(now_ms())
 }
 
-/// A locator made for the run: opaque, stable for the life of the kit, and nobody else's.
-fn fresh_locator() -> String {
-    format!("kr-recovery-{}", fresh_uuid())
+/// A locator made for the run, as a new kit's is: a random identifier nobody else holds.
+fn locator() -> String {
+    fresh_locator().expect("a locator")
 }
 
-/// One installation's settings-sync client at one service, over a transport that holds every
-/// answer to naming no history.
+/// One installation's client at one service, presenting `tokens`' account token for `scope` with
+/// every request about the bundle, over a transport that holds every answer to naming no history.
 fn client_at(
     deployment: &Deployment,
     who: &Arc<RunKey>,
+    tokens: &Arc<dyn AccountTokenSource>,
+    scope: &'static str,
 ) -> (Arc<ManagedSyncService>, Arc<Watched>) {
     let transport = Watched::new(deployment.transport(), None);
-    let service = Arc::new(ManagedSyncService::new(
-        deployment.origin().clone(),
-        Arc::clone(&transport) as Arc<dyn ServiceHttp>,
-        Arc::clone(who) as Arc<dyn ServiceSigner>,
-    ));
+    let service = Arc::new(
+        ManagedSyncService::new(
+            deployment.origin().clone(),
+            Arc::clone(&transport) as Arc<dyn ServiceHttp>,
+            Arc::clone(who) as Arc<dyn ServiceSigner>,
+        )
+        .presenting(Arc::clone(tokens), scope),
+    );
     (service, transport)
 }
 
@@ -88,7 +99,7 @@ fn blocked(what: &str, origin: &str, transport: &Watched, error: &RecoveryError)
     panic!("blocked: {what} at {origin} ({sent}), so nothing after it ran: {error}");
 }
 
-/// A service that answers for one locator with what it holds at another.
+/// A service that answers for one collection with what it holds at another.
 ///
 /// It is the substitution section 20 ¶13 names: the bytes are real, written by the owner and
 /// served by the service, and only the place they are served from is wrong.
@@ -164,36 +175,50 @@ impl SyncBackupService for Substituting {
     }
 }
 
-/// A restore from `kit` that has been given access to `origin` through the owner's account.
-fn restore_with(kit: RecoveryKit, origin: &str) -> FreshRestore {
+/// A restore from `kit` whose retrieval policy, the owner's account, gave it `reader` at `origin`.
+fn restore_with(
+    kit: RecoveryKit,
+    origin: &str,
+    reader: Arc<dyn SyncBackupService>,
+) -> FreshRestore {
     let mut restore = FreshRestore::new(kit, RetrievalPolicy::Account);
     restore
-        .obtained_access(ServiceAccess {
-            policy: RetrievalPolicy::Account,
-            service_origin: origin.to_owned(),
-        })
+        .obtained_access(ServiceAccess::new(RetrievalPolicy::Account, origin, reader))
         .expect("the kit names that origin");
     restore
 }
 
+/// The collection a kit's bundle is kept in at one origin.
+fn collection_of(origin: &str, locator: &str) -> String {
+    bundle_collection(&RecoveryContext {
+        service_origin: origin.to_owned(),
+        bundle_locator: locator.to_owned(),
+    })
+}
+
 /// KR-ACC-033 against a service: a bundle written at a stable locator is found and authenticated by
-/// a new installation holding only the kit and the origin; the same bytes served under another
-/// locator or from another origin fail authentication and bring in no writer; a kit of another seed
-/// fails too; and a writer enabled by compare and swap at the same locator is read with the same
-/// kit.
+/// a new installation holding only the kit, the origin and the account's token for the restore; the
+/// same bytes served under another locator or from another origin fail authentication and bring in
+/// no writer; a kit of another seed fails too; and a writer enabled by compare and swap at the same
+/// locator is read with the same kit.
 #[tokio::test]
 async fn a_bundle_is_found_and_authenticated_with_only_the_kit_and_its_origin() {
     let Some(deployment) = Deployment::from_environment() else {
         return;
     };
     let origin = deployment.origin().as_str().to_owned();
+    let Some(tokens) = account_tokens(&origin) else {
+        skipped(TOKENS_VARIABLE);
+        return;
+    };
     let directory = tempfile::tempdir().expect("a directory for the stores");
 
     // The owner's device: a fresh installation, a fresh seed, and a locator made for the run.
     let owner = RunKey::installation();
-    let (owner_service, owner_transport) = client_at(&deployment, &owner);
+    let (owner_service, owner_transport) =
+        client_at(&deployment, &owner, &tokens.write, BACKUP_WRITE_SCOPE);
     let seed = RecoverySeed::generate().expect("a seed");
-    let locator = fresh_locator();
+    let locator = locator();
     let kit = seed.to_kit(vec![origin.clone()], locator.clone());
     std::fs::create_dir_all(directory.path().join("owner")).expect("a directory");
     let mut store = BundleStore::open(
@@ -214,13 +239,15 @@ async fn a_bundle_is_found_and_authenticated_with_only_the_kit_and_its_origin() 
     };
     assert_eq!((written.write_sequence, written.recovery()), (1, None));
 
-    // A new installation, holding the printed kit and nothing else, reaches the service through
-    // its own access and authenticates the bundle with the kit.
+    // A new installation, holding the printed kit and the account's token for the restore and
+    // nothing else, reaches the service through that access and authenticates the bundle with the
+    // kit.
     let reader = RunKey::installation();
-    let (reader_service, reader_transport) = client_at(&deployment, &reader);
+    let (reader_service, reader_transport) =
+        client_at(&deployment, &reader, &tokens.restore, BACKUP_RESTORE_SCOPE);
     let reader_service = reader_service as Arc<dyn SyncBackupService>;
-    let found = restore_with(kept(&kit), &origin)
-        .open_bundle(Arc::clone(&reader_service), &origin)
+    let found = restore_with(kept(&kit), &origin, Arc::clone(&reader_service))
+        .open_bundle(&origin)
         .await
         .expect("the bundle is found and authenticated with only the kit");
     assert_eq!(found.bundle_revision, 1);
@@ -231,16 +258,16 @@ async fn a_bundle_is_found_and_authenticated_with_only_the_kit_and_its_origin() 
 
     // The same bytes, served under another locator: the kit naming that locator does not open
     // them, and nothing is trusted.
-    let elsewhere = fresh_locator();
+    let elsewhere = self::locator();
     let substituted = Arc::new(Substituting {
         inner: Arc::clone(&reader_service),
-        asked: elsewhere.clone(),
-        served: locator.clone(),
+        asked: collection_of(&origin, &elsewhere),
+        served: collection_of(&origin, &locator),
     }) as Arc<dyn SyncBackupService>;
     let moved_kit = seed.to_kit(vec![origin.clone()], elsewhere);
     assert!(matches!(
-        restore_with(kept(&moved_kit), &origin)
-            .open_bundle(substituted, &origin)
+        restore_with(kept(&moved_kit), &origin, substituted)
+            .open_bundle(&origin)
             .await,
         Err(RecoveryError::BundleNotAuthentic)
     ));
@@ -249,8 +276,8 @@ async fn a_bundle_is_found_and_authenticated_with_only_the_kit_and_its_origin() 
     let other_origin = "https://recovery-substitute.invalid";
     let other_kit = seed.to_kit(vec![other_origin.to_owned()], locator.clone());
     assert!(matches!(
-        restore_with(kept(&other_kit), other_origin)
-            .open_bundle(Arc::clone(&reader_service), other_origin)
+        restore_with(kept(&other_kit), other_origin, Arc::clone(&reader_service))
+            .open_bundle(other_origin)
             .await,
         Err(RecoveryError::BundleNotAuthentic)
     ));
@@ -260,8 +287,8 @@ async fn a_bundle_is_found_and_authenticated_with_only_the_kit_and_its_origin() 
         .expect("a seed")
         .to_kit(vec![origin.clone()], locator.clone());
     assert!(matches!(
-        restore_with(kept(&stranger), &origin)
-            .open_bundle(Arc::clone(&reader_service), &origin)
+        restore_with(kept(&stranger), &origin, Arc::clone(&reader_service))
+            .open_bundle(&origin)
             .await,
         Err(RecoveryError::BundleNotAuthentic)
     ));
@@ -292,7 +319,7 @@ async fn a_bundle_is_found_and_authenticated_with_only_the_kit_and_its_origin() 
     );
 
     // The same kit reads the bundle as it now stands, writer and all, from a store that holds
-    // nothing but the kit and the origin.
+    // nothing but the kit, the origin and the restore's access.
     let reading_directory = directory.path().join("reader");
     std::fs::create_dir_all(&reading_directory).expect("a directory");
     let mut reading = BundleStore::open(
@@ -324,13 +351,18 @@ async fn a_bundle_is_found_and_authenticated_with_only_the_kit_and_its_origin() 
     proved(
         "bundle",
         &deployment,
-        "a new installation with only the printed kit found and authenticated the bundle and read the writer a compare and swap added; another locator, another origin and another seed's kit all failed authentication; every answer named no history",
+        "a new installation with only the printed kit and a token for the restore found and authenticated the bundle and read the writer a compare and swap added; another locator, another origin and another seed's kit all failed authentication; every answer named no history",
     );
 }
 
-/// The two services a leg over several services runs against, and the directory it keeps the
-/// printed kit in between its phases.
-fn two_services() -> Option<(Deployment, Deployment, RunDirectory)> {
+/// The two services a leg over several services runs against, the account tokens the run holds at
+/// each, and the directory it keeps the printed kit in between its phases.
+fn two_services() -> Option<(
+    Deployment,
+    Deployment,
+    RunDirectory,
+    [kr_backup_integration::AccountTokens; 2],
+)> {
     let first = Deployment::from_environment()?;
     let Some(second) = variable(SECOND_VARIABLE) else {
         skipped(SECOND_VARIABLE);
@@ -341,14 +373,21 @@ fn two_services() -> Option<(Deployment, Deployment, RunDirectory)> {
         return None;
     };
     let second = Deployment::at(GatewayOrigin::new(second).expect("an origin"));
-    Some((first, second, run))
+    let (Some(at_first), Some(at_second)) = (
+        account_tokens(first.origin().as_str()),
+        account_tokens(second.origin().as_str()),
+    ) else {
+        skipped(TOKENS_VARIABLE);
+        return None;
+    };
+    Some((first, second, run, [at_first, at_second]))
 }
 
 /// KR-REQ-20.18 against two services, first phase: a kit naming both reads the bundle at either.
 /// The phase keeps the printed kit for the next one, which runs once the first service is gone.
 #[tokio::test]
 async fn a_kit_naming_two_services_reads_the_bundle_at_either() {
-    let Some((first, second, run)) = two_services() else {
+    let Some((first, second, run, tokens)) = two_services() else {
         return;
     };
     let origins = [
@@ -358,11 +397,11 @@ async fn a_kit_naming_two_services_reads_the_bundle_at_either() {
 
     let owner = RunKey::installation();
     let seed = RecoverySeed::generate().expect("a seed");
-    let kit = seed.to_kit(origins.to_vec(), fresh_locator());
+    let kit = seed.to_kit(origins.to_vec(), locator());
     let mut transports = Vec::new();
-    for (index, deployment) in [&first, &second].into_iter().enumerate() {
+    for (index, (deployment, tokens)) in [&first, &second].into_iter().zip(&tokens).enumerate() {
         let origin = deployment.origin().as_str().to_owned();
-        let (service, transport) = client_at(deployment, &owner);
+        let (service, transport) = client_at(deployment, &owner, &tokens.write, BACKUP_WRITE_SCOPE);
         let path = run.path(&format!("owner-{index}"));
         std::fs::create_dir_all(&path).expect("a directory");
         let mut store = BundleStore::open(
@@ -383,13 +422,15 @@ async fn a_kit_naming_two_services_reads_the_bundle_at_either() {
         transports.push(transport);
     }
 
-    // A new installation with the printed kit reads the bundle at each service it names.
+    // A new installation with the printed kit and a token for the restore reads the bundle at each
+    // service it names.
     let reader = RunKey::installation();
-    for deployment in [&first, &second] {
+    for (deployment, tokens) in [&first, &second].into_iter().zip(&tokens) {
         let origin = deployment.origin().as_str().to_owned();
-        let (service, transport) = client_at(deployment, &reader);
-        let found = restore_with(kept(&kit), &origin)
-            .open_bundle(service as Arc<dyn SyncBackupService>, &origin)
+        let (service, transport) =
+            client_at(deployment, &reader, &tokens.restore, BACKUP_RESTORE_SCOPE);
+        let found = restore_with(kept(&kit), &origin, service as Arc<dyn SyncBackupService>)
+            .open_bundle(&origin)
             .await
             .expect("the bundle at that service");
         assert_eq!(found.bundle_revision, 1);
@@ -413,40 +454,54 @@ async fn a_kit_naming_two_services_reads_the_bundle_at_either() {
 /// gone reads nothing, since a seed alone rebuilds no service.
 #[tokio::test]
 async fn with_one_service_gone_the_same_kit_still_reads_at_the_other() {
-    let Some((first, second, run)) = two_services() else {
+    let Some((first, second, run, tokens)) = two_services() else {
         return;
     };
+    let [at_first, at_second] = tokens;
     let printed = run.read(KIT);
     let kit = parse_kit(printed["kit"].as_str().expect("the printed kit")).expect("a kit");
     let gone = first.origin().as_str().to_owned();
     let left = second.origin().as_str().to_owned();
 
     let reader = RunKey::installation();
-    let (gone_service, _) = client_at(&first, &reader);
+    let (gone_service, _) = client_at(&first, &reader, &at_first.restore, BACKUP_RESTORE_SCOPE);
     assert!(
         matches!(
-            restore_with(kit.clone(), &gone)
-                .open_bundle(gone_service as Arc<dyn SyncBackupService>, &gone)
-                .await,
+            restore_with(
+                kit.clone(),
+                &gone,
+                gone_service as Arc<dyn SyncBackupService>
+            )
+            .open_bundle(&gone)
+            .await,
             Err(RecoveryError::Service(_))
         ),
         "the service that is gone gives nothing back"
     );
-    let (left_service, transport) = client_at(&second, &reader);
-    let found = restore_with(kit.clone(), &left)
-        .open_bundle(left_service as Arc<dyn SyncBackupService>, &left)
-        .await
-        .expect("the service that is left still serves the bundle");
+    let (left_service, transport) =
+        client_at(&second, &reader, &at_second.restore, BACKUP_RESTORE_SCOPE);
+    let found = restore_with(
+        kit.clone(),
+        &left,
+        left_service as Arc<dyn SyncBackupService>,
+    )
+    .open_bundle(&left)
+    .await
+    .expect("the service that is left still serves the bundle");
     assert_eq!(found.bundle_revision, 1);
     transport.assert_every_answer_named_its_history();
 
     let seed = RecoverySeed::from_kit(&kit).expect("the kit's seed");
     let only_gone = seed.to_kit(vec![gone.clone()], kit.bundle_locator.clone());
-    let (gone_service, _) = client_at(&first, &reader);
+    let (gone_service, _) = client_at(&first, &reader, &at_first.restore, BACKUP_RESTORE_SCOPE);
     assert!(matches!(
-        restore_with(kept(&only_gone), &gone)
-            .open_bundle(gone_service as Arc<dyn SyncBackupService>, &gone)
-            .await,
+        restore_with(
+            kept(&only_gone),
+            &gone,
+            gone_service as Arc<dyn SyncBackupService>
+        )
+        .open_bundle(&gone)
+        .await,
         Err(RecoveryError::Service(_))
     ));
     proved(

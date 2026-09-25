@@ -19,13 +19,20 @@
 # prepared from that export and restored on its own schedule, and a device's stores meeting each in
 # turn. On macOS, keep the tree on the internal disk: the Workers it starts read it.
 #
+# The recovery bundle belongs to an account, so its legs present an account token beside every
+# device's signature: one issued with backup.write for the device that writes the bundle, and one
+# issued with backup.restore for the device that restores from the kit. KR_BACKUP_TOKENS names a
+# file, readable by its owner alone, that holds both for each origin. A loopback run has each local
+# deployment's development-only sign-in, the driver's `sign-in` command, write it; a run against a
+# deployment is handed one, and without one its bundle leg does not run. No token is printed.
+#
 # What it sends, and what it leaves. Every key is made for the run and discarded with it, and every
 # locator and identifier is drawn fresh. A local run's deployments, their storage and the device's
 # stores live in one directory under TMPDIR, removed when the run ends and kept, and named, when a
 # leg failed. Against a deployment a bundle stays where it was written, because no client operation
 # removes a bundle: the closing lines say what each leg left there.
 #
-# Usage: scripts/e2e-backup.sh https://example.invalid
+# Usage: KR_BACKUP_TOKENS=/path/to/tokens.json scripts/e2e-backup.sh https://example.invalid
 #        KR_WEB_TREE=/path/to/kalareach-web scripts/e2e-backup.sh http://127.0.0.1:8805
 #
 # It exits 0 when every leg that applies to the origin passed, 1 when any failed or did not run,
@@ -221,13 +228,13 @@ report() {
   printf '  %-7s %-10s %s\n' "$result" "$leg" "$what"
 }
 
-# The bundle, at one service: the origin this run was given.
+# The bundle, at one service: the origin this run was given, with the account tokens the run holds.
 bundle_leg() {
   local against="$1"
   local log="$evidence/bundle.log"
   local rc=0
   run_test bundle a_bundle_is_found_and_authenticated_with_only_the_kit_and_its_origin "$log" \
-    KR_DEPLOYED_ORIGIN="$against" || rc=$?
+    KR_DEPLOYED_ORIGIN="$against" KR_BACKUP_TOKENS="$tokens" || rc=$?
   case "$rc" in
     0) report ok bundle "$(proved "$log" "$against")" ;;
     1) report FAILED bundle "$(reason "$log")" ;;
@@ -239,29 +246,39 @@ bundle_leg() {
     if [ "$rc" -ne 0 ] && grep -q '(nothing was sent)' "$log"; then
       left+=("bundle: nothing, because the leg sent nothing")
     else
-      left+=("bundle: as far as the leg got, one bundle collection under a locator made for the run in the namespace of a key discarded with the run, the empty collections its readers reached in their own namespaces, and the receipts and spent nonces the service keeps; no client operation removes a bundle")
+      left+=("bundle: as far as the leg got, one bundle collection at a locator made for the run, owned by the account whose tokens the run was given, and the receipts and spent nonces the service keeps; no client operation removes a bundle")
     fi
   fi
 }
 
 if [ "$mode" = deployment ]; then
-  bundle_leg "$origin"
+  tokens="${KR_BACKUP_TOKENS:-}"
+  if [ -n "$tokens" ] && [ -f "$tokens" ]; then
+    bundle_leg "$origin"
+  else
+    report 'NOT RUN' bundle "no account tokens: KR_BACKUP_TOKENS names no file of this deployment's tokens"
+    left+=("bundle: nothing, because the leg did not run")
+  fi
   printf '  %-7s %-10s %s\n' '-' services "local only: needs two services on this machine"
   printf '  %-7s %-10s %s\n' '-' restore "local only: needs a deployment restored from its export on this machine"
 else
   run="$(mktemp -d "${TMPDIR:-/tmp}/kr-e2e-backup-XXXXXX")"
   state="$run/web"
+  # Each local deployment's account tokens, written by its development-only sign-in.
+  tokens="$run/tokens.json"
 
   # The bundle, at a local deployment on the given port.
   first=""
   if answer="$(step start --name first --port "$port")"; then
     first="$(member "$answer" origin)"
   fi
-  if [ "$first" = "$origin" ]; then
-    bundle_leg "$first"
-  else
+  if [ "$first" != "$origin" ]; then
     first=""
     report FAILED bundle "no local deployment served on $origin; see $evidence/driver.log"
+  elif ! step sign-in --name first --tokens "$tokens" >/dev/null; then
+    report FAILED bundle "the local deployment on $origin signed no account in; see $evidence/driver.log"
+  else
+    bundle_leg "$first"
   fi
 
   # The bundle at two services, then, once the first is stopped, with only the second left.
@@ -273,10 +290,13 @@ else
     report 'NOT RUN' services "the first local deployment did not serve"
   elif [ -z "$second" ]; then
     report FAILED services "a second local deployment did not serve; see $evidence/driver.log"
+  elif ! step sign-in --name second --tokens "$tokens" >/dev/null; then
+    report FAILED services "the second local deployment signed no account in; see $evidence/driver.log"
   else
     rc=0
     run_test bundle a_kit_naming_two_services_reads_the_bundle_at_either "$evidence/services-1.log" \
-      KR_DEPLOYED_ORIGIN="$first" KR_BACKUP_SECOND_ORIGIN="$second" KR_BACKUP_RUN_DIR="$run/services" || rc=$?
+      KR_DEPLOYED_ORIGIN="$first" KR_BACKUP_SECOND_ORIGIN="$second" KR_BACKUP_RUN_DIR="$run/services" \
+      KR_BACKUP_TOKENS="$tokens" || rc=$?
     if [ "$rc" -eq 1 ]; then
       report FAILED services "$(reason "$evidence/services-1.log")"
     elif [ "$rc" -ne 0 ]; then
@@ -286,7 +306,8 @@ else
     else
       rc=0
       run_test bundle with_one_service_gone_the_same_kit_still_reads_at_the_other "$evidence/services-2.log" \
-        KR_DEPLOYED_ORIGIN="$first" KR_BACKUP_SECOND_ORIGIN="$second" KR_BACKUP_RUN_DIR="$run/services" || rc=$?
+        KR_DEPLOYED_ORIGIN="$first" KR_BACKUP_SECOND_ORIGIN="$second" KR_BACKUP_RUN_DIR="$run/services" \
+        KR_BACKUP_TOKENS="$tokens" || rc=$?
       case "$rc" in
         0) report ok services "$(proved "$evidence/services-1.log" "$first"); $(proved "$evidence/services-2.log" "$second")" ;;
         1) report FAILED services "with the first service gone: $(reason "$evidence/services-2.log")" ;;

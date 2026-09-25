@@ -4,10 +4,11 @@
 //! test. These legs hold them to the web service itself: a local deployment `wrangler dev` serves, or
 //! a deployment over HTTPS.
 //!
-//! * **The bundle** (`tests/bundle.rs`): a bundle written at a stable locator by one installation,
-//!   found and authenticated by another that holds only the kit and the origin, moved on by
-//!   compare and swap and read again with the same kit, and refused wherever its origin or its
-//!   locator is substituted or the kit belongs to another seed.
+//! * **The bundle** (`tests/bundle.rs`): a bundle written at a stable locator by one installation
+//!   with the account's `backup.write` token, found and authenticated by another that holds only the
+//!   kit, the origin and the same account's `backup.restore` token, moved on by compare and swap and
+//!   read again with the same kit, and refused wherever its origin or its locator is substituted or
+//!   the kit belongs to another seed.
 //! * **A restored deployment** (`tests/restore.rs`): a device's settings, drafts and membership,
 //!   made against one local deployment, meeting a second deployment restored from the first one's
 //!   export. That leg runs in phases, between which the deployments are exported, stopped, prepared
@@ -33,6 +34,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use kr_client::ClientError;
+use kr_client::services::account::{AccountToken, AccountTokenSource};
 use kr_client::services::relay::{ServiceHttp, ServiceHttpAnswer, ServiceSigner};
 use kr_client::services::{ServiceFuture, SyncRecoveryId};
 use kr_crypto::keys::DeviceKeys;
@@ -75,6 +77,68 @@ pub fn skipped(name: &str) {
 }
 
 /* -------------------------------------------------------------------------- */
+/* The account a bundle belongs to                                             */
+/* -------------------------------------------------------------------------- */
+
+/// The variable naming the file that holds the run's account tokens, for each origin.
+///
+/// A recovery bundle belongs to an account, so every request about it carries an account token
+/// beside the device's signature. The file is a JSON object from each origin to the two tokens one
+/// account holds there, `{"write": "...", "restore": "..."}`: one issued with `backup.write` for the
+/// device that writes the bundle, and one issued with `backup.restore` for the device that restores
+/// from the kit. `scripts/e2e-backup.sh` has each local deployment's development-only sign-in write
+/// it; a run against a deployment is handed one. It is readable by this account alone, and nothing
+/// here prints a token.
+pub const TOKENS_VARIABLE: &str = "KR_BACKUP_TOKENS";
+
+/// The two account tokens a run holds at one origin.
+#[derive(Debug)]
+pub struct AccountTokens {
+    /// Issued with `backup.write`, for the device that writes the bundle.
+    pub write: Arc<dyn AccountTokenSource>,
+    /// Issued with `backup.restore`, for the device that restores from the kit.
+    pub restore: Arc<dyn AccountTokenSource>,
+}
+
+/// The account tokens the run holds at `origin`, or nothing when the run named no token file.
+///
+/// # Panics
+///
+/// Panics when the run was promised its services and named no file, and when the file cannot be
+/// read, is not the shape above, or names no tokens for `origin`.
+#[must_use]
+pub fn account_tokens(origin: &str) -> Option<AccountTokens> {
+    let path = variable(TOKENS_VARIABLE)?;
+    let text = std::fs::read(&path).expect("the run's token file");
+    let tokens: serde_json::Value = serde_json::from_slice(&text).expect("a JSON object");
+    let held = &tokens[origin];
+    let token = |which: &str| {
+        let value = held[which]
+            .as_str()
+            .unwrap_or_else(|| panic!("the token file holds a {which} token for {origin}"));
+        Arc::new(Given(
+            AccountToken::new(value).expect("a token a header can carry"),
+        )) as Arc<dyn AccountTokenSource>
+    };
+    Some(AccountTokens {
+        write: token("write"),
+        restore: token("restore"),
+    })
+}
+
+/// A token the run was given, handed out for whatever scope is asked: the service checks the
+/// scope it was issued with.
+#[derive(Debug)]
+struct Given(AccountToken);
+
+impl AccountTokenSource for Given {
+    fn token<'a>(&'a self, _scope: &'a str) -> ServiceFuture<'a, AccountToken> {
+        let token = self.0.clone();
+        Box::pin(async move { Ok(token) })
+    }
+}
+
+/* -------------------------------------------------------------------------- */
 /* The transport every leg watches                                             */
 /* -------------------------------------------------------------------------- */
 
@@ -83,7 +147,7 @@ pub fn skipped(name: &str) {
 pub struct Sent {
     /// The member the request asked for: `exchange`, `compare`, `status`, `fence` and the rest.
     pub member: String,
-    /// The collection it named, when it named one.
+    /// The collection it named, or the recovery bundle's locator, when it named one.
     pub collection: Option<String>,
     /// The request identity it named, when it named one.
     pub request_id: Option<String>,
@@ -246,7 +310,10 @@ impl Watched {
         let (member, asked) = request["body"].as_object()?.iter().next()?;
         self.sent.lock().expect("the requests").push(Sent {
             member: member.clone(),
-            collection: asked["collection_id"].as_str().map(str::to_owned),
+            collection: asked["collection_id"]
+                .as_str()
+                .or_else(|| asked["locator"].as_str())
+                .map(str::to_owned),
             request_id: asked["request_id"].as_str().map(str::to_owned),
         });
         Some(member.clone())
