@@ -655,6 +655,13 @@ impl NativeBridges {
         if !journal.changes.is_empty() {
             self.undo(journal)?;
         }
+        // What this refusal had to leave in place because it changed since it was placed. It is
+        // taken before the recheck below, which may drop what an earlier removal left.
+        let added: Vec<Kept> = journal
+            .leftovers
+            .get(earlier..)
+            .unwrap_or_default()
+            .to_vec();
         journal.refusal = Some(reason.clone());
         journal.state = if journal.changes.is_empty() {
             State::Refused
@@ -663,12 +670,10 @@ impl NativeBridges {
         };
         recheck(journal);
         self.save(journal)?;
-        // What this refusal had to leave in place, because it changed since it was placed, is
-        // named as left, and the refusal is not reported as clean.
-        let left: Vec<String> = journal
-            .leftovers
+        // What it left, and is still there, is named, and the refusal is not reported as clean.
+        let left: Vec<String> = added
             .iter()
-            .skip(earlier)
+            .filter(|kept| journal.leftovers.contains(kept))
             .map(Kept::describe)
             .collect();
         if !journal.changes.is_empty() || !journal.unresolved.is_empty() || !left.is_empty() {

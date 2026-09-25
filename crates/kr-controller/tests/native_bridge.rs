@@ -967,6 +967,67 @@ fn a_refusal_that_has_to_leave_a_changed_file_is_not_reported_as_clean() {
     );
 }
 
+/// A refusal names the file its undo had to leave even when, in the same run, something an earlier
+/// removal left is found gone.
+#[test]
+fn a_refusal_names_what_it_left_when_an_earlier_leftover_goes_in_the_same_run() {
+    let site = Site::new();
+    site.bridges()
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("applies");
+    // Somebody edits the hooks file installed in the first directory, so its removal leaves it.
+    let first_hooks = site.application().join(HOOKS_PATH);
+    std::fs::write(&first_hooks, b"{\"hooks\": {}}").expect("somebody edits it");
+    // The host now keeps Claude Code's plugins in another directory.
+    let other = site.root.join("other/.claude");
+    std::fs::create_dir_all(&other).expect("another directory");
+    std::fs::write(other.join("settings.json"), SETTINGS).expect("settings");
+    let other_hooks = other.join(HOOKS_PATH);
+    let moved = NativeBridges::new(BridgeHost {
+        applications: vec![ApplicationDirectory {
+            application: "Claude Code".to_owned(),
+            directory: other.clone(),
+        }],
+        ..site.host()
+    });
+    {
+        let first_hooks = first_hooks.clone();
+        let other_hooks = other_hooks.clone();
+        let document = other.join("settings.json");
+        let edits = std::sync::atomic::AtomicUsize::new(0);
+        moved.before_publishing(move |destination: &Path| {
+            // Only the second directory's document: the first one's is edited by its removal.
+            if destination == document {
+                let edit = edits.fetch_add(1, Ordering::SeqCst);
+                if edit == 0 {
+                    // What the first removal left is removed by its owner, and the hooks file just
+                    // placed in the second directory is edited.
+                    std::fs::remove_file(&first_hooks).expect("its owner removes it");
+                    std::fs::write(&other_hooks, b"{\"hooks\": {}}").expect("somebody edits it");
+                }
+                let text = std::fs::read_to_string(&document).expect("reads");
+                std::fs::write(
+                    &document,
+                    text.replacen('{', &format!("{{\"edit{edit}\": 1, "), 1),
+                )
+                .expect("somebody edits it again");
+            }
+        });
+    }
+
+    let settled = moved
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("reconciles");
+
+    let Settled::Unsettled(reason) = &settled else {
+        panic!("reported as clean: {settled:?}");
+    };
+    assert!(
+        reason.contains("left in place") && reason.contains(&other_hooks.display().to_string()),
+        "{reason}"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // Stopped at each boundary
 // ---------------------------------------------------------------------------------------------
