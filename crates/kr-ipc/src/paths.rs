@@ -804,6 +804,42 @@ mod windows {
         Err(std::io::Error::from_raw_os_error(code.cast_signed()))
     }
 
+    /// Opens the directory an open handle holds a second time, relative to that handle, holding
+    /// `right`.
+    ///
+    /// No name is resolved: the new handle is on the object the old one holds, wherever its name
+    /// has gone since. The operating system checks `right` against the directory's list as it would
+    /// for an open by name, and the backup semantics are what let a program open a directory at
+    /// all, as they are for [`super::flush_directory`]'s own open.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating system's error when the directory cannot be opened with that right.
+    pub(super) fn reopen_directory(
+        directory: BorrowedHandle<'_>,
+        right: u32,
+    ) -> std::io::Result<std::fs::File> {
+        use std::os::windows::io::FromRawHandle as _;
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, ReOpenFile};
+
+        // SAFETY: `directory` is a live handle borrowed for this call, which the call reads and
+        // leaves as it was; the flags carry no file attribute, which the call refuses.
+        let handle = unsafe {
+            ReOpenFile(
+                directory.as_raw_handle(),
+                right,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_FLAG_BACKUP_SEMANTICS,
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: the call above returned a handle this owns and closes once.
+        Ok(unsafe { std::fs::File::from_raw_handle(handle.cast()) })
+    }
+
     /// The limit flags of the job this process runs in, or `None` when it runs in no job.
     ///
     /// A daemon reads this to decide whether a worker it starts must break away from its job: a
@@ -1660,6 +1696,69 @@ fn flush_through(directory: &Path, right: u32) -> std::io::Result<()> {
         .sync_all()
 }
 
+/// Flushes a directory this process holds open, after a name inside it was created, replaced or
+/// removed, so the change survives a crash.
+///
+/// [`flush_directory`] for a store that reaches its directories through handles it holds and never
+/// through their names again. The directory is opened a second time relative to the handle, so the
+/// directory flushed is the one the handle holds even where its name has since been renamed or put
+/// somewhere else. On Unix the second descriptor is opened for reading, because the handle may be a
+/// reference to the directory rather than a file description, which is what Linux gives for an
+/// `O_PATH` open and refuses to flush. On Windows the second handle holds only the right `kind`
+/// names, as [`flush_directory`]'s does, and the flush is asked of the operating system through it.
+///
+/// # Errors
+///
+/// Returns the operating system's error when the directory cannot be opened again or flushed.
+#[cfg(unix)]
+pub fn flush_held_directory(
+    directory: &impl std::os::fd::AsFd,
+    kind: NameKind,
+) -> std::io::Result<()> {
+    use rustix::fs::{Mode, OFlags};
+
+    let _ = kind;
+    // `.` is the directory the handle holds, whatever name reaches it by now.
+    let flushable = rustix::fs::openat(
+        directory.as_fd(),
+        ".",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    rustix::fs::fsync(&flushable).map_err(std::io::Error::from)
+}
+
+/// Flushes a directory this process holds open, after a name inside it was created, replaced or
+/// removed, so the change survives a crash.
+///
+/// [`flush_directory`] for a store that reaches its directories through handles it holds and never
+/// through their names again. The directory is opened a second time relative to the handle, so the
+/// directory flushed is the one the handle holds even where its name has since been renamed or put
+/// somewhere else. On Unix the second descriptor is opened for reading, because the handle may be a
+/// reference to the directory rather than a file description, which is what Linux gives for an
+/// `O_PATH` open and refuses to flush. On Windows the second handle holds only the right `kind`
+/// names, as [`flush_directory`]'s does, and the flush is asked of the operating system through it.
+///
+/// # Errors
+///
+/// Returns the operating system's error when the directory cannot be opened again or flushed.
+#[cfg(windows)]
+pub fn flush_held_directory(
+    directory: &impl std::os::windows::io::AsHandle,
+    kind: NameKind,
+) -> std::io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY};
+
+    self::windows::reopen_directory(
+        directory.as_handle(),
+        match kind {
+            NameKind::File => FILE_ADD_FILE,
+            NameKind::Directory => FILE_ADD_SUBDIRECTORY,
+        },
+    )?
+    .sync_all()
+}
+
 /// How many links the walk over a path follows before it gives up.
 ///
 /// A backstop rather than the rule. Every kernel this runs on applies a limit of its own, usually
@@ -2309,6 +2408,135 @@ mod tests {
         );
         flush_through(&root, FILE_ADD_FILE)
             .expect("and through one that may add a file, the flush is made");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A directory held open is flushed through a descriptor opened from the one held, not through
+    /// its name, and a held reference the kernel refuses to flush is flushed that way too.
+    #[cfg(unix)]
+    #[test]
+    fn a_held_directory_is_flushed_through_a_descriptor_opened_from_it() {
+        let root = temporary_root("flush-held");
+        let named = root.join("held");
+        std::fs::create_dir(&named).expect("a directory to hold");
+        let held = std::fs::File::open(&named).expect("the directory is held open");
+        flush_held_directory(&held, NameKind::File).expect("the held directory is flushed");
+        let moved = root.join("moved");
+        std::fs::rename(&named, &moved).expect("the held directory is renamed");
+        flush_held_directory(&held, NameKind::File)
+            .expect("the directory the handle holds is flushed wherever its name went");
+        // A reference to the directory rather than a file description, which Linux refuses to
+        // flush directly.
+        #[cfg(target_os = "linux")]
+        {
+            use rustix::fs::{Mode, OFlags};
+
+            let reference = rustix::fs::open(
+                &moved,
+                OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .expect("a reference to the directory");
+            assert_eq!(
+                rustix::fs::fsync(&reference).expect_err("a reference is not flushed directly"),
+                rustix::io::Errno::BADF
+            );
+            flush_held_directory(&reference, NameKind::File)
+                .expect("the directory it refers to is flushed");
+        }
+        drop(held);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A directory held open is flushed through a second handle opened from the one held, not
+    /// through its name: after a rename its old name reaches nothing and the flush still goes
+    /// through. A handle that shares no writing stops that second open with a sharing violation,
+    /// where a flush that did nothing would succeed and one made through the held handle itself
+    /// would be refused for want of the right.
+    #[cfg(windows)]
+    #[test]
+    fn a_held_directory_is_flushed_through_a_second_handle_opened_from_it() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        };
+
+        let root = temporary_root("flush-held");
+        let named = root.join("held");
+        std::fs::create_dir(&named).expect("a directory to hold");
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&named)
+            .expect("the directory is held open");
+        flush_held_directory(&held, NameKind::File)
+            .expect("a directory this account adds files to is flushed");
+        flush_held_directory(&held, NameKind::Directory).expect("and one it adds directories to");
+
+        let moved = root.join("moved");
+        std::fs::rename(&named, &moved).expect("the held directory is renamed");
+        assert_eq!(
+            flush_directory(&named, NameKind::File)
+                .expect_err("its old name reaches nothing")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        flush_held_directory(&held, NameKind::File)
+            .expect("the directory the handle holds is flushed wherever its name went");
+
+        let unshared = std::fs::OpenOptions::new()
+            .access_mode(FILE_LIST_DIRECTORY)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&moved)
+            .expect("a handle that shares no writing");
+        for kind in [NameKind::File, NameKind::Directory] {
+            let refused = flush_held_directory(&held, kind)
+                .expect_err("the second handle may add to the directory, which that one forbids");
+            assert_eq!(
+                refused.raw_os_error(),
+                Some(ERROR_SHARING_VIOLATION.cast_signed()),
+                "{kind:?}: {refused}"
+            );
+        }
+        drop(unshared);
+        flush_held_directory(&held, NameKind::File).expect("and with it gone, the flush is made");
+        drop(held);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The second handle is flushed by the operating system, which refuses a handle that may not
+    /// write and flushes through one that may add a file.
+    #[cfg(windows)]
+    #[test]
+    fn the_held_flush_is_asked_of_the_operating_system() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use std::os::windows::io::AsHandle as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ADD_FILE, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
+        };
+
+        let root = temporary_root("flush-held-asked");
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&root)
+            .expect("the directory is held open");
+        let reading = super::windows::reopen_directory(held.as_handle(), FILE_READ_ATTRIBUTES)
+            .expect("the directory opens again with the right to read its attributes");
+        assert_eq!(
+            reading
+                .sync_all()
+                .expect_err("a flush through a handle that may not write")
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        super::windows::reopen_directory(held.as_handle(), FILE_ADD_FILE)
+            .expect("the directory opens again with the right to add a file")
+            .sync_all()
+            .expect("and through that handle the flush is made");
+        drop((reading, held));
         std::fs::remove_dir_all(&root).ok();
     }
 
