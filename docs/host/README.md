@@ -171,7 +171,7 @@ an older build read joins nothing because of them.
 | `network.relay_only` | every packet through the relay, and no direct path | `true` or `false`; `true` needs at least one relay |
 | `network.local_discovery` | discovery of peers on the local network | `true` or `false` |
 | `network.mainline_dht` | the public Mainline DHT, which carries no KalaReach service guarantee | `true` or `false` |
-| `network.proxy_url` | the HTTP proxy the endpoint reaches its relays and Pkarr servers through; the DNS lookup does not use it, and absent reaches them directly | an absolute `http` or `https` origin, with no user information, no path and no trailing slash |
+| `network.proxy_url` | the HTTP proxy this host's outbound HTTPS goes through: the endpoint's relays and Pkarr servers, the rendezvous, delivery and webhooks, and plugin repositories; name lookups and mail submission do not use it, and absent everything goes directly | an absolute `http` or `https` origin, with no user information, no path and no trailing slash |
 | `voice.broker_origin` | the managed broker a device's voice session talks to | an absolute `https` or `http` origin in lower case, with no path and no port its scheme already implies |
 
 A field the document does not write selects nothing, because there is no public relay or discovery
@@ -188,9 +188,17 @@ the document accepts is therefore one the endpoint accepts. A value outside thes
 whole document invalid, as it would in any other section: the host keeps its product defaults,
 `kr doctor` names the key and withholds the value, and an edit to another section is refused until
 the document is fixed. The proxy is this machine's own choice, and no invitation or host bundle
-carries it. Without one, the endpoint reaches its relays and Pkarr servers directly, apart from
-iroh's relay latency probe and captive-portal check, which then follow `HTTP_PROXY`, `HTTPS_PROXY`
-and `ALL_PROXY` when those are set.
+carries it.
+
+One rule covers the proxy. Every outbound HTTPS connection this host makes goes through it when the
+document names one: the endpoint's relays and Pkarr servers, the rendezvous it reserves a code's
+locator at and opens the room at, delivery to the push gateway and to webhook addresses, and plugin
+repositories. Nothing goes around it, so an address the proxy cannot reach fails, a webhook
+included. Mail submission is SMTP and connects directly, and name lookups go directly too. Without
+a proxy every one of those connections goes directly, apart from iroh's relay latency probe and
+captive-portal check, which then follow `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` when those are
+set. The daemon reads the proxy when it starts, like the rest of the section, and every client takes
+that one reading.
 
 The daemon reads both sections once, when it starts, because that is when its endpoint and its
 voice service are built. `kr doctor` prints each field with its value, its source
@@ -386,19 +394,23 @@ No other inherited variable takes part in the precedence. No entry in that table
 organisation restriction, a grant ceiling, a hard resource limit or a provider origin, and none can:
 each entry has to name an ordinary preference, and those are not.
 
-Two other groups of variables this build reads are outside the precedence, and `kr doctor` lists
-all of them rather than leaving the sentence above to be read as more than it says.
+Three other groups of variables this build reads are outside the precedence, and `kr doctor` lists
+those set here rather than leaving the sentence above to be read as more than it says.
 
 | Group | Variables | What they select |
 | --- | --- | --- |
 | platform locations | `TMPDIR`, `XDG_RUNTIME_DIR`, `XDG_STATE_HOME`, `XDG_CONFIG_HOME`, `HOME`, `LOCALAPPDATA` | the operating system's own conventional directories, which is what the native locations above are derived from |
 | session readings | `PATH`, `DISPLAY`, `XAUTHORITY`, `XDG_SESSION_ID`, `SESSIONNAME` | what the platform says about the login this host is running in and where a capability probe looks for the tools it reports on |
+| network library | `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` and their lower-case spellings, `REQUEST_METHOD`, `SystemRoot` | with no `network.proxy_url`, the proxy iroh's relay latency probe and captive-portal check go through; and on Windows where the endpoint reads the hosts file. iroh reads these itself and offers no way not to |
 
-Neither group reaches authority or a provider origin. No variable selects a network service or the
-voice broker: those are provider origins and a trust decision, and they are the configuration
-document's `network` and `voice` sections. No variable names this host's owner either: the owner is
-recorded through local IPC, by the pairing that establishes it (see "Pairing and the host's owner"
-below).
+No group reaches authority, a provider origin or whom this host trusts. The network library's
+variables move where two relay checks and a lookup go; they choose no relay, no service and no
+trust. No variable selects a network service, the proxy or the voice broker: those are the
+configuration document's `network` and `voice` sections. Certificates are verified against the
+platform's own store, and `SSL_CERT_FILE` and `SSL_CERT_DIR` are not read, so an authority given
+only through them is not trusted until it is installed in the system store; `kr doctor` says so.
+No variable names this host's owner either: the owner is recorded through local IPC, by the pairing
+that establishes it (see "Pairing and the host's owner" below).
 
 ### Ceilings
 
