@@ -421,8 +421,8 @@ jobs:
       # independent process it must be; the executable, run directly, is not inside that job, and the
       # worker starts. Three of those tests are held back, named at their step: two need the worker's
       # rendezvous to complete on this platform, which it does not yet, and one uses a POSIX shell
-      # binary this platform has not got. `docs/host/README.md` and the task's records carry the
-      # evidence.
+      # binary this platform has not got. Each gives its reason in its ignore attribute in
+      # `crates/kr-worker/tests/host.rs`.
       #
       # What this runner cannot do at all is qualify a console interactively. The pseudo-console
       # tests open a console of their own and drive it, which works here; what needs a real machine
@@ -614,7 +614,8 @@ jobs:
       # does not kill on close, so no breakaway is asked for. Three are held back: two need the
       # worker's rendezvous to complete on this platform, which it does not yet (the worker does not
       # report itself in time), and one places a POSIX `/bin/cat` as a stand-in shell binary, which
-      # this platform has not got; `docs/host/README.md` and the task's records name them.
+      # this platform has not got. Each gives its reason in its ignore attribute in
+      # `crates/kr-worker/tests/host.rs`.
       - name: The real-worker host tests, from the built executable
         if: ${{ !cancelled() }}
         run: |
