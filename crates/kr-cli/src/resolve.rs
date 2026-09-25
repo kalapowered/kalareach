@@ -219,16 +219,44 @@ pub const SETUP_ACTION: &str = "start the control daemon, kr-controller, for it"
 
 /// Connects to the control daemon.
 ///
+/// The connection and its hello together are given [`crate::startup::ANSWER_BOUND`], the time
+/// `kr new` gives a daemon that is already listening, so a daemon that takes the connection and
+/// never answers holds the command no longer than that.
+///
 /// # Errors
 ///
 /// Returns [`CliError::HostUnavailable`] when no daemon is listening. Its message names what the
 /// person has to do about it, because a failure that only says what is missing leaves the setup
-/// to be guessed.
+/// to be guessed. Returns [`CliError::Unfinished`] with `ENVIRONMENT_UNAVAILABLE` when a daemon
+/// took the connection and did not answer within the bound.
 pub async fn open_controller(paths: &EnvironmentPaths, build_id: BuildId) -> Result<LocalClient> {
+    open_controller_within(paths, build_id, crate::startup::ANSWER_BOUND).await
+}
+
+/// Connects to the control daemon, the connection and its hello together bounded by `bound`.
+async fn open_controller_within(
+    paths: &EnvironmentPaths,
+    build_id: BuildId,
+    bound: std::time::Duration,
+) -> Result<LocalClient> {
     let endpoint = paths.controller_endpoint()?;
-    LocalClient::connect(&endpoint, LocalClientKind::Cli, build_id)
-        .await
-        .map_err(|error| not_running(&error, SETUP_ACTION))
+    match tokio::time::timeout(
+        bound,
+        LocalClient::connect(&endpoint, LocalClientKind::Cli, build_id),
+    )
+    .await
+    {
+        Ok(connected) => connected.map_err(|error| not_running(&error, SETUP_ACTION)),
+        Err(_) => Err(CliError::Unfinished {
+            code: ErrorCode::EnvironmentUnavailable,
+            message: format!(
+                "the control daemon listening for environment {} accepted the connection and did \
+                 not answer within {} seconds",
+                paths.environment_id(),
+                bound.as_secs_f64()
+            ),
+        }),
+    }
 }
 
 /// The failure a command that needs a control daemon is given when none answers: what went wrong,
@@ -468,5 +496,39 @@ mod tests {
             .expect("the identifier says which");
         assert_eq!(known.environment_id, first);
         assert_eq!(descriptor.session_id, in_first);
+    }
+
+    /// A daemon that takes the connection and never answers its hello holds a command for no
+    /// longer than the bound, and the failure says what happened.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_daemon_that_never_answers_its_hello_is_waited_for_no_longer_than_the_bound() {
+        let host = kr_ipc::testing::TempHost::create();
+        let environment = host.environment();
+        // Bound and never accepted from: the connection is taken, and nothing ever answers it.
+        let _listening = kr_ipc::endpoint::Listener::bind(
+            &environment.controller_endpoint().expect("an endpoint"),
+        )
+        .expect("binds the endpoint");
+        let bound = std::time::Duration::from_millis(300);
+        let patience = std::time::Duration::from_secs(30);
+        let Ok(opened) = tokio::time::timeout(
+            patience,
+            open_controller_within(&environment, crate::build_id(), bound),
+        )
+        .await
+        else {
+            panic!("the connection was still waiting for a hello after {patience:?}");
+        };
+        let refused = opened.map(|_| ()).expect_err("nothing answered");
+        assert_eq!(refused.code(), "ENVIRONMENT_UNAVAILABLE", "{refused}");
+        assert!(
+            refused.to_string().contains(&format!(
+                "the control daemon listening for environment {} accepted the connection and did \
+                 not answer within 0.3 seconds",
+                host.environment_id()
+            )),
+            "{refused}"
+        );
     }
 }
