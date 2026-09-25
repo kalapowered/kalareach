@@ -6,14 +6,18 @@
 //! asks for, the name says what it does establish and the comment says what is left.
 
 use kr_plugin_sdk::capability::PluginCapability;
+use kr_plugin_sdk::effect::ActionDeclaration;
 use kr_protocol::agent::{
     AgentApprovalRespondParams, AgentApprovalRespondResult, AgentMutationTarget,
+    PluginActionInvokeParams,
 };
+use kr_protocol::authority::EffectClass;
 use kr_protocol::broker::{
     ActionName, ActionProvenance, ActionTokenClaim, AuthenticationState, BinaryIdentity,
     BrokerGrant, BrokerGrants, DecodedProjection, DecodingTrust, InstanceCapabilityIdentity,
     InstanceCapabilityRecord, InstanceCapabilityState, InstanceEvidenceSource,
     InstanceInvalidation, IntegrationMode, LaunchProfile, LaunchRefusal, OfferedDecision,
+    PreparedEffect, PreparedOperation,
 };
 use kr_protocol::gateway::{
     DeclarativeEntry, DeclarativeTable, DownstreamRequestId, NativeFraming, NativeMethodClass,
@@ -27,7 +31,7 @@ use kr_protocol::ids::{
     StreamCursor, UpstreamMethod, UpstreamRequestId,
 };
 use kr_protocol::rights::ActionRight;
-use kr_protocol::scalars::{CanonicalSet, Digest256, Nullable, TimestampMs, U64, Uuid};
+use kr_protocol::scalars::{Bytes, CanonicalSet, Digest256, Nullable, TimestampMs, U64, Uuid};
 #[cfg(unix)]
 use kr_worker::broker::InstanceEnding;
 use kr_worker::broker::bridge::BridgeProcess;
@@ -35,8 +39,8 @@ use kr_worker::broker::connectors::{DECISION_SCHEMA, InstalledConnector, decodin
 use kr_worker::broker::{
     Broker, BrokerError, BrokerTransport, Caller, Credential, ForegroundMark, Invocation, Ledger,
     ManagedProcess, MutationAdmission, PackageIdentity, PendingTransmission, Probe, ReconcileScope,
-    TransportHandle, UpstreamArrival, UpstreamBody, UpstreamDispatch, UpstreamOutcome,
-    UpstreamRequest, subject,
+    RegisteredAction, TransportHandle, UpstreamArrival, UpstreamBody, UpstreamDispatch,
+    UpstreamOutcome, UpstreamRequest, subject,
 };
 use kr_worker::persistence::JournalHealth;
 
@@ -290,6 +294,57 @@ fn component_schema() -> String {
 /// The method a Claude Code channel relays a tool approval as.
 fn channel_permission_method() -> UpstreamMethod {
     UpstreamMethod::new("notifications/claude/channel/permission_request").expect("valid")
+}
+
+/// The application's own channel for instance 2, opened for one connector.
+fn open_channel(broker: &Broker, connector: &InstalledConnector) -> GatewayConnectionId {
+    broker
+        .open_bridge_channel(
+            instance(2),
+            &BridgeProcess {
+                identity: process_identity(43, 902),
+                starter: Some(process_identity(41, 900)),
+                started: None,
+            },
+            connector,
+            Some(fixture::QUALIFIED_VERSION),
+        )
+        .expect("the application's own channel is opened")
+}
+
+/// Relays one tool approval on a channel, as the forwarder does, and returns what the broker
+/// recorded for it.
+fn relay(
+    broker: &Broker,
+    connection: GatewayConnectionId,
+    request_id: &str,
+    now: u64,
+) -> PendingResource {
+    let frame = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": channel_permission_method().as_str(),
+        "params": {
+            "request_id": request_id,
+            "tool_name": "Bash",
+            "description": "List the files here",
+            "input_preview": "ls -la",
+        },
+    })
+    .to_string();
+    let Ok(UpstreamArrival::Forward {
+        resource: Some(relayed),
+        ..
+    }) = broker.receive_upstream(
+        connection,
+        frame.as_bytes(),
+        EnvironmentId::new(Uuid::from_bytes([7; 16])),
+        "person",
+        TimestampMs::new(now),
+    )
+    else {
+        panic!("the relayed approval is recorded");
+    };
+    relayed
 }
 
 /// Binds a transport on the suite's connection, as its owner does when it serves one.
@@ -1248,42 +1303,8 @@ fn kr_req_11_26_on_a_live_connection_only_the_recording_packages_decoder_interpr
             TimestampMs::new(1),
         )
         .expect("another package is bound, trusted for the same method");
-    let connection = broker
-        .open_bridge_channel(
-            instance(2),
-            &BridgeProcess {
-                identity: process_identity(43, 902),
-                starter: Some(process_identity(41, 900)),
-                started: None,
-            },
-            &connector,
-            Some(fixture::QUALIFIED_VERSION),
-        )
-        .expect("the application's own channel is opened");
-    let frame = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": channel_permission_method().as_str(),
-        "params": {
-            "request_id": "abcde",
-            "tool_name": "Bash",
-            "description": "List the files here",
-            "input_preview": "ls -la",
-        },
-    })
-    .to_string();
-    let Ok(UpstreamArrival::Forward {
-        resource: Some(relayed),
-        ..
-    }) = broker.receive_upstream(
-        connection,
-        frame.as_bytes(),
-        EnvironmentId::new(Uuid::from_bytes([7; 16])),
-        "person",
-        TimestampMs::new(2),
-    )
-    else {
-        panic!("the relayed approval is recorded");
-    };
+    let connection = open_channel(&broker, &connector);
+    let relayed = relay(&broker, connection, "abcde", 2);
     let refusal = broker
         .interpret(
             binding(10),
@@ -1485,6 +1506,371 @@ fn kr_req_11_25_withdrawing_a_grant_narrows_a_component_packages_trust_where_it_
     assert!(recorded().trust.is_none());
     drop(broker);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// One action declaration, as a package's manifest writes it.
+fn declaration(
+    id: &str,
+    label: &str,
+    effect: &str,
+    implementation: serde_json::Value,
+) -> ActionDeclaration {
+    serde_json::from_value(serde_json::json!({
+        "id": id,
+        "label": label,
+        "effect": effect,
+        "implementation": implementation,
+        "parameters": { "parameters": [] },
+        "description": format!("{label}, as the package declares it"),
+        "confirmation_required": false,
+    }))
+    .expect("a declaration the manifest format reads")
+}
+
+/// A component's own implementation, which prepares a plan and sends nothing.
+fn by_component() -> serde_json::Value {
+    serde_json::json!({ "type": "component" })
+}
+
+/// Records that instance 2's upstream takes a prompt, as a probe would.
+fn prompts_work(broker: &Broker) {
+    broker
+        .record_capability(evidence(
+            "agent.prompt",
+            InstanceCapabilityState::QualifiedAvailable,
+            InstanceInvalidation::BindingChanged,
+            instance(2),
+        ))
+        .expect("the evidence is recorded");
+}
+
+/// One `plugin.action.invoke` of one package's action on instance 2, with no parameters.
+fn invocation_of(plugin_id: PluginId, action: &str) -> PluginActionInvokeParams {
+    PluginActionInvokeParams {
+        target: AgentMutationTarget {
+            subject: subject(session(), instance(2)),
+            binding_revision: AgentBindingRevision::new(1),
+        },
+        plugin_id,
+        action: ActionName::new(action).expect("valid"),
+        draft_id: Nullable::null(),
+        resource_id: Nullable::null(),
+        parameters: Bytes::from(b"{}".to_vec()),
+    }
+}
+
+/// The digest of the arguments an invocation of [`invocation_of`] executes with.
+fn no_arguments() -> Digest256 {
+    Digest256::from_bytes(kr_cbor::sha256(b"{}"))
+}
+
+/// A component package's channel with one relayed approval that the package's decoder
+/// interpreted as its component does, against the component's own projection schema, with the
+/// package's actions registered and a transport bound to carry an answer.
+fn component_decoded(connector: &InstalledConnector) -> (Broker, PendingResourceId) {
+    let package = connector.package().clone();
+    let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
+    broker
+        .register_instance(
+            instance(2),
+            IntegrationMode::NativeBridge,
+            None,
+            Some(managed(instance(2), false)),
+        )
+        .expect("the launched instance is registered");
+    broker
+        .bind(
+            binding(9),
+            instance(2),
+            package.plugin_id.clone(),
+            package.publisher_id.clone(),
+            package.package_digest,
+            BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
+            decoding_trust(connector, TimestampMs::new(1)),
+            TimestampMs::new(1),
+        )
+        .expect("the package is bound with its trust");
+    broker
+        .register_actions(
+            binding(9),
+            connector
+                .manifest()
+                .actions
+                .iter()
+                .filter_map(|declared| RegisteredAction::from_declaration(declared).ok()),
+        )
+        .expect("its actions are registered");
+    let connection = open_channel(&broker, connector);
+    let relayed = relay(&broker, connection, "abcde", 2);
+    broker.note_relayed_approval(connection, TimestampMs::new(2));
+    broker
+        .interpret(
+            binding(9),
+            relayed.resource_id,
+            DecodedProjection {
+                schema_version: component_schema(),
+                summary: "Bash wants to list the files here".to_owned(),
+                decisions: connector.offered_decisions(),
+            },
+            None,
+            TimestampMs::new(3),
+        )
+        .expect("the component's interpretation is accepted");
+    broker.bind_connection_dispatch(
+        connection,
+        std::sync::Arc::new(RecordingUpstream::default()) as _,
+    );
+    (broker, relayed.resource_id)
+}
+
+/// KR-REQ-11.47: an action's effect class is the class it declares, and a label cannot change it.
+/// Two `upstream.prompt` declarations, one labelled "Preview (read only)" and one "Send", register
+/// alike: a write that needs the upstream-action grant and the prompt capability and prepares a
+/// submission. An answer labelled as a read registers as the answer it declares. A binding that
+/// holds observation alone is refused the prompt whose label reads as a read, and a read is refused
+/// on the write path whatever its own label says.
+#[test]
+fn kr_req_11_47_a_label_that_reads_as_a_read_registers_as_its_declared_class() {
+    let preview = RegisteredAction::from_declaration(&declaration(
+        "prompt.preview",
+        "Preview (read only)",
+        "upstream.prompt",
+        by_component(),
+    ))
+    .expect("an upstream.prompt declaration registers");
+    let send = RegisteredAction::from_declaration(&declaration(
+        "prompt.send",
+        "Send",
+        "upstream.prompt",
+        by_component(),
+    ))
+    .expect("an upstream.prompt declaration registers");
+    assert_eq!(
+        RegisteredAction {
+            name: send.name.clone(),
+            ..preview.clone()
+        },
+        send,
+        "the two register alike but for their names"
+    );
+    assert_eq!(preview.grant, BrokerGrant::UpstreamAction);
+    assert_eq!(preview.effect, EffectClass::Write);
+    assert_eq!(preview.capability, Some(capability("agent.prompt")));
+    assert_eq!(preview.operation, Some(PreparedOperation::UpstreamSubmit));
+    let answer = RegisteredAction::from_declaration(&declaration(
+        "request.view",
+        "View details (read only)",
+        "approval.respond",
+        serde_json::json!({ "type": "decision_destination", "decision": "decision" }),
+    ))
+    .expect("an approval.respond declaration registers");
+    assert_eq!(answer.grant, BrokerGrant::ApprovalInterpreter);
+    assert_eq!(answer.effect, EffectClass::Write);
+    assert_eq!(answer.capability, Some(capability("agent.approval")));
+    assert_eq!(
+        answer.decision.as_ref().map(|decision| decision.as_str()),
+        Some("decision"),
+        "an answer, whatever it is called"
+    );
+
+    let broker = broker_with(BrokerGrants::granted([BrokerGrant::Observation]), None);
+    prompts_work(&broker);
+    let read = RegisteredAction::from_declaration(&declaration(
+        "conversation.read",
+        "Send now",
+        "observe",
+        serde_json::json!({ "type": "presentation" }),
+    ))
+    .expect("an observe declaration registers");
+    broker
+        .register_actions(binding(9), [preview, read])
+        .expect("the actions are registered");
+    let refusal = broker
+        .admit_plugin_action(
+            &caller("device-1"),
+            binding(9),
+            &invocation_of(package(), "prompt.preview"),
+            TimestampMs::new(2),
+        )
+        .expect_err("an observation-only binding is refused a write, whatever it is called");
+    assert!(matches!(refusal, BrokerError::Grant(_)), "{refusal}");
+    let refusal = broker
+        .admit_plugin_action(
+            &caller("device-1"),
+            binding(9),
+            &invocation_of(package(), "conversation.read"),
+            TimestampMs::new(3),
+        )
+        .expect_err("a read is not taken on the write path, whatever its label says");
+    assert!(
+        matches!(refusal, BrokerError::InvalidArgument { .. }),
+        "{refusal}"
+    );
+}
+
+/// KR-REQ-11.47: a component's plan is checked against the class its action declared. A plan for
+/// an `upstream.prompt` action that prepares a cancellation, an attachment or terminal text, or
+/// that calls its submission a read, is refused when its token is spent, and nothing is carried
+/// for it; the submission the class declares is validated.
+#[test]
+fn kr_req_11_47_a_plan_whose_operation_is_another_class_is_refused_at_the_spend() {
+    let (broker, upstream) =
+        broker_recording(BrokerGrants::granted([BrokerGrant::UpstreamAction]), None);
+    prompts_work(&broker);
+    broker
+        .register_actions(
+            binding(9),
+            [RegisteredAction::from_declaration(&declaration(
+                "prompt.send",
+                "Send",
+                "upstream.prompt",
+                by_component(),
+            ))
+            .expect("an upstream.prompt declaration registers")],
+        )
+        .expect("the action is registered");
+    let plan = |class: EffectClass, operation: PreparedOperation| PreparedEffect {
+        action: ActionName::new("prompt.send").expect("valid"),
+        class,
+        operation,
+        draft_id: Nullable::null(),
+        argument_hash: no_arguments(),
+    };
+    for (at, class, operation, what) in [
+        (
+            2,
+            EffectClass::Write,
+            PreparedOperation::UpstreamCancel,
+            "a cancellation",
+        ),
+        (
+            3,
+            EffectClass::Write,
+            PreparedOperation::UpstreamAttachment,
+            "an attachment",
+        ),
+        (
+            4,
+            EffectClass::Write,
+            PreparedOperation::TerminalText,
+            "terminal text",
+        ),
+        (
+            5,
+            EffectClass::Read,
+            PreparedOperation::UpstreamSubmit,
+            "a submission called a read",
+        ),
+    ] {
+        let admitted = broker
+            .admit_plugin_action(
+                &caller("device-1"),
+                binding(9),
+                &invocation_of(package(), "prompt.send"),
+                TimestampMs::new(at),
+            )
+            .expect("the invocation is admitted");
+        let refusal = broker
+            .validate_effect(&admitted, &plan(class, operation))
+            .expect_err(what);
+        assert!(
+            matches!(refusal, BrokerError::InvalidArgument { .. }),
+            "{what}: {refusal}"
+        );
+        assert!(
+            broker
+                .record_plugin_action(&admitted, TimestampMs::new(at))
+                .is_err(),
+            "{what}: a plan nobody validated is not carried"
+        );
+        broker.abandon(&admitted);
+    }
+    assert!(upstream.submitted().is_empty(), "nothing was carried");
+
+    let admitted = broker
+        .admit_plugin_action(
+            &caller("device-1"),
+            binding(9),
+            &invocation_of(package(), "prompt.send"),
+            TimestampMs::new(10),
+        )
+        .expect("the invocation is admitted");
+    broker
+        .validate_effect(
+            &admitted,
+            &plan(EffectClass::Write, PreparedOperation::UpstreamSubmit),
+        )
+        .expect("the submission its class declares is validated");
+    assert!(admitted.carries_a_validated_plan());
+}
+
+/// KR-REQ-11.47: an answer to a request a component decoded is an `approval.respond`, and it is
+/// admitted only while that decoder may encode one. It is admitted while the installation grants
+/// both `approval.decode` and `approval.respond`; once either leaves, an answer is refused before
+/// any claim, whether it comes as `agent.approval.respond` or as the package's own answer action,
+/// and the request stays pending for the native client.
+#[test]
+fn kr_req_11_47_an_answer_to_a_component_decoded_request_needs_its_decoder_to_encode() {
+    for narrowing in ["approval.respond", "approval.decode"] {
+        let root = package_store();
+        let connector = claude_code(&root, true, &[]);
+        let (broker, relayed) = component_decoded(&connector);
+        let admitted = broker
+            .admit_approval(
+                &caller("device-1"),
+                &respond(relayed, "allow"),
+                TimestampMs::new(4),
+            )
+            .expect("an answer is admitted while its decoder may encode one");
+        broker.abandon(&admitted);
+        assert_eq!(
+            broker.pending(relayed).expect("held").state,
+            PendingState::Pending,
+            "and given back"
+        );
+
+        match narrowing {
+            "approval.respond" => broker.withdraw_answering(binding(9)),
+            _ => broker.withdraw_grant(binding(9), BrokerGrant::ApprovalInterpreter),
+        }
+        .expect("the installation's grants narrow");
+        let refusal = broker
+            .admit_approval(
+                &caller("device-1"),
+                &respond(relayed, "allow"),
+                TimestampMs::new(5),
+            )
+            .expect_err(narrowing);
+        assert!(
+            matches!(refusal, BrokerError::PermissionDenied { .. }),
+            "{narrowing}: {refusal}"
+        );
+        let refusal = broker
+            .admit_plugin_answer(
+                &caller("device-1"),
+                binding(9),
+                &PluginActionInvokeParams {
+                    resource_id: Nullable::some(relayed),
+                    parameters: Bytes::from(br#"{"decision":"allow"}"#.to_vec()),
+                    ..invocation_of(connector.plugin_id(), "approval.answer")
+                },
+                TimestampMs::new(6),
+            )
+            .expect_err(narrowing);
+        assert!(
+            matches!(
+                refusal,
+                BrokerError::PermissionDenied { .. } | BrokerError::Grant(_)
+            ),
+            "{narrowing}: {refusal}"
+        );
+        assert_eq!(
+            broker.pending(relayed).expect("held").state,
+            PendingState::Pending,
+            "{narrowing}: refused before any claim"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 /// KR-REQ-11.27: a transport that panics as it takes an answer, in a host that goes on running,
