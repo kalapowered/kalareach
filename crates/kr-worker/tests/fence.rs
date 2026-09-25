@@ -2022,9 +2022,12 @@ async fn asks_the_real_worker_before_each_command(
         // finishing are typeahead, which the worker cannot attribute to anyone. Even at the
         // prompt, the publication travels on the bridge's socket and the keys on the terminal, and
         // nothing orders the two, so a line typed as the fence is published can still be accepted
-        // ahead of it. What the worker recorded for the line says which happened: a line it
-        // recorded as fenced must carry its capability, and one accepted ahead of the fence is let
-        // finish and typed again at the next prompt, a bounded number of times.
+        // ahead of it; and a shell that had no answer within its deadline runs the line without
+        // its capability, which is how it keeps a command from waiting on the worker. What the
+        // worker recorded for the line, and what the shell traced, say which happened: a line
+        // the worker recorded as fenced and the shell had its answer for must carry its
+        // capability, and any other is let finish and typed again at the next prompt, a bounded
+        // number of times.
         const ATTEMPTS: usize = 5;
         let mut previous = sourced;
         let mut attempt = 0;
@@ -2033,15 +2036,40 @@ async fn asks_the_real_worker_before_each_command(
             back_at_the_prompt(&shell, &probes, &previous).await;
             probes.hold();
             let before = probes.runs().len();
+            // The bridge reports a line's acceptance before its block, on one connection, and the
+            // worker takes them in that order. Once the worker holds a running block for this line
+            // at a newer prompt than the line before, what it recorded about the acceptance is
+            // about this line, whether or not the shell had the answer in time.
+            let earlier = shell
+                .runtime
+                .session()
+                .last_command_block()
+                .map(|block| block.prompt_generation.0.get());
             keys.type_line(&shell, "kr-probe hold");
-            let token = tokio::time::timeout(Duration::from_secs(30), async {
+            let (token, fenced) = tokio::time::timeout(Duration::from_secs(30), async {
+                let mut started = None;
                 loop {
-                    let runs = probes.runs();
-                    if runs.len() > before
-                        && let Some((arguments, environment)) = runs.last()
-                        && arguments.first().map(String::as_str) == Some("hold")
-                    {
-                        return environment.get("KR_DETACH_TOKEN").cloned();
+                    if started.is_none() {
+                        let runs = probes.runs();
+                        if runs.len() > before
+                            && let Some((arguments, environment)) = runs.last()
+                            && arguments.first().map(String::as_str) == Some("hold")
+                        {
+                            started = Some(environment.get("KR_DETACH_TOKEN").cloned());
+                        }
+                    }
+                    if let Some(token) = &started {
+                        let session = shell.runtime.session();
+                        if let Some(block) = session.last_command_block()
+                            && block.command == "kr-probe hold"
+                            && !block.finished()
+                            && earlier
+                                .is_none_or(|earlier| block.prompt_generation.0.get() > earlier)
+                        {
+                            let fenced = session.fence().expect("a driver").detach_target()
+                                == DetachTarget::Attachment(keys.attachment_id);
+                            return (token.clone(), fenced);
+                        }
                     }
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
@@ -2049,25 +2077,31 @@ async fn asks_the_real_worker_before_each_command(
             .await
             .unwrap_or_else(|_| {
                 panic!(
-                    "the held command started ({:?}, {bypass}, attempt {attempt}): {}",
+                    "the held command started and the worker has its block ({:?}, {bypass}, \
+                     attempt {attempt}): {}",
                     package.kind(),
                     probes.trace()
                 )
             });
-            let fenced = shell
-                .runtime
-                .session()
-                .fence()
-                .expect("a driver")
-                .detach_target()
-                == DetachTarget::Attachment(keys.attachment_id);
+            // The shell's own word for the line it just accepted, which is its last.
+            let answered = probes
+                .trace()
+                .lines()
+                .rev()
+                .find(|line| line.starts_with("line ") && line.contains(": "))
+                .is_some_and(|line| !line.ends_with("no answer, so no capability"));
             match token {
                 Some(token) => break token,
-                None if !fenced && attempt < ATTEMPTS => {
+                None if (!fenced || !answered) && attempt < ATTEMPTS => {
                     eprintln!(
-                        "the {:?} package's held line was accepted ahead of its fence on attempt \
-                         {attempt}, so it is typed again at the next prompt",
-                        package.kind()
+                        "the {:?} package's held line was {} on attempt {attempt}, so it is \
+                         typed again at the next prompt",
+                        package.kind(),
+                        if fenced {
+                            "answered after the shell's deadline"
+                        } else {
+                            "accepted ahead of its fence"
+                        }
                     );
                     probes.release();
                     printed += 1;
@@ -2076,9 +2110,11 @@ async fn asks_the_real_worker_before_each_command(
                 }
                 None => panic!(
                     "the {:?} package started the command with its line's capability ({bypass}, \
-                     attempt {attempt}, the line {} through the fence): {}",
+                     attempt {attempt}, the line {} through the fence and the shell {} its \
+                     answer): {}",
                     package.kind(),
                     if fenced { "went" } else { "did not go" },
+                    if answered { "had" } else { "did not have" },
                     probes.trace()
                 ),
             }
