@@ -42,6 +42,7 @@ import type {
 import type { AccountView, UsageView } from '../model/account'
 import type {
   ApprovedLink,
+  ConnectionState,
   DroppedFile,
   HostEvent,
   HostPort,
@@ -190,6 +191,11 @@ export interface FakeHostControls {
   changePromptGeneration(): void
   /** Marks the host as unreachable, or reachable again. */
   setConnected(connected: boolean): void
+  /**
+   * Holds the answer to every connection state read from now on, as a slow backend would, until
+   * the returned function is called. Each answer is the state when it was read.
+   */
+  holdConnectionState(): () => void
   /** Hands the window a set of dropped files. */
   dropFiles(files: readonly DroppedFile[]): void
   /** What the interface asked the platform to save, in order. */
@@ -267,9 +273,9 @@ export interface FakeHostControls {
   /** The references the page asked to review, in order. */
   readonly reviewed: string[]
   /**
-   * Holds every pairing and confirmations listener the page registers from now on, as the desktop
-   * shell's registration does until it completes: nothing published meanwhile reaches it. Returns
-   * the function that completes the registrations.
+   * Holds every listener the page registers from now on (pairing, confirmations, the connection
+   * and host events), as the desktop shell's registration does until it completes: nothing
+   * published meanwhile reaches it. Returns the function that completes the registrations.
    */
   holdRegistrations(): () => void
 }
@@ -307,6 +313,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
   let reviewOutcome: ReviewOutcome = 'confirmed'
   const reviewed: string[] = []
   let registering: Promise<void> = Promise.resolve()
+  let holding = false
   /** Adds `listener` to `set` once registration completes, and resolves then with its stop. */
   const register = <T,>(
     set: Set<(value: T) => void>,
@@ -376,14 +383,20 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
   const emit = (event: HostEvent) => {
     for (const listener of listeners) listener(event)
   }
+  const connectionNow = (): ConnectionState => ({
+    connected,
+    environment_id: connected ? ENVIRONMENT : null,
+    reason: connected ? null : 'this host cannot be contacted right now'
+  })
+  const connectionListeners = new Set<(state: ConnectionState) => void>()
+  let stateHeld: Promise<void> | null = null
 
   const port: HostPort = {
-    connectionState: () =>
-      Promise.resolve({
-        connected,
-        environment_id: connected ? ENVIRONMENT : null,
-        reason: connected ? null : 'this host cannot be contacted right now'
-      }),
+    connectionState: () => {
+      const state = connectionNow()
+      return stateHeld === null ? Promise.resolve(state) : stateHeld.then(() => state)
+    },
+    onConnection: (listener) => register(connectionListeners, listener),
 
     environmentCapabilities: (params) => {
       requireConnection()
@@ -977,8 +990,18 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     },
 
     subscribe(listener) {
-      listeners.add(listener)
-      return () => listeners.delete(listener)
+      let stopped = false
+      const add = () => {
+        if (!stopped) listeners.add(listener)
+      }
+      // As the shell's: a listener registered while registrations are held hears nothing until
+      // they complete.
+      if (holding) void registering.then(add)
+      else add()
+      return () => {
+        stopped = true
+        listeners.delete(listener)
+      }
     },
     onFilesDropped(listener) {
       dropListeners.add(listener)
@@ -1030,6 +1053,17 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
         sequence: '0',
         body: { kind: 'connection', connected: next }
       })
+      for (const listener of connectionListeners) listener(connectionNow())
+    },
+    holdConnectionState() {
+      let release = () => {}
+      stateHeld = new Promise((resolve) => {
+        release = resolve
+      })
+      return () => {
+        release()
+        stateHeld = null
+      }
     },
     dropFiles(files) {
       for (const listener of dropListeners) listener(files)
@@ -1099,11 +1133,13 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     reviewed,
     holdRegistrations() {
       let complete = () => {}
+      holding = true
       registering = new Promise((resolve) => {
         complete = resolve
       })
       return () => {
         complete()
+        holding = false
         registering = Promise.resolve()
       }
     }

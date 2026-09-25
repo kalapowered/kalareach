@@ -18,7 +18,7 @@ import { Pairing } from './views/Pairing'
 import { Plugins } from './views/Plugins'
 import { Session } from './views/Session'
 import { Setup } from './setup/Setup'
-import { failureMessage } from './host/port'
+import { failureMessage, type ConnectionState } from './host/port'
 import { useConfirmations } from './pairing/Confirmations'
 
 const NAVIGATION: readonly { readonly place: Place; readonly label: string }[] = [
@@ -52,29 +52,40 @@ export function App(): ReactNode {
 
   useEffect(() => {
     let watching = true
+    let stop: (() => void) | null = null
+    // The state is read once the listener is registered, so no change can fall between the two.
+    // A change heard before the read answers is at least as new, so the read is let go then.
+    let heard = false
+    const show = (state: ConnectionState) => {
+      setConnected(state.connected)
+      setReason(state.reason)
+    }
     // A failure to answer is itself an answer: the window says it is not connected, and says why,
     // rather than leaving a rejected promise for nobody.
+    const failed = (failure: unknown) => {
+      if (!watching || heard) return
+      setConnected(false)
+      setReason(failureMessage(failure))
+    }
     port
-      .connectionState()
-      .then((state) => {
+      .onConnection((state) => {
         if (!watching) return
-        setConnected(state.connected)
-        setReason(state.reason)
+        heard = true
+        show(state)
       })
-      .catch((failure: unknown) => {
-        if (!watching) return
-        setConnected(false)
-        setReason(failureMessage(failure))
+      .then(async (unlisten) => {
+        if (!watching) {
+          unlisten()
+          return
+        }
+        stop = unlisten
+        const state = await port.connectionState()
+        if (watching && !heard) show(state)
       })
-    const stop = port.subscribe((event) => {
-      const body = event.body as { kind?: string; connected?: boolean }
-      if (body.kind === 'connection' && typeof body.connected === 'boolean') {
-        setConnected(body.connected)
-      }
-    })
+      .catch(failed)
     return () => {
       watching = false
-      stop()
+      stop?.()
     }
   }, [port])
 
