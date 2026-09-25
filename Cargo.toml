@@ -29,6 +29,7 @@ members = [
     "crates/kr-transport",
     "crates/kr-voice",
     "crates/kr-worker",
+    "tests/conformance",
     "tests/integration/sync",
 ]
 
