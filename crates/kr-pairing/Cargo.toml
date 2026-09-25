@@ -16,8 +16,10 @@ path = "src/bin/kr-pairing-vectors.rs"
 hex.workspace = true
 kr-cbor.workspace = true
 kr-crypto.workspace = true
-# The host's shared directory flush and its walk of a path, which the attempt budget's directory is
-# flushed through on every platform.
+# The host's shared directory flush, which the attempt budget's directory is flushed through on
+# every platform.
+kr-flush.workspace = true
+# The host's walk of a path, which flushes each directory the budget's path is made of.
 kr-ipc.workspace = true
 kr-protocol.workspace = true
 serde.workspace = true

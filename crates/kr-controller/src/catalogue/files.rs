@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use kr_ipc::paths::{NameKind, flush_directory};
+use kr_flush::{NameKind, flush_directory};
 use kr_protocol::scalars::Digest256;
 
 use crate::error::{ControllerError, Result};

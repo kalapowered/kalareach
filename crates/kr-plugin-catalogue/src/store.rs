@@ -53,7 +53,7 @@ use kr_plugin_sdk::plugin::PluginManifest;
 
 use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
 use cap_std::fs::{Dir, OpenOptions};
-use kr_ipc::paths::{NameKind, flush_held_directory};
+use kr_flush::{NameKind, flush_held_directory};
 
 use crate::authority::Permit;
 use crate::budget::{BudgetLedger, Resource, ResourceLimit, Stage};

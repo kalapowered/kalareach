@@ -59,7 +59,7 @@ use kr_crypto::backup::{
 use kr_crypto::kdf::RecoverySeed;
 use kr_crypto::keys::{AuthorisationKeyPair, StoredEnvelopeKeyPair};
 use kr_crypto::sign::{SigningTranscript, sign};
-use kr_ipc::paths::{NameKind, flush_directory};
+use kr_flush::{NameKind, flush_directory};
 use kr_protocol::archive::{
     BACKUP_PUBLICATION_DOMAIN, BACKUP_WRITER_DOMAIN, BackupGenerationPublication,
     BackupGenerationPublicationPayload, BackupWriterRecord, BackupWriterRecordPayload,

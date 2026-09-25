@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 cap-std.workspace = true
 kr-cbor.workspace = true
+kr-flush.workspace = true
 kr-ipc.workspace = true
 kr-project = { workspace = true }
 kr-protocol.workspace = true

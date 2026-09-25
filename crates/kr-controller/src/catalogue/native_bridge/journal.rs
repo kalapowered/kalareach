@@ -386,7 +386,7 @@ impl Journals {
     /// Returns [`ControllerError::Storage`] when it cannot be deleted.
     pub(super) fn delete(&self, plugin_id: &str) -> Result<()> {
         match std::fs::remove_file(self.path(plugin_id)) {
-            Ok(()) => files::sync_directory(&self.directory, kr_ipc::paths::NameKind::File),
+            Ok(()) => files::sync_directory(&self.directory, kr_flush::NameKind::File),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(files::storage(error)),
         }

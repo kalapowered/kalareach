@@ -19,7 +19,7 @@ futures.workspace = true
 jiff.workspace = true
 kr-crypto.workspace = true
 # The host's shared directory flush, through a handle the store already holds, on every platform.
-kr-ipc.workspace = true
+kr-flush.workspace = true
 kr-plugin-sdk.workspace = true
 kr-protocol.workspace = true
 # Reads a delegated role's name back out of the file the update client fetches its document from,
@@ -46,6 +46,8 @@ rustix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 aws-lc-rs.workspace = true
+# Identifiers a test makes for environments of its own.
+kr-ipc.workspace = true
 # The TLS provider a test's own repository client is built on; a host's comes with its trust.
 rustls.workspace = true
 tempfile.workspace = true

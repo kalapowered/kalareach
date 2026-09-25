@@ -293,7 +293,7 @@ fn a_handle_keeps_its_object_and_a_replaced_path_does_not_extend_the_grant() {
 #[cfg(windows)]
 #[test]
 fn a_name_is_not_reported_durable_while_its_directory_cannot_be_flushed() {
-    use kr_ipc::paths::NameKind;
+    use kr_flush::NameKind;
 
     let root = tempfile::tempdir().expect("a temporary directory");
     let authority =

@@ -18,7 +18,8 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use kr_ipc::paths::{EnvironmentPaths, NameKind};
+use kr_flush::NameKind;
+use kr_ipc::paths::EnvironmentPaths;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{ActorId, DraftId, DraftRevision, EnvironmentId, GrantId, TransferId};
 use kr_protocol::scalars::{Bytes, Digest256, Nullable, TimestampMs, U64, Uuid};
