@@ -1650,6 +1650,19 @@ fn conventions(tokens: &[Token], helpers: &BTreeSet<String>) -> Vec<(usize, Stri
         let declaration = uses
             .iter()
             .find(|declaration| declaration.from <= index && index < declaration.to);
+        // A macro invoked in a foreign block makes items of the module, which the reading does not
+        // see.
+        if levels.foreign[index]
+            && around.punct_after(1, '!')
+            && ['(', '[', '{']
+                .iter()
+                .any(|open| around.punct_after(2, *open))
+        {
+            found.push((
+                token.line,
+                format!("`{name}!` is a macro invoked in a foreign block, whose items are its module's own and which the reading does not see"),
+            ));
+        }
         if name == "mod" && !levels.module[index] && around.declares_a_module_file() {
             found.push((
                 token.line,
@@ -1677,10 +1690,12 @@ fn conventions(tokens: &[Token], helpers: &BTreeSet<String>) -> Vec<(usize, Stri
 }
 
 /// Where each token of a file stands: among a module's items (every group around it is the body of
-/// a `mod`), and directly inside an `enum`'s body.
+/// a `mod`), directly inside an `enum`'s body, and directly inside a foreign block (`extern "C" {`),
+/// whose items are its module's own.
 struct Levels {
     module: Vec<bool>,
     enum_body: Vec<bool>,
+    foreign: Vec<bool>,
 }
 
 fn levels(tokens: &[Token]) -> Levels {
@@ -1688,15 +1703,18 @@ fn levels(tokens: &[Token]) -> Levels {
     enum Group {
         Module,
         Enum,
+        Foreign,
         Other,
     }
     let enums = enum_bodies(tokens);
     let mut groups: Vec<Group> = Vec::new();
     let mut module = Vec::with_capacity(tokens.len());
     let mut enum_body = Vec::with_capacity(tokens.len());
+    let mut foreign = Vec::with_capacity(tokens.len());
     for (index, token) in tokens.iter().enumerate() {
         module.push(groups.iter().all(|group| *group == Group::Module));
         enum_body.push(groups.last() == Some(&Group::Enum));
+        foreign.push(groups.last() == Some(&Group::Foreign));
         match token.tok {
             Tok::Punct('(' | '[') => groups.push(Group::Other),
             Tok::Punct('{') => groups.push(
@@ -1707,6 +1725,13 @@ fn levels(tokens: &[Token]) -> Levels {
                     Group::Module
                 } else if enums.contains(&index) {
                     Group::Enum
+                } else if index >= 1
+                    && (tokens[index - 1].ident() == Some("extern")
+                        || (matches!(tokens[index - 1].tok, Tok::Str(..))
+                            && index >= 2
+                            && tokens[index - 2].ident() == Some("extern")))
+                {
+                    Group::Foreign
                 } else {
                     Group::Other
                 },
@@ -1717,7 +1742,11 @@ fn levels(tokens: &[Token]) -> Levels {
             _ => {}
         }
     }
-    Levels { module, enum_body }
+    Levels {
+        module,
+        enum_body,
+        foreign,
+    }
 }
 
 /// Where each `enum`'s body opens: after `enum` and its name, however a macro writes it, the first
@@ -2641,6 +2670,26 @@ mod tests {
             "fn t(a: u8, std: u8) { let _ = S { a: 1, core: 2 }; }",
             "fn t<T>() where T: Into<Vec<u8>>, T: Clone {}",
             "#[cfg_attr(any(), serde(rename_all = \"camelCase\"))]\nstruct S;",
+        ] {
+            assert_eq!(breached(text), [], "{text}");
+        }
+    }
+
+    #[test]
+    fn a_macro_invoked_in_a_foreign_block_is_a_breach() {
+        // A foreign block's items are its module's own, so what a macro makes there is too.
+        for text in [
+            "extern \"C\" { make!(shared()); }",
+            "unsafe extern \"C\" { helpers::make! { other } }",
+            "extern { make![x]; }",
+        ] {
+            let found = breached(text);
+            assert_eq!(found.len(), 1, "{text}: {found:?}");
+            assert!(found[0].1.contains("foreign block"), "{text}: {found:?}");
+        }
+        for text in [
+            "extern \"C\" { fn other(); static VALUE: u8; }",
+            "make!(x);\nfn t() { println!(\"{}\", 1); }",
         ] {
             assert_eq!(breached(text), [], "{text}");
         }
