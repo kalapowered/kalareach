@@ -953,6 +953,16 @@ fn waiting(runtime: &SessionRuntime) -> usize {
     runtime.session().waiting_for_fence()
 }
 
+/// Waits until the connection's writer has brought the published fence to `gate`, or fails.
+///
+/// A writer that ended before it got there would never arrive, and the case fails rather than
+/// waiting for it.
+async fn at_the_gate(gate: &FenceGate) {
+    tokio::time::timeout(SOON, gate.arrived(1))
+        .await
+        .expect("the writer brought the published fence to the gate");
+}
+
 /// Takes the session through entry to a published fence, typing `held` while the reader is asked
 /// when there is anything to type, and returns once the machine has published the fence.
 async fn fenced_with(
@@ -1006,7 +1016,7 @@ async fn held_keys_reach_the_shell_only_once_their_fence_is_written() {
     let fence_id = fenced_with(&mut wired, holder, Some(b"held-keys\n")).await;
     // The machine published the fence and let the keys go on one step. The writer has the fence
     // and is keeping it, so the session keeps the keys.
-    gate.arrived(1).await;
+    at_the_gate(&gate).await;
     assert_eq!(
         waiting(&wired.runtime),
         1,
@@ -1043,7 +1053,7 @@ async fn keys_typed_while_their_fence_is_on_its_way_wait_for_it() {
     let mut wired = wired_holding_fences(&clock, Some(&gate)).await;
     let holder = wired.holder();
     let _ = fenced_with(&mut wired, holder, None).await;
-    gate.arrived(1).await;
+    at_the_gate(&gate).await;
 
     type_keys(&wired, holder, 0, b"typed-keys\n");
     assert!(
@@ -1093,7 +1103,7 @@ async fn keys_behind_a_fence_never_written_go_once_the_loss_is_recorded() {
     let mut wired = wired_holding_fences(&clock, Some(&gate)).await;
     let holder = wired.holder();
     let _ = fenced_with(&mut wired, holder, Some(b"stranded-keys\n")).await;
-    gate.arrived(1).await;
+    at_the_gate(&gate).await;
     assert_eq!(waiting(&wired.runtime), 1, "the keys wait for their fence");
     tokio::time::sleep(WHILE_HELD).await;
     assert!(
@@ -1148,7 +1158,7 @@ async fn a_fence_not_written_within_its_limit_ends_the_connection_and_lets_the_k
     let mut wired = wired_holding_fences(&clock, Some(&gate)).await;
     let holder = wired.holder();
     let _ = fenced_with(&mut wired, holder, Some(b"waiting-keys\n")).await;
-    gate.arrived(1).await;
+    at_the_gate(&gate).await;
     assert_eq!(waiting(&wired.runtime), 1, "the keys wait for their fence");
 
     clock.advance(kr_worker::fence::FENCE_WRITE_LIMIT);
@@ -1197,7 +1207,7 @@ async fn a_takeover_that_times_out_lets_its_keys_go_while_an_earlier_fence_is_un
     let mut wired = wired_holding_fences(&clock, Some(&gate)).await;
     let first = wired.holder();
     let _ = fenced_with(&mut wired, first, None).await;
-    gate.arrived(1).await;
+    at_the_gate(&gate).await;
 
     let second = wired.holder();
     type_keys(&wired, second, 0, b"second-keys\n");
@@ -1253,7 +1263,7 @@ async fn keys_waiting_for_a_fence_go_when_the_reader_leaves_the_prompt() {
     let mut wired = wired_holding_fences(&clock, Some(&gate)).await;
     let holder = wired.holder();
     let _ = fenced_with(&mut wired, holder, None).await;
-    gate.arrived(1).await;
+    at_the_gate(&gate).await;
     type_keys(&wired, holder, 0, b"leaving-keys\n");
     assert_eq!(waiting(&wired.runtime), 1, "the keys wait for their fence");
 
@@ -1297,7 +1307,7 @@ async fn a_launch_that_times_out_behind_an_unwritten_fence_gives_up_the_connecti
         .expect("connects");
     let holder = holder_over(&mut client, &wired).await;
     let _ = fenced_with(&mut wired, holder, None).await;
-    gate.arrived(1).await;
+    at_the_gate(&gate).await;
 
     // The launch reserves the fence, and its request waits on the writer behind it.
     let params = ShellLaunchParams {

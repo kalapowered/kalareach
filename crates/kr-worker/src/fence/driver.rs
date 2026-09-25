@@ -1159,11 +1159,14 @@ impl FenceDriver {
                     && let Some(fence_id) = self.published
                 {
                     // The launch's hold has ended and the machine lets go of what it held, but the
-                    // fence the launch reserved has not reached the reader, which is still the
-                    // current fence: the input behind it may not go ahead of it. A writer that has
-                    // kept a frame for the whole of a launch's hold is not delivering, so the
-                    // connection is given up now rather than at the limit, and the loss that ends
-                    // it lets that input go at the time the 250 ms rule gives, unfenced.
+                    // writer has not reported the fence the launch reserved written, and it is
+                    // still the current fence: the input behind it may not go ahead of it. No
+                    // report by the end of a launch's hold, which began after the fence was
+                    // published, is a writer that is not delivering, so the connection is given up
+                    // now rather than at the limit, and the loss that ends it lets that input go
+                    // at the time the 250 ms rule gives, unfenced. A write that finished just before
+                    // and is still waiting to report is given up with it; that costs a session its
+                    // integration, never a line its fence.
                     let now = self.reading();
                     for (_, unwritten, due) in &mut self.unwritten {
                         if *unwritten == fence_id {
