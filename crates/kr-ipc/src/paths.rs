@@ -2069,6 +2069,46 @@ mod windows {
             assert_ne!(older, control);
         }
 
+        /// Reads a descriptor built from SDDL the way [`read_descriptor`] reads one the kernel
+        /// wrote: self-relative, in a buffer aligned for it.
+        fn built(sddl: &str) -> FileAccess {
+            use windows_sys::Win32::Security::GetSecurityDescriptorLength;
+
+            let built = BuiltDescriptor::parse(sddl).expect("a descriptor");
+            // SAFETY: the descriptor is the self-relative one the conversion built, alive until
+            // `built` is dropped.
+            let length = usize::try_from(unsafe { GetSecurityDescriptorLength(built.0) })
+                .expect("a descriptor's length");
+            let mut buffer = vec![0_u64; length.div_ceil(8)];
+            // SAFETY: the descriptor holds `length` bytes, the buffer at least as many, and the two
+            // do not overlap.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    built.0.cast::<u8>(),
+                    buffer.as_mut_ptr().cast::<u8>(),
+                    length,
+                );
+            }
+            read_descriptor(&buffer).expect("the descriptor is read")
+        }
+
+        /// Where there is no list, the descriptor's control still says whether the list is
+        /// protected and whether it records inheritance, and both are read from it: each case
+        /// beside the control, which reads equal to itself.
+        #[test]
+        fn an_absent_lists_bits_are_read_from_the_descriptor() {
+            let plain = built("O:SYD:NO_ACCESS_CONTROL");
+            assert_eq!(built("O:SYD:NO_ACCESS_CONTROL"), plain, "the control");
+            assert!(plain.discretionary.entries.is_none(), "{plain:?}");
+            let recorded = built("O:SYD:AINO_ACCESS_CONTROL");
+            assert!(recorded.discretionary.records_inheritance, "{recorded:?}");
+            assert!(recorded.discretionary.entries.is_none(), "{recorded:?}");
+            assert_ne!(recorded, plain);
+            let protected = built("O:SYD:PNO_ACCESS_CONTROL");
+            assert!(protected.discretionary.protected, "{protected:?}");
+            assert_ne!(protected, plain);
+        }
+
         /// The entry types this host evaluates, and the ones it names and refuses.
         #[test]
         fn only_allows_denies_and_labels_are_evaluated() {
@@ -3191,9 +3231,9 @@ mod tests {
             "the same absent list reads the same"
         );
         // Where there is no list, whether the descriptor records inheritance is read and compared
-        // as well (the library's own unit case). Windows keeps that bit on no file without a list
-        // that a test can make: creation works it out itself, and the older call that sets a list
-        // drops it.
+        // too. Neither way of making such a file tried here kept that bit: creation works it out
+        // itself, and the older call that sets a list dropped it. The library's own unit cases
+        // read it from a descriptor built for them and compare it.
         assert_ne!(
             access(&directory.described("no-list-protected", "D:PNO_ACCESS_CONTROL")),
             absent,
