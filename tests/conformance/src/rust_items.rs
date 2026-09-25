@@ -1580,8 +1580,8 @@ impl std::fmt::Display for Breach {
 /// * a character outside ASCII anywhere but in a comment or a literal: the compiler compares
 ///   identifiers once it has normalised them, and the reading compares them as written;
 /// * in a macro whose tokens hold a metavariable or a repetition (see [`macro_text`]), a keyed
-///   helper's name however it is written, and a trusted name anywhere but where no expansion can
-///   make it a declaration;
+///   helper's name however it is written, and a trusted name anywhere but where the macro cannot
+///   make a declaration of it;
 /// * a macro's repetition that opens or ends inside an item's header (see [`split_headers`]).
 ///
 /// # Errors
@@ -1684,7 +1684,7 @@ fn conventions(tokens: &[Token], helpers: &BTreeSet<String>) -> Vec<(usize, Stri
         }
         // In a macro that holds a metavariable or a repetition, what the tokens around a name show
         // is no guide to what it is where the macro is invoked: a keyed helper's name is a breach
-        // however it is written, and a trusted name wherever an expansion may make it a declaration.
+        // however it is written, and a trusted name wherever the macro may make it a declaration.
         if helpers.contains(name)
             && let Some(what) = helper_occurrence(&around, &levels, declaration)
                 .or(rewritten[index].then_some(
@@ -1704,7 +1704,7 @@ fn conventions(tokens: &[Token], helpers: &BTreeSet<String>) -> Vec<(usize, Stri
                 ));
             } else if rewritten[index]
                 && !around.punct_before(1, '$')
-                && !around.declares_nothing_however_expanded(attributes[index])
+                && !around.declares_nothing_where_written(attributes[index])
             {
                 found.push((
                     token.line,
@@ -1780,11 +1780,12 @@ const ITEM_KEYWORDS: &[&str] = &[
     "enum", "fn", "impl", "mod", "struct", "trait", "type", "union",
 ];
 
-/// The index of each item keyword whose header, from the keyword to the item's body or `;`, holds
-/// where a macro's repetition opens or ends outside the groups the header holds (angle brackets are
-/// no group): there the reading cannot tell where the item's name, generic parameters or body are.
-/// A repetition that holds whole items, or one inside a group of the header (a function's
-/// parameters), splits no header.
+/// The index of each item keyword the tokens write whose header holds where a macro's repetition
+/// opens or ends: there the reading cannot tell where the item's name, generic parameters or body
+/// are. A header runs from its keyword (`fn` but for a function's type, `fn(...)`; `impl` in a type
+/// as well as an item's) to its body, its `;` or the end of the group it stands in, and the groups
+/// it holds, a macro's braces (`ty!{}`) among them, are no part of it; angle brackets are no group.
+/// A repetition that holds whole items splits no header.
 fn split_headers(tokens: &[Token]) -> BTreeSet<usize> {
     // Where each repetition's group ends: the `)` of a `$(`.
     let mut ends = BTreeSet::new();
@@ -1809,14 +1810,10 @@ fn split_headers(tokens: &[Token]) -> BTreeSet<usize> {
         let Some(word) = token.ident() else {
             continue;
         };
-        // A metavariable's own name is none of these keywords; `fn(u8)` is a type, and `union` is a
-        // keyword only before an item's name.
+        // A metavariable's own name is none of these keywords, and `fn(u8)` is a type.
         if !ITEM_KEYWORDS.contains(&word)
             || (index >= 1 && tokens[index - 1].is_punct('$'))
-            || (matches!(word, "fn" | "union")
-                && !tokens
-                    .get(index + 1)
-                    .is_some_and(|next| next.ident().is_some() || next.is_punct('$')))
+            || (word == "fn" && tokens.get(index + 1).is_some_and(|next| next.is_punct('(')))
         {
             continue;
         }
@@ -1830,8 +1827,12 @@ fn split_headers(tokens: &[Token]) -> BTreeSet<usize> {
                 found.insert(index);
                 break;
             }
+            // A macro's braces in the header (`ty!{}`, a name and then `!`) are a group, not the body.
+            let body = tokens[at].is_punct('{')
+                && !(tokens[at - 1].is_punct('!') && at >= 2 && tokens[at - 2].ident().is_some());
             match tokens[at].tok {
-                Tok::Punct('{' | ';') if groups == 0 && angles == 0 => break,
+                Tok::Punct('{') if body && groups == 0 && angles == 0 => break,
+                Tok::Punct(';') if groups == 0 && angles == 0 => break,
                 Tok::Punct('(' | '[' | '{') => groups += 1,
                 Tok::Punct(')' | ']' | '}') => {
                     if groups == 0 {
@@ -2037,17 +2038,16 @@ impl Around<'_> {
             .is_none_or(|token| token.is_punct(';') || token.is_punct(',') || token.is_punct('}'))
     }
 
-    /// Whether no expansion of a macro around this name can make it a declaration: it is invoked
-    /// (`name!`), a path goes on through it (`name::item`), it follows a `.` (a field, a method or
-    /// the end of a range), or it is inside an attribute.
-    fn declares_nothing_however_expanded(&self, in_attribute: bool) -> bool {
+    /// Whether the macro around this name cannot make a declaration of it where it is written: it
+    /// is invoked (`name!`), a path goes on through it (`name::item`), it follows a `.` (a field, a
+    /// method or the end of a range), or it is inside an attribute. A macro it is handed to may make
+    /// anything of it, which the rules on where that macro is invoked cover.
+    fn declares_nothing_where_written(&self, in_attribute: bool) -> bool {
         in_attribute
             || self.punct_after(1, '!')
             || (self.punct_after(1, ':')
                 && self.punct_after(2, ':')
-                && self
-                    .word_after(3)
-                    .is_some_and(|next| !matches!(next, "self" | "super" | "crate" | "Self")))
+                && self.word_after(3).is_some())
             || self.punct_before(1, '.')
     }
 
@@ -2919,6 +2919,24 @@ mod tests {
                 "macro_rules! m { ($($e:tt)*) => { trait $($e)* T {} }; }",
                 &[],
             ),
+            // A keyword right before the repetition ends, and a macro's braces in the header.
+            (
+                "macro_rules! m { ($($attr:meta)?) => { $(#[$attr] fn)? other() {} }; }",
+                &[],
+            ),
+            (
+                "macro_rules! m { ($($v:vis)?) => { $($v union)? U { a: u8 } }; }",
+                &[],
+            ),
+            (
+                "macro_rules! m { ($($e:tt)*) => { fn other() -> ty!{} $($e)* { 0 } }; }",
+                &[],
+            ),
+            // `impl Trait` in a type has a header of its own.
+            (
+                "macro_rules! m { ($($b:tt)+) => { fn other(_: impl $($b)+) {} }; }",
+                &[],
+            ),
         ] {
             let found = breached(text);
             assert_eq!(found.len(), 1 + others.len(), "{text}: {found:?}");
@@ -2940,6 +2958,7 @@ mod tests {
             "macro_rules! m { ($($t:ty),*) => { struct S($($t),*); }; }",
             "macro_rules! m { ($($v:ident),*) => { enum E { $($v),* } }; }",
             "macro_rules! m { ($($v:vis)?) => { $($v)? fn other() {} }; }",
+            "macro_rules! m { ($($e:tt)*) => { fn other() -> ! { $($e)* loop {} } }; }",
             // A function's type, and `union` where it names no item.
             "macro_rules! m { ($($t:ty),*) => { let f: fn($($t),*) = g; let u = a.union($($t),*); }; }",
             "fn union() {}\nfn t() { let union = 1; }",
@@ -2949,7 +2968,7 @@ mod tests {
     }
 
     #[test]
-    fn a_name_in_a_macro_that_holds_a_metavariable_keeps_to_what_no_expansion_changes() {
+    fn a_name_in_a_macro_that_holds_a_metavariable_keeps_to_forms_that_declare_nothing() {
         // A metavariable stands for whatever it is handed, a keyword or a `.` included, and a
         // repetition for any number of copies of what it holds, so the tokens around a name in such
         // a macro do not show what the name is where the macro is invoked.
