@@ -116,8 +116,10 @@ pub fn render(kit: &RecoveryKit) -> Result<Zeroizing<String>, RecoveryError> {
         out.push_str(origin);
         out.push('\n');
     }
-    debug_assert_eq!(out.len(), total, "the reserved size is the written size");
-    debug_assert_eq!(out.capacity(), total, "the buffer never grew");
+    // Compared without rendering either side: an assertion that printed what it compared would be
+    // one step from printing what the buffer holds.
+    debug_assert!(out.len() == total, "the reserved size is the written size");
+    debug_assert!(out.capacity() == total, "the buffer never grew");
     Ok(out)
 }
 

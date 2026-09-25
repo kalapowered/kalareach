@@ -800,9 +800,9 @@ impl Session {
         params: &kr_protocol::input::InputWriteParams,
     ) -> Result<kr_protocol::input::InputWriteResult> {
         let entry = Method::InputWrite.entry();
-        debug_assert_eq!(
-            entry.idempotency,
-            kr_protocol::authority::IdempotencyBehaviour::OrderedStream
+        debug_assert!(
+            entry.idempotency == kr_protocol::authority::IdempotencyBehaviour::OrderedStream,
+            "input is written as an ordered stream"
         );
         let request_id = self.next_request_id();
         let waiter = self.register(request_id)?;

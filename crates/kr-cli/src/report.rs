@@ -60,6 +60,20 @@ pub fn failed(error: &CliError) {
     say(&shown!("kr: {}", *error));
 }
 
+/// Writes the one byte that tells the process that started this one that it is ready, on standard
+/// error, which that process reads as a pipe rather than as text.
+///
+/// # Errors
+///
+/// Returns the failure to write or flush the byte.
+pub fn ready(byte: u8) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let mut pipe = std::io::stderr();
+    pipe.write_all(&[byte])?;
+    pipe.flush()
+}
+
 /// Renders a host's answer as machine-readable output: the answer exactly as the host sent it,
 /// marked as a success.
 ///
