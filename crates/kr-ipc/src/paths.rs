@@ -816,10 +816,11 @@ mod windows {
     /// Opens the directory an open handle holds a second time, relative to that handle, holding
     /// `right`.
     ///
-    /// No name is resolved: the new handle is on the object the old one holds, wherever its name
-    /// has gone since. The operating system checks `right` against the directory's list as it would
-    /// for an open by name, and the backup semantics are what let a program open a directory at
-    /// all, as they are for [`super::flush_directory`]'s own open.
+    /// The name opened is empty, which the kernel reads as the object the handle holds, so no name
+    /// is resolved and the new handle is on that directory wherever its name has gone since. The
+    /// operating system checks `right` against the directory's list as it does for an open by name,
+    /// and asks for the same backup intent [`super::flush_directory`]'s own open carries. The
+    /// Win32 call for a reopen is not used: it refuses a directory whatever right it is asked for.
     ///
     /// # Errors
     ///
@@ -829,24 +830,50 @@ mod windows {
         right: u32,
     ) -> std::io::Result<std::fs::File> {
         use std::os::windows::io::FromRawHandle as _;
-        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-        use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, ReOpenFile};
+        use windows_sys::Wdk::Storage::FileSystem::{
+            FILE_DIRECTORY_FILE, FILE_OPEN_FOR_BACKUP_INTENT,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, SYNCHRONIZE};
 
-        // SAFETY: `directory` is a live handle borrowed for this call, which the call reads and
-        // leaves as it was; the flags carry no file attribute, which the call refuses.
-        let handle = unsafe {
-            ReOpenFile(
-                directory.as_raw_handle(),
-                right,
+        // A name of no characters. The buffer is live and never read, because the length is zero.
+        let mut nothing = [0_u16; 1];
+        let object_name = UNICODE_STRING {
+            Length: 0,
+            MaximumLength: 0,
+            Buffer: nothing.as_mut_ptr(),
+        };
+        let attributes = OBJECT_ATTRIBUTES {
+            Length: u32::try_from(std::mem::size_of::<OBJECT_ATTRIBUTES>()).unwrap_or(0),
+            RootDirectory: directory.as_raw_handle(),
+            ObjectName: &raw const object_name,
+            Attributes: 0,
+            SecurityDescriptor: std::ptr::null(),
+            SecurityQualityOfService: std::ptr::null(),
+        };
+        let mut handle: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
+        let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+        // SAFETY: `handle` and `status_block` are live out parameters; `attributes` points at
+        // `object_name`, whose buffer is `nothing`, and all three are locals that live to the end
+        // of this function, past the call. `directory` is a handle borrowed for this call and used
+        // as the object the empty name resolves to. The options open an existing directory only,
+        // so the call creates nothing.
+        let status = unsafe {
+            NtOpenFile(
+                &raw mut handle,
+                right | SYNCHRONIZE | FILE_READ_ATTRIBUTES,
+                &raw const attributes,
+                &raw mut status_block,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                FILE_FLAG_BACKUP_SEMANTICS,
+                FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_FOR_BACKUP_INTENT,
             )
         };
-        if handle == INVALID_HANDLE_VALUE {
-            return Err(std::io::Error::last_os_error());
+        if status == STATUS_SUCCESS {
+            // SAFETY: the call above filled `handle` with a handle this owns and closes once.
+            return Ok(unsafe { std::fs::File::from_raw_handle(handle.cast()) });
         }
-        // SAFETY: the call above returned a handle this owns and closes once.
-        Ok(unsafe { std::fs::File::from_raw_handle(handle.cast()) })
+        // SAFETY: the status is the one the call returned; this only maps it to a Win32 code.
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        Err(std::io::Error::from_raw_os_error(code.cast_signed()))
     }
 
     /// The limit flags of the job this process runs in, or `None` when it runs in no job.
