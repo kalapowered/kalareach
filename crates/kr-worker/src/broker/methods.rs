@@ -767,16 +767,19 @@ pub struct RegisteredAction {
     /// Such an action is admitted as an answer to the resource the invocation names, and nothing
     /// else about it reaches a component.
     pub decision: Option<kr_plugin_sdk::ids::ParameterName>,
+    /// The rights a caller acting under a grant must hold to invoke it: the ones the package
+    /// contract names for its declared class, whatever the action is called.
+    pub rights: kr_protocol::scalars::CanonicalSet<kr_protocol::rights::ActionRight>,
 }
 
 impl RegisteredAction {
     /// Registers one action the way its package declared it.
     ///
-    /// The grant, the capability, whether it writes, the operation and the decision parameter all
-    /// follow from the declaration's effect class and implementation, so the installation and
-    /// this host's tests register an action one way. An answer through the decision destination
-    /// holds the approval interpreter grant and the approval capability, and carries its decision
-    /// in the parameter the declaration names.
+    /// The grant, the capability, whether it writes, the operation, the decision parameter and the
+    /// rights a caller needs all follow from the declaration's effect class and implementation,
+    /// so the installation and this host's tests register an action one way. An answer through
+    /// the decision destination holds the approval interpreter grant and the approval
+    /// capability, and carries its decision in the parameter the declaration names.
     ///
     /// # Errors
     ///
@@ -864,6 +867,7 @@ impl RegisteredAction {
             needs_draft: operation == Some(PreparedOperation::UpstreamAttachment),
             operation,
             decision,
+            rights: declaration.required_rights(),
         })
     }
 }

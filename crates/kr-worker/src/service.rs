@@ -4148,13 +4148,17 @@ impl WorkerService {
                     &params.plugin_id,
                     params.target.subject.application_instance_id,
                 )?;
+                let registered = self.broker.registered_action(binding_id, &params.action)?;
+                // The rights this call intersects are the action's own: the ones its declared
+                // class needs. A caller acting under a grant holds them, or the call is refused
+                // here, before the marker. An action nobody registered is refused below for that.
+                if let Some(registered) = registered.as_ref() {
+                    Self::check_action_rights(caller, &params.action, &registered.rights)?;
+                }
                 // An action that answers a pending request through the connector table's decision
                 // destination is admitted as that answer: the transaction an approval answer
                 // makes, with the action's own checks inside it, and no component involved.
-                let answers = self
-                    .broker
-                    .registered_action(binding_id, &params.action)?
-                    .is_some_and(|registered| registered.decision.is_some());
+                let answers = registered.is_some_and(|registered| registered.decision.is_some());
                 if answers {
                     self.wait_before_admission();
                     let admitted = self.broker.admit_plugin_answer(
@@ -4860,6 +4864,40 @@ impl WorkerService {
     }
 
     /// Returns the broker caller for one verified actor.
+    /// Refuses a plugin action whose declared class needs a right the caller's grant does not
+    /// carry.
+    ///
+    /// The one caller not held to a grant is the local owner, on this worker's own socket and
+    /// naming no grant: its peer credentials proved it is this user, as they do for an
+    /// attachment's capabilities. Every other caller holds exactly the rights its grant was
+    /// checked against, a caller that reached the host some other way and named no grant
+    /// included, which then holds none.
+    fn check_action_rights(
+        caller: &Caller,
+        action: &kr_protocol::broker::ActionName,
+        rights: &CanonicalSet<kr_protocol::rights::ActionRight>,
+    ) -> Result<()> {
+        if caller.ingress == ActorIngress::LocalIpc && !caller.grant_id.is_present() {
+            return Ok(());
+        }
+        let missing: Vec<&str> = rights
+            .iter()
+            .filter(|right| !caller.grant_rights.contains(right))
+            .map(|right| right.as_str())
+            .collect();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(WorkerError::PermissionDenied {
+                detail: format!(
+                    "{action} needs {}, which the grant this call was admitted under does not \
+                     carry",
+                    missing.join(" and ")
+                ),
+            })
+        }
+    }
+
     fn broker_caller(caller: &Caller) -> crate::broker::Caller {
         crate::broker::Caller {
             actor_id: caller.actor_id.clone(),
