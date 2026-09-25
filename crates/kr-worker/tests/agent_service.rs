@@ -2353,7 +2353,7 @@ impl UpstreamDispatch for BlockingUpstream {
     }
 }
 
-/// KR-REQ-09: an admitted operation whose transport blocks while it takes the operation is answered
+/// Section 9: an admitted operation whose transport blocks while it takes the operation is answered
 /// when the upstream deadline passes, as an outcome nobody can establish, and not whenever the
 /// transport lets go.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2406,7 +2406,7 @@ fn state_of(
         .state
 }
 
-/// KR-REQ-09, KR-REQ-11.27: an answer whose transport blocks while it takes it is settled as
+/// Section 9 and KR-REQ-11.27: an answer whose transport blocks while it takes it is settled as
 /// uncertain when the upstream deadline passes, before its receipt is recorded and before its
 /// caller hears; the transport letting go afterwards, and saying it took the answer, settles
 /// nothing again.
@@ -2455,7 +2455,7 @@ async fn kr_req_09_an_answer_whose_transport_blocks_is_uncertain_before_its_call
     );
 }
 
-/// KR-REQ-09, KR-REQ-11.27: an answer the transport took and the upstream never acknowledged is
+/// Section 9 and KR-REQ-11.27: an answer the transport took and the upstream never acknowledged is
 /// settled as uncertain at the upstream deadline, before its caller hears.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_09_an_answer_never_acknowledged_is_uncertain_before_its_caller_hears() {
