@@ -64,10 +64,11 @@ refusal, so the most such a failure can do there is a warning that names the hoo
 
 The thread is Gemini CLI's `session_id`. `/clear` ends one session and starts another. Gemini CLI
 waits for `SessionEnd` hooks when it exits and on `/clear`, and it waits for `Notification` hooks
-before it shows the permission prompt they announce. Whatever happens, a hook writes exactly `{}`
-and exits 0 within 500 milliseconds, well inside the shortest timeout the extension registers, and
-never waits for a person, as the Claude Code bridge's "Hooks" section describes. A hook that ran
-past its timeout would get SIGTERM and a warning; the forwarder always answers before that.
+before it shows the permission prompt they announce. Whatever happens, a hook stops waiting for the
+worker 500 milliseconds after it starts, then writes exactly `{}` and exits 0, well inside the
+shortest timeout the extension registers, and it never waits for a person, as the Claude Code
+bridge's "Hooks" section describes. A hook that ran past its timeout would get SIGTERM and a
+warning; the forwarder answers long before that.
 
 ## Limits
 

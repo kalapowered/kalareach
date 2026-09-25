@@ -4,7 +4,8 @@ Qoder CLI runs a hook for an event and reads what the hook answers, much as Clau
 reads hooks from the person's own settings files and from settings a launch passes with
 `--settings`, and it runs the hooks from both for the same event. KalaReach uses the second way.
 The launch passes KalaReach's hooks, so nothing is written into the person's Qoder CLI directory
-and the hooks exist only in sessions KalaReach launched. Qoder CLI then starts `kr-hook`, the core
+and the hooks exist only in sessions KalaReach launched; "The fallback" below says what else would
+work. Qoder CLI then starts `kr-hook`, the core
 forwarder, for each event, and the forwarder carries the event to the worker that owns the launch.
 
 The forwarder finds its worker, presents itself and is admitted exactly as it is for Claude Code:
@@ -54,8 +55,26 @@ The thread is Qoder CLI's `session_id`. A session starting at startup, on a resu
 or as a new session selects its thread. Qoder CLI names an MCP tool `mcp__<server>__<tool>`, as
 Claude Code does, and describes the call in `mcp_context`; a finished `mcp__kalareach__ask_user`
 names its request only when that context, where it is given, names the `kalareach` server and the
-`ask_user` tool. Whatever happens, a hook writes exactly `{}` and exits 0 within 500 milliseconds,
-and never waits for a person, as the Claude Code bridge's "Hooks" section describes.
+`ask_user` tool. Whatever happens, a hook stops waiting for the worker 500 milliseconds after it
+starts, then writes exactly `{}` and exits 0, and it never waits for a person, as the Claude Code
+bridge's "Hooks" section describes.
+
+## The fallback
+
+A hooks key in the person's settings file is not a place for KalaReach's hooks: it holds the
+person's own hooks for the same event, so adding KalaReach's there would replace theirs. An
+installed plugin is not one either, because Qoder CLI loads it from an install record that names
+its absolute path. A local marketplace is. Two keys the settings file does not otherwise hold,
+`extraKnownMarketplaces.kalareach`, a directory source whose path is written as `${HOME}/...`,
+which Qoder CLI expands, and `enabledPlugins.kalareach-hooks@kalareach`, beside three files (the
+marketplace's manifest and a plugin with its hooks), make Qoder CLI copy the marketplace into its
+own plugin state at the next start and run the plugin's hooks from the start after that, beside the
+person's own. That was checked on the binary over two sessions.
+
+It costs two keys in the person's `settings.json`, Qoder CLI's own copy and record of the
+marketplace, which removal leaves behind, and no hooks in the first session after installation.
+Like the launch, it gives a session a registration only when KalaReach launches it through a
+command integration. It is the route to take if a later Qoder CLI stops reading `--settings`.
 
 ## Limits
 
