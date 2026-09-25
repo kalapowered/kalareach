@@ -3435,3 +3435,72 @@ async fn an_owner_managed_workflow_runs_under_a_members_organisation_grant_while
 
     host.clients.abort();
 }
+
+/// A workflow grant's end on the continuous clock is answered as an expiry only once its tombstone
+/// is on disk. The store refuses every tombstone, the grant's anchor runs out while UTC is still
+/// before its expiry, and authority is unavailable rather than refused. The control: once the store
+/// takes the tombstone, the grant is refused as expired.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_workflow_grant_whose_end_could_not_be_written_is_not_answered_as_expired() {
+    use kr_automation::{AuthoritySource, AutomationError};
+    use kr_controller::automation::HostGrants;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const T: u64 = 1_767_225_600_000;
+    let continuous = kr_transport::clock::ManualClock::new();
+    let wall = Arc::new(AtomicU64::new(T));
+    let host = host_on(Clocks {
+        continuous: Arc::new(continuous.clone()),
+        wall: WallClock::from_fn({
+            let wall = Arc::clone(&wall);
+            move || wall.load(Ordering::SeqCst)
+        }),
+    })
+    .await;
+    let grant = issue_grant(
+        &host,
+        grant_id(30),
+        another_device(),
+        &[ActionRight::ChangesetCreate],
+        GrantExpiry::At {
+            expires_at_ms: kr_protocol::scalars::TimestampMs::new(T + 60_000),
+        },
+    );
+    let grants = HostGrants::for_daemon(&host.controller);
+    grants
+        .grant(grant.grant_id, T)
+        .expect("anchored in this boot, a minute from its end");
+
+    let registry = rusqlite::Connection::open(host._temp.environment().registry_database())
+        .expect("opens the registry");
+    registry
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .expect("waits for the daemon's writes");
+    registry
+        .execute_batch(
+            "CREATE TRIGGER refuse_tombstones BEFORE UPDATE OF expired_at_ms ON grants
+             BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+        )
+        .expect("the fault is in place");
+    continuous.advance(std::time::Duration::from_secs(61));
+    let refused = grants
+        .grant(grant.grant_id, T)
+        .expect_err("the grant ran out on the continuous clock");
+    assert!(
+        matches!(refused, AutomationError::AuthorityUnavailable(_)),
+        "not answered as an expiry while its end is not on disk: {refused}"
+    );
+
+    registry
+        .execute_batch("DROP TRIGGER refuse_tombstones;")
+        .expect("the fault is cleared");
+    let refused = grants
+        .grant(grant.grant_id, T)
+        .expect_err("the grant stays run out");
+    assert!(
+        matches!(&refused, AutomationError::PermissionDenied(detail) if detail.contains("expired")),
+        "{refused}"
+    );
+
+    host.clients.abort();
+}

@@ -2144,7 +2144,7 @@ impl Controller {
             .policy
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match self.organisation_standing(device_id, organisation_id, &held)? {
+        match self.organisation_standing(device_id, organisation_id)? {
             Standing::Holds => {}
             Standing::Lacks => return Ok(Err(LeaseRefused::NoOrganisationGrant)),
             Standing::Unrecorded => return Ok(Err(LeaseRefused::FloorUnrecorded)),
@@ -2214,80 +2214,58 @@ impl Controller {
         Ok(Ok(installed))
     }
 
-    /// Whether `device_id` may present a lease for `organisation_id`, decided with the policy's lock
-    /// held as `policy`.
+    /// Whether `device_id` may present a lease for `organisation_id`, decided while the caller holds
+    /// the policy's lock.
     ///
     /// A paired device needs its pairing to stand: paired, and its grant in force on both clocks
     /// (UTC through this host's floor, the continuous clock through the grant's anchor in this
     /// boot). Then it needs a live grant that requires the organisation: its pairing grant, or a
-    /// redeemed grant naming it as recipient that is neither revoked nor expired. A lapse found at
-    /// a reading the floor on disk does not cover yet is owed that record, and is answered as
-    /// unrecorded until the record is written.
+    /// redeemed grant naming it as recipient that is not revoked and is in force on both clocks by
+    /// its own anchor, and has no end on record. An end found here is written down before it is
+    /// answered, and answered as unrecorded until it is.
     fn organisation_standing(
         &self,
         device_id: kr_protocol::ids::DeviceId,
         organisation_id: kr_protocol::ids::OrganisationId,
-        policy: &std::sync::MutexGuard<'_, crate::grants::HostPolicy>,
     ) -> Result<Standing> {
+        use net::lifetimes::GrantStanding;
+
         let requires = |grant: &kr_protocol::grant::Grant| {
             grant
                 .organisation
                 .as_ref()
                 .is_some_and(|requirement| requirement.organisation_id == organisation_id)
         };
-        let wall_now = self.wall_now_ms();
         if let Some(record) = self.devices.record_for_device(device_id)? {
             if !record.is_paired() {
                 return Ok(Standing::Lacks);
             }
-            let bound = self.utc_floor.bound(record.grant.expiry, wall_now);
-            if bound.owed {
-                return Ok(Standing::Unrecorded);
-            }
-            if bound.passed {
-                return Ok(self.lapse_standing(policy, bound));
-            }
-            if !self.lifetimes.in_force(&record)? {
-                return Ok(Standing::Lacks);
+            match self.lifetimes.paired_standing(&record)? {
+                GrantStanding::InForce => {}
+                GrantStanding::OutOfForce => return Ok(Standing::Lacks),
+                GrantStanding::Unrecorded => return Ok(Standing::Unrecorded),
             }
             if requires(&record.grant) {
                 return Ok(Standing::Holds);
             }
         }
-        let mut lapsed = None;
-        for stored in self.sharing.grants().records_for_device(device_id)? {
+        let grants = self.sharing.grants();
+        let mut unrecorded = false;
+        for stored in grants.records_for_device(device_id)? {
             if stored.revoked_at_ms.is_some() || !stored.is_active() || !requires(&stored.grant) {
                 continue;
             }
-            let bound = self.utc_floor.bound(stored.grant.expiry, wall_now);
-            if bound.owed {
-                return Ok(Standing::Unrecorded);
+            match self.lifetimes.stored_standing(grants, &stored)? {
+                GrantStanding::InForce => return Ok(Standing::Holds),
+                GrantStanding::OutOfForce => {}
+                GrantStanding::Unrecorded => unrecorded = true,
             }
-            if !bound.passed {
-                return Ok(Standing::Holds);
-            }
-            lapsed = Some(bound);
         }
-        Ok(lapsed.map_or(Standing::Lacks, |bound| self.lapse_standing(policy, bound)))
-    }
-
-    /// What a grant found lapsed at `bound` leaves of a device's standing: none, answered once the
-    /// floor it was found on is on disk, and unrecorded until then.
-    fn lapse_standing(
-        &self,
-        policy: &std::sync::MutexGuard<'_, crate::grants::HostPolicy>,
-        bound: crate::grants::policy::Bound,
-    ) -> Standing {
-        if bound.recorded {
-            return Standing::Lacks;
-        }
-        let floor = policy.utc_floor_ms();
-        self.owe_floor(policy);
-        if self.utc_floor.written() < floor {
+        Ok(if unrecorded {
             Standing::Unrecorded
         } else {
             Standing::Lacks
-        }
+        })
     }
 
     /// A grant's own bound in this boot, anchoring it the first time anything asks: a grant in the
@@ -2317,18 +2295,21 @@ impl Controller {
     }
 
     /// Writes down that a grant ran out on the continuous clock: a stored grant's tombstone in the
-    /// grant store, a paired device's in its record, each owed until the write lands.
-    fn note_grant_lapse(&self, record: &crate::grants::GrantRecord) {
+    /// grant store, a paired device's in its record, each owed until the write lands. Returns
+    /// whether the end is on disk.
+    fn note_grant_lapse(&self, record: &crate::grants::GrantRecord) -> bool {
         let grants = self.sharing.grants();
         if matches!(grants.record(record.grant.grant_id), Ok(Some(_))) {
             self.lifetimes.owe_stored_expiry(record.grant.grant_id);
             self.lifetimes.settle_stored(grants);
+            !self.lifetimes.stored_expiry_owed(record.grant.grant_id)
         } else {
-            self.lifetimes.pending_expiry().owe(
-                record.grant.recipient_device_id,
-                TimestampMs::new(self.wall_now_ms()),
-            );
+            let device_id = record.grant.recipient_device_id;
+            self.lifetimes
+                .pending_expiry()
+                .owe(device_id, TimestampMs::new(self.wall_now_ms()));
             self.lifetimes.settle();
+            !self.lifetimes.pending_expiry().is_owed(device_id)
         }
     }
 
@@ -2581,21 +2562,27 @@ impl Controller {
             now_ms,
             self.clock.now(),
         )
-        .map(|intersection| intersection.rights)
-        .and_then(|rights| {
-            // Its anchor on the continuous clock, read now: a grant that ran out there is refused
-            // whatever the wall clock says, and its end is written down.
-            if anchored.holds_at(self.clock.now()) {
-                return Ok(rights);
+        .map(|intersection| intersection.rights);
+        // Its anchor on the continuous clock, read now: a grant that ran out there is refused
+        // whatever the wall clock says, once its end is written down. Until then authority is
+        // unavailable, because a daemon started in a new boot, where this anchor means nothing,
+        // could find the grant in force by UTC.
+        let decided = match decided {
+            Ok(_) if !anchored.holds_at(self.clock.now()) => {
+                if !self.note_grant_lapse(record) {
+                    return Err(unwritten());
+                }
+                Err(crate::grants::Refusal::Expired {
+                    expired_at_ms: match record.grant.expiry {
+                        kr_protocol::grant::GrantExpiry::At { expires_at_ms } => {
+                            expires_at_ms.get()
+                        }
+                        kr_protocol::grant::GrantExpiry::Never => now_ms,
+                    },
+                })
             }
-            self.note_grant_lapse(record);
-            Err(crate::grants::Refusal::Expired {
-                expired_at_ms: match record.grant.expiry {
-                    kr_protocol::grant::GrantExpiry::At { expires_at_ms } => expires_at_ms.get(),
-                    kr_protocol::grant::GrantExpiry::Never => now_ms,
-                },
-            })
-        });
+            decided => decided,
+        };
         let decided = match (decided, offline) {
             (Ok(rights), Some(offline)) => {
                 let lapsed = crate::grants::Refusal::OfflineValidityLapsed {

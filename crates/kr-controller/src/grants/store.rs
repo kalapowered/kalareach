@@ -388,13 +388,20 @@ impl GrantDirectory {
     /// now ([`Self::bound_passed`]).
     pub fn lapsed(&self, record: &GrantRecord, admitted_ms: u64) -> Result<bool> {
         let anchored = self.anchor_before_effect(record)?;
+        let ran_out = std::cell::Cell::new(None);
         let lapsed = self.passed_at_effect(
             record.grant.grant_id,
             record.grant.expiry,
             admitted_ms,
             anchored,
+            &ran_out,
         );
         self.settle_tombstones();
+        // A lapse is an answer, so an end found on the continuous clock waits for its record as a
+        // refusal does.
+        if matches!(lapsed, Ok(true)) && self.tombstone_owed(ran_out.get()) {
+            return Err(unrecorded());
+        }
         lapsed
     }
 
@@ -418,15 +425,19 @@ impl GrantDirectory {
     }
 
     /// The anchor of the grant `record` delegates from, taken before the delegation's transaction.
+    ///
+    /// A parent this host does not hold when the delegation begins is refused here, whatever is
+    /// written meanwhile: the transaction decides only a parent this read anchored.
     fn parent_anchor_before_effect(&self, record: &GrantRecord) -> Result<Option<Anchored>> {
         let Some(parent_grant_id) = record.grant.parent_grant_id.as_ref().copied() else {
             return Ok(None);
         };
-        match self.record(parent_grant_id)? {
-            Some(parent) => self.anchor_before_effect(&parent),
-            // The transaction refuses a parent this host does not hold.
-            None => Ok(None),
-        }
+        let parent =
+            self.record(parent_grant_id)?
+                .ok_or_else(|| ControllerError::PermissionDenied {
+                    detail: "this grant names a parent this host does not hold".to_owned(),
+                })?;
+        self.anchor_before_effect(&parent)
     }
 
     /// Whether a stored grant's bound has passed at the effect, on both of its deadlines: its
@@ -441,8 +452,10 @@ impl GrantDirectory {
         expiry: GrantExpiry,
         admitted_ms: u64,
         anchored: Option<Anchored>,
+        ran_out: &std::cell::Cell<Option<GrantId>>,
     ) -> Result<bool> {
         if self.lapsed_on_the_continuous_clock(grant_id, anchored) {
+            ran_out.set(Some(grant_id));
             return Ok(true);
         }
         self.bound_passed(expiry, admitted_ms)
@@ -471,6 +484,27 @@ impl GrantDirectory {
         if let Some(clock) = self.host_clock.get() {
             clock.lifetimes.settle_stored(self);
         }
+    }
+
+    /// Whether the tombstone of the grant an effect found run out on the continuous clock is still
+    /// owed to this store.
+    fn tombstone_owed(&self, ran_out: Option<GrantId>) -> bool {
+        ran_out
+            .zip(self.host_clock.get())
+            .is_some_and(|(grant_id, clock)| clock.lifetimes.stored_expiry_owed(grant_id))
+    }
+
+    /// Settles the tombstones an effect owes once its transaction is over, and answers a refusal
+    /// that a grant's end on the continuous clock decided only once that end is on disk.
+    ///
+    /// Until then the refusal is `STORAGE_UNAVAILABLE`: a daemon started in a new boot, where this
+    /// boot's anchor means nothing, could find the grant in force by UTC and decide the other way.
+    fn after_effect<T>(&self, outcome: Result<T>, ran_out: Option<GrantId>) -> Result<T> {
+        self.settle_tombstones();
+        if outcome.is_err() && self.tombstone_owed(ran_out) {
+            return Err(unrecorded());
+        }
+        outcome
     }
 
     /// Binds this host's clocks and every grant's anchor, so a grant's time bound is decided at
@@ -565,6 +599,7 @@ impl GrantDirectory {
         let encoded = kr_cbor::to_canonical_vec(&record.grant)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         let parent_anchor = self.parent_anchor_before_effect(record)?;
+        let ran_out = std::cell::Cell::new(None);
         // The parent check and the write are one transaction. Checking first and writing after
         // would prove the parent stood before the write rather than at it, and a revocation that
         // landed in between would leave a live child of a revoked parent. The caller's admission
@@ -572,13 +607,12 @@ impl GrantDirectory {
         // parent read can each outlast it.
         let issued = self.in_transaction(|connection| {
             check_parent(connection, record, |parent, expiry, at| {
-                self.passed_at_effect(parent, expiry, at, parent_anchor)
+                self.passed_at_effect(parent, expiry, at, parent_anchor, &ran_out)
             })?;
             still_admitted()?;
             write_grant(connection, record, &encoded)
         });
-        self.settle_tombstones();
-        issued
+        self.after_effect(issued, ran_out.get())
     }
 
     /// Returns one grant's record, revoked or not.
@@ -922,9 +956,10 @@ impl GrantDirectory {
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         let recipient = record.grant.recipient_device_id;
         let parent_anchor = self.parent_anchor_before_effect(record)?;
+        let ran_out = std::cell::Cell::new(None);
         let issued = self.in_transaction(|connection| {
             check_parent(connection, record, |parent, expiry, at| {
-                self.passed_at_effect(parent, expiry, at, parent_anchor)
+                self.passed_at_effect(parent, expiry, at, parent_anchor, &ran_out)
             })?;
             still_admitted()?;
             write_grant(connection, record, &encoded_grant)?;
@@ -952,8 +987,7 @@ impl GrantDirectory {
             }
             Ok(())
         });
-        self.settle_tombstones();
-        issued
+        self.after_effect(issued, ran_out.get())
     }
 
     /// Returns one invitation's record.
@@ -995,14 +1029,17 @@ impl GrantDirectory {
         now_ms: u64,
     ) -> Result<Grant> {
         // The anchor of the grant the invitation carries, taken before the transaction, because
-        // taking it can write to this store.
-        let grant_anchor = match self.invitation(invitation_id)? {
-            Some(invitation) => match self.record(invitation.grant_id)? {
-                Some(record) => self.anchor_before_effect(&record),
-                None => Ok(None),
-            },
-            None => Ok(None),
-        };
+        // taking it can write to this store. An invitation this host does not hold when the
+        // redemption begins is refused here, whatever is written meanwhile: the transaction
+        // decides only a grant this read anchored.
+        let invitation = self.invitation(invitation_id)?.ok_or_else(|| {
+            ControllerError::InvalidArgument("this host holds no such invitation".to_owned())
+        })?;
+        let carried = self.record(invitation.grant_id)?.ok_or_else(|| {
+            ControllerError::InvalidArgument("this host holds no such grant".to_owned())
+        })?;
+        let grant_anchor = self.anchor_before_effect(&carried);
+        let ran_out = std::cell::Cell::new(None);
         // The refusal travels out of the transaction as a *value*, so the transaction commits and
         // the refusal is raised afterwards. An error would roll the transaction back, and one of
         // the things it writes is that the invitation expired: rolling that back would let a
@@ -1061,6 +1098,7 @@ impl GrantDirectory {
                 Err(error) => return Ok(Err(error)),
             };
             if self.lapsed_on_the_continuous_clock(record.grant.grant_id, grant_anchor) {
+                ran_out.set(Some(record.grant.grant_id));
                 return Ok(Err(refusal("that invitation has expired")));
             }
             let grant_bound = self.bound_at_effect(record.grant.expiry, now_ms);
@@ -1102,8 +1140,7 @@ impl GrantDirectory {
             }
             Ok(Ok(record.grant))
         });
-        self.settle_tombstones();
-        redeemed?
+        self.after_effect(redeemed.and_then(|redeemed| redeemed), ran_out.get())
     }
 
     /// Withdraws an invitation and the proposal it carries, in one transaction.
@@ -1161,10 +1198,15 @@ impl GrantDirectory {
     ) -> Result<GrantRevocation> {
         let encoded = kr_cbor::to_canonical_vec(&replacement.grant)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-        let source_anchor = match self.record(source_grant_id)? {
-            Some(source) => self.anchor_before_effect(&source)?,
-            None => None,
-        };
+        // A source this host does not hold when the transfer begins is refused here, whatever is
+        // written meanwhile: the transaction decides only a grant this read anchored.
+        let source =
+            self.record(source_grant_id)?
+                .ok_or_else(|| ControllerError::PermissionDenied {
+                    detail: "this host holds no such grant".to_owned(),
+                })?;
+        let source_anchor = self.anchor_before_effect(&source)?;
+        let ran_out = std::cell::Cell::new(None);
         let transferred = self.in_transaction(|connection| {
             let source = read_one(connection, source_grant_id)?.ok_or_else(|| {
                 ControllerError::PermissionDenied {
@@ -1184,6 +1226,7 @@ impl GrantDirectory {
                     source.grant.expiry,
                     now_ms,
                     source_anchor,
+                    &ran_out,
                 )?
             {
                 return Err(ControllerError::PermissionDenied {
@@ -1195,8 +1238,7 @@ impl GrantDirectory {
             write_grant(connection, replacement, &encoded)?;
             Self::revoke_within(connection, source_grant_id, now_ms)
         });
-        self.settle_tombstones();
-        transferred
+        self.after_effect(transferred, ran_out.get())
     }
 
     // --- Fence debt -------------------------------------------------------------------------

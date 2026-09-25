@@ -52,6 +52,20 @@ pub enum Anchored {
     Over,
 }
 
+/// Whether a grant is in force now, on both of its deadlines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrantStanding {
+    /// It is in force on both clocks.
+    InForce,
+    /// It is not, and nothing about that is owed a record: its end is written down, or nothing
+    /// proves it in force.
+    OutOfForce,
+    /// It is not in force, and the end that decides it is not written down yet, or it cannot be
+    /// decided while the clock floor is owed its record. Answered as neither, because a daemon
+    /// started in a new boot could decide the other way.
+    Unrecorded,
+}
+
 impl Anchored {
     /// Whether it still holds at `now` on the continuous clock.
     #[must_use]
@@ -211,13 +225,23 @@ impl GrantLifetimes {
     ///
     /// Returns an error when the lifetime or an observed expiry cannot be read or written.
     pub fn in_force(&self, record: &DeviceRecord) -> Result<bool> {
+        Ok(self.paired_standing(record)? == GrantStanding::InForce)
+    }
+
+    /// Returns whether `record`'s grant is in force now on both clocks, and whether an end found is
+    /// on record ([`Self::in_force`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the lifetime cannot be read or written.
+    pub fn paired_standing(&self, record: &DeviceRecord) -> Result<GrantStanding> {
         let lifetime = match self.lifetime(record) {
             Ok(lifetime) => lifetime,
-            Err(ControllerError::ClockUntrusted { .. }) => return Ok(false),
+            Err(ControllerError::ClockUntrusted { .. }) => return Ok(GrantStanding::OutOfForce),
             Err(error) => return Err(error),
         };
         if self.holds(lifetime, record.grant.expiry) {
-            return Ok(true);
+            return Ok(GrantStanding::InForce);
         }
         if lifetime != Anchored::Over {
             // Observed here, so it is written here: the tombstone is what a later boot reads,
@@ -229,7 +253,11 @@ impl GrantLifetimes {
             self.pending_expiry.owe(record.device_id, moment);
             self.pending_expiry.settle(&self.devices);
         }
-        Ok(false)
+        Ok(if self.pending_expiry.is_owed(record.device_id) {
+            GrantStanding::Unrecorded
+        } else {
+            GrantStanding::OutOfForce
+        })
     }
 
     /// Returns whether a paired device's grant is in force now, from memory alone, on both clocks.
@@ -336,7 +364,8 @@ impl GrantLifetimes {
     }
 
     /// Whether a stored grant's tombstone is owed to the store and not written yet.
-    fn stored_expiry_owed(&self, grant_id: GrantId) -> bool {
+    #[must_use]
+    pub fn stored_expiry_owed(&self, grant_id: GrantId) -> bool {
         self.pending_stored
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -354,19 +383,41 @@ impl GrantLifetimes {
     ///
     /// Returns an error when the store cannot be read or written.
     pub fn stored_in_force(&self, store: &GrantDirectory, record: &GrantRecord) -> Result<bool> {
+        Ok(self.stored_standing(store, record)? == GrantStanding::InForce)
+    }
+
+    /// Returns whether a stored grant is in force now on both clocks, and whether an end found is
+    /// on record ([`Self::stored_in_force`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store cannot be read or written.
+    pub fn stored_standing(
+        &self,
+        store: &GrantDirectory,
+        record: &GrantRecord,
+    ) -> Result<GrantStanding> {
         let lifetime = match self.stored(store, record) {
             Ok(lifetime) => lifetime,
-            Err(ControllerError::ClockUntrusted { .. }) => return Ok(false),
+            Err(ControllerError::ClockUntrusted { .. }) => return Ok(GrantStanding::OutOfForce),
+            Err(ControllerError::Refused {
+                code: kr_protocol::error::ErrorCode::StorageUnavailable,
+                ..
+            }) => return Ok(GrantStanding::Unrecorded),
             Err(error) => return Err(error),
         };
         if self.holds(lifetime, record.grant.expiry) {
-            return Ok(true);
+            return Ok(GrantStanding::InForce);
         }
         if lifetime != Anchored::Over {
             self.owe_stored_expiry(record.grant.grant_id);
             self.settle_stored(store);
         }
-        Ok(false)
+        Ok(if self.stored_expiry_owed(record.grant.grant_id) {
+            GrantStanding::Unrecorded
+        } else {
+            GrantStanding::OutOfForce
+        })
     }
 
     /// Records that a stored grant was found to have run out, for the grant store to write down.

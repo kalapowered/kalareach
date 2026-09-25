@@ -240,6 +240,15 @@ impl PendingExpiry {
         }
     }
 
+    /// Whether one device's expiry is owed to the record and not written yet.
+    #[must_use]
+    pub fn is_owed(&self, device_id: DeviceId) -> bool {
+        self.owed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&device_id)
+    }
+
     /// Returns how many records are still owed. A test reads it; nothing else needs it.
     #[must_use]
     pub fn owed(&self) -> usize {

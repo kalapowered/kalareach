@@ -2271,6 +2271,20 @@ async fn start_daemon_on(
     temp: &kr_ipc::testing::TempHost,
     clocks: kr_controller::service::Clocks,
 ) -> Arc<Controller> {
+    start_daemon_in_boot(
+        temp,
+        clocks,
+        kr_ipc::identity::boot_identity().expect("a boot identity"),
+    )
+    .await
+}
+
+/// Starts a daemon over `temp` on the clocks the test gives it, in the boot `boot`.
+async fn start_daemon_in_boot(
+    temp: &kr_ipc::testing::TempHost,
+    clocks: kr_controller::service::Clocks,
+    boot: kr_protocol::identity::BootIdentity,
+) -> Arc<Controller> {
     let environment = temp.environment();
     let environment_id = temp.environment_id();
     let secrets = environment.secrets_dir();
@@ -2287,7 +2301,7 @@ async fn start_daemon_on(
                 )
             }),
             secret_store: StoreSelection::File,
-            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+            boot_identity: boot,
             supervisor: Box::new(SilentSupervisor),
             worker_program: std::path::PathBuf::from("/nonexistent/kr-worker"),
             build_id: BuildId::new("kr-test/0").expect("a build identifier"),
@@ -2415,8 +2429,9 @@ async fn an_effect_waiting_for_the_store(effect: Effect, advanced: bool) {
     };
     tokio::time::sleep(Duration::from_millis(300)).await;
     if advanced {
-        // Past the grant's anchor on the continuous clock; UTC stays where it was.
-        continuous.advance(Duration::from_secs(60 * 60 + 1));
+        // Well past the grant's anchor on the continuous clock, an hour after its issue; UTC stays
+        // where it was, before its expiry.
+        continuous.advance(Duration::from_secs(2 * 60 * 60));
     }
     registry
         .execute_batch("ROLLBACK;")
@@ -2534,4 +2549,170 @@ async fn an_expiring_grant_this_boot_never_anchored_is_refused_under_a_distruste
     transfer_to_another(&controller, &lasting, grant_id(10))
         .await
         .expect("the control: a grant that does not expire reads no clock");
+}
+
+/// An end a stored grant reached on the continuous clock is answered as an expiry only once its
+/// tombstone is on disk. The store refuses every tombstone; the grant's anchor runs out while UTC is
+/// still before its expiry; a transfer under it is refused as a record this host could not write,
+/// not as an expiry. A daemon started in a new boot, the store recovered and the wall clock where
+/// it was, finds nothing on record against the grant and transfers it, which contradicts no answer
+/// this host gave.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_end_whose_tombstone_could_not_be_written_is_not_answered_as_an_expiry() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let now = kr_ipc::now_ms().get();
+    let continuous = kr_transport::clock::ManualClock::new();
+    let wall = Arc::new(AtomicU64::new(now));
+    let clocks = || kr_controller::service::Clocks {
+        continuous: Arc::new(continuous.clone()),
+        wall: kr_controller::service::WallClock::from_fn({
+            let wall = Arc::clone(&wall);
+            move || wall.load(Ordering::SeqCst)
+        }),
+    };
+    let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
+    let controller = start_daemon_in_boot(&temp, clocks(), boot.clone()).await;
+    let held = shared_and_redeemed(&controller, 1, device_id(0xf1));
+    let record = controller
+        .sharing()
+        .grants()
+        .record(held.grant_id)
+        .expect("readable")
+        .expect("the grant");
+    assert!(
+        !controller
+            .sharing()
+            .grants()
+            .lapsed(&record, now)
+            .expect("decided"),
+        "anchored in this boot, an hour from its end"
+    );
+
+    // The store refuses every tombstone from here, as a full disk would.
+    let registry = rusqlite::Connection::open(temp.environment().registry_database())
+        .expect("opens the registry");
+    registry
+        .busy_timeout(Duration::from_secs(5))
+        .expect("waits for the daemon's writes");
+    registry
+        .execute_batch(
+            "CREATE TRIGGER refuse_tombstones BEFORE UPDATE OF expired_at_ms ON grants
+             BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+        )
+        .expect("the fault is in place");
+    // Well past the grant's anchor; UTC stays where it was, before its expiry.
+    continuous.advance(Duration::from_secs(2 * 60 * 60));
+    let first = transfer_to_another(&controller, &held, grant_id(9)).await;
+
+    // A new boot: the store recovers, and the wall clock is where it was.
+    stop_daemon(controller).await;
+    registry
+        .execute_batch("DROP TRIGGER refuse_tombstones;")
+        .expect("the fault is cleared");
+    let controller = start_daemon_in_boot(
+        &temp,
+        clocks(),
+        kr_protocol::identity::BootIdentity {
+            value: kr_protocol::scalars::Bytes::new(vec![0x5a; 16]),
+            ..boot
+        },
+    )
+    .await;
+    let second = transfer_to_another(&controller, &held, grant_id(10)).await;
+
+    let refused_as_expired = matches!(
+        &first,
+        Err(error) if error.code() == kr_protocol::error::ErrorCode::PermissionDenied
+    );
+    assert!(
+        !(refused_as_expired && second.is_ok()),
+        "a grant this host refused as expired was transferred in a new boot: {first:?}, then \
+         {second:?}"
+    );
+    assert_eq!(
+        first.expect_err("the transfer is refused").code(),
+        kr_protocol::error::ErrorCode::StorageUnavailable,
+        "refused as a record this host could not write down, not decided"
+    );
+    second.expect("nothing on record stands against the grant in a new boot");
+}
+
+/// A redemption decides only a grant it anchored before its transaction. An invitation this host
+/// does not hold when the redemption begins is refused then, although another writer commits it
+/// while the redemption would have waited for the store, so an expiring grant is never redeemed
+/// unanchored while the clock is distrusted. The invitation stays open, its grant unredeemed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_invitation_written_while_its_redemption_waits_is_not_redeemed_unanchored() {
+    let (temp, controller) = daemon().await;
+    let now = kr_ipc::now_ms().get();
+    let environment_id = controller.paths().environment_id();
+    // The invitation is written into a store of its own first, so another writer can commit its
+    // rows into this host's registry while the redemption waits.
+    let donor_directory = tempfile::TempDir::new().expect("a directory on the internal disk");
+    let donor_path = donor_directory.path().join("donor.sqlite3");
+    let shared = SharingService::new(
+        kr_controller::grants::GrantDirectory::open(&donor_path).expect("the donor store opens"),
+        DeviceId::new(environment_id.get()),
+    )
+    .share(
+        &ShareRequest {
+            environment_id,
+            issuer_device_id: DeviceId::new(environment_id.get()),
+            recipient_device_id: device_id(0xf1),
+            authority_revision: controller.policy().authority_revision(),
+            now_ms: now,
+            ..share(SessionRole::Owner, 1)
+        },
+        || Ok(()),
+    )
+    .expect("the invitation is written in the donor store");
+    // The clock is distrusted from here, so nothing can anchor an expiring grant in this boot.
+    controller
+        .devices()
+        .utc_at_least(kr_protocol::scalars::TimestampMs::new(now + 60 * 60 * 1000))
+        .expect("the mark");
+
+    let registry = rusqlite::Connection::open(temp.environment().registry_database())
+        .expect("opens the registry");
+    registry
+        .busy_timeout(Duration::from_secs(5))
+        .expect("waits for the daemon's writes");
+    registry
+        .execute(
+            "ATTACH DATABASE ?1 AS donor",
+            [donor_path.to_str().expect("a path")],
+        )
+        .expect("the donor store is attached");
+    registry
+        .execute_batch(
+            "BEGIN IMMEDIATE;
+             INSERT INTO grants SELECT * FROM donor.grants;
+             INSERT INTO session_invitations SELECT * FROM donor.session_invitations;",
+        )
+        .expect("another writer holds the rows");
+    let redeeming = {
+        let controller = Arc::clone(&controller);
+        let invitation_id = shared.preview.invitation_id;
+        tokio::task::spawn_blocking(move || {
+            controller
+                .sharing()
+                .redeem(invitation_id, device_id(0xf1), now + 1)
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    registry
+        .execute_batch("COMMIT;")
+        .expect("the rows are committed");
+    let outcome = redeeming.await.expect("the redemption ends");
+
+    outcome.expect_err("an invitation this host did not hold when the redemption began");
+    let proposal = controller
+        .sharing()
+        .grants()
+        .record(grant_id(1))
+        .expect("readable")
+        .expect("the proposal is on disk now");
+    assert!(proposal.activated_at_ms.is_none(), "nothing redeemed it");
 }

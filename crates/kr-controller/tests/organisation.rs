@@ -969,26 +969,44 @@ async fn start_daemon(
     environment: &kr_ipc::paths::EnvironmentPaths,
     environment_id: EnvironmentId,
 ) -> Arc<Controller> {
-    let secrets = environment.secrets_dir();
-    Controller::start(ControllerSetup {
-        paths: environment.clone(),
+    start_daemon_on(
+        environment,
         environment_id,
-        identity: Box::new(move || {
-            let store = open_store_in(&secrets).expect("a secret store for the test environment");
-            Ok(
-                ControllerIdentity::open(store.store.as_ref(), environment_id, false)
-                    .expect("an identity"),
-            )
-        }),
-        secret_store: StoreSelection::File,
-        boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-        supervisor: Box::new(RefusingSupervisor),
-        worker_program: PathBuf::from("/nonexistent/kr-worker"),
-        build_id: BuildId::new("kr-test/0").expect("a build identifier"),
-        release: "0".to_owned(),
-        shell_packages: None,
-        terminal: Box::new(kr_controller::supervision::NoTerminal),
-    })
+        kr_controller::service::Clocks::system(),
+    )
+    .await
+}
+
+/// Starts a daemon on the clocks the test gives it.
+async fn start_daemon_on(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+    environment_id: EnvironmentId,
+    clocks: kr_controller::service::Clocks,
+) -> Arc<Controller> {
+    let secrets = environment.secrets_dir();
+    Controller::start_on_clocks(
+        ControllerSetup {
+            paths: environment.clone(),
+            environment_id,
+            identity: Box::new(move || {
+                let store =
+                    open_store_in(&secrets).expect("a secret store for the test environment");
+                Ok(
+                    ControllerIdentity::open(store.store.as_ref(), environment_id, false)
+                        .expect("an identity"),
+                )
+            }),
+            secret_store: StoreSelection::File,
+            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+            supervisor: Box::new(RefusingSupervisor),
+            worker_program: PathBuf::from("/nonexistent/kr-worker"),
+            build_id: BuildId::new("kr-test/0").expect("a build identifier"),
+            release: "0".to_owned(),
+            shell_packages: None,
+            terminal: Box::new(kr_controller::supervision::NoTerminal),
+        },
+        clocks,
+    )
     .await
     .unwrap_or_else(|error| panic!("the daemon starts: {error}"))
 }
@@ -1537,4 +1555,107 @@ fn a_stored_grant_with_an_earlier_organisation_requirement_still_reads() {
     .expect("installed");
     decide(&read.grant, &record, &mut host, request())
         .expect("it answers once an enrolment records its revision");
+}
+
+/// A grant in the grant store answers for a presentation only while it is in force on both clocks
+/// and has no end on record. A device whose pairing grant is personal presents under a stored
+/// organisation grant whose anchor has run out on the continuous clock, and another under one whose
+/// end is on record, both with UTC still before their expiry: neither binds. The control: a device
+/// under a live stored organisation grant binds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stored_organisation_grant_that_ran_out_admits_no_lease() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let continuous = ManualClock::new();
+    let wall = Arc::new(AtomicU64::new(T));
+    let controller = start_daemon_on(
+        &temp.environment(),
+        temp.environment_id(),
+        kr_controller::service::Clocks {
+            continuous: Arc::new(continuous.clone()),
+            wall: kr_controller::service::WallClock::from_fn({
+                let wall = Arc::clone(&wall);
+                move || wall.load(Ordering::SeqCst)
+            }),
+        },
+    )
+    .await;
+    let mut organisation = Organisation::new(0x35, T - 2 * DAY_MS);
+    organisation.rotate(T - DAY_MS);
+    let revision = controller.policy().authority_revision();
+    controller
+        .update_policy(|policy| organisation.enrol(policy, T))
+        .expect("the enrolment is written down");
+    let organisation_id = organisation.organisation_id;
+    let grants = controller.sharing().grants();
+
+    // Three devices paired under personal grants, each named by a stored organisation grant.
+    let mut presenting = Vec::new();
+    for (byte, lifetime_ms) in [
+        (0x4a, MINUTE_MS),
+        (0x4b, 60 * MINUTE_MS),
+        (0x4c, 60 * MINUTE_MS),
+    ] {
+        let key = device();
+        let paired = member_device(byte, *key.public(), None);
+        controller.devices().commit(&paired).expect("paired");
+        let stored = GrantRecord {
+            grant: Grant {
+                grant_id: GrantId::new(Uuid::from_bytes([byte ^ 0x80; 16])),
+                expiry: GrantExpiry::At {
+                    expires_at_ms: TimestampMs::new(T + lifetime_ms),
+                },
+                organisation: Nullable::some(OrganisationRequirement {
+                    organisation_id,
+                    policy_revision: revision,
+                }),
+                ..paired.grant.clone()
+            },
+            session_id: None,
+            issued_at_ms: T,
+            activated_at_ms: Some(T),
+            revoked_at_ms: None,
+            revoked_by_parent: None,
+        };
+        grants
+            .issue(&stored, || Ok(()))
+            .expect("the grant is written");
+        presenting.push((paired, key, stored));
+    }
+
+    // The first grant is anchored in this boot, and its anchor runs out on the continuous clock
+    // while UTC stays before its expiry.
+    assert!(
+        !grants.lapsed(&presenting[0].2, T).expect("decided"),
+        "anchored in this boot"
+    );
+    continuous.advance(std::time::Duration::from_millis(MINUTE_MS + 1_000));
+    // The second grant's end is on record from an earlier reader, before anything in this daemon
+    // anchored it.
+    grants
+        .record_grant_expiry(presenting[1].2.grant.grant_id, T)
+        .expect("the end is written down");
+
+    for (index, (paired, key, _)) in presenting.iter().enumerate() {
+        let lease = organisation.lease(2, &member("ada"), *key.public(), T, VIEW);
+        let outcome = controller
+            .present_membership_lease(paired.device_id, key.public(), &lease)
+            .expect("storage");
+        if index < 2 {
+            assert_eq!(
+                outcome,
+                Err(LeaseRefused::NoOrganisationGrant),
+                "device {index}: a grant out of force answers for no presentation"
+            );
+            assert!(binding_of(&controller, organisation_id, paired.device_id).is_none());
+        } else {
+            assert!(
+                outcome
+                    .expect("the control: a live stored grant answers")
+                    .bound,
+                "and the device binds"
+            );
+        }
+    }
 }
