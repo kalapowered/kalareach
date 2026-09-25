@@ -827,6 +827,20 @@ pub enum HostCommand {
     Power(PowerArguments),
     /// Show the terminal applications this host has, and which one a new window opens in.
     Terminal(TerminalArguments),
+    /// Show or choose how `kr new` starts this environment's control daemon when none is running.
+    Startup(StartupArguments),
+}
+
+/// `kr host startup`.
+#[derive(Debug, Args)]
+pub struct StartupArguments {
+    /// The way to choose: `standalone`, which has `kr new` start the daemon itself, detached from
+    /// the command. Without it, what is chosen is shown and nothing changes.
+    #[arg(long)]
+    pub set: Option<String>,
+    /// Choose none, so that `kr new` finds no daemon and says what to set up.
+    #[arg(long, conflicts_with = "set")]
+    pub clear: bool,
 }
 
 /// `kr host terminal`.
@@ -1430,6 +1444,35 @@ mod tests {
             panic!("power");
         };
         assert_eq!(power.set.as_deref(), Some("mains_only"));
+    }
+
+    /// KR-REQ-07.12: how the control daemon is started is shown with no argument, chosen with
+    /// `--set` and cleared with `--clear`, and the last two are not one request.
+    #[test]
+    fn the_startup_is_shown_set_and_cleared() {
+        let startup = |arguments: &[&str]| {
+            let parsed = Cli::try_parse_from(arguments).expect("parses");
+            let Command::Host(arguments) = parsed.command else {
+                panic!("host");
+            };
+            let HostCommand::Startup(startup) = arguments.command else {
+                panic!("startup");
+            };
+            startup
+        };
+        let shown = startup(&["kr", "host", "startup"]);
+        assert!(
+            shown.set.is_none() && !shown.clear,
+            "showing it changes nothing"
+        );
+        let chosen = startup(&["kr", "host", "startup", "--set", "standalone"]);
+        assert_eq!(chosen.set.as_deref(), Some("standalone"));
+        assert!(startup(&["kr", "host", "startup", "--clear"]).clear);
+        assert!(
+            Cli::try_parse_from(["kr", "host", "startup", "--set", "standalone", "--clear"])
+                .is_err(),
+            "choosing one and clearing it are not one request"
+        );
     }
 
     /// KR-REQ-07.31: the saved preference is the middle step of the selection order.

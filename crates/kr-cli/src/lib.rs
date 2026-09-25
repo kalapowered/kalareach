@@ -19,6 +19,7 @@
 //! | [`device`] | `kr device`: the paired devices, and revoking one |
 //! | [`plugin`] | `kr plugin`: plugin packages and the repositories they come from |
 //! | [`resolve`] | Finding a session by number or identifier, and reaching its worker |
+//! | [`startup`] | `kr host startup`, and `kr new` starting the control daemon under the standalone start |
 //! | [`contact`] | The contact tools an agent reaches its person through, over the Model Context Protocol |
 //! | [`create`] | The palette a new session starts with |
 //! | [`question`] | Reading and answering an agent's questions from the terminal |
@@ -57,6 +58,7 @@ pub mod resolve;
 pub mod session;
 pub mod shell;
 pub mod skill;
+pub mod startup;
 pub mod terminal;
 pub mod windows;
 pub mod workspace;

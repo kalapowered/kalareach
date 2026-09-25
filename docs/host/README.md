@@ -26,7 +26,7 @@ Two roots, both owner-only, both checked rather than assumed on every open.
 | Root | macOS | Linux | Override | Holds |
 | --- | --- | --- | --- | --- |
 | runtime | `$TMPDIR/kalareach` | `$XDG_RUNTIME_DIR/kalareach` | `KR_RUNTIME_DIR` | the control socket, the rendezvous socket, worker endpoints, published descriptors |
-| state | `~/Library/Application Support/KalaReach` | `$XDG_STATE_HOME/kalareach` | `KR_STATE_DIR` | the registry, worker journals, output spools, generated job definitions, the secret-store fallback, the transfer store and its staging area, the backup store and its staged ciphertext |
+| state | `~/Library/Application Support/KalaReach` | `$XDG_STATE_HOME/kalareach` | `KR_STATE_DIR` | the registry, worker journals, output spools, generated job definitions, the secret-store fallback, the transfer store and its staging area, the backup store and its staged ciphertext, and what a daemon `kr new` started writes (`controller.log`) |
 
 Everything above a root is created with the platform's ordinary permissions; `/tmp` is
 world-writable by design and `~/.cache` is usually group-readable, and neither is KalaReach's to
@@ -84,7 +84,8 @@ configuration file this host reads.
   },
   "secrets": [{ "name": "relay", "store": "login_keychain", "item": "kalareach/relay" }],
   "network": { "enabled": true, "relay_urls": ["https://relay.example.com"] },
-  "voice": { "broker_origin": "https://voice.example.com" }
+  "voice": { "broker_origin": "https://voice.example.com" },
+  "startup": { "controller": "standalone" }
 }
 ```
 
@@ -201,6 +202,40 @@ document now selects something other than what the daemon started with, the chec
 edit applies at the next start. What only the start can find out, a trust anchor file that is
 missing or empty or a bind address somebody else holds, stops the start with the key named, rather
 than leaving a host that appears to run and cannot be reached.
+
+### How the daemon is started
+
+A headless or SSH-first host has its per-user daemon started on demand, and only once it has been
+set up for that. The document's `startup` section records the setup:
+
+```json
+"startup": { "controller": "standalone" }
+```
+
+| Field | What it selects | What it accepts |
+| --- | --- | --- |
+| `startup.controller` | how `kr new` starts this environment's control daemon when none is running; absent starts none, and `kr new` answers `HOST_NOT_CONFIGURED` with the setup action | `standalone` |
+
+`standalone` is the standalone headless profile, for a host with no service manager set up to start
+the daemon. `kr new` then runs the `kr-controller` installed beside it, detached: in a session and a
+process group of its own with no controlling terminal, its standard streams going to
+`controller.log` in the environment's state directory, working in that directory, and given the
+environment's own runtime and state roots. It inherits the command's environment except `PATH`,
+which is the one a per-user service manager gives a daemon on the platform
+(`/usr/bin:/bin:/usr/sbin:/sbin` on macOS, `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`
+elsewhere), so the programs the daemon runs are the platform's and not whatever a caller's shell
+put first. Its IPC is the owner-only endpoints every daemon serves, and it takes the environment's
+singleton lock and advances its generation like any other start; several commands starting it at
+once leave one daemon. The command waits up to 30 seconds for it to answer, and
+[docs/cli/README.md](../cli/README.md#when-no-control-daemon-is-running) says what a person sees.
+
+`kr host startup` writes the section as one validated edit with no daemon running, and `kr doctor`
+reports it with its source and as applying at the next start. Like the network and the voice
+broker, no request, profile or environment variable reaches it, so a variable exported in one
+terminal cannot make a command start a daemon on a host that was never set up to have one started.
+Neither writing the choice nor starting the daemon installs a service, enables lingering or obtains
+a privilege. A value this build does not know makes the document invalid, and the host starts
+nothing.
 
 ### What leaves this host
 

@@ -134,7 +134,19 @@ async fn run(cli: Cli) -> Result<Completion> {
                 }
                 Presentation::Terminal | Presentation::Invisible => None,
             };
-            let mut client = open_controller(&environment.paths, build_id()).await?;
+            // A host set up for the standalone start has its daemon started here when none is
+            // running; any other host is told what to set up.
+            let (mut client, started) =
+                kr_cli::startup::open_or_start(&paths, &environment).await?;
+            if let Some(started) = started
+                && !cli.json
+            {
+                eprintln!(
+                    "kr: started the control daemon for environment {} (process {}) under the \
+                     standalone start",
+                    environment.environment_id, started.pid
+                );
+            }
             // The execution context is this host's own unless the command chose one. The
             // presentation is not consulted: an invisible session runs where a visible one would,
             // and it keeps that desktop's access.
@@ -845,6 +857,10 @@ async fn run(cli: Cli) -> Result<Completion> {
                         ),
                     }
                 }
+                Ok(Completion::Done)
+            }
+            HostCommand::Startup(startup) => {
+                kr_cli::startup::run(&paths, &startup, cli.json)?;
                 Ok(Completion::Done)
             }
         },

@@ -205,6 +205,12 @@ pub async fn open_worker(descriptor: &WorkerDescriptor, build_id: BuildId) -> Re
     Ok(client)
 }
 
+/// What a person does about an environment whose control daemon is not running: start one, or
+/// set this host up for `kr new` to start one itself.
+pub const SETUP_ACTION: &str = "start the control daemon, kr-controller, for it, or select the \
+                                standalone start with `kr host startup --set standalone` so that \
+                                `kr new` starts one";
+
 /// Connects to the control daemon.
 ///
 /// # Errors
@@ -216,12 +222,16 @@ pub async fn open_controller(paths: &EnvironmentPaths, build_id: BuildId) -> Res
     let endpoint = paths.controller_endpoint()?;
     LocalClient::connect(&endpoint, LocalClientKind::Cli, build_id)
         .await
-        .map_err(|error| {
-            CliError::HostUnavailable(format!(
-                "no KalaReach host is running for this environment: {error}; start the control \
-                 daemon, kr-controller, for it"
-            ))
-        })
+        .map_err(|error| not_running(&error, SETUP_ACTION))
+}
+
+/// The failure a command that needs a control daemon is given when none answers: what went wrong,
+/// and `action`, what the person does about it.
+#[must_use]
+pub fn not_running(error: &dyn core::fmt::Display, action: &str) -> CliError {
+    CliError::HostUnavailable(format!(
+        "no KalaReach host is running for this environment: {error}; {action}"
+    ))
 }
 
 /// Resolves a selector that names no live descriptor, through what the environment's daemon

@@ -19,6 +19,7 @@ worker directly for what a session owns.
 | `kr doctor` | — | Read-only diagnostics, this host's effective configuration, and support bundles |
 | `kr host power` | — | Show or change whether this host stays awake for work it has admitted |
 | `kr host terminal` | — | Show the terminal applications this host has, and which one a new window opens in |
+| `kr host startup` | — | Show or choose how `kr new` starts this environment's control daemon when none is running |
 | `kr bridge --stdio` | — | Serve this environment to a local process bridge on standard input and output |
 | `kr bridge [list/enrol/forget/refresh]` | — | The environments this host has enrolled, and what it last saw of them |
 | `kr pair [invite/confirm/cancel/status]` | `kr p` | Pair a device: issue an invitation, approve the device that answers it, withdraw one, or read one |
@@ -121,6 +122,38 @@ forwarding input here, so the command says how many bytes it could not deliver. 
 does not report both colours has shared no palette, and the command says so rather than recording a
 provenance nothing measured. `--invisible --palette probe` is refused for the same reason: there is
 no terminal to ask.
+
+### When no control daemon is running
+
+`kr new` asks the environment's control daemon for the session, and a host where none is running
+has to have been set up for one to be started. One that was not is answered `HOST_NOT_CONFIGURED`
+with what to do: start the daemon, `kr-controller`, or choose the standalone start with
+`kr host startup --set standalone`. The command installs no service, enables no lingering and
+obtains no privilege on the way.
+
+With the standalone start chosen, `kr new` starts the daemon itself when nothing answers on the
+environment's endpoint: the `kr-controller` installed beside `kr`, detached from the command. It runs
+in a session and a process group of its own with no controlling terminal and none of the command's
+standard streams, works in the environment's own state directory, is told the environment's own
+runtime and state roots, and looks for the programs it runs in the platform's own directories rather
+than in the `PATH` of whoever ran the first `kr new`. It is otherwise an ordinary start: its keys go
+where an installed daemon keeps them, it serves the usual owner-only endpoints, and it takes the
+environment's singleton lock and advances its generation. That lock is what leaves one daemon when
+several commands start one at once; a daemon that cannot take it ends, and the command that started
+it goes on with the one that did. The start is for this installation's own environment only, and a
+command that names another environment is told to start that environment's daemon.
+
+The command waits up to 30 seconds for an answer, then creates the session exactly as it would with
+a daemon that was already running. In text form it first says, on standard error, which daemon it
+started. A daemon that has not answered in 30 seconds ends the command with
+`ENVIRONMENT_UNAVAILABLE` and exit status 1, naming the process, whether it is still running and the
+last line it wrote. What the daemon writes is in `controller.log` in the environment's state
+directory. The command does not end a daemon that is slow to come up, such as one waiting for
+somebody to allow it into a credential store: it may still come up, and the lock keeps a second one
+from serving beside it.
+
+Other commands never start a daemon. `kr list`, `kr status` and the rest answer `HOST_NOT_CONFIGURED`
+with the same setup action when none is running.
 
 ### Shell mode
 
@@ -998,6 +1031,21 @@ already permitted needs. When the host answers that this one needs the owner, `k
 `OWNER_CONFIRMATION_REQUIRED` and says to confirm and install it from an owner device. It leaves no
 confirmation waiting.
 
+## `kr host startup`
+
+```sh
+kr host startup                        # what is chosen, and where it was chosen
+kr host startup --set standalone       # kr new starts the control daemon itself when none runs
+kr host startup --clear                # choose nothing; kr new says what to set up instead
+```
+
+The choice is the `startup.controller` selection of the versioned per-user host configuration
+document, and `--set` and `--clear` each apply one validated revision of it. No daemon is asked and
+none is started: `kr new` reads the choice the next time it finds no daemon running, which is why
+`kr doctor` reports it as applying at the next start. Writing it installs no service, enables no
+lingering and obtains no privilege. `standalone` is the one way this build knows. The standalone
+start runs the daemon in a session of its own, which Windows does not have, so there it is refused.
+
 ## `kr host power`
 
 Automatic sleep is the machine's own policy, and `kr` changes it only when you ask:
@@ -1136,6 +1184,24 @@ inhibition line.
 power object holds the setting, whether an assertion is held, its reason, the facility holding it,
 the power source, the counts behind the decision, and either the holder or the reason nothing is
 held.
+
+`kr host startup --json` returns what is chosen and where it was chosen. `controller` is
+`standalone` or null, `source` is `host_configuration` or `default`, `document_state` is the
+document's condition as `kr doctor` names it, and `revision` is the document's revision as text:
+
+```json
+{
+  "ok": true,
+  "environment_id": "70a528be-be60-4cfb-870e-e3d3ba30344d",
+  "startup": {
+    "controller": "standalone",
+    "source": "host_configuration",
+    "document": "/home/example/.config/kalareach/environments/70a528be/config.json",
+    "document_state": "loaded",
+    "revision": "4"
+  }
+}
+```
 
 `kr pair invite --json` returns the invitation:
 
