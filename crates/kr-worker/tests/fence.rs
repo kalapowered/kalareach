@@ -1424,7 +1424,8 @@ async fn a_real_qualified_package_registers_and_qualifies_on_this_hosts_endpoint
 /// host's own endpoint.
 struct RealShell {
     _temp: kr_ipc::testing::TempHost,
-    home: tempfile::TempDir,
+    /// The shell's home, which is also the directory it starts in, kept for as long as it runs.
+    _home: tempfile::TempDir,
     runtime: Arc<SessionRuntime>,
     bridge_task: tokio::task::JoinHandle<()>,
     qualified: Option<ShellKind>,
@@ -1562,19 +1563,23 @@ impl RealShell {
         });
         Self {
             _temp: temp,
-            home,
+            _home: home,
             runtime,
             bridge_task,
             qualified,
         }
     }
 
-    /// The shell's home, as the kernel names it, which is the directory a shell reports.
+    /// The directory the shell started in, which is its home, as the kernel names it: the name a
+    /// shell reports.
+    #[cfg(unix)]
     fn home(&self) -> std::path::PathBuf {
-        std::fs::canonicalize(self.home.path()).expect("the home resolves")
+        let started_in = self.runtime.session().config().shell.cwd.clone();
+        std::fs::canonicalize(started_in).expect("the home resolves")
     }
 
     /// Attaches a terminal that takes the keys, as a person's terminal does.
+    #[cfg(unix)]
     fn keys(&self) -> RealKeys {
         let attachment_id = AttachmentId::new(kr_ipc::new_uuid());
         let params = terminal(self.runtime.session().config().session_id);
@@ -1596,6 +1601,7 @@ impl RealShell {
     }
 
     /// Waits until the session's retained output carries `marker` `count` times.
+    #[cfg(unix)]
     async fn produced(&self, marker: &[u8], count: usize) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
@@ -1629,12 +1635,14 @@ impl RealShell {
 }
 
 /// The input lease a real shell's terminal holds.
+#[cfg(unix)]
 struct RealKeys {
     attachment_id: AttachmentId,
     epoch: u64,
     sequence: u64,
 }
 
+#[cfg(unix)]
 impl RealKeys {
     /// Types one line into the shell through the lease, as a person at the terminal does.
     fn type_line(&mut self, shell: &RealShell, line: &str) {
@@ -1657,11 +1665,16 @@ impl RealKeys {
 }
 
 /// A recording program on the internal disk, what it recorded, and the integration's diagnostics.
+///
+/// The program is a POSIX shell script made executable through its permission bits, so it and the
+/// cases that start it are for Unix only.
+#[cfg(unix)]
 struct RealProbes {
     _directory: tempfile::TempDir,
     root: std::path::PathBuf,
 }
 
+#[cfg(unix)]
 impl RealProbes {
     fn new() -> Self {
         let directory = tempfile::Builder::new()
@@ -1810,6 +1823,7 @@ impl RealProbes {
 /// This host establishes no command backend yet, so every answer here is a bypass: `not_integrated`
 /// for a session created with no integration, and `backend_unavailable` for one created with an
 /// integration for the name.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_real_package_asks_the_real_worker_before_each_command_and_runs_a_bypass_as_typed() {
     let Some(root) = std::env::var_os(PACKAGE_ROOT_VARIABLE) else {
@@ -1833,6 +1847,7 @@ async fn a_real_package_asks_the_real_worker_before_each_command_and_runs_a_bypa
 
 /// What [`a_real_package_asks_the_real_worker_before_each_command_and_runs_a_bypass_as_typed`]
 /// asks of one package.
+#[cfg(unix)]
 async fn asks_the_real_worker_before_each_command(
     package: &kr_shell_integration::host::package::ShellPackage,
 ) {
