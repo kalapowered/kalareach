@@ -518,22 +518,28 @@ mod cases {
             assert!(!said.contains(NEUTRAL), "{said}");
         }
         // A local connection's failure names the file by the names the host's tree writes, and
-        // replaces a name a listing could have found.
+        // replaces a name a listing could have found, with the platform's own separator
+        // throughout. The file is in this machine's temporary directory, a real place on every
+        // platform, whatever that directory is rendered as.
+        let separator = std::path::MAIN_SEPARATOR;
         let said = ClientError::Ipc(kr_ipc::IpcError::Io {
             operation: "read",
-            path: std::path::Path::new("/nowhere-configured")
+            path: std::env::temp_dir()
                 .join(NEUTRAL)
                 .join("sessions")
                 .join("0e1f9a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b.kr"),
             source: std::io::Error::from_raw_os_error(2),
         })
         .to_string();
+        assert!(said.starts_with("read "), "{said}");
         assert!(
-            said.starts_with(
-                "read /[a name]/[a name]/sessions/0e1f9a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b.kr: "
-            ),
+            said.contains(&format!(
+                "{separator}[a name]{separator}sessions{separator}\
+                 0e1f9a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b.kr: "
+            )),
             "{said}"
         );
+        assert!(!said.contains(NEUTRAL), "{said}");
         assert!(said.ends_with("(os error 2)"), "{said}");
     }
 
