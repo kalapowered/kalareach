@@ -1129,7 +1129,8 @@ its worker reports it, with how it is presented and why. `presentation` is `dire
 and `presentation_reason` is null for a direct attachment, which needs no reason, and for a
 viewport whose worker was built before reasons existed. It is null as a whole for a session read
 from the control daemon, which has no live worker to ask; when the worker answered the session read
-and not the question about its attachments, `terminal_attachments_unread` says why.
+and not the question about its attachments, within 10 seconds of being asked,
+`terminal_attachments_unread` says why.
 
 ```json
 {

@@ -1188,12 +1188,17 @@ async fn read_from_controller(
 /// be read.
 type AttachmentsRead = std::result::Result<Vec<kr_protocol::attachment::AttachmentSummary>, String>;
 
+/// How long `kr status` waits for a worker to answer the question about its attachments, after it
+/// has already answered the session read.
+const ATTACHMENTS_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Reads a session from its own worker, and each of its attachments with it.
 ///
 /// Each attachment's presentation and the reason for it travel in the worker's snapshot rather
 /// than in the session read, so the snapshot is asked on the same connection. It is a second
-/// question: a worker that cannot answer it leaves the session read standing, and the command says
-/// the attachments were not read rather than failing the whole status.
+/// question, asked within [`ATTACHMENTS_BOUND`]: a worker that cannot answer it, or does not answer
+/// it in time, leaves the session read standing, and the command says the attachments were not read
+/// rather than failing or holding back the whole status.
 async fn read_session(
     descriptor: &kr_protocol::worker::WorkerDescriptor,
 ) -> Result<(SessionReadResult, AttachmentsRead)> {
@@ -1207,22 +1212,28 @@ async fn read_session(
         )
         .await?;
     let read = read_result(outcome)?;
-    let attachments = match client
-        .request(
+    let asked = tokio::time::timeout(
+        ATTACHMENTS_BOUND,
+        client.request(
             Method::EventsSnapshot,
             &kr_protocol::recovery::EventsSnapshotParams {
                 session_id: descriptor.session_id,
                 agent_resources_from: Nullable::null(),
             },
-        )
-        .await
-    {
-        Ok(Ok(value)) => value
+        ),
+    )
+    .await;
+    let attachments = match asked {
+        Ok(Ok(Ok(value))) => value
             .to_typed::<kr_protocol::recovery::EventsSnapshotResult>()
             .map(|snapshot| snapshot.attachments)
             .map_err(|error| error.to_string()),
-        Ok(Err(refusal)) => Err(refusal.to_string()),
-        Err(error) => Err(error.to_string()),
+        Ok(Ok(Err(refusal))) => Err(refusal.to_string()),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err(format!(
+            "the session's worker did not answer within {} seconds",
+            ATTACHMENTS_BOUND.as_secs()
+        )),
     };
     Ok((read, attachments))
 }
