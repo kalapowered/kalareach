@@ -1974,15 +1974,32 @@ fn an_object_at_a_former_temporary_name_does_not_hide_what_was_published() {
         assert!(!staged.exists(), "{published}: renamed away");
         std::fs::write(&staged, b"somebody's own").expect("somebody puts a file there");
 
-        let settled = site
-            .bridges()
-            .reconcile(&plugin(), None)
-            .expect("reconciles");
+        let next = site.bridges();
+        let settled = next.reconcile(&plugin(), None).expect("reconciles");
 
         assert!(
             matches!(settled, Settled::Unsettled(_)),
             "{published}: {settled:?}"
         );
+        // The publication is recorded only after its directory is flushed, although nothing
+        // was taken from the temporary name.
+        let steps = next.steps();
+        let directory = site
+            .application()
+            .join(published)
+            .parent()
+            .expect("a directory")
+            .display()
+            .to_string();
+        let flushed = steps
+            .iter()
+            .position(|step| *step == format!("flush {directory}"))
+            .expect("the directory is flushed");
+        let recorded = steps
+            .iter()
+            .position(|step| step.starts_with("save "))
+            .expect("the publication is recorded");
+        assert!(flushed < recorded, "{published}: {steps:?}");
         assert_eq!(
             std::fs::read(&staged).expect("left"),
             b"somebody's own",
