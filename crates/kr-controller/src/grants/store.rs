@@ -370,6 +370,9 @@ impl GrantDirectory {
     /// writes the floor it stood on before its next decision, and an effect asked for again once
     /// that record is down is refused as expired.
     fn unanswerable(&self, bound: &Bound) -> ControllerError {
+        if bound.unproven {
+            return crate::grants::continuity_lost();
+        }
         if let Some(clock) = self.host_clock.get()
             && !bound.recorded
         {
@@ -536,6 +539,7 @@ impl GrantDirectory {
                 passed: !expiry.is_valid_at(admitted_ms),
                 recorded: true,
                 owed: false,
+                unproven: false,
             },
         }
     }
@@ -1069,7 +1073,7 @@ impl GrantDirectory {
                     return Ok(Err(refusal("this invitation has expired")));
                 }
                 InvitationState::Open if invitation_bound.owed => {
-                    return Ok(Err(unrecorded()));
+                    return Ok(Err(self.unanswerable(&invitation_bound)));
                 }
                 InvitationState::Open => {}
                 InvitationState::Redeemed => {
@@ -1107,7 +1111,7 @@ impl GrantDirectory {
                 return Ok(Err(refusal("that invitation has expired")));
             }
             if grant_bound.owed {
-                return Ok(Err(unrecorded()));
+                return Ok(Err(self.unanswerable(&grant_bound)));
             }
             let activated = connection
                 .execute(

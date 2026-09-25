@@ -167,6 +167,7 @@ async fn host_with(
         worker_endpoint: None,
         send_queue_bytes,
         resident_bytes: 1024 * 1024,
+        time: kr_worker::action::time::TimeSources::system(),
         launch_profile: kr_protocol::session::LaunchProfile::default(),
     };
     let mut session = Session::open(config).expect("opens the session");
@@ -2124,6 +2125,7 @@ async fn a_queue_too_small_for_any_screen_is_refused_when_it_is_asked_for() {
         worker_endpoint: None,
         send_queue_bytes: 8 * 1024 * 1024,
         resident_bytes: 1024 * 1024,
+        time: kr_worker::action::time::TimeSources::system(),
         launch_profile: kr_protocol::session::LaunchProfile::default(),
     };
     let mut session = Session::open(config).expect("opens the session");

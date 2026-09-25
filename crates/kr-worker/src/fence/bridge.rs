@@ -271,6 +271,7 @@ mod tests {
             worker_endpoint: None,
             send_queue_bytes: 8 * 1024 * 1024,
             resident_bytes: 1024 * 1024,
+            time: crate::action::time::TimeSources::system(),
             launch_profile: kr_protocol::session::LaunchProfile::default(),
         })
         .expect("opens the session");

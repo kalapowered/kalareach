@@ -268,6 +268,7 @@ async fn host() -> Host {
         worker_endpoint: None,
         send_queue_bytes: 1024 * 1024,
         resident_bytes: 64 * 1024,
+        time: kr_worker::action::time::TimeSources::system(),
         launch_profile: kr_protocol::session::LaunchProfile::default(),
     };
     let journal_path = config.journal_path.clone().expect("the harness journals");

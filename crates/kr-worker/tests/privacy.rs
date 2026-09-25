@@ -54,6 +54,7 @@ fn session_on_disk() -> (kr_ipc::testing::TempHost, Session) {
         spool_directory: Some(environment.session_spool(session_id)),
         send_queue_bytes: 1024 * 1024,
         resident_bytes: 64 * 1024,
+        time: kr_worker::action::time::TimeSources::system(),
     };
     let session = Session::open(config).expect("opens the session");
     (temp, session)
@@ -501,6 +502,7 @@ fn a_restarted_session_reads_its_generation_back_and_keeps_refusing_what_it_refu
         spool_directory: Some(environment.session_spool(session_id)),
         send_queue_bytes: 1024 * 1024,
         resident_bytes: 64 * 1024,
+        time: kr_worker::action::time::TimeSources::system(),
     };
     let restarted = Session::open(config).expect("opens the session again");
     assert!(restarted.privacy().is_enabled());
@@ -631,6 +633,7 @@ fn a_session_whose_privacy_state_cannot_be_read_retains_nothing_and_owes_its_cle
         spool_directory: Some(environment.session_spool(session_id)),
         send_queue_bytes: 1024 * 1024,
         resident_bytes: 64 * 1024,
+        time: kr_worker::action::time::TimeSources::system(),
     };
     let mut session = Session::open(config).expect("opens the session");
     session.ingest_output(&[b'x'; 4096]);

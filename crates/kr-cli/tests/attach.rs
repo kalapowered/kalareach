@@ -175,6 +175,7 @@ async fn hosted_listening(script: &str, listening: Option<DisplayNumber>) -> Hos
         worker_endpoint: None,
         send_queue_bytes: 1024 * 1024,
         resident_bytes: 256 * 1024,
+        time: kr_worker::action::time::TimeSources::system(),
         launch_profile: kr_protocol::session::LaunchProfile::default(),
     };
     let mut session = Session::open(config).expect("opens the session");
@@ -345,6 +346,7 @@ async fn second_session(hosted: &Hosted, script: &str) -> (DisplayNumber, Arc<Se
         worker_endpoint: None,
         send_queue_bytes: 1024 * 1024,
         resident_bytes: 256 * 1024,
+        time: kr_worker::action::time::TimeSources::system(),
         launch_profile: kr_protocol::session::LaunchProfile::default(),
     };
     let mut session = Session::open(config).expect("opens the session");

@@ -23,6 +23,8 @@
 //! | KR-REQ-24.15 | `expiry_is_revalidated_after_a_wake_and_a_restored_old_policy_cannot_revive_authority` |
 
 use std::sync::Arc;
+
+use kr_controller::grants::policy::UtcFloor;
 use std::time::Duration;
 
 mod net_support;
@@ -1899,7 +1901,11 @@ fn a_stored_policy_is_read_back_with_its_restrictions_and_its_floors() {
         .stored_policy()
         .expect("readable")
         .expect("present");
-    let mut restored = HostPolicy::restore(&stored, AuthorityRevision::new(3));
+    let mut restored = HostPolicy::restore(
+        &stored,
+        AuthorityRevision::new(3),
+        Arc::new(UtcFloor::at(stored.utc_floor_ms.get())),
+    );
     assert!(
         restored.is_exclusively_managed(),
         "a restart is not an amnesty"
@@ -2589,14 +2595,16 @@ async fn a_local_revocation_advances_the_revision_and_answers_through_the_barrie
     );
 
     // And the revision survives a restart of the policy, because it was written down.
+    let stored = controller
+        .sharing()
+        .grants()
+        .stored_policy()
+        .expect("readable")
+        .expect("present");
     let restored = HostPolicy::restore(
-        &controller
-            .sharing()
-            .grants()
-            .stored_policy()
-            .expect("readable")
-            .expect("present"),
+        &stored,
         before,
+        Arc::new(UtcFloor::at(stored.utc_floor_ms.get())),
     );
     assert_eq!(restored.accepted_floor(), result.authority_revision);
 }

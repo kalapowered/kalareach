@@ -4354,6 +4354,7 @@ mod tests {
             active: Arc::new(active.clone()),
             wall: Arc::new(wall.clone()),
             adapter: Arc::new(adapter.clone()),
+            floor: None,
         };
         let written = |module: &AttentionModule| {
             let bytes = std::fs::read(&module.time_file).expect("the record is written");

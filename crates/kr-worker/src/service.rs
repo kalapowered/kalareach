@@ -159,6 +159,8 @@ pub struct WorkerService {
     clock: Arc<SystemContinuousClock>,
     /// The machine's own continuous clock, which is the one a forwarded deadline arrives on.
     shared_clock: Arc<dyn kr_ipc::clock::SharedClock>,
+    /// The session's time contract, which reads UTC through the host's clock floor.
+    time: Arc<crate::action::time::TimeContract>,
     /// The action windows of every connection this worker serves.
     windows: ActionWindowIssuer,
     controller_public_key: AuthorisationKey,
@@ -343,6 +345,7 @@ impl WorkerService {
         // accepted and the fence the writer applies before it is written have to be reading the
         // same clock for the second to be a continuation of the first.
         let shared_clock = runtime.shared_clock();
+        let time = Arc::clone(runtime.session().time());
         let journal_changes = runtime
             .session()
             .journal()
@@ -360,6 +363,7 @@ impl WorkerService {
             windows: ActionWindowIssuer::with_default_validity(Arc::clone(&clock) as Arc<_>),
             clock,
             shared_clock,
+            time,
             controller_public_key: binding.controller_public_key,
             authority: Mutex::new(Authority {
                 accepted_generation: Some(binding.controller_generation),
@@ -1556,9 +1560,22 @@ impl WorkerService {
             boot_identity: self.boot_identity.clone(),
             peer: peer.to_wire(),
             action_window,
-            capabilities: CanonicalSet::new(),
+            capabilities: self.stated_capabilities(),
             max_receive: kr_protocol::hello::ReceiveLimits::default(),
         }))
+    }
+
+    /// What this worker states about itself in its answer to a hello.
+    ///
+    /// The clock floor it maps, by the floor's identity, so a control daemon can tell whether this
+    /// worker decides UTC deadlines from the same floor as it does. A worker that maps none states
+    /// none.
+    fn stated_capabilities(&self) -> CanonicalSet<kr_protocol::ids::CapabilityId> {
+        self.time
+            .floor_identity()
+            .map(|identity| kr_protocol::local::utc_floor_capability(identity.as_bytes()))
+            .into_iter()
+            .collect()
     }
 
     /// Issues an action window for one authenticated connection.

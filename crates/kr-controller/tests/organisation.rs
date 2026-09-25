@@ -8,6 +8,8 @@ mod organisation_support;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+
+use kr_controller::grants::policy::UtcFloor;
 use std::time::Duration;
 
 use kr_controller::grants::organisation::{
@@ -286,7 +288,11 @@ fn the_anchor_and_lease_records_survive_a_restart_and_no_lease_is_installed() {
         .stored_policy()
         .expect("readable")
         .expect("present");
-    let mut restored = HostPolicy::restore(&stored, AuthorityRevision::new(1));
+    let mut restored = HostPolicy::restore(
+        &stored,
+        AuthorityRevision::new(1),
+        Arc::new(UtcFloor::at(stored.utc_floor_ms.get())),
+    );
     let enrolment = restored
         .enrolment(organisation_id)
         .expect("the enrolment survives");
@@ -812,7 +818,11 @@ fn a_record_is_let_go_only_once_the_floor_shows_its_leases_expired() {
 
     // Restored without the record, the lease is still refused: the floor written beside the
     // pruning has passed its expiry, whatever the wall clock reads.
-    let mut restored = HostPolicy::restore(&snapshot, AuthorityRevision::new(1));
+    let mut restored = HostPolicy::restore(
+        &snapshot,
+        AuthorityRevision::new(1),
+        Arc::new(UtcFloor::at(snapshot.utc_floor_ms.get())),
+    );
     assert_eq!(
         restored.install_lease(presented(
             &lease,

@@ -210,6 +210,7 @@ async fn wired(script: &str) -> Wired {
         launch_profile: kr_protocol::session::LaunchProfile::default(),
         send_queue_bytes: 8 * 1024 * 1024,
         resident_bytes: 1024 * 1024,
+        time: kr_worker::action::time::TimeSources::system(),
     };
     let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
     let process = kr_ipc::identity::current_process_start_identity().expect("a process identity");

@@ -928,6 +928,7 @@ async fn a_worker_that_has_not_qualified_proves_nothing_and_is_found_when_it_doe
         worker_endpoint: None,
         send_queue_bytes: 8 * 1024 * 1024,
         resident_bytes: 1024 * 1024,
+        time: kr_worker::action::time::TimeSources::system(),
         launch_profile: kr_protocol::session::LaunchProfile::default(),
     })
     .expect("opens the session");

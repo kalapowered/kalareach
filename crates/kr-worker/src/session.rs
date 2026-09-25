@@ -100,6 +100,12 @@ pub struct SessionConfig {
     pub send_queue_bytes: usize,
     /// The resident output cache.
     pub resident_bytes: usize,
+    /// The clocks the session's time contract reads, and the host's clock floor it publishes its
+    /// readings in and decides every copy of authority's UTC deadline from.
+    ///
+    /// The worker binary maps the environment's floor here; a session with none refuses every
+    /// copy that carries a UTC deadline ([`crate::action::time::TimeContract::check_utc_deadline`]).
+    pub time: crate::action::time::TimeSources,
 }
 
 /// What a close request produced.
@@ -403,7 +409,7 @@ impl Session {
         let time = Arc::new(crate::action::time::TimeContract::restore(
             boot_identity,
             String::new(),
-            crate::action::time::TimeSources::system(),
+            config.time.clone(),
             recorded,
         ));
         if let Some(journal) = journal.as_mut() {

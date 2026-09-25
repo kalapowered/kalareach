@@ -35,6 +35,7 @@ use kr_protocol::worker::{ReservationId, WorkerLaunchSpec, WorkerReady};
 use kr_shell_integration::host::HostError;
 use kr_shell_integration::host::endpoint::HostEndpoint;
 use kr_shell_integration::host::package::{PackageFault, ShellPackage, StartupMode};
+use kr_worker::action::time::TimeSources;
 use kr_worker::environment::{ExecutionContext, build as build_environment};
 use kr_worker::history::DEFAULT_RESIDENT_BYTES;
 use kr_worker::output::DEFAULT_SEND_QUEUE_BYTES;
@@ -110,6 +111,23 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     environment.create()?;
 
     let boot_identity = kr_ipc::identity::boot_identity()?;
+    // The host's one reading of UTC in this boot, which the control daemon created before it asked
+    // for this worker. A worker maps it and never creates or replaces it; one that finds no usable
+    // floor maps nothing and serves no copy of authority that carries a UTC deadline.
+    let floor = match kr_ipc::floor::SharedFloor::open(
+        &environment.utc_floor_file(),
+        environment_id,
+        kr_ipc::identity::boot_epoch(&boot_identity)?,
+    ) {
+        Ok(floor) => Some(Arc::new(floor)),
+        Err(unusable) => {
+            eprintln!(
+                "kr-worker: {unusable}; this session serves no copy of authority that carries a UTC \
+                 deadline"
+            );
+            None
+        }
+    };
     let process_identity = kr_ipc::identity::current_process_start_identity()?;
     // The private half of this key never leaves this process: not to disk, not into an argument
     // vector, not into an environment variable. It dies with the worker.
@@ -202,6 +220,7 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         package.as_ref(),
         bridge.as_ref().map(|(_, endpoint)| endpoint),
         &endpoint,
+        floor,
     );
     // The machine's own continuous clock, which is the clock the daemon expresses a forwarded
     // authority deadline on. Every boundary in this process that decides whether authority has
@@ -495,6 +514,7 @@ fn session_config(
     package: Option<&ShellPackage>,
     bridge: Option<&HostEndpoint>,
     worker_endpoint: &kr_ipc::paths::Endpoint,
+    floor: Option<Arc<kr_ipc::floor::SharedFloor>>,
 ) -> SessionConfig {
     let create: &SessionCreateParams = &specification.create;
     // A managed session launches the package's own binary. Everything else launches the shell the
@@ -578,6 +598,9 @@ fn session_config(
         worker_endpoint: Some(worker_endpoint.as_text()),
         send_queue_bytes: DEFAULT_SEND_QUEUE_BYTES,
         resident_bytes: DEFAULT_RESIDENT_BYTES,
+        time: floor.map_or_else(TimeSources::system, |floor| {
+            TimeSources::system().with_floor(floor)
+        }),
     }
 }
 

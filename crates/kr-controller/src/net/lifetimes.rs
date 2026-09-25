@@ -141,7 +141,7 @@ impl GrantLifetimes {
             anchoring: Mutex::new(()),
             pending_expiry: Arc::new(PendingExpiry::default()),
             pending_stored: Mutex::new(BTreeMap::new()),
-            clock_trust: Arc::new(ClockTrust::new(wall.clone())),
+            clock_trust: Arc::new(ClockTrust::new(wall.clone(), Arc::clone(&floor))),
             wall,
             floor,
         }
@@ -274,6 +274,11 @@ impl GrantLifetimes {
         if matches!(grant.expiry, GrantExpiry::Never) {
             return true;
         }
+        // Nothing proves an expiring grant in force while this boot's clock continuity is lost,
+        // whatever its anchor says, and nothing is owed to the record either: it has not ended.
+        if self.floor.continuity_lost() {
+            return false;
+        }
         let Some(anchored) = self.anchored().get(&grant.grant_id).copied() else {
             return false;
         };
@@ -301,6 +306,7 @@ impl GrantLifetimes {
     /// an error when the store cannot be read or written.
     pub fn stored(&self, store: &GrantDirectory, record: &GrantRecord) -> Result<Anchored> {
         let grant_id = record.grant.grant_id;
+        self.provable(record.grant.expiry)?;
         if let Some(anchored) = self.anchored().get(&grant_id).copied() {
             return Ok(Anchored::of(anchored));
         }
@@ -475,8 +481,22 @@ impl GrantLifetimes {
         &self.clock_trust
     }
 
+    /// Refuses an expiring grant while this boot's clock continuity is lost.
+    ///
+    /// A reading published only in the floor this boot lost may have passed the grant's expiry,
+    /// and its anchor on the continuous clock proves nothing about that, so until the owner
+    /// establishes the clock no expiring grant is in force. Nothing is written: the grant has not
+    /// been found run out, only unproven.
+    fn provable(&self, expiry: GrantExpiry) -> Result<()> {
+        if expiry != GrantExpiry::Never && self.floor.continuity_lost() {
+            return Err(crate::grants::continuity_lost());
+        }
+        Ok(())
+    }
+
     fn lifetime(&self, record: &DeviceRecord) -> Result<Anchored> {
         let grant_id = record.grant.grant_id;
+        self.provable(record.grant.expiry)?;
         if let Some(anchored) = self.anchored().get(&grant_id).copied() {
             return Ok(Anchored::of(anchored));
         }
@@ -860,5 +880,90 @@ mod tests {
             .expect("readable")
             .expect("the device");
         assert!(recorded.expired_at_ms.is_some(), "the expiry is on record");
+    }
+
+    /// While this boot's clock continuity is lost, nothing proves an expiring grant in force,
+    /// whatever its anchor on the continuous clock says, and nothing about it is written as an
+    /// end: once the owner establishes the clock it stands again. A grant that does not expire is
+    /// never affected.
+    #[test]
+    fn a_lost_clock_continuity_proves_no_expiring_grant_and_ends_none() {
+        let devices = Arc::new(DeviceDirectory::in_memory().expect("a directory"));
+        let expiring = owner(4, in_a_minute());
+        let lasting = owner(5, GrantExpiry::Never);
+        devices.commit(&expiring).expect("the device");
+        devices.commit(&lasting).expect("the device");
+        let floor = Arc::new(UtcFloor::default());
+        let lifetimes = GrantLifetimes::new(
+            Arc::clone(&devices),
+            Arc::new(ManualClock::new()),
+            Arc::new(ManualSharedClock::new()),
+            kr_ipc::identity::boot_identity().expect("a boot identity"),
+            crate::service::WallClock::system(),
+            Arc::clone(&floor),
+        );
+        assert!(lifetimes.in_force(&expiring).expect("decided"), "anchored");
+
+        floor.lose_continuity();
+        assert!(!lifetimes.in_force(&expiring).expect("decided"));
+        assert!(!lifetimes.in_force_now(expiring.device_id, &expiring.grant));
+        assert!(
+            matches!(
+                lifetimes.deadline(&expiring),
+                Err(ControllerError::ClockUntrusted { .. })
+            ),
+            "the refusal is the clock's, not the grant's end"
+        );
+        assert!(lifetimes.in_force(&lasting).expect("decided"));
+        lifetimes.settle();
+        let recorded = devices
+            .record_for_device(expiring.device_id)
+            .expect("readable")
+            .expect("the device");
+        assert!(recorded.expired_at_ms.is_none(), "no end was written");
+        assert!(!lifetimes.pending_expiry().is_owed(expiring.device_id));
+
+        // The control: the owner's word ends the lost continuity, and the grant stands on its
+        // anchor again.
+        floor.establish_continuity();
+        assert!(lifetimes.in_force(&expiring).expect("decided"));
+        assert!(lifetimes.in_force_now(expiring.device_id, &expiring.grant));
+    }
+
+    /// A lifetime derived in this boot is measured from the reading published in the host's floor,
+    /// not from the raw sample: when another process has published a later reading, the grant has
+    /// that much less left.
+    #[test]
+    fn a_derived_lifetime_is_measured_from_the_published_reading() {
+        let now = kr_ipc::now_ms().get();
+        let expiry = GrantExpiry::At {
+            expires_at_ms: TimestampMs::new(now + 60_000),
+        };
+        for (raised, holds_after_31_seconds) in [(true, false), (false, true)] {
+            let devices = Arc::new(DeviceDirectory::in_memory().expect("a directory"));
+            let device = owner(6, expiry);
+            devices.commit(&device).expect("the device");
+            let floor = Arc::new(UtcFloor::default());
+            if raised {
+                // Another process read the clock thirty seconds ahead of this one.
+                floor.observe(now + 30_000);
+            }
+            let clock = ManualClock::new();
+            let lifetimes = GrantLifetimes::new(
+                Arc::clone(&devices),
+                Arc::new(clock.clone()),
+                Arc::new(ManualSharedClock::new()),
+                kr_ipc::identity::boot_identity().expect("a boot identity"),
+                crate::service::WallClock::from_fn(move || now),
+                Arc::clone(&floor),
+            );
+            assert!(lifetimes.in_force(&device).expect("decided"));
+            clock.advance(Duration::from_secs(31));
+            assert_eq!(
+                lifetimes.in_force_now(device.device_id, &device.grant),
+                holds_after_31_seconds,
+                "raised: {raised}"
+            );
+        }
     }
 }

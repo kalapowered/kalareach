@@ -537,6 +537,7 @@ async fn worker(temp: &kr_ipc::testing::TempHost, display: u64) -> Worker {
         worker_endpoint: None,
         send_queue_bytes: 1024 * 1024,
         resident_bytes: 64 * 1024,
+        time: kr_worker::action::time::TimeSources::system(),
         launch_profile: kr_protocol::session::LaunchProfile::default(),
     };
     let mut session = kr_worker::session::Session::open(config).expect("opens the session");

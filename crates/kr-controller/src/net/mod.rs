@@ -626,7 +626,10 @@ impl NetworkHost {
     /// answered, and an error when the record cannot be written.
     async fn establish_clock(&self) -> Result<()> {
         self.pairing.accept_clock()?;
-        self.lifetimes.clock_trust().establish(&self.devices)
+        let established = self.lifetimes.clock_trust().establish(&self.devices)?;
+        // The same word ends a boot's lost clock continuity, which the registry records for the
+        // boot so a restart of this daemon in it does not lose it again.
+        self.daemon()?.establish_clock_continuity(established).await
     }
 
     /// Returns the records a connection reads and writes, each of which outlives it.
@@ -1581,6 +1584,11 @@ impl Controller {
             .policy
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A floor still owed its record is written before anything is decided on it, whoever owed
+        // it: an earlier refusal here, or a worker of this host whose copy's deadline passed at a
+        // reading nothing had written down. The decision then stands on the record rather than
+        // being refused for it.
+        self.write_owed_floor(&policy);
         // The bound a remote caller under a personal grant is held to, which is the policy's own
         // rule for when it applies.
         let offline = (request.ingress != kr_protocol::actor::ActorIngress::LocalIpc
@@ -1646,11 +1654,6 @@ impl Controller {
                     },
                 ));
             }
-        } else {
-            // Before this answer goes out, and whatever it is: a refusal whose record could not be
-            // written earlier is written as soon as storage takes it, rather than waiting for the
-            // clock to refuse something else.
-            self.write_owed_floor(&policy);
         }
         decided
     }
@@ -1802,6 +1805,18 @@ mod tests {
 
     /// Starts a daemon on an environment that may already hold an earlier daemon's records.
     pub(super) async fn daemon(temp: &kr_ipc::testing::TempHost) -> Arc<Controller> {
+        daemon_in(
+            temp,
+            kr_ipc::identity::boot_identity().expect("a boot identity"),
+        )
+        .await
+    }
+
+    /// Starts a daemon as [`daemon`] does, in the boot `boot_identity` names.
+    async fn daemon_in(
+        temp: &kr_ipc::testing::TempHost,
+        boot_identity: kr_protocol::identity::BootIdentity,
+    ) -> Arc<Controller> {
         let environment = temp.environment();
         let environment_id = temp.environment_id();
         let secrets = environment.secrets_dir();
@@ -1819,7 +1834,7 @@ mod tests {
                 .expect("an identity"))
             }),
             secret_store: kr_crypto::store::StoreSelection::File,
-            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+            boot_identity,
             supervisor: Box::new(NoWorkers),
             worker_program: temp.root().join("kr-worker"),
             build_id: BuildId::new("kr-test/0").expect("a build identifier"),
@@ -1998,6 +2013,262 @@ mod tests {
             matches!(refused, CeilingRefusal::Refused(Refusal::Expired { .. })),
             "{refused:?}"
         );
+        drop(controller);
+    }
+
+    /// The clock floor this environment maps in this boot, mapped again as a worker maps it.
+    fn worker_mapping(temp: &kr_ipc::testing::TempHost) -> kr_ipc::floor::SharedFloor {
+        let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
+        kr_ipc::floor::SharedFloor::open(
+            &temp.environment().utc_floor_file(),
+            temp.environment_id(),
+            kr_ipc::identity::boot_epoch(&boot).expect("a boot epoch"),
+        )
+        .expect("the floor is this environment's, for this boot")
+    }
+
+    /// Stops `controller` and starts the next daemon on the same environment, in this boot.
+    async fn restarted(
+        controller: Arc<Controller>,
+        temp: &kr_ipc::testing::TempHost,
+    ) -> Arc<Controller> {
+        drop(controller);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        daemon(temp).await
+    }
+
+    /// The host's floor is one word for the boot. A daemon's floor and a worker's mapping of it
+    /// read and raise the same word; a daemon started again in the same boot keeps the file, its
+    /// identity and its word, and marks nothing lost; a daemon started in another boot replaces a
+    /// file of the earlier one with a new floor that starts at the host's record.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_shared_floor_is_one_word_for_the_boot() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = daemon(&temp).await;
+        let worker = worker_mapping(&temp);
+        let identity = worker.identity().expect("a mapped floor has an identity");
+        assert_eq!(controller.utc_floor().get(), worker.load());
+        let ahead = kr_ipc::now_ms().get() + 60 * 60 * 1000;
+        worker.raise(ahead);
+        assert_eq!(
+            controller.utc_floor().get(),
+            ahead,
+            "a worker's reading is the daemon's floor at once"
+        );
+        let boot = controller.boot_epoch;
+        assert_eq!(
+            controller
+                .registry
+                .lock()
+                .await
+                .floors_of_boot(boot)
+                .expect("readable"),
+            vec![crate::registry::RecordedFloor {
+                identity,
+                in_force: true
+            }]
+        );
+
+        // The control: ordinary reopening keeps the floor as it stands.
+        let controller = restarted(controller, &temp).await;
+        assert!(
+            worker.named(),
+            "the file was opened as it stands, not replaced"
+        );
+        assert_eq!(worker_mapping(&temp).identity(), Some(identity));
+        assert!(controller.utc_floor().get() >= ahead, "the word is kept");
+        assert!(!controller.utc_floor().continuity_lost());
+        assert!(
+            written_floor(&controller) >= ahead,
+            "the start wrote the floor it found down"
+        );
+
+        // Another boot: the earlier boot's file is replaced by a floor that starts at the record.
+        drop(controller);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let later_boot = kr_protocol::identity::BootIdentity {
+            source: kr_protocol::identity::BootIdentitySource::MacosBootSessionUuid,
+            value: kr_protocol::scalars::Bytes::new(vec![0x5b; 16]),
+        };
+        let later = daemon_in(&temp, later_boot.clone()).await;
+        assert!(
+            !worker.named(),
+            "the earlier boot's file no longer has the name"
+        );
+        let replaced = kr_ipc::floor::SharedFloor::open(
+            &temp.environment().utc_floor_file(),
+            temp.environment_id(),
+            kr_ipc::identity::boot_epoch(&later_boot).expect("a boot epoch"),
+        )
+        .expect("the later boot's floor");
+        assert_ne!(replaced.identity(), Some(identity));
+        assert!(
+            replaced.load() >= ahead,
+            "a new floor starts at the host's record"
+        );
+        assert!(replaced.recorded() >= ahead);
+        assert!(
+            !later.utc_floor().continuity_lost(),
+            "a boot's first floor loses nothing"
+        );
+        drop(later);
+    }
+
+    /// A floor whose file lost its name in a boot is a lost floor, not a first start. The next
+    /// daemon creates a new floor and records the boot's clock continuity as lost: a reading only
+    /// the lost floor held may have passed a deadline nothing on record shows as passed, so every
+    /// bound that can pass is refused as unproven, whatever its continuous deadline, until the owner
+    /// establishes the clock; authority that reads no clock is untouched. A restart in the boot
+    /// keeps that state, and a lost floor moved back into place is never adopted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lost_floor_leaves_every_bound_unproven_until_the_owner_establishes_the_clock() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = daemon(&temp).await;
+        let revision = controller.policy().authority_revision();
+        let now = kr_ipc::now_ms().get();
+        let (expiring, expiring_record) = granted(
+            GrantExpiry::At {
+                expires_at_ms: TimestampMs::new(now + 60 * 60 * 1000),
+            },
+            revision,
+        );
+        let (lasting, lasting_record) = granted(GrantExpiry::Never, revision);
+        controller
+            .decide_for_device(&expiring, &expiring_record, listing(&temp, now))
+            .expect("the control: the grant stands while the floor is the boot's");
+
+        let path = temp.environment().utc_floor_file();
+        let lost = worker_mapping(&temp);
+        let kept = temp.environment().runtime_dir().join("kept");
+        std::fs::hard_link(&path, &kept).expect("a link elsewhere");
+        std::fs::remove_file(&path).expect("the floor's name is removed");
+        assert!(!lost.named());
+
+        let controller = restarted(controller, &temp).await;
+        assert!(controller.utc_floor().continuity_lost());
+        assert_ne!(worker_mapping(&temp).identity(), lost.identity());
+        let refused = controller
+            .decide_for_device(&expiring, &expiring_record, listing(&temp, now))
+            .expect_err("nothing proves the bound");
+        assert!(
+            matches!(refused, CeilingRefusal::Refused(Refusal::ClockUnproven)),
+            "{refused:?}"
+        );
+        assert_eq!(
+            refused.to_protocol_error().code,
+            kr_protocol::error::ErrorCode::ClockUntrusted
+        );
+        controller
+            .decide_for_device(&lasting, &lasting_record, listing(&temp, now))
+            .expect("a grant that reads no clock is served");
+
+        // A restart in the same boot keeps the state, and so does moving the lost file back.
+        let controller = restarted(controller, &temp).await;
+        assert!(controller.utc_floor().continuity_lost());
+        let current = worker_mapping(&temp).identity();
+        drop(controller);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        std::fs::rename(&kept, &path).expect("the lost file is moved back");
+        let controller = daemon(&temp).await;
+        let adopted = worker_mapping(&temp).identity();
+        assert_ne!(adopted, lost.identity(), "a lost floor is never adopted");
+        assert_ne!(adopted, current, "it is replaced by a new one");
+        assert!(controller.utc_floor().continuity_lost());
+
+        // The owner establishes the clock: the bound is decided again, and a restart in the boot
+        // keeps it established.
+        controller
+            .establish_clock_continuity(TimestampMs::new(now))
+            .await
+            .expect("recorded");
+        controller
+            .decide_for_device(&expiring, &expiring_record, listing(&temp, now))
+            .expect("the grant stands once the clock is established");
+        let controller = restarted(controller, &temp).await;
+        assert!(!controller.utc_floor().continuity_lost());
+        controller
+            .decide_for_device(&expiring, &expiring_record, listing(&temp, now))
+            .expect("and it stays established in this boot");
+        drop(controller);
+    }
+
+    /// The daemon's floor keeps its record rule over the shared word. A worker's reading past an
+    /// expiry is the daemon's floor, so the daemon refuses the grant whatever its own clock says,
+    /// and answers the lapse only once the floor is written down, which it does before its next
+    /// decision; a worker's owed lapse is owed here too; the file's record word says what is
+    /// written; and a raise that decides no lapse owes and writes nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_shared_floor_keeps_the_record_rule_at_the_device_door() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = daemon(&temp).await;
+        let worker = worker_mapping(&temp);
+        let revision = controller.policy().authority_revision();
+        let now = kr_ipc::now_ms().get();
+        let expires = now + 60 * 60 * 1000;
+        let expiry = GrantExpiry::At {
+            expires_at_ms: TimestampMs::new(expires),
+        };
+        let (expiring, expiring_record) = granted(expiry, revision);
+        let (lasting, lasting_record) = granted(GrantExpiry::Never, revision);
+
+        // The control: a worker's raise that stays below every expiry decides no lapse, owes
+        // nothing and writes nothing.
+        worker.raise(now + 10 * 60 * 1000);
+        controller
+            .decide_for_device(&expiring, &expiring_record, listing(&temp, now))
+            .expect("the grant stands");
+        assert!(!controller.utc_floor().is_owed());
+        assert!(written_floor(&controller) < now + 10 * 60 * 1000);
+
+        let registry = refuse_policy_writes(&temp);
+        worker.raise(expires + 1);
+        assert_eq!(controller.utc_floor().get(), worker.load(), "one floor");
+        let refused = controller
+            .decide_for_device(&expiring, &expiring_record, listing(&temp, now))
+            .expect_err("the worker's reading passed the expiry");
+        assert!(
+            matches!(
+                refused,
+                CeilingRefusal::Refused(Refusal::ExpiryUnrecorded { .. })
+            ),
+            "{refused:?}"
+        );
+        assert!(written_floor(&controller) < expires);
+        let effect = controller
+            .sharing()
+            .grants()
+            .bound_passed(expiry, now)
+            .expect_err("an effect under the grant is not decided either");
+        assert_eq!(
+            effect.to_protocol_error().code,
+            kr_protocol::error::ErrorCode::StorageUnavailable
+        );
+
+        // A worker that refused a copy on that reading owes it its record.
+        worker.owe(worker.load());
+        assert!(controller.utc_floor().is_owed());
+
+        // Storage takes the write: the next decision writes the floor before it decides, and the
+        // file's record word covers the expiry.
+        allow_policy_writes(&registry);
+        controller
+            .decide_for_device(&lasting, &lasting_record, listing(&temp, now))
+            .expect("a grant that does not expire is served");
+        assert!(written_floor(&controller) > expires);
+        assert!(worker.recorded() > expires);
+        assert!(!controller.utc_floor().is_owed());
+        let refused = controller
+            .decide_for_device(&expiring, &expiring_record, listing(&temp, now))
+            .expect_err("the grant stays expired");
+        assert!(
+            matches!(refused, CeilingRefusal::Refused(Refusal::Expired { .. })),
+            "{refused:?}"
+        );
+        assert_eq!(
+            controller.sharing().grants().bound_passed(expiry, now).ok(),
+            Some(true)
+        );
+        assert_eq!(controller.utc_floor().get(), worker.load(), "one floor");
         drop(controller);
     }
 

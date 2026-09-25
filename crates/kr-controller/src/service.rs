@@ -799,11 +799,29 @@ impl Controller {
         // The policy and the feed are read back from the store rather than rebuilt empty. A host
         // that came back unrestricted after every restart would be the same failure as one that
         // accepted a restored old policy, by a different route.
-        let policy = match sharing.grants().stored_policy()? {
-            Some(stored) => crate::grants::HostPolicy::restore(&stored, authority_revision),
-            None => crate::grants::HostPolicy::personal(authority_revision),
+        let stored = match sharing.grants().stored_policy()? {
+            Some(stored) => stored,
+            None => crate::grants::HostPolicy::personal(authority_revision).snapshot(),
         };
-        let utc_floor = Arc::clone(policy.utc_floor());
+        // The host's one reading of UTC in this boot, which every worker maps too. It is opened,
+        // adopted or created here, before any worker is adopted or spawned, and it starts at least
+        // where this host's record of it stands.
+        let (floor_words, continuity_lost) = open_utc_floor(
+            &mut registry,
+            &setup.paths,
+            setup.environment_id,
+            boot_epoch,
+            stored.utc_floor_ms.get(),
+        )?;
+        let utc_floor = Arc::new(crate::grants::policy::UtcFloor::on(
+            floor_words,
+            stored.utc_floor_ms.get(),
+        ));
+        if continuity_lost {
+            utc_floor.lose_continuity();
+        }
+        let policy =
+            crate::grants::HostPolicy::restore(&stored, authority_revision, Arc::clone(&utc_floor));
         // Written down again with the revision the registry reached. A start that cannot write it
         // still starts, with its floor owed its record: no decision that reads the clock is taken
         // until a write lands, and a personal grant that never expires is used as before. Stopping
@@ -2646,6 +2664,32 @@ impl Controller {
         let _registry = self.registry.lock().await;
         self.check_fence()?;
         Ok(effect())
+    }
+
+    /// Ends this boot's lost clock continuity, now that the owner established the clock at
+    /// `established`.
+    ///
+    /// Recorded for the boot before it takes effect, so a restart of this daemon in the same boot
+    /// keeps the continuity it established rather than losing it again. A write that fails leaves
+    /// the continuity lost, which is the stricter answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be written.
+    pub(crate) async fn establish_clock_continuity(&self, established: TimestampMs) -> Result<()> {
+        self.registry
+            .lock()
+            .await
+            .establish_clock_continuity(self.boot_epoch, established)?;
+        self.utc_floor.establish_continuity();
+        Ok(())
+    }
+
+    /// The host's clock floor: the one reading of UTC every process of this environment decides
+    /// from in this boot.
+    #[must_use]
+    pub fn utc_floor(&self) -> &Arc<crate::grants::policy::UtcFloor> {
+        &self.utc_floor
     }
 
     /// Returns which workers have not yet acknowledged the environment's authority revision.
@@ -9169,6 +9213,75 @@ pub struct ControllerSetup {
 /// # Errors
 ///
 /// Returns [`ControllerError::ShellIntegrationUnsupported`] naming the shell, never a substitution.
+/// Opens, adopts or creates this environment's clock floor for the boot, and says whether the
+/// boot's clock continuity is lost.
+///
+/// Three cases, told apart by the file and by the registry's record of the floors created in
+/// this boot:
+///
+/// 1. A file of this environment and boot that passes every check, whose identity is not recorded
+///    as lost: opened as it stands, never truncated or replaced, so every worker that outlived a
+///    daemon restart keeps mapping the same word. An identity the registry does not know (a start
+///    that stopped between publishing the file and recording it) is recorded now.
+/// 2. No usable file and no floor recorded for this boot: the boot's first start. A new floor is
+///    created under a fresh identity and recorded as the boot's floor in force.
+/// 3. No usable file and a floor recorded for this boot: the floor was lost, and a worker of this
+///    boot may still map it. The boot's clock continuity is recorded as lost first, then a new
+///    floor is created and recorded in force. A reading published only in the lost floor may have
+///    passed a deadline nothing on record shows as passed, so until the owner establishes the
+///    clock no bound that can pass is decided ([`crate::grants::policy::UtcFloor::bound`]).
+///
+/// A file of another boot, one that fails a check, and one whose identity is recorded as lost
+/// count as no usable file and are replaced: a lost floor moved back into place is never adopted.
+/// A new floor's first value is `durable_ms`, the floor this host last wrote down.
+fn open_utc_floor(
+    registry: &mut Registry,
+    paths: &EnvironmentPaths,
+    environment_id: EnvironmentId,
+    boot_epoch: BootEpoch,
+    durable_ms: u64,
+) -> Result<(Arc<kr_ipc::floor::SharedFloor>, bool)> {
+    use kr_ipc::floor::SharedFloor;
+
+    registry.forget_other_boots(boot_epoch)?;
+    let recorded = registry.floors_of_boot(boot_epoch)?;
+    let path = paths.utc_floor_file();
+    let adopted = SharedFloor::open(&path, environment_id, boot_epoch)
+        .ok()
+        .filter(|floor| {
+            let identity = floor.identity();
+            !recorded
+                .iter()
+                .any(|known| Some(known.identity) == identity && !known.in_force)
+        });
+    let floor = match adopted {
+        Some(floor) => {
+            if let Some(identity) = floor.identity()
+                && !recorded.iter().any(|known| known.identity == identity)
+            {
+                registry.record_floor_in_force(boot_epoch, identity, kr_ipc::now_ms())?;
+            }
+            floor
+        }
+        None => {
+            if !recorded.is_empty() {
+                registry.lose_clock_continuity(boot_epoch, kr_ipc::now_ms())?;
+            }
+            let floor = SharedFloor::create(&path, environment_id, boot_epoch, durable_ms)?;
+            let identity =
+                floor
+                    .identity()
+                    .ok_or_else(|| ControllerError::RegistryUnavailable {
+                        detail: "a clock floor created from a file has no identity".to_owned(),
+                    })?;
+            registry.record_floor_in_force(boot_epoch, identity, kr_ipc::now_ms())?;
+            floor
+        }
+    };
+    let lost = registry.clock_continuity_lost(boot_epoch)?;
+    Ok((Arc::new(floor), lost))
+}
+
 fn qualified_package(root: Option<&Path>, requested: Option<&str>) -> Result<PathBuf> {
     use kr_shell_integration::host::package::{PackageSet, default_package_root};
 

@@ -399,12 +399,13 @@ impl HighWater {
     }
 }
 
-/// The three clocks and the time service a contract reads.
+/// The three clocks and the time service a contract reads, and the host's clock floor it
+/// publishes its readings in.
 ///
 /// They travel together because none of them means anything without the others: the continuous
 /// clock says how much time passed, the active one says how much of it the machine was awake for,
-/// the wall clock says what it claims the time is, and the adapter says whether that claim is worth
-/// anything.
+/// the wall clock says what it claims the time is, the adapter says whether that claim is worth
+/// anything, and the floor is the one reading of UTC every process of the host decides from.
 #[derive(Clone)]
 pub struct TimeSources {
     /// The machine's boot-scoped continuous clock, which counts suspended time.
@@ -415,10 +416,16 @@ pub struct TimeSources {
     pub wall: Arc<dyn WallClock>,
     /// The platform's own time service.
     pub adapter: Arc<dyn TimeAdapter>,
+    /// The environment's clock floor for this boot, when this worker maps one
+    /// ([`kr_ipc::floor`]).
+    ///
+    /// A worker that found no usable floor maps none, and then decides no copy of authority that
+    /// carries a UTC deadline ([`TimeContract::check_utc_deadline`]).
+    pub floor: Option<Arc<kr_ipc::floor::SharedFloor>>,
 }
 
 impl TimeSources {
-    /// Returns this machine's own clocks and time service.
+    /// Returns this machine's own clocks and time service, with no clock floor.
     #[must_use]
     pub fn system() -> Self {
         Self {
@@ -426,7 +433,15 @@ impl TimeSources {
             active: Arc::new(SystemActiveClock::new()),
             wall: Arc::new(SystemWallClock),
             adapter: Arc::new(PlatformTimeAdapter::new()),
+            floor: None,
         }
+    }
+
+    /// The same sources, publishing in `floor`.
+    #[must_use]
+    pub fn with_floor(mut self, floor: Arc<kr_ipc::floor::SharedFloor>) -> Self {
+        self.floor = Some(floor);
+        self
     }
 }
 
@@ -438,8 +453,26 @@ impl std::fmt::Debug for TimeSources {
             .field("active", &self.active)
             .field("wall", &self.wall)
             .field("adapter", &self.adapter)
+            .field("floor", &self.floor)
             .finish()
     }
+}
+
+/// What a check of one copy's UTC deadline found ([`TimeContract::check_utc_deadline`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UtcDeadline {
+    /// The deadline is ahead of the host's floor: the copy may be used.
+    Ahead,
+    /// It has passed, and the host's record covers the moment it passed: an expiry.
+    Passed,
+    /// It has passed at a reading the host has not written down yet. The floor it passed on is
+    /// owed its record, and the refusal names no expiry until that record lands.
+    Unrecorded,
+    /// This worker maps no clock floor, so it decides no copy that carries a UTC deadline.
+    NoFloor,
+    /// The floor this worker maps has lost its name, so it is no longer the host's floor and
+    /// decides no copy that carries a UTC deadline.
+    FloorLost,
 }
 
 /// The host's time contract.
@@ -459,6 +492,8 @@ pub struct TimeContract {
     active: Arc<dyn ActiveClock>,
     wall: Arc<dyn WallClock>,
     adapter: Arc<dyn TimeAdapter>,
+    /// The host's clock floor, which every reading taken here is published in.
+    floor: Option<Arc<kr_ipc::floor::SharedFloor>>,
     state: Mutex<TimeState>,
 }
 
@@ -520,6 +555,7 @@ impl TimeContract {
             active,
             wall,
             adapter,
+            floor,
         } = sources;
         let trust = recorded
             .as_ref()
@@ -564,6 +600,7 @@ impl TimeContract {
             active,
             wall,
             adapter,
+            floor,
             state: Mutex::new(TimeState {
                 critical: 0,
                 written: 0,
@@ -599,10 +636,14 @@ impl TimeContract {
     }
 
     /// Records the complete clock sample, without deciding anything from it.
+    ///
+    /// The wall clock's reading is published in the host's floor all the same, as every reading
+    /// this contract takes is.
     fn sample(&self) {
         let continuous_ms = self.continuous.boot_elapsed_ms();
         let active_ms = self.active.active_elapsed_ms();
         let wall_ms = self.wall.now_ms().get();
+        self.publish(wall_ms);
         let mut state = self.lock();
         state.last = Some(Reading {
             continuous_ms,
@@ -673,6 +714,10 @@ impl TimeContract {
         let continuous_ms = self.continuous.boot_elapsed_ms();
         let active_ms = self.active.active_elapsed_ms();
         let wall_ms = self.wall.now_ms().get();
+        // Published before anything is decided from it. The raw sample is still what the rollback
+        // detection below compares: the floor only moves forward, so it cannot show that the wall
+        // clock went back.
+        self.publish(wall_ms);
         let now = Reading {
             continuous_ms,
             active_ms,
@@ -822,6 +867,70 @@ impl TimeContract {
         })
     }
 
+    /// Publishes `reading` in the host's clock floor and returns the floor as the raise left it,
+    /// or the reading itself when this worker maps no floor.
+    fn publish(&self, reading: u64) -> u64 {
+        self.floor
+            .as_ref()
+            .map_or(reading, |floor| floor.raise(reading))
+    }
+
+    /// This host's reading of UTC: the proven reading, published in the host's clock floor, and
+    /// the floor's value as that left it.
+    ///
+    /// Every process of the host publishes what it reads before it decides from it, so a reading
+    /// any of them took past a deadline is in the value this returns, whatever the wall clock says
+    /// by now.
+    #[must_use]
+    pub fn settled_utc_ms(&self) -> u64 {
+        let proven = {
+            let state = self.lock();
+            self.proven_wall_ms(&state)
+        };
+        self.publish(proven)
+    }
+
+    /// The identity of the clock floor this worker maps, whether or not its name still names it:
+    /// a worker never changes its mapping, and states the one it has.
+    #[must_use]
+    pub fn floor_identity(&self) -> Option<kr_ipc::floor::FloorIdentity> {
+        self.floor.as_ref().and_then(|floor| floor.identity())
+    }
+
+    /// Decides one copy of authority against its UTC deadline, at a point where its use is
+    /// committed.
+    ///
+    /// The reading is published first and the floor's value loaded from that raise; then the
+    /// floor's pathname is confirmed to still name the file this worker maps. A deadline at or
+    /// below the value loaded has passed, and the copy never acts. The refusal is an expiry only
+    /// when the host's record, the floor's `recorded` word, covers the deadline; otherwise the value
+    /// loaded is owed its record, which the control daemon writes at its next decision that reads
+    /// the clock or its record task's next pass, and the refusal names no expiry. So nothing this
+    /// worker answers as expired rests on a reading a restart, a reboot or a lost floor could take
+    /// away. A worker with no floor, or whose floor has lost its name, decides no such copy.
+    #[must_use]
+    pub fn check_utc_deadline(&self, deadline_ms: u64) -> UtcDeadline {
+        let Some(floor) = self.floor.as_ref() else {
+            return UtcDeadline::NoFloor;
+        };
+        let proven = {
+            let state = self.lock();
+            self.proven_wall_ms(&state)
+        };
+        let loaded = floor.raise(proven);
+        if !floor.named() {
+            return UtcDeadline::FloorLost;
+        }
+        if loaded < deadline_ms {
+            return UtcDeadline::Ahead;
+        }
+        if floor.recorded() >= deadline_ms {
+            return UtcDeadline::Passed;
+        }
+        floor.owe(loaded);
+        UtcDeadline::Unrecorded
+    }
+
     /// Decides whether an object is still valid.
     ///
     /// The order is the contract. A tombstone wins outright, because a previously expired object
@@ -877,8 +986,10 @@ impl TimeContract {
             }) else {
                 return Validity::Unproven;
             };
+            // Published in the host's floor, and decided from the floor's value, so an expiry here
+            // stands on the same reading every process of the host decides from.
             if self
-                .proven_wall_ms(&state)
+                .publish(self.proven_wall_ms(&state))
                 .saturating_add(uncertainty_us / 1_000)
                 >= deadline
             {
@@ -1204,6 +1315,7 @@ mod tests {
                 active: Arc::new(active.clone()),
                 wall: Arc::new(wall.clone()),
                 adapter: Arc::new(adapter.clone()),
+                floor: None,
             },
         );
         Harness {
@@ -1436,6 +1548,7 @@ mod tests {
                 active: Arc::new(active.clone()),
                 wall: Arc::new(wall.clone()),
                 adapter: Arc::new(adapter.clone()),
+                floor: None,
             },
             state,
         );
@@ -1728,6 +1841,7 @@ mod tests {
                         TimestampMs::new(WALL),
                     ),
                 )),
+                floor: None,
             },
         );
         assert_eq!(contract.trust(), WallClockTrust::Unresolved);
@@ -1892,6 +2006,7 @@ mod tests {
             active: Arc::new(active.clone()),
             wall: Arc::new(wall.clone()),
             adapter: Arc::new(adapter.clone()),
+            floor: None,
         };
 
         let contract = TimeContract::restore(boot(1), AUTHORITY, sources(), None);
@@ -2046,6 +2161,7 @@ mod tests {
                         TimestampMs::new(WALL),
                     ),
                 )),
+                floor: None,
             },
             Some(state),
         );
@@ -2077,6 +2193,7 @@ mod tests {
             active: Arc::new(active.clone()),
             wall: Arc::new(wall.clone()),
             adapter: Arc::new(adapter.clone()),
+            floor: None,
         };
         let contract = TimeContract::restore(boot(1), AUTHORITY, sources(), None);
         let (state, generation) = contract.durable_state();
@@ -2131,6 +2248,7 @@ mod tests {
             active: Arc::new(active.clone()),
             wall: Arc::new(wall.clone()),
             adapter: Arc::new(adapter.clone()),
+            floor: None,
         };
         let contract = TimeContract::restore(boot(1), AUTHORITY, sources(), None);
         let (state, generation) = contract.durable_state();
@@ -2260,5 +2378,155 @@ mod tests {
         contract.observe();
         let found = contract.observe();
         assert!(!found.any(), "{found:?}");
+    }
+
+    /// A contract over manual clocks, a qualified time service and `floor`.
+    fn floored(floor: Option<Arc<kr_ipc::floor::SharedFloor>>) -> (TimeContract, ManualWallClock) {
+        let continuous = ManualSharedClock::new();
+        continuous.advance(Duration::from_secs(3_600));
+        let active = ManualActiveClock::new();
+        active.advance(Duration::from_secs(3_600));
+        let wall = ManualWallClock::new(WALL);
+        let contract = TimeContract::new(
+            boot(1),
+            AUTHORITY,
+            TimeSources {
+                continuous: Arc::new(continuous),
+                active: Arc::new(active),
+                wall: Arc::new(wall.clone()),
+                adapter: Arc::new(RecordedTimeAdapter::new(qualified())),
+                floor,
+            },
+        );
+        (contract, wall)
+    }
+
+    #[test]
+    fn every_reading_is_published_before_it_is_decided_from() {
+        let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(WALL - 1_000));
+        let (contract, wall) = floored(Some(Arc::clone(&floor)));
+        // Building the contract observed the clock, and the observation is in the floor.
+        assert!(floor.load() >= WALL, "an observation publishes its sample");
+        wall.set(WALL + 500);
+        contract.observe();
+        assert_eq!(floor.load(), WALL + 500, "and so does every later one");
+        assert_eq!(
+            contract.settled_utc_ms(),
+            WALL + 500,
+            "the settled reading is the proven one, published"
+        );
+
+        // Another process publishes a reading ahead of this worker's own. The settled reading is
+        // the floor's value, and an expiry is decided from it.
+        floor.raise(WALL + 10_000);
+        assert_eq!(contract.settled_utc_ms(), WALL + 10_000);
+        let signed = ExpiringObject::signed_across_reboot("signed", WALL + 5_000);
+        assert_eq!(
+            contract.validity(&signed),
+            Validity::Expired(ExpiryReason::TrustedUtcDeadline),
+            "a UTC deadline another process's reading passed is passed here too"
+        );
+
+        // The control: the same object under a floor nothing raised is valid, and a reading below
+        // the floor leaves the floor where it is.
+        let quiet = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+        let (quiet_contract, _) = floored(Some(Arc::clone(&quiet)));
+        assert!(quiet_contract.validity(&signed).is_valid());
+        quiet.raise(WALL + 60_000);
+        assert_eq!(quiet_contract.settled_utc_ms(), WALL + 60_000);
+        assert_eq!(quiet.load(), WALL + 60_000);
+    }
+
+    #[test]
+    fn publishing_hides_no_rollback() {
+        // The floor only moves forward, so it cannot show that the wall clock went back; the raw
+        // sample still decides that.
+        let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+        let (contract, wall) = floored(Some(Arc::clone(&floor)));
+        floor.raise(WALL + 10_000);
+        wall.set(WALL - 60_000);
+        let found = contract.observe();
+        assert!(found.rolled_back, "{found:?}");
+        assert_eq!(contract.trust(), WallClockTrust::Unresolved);
+        assert_eq!(
+            floor.load(),
+            WALL + 10_000,
+            "and the floor stays where it was"
+        );
+    }
+
+    #[test]
+    fn a_copy_past_its_utc_deadline_is_an_expiry_only_once_the_record_covers_it() {
+        let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+        let (contract, wall) = floored(Some(Arc::clone(&floor)));
+        let deadline = WALL + 2_000;
+        assert_eq!(contract.check_utc_deadline(deadline), UtcDeadline::Ahead);
+        assert_eq!(floor.owed(), 0, "a copy that is still live owes nothing");
+
+        // The deadline passes by this worker's own reading, with nothing recorded past it: the
+        // copy is refused, the refusal names no expiry, and the floor it passed on is owed.
+        wall.set(WALL + 3_000);
+        assert_eq!(
+            contract.check_utc_deadline(deadline),
+            UtcDeadline::Unrecorded
+        );
+        assert!(floor.owed() >= WALL + 3_000);
+        // A step back of the wall clock gives the copy nothing: the floor holds the reading.
+        wall.set(WALL);
+        assert_eq!(
+            contract.check_utc_deadline(deadline),
+            UtcDeadline::Unrecorded
+        );
+
+        // The control daemon writes the floor down; from then on the refusal is an expiry.
+        floor.record(floor.load());
+        assert_eq!(contract.check_utc_deadline(deadline), UtcDeadline::Passed);
+
+        // The control: a record that already covered the deadline makes the first refusal an
+        // expiry, and owes nothing.
+        let recorded = Arc::new(kr_ipc::floor::SharedFloor::in_process(WALL + 5_000));
+        let (covered, _) = floored(Some(Arc::clone(&recorded)));
+        assert_eq!(covered.check_utc_deadline(deadline), UtcDeadline::Passed);
+        assert_eq!(recorded.owed(), 0);
+    }
+
+    #[test]
+    fn a_worker_with_no_floor_or_a_nameless_one_decides_no_utc_deadline() {
+        let (unfloored, _) = floored(None);
+        assert_eq!(
+            unfloored.check_utc_deadline(WALL + 60_000),
+            UtcDeadline::NoFloor
+        );
+        assert_eq!(unfloored.floor_identity(), None);
+
+        let suffix = kr_ipc::new_uuid().to_string();
+        let root = std::env::temp_dir().join(format!("kr-worker-floor-{}", &suffix[..8]));
+        kr_ipc::paths::create_private_tree(&root, &root).expect("a private directory");
+        let path = root.join("utc-floor");
+        let environment_id = kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid());
+        let boot_epoch = kr_protocol::ids::BootEpoch::new(11);
+        let created = kr_ipc::floor::SharedFloor::create(&path, environment_id, boot_epoch, 0)
+            .expect("created");
+        let mapped = Arc::new(
+            kr_ipc::floor::SharedFloor::open(&path, environment_id, boot_epoch).expect("mapped"),
+        );
+        let (contract, _) = floored(Some(Arc::clone(&mapped)));
+        assert_eq!(contract.floor_identity(), created.identity());
+        // The control: while the name names the file, a live copy is live.
+        assert_eq!(
+            contract.check_utc_deadline(WALL + 60_000),
+            UtcDeadline::Ahead
+        );
+        std::fs::remove_file(&path).expect("the name is removed");
+        assert_eq!(
+            contract.check_utc_deadline(WALL + 60_000),
+            UtcDeadline::FloorLost
+        );
+        assert_eq!(
+            contract.floor_identity(),
+            created.identity(),
+            "a worker states the floor it maps, name or not"
+        );
+        std::fs::remove_dir_all(&root).expect("removed");
     }
 }
