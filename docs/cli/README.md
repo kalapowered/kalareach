@@ -900,6 +900,10 @@ acknowledgement is how you see which devices have.
 paired is refused with `RESOURCE_UNAVAILABLE` and nothing is sent; a device already revoked answers
 with its revocation as it stands.
 
+A revocation is complete when every affected session's worker has fenced it, so the command says
+how far they have got. A worker that has not is named with the reason the host gives, and so is
+any action a worker could not show did not run before the revocation reached it.
+
 ## `kr plugin`
 
 | Command | What it does |

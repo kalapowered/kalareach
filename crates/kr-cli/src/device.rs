@@ -102,18 +102,56 @@ async fn revoke(paths: &HostPaths, arguments: &DeviceRevokeArguments, json: bool
     if json {
         report::print_json(&report::answer(&revoked)?);
     } else {
-        println!(
-            "Revoked device {device} and {} grant{}, at authority revision {}.",
-            revoked.revoked_grants.len(),
-            if revoked.revoked_grants.len() == 1 {
-                ""
-            } else {
-                "s"
-            },
-            revoked.authority_revision
-        );
+        print!("{}", revocation(device, &revoked));
     }
     Ok(())
+}
+
+/// What a revocation did, as lines for a person: the grants it took, and how far each affected
+/// session's worker has got in fencing what the device could still have been doing.
+///
+/// The revocation is recorded when this is printed, and it is complete only once every worker's
+/// barrier holds. A worker still pending is named with why, and so is every action a worker could
+/// not show did not run before the revocation reached it.
+fn revocation(device: DeviceId, revoked: &RevocationResult) -> String {
+    let grants = revoked.revoked_grants.len();
+    let mut text = format!(
+        "Revoked device {device} and {grants} grant{}, at authority revision {}.\n",
+        if grants == 1 { "" } else { "s" },
+        revoked.authority_revision
+    );
+    let barrier = &revoked.barrier;
+    if barrier.workers.is_empty() {
+        text.push_str("No session's worker was affected.\n");
+    } else if barrier.holds() {
+        text.push_str("Every affected session's worker has fenced it.\n");
+    } else {
+        text.push_str("The revocation is not complete until these sessions' workers fence it:\n");
+    }
+    for worker in &barrier.workers {
+        if !worker.state.holds() {
+            text.push_str(&format!(
+                "  session {}: {}{}\n",
+                worker.session_id,
+                worker.state.as_str(),
+                if worker.detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", worker.detail)
+                }
+            ));
+        }
+        for action in &worker.possibly_executed {
+            text.push_str(&format!(
+                "  session {}: action {} ({}) may have run before the revocation, and is {}\n",
+                worker.session_id,
+                action.action_id,
+                action.method.as_str(),
+                report::wire_name(&action.state)
+            ));
+        }
+    }
+    text
 }
 
 /// One device as a line for a person.
@@ -133,4 +171,84 @@ fn line(device: &DeviceSummary) -> String {
         "{}  {standing:<8} {}  {acknowledged}",
         device.device_id, device.display_name
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use kr_protocol::action::{
+        BarrierState, PossiblyExecutedAction, RevocationBarrier, WorkerBarrier,
+    };
+    use kr_protocol::ids::{ActionId, ActorId, AuthorityRevision, SessionId};
+    use kr_protocol::receipt::ReceiptState;
+    use kr_protocol::scalars::{CanonicalSet, Nullable, U64, Uuid};
+
+    use super::*;
+
+    fn worker(byte: u8, state: BarrierState, detail: &str) -> WorkerBarrier {
+        WorkerBarrier {
+            session_id: SessionId::new(Uuid::from_bytes([byte; 16])),
+            state,
+            acknowledged_revision: Nullable::null(),
+            rejected_actions: Vec::new(),
+            possibly_executed: Vec::new(),
+            omitted_actions: U64::new(0),
+            names_pending: U64::new(0),
+            detail: detail.to_owned(),
+        }
+    }
+
+    fn revoked(workers: Vec<WorkerBarrier>) -> RevocationResult {
+        RevocationResult {
+            authority_revision: AuthorityRevision::new(4),
+            revoked_grants: CanonicalSet::new(),
+            barrier: RevocationBarrier {
+                authority_revision: AuthorityRevision::new(4),
+                workers,
+            },
+        }
+    }
+
+    #[test]
+    fn a_worker_still_pending_is_named_with_why() {
+        let device = DeviceId::new(Uuid::from_bytes([1; 16]));
+        let mut pending = worker(2, BarrierState::Pending, "the worker has not answered yet");
+        pending.possibly_executed.push(PossiblyExecutedAction {
+            action_id: ActionId::new(Uuid::from_bytes([3; 16])),
+            actor_id: ActorId::new("device:phone").expect("an actor"),
+            method: kr_protocol::method::Method::InputWrite.into(),
+            state: ReceiptState::Accepted,
+        });
+        let text = revocation(
+            device,
+            &revoked(vec![pending, worker(4, BarrierState::Acknowledged, "")]),
+        );
+        assert!(text.contains("is not complete until"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "session {}: pending (the worker has not answered yet)",
+                SessionId::new(Uuid::from_bytes([2; 16]))
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains("may have run before the revocation"),
+            "{text}"
+        );
+        assert!(
+            !text.contains(&SessionId::new(Uuid::from_bytes([4; 16])).to_string()),
+            "a worker whose barrier holds needs no line: {text}"
+        );
+    }
+
+    #[test]
+    fn a_revocation_every_worker_fenced_says_so() {
+        let device = DeviceId::new(Uuid::from_bytes([1; 16]));
+        let text = revocation(device, &revoked(vec![worker(2, BarrierState::Ended, "")]));
+        assert!(
+            text.contains("Every affected session's worker has fenced it."),
+            "{text}"
+        );
+        let text = revocation(device, &revoked(Vec::new()));
+        assert!(text.contains("No session's worker was affected."), "{text}");
+    }
 }
