@@ -387,6 +387,15 @@ impl ConnectorSources {
         Self::default()
     }
 
+    /// Returns true while no connector has been handed over.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.by_command
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    }
+
     /// Replaces the whole set with what the installation handed over now.
     ///
     /// Every source is read and checked; one that fails is left out and returned with its

@@ -1026,6 +1026,136 @@
       ],
       "type": "object"
     },
+    "AgentInstanceEvent": {
+      "additionalProperties": false,
+      "description": "One change to a session's agent instances, as an attached view is told about it.",
+      "properties": {
+        "instance": {
+          "$ref": "#/$defs/AgentInstanceSummary",
+          "description": "What the instance is now."
+        },
+        "sequence": {
+          "$ref": "#/$defs/U64",
+          "description": "This announcement's position in the session's own count of them.\n\nA view that installed an [`AgentInstanceList`] applies the announcements whose sequence is\nabove the list's and discards the rest."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session."
+        }
+      },
+      "required": [
+        "session_id",
+        "sequence",
+        "instance"
+      ],
+      "type": "object"
+    },
+    "AgentInstanceList": {
+      "additionalProperties": false,
+      "description": "A session's live agent instances, as a view installs them.\n\nThe session keeps the list and counts its announcements under its own lock, and it announces\nunder that lock too, so every announcement is either in a list or after it: its sequence says\nwhich. A view installs the list, then applies the announcements above its sequence, and so\nholds every live instance once.",
+      "properties": {
+        "instances": {
+          "description": "Every instance of the session that has not ended, in identifier order.",
+          "items": {
+            "$ref": "#/$defs/AgentInstanceSummary"
+          },
+          "type": "array"
+        },
+        "sequence": {
+          "$ref": "#/$defs/U64",
+          "description": "The sequence of the last announcement the list includes, or zero before the first."
+        }
+      },
+      "required": [
+        "sequence",
+        "instances"
+      ],
+      "type": "object"
+    },
+    "AgentInstanceSummary": {
+      "additionalProperties": false,
+      "description": "One agent instance of a session, as the session announces it.\n\nSection 12 has a program the integrated route did not launch detected and observed rather than\ngiven a gateway after the fact, and a person watching the session needs to tell the two apart:\na launched instance can have rich bridges, and an adopted one never does. This says which it\nis, how it came to run and, where its bridges are refused, why.",
+      "properties": {
+        "application_instance_id": {
+          "$ref": "#/$defs/ApplicationInstanceId",
+          "description": "The instance."
+        },
+        "bypass": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CommandBypassReason"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why the shell ran the program as typed, where the session answered it with a bypass."
+        },
+        "ended_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When the instance ended. A view drops an ended instance from its list."
+        },
+        "mode": {
+          "$ref": "#/$defs/IntegrationMode",
+          "description": "How the program is integrated: `native_bridge` for a launch the integration made, and\n`native_terminal` for a program that was adopted."
+        },
+        "plugin_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PluginId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The plugin whose connector recognised the program, where one did."
+        },
+        "profile_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LaunchProfileId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The launch profile recorded for the program, where one was."
+        },
+        "refusal": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why the instance's bridges are refused, where they are."
+        },
+        "started_at": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the session learned the instance was running."
+        }
+      },
+      "required": [
+        "application_instance_id",
+        "plugin_id",
+        "profile_id",
+        "mode",
+        "bypass",
+        "started_at",
+        "ended_at",
+        "refusal"
+      ],
+      "type": "object"
+    },
     "AgentMutationResult": {
       "additionalProperties": false,
       "description": "What one accepted agent mutation did.",
@@ -12229,6 +12359,10 @@
       "additionalProperties": false,
       "description": "The result of `events.snapshot`.\n\nEvery field is present state, not a replay: installing a snapshot emits no bell, no clipboard\nwrite, no notification and no query.",
       "properties": {
+        "agent_instances": {
+          "$ref": "#/$defs/AgentInstanceList",
+          "description": "The session's live agent instances when the snapshot was taken.\n\nA resynchronised view installs them and applies the announcements above\n[`crate::projection::AgentInstanceList::sequence`] that its stream still delivers."
+        },
         "agent_resources": {
           "$ref": "#/$defs/AgentResourceSnapshot",
           "description": "One page of the agent resources this session's host still arbitrates.\n\nA client that lost its place installs the whole session from this call, and the resources\nare part of that state: without them a resynchronised view would show the screen and none\nof the requests waiting on a person. The page named by `agent_resources_from` is returned,\nso the same call that takes the snapshot also reads the rest of it."
@@ -12273,7 +12407,8 @@
         "attachments",
         "oldest_retained_cursor",
         "taken_at_ms",
-        "agent_resources"
+        "agent_resources",
+        "agent_instances"
       ],
       "type": "object"
     },
@@ -12321,6 +12456,10 @@
       "additionalProperties": false,
       "description": "The result of `events.subscribe`.",
       "properties": {
+        "agent_instances": {
+          "$ref": "#/$defs/AgentInstanceList",
+          "description": "The session's live agent instances, read under the same lock that starts the queue.\n\nAn announcement is either in this list or among the events that follow it, and its\nsequence says which: a view applies the announcements above\n[`crate::projection::AgentInstanceList::sequence`] and discards the rest."
+        },
         "agent_resources": {
           "$ref": "#/$defs/AgentResourceSnapshot",
           "description": "The first page of the agent resources this subscription starts from.\n\nIt is taken with the subscription rather than fetched beside it, and that is what makes it\nusable: the queue this call returns begins at the same moment, so a resolution is either in\nthe state described here or in the events that follow, never in neither. A view applies the\nevents whose position is above [`AgentResourceSnapshot::cursor`] and ignores the rest.\n\nOne answer carries one bounded page of it, because a host that arbitrates a large number\nof resources would otherwise answer with a frame no peer can receive. When\n[`AgentResourceSnapshot::continue_after`] is present the rest is read with `events.snapshot`\nbefore the events are applied."
@@ -12354,7 +12493,8 @@
         "from_cursor",
         "oldest_retained_cursor",
         "gap",
-        "agent_resources"
+        "agent_resources",
+        "agent_instances"
       ],
       "type": "object"
     },
@@ -34403,6 +34543,15 @@
     },
     "agent_draft_add_attachment_result": {
       "$ref": "#/$defs/AgentDraftAddAttachmentResult"
+    },
+    "agent_instance_event": {
+      "$ref": "#/$defs/AgentInstanceEvent"
+    },
+    "agent_instance_list": {
+      "$ref": "#/$defs/AgentInstanceList"
+    },
+    "agent_instance_summary": {
+      "$ref": "#/$defs/AgentInstanceSummary"
     },
     "agent_mutation_result": {
       "$ref": "#/$defs/AgentMutationResult"

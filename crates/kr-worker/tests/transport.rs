@@ -5654,12 +5654,13 @@ async fn kr_req_12_11_a_subscription_its_peer_could_not_receive_is_refused_whole
         "and the client is told why rather than given a frame it must discard"
     );
 
-    // What the refusal is about is this peer's frame and not this session's state, so it is the
-    // same answer before the state grows and after it. A connection that is refused was refused on
-    // its first subscription, which is what keeps a refusal from ever taking a stream away: there
-    // is no state of this session in which this connection subscribes and no later state in which
-    // it is refused. The state grows past what one page carries, so the peer served below reads it
-    // in more than one.
+    // What the refusal is about is this peer's frame against the answer's parts other than the
+    // resources, and not the resources this session holds, so it is the same answer before they
+    // grow and after it: however many resources the session holds, a connection that subscribes
+    // is not refused a later subscription for them. The refusal is decided before the subscription
+    // changes anything, which is what keeps a refusal from ever taking a stream away. The
+    // resources grow past what one page carries, so the peer served below reads them in more than
+    // one.
     for index in 0..kr_worker::broker::MAX_SNAPSHOT_RESOURCES {
         owner
             .from_upstream(

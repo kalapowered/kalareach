@@ -145,7 +145,8 @@ use crate::project::{
     WorkspaceRemoveParams, WorkspaceRemoveResult, WorkspaceSummary,
 };
 use crate::projection::{
-    AgentResourceCause, AgentResourceContentClass, AgentResourceEvent, AgentResourceSnapshot,
+    AgentInstanceEvent, AgentInstanceList, AgentInstanceSummary, AgentResourceCause,
+    AgentResourceContentClass, AgentResourceEvent, AgentResourceSnapshot,
     AgentResourceSnapshotContinuation, ProjectionDelta, ProjectionReset, ProjectionRowPage,
     ProjectionSnapshot,
 };
@@ -267,6 +268,9 @@ pub fn protocol_schema() -> Value {
         "agent_capabilities_result" => AgentCapabilitiesResult,
         "agent_commands_params" => AgentCommandsParams,
         "agent_commands_result" => AgentCommandsResult,
+        "agent_instance_event" => AgentInstanceEvent,
+        "agent_instance_list" => AgentInstanceList,
+        "agent_instance_summary" => AgentInstanceSummary,
         "agent_mutation_result" => AgentMutationResult,
         "agent_prompt_params" => AgentPromptParams,
         "agent_resource_cause" => AgentResourceCause,

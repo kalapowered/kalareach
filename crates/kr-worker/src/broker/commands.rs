@@ -207,8 +207,23 @@ struct Backend {
     host_directory: Arc<std::sync::OnceLock<kr_transfer::authority::AuthorisedDirectory>>,
     /// The session whose attached views a channel's transitions are delivered to, where one is.
     views: Option<(SessionId, Weak<crate::runtime::SessionRuntime>)>,
+    /// What the session's views were last told this backend's instance is.
+    ///
+    /// Every announcement about the instance is made while this is held, so the views hear its
+    /// start, a refusal of its bridges and its end in the order they happened, whichever task
+    /// found each.
+    announced: Mutex<Announced>,
     #[cfg(feature = "testing")]
     confirm_pause: Arc<Mutex<Option<ConfirmPause>>>,
+}
+
+/// What a backend's instance was last announced as.
+#[derive(Debug, Default)]
+struct Announced {
+    /// The instance as the views were told, once its program was announced as started.
+    summary: Option<kr_protocol::projection::AgentInstanceSummary>,
+    /// Why the instance's bridges are refused, where one was, whether or not it was announced yet.
+    refusal: Option<String>,
 }
 
 impl std::fmt::Debug for Backend {
@@ -670,6 +685,7 @@ impl CommandBackends {
             lifecycle: Lifecycle::new(BackendState::Unbound),
             identity,
             image_refused: Mutex::new(None),
+            announced: Mutex::new(Announced::default()),
             image_verified: crate::broker::image::VerifiedFiles::default(),
             stopped: Arc::new(AtomicBool::new(false)),
             tasks: Mutex::new(Vec::new()),
@@ -742,6 +758,76 @@ impl CommandBackends {
 }
 
 impl Backend {
+    /// Announces the committed program to the session's views: launched through the integration,
+    /// with the refusal of its bridges where one came first.
+    fn announce_started(&self) {
+        let mut announced = self
+            .announced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let summary = kr_protocol::projection::AgentInstanceSummary {
+            application_instance_id: self.application_instance_id,
+            plugin_id: kr_protocol::scalars::Nullable::some(self.connector.plugin_id()),
+            profile_id: kr_protocol::scalars::Nullable::some(self.profile_id.clone()),
+            mode: IntegrationMode::NativeBridge,
+            bypass: kr_protocol::scalars::Nullable::null(),
+            started_at: kr_ipc::now_ms(),
+            ended_at: kr_protocol::scalars::Nullable::null(),
+            refusal: kr_protocol::scalars::Nullable(announced.refusal.clone()),
+        };
+        announced.summary = Some(summary.clone());
+        self.publish(summary);
+    }
+
+    /// Records why the instance's bridges are refused, and announces it once the program has been.
+    ///
+    /// A refusal stands for every later bridge and is found again by each, so only a new reason is
+    /// announced.
+    fn announce_refusal(&self, why: &str) {
+        let mut announced = self
+            .announced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let why = bounded_refusal(why);
+        if announced.refusal.as_deref() == Some(why) {
+            return;
+        }
+        announced.refusal = Some(why.to_owned());
+        if let Some(summary) = announced.summary.as_mut() {
+            summary.refusal = kr_protocol::scalars::Nullable::some(why.to_owned());
+            let summary = summary.clone();
+            self.publish(summary);
+        }
+    }
+
+    /// Announces the end of the program that was announced as started.
+    fn announce_ended(&self) {
+        let mut announced = self
+            .announced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(summary) = announced.summary.as_mut() {
+            summary.ended_at = kr_protocol::scalars::Nullable::some(kr_ipc::now_ms());
+            let summary = summary.clone();
+            self.publish(summary);
+        }
+    }
+
+    /// Hands one announcement to the session's views, where this backend was given them.
+    ///
+    /// Called with the announced state held, which is what orders the announcements; the session
+    /// never takes that state, so holding it while the session's lock is taken orders nothing
+    /// against the session.
+    fn publish(&self, summary: kr_protocol::projection::AgentInstanceSummary) {
+        if let Some(runtime) = self
+            .views
+            .as_ref()
+            .and_then(|(_, runtime)| runtime.upgrade())
+        {
+            runtime.session().announce_instance(summary);
+        }
+    }
+
     fn is_unbound(&self) -> bool {
         matches!(*self.lifecycle.state.borrow(), BackendState::Unbound)
     }
@@ -899,8 +985,13 @@ async fn admit(
                 let registration = Arc::clone(&registration);
                 tokio::task::spawn_blocking(move || verify(&backend, &registration)).await
             };
-            if !matches!(verdict, Ok(Ok(()))) {
-                return;
+            match verdict {
+                Ok(Ok(())) => {}
+                Ok(Err(why)) => {
+                    backend.announce_refusal(&why);
+                    return;
+                }
+                Err(_) => return,
             }
             let Ok(admitted) = authenticated.admit().await else {
                 return;
@@ -1261,6 +1352,24 @@ fn confirmation() -> Vec<u8> {
         .into_bytes()
 }
 
+/// The most bytes of a refusal's reason an announcement carries.
+///
+/// A reason names paths the platform reported, and an announcement is carried whole in every
+/// subscription's answer, so it is bounded where it is made.
+pub const MAX_REFUSAL_BYTES: usize = 512;
+
+/// Returns a refusal's reason cut to [`MAX_REFUSAL_BYTES`], at a character boundary.
+fn bounded_refusal(why: &str) -> &str {
+    if why.len() <= MAX_REFUSAL_BYTES {
+        return why;
+    }
+    let mut end = MAX_REFUSAL_BYTES;
+    while !why.is_char_boundary(end) {
+        end -= 1;
+    }
+    &why[..end]
+}
+
 /// Returns true for the frame a launcher writes when it is about to exec the program.
 fn is_going(frame: &[u8]) -> bool {
     serde_json::from_slice::<serde_json::Value>(frame).is_ok_and(|value| {
@@ -1272,8 +1381,13 @@ fn is_going(frame: &[u8]) -> bool {
     })
 }
 
-/// Watches the committed program for as long as it runs, and ends the instance when it exits.
+/// Announces the committed program, watches it for as long as it runs, and ends the instance and
+/// announces its end when it exits.
+///
+/// The start is announced here rather than where the launch is committed, so the one task that
+/// announces the end has announced the start before it.
 async fn supervise(backend: Arc<Backend>, broker: Arc<Broker>, process: ProcessStartIdentity) {
+    backend.announce_started();
     loop {
         if matches!(
             kr_ipc::identity::process_state(&process),
@@ -1284,6 +1398,7 @@ async fn supervise(backend: Arc<Backend>, broker: Arc<Broker>, process: ProcessS
                 crate::broker::InstanceEnding::NativeExit,
             );
             backend.retire();
+            backend.announce_ended();
             return;
         }
         tokio::time::sleep(SUPERVISION_POLL).await;

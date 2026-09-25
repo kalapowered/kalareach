@@ -109,6 +109,20 @@ export type InstanceInvalidation =
  */
 export type ApplicationInstanceId = string
 /**
+ * Why an invocation ran exactly as it was typed.
+ *
+ * Section 12: an absolute-path invocation and a user-disabled integration keep their actual
+ * bypassed execution, with only verified observation and the terminal's own capabilities.
+ */
+export type CommandBypassReason =
+  | 'not_integrated'
+  | 'disabled'
+  | 'absolute_path'
+  | 'unmanaged_shell'
+  | 'not_interactive'
+  | 'backend_unavailable'
+  | 'session_closing'
+/**
  * Prompt or steering text carried inline. The normative bound is 65536                             bytes of UTF-8; maxLength counts characters and is therefore a                             necessary rather than a sufficient condition.
  */
 export type PromptText = string
@@ -1609,20 +1623,6 @@ export type RichOperation =
  */
 export type FenceId = string
 /**
- * Why an invocation ran exactly as it was typed.
- *
- * Section 12: an absolute-path invocation and a user-disabled integration keep their actual
- * bypassed execution, with only verified observation and the terminal's own capabilities.
- */
-export type CommandBypassReason =
-  | 'not_integrated'
-  | 'disabled'
-  | 'absolute_path'
-  | 'unmanaged_shell'
-  | 'not_interactive'
-  | 'backend_unavailable'
-  | 'session_closing'
-/**
  * What the worker tells the bridge about the fence.
  *
  * The bridge cannot conclude that its acknowledgement published a fence: the hold may have expired
@@ -1799,6 +1799,9 @@ export interface KalaReachProtocol {
   agent_commands_result?: AgentCommandsResult
   agent_draft_add_attachment_params?: AgentDraftAddAttachmentParams
   agent_draft_add_attachment_result?: AgentDraftAddAttachmentResult
+  agent_instance_event?: AgentInstanceEvent
+  agent_instance_list?: AgentInstanceList
+  agent_instance_summary?: AgentInstanceSummary1
   agent_mutation_result?: AgentMutationResult1
   agent_prompt_params?: AgentPromptParams
   agent_resource_cause?: AgentResourceCause
@@ -3496,6 +3499,119 @@ export interface DraftAttachment1 {
    * [`InsertionState::AcceptedByAgent`], because nothing else establishes acceptance.
    */
   upstream_evidence: string | null
+}
+/**
+ * One change to a session's agent instances, as an attached view is told about it.
+ */
+export interface AgentInstanceEvent {
+  instance: AgentInstanceSummary
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  sequence: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * What the instance is now.
+ */
+export interface AgentInstanceSummary {
+  /**
+   * One foreground application within a terminal session.
+   */
+  application_instance_id: string
+  /**
+   * Why the shell ran the program as typed, where the session answered it with a bypass.
+   */
+  bypass: CommandBypassReason | null
+  /**
+   * When the instance ended. A view drops an ended instance from its list.
+   */
+  ended_at: TimestampMs | null
+  /**
+   * How the program is integrated: `native_bridge` for a launch the integration made, and
+   * `native_terminal` for a program that was adopted.
+   */
+  mode: 'native_terminal' | 'gateway' | 'native_bridge'
+  /**
+   * The plugin whose connector recognised the program, where one did.
+   */
+  plugin_id: PluginId | null
+  /**
+   * The launch profile recorded for the program, where one was.
+   */
+  profile_id: LaunchProfileId | null
+  /**
+   * Why the instance's bridges are refused, where they are.
+   */
+  refusal: string | null
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  started_at: string
+}
+/**
+ * A session's live agent instances, as a view installs them.
+ *
+ * The session keeps the list and counts its announcements under its own lock, and it announces
+ * under that lock too, so every announcement is either in a list or after it: its sequence says
+ * which. A view installs the list, then applies the announcements above its sequence, and so
+ * holds every live instance once.
+ */
+export interface AgentInstanceList {
+  /**
+   * Every instance of the session that has not ended, in identifier order.
+   */
+  instances: AgentInstanceSummary1[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  sequence: string
+}
+/**
+ * One agent instance of a session, as the session announces it.
+ *
+ * Section 12 has a program the integrated route did not launch detected and observed rather than
+ * given a gateway after the fact, and a person watching the session needs to tell the two apart:
+ * a launched instance can have rich bridges, and an adopted one never does. This says which it
+ * is, how it came to run and, where its bridges are refused, why.
+ */
+export interface AgentInstanceSummary1 {
+  /**
+   * One foreground application within a terminal session.
+   */
+  application_instance_id: string
+  /**
+   * Why the shell ran the program as typed, where the session answered it with a bypass.
+   */
+  bypass: CommandBypassReason | null
+  /**
+   * When the instance ended. A view drops an ended instance from its list.
+   */
+  ended_at: TimestampMs | null
+  /**
+   * How the program is integrated: `native_bridge` for a launch the integration made, and
+   * `native_terminal` for a program that was adopted.
+   */
+  mode: 'native_terminal' | 'gateway' | 'native_bridge'
+  /**
+   * The plugin whose connector recognised the program, where one did.
+   */
+  plugin_id: PluginId | null
+  /**
+   * The launch profile recorded for the program, where one was.
+   */
+  profile_id: LaunchProfileId | null
+  /**
+   * Why the instance's bridges are refused, where they are.
+   */
+  refusal: string | null
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  started_at: string
 }
 /**
  * What one accepted agent mutation did.
@@ -11680,6 +11796,7 @@ export interface EventsSnapshotParams {
  * write, no notification and no query.
  */
 export interface EventsSnapshotResult {
+  agent_instances: AgentInstanceList1
   agent_resources: AgentResourceSnapshot1
   /**
    * Every current attachment, in join order.
@@ -11700,6 +11817,22 @@ export interface EventsSnapshotResult {
    * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
   taken_at_ms: string
+}
+/**
+ * The session's live agent instances when the snapshot was taken.
+ *
+ * A resynchronised view installs them and applies the announcements above
+ * [`crate::projection::AgentInstanceList::sequence`] that its stream still delivers.
+ */
+export interface AgentInstanceList1 {
+  /**
+   * Every instance of the session that has not ended, in identifier order.
+   */
+  instances: AgentInstanceSummary1[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  sequence: string
 }
 /**
  * One page of the agent resources this session's host still arbitrates.
@@ -11916,6 +12049,7 @@ export interface EventsSubscribeParams {
  * The result of `events.subscribe`.
  */
 export interface EventsSubscribeResult {
+  agent_instances: AgentInstanceList2
   agent_resources: AgentResourceSnapshot2
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
@@ -11934,6 +12068,23 @@ export interface EventsSubscribeResult {
    * The stream identifier notifications will carry.
    */
   stream_id: string
+}
+/**
+ * The session's live agent instances, read under the same lock that starts the queue.
+ *
+ * An announcement is either in this list or among the events that follow it, and its
+ * sequence says which: a view applies the announcements above
+ * [`crate::projection::AgentInstanceList::sequence`] and discards the rest.
+ */
+export interface AgentInstanceList2 {
+  /**
+   * Every instance of the session that has not ended, in identifier order.
+   */
+  instances: AgentInstanceSummary1[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  sequence: string
 }
 /**
  * The first page of the agent resources this subscription starts from.

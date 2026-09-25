@@ -46,6 +46,8 @@
 //! application that took the foreground. And it does not answer a request twice, whatever
 //! reconnects.
 
+#[cfg(unix)]
+pub mod adoption;
 pub mod agents;
 pub mod arbitration;
 pub mod attach;
@@ -1111,6 +1113,22 @@ impl Broker {
             .instances
             .get(&application_instance_id)
             .and_then(|instance| instance.dispatch.clone())
+    }
+
+    /// Returns whether an instance of this broker names `process` as its own, by its whole
+    /// identity.
+    ///
+    /// A launch registers its instance with the process that presented itself, and that process
+    /// keeps its identity when it execs the program, so a program the integration launched is held
+    /// here from its admission on. Adoption asks this before it records anything.
+    #[must_use]
+    pub fn holds_process(&self, process: &ProcessStartIdentity) -> bool {
+        self.state().instances.values().any(|instance| {
+            instance
+                .process
+                .as_ref()
+                .is_some_and(|held| held.process.matches(process))
+        })
     }
 
     /// Records that another attachment is watching one instance.

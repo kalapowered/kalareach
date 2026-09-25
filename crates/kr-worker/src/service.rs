@@ -275,7 +275,8 @@ impl WorkerService {
     }
 
     /// Sets up the backends an integrated invocation is given before it runs, on this session's
-    /// broker, and hands them to the session.
+    /// broker, and hands them to the session; on Unix it also starts the watch that adopts a
+    /// program those backends did not launch.
     ///
     /// Returns them, so the installation's connectors can be handed over to their sources. It must
     /// be called from inside the runtime the backends serve their endpoints on.
@@ -283,6 +284,14 @@ impl WorkerService {
         &self,
         config: crate::broker::commands::CommandBackendsConfig,
     ) -> Arc<crate::broker::commands::CommandBackends> {
+        // A program the integrated route did not launch is adopted from the same connectors, by
+        // a watch of the terminal's foreground that ends with the session.
+        #[cfg(unix)]
+        let adoptions = Arc::new(crate::broker::adoption::Adoptions::new(
+            Arc::clone(&self.broker),
+            Arc::clone(&config.sources),
+            config.environment_id,
+        ));
         let backends = Arc::new(
             crate::broker::commands::CommandBackends::new(
                 Arc::clone(&self.broker),
@@ -294,6 +303,11 @@ impl WorkerService {
         self.runtime
             .session()
             .set_command_backends(Arc::clone(&backends));
+        #[cfg(unix)]
+        tokio::spawn(crate::broker::adoption::watch(
+            adoptions,
+            Arc::downgrade(&self.runtime),
+        ));
         backends
     }
 }
@@ -1127,6 +1141,19 @@ impl WorkerService {
                                     &stream_id,
                                     sequence,
                                     kr_protocol::projection::AGENT_RESOURCE_EVENT,
+                                    &*event,
+                                ) else {
+                                    continue;
+                                };
+                                sequence += 1;
+                                outlet.write(&notification).await
+                            }
+                            // An announcement about one of this session's agent instances.
+                            OutputDelivery::AgentInstance { event, .. } => {
+                                let Some(notification) = notification(
+                                    &stream_id,
+                                    sequence,
+                                    kr_protocol::projection::AGENT_INSTANCE_EVENT,
                                     &*event,
                                 ) else {
                                     continue;
@@ -4484,17 +4511,22 @@ impl WorkerService {
 
     /// What a subscription answer costs before a single resource is in it.
     ///
-    /// Every part of it that varies is measured at its widest - the cursors, the gap this
-    /// subscription may have to report, and the recovery's own counters and continuation - because
-    /// none of them is known until the session has been read, and a page cut against a narrower
-    /// measurement would be cut too generously.
-    fn subscription_answer_bytes(state: &ConnectionState) -> usize {
+    /// The session's agent instances are measured as they are, read under the lock that starts
+    /// the subscription's queue. Every other part that varies is measured at its widest - the
+    /// cursors, the gap this subscription may have to report, and the recovery's own counters and
+    /// continuation - because none of them is known until the session has been read further, and
+    /// a page cut against a narrower measurement would be cut too generously.
+    fn subscription_answer_bytes(
+        state: &ConnectionState,
+        agent_instances: &kr_protocol::projection::AgentInstanceList,
+    ) -> usize {
         Self::answer_bytes(&EventsSubscribeResult {
             stream_id: state.stream_id.clone(),
             from_cursor: U64::new(u64::MAX),
             oldest_retained_cursor: U64::new(u64::MAX),
             gap: Nullable::some(Self::widest_gap()),
             agent_resources: Self::no_resources(),
+            agent_instances: agent_instances.clone(),
         })
     }
 
@@ -4618,15 +4650,21 @@ impl WorkerService {
     ) -> Result<ParamsValue> {
         let params: EventsSubscribeParams = parse(params)?;
         Self::check_attachment(state, params.attachment_id)?;
+        let mut session = self.runtime.session();
+        Self::check_session(&session, params.session_id)?;
+        // The session's agent instances, read under the lock that starts the queue below. The
+        // session announces under this lock too, so an announcement is either in this list or
+        // among the events that follow it, and the list's sequence says which.
+        let agent_instances = session.agent_instances();
         // Before anything of this connection changes. A subscription replaces the stream the
         // attachment was being served through, and a refusal after that would leave a client with
         // neither the stream it had nor the one it asked for. What decides the refusal is this
-        // peer's own frame against the answer's fixed parts and the room one resource needs, and
-        // none of that depends on the session, so it is settled first and settled once: a
-        // connection whose subscription is answered is never refused a later one.
-        let bounds = Self::recovery_bounds(state, Self::subscription_answer_bytes(state))?;
-        let mut session = self.runtime.session();
-        Self::check_session(&session, params.session_id)?;
+        // peer's own frame against the answer's fixed parts, this session's instances and the room
+        // one resource needs.
+        let bounds = Self::recovery_bounds(
+            state,
+            Self::subscription_answer_bytes(state, &agent_instances),
+        )?;
         let from = params
             .from_cursor
             .as_ref()
@@ -4667,6 +4705,7 @@ impl WorkerService {
             oldest_retained_cursor: U64::new(oldest),
             gap: Nullable(gap),
             agent_resources: Self::agent_resource_snapshot(agent_resources),
+            agent_instances,
         };
         // Before the subscription is this connection's. A refused answer must leave the client
         // reading what it was reading before it asked: a stream started for an answer that was

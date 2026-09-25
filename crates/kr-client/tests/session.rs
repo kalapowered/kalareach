@@ -321,6 +321,10 @@ fn answer_read(request: &kr_protocol::envelope::Request) -> ParamsValue {
                 resources: Vec::new(),
                 continue_after: Nullable::null(),
             },
+            agent_instances: kr_protocol::projection::AgentInstanceList {
+                sequence: U64::ZERO,
+                instances: Vec::new(),
+            },
         })
         .expect("a result");
     }

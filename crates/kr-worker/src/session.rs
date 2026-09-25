@@ -256,6 +256,14 @@ pub struct Session {
     /// ran in memory. What a reader of this needs is what happened recently, and the durable
     /// record of a command is its own.
     command_blocks: std::collections::VecDeque<kr_protocol::root::RootCommandBlockParams>,
+    /// The bypass each executable was answered with in the latest prompt generation that asked.
+    ///
+    /// A program the integrated route did not launch is adopted with the reason the shell ran it
+    /// as typed, where the session gave one. Only the latest generation is kept: a program running
+    /// now was started by the line being run now.
+    answered: Answered,
+    /// The session's live agent instances, and how many announcements it has made about them.
+    agent_instances: AgentInstances,
     /// Why the last interrupt this session tried did not reach the foreground group.
     interrupt_failed: Option<String>,
     /// Accepted bytes the root editor's machine is holding for a reader transition.
@@ -539,6 +547,8 @@ impl Session {
             launches: BTreeMap::new(),
             late_installations: Vec::new(),
             command_blocks: std::collections::VecDeque::new(),
+            answered: Answered::default(),
+            agent_instances: AgentInstances::default(),
             interrupt_failed: None,
             held_input_bytes: 0,
             restoration_losses: crate::render::Carried::default(),
@@ -763,7 +773,13 @@ impl Session {
 
         match hook {
             crate::fence::CommandHook::Resolve(params) => {
-                EventOutcome::CommandResolved(Box::new(self.resolve_invocation(&params)))
+                let answer = self.resolve_invocation(&params);
+                self.answered.record(
+                    params.prompt_generation,
+                    &params.executable,
+                    answer.bypass.as_ref().copied(),
+                );
+                EventOutcome::CommandResolved(Box::new(answer))
             }
             crate::fence::CommandHook::Block(block) => {
                 let prompt_generation = block.prompt_generation;
@@ -2997,7 +3013,72 @@ impl Session {
             oldest_retained_cursor: U64::new(self.history.oldest_retained_cursor()),
             taken_at_ms: kr_ipc::now_ms(),
             agent_resources,
+            agent_instances: self.agent_instances(),
         }
+    }
+
+    /// Announces what one agent instance is now to every attached view, and keeps it.
+    ///
+    /// The announcement is counted, kept and published under this session's lock, so a list read
+    /// under the same lock either includes it or comes before it, and [`Self::agent_instances`]
+    /// carries the sequence of the last announcement it includes. An instance that ended leaves the
+    /// list. Each view is charged the event against its queue bound, like an agent resource.
+    pub fn announce_instance(&mut self, instance: kr_protocol::projection::AgentInstanceSummary) {
+        self.agent_instances.sequence = self.agent_instances.sequence.saturating_add(1);
+        if instance.ended_at.is_present() {
+            self.agent_instances
+                .live
+                .remove(&instance.application_instance_id);
+        } else {
+            self.agent_instances
+                .live
+                .insert(instance.application_instance_id, instance.clone());
+        }
+        let event = kr_protocol::projection::AgentInstanceEvent {
+            session_id: self.config.session_id,
+            sequence: U64::new(self.agent_instances.sequence),
+            instance,
+        };
+        let cost = crate::snapshot::wire::measure(&event).map_or(256, |cost| cost.bytes);
+        let oldest = self.history.oldest_retained_cursor();
+        let cursor = self.history.next_cursor();
+        for attachment_id in self.hub.subscribers() {
+            if self
+                .hub
+                .publish_agent_instance(attachment_id, cursor, event.clone(), cost, oldest)
+            {
+                self.projections.forget(attachment_id);
+            }
+        }
+    }
+
+    /// Returns the session's live agent instances, with the sequence of the last announcement the
+    /// list includes.
+    #[must_use]
+    pub fn agent_instances(&self) -> kr_protocol::projection::AgentInstanceList {
+        kr_protocol::projection::AgentInstanceList {
+            sequence: U64::new(self.agent_instances.sequence),
+            instances: self.agent_instances.live.values().cloned().collect(),
+        }
+    }
+
+    /// Returns what the terminal has in the foreground, for the adoption watch: its process group,
+    /// the root shell, and what the latest prompt generation's resolves were answered with.
+    ///
+    /// None once the session no longer accepts input, before its shell runs, and where the
+    /// platform reports no foreground group.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn foreground(&self) -> Option<crate::broker::adoption::Foreground> {
+        if !self.state.accepts_input() {
+            return None;
+        }
+        let root_shell = self.root_identity()?;
+        Some(crate::broker::adoption::Foreground {
+            group: self.pty.foreground_group()?,
+            root_shell,
+            answered: self.answered.executables.clone(),
+        })
     }
 
     /// Returns the oldest output cursor this session can still replay.
@@ -4228,4 +4309,49 @@ fn retained_bytes_under(root: &std::path::Path) -> u64 {
         }
     }
     total
+}
+
+/// A session's live agent instances, and how many announcements it has made about them.
+#[derive(Debug, Default)]
+struct AgentInstances {
+    /// The sequence of the latest announcement.
+    sequence: u64,
+    /// Every instance that has not ended.
+    live: BTreeMap<
+        kr_protocol::ids::ApplicationInstanceId,
+        kr_protocol::projection::AgentInstanceSummary,
+    >,
+}
+
+/// What the latest prompt generation's resolves were answered with.
+#[derive(Debug, Default)]
+struct Answered {
+    /// The generation the answers belong to.
+    generation: Option<kr_protocol::root::PromptGeneration>,
+    /// Each executable the shell named in it, with the bypass it was given or none.
+    executables: Vec<(String, Option<kr_protocol::root::CommandBypassReason>)>,
+}
+
+impl Answered {
+    /// The most answers one generation keeps: a line runs a bounded number of commands, and a line
+    /// that runs more than this is a loop whose early answers no adoption needs.
+    const RETAINED: usize = 16;
+
+    /// Keeps one answer, forgetting the answers of an earlier generation.
+    fn record(
+        &mut self,
+        generation: kr_protocol::root::PromptGeneration,
+        executable: &str,
+        bypass: Option<kr_protocol::root::CommandBypassReason>,
+    ) {
+        if self.generation != Some(generation) {
+            self.generation = Some(generation);
+            self.executables.clear();
+        }
+        self.executables.retain(|(held, _)| held != executable);
+        if self.executables.len() == Self::RETAINED {
+            self.executables.remove(0);
+        }
+        self.executables.push((executable.to_owned(), bypass));
+    }
 }

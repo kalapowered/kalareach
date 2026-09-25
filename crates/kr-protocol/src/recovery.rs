@@ -99,6 +99,12 @@ pub struct EventsSubscribeResult {
     /// [`AgentResourceSnapshot::continue_after`] is present the rest is read with `events.snapshot`
     /// before the events are applied.
     pub agent_resources: crate::projection::AgentResourceSnapshot,
+    /// The session's live agent instances, read under the same lock that starts the queue.
+    ///
+    /// An announcement is either in this list or among the events that follow it, and its
+    /// sequence says which: a view applies the announcements above
+    /// [`crate::projection::AgentInstanceList::sequence`] and discards the rest.
+    pub agent_instances: crate::projection::AgentInstanceList,
 }
 
 /// A range of output the worker can no longer replay.
@@ -199,6 +205,11 @@ pub struct EventsSnapshotResult {
     /// of the requests waiting on a person. The page named by `agent_resources_from` is returned,
     /// so the same call that takes the snapshot also reads the rest of it.
     pub agent_resources: crate::projection::AgentResourceSnapshot,
+    /// The session's live agent instances when the snapshot was taken.
+    ///
+    /// A resynchronised view installs them and applies the announcements above
+    /// [`crate::projection::AgentInstanceList::sequence`] that its stream still delivers.
+    pub agent_instances: crate::projection::AgentInstanceList,
 }
 
 /// Maximum bytes one history page may carry.

@@ -140,27 +140,42 @@ struct Shell {
     placed: Placed,
     runtime: tokio::runtime::Runtime,
     broker: Arc<Broker>,
+    sources: Arc<ConnectorSources>,
     backends: CommandBackends,
     executable: PathBuf,
     other: PathBuf,
     reports: PathBuf,
     generation: std::sync::atomic::AtomicU64,
+    /// The session whose attached view hears the launches' announcements, where one was made.
+    view: Option<View>,
+}
+
+/// A session with one attached view, the way the worker delivers to its clients.
+struct View {
+    runtime: Arc<kr_worker::runtime::SessionRuntime>,
+    stream: std::sync::Mutex<kr_worker::output::OutputStream>,
 }
 
 impl Shell {
     fn new() -> Self {
-        Self::with_source(|source| source)
+        Self::with_source(|source| source, false)
     }
 
     /// A shell whose connector's installation is granted to read files as well.
     fn reading() -> Self {
-        Self::with_source(fixture::reading)
+        Self::with_source(fixture::reading, false)
+    }
+
+    /// A shell whose session has an attached view, which the backends announce to.
+    fn viewed() -> Self {
+        Self::with_source(|source| source, true)
     }
 
     fn with_source(
         installed: impl FnOnce(
             kr_worker::broker::connectors::ConnectorSource,
         ) -> kr_worker::broker::connectors::ConnectorSource,
+        viewed: bool,
     ) -> Self {
         let placed = Placed::new();
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -187,30 +202,57 @@ impl Shell {
         );
         // The host tree itself, so a backend's socket path stays inside the bound it has on macOS.
         let runtime_dir = placed.host.root().to_path_buf();
-        let backends = CommandBackends::new(
+        let mut backends = CommandBackends::new(
             Arc::clone(&broker),
             CommandBackendsConfig {
                 session_id: session(),
                 environment_id: EnvironmentId::new(Uuid::from_bytes([4; 16])),
                 os_user: "someone".to_owned(),
                 runtime_dir,
-                sources,
+                sources: Arc::clone(&sources),
                 launcher: Some(placed.forwarder.clone()),
             },
             runtime.handle().clone(),
         );
+        let view = viewed.then(|| {
+            let _entered = runtime.enter();
+            View::open(&placed.host)
+        });
+        if let Some(view) = view.as_ref() {
+            backends = backends.with_views(Arc::downgrade(&view.runtime));
+        }
         let reports = placed.host.root().join("reports");
         std::fs::create_dir_all(&reports).expect("a directory for reports");
         Self {
             placed,
             runtime,
             broker,
+            sources,
             backends,
             executable,
             other,
             reports,
             generation: std::sync::atomic::AtomicU64::new(1),
+            view,
         }
+    }
+
+    /// The next announcement about an agent instance the session's view is sent.
+    fn announcement(&self) -> kr_protocol::projection::AgentInstanceEvent {
+        let view = self.view.as_ref().expect("a shell with a view");
+        let mut stream = view.stream.lock().expect("the view's stream");
+        self.runtime.block_on(async {
+            loop {
+                match tokio::time::timeout(LIVENESS, stream.recv()).await {
+                    Ok(Some(kr_worker::output::OutputDelivery::AgentInstance { event, bytes })) => {
+                        stream.written(bytes);
+                        return *event;
+                    }
+                    Ok(Some(delivery)) => stream.written(delivery.len()),
+                    Ok(None) | Err(_) => panic!("no announcement reached the view"),
+                }
+            }
+        })
     }
 
     fn integration() -> CommandIntegration {
@@ -377,6 +419,99 @@ impl Drop for Shell {
     fn drop(&mut self) {
         self.backends.close();
     }
+}
+
+impl View {
+    /// Opens a session whose shell is `cat`, attaches one view to it and subscribes that view.
+    fn open(host: &kr_ipc::testing::TempHost) -> Self {
+        let mut requested = kr_protocol::scalars::CanonicalSet::new();
+        requested.insert(kr_protocol::attachment::AttachmentCapability::ObserveTerminal);
+        let config = kr_worker::session::SessionConfig {
+            session_id: session(),
+            session_epoch: kr_protocol::ids::SessionEpoch::V1,
+            environment_id: host.environment_id(),
+            display_number: kr_protocol::session::DisplayNumber::new(1),
+            shell: kr_worker::testing::posix_script("exec cat"),
+            shell_mode: kr_protocol::session::ShellMode::NativeCompat,
+            worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+            desktop: kr_protocol::identity::DesktopBinding::none(),
+            dimensions: kr_protocol::session::Dimensions::new(80, 24),
+            journal_path: Some(host.environment().journal_database(session())),
+            spool_directory: Some(host.environment().session_spool(session())),
+            worker_endpoint: None,
+            send_queue_bytes: 8 * 1024 * 1024,
+            resident_bytes: 1024 * 1024,
+            time: kr_worker::action::time::TimeSources::system(),
+            launch_profile: kr_protocol::session::LaunchProfile::default(),
+        };
+        let mut opened = kr_worker::session::Session::open(config).expect("the session opens");
+        opened.launch().expect("its shell starts");
+        let attachment_id = kr_protocol::ids::AttachmentId::new(Uuid::from_bytes([5; 16]));
+        let params = kr_protocol::attachment::SessionAttachParams {
+            session_id: session(),
+            mode: kr_protocol::attachment::AttachMode::Terminal,
+            claim_geometry: false,
+            dimensions: kr_protocol::scalars::Nullable::some(
+                kr_protocol::session::Dimensions::new(80, 24),
+            ),
+            terminal_profile_id: kr_protocol::scalars::Nullable::some("xterm-256color".to_owned()),
+            requested: requested.clone(),
+        };
+        opened
+            .attach(&params, requested, attachment_id)
+            .expect("the view attaches");
+        let stream = opened
+            .subscribe(attachment_id)
+            .expect("the view subscribes");
+        let runtime = Arc::new(
+            kr_worker::runtime::SessionRuntime::start(
+                opened,
+                Arc::new(kr_ipc::clock::SystemSharedClock),
+            )
+            .expect("the session runs"),
+        );
+        Self {
+            runtime,
+            stream: std::sync::Mutex::new(stream),
+        }
+    }
+}
+
+/// The variable that makes a placed copy of this test binary the stand-in program an adoption
+/// finds: it sleeps for as many seconds as it names.
+const STAND_IN: &str = "KR_ADOPTION_STAND_IN";
+
+/// The stand-in program's body. Run by the test harness with nothing set, it does nothing.
+#[test]
+fn the_stand_in_program() {
+    if let Ok(seconds) = std::env::var(STAND_IN) {
+        std::thread::sleep(Duration::from_secs(seconds.parse().unwrap_or(60)));
+    }
+}
+
+/// Starts a program named `claude` that the integration did not launch, as this process's own
+/// child in a process group of its own: a copy of this test binary running only the stand-in, as
+/// a shell with job control starts a foreground job.
+fn stand_in(placed: &Placed) -> std::process::Child {
+    use std::os::unix::process::CommandExt as _;
+
+    let directory = placed.host.root().join("adopted");
+    std::fs::create_dir_all(&directory).expect("a directory for the stand-in");
+    let program = directory.join(fixture::COMMAND);
+    kr_ipc::testing::place_program(
+        &std::env::current_exe().expect("this test's own binary"),
+        &program,
+    );
+    std::process::Command::new(&program)
+        .args(["--exact", "the_stand_in_program", "--test-threads", "1"])
+        .env(STAND_IN, "60")
+        .current_dir(placed.host.root())
+        .process_group(0)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("the stand-in starts")
 }
 
 /// Waits for a process to end, within the liveness bound.
@@ -1556,4 +1691,154 @@ fn kr_req_12_16_a_directory_slow_to_open_does_not_hold_the_establish() {
         "the launch is granted the directory once it is open"
     );
     let _ = finish(child);
+}
+
+/// KR-REQ-12.07: a session's views hear its agent instances in the order they came and went: a
+/// launch once it is committed, a program adopted beside it, and each end, the launch's once its
+/// endpoint, credential, registration and launch record are gone.
+#[test]
+fn kr_req_12_07_a_launch_an_adoption_and_their_ends_reach_a_view_in_order() {
+    let shell = Shell::viewed();
+    let view = shell.view.as_ref().expect("a view");
+    let answer = shell.establish();
+    let directory = Shell::directory(&answer);
+    let registration = Shell::registration(&answer);
+    let child = shell.launch(&answer, "announced", &[("LINGER", "3")]);
+    let launched = instance_of(&shell.report("announced"));
+
+    let started = shell.announcement();
+    assert_eq!(started.instance.application_instance_id, launched);
+    assert_eq!(
+        started.instance.mode,
+        kr_protocol::broker::IntegrationMode::NativeBridge
+    );
+    assert!(!started.instance.ended_at.is_present());
+    assert!(started.instance.refusal.as_ref().is_none());
+    assert_eq!(
+        started.instance.profile_id.as_ref(),
+        shell
+            .broker
+            .profile_of(launched)
+            .map(|profile| profile.profile_id)
+            .as_ref(),
+        "the launch's own profile"
+    );
+
+    // A program the root shell ran beside it, which the integration did not launch.
+    let mut other = stand_in(&shell.placed);
+    let adoptions = kr_worker::broker::adoption::Adoptions::new(
+        Arc::clone(&shell.broker),
+        Arc::clone(&shell.sources),
+        EnvironmentId::new(Uuid::from_bytes([4; 16])),
+    );
+    let foreground = kr_worker::broker::adoption::Foreground {
+        group: i32::try_from(other.id()).expect("a process identifier"),
+        root_shell: kr_ipc::identity::current_process_start_identity().expect("this process"),
+        answered: Vec::new(),
+    };
+    let mut told = Vec::new();
+    eventually("the program is adopted", || {
+        told = adoptions.look(&foreground);
+        !told.is_empty()
+    });
+    for summary in told {
+        view.runtime.session().announce_instance(summary);
+    }
+    let adopted = shell.announcement();
+    assert_eq!(
+        adopted.instance.mode,
+        kr_protocol::broker::IntegrationMode::NativeTerminal
+    );
+    assert!(adopted.sequence.get() > started.sequence.get());
+
+    let (status, said) = finish(child);
+    assert!(status.success(), "{said}");
+    let ended = shell.announcement();
+    assert_eq!(ended.instance.application_instance_id, launched);
+    assert!(ended.instance.ended_at.is_present(), "the launch's end");
+    assert!(ended.sequence.get() > adopted.sequence.get());
+    let left: Vec<String> = std::fs::read_dir(&directory)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        left.is_empty() && !registration.exists(),
+        "by then its endpoint, credential, registration and launch record are gone: {left:?}"
+    );
+
+    let _ = other.kill();
+    let _ = other.wait();
+    for summary in adoptions.sweep() {
+        view.runtime.session().announce_instance(summary);
+    }
+    let adopted_ended = shell.announcement();
+    assert_eq!(
+        adopted_ended.instance.application_instance_id,
+        adopted.instance.application_instance_id
+    );
+    assert!(adopted_ended.instance.ended_at.is_present());
+    assert!(adopted_ended.sequence.get() > ended.sequence.get());
+    assert!(
+        view.runtime
+            .session()
+            .agent_instances()
+            .instances
+            .is_empty(),
+        "the session lists no instance once both have ended"
+    );
+}
+
+/// KR-REQ-12.07, KR-REQ-05.09: when a launched program's bridge is refused for what its process
+/// executes, the session's views are told why, once, and the reason stands in the instance's
+/// announcements until its end.
+#[test]
+fn kr_req_12_07_a_refused_bridge_is_announced_with_its_reason() {
+    let shell = Shell::viewed();
+    let hook = shell.placed.forwarder.display().to_string();
+    let (_, another) = shells();
+    let second = SESSION_START.replace(THREAD, SECOND_THREAD);
+    let then_exec = another.display().to_string();
+    let answer = shell.establish();
+    let child = shell.launch(
+        &answer,
+        "refused",
+        &[
+            ("HOOK", hook.as_str()),
+            ("HOOK_EVENT", SESSION_START),
+            ("HOOK_EVENT_2", second.as_str()),
+            ("THEN_EXEC", then_exec.as_str()),
+        ],
+    );
+    let instance = instance_of(&shell.report("refused"));
+    let started = shell.announcement();
+    assert_eq!(started.instance.application_instance_id, instance);
+    assert!(
+        started.instance.refusal.as_ref().is_none(),
+        "nothing is refused yet"
+    );
+    eventually("the other program's hook has run", || {
+        shell.reports.join("refused.hooked2").exists()
+    });
+    let refused = shell.announcement();
+    assert_eq!(refused.instance.application_instance_id, instance);
+    assert!(!refused.instance.ended_at.is_present());
+    let why = refused
+        .instance
+        .refusal
+        .as_ref()
+        .expect("the views are told why its bridges are refused")
+        .clone();
+    assert!(refused.sequence.get() > started.sequence.get());
+    let _ = finish(child);
+    let ended = shell.announcement();
+    assert!(ended.instance.ended_at.is_present(), "then its end");
+    assert_eq!(
+        ended.instance.refusal.as_ref(),
+        Some(&why),
+        "the refusal stands to the end"
+    );
 }
