@@ -690,6 +690,19 @@ three sign through `services::signed`, which is the one credential every method 
 `Services` group is proven by: the gateway origin, the method, a fresh nonce, the time and the
 digest of the canonical request body.
 
+A request for something an account owns, rather than the key that asks, carries a second
+authorisation beside that credential. `signed::AccountAuthorisation` names a token source and the
+scope the resource reads; the token the source holds at that moment is taken before the request is
+signed and travels as its `authorization` header, and the signature covers none of it. The same
+call says whether a request that went unanswered ever left this device: `Unanswered::NotSent` for
+everything refused before the transport is given the request (a body it cannot write, a token its
+source will not give, a credential it cannot make or that falls outside the service's clock window,
+a request larger than the method admits), and `Unanswered::Sent` for everything after, an answer it
+cannot read included. An authorisation made for one purpose asks for that purpose alone:
+`AuthorisationRequest::asking` asks the identity and refresh scopes and the resources its caller
+names, so a device restoring from a recovery kit asks for `backup.restore` and nothing else, while
+`AuthorisationRequest::new` is the application's own sign-in and asks for what it always has.
+
 A mailbox is addressed by the identifier of the recipient's stored-envelope public key, and every
 paired peer of that recipient knows that key, because it is what they seal to. So possession of the
 private half is what distinguishes the recipient: the first read of an unclaimed mailbox is
@@ -767,7 +780,10 @@ The service is what states that, from records only it holds, and the caller does
 its own. Every exchange is signed with the instant its caller states rather than one the
 implementation reads, because those are the instants the fence presents afterwards. `resolve` drops
 the copy the service kept of one refused write once the person has chosen, and answers a copy that
-is already gone the same way, so asking again is safe.
+is already gone the same way, so asking again is safe. `compare_exchange_dispatched` is the exchange
+for a caller that records a write before it sends it: it answers `SyncDispatch::NotSent` for a
+request refused before anything left, which can never run, and an implementation that cannot tell
+counts every failure as possibly sent.
 
 The trait states what an implementation owes. The order is the service's: every applied write takes
 the next place in its collection's order, from a counter the service keeps, because numbers assigned
@@ -805,6 +821,17 @@ shared collections that name this installation.
   sent. Where a shared collection's two refusals reach a caller as errors, `COLLECTION_ABSENT` is
   an unknown object and `KEY_EPOCH_RETIRED` a view to bring up to date. A fetch reads the object
   through a comparison for its kind, and a collection holding none is reported as such.
+- The owner's recovery bundle is the fourth kind, `recovery_bundle`, named by
+  `recovery::bundle_collection` for its kind and the kit's locator. Its four requests, an exchange,
+  a read, the status of a request identity and a fence, name the locator instead of a collection
+  and a home, because the service keeps one collection at each locator for the whole origin. Each
+  carries the account token `ManagedSyncService::presenting` names beside the signature:
+  `backup.write` for a device that writes the bundle, `backup.restore` for one restoring from the
+  kit. A client that presents no account sends none of them. The bundle travels as a
+  `SealedRecoveryBundle`, its stream and nothing else, of at most 128 KiB, which fits the request
+  every member shares. A longer one, a locator that is not a canonical identifier and a resolution
+  (a bundle keeps no copies) are refused before anything is sent, and a bundle named among a
+  collection's objects or copies is an answer about something else.
 - An answer may carry members this client does not read, because the service and this client are
   deployed on their own schedules; every member it does read is required and typed. A sealed object
   and a key record are the exceptions and stay closed schemas. One path carries every member, and a
@@ -961,7 +988,10 @@ seed behind.
 ### The bundle
 
 `BundleStore` reads and writes the bundle through `services::SyncBackupService`, which is a
-compare-and-swap over opaque bytes at the locator. Three things follow.
+compare-and-swap over opaque bytes at the locator; `bundle_collection` names the collection for the
+bundle's kind and the locator, and a managed service is reached through `services::sync` with the
+account's token beside every request. A new kit's locator is drawn with `fresh_locator`, a random
+identifier in its one spelling. Three things follow.
 
 **A writer is declared recovery-enabled only after its bundle has landed.** `enable_writer` commits
 the updated bundle and then returns `WriterEnabled`, whose fields are private and which this crate
@@ -988,6 +1018,13 @@ read again and apply the change to what is actually there. The conflict names th
 kept of the refused write, where it kept one, because what a service holds is ciphertext this
 device sent and an owner is shown a retained artefact rather than told it does not exist.
 
+**The locator names one collection for the whole origin, owned by the account whose first write
+applied there.** A device holding only the kit reaches it with the locator and its account, and
+another account is answered as if nothing were there. The locator's secrecy covers its first claim
+only: once one service has seen it, a claim at a second service, or at one put back from an archive
+that held no bundle, can be taken by another account that writes there first. That denies the owner
+the bundle at that service. It cannot forge one, because only the seed derives the key.
+
 **The bundle is key material, and it settles itself by reading.** Section 20 says what it holds:
 collection locators, trusted backup-writer signing public keys and generation checkpoints. None of
 that is session content, so it is not one of the content-bearing outboxes privacy mode fences, and a
@@ -1007,6 +1044,16 @@ its own request. When an answer does not come back, `commit` says exactly that -
 write made in the meantime would compare against a place the first one may be about to leave, and
 its refusal would be reported as another device's conflict when what it had met was this device's
 own write.
+
+The one exception is a write that never left this device. A bundle sealed past the 128 KiB a
+service keeps is refused before anything is recorded (`BundleTooLarge`). For the rest the service
+client says whether a refused request left (`SyncDispatch::NotSent`): one refused for want of an
+account token, for a signing instant outside the service's window or for a locator the service
+cannot address can never run, so `commit` puts back the record the call found, reports
+`BundleNotSent`, and the next write goes out. A migration whose destination write is refused that
+way leaves both locations and both stores as they were. A record the disk will not take back
+reads, after a restart, as a write outstanding, which one fence ends. Everything after the request
+left stays unknown, a fault with no envelope included.
 
 Two things end it. A read that finds the very bytes this device sent, which the record's digest
 establishes, settles the write as applied: it landed, and it cannot land twice, because a service
@@ -1122,9 +1169,13 @@ A restore obtains service access through the configured retrieval policy - a man
 service the owner runs - and then authenticates the bundle with the kit. They are two different
 things, and the cryptography is what makes them different: the ciphertext that access reaches opens
 only under the owner's own seed, so signing in gets a restore to the bytes and no further.
-`FreshRestore::open_bundle` also refuses before the policy has been satisfied, which orders the two
-steps; `ServiceAccess` is the caller's own statement that its policy was met, so that ordering is a
-guard against a caller skipping a step rather than a proof that the service authenticated anybody.
+`ServiceAccess` is what the policy gave the device: the reader it reaches one origin through. Under
+a managed account that is a `ManagedSyncService` presenting a token from an authorisation made for
+the restore alone (`backup.restore`, with the identity and refresh scopes); under a service the
+owner runs it presents the credential the owner's own deployment issued. `FreshRestore::open_bundle`
+reads only through it and refuses before the policy has given access, and the service decides what
+the reader reaches: a reader it does not admit reads nothing, so holding a `ServiceAccess` proves
+nothing by itself.
 
 Substituting the origin or the locator fails authentication. A kit will not even build a context
 for an origin it does not name, and a bundle written at one origin does not open under the key
@@ -1204,8 +1255,8 @@ not one of them, so an account password reset returns an account and nothing els
 | KR-REQ-18.05 | The encrypted settings sync part only: the service holds ciphertext in a declared size bucket and never a setting, against a live deployment as well as the suite's own service (`kr_req_18_05_a_setting_is_stored_sealed_in_a_declared_bucket`), and the feature names its three parts and which of them are optional. A device receives a collection key only through its own wrap in a record it accepted, and only after its hosts committed its pairing and the owner confirmed the addition and the join (`a_production_device_receives_its_key_through_its_own_wrap_and_keeps_it_in_its_store`, `nothing_is_sealed_to_a_device_its_host_has_not_committed` in `crates/kr-client/tests/membership.rs`, against the suite's own service and hosts). Across a restore, a device follows a collection put back only from the head it holds and is otherwise out until the owner confirms a join (`a_collection_put_back_without_the_head_this_device_holds_leaves_it_out_until_a_join`, with its control `an_older_revision_in_the_same_history_leaves_the_head_standing`, in the same file). Nothing here performs a history backup or produces recovery material |
 | KR-REQ-20.11 | The sync-collection half: removing a device gives the members that stay a fresh key at the next epoch that the removed device has no wrap of, and publication stays fenced until that record is installed (`removing_a_device_gives_the_rest_a_key_it_cannot_open`, `every_new_epoch_has_a_freshly_drawn_key`, `publication_stays_fenced_from_a_recorded_removal_until_its_record_is_installed` in `crates/kr-client/tests/membership.rs`, and the reconciler's exhaustive test in `crates/kr-client/src/sync/membership/exhaustive.rs`) |
 | KR-REQ-20.14 | `a_kit_round_trips_through_its_printable_and_scanned_forms`, `the_printed_kit_is_the_document_the_fixture_publishes`, `a_mistyped_kit_fails_on_its_checksum_before_anything_is_derived`, `a_kit_read_by_hand_forgives_the_letters_the_alphabet_leaves_out` and `a_kit_value_whose_spacing_would_change_when_read_is_refused` in `crates/kr-client/tests/recovery.rs`, with `fixtures/crypto/kdf.json` and `fixtures/crypto/recovery-kit.json` |
-| KR-REQ-20.15 | `a_writer_is_declared_recovery_enabled_only_after_its_bundle_has_landed`, `a_writer_whose_bundle_did_not_commit_is_not_declared`, `rotating_a_writers_key_replaces_it_in_one_commit` and `a_verified_generation_never_moves_backwards` in `crates/kr-client/tests/recovery.rs`. They establish the ordering and what the bundle holds; nothing here declares a writer to a *service*, because that declaration belongs to the collection's enrolment record |
-| KR-REQ-20.16 | `a_restore_with_only_the_kit_reaches_the_archive_and_trusts_only_the_bundles_writers` in `crates/kr-client/tests/recovery.rs`, which drops every producer value before the restore and takes the producer key out of the authenticated bundle |
+| KR-REQ-20.15 | `a_writer_is_declared_recovery_enabled_only_after_its_bundle_has_landed`, `a_writer_whose_bundle_did_not_commit_is_not_declared`, `rotating_a_writers_key_replaces_it_in_one_commit` and `a_verified_generation_never_moves_backwards` in `crates/kr-client/tests/recovery.rs`. They establish the ordering and what the bundle holds; nothing here declares a writer to a *service*, because that declaration belongs to the collection's enrolment record. Through the managed client, against a service kept to the managed service's contract, a writer is declared only once its bundle has landed at the locator (`a_bundle_is_written_and_read_at_its_locator_with_the_account_token_beside_every_request` in `crates/kr-client/src/services/sync/tests/bundle.rs`) |
+| KR-REQ-20.16 | `a_restore_with_only_the_kit_reaches_the_archive_and_trusts_only_the_bundles_writers` in `crates/kr-client/tests/recovery.rs`, which drops every producer value before the restore and takes the producer key out of the authenticated bundle; through the managed client, a bundle served under another locator or read as another origin's, or under another seed's kit, trusts no writer (`a_bundle_served_under_another_locator_or_origin_fails_authentication` in `crates/kr-client/src/services/sync/tests/bundle.rs`) |
 | KR-REQ-20.17 | The table's answers: `the_material_table_refuses_a_reusable_key_and_a_revoked_grant` and `the_admitted_set_is_data_and_configuration_and_the_limits_still_require_owner_pairing` in `crates/kr-client/tests/recovery.rs`. The settings part, through the export and import paths that ask the table: `a_collection_key_is_neither_backed_up_nor_restored`, `a_restore_returns_settings_without_a_key_a_membership_or_a_sync_checkpoint` and `a_restored_device_joins_only_after_a_fresh_authorisation` in `crates/kr-client/tests/membership.rs`, which carry the settings through an archive only the recovery recipient opens. Producing and uploading the device's archive is the backup producer's; this library supplies what goes into it and takes back what comes out |
-| KR-REQ-20.18 | `a_migration_produces_an_updated_kit_and_a_verified_record` and `one_kit_serves_several_services` in `crates/kr-client/tests/recovery.rs`. The offline-export half is `the_encrypted_bundle_and_selected_archives_export_offline` in the same file, over the library's own `OfflineExport`: the encrypted bundle and the selected archives' ciphertext in one canonical document, which restores without a service |
-| KR-REQ-20.19 | `service_access_alone_does_not_decrypt_the_bundle` and `substituting_the_origin_or_the_locator_fails_authentication` in `crates/kr-client/tests/recovery.rs` |
+| KR-REQ-20.18 | `a_migration_produces_an_updated_kit_and_a_verified_record` and `one_kit_serves_several_services` in `crates/kr-client/tests/recovery.rs`. The offline-export half is `the_encrypted_bundle_and_selected_archives_export_offline` in the same file, over the library's own `OfflineExport`: the encrypted bundle and the selected archives' ciphertext in one canonical document, which restores without a service. The bundle's path to a managed service: its locator and the claim a first write makes, the race between two writers and a lost write ended under a new token (`two_writers_of_one_account_race_and_one_is_told_the_bundle_moved_on`, `competing_first_claims_leave_one_owner_and_every_other_account_meets_an_absent_bundle`, `a_first_write_that_did_not_apply_claims_nothing`, `a_fence_made_before_the_claim_survives_it`, `a_lost_write_is_ended_under_a_new_token_and_after_a_restart`), and a write that never left (`a_write_refused_before_it_was_sent_leaves_the_store_as_it_was_and_the_next_write_goes_out`, `a_migration_refused_before_it_was_sent_leaves_both_locations_as_they_were`, `a_bundle_over_its_bound_is_refused_before_anything_is_recorded_or_sent`), all in `crates/kr-client/src/services/sync/tests/bundle.rs`, with `a_write_refused_before_it_was_sent_is_reported_so_and_leaves_the_store_as_it_was` and `a_record_the_disk_would_not_take_back_leaves_an_unsent_write_a_restart_ends` in `crates/kr-client/tests/recovery.rs` |
+| KR-REQ-20.19 | `service_access_alone_does_not_decrypt_the_bundle` and `substituting_the_origin_or_the_locator_fails_authentication` in `crates/kr-client/tests/recovery.rs`. Through the managed client: a device with only the kit reads the bundle through the access its policy gave it and reaches nothing without it (`a_device_with_only_the_kit_reads_the_bundle_through_the_access_its_policy_gives_it`), and a service put back without the bundle is refused as a bundle put back (`a_service_put_back_without_the_bundle_is_refused_as_a_bundle_put_back`), in `crates/kr-client/src/services/sync/tests/bundle.rs`; the restore's own authorisation holds a token for `backup.restore` and for no other resource (`a_restore_authorisation_holds_a_token_for_its_scope_and_for_no_other` in `crates/kr-client/src/services/account.rs`) |
