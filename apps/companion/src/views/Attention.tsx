@@ -7,11 +7,12 @@
  * one thing this screen must never do is turn silence into a claim that an agent is stuck.
  */
 
-import { useCallback, useEffect, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 
 import { Badge, Banner, Button, Card, CommitButton } from '../components/ui'
 import { useApp } from '../app/state'
-import { failureMessage } from '../host/port'
+import { failureMessage, watch, type Watch } from '../host/port'
+import { ask } from '../mobile/model/call'
 import { outcomeMessage, receiptTone } from './Conversation'
 import { Confirmations } from '../pairing/Confirmations'
 import type { AttentionEntry, AttentionInbox, AttentionKind } from '../model/pending'
@@ -58,21 +59,34 @@ export function Attention(): ReactNode {
   const [failure, setFailure] = useState<string | null>(null)
   const [filter, setFilter] = useState<AttentionKind | 'all'>('all')
   const [readAtMs, setReadAtMs] = useState(0)
+  // Every read of the inbox, on opening, after a decision and on a retry, is made under one watch
+  // with no listeners, so only the newest read's answer is shown, and none once the screen closes.
+  const reads = useRef<Watch | null>(null)
 
   const load = useCallback(() => {
-    port
-      .attentionRead({})
+    const current = reads.current?.read() ?? null
+    if (current === null) return
+    ask(() => port.attentionRead({}))
       .then((result) => {
+        if (!current()) return
         setInbox(result)
         setReadAtMs(Date.now())
         setFailure(null)
       })
       .catch((error: unknown) => {
+        if (!current()) return
         setFailure(failureMessage(error))
       })
   }, [port])
 
-  useEffect(load, [load])
+  useEffect(() => {
+    const reading = watch([], load)
+    reads.current = reading
+    return () => {
+      reading.stop()
+      if (reads.current === reading) reads.current = null
+    }
+  }, [load])
 
   const decide = (entry: AttentionEntry, decision: 'allow' | 'deny') => {
     port

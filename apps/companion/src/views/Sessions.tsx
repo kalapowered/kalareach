@@ -6,13 +6,14 @@
  * on the row is inferred from elapsed time.
  */
 
-import { useCallback, useEffect, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 
 import type { EnvironmentListResult, HostInfoResult, SessionListResult } from '@kalareach/protocol'
 
 import { Badge, Banner, Button, Card } from '../components/ui'
 import { useApp } from '../app/state'
-import { failureMessage } from '../host/port'
+import { failureMessage, watch, type Watch } from '../host/port'
+import { ask } from '../mobile/model/call'
 import { accountName } from './account-name'
 
 type Session = SessionListResult['sessions'][number]
@@ -52,21 +53,34 @@ export function Sessions(): ReactNode {
   const [list, setList] = useState<SessionListResult | null>(null)
   const [failure, setFailure] = useState<string | null>(null)
   const [query, setQuery] = useState('')
+  // Every read, on opening and on a retry, is made under one watch with no listeners, so only the
+  // newest read's answer is shown, and none once the screen closes.
+  const reads = useRef<Watch | null>(null)
 
   const load = useCallback(() => {
-    port
-      // Every environment this connection may see, and only the sessions that are still open.
-      .sessionList({ environment_id: null, include_closed: false })
+    const current = reads.current?.read() ?? null
+    if (current === null) return
+    // Every environment this connection may see, and only the sessions that are still open.
+    ask(() => port.sessionList({ environment_id: null, include_closed: false }))
       .then((result) => {
+        if (!current()) return
         setList(result)
         setFailure(null)
       })
       .catch((error: unknown) => {
+        if (!current()) return
         setFailure(failureMessage(error))
       })
   }, [port])
 
-  useEffect(load, [load])
+  useEffect(() => {
+    const reading = watch([], load)
+    reads.current = reading
+    return () => {
+      reading.stop()
+      if (reads.current === reading) reads.current = null
+    }
+  }, [load])
 
   const sessions = (list?.sessions ?? []).filter((session) => {
     if (query.trim().length === 0) return true
@@ -166,22 +180,36 @@ export function Hosts(): ReactNode {
   const [environments, setEnvironments] = useState<EnvironmentListResult | null>(null)
   const [reachable, setReachable] = useState(true)
   const [failure, setFailure] = useState<string | null>(null)
+  // Every read, on opening, on a refresh and on a retry, is made under one watch with no listeners,
+  // so only the newest read's answer is shown, and none once the screen closes.
+  const reads = useRef<Watch | null>(null)
 
   const load = useCallback(() => {
-    Promise.all([port.hostInfo(), port.environmentList()])
+    const current = reads.current?.read() ?? null
+    if (current === null) return
+    ask(() => Promise.all([port.hostInfo(), port.environmentList()]))
       .then(([hostInfo, list]) => {
+        if (!current()) return
         setInfo(hostInfo)
         setEnvironments(list)
         setReachable(true)
         setFailure(null)
       })
       .catch((error: unknown) => {
+        if (!current()) return
         setReachable(false)
         setFailure(failureMessage(error))
       })
   }, [port])
 
-  useEffect(load, [load])
+  useEffect(() => {
+    const reading = watch([], load)
+    reads.current = reading
+    return () => {
+      reading.stop()
+      if (reads.current === reading) reads.current = null
+    }
+  }, [load])
 
   return (
     <>
