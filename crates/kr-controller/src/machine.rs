@@ -31,6 +31,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use kr_flush::{NameKind, flush_directory};
 use kr_ipc::paths::EnvironmentPaths;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{ActionId, ActorId, EnvironmentId, MachineId};
@@ -411,7 +412,7 @@ impl MachineStore {
         // The record exists from here on, and the next open reads it. A failed flush is reported,
         // because the first start cannot say it recorded the group durably.
         self.passed(Boundary::Published)
-            .and_then(|()| flush_directory(&self.directory))
+            .and_then(|()| flush_directory(&self.directory, NameKind::File))
             .map_err(|error| storage("create the machine group record", &self.record, error))
     }
 
@@ -435,7 +436,7 @@ impl MachineStore {
         // The record's name holds the new record from here on, and every later read returns it.
         // What cannot be told without the directory flush is whether it survives a crash.
         self.passed(Boundary::Published)
-            .and_then(|()| flush_directory(&self.directory))
+            .and_then(|()| flush_directory(&self.directory, NameKind::File))
             .map_err(|error| ControllerError::Uncertain {
                 detail: format!(
                     "{} now names machine group {} at revision {}, but its directory could not be \
@@ -546,18 +547,6 @@ fn storage(
         operation,
         detail: format!("{}: {reason}", path.display()),
     }
-}
-
-/// Flushes a directory, so the rename inside it is on disk.
-#[cfg(unix)]
-fn flush_directory(directory: &Path) -> std::io::Result<()> {
-    std::fs::File::open(directory)?.sync_all()
-}
-
-/// Flushes a directory. Windows offers no flush of a directory to ask for.
-#[cfg(not(unix))]
-fn flush_directory(_directory: &Path) -> std::io::Result<()> {
-    Ok(())
 }
 
 /// Interruptions a test registers for one record, each taken by the first publication of that
@@ -1940,5 +1929,101 @@ mod tests {
                 "{what} was not kept as it was"
             );
         }
+    }
+
+    /// Holds `directory` open with a handle that shares reading and deleting but not writing, which
+    /// is what any handle that may add a file to it has to share.
+    #[cfg(windows)]
+    fn hold_without_shared_writing(directory: &Path) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        /// The right to list a directory, which is all the handle holds.
+        const FILE_LIST_DIRECTORY: u32 = 0x0001;
+        /// Reading is shared with other handles.
+        const FILE_SHARE_READ: u32 = 0x0001;
+        /// Deleting is shared; writing is not.
+        const FILE_SHARE_DELETE: u32 = 0x0004;
+        /// What lets a program open a directory at all.
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+        std::fs::OpenOptions::new()
+            .access_mode(FILE_LIST_DIRECTORY)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(directory)
+            .expect("the directory is held")
+    }
+
+    /// Runs `publication` held at the point its record's name changed, while `directory` is held
+    /// without shared writing, and returns its answer once it has been let go on.
+    #[cfg(windows)]
+    fn published_while_held<T: Send>(
+        environment: &Environment,
+        publication: impl FnOnce() -> Result<T> + Send,
+    ) -> Result<T> {
+        let (arrived, arrival) = mpsc::channel();
+        let (resume, resumed) = mpsc::channel();
+        seam::register(
+            &environment.record(),
+            Boundary::Published,
+            Interruption::Pause {
+                arrived,
+                resume: resumed,
+            },
+        );
+        let resume = Resume(resume);
+        std::thread::scope(|scope| {
+            let running = scope.spawn(publication);
+            arrival
+                .recv_timeout(WAIT)
+                .expect("the publication changed the record's name");
+            let holding = hold_without_shared_writing(environment.paths().state_dir());
+            drop(resume);
+            let answer = running.join().expect("the publication ran");
+            drop(holding);
+            answer
+        })
+    }
+
+    /// KR-REQ-03.07: once a first start has linked its record into place, or a step has renamed its
+    /// record over the old one, the state directory is flushed through a handle that may add a file
+    /// to it, so the name survives a crash. While a handle that shares no writing holds the
+    /// directory, that flush is refused: the first start fails and the step says its change may not
+    /// survive a crash, where a flush that did nothing would call both durable. Either way the
+    /// record's name already holds the new record, and with nothing held the same publications
+    /// succeed.
+    #[cfg(windows)]
+    #[test]
+    fn a_record_whose_directory_cannot_be_flushed_is_not_called_durable() {
+        let environment = Environment::create();
+        let minted = published_while_held(&environment, || {
+            MachineStore::open(&environment.lock, &environment.paths(), 1_000)
+        });
+        let refused = minted.expect_err("a first start whose directory cannot be flushed");
+        assert_eq!(refused.code(), ErrorCode::StorageUnavailable, "{refused}");
+        let store = environment.open();
+        let created = store.group().expect("the linked record is read");
+
+        let into = some_group();
+        let stepped = published_while_held(&environment, || {
+            store.join(
+                &environment.lock,
+                into,
+                created.expected(),
+                &approval(),
+                2_000,
+            )
+        });
+        let uncertain = stepped.expect_err("a step whose directory cannot be flushed");
+        assert_eq!(uncertain.code(), ErrorCode::OutcomeUnknown, "{uncertain}");
+        let joined = store.group().expect("the renamed record is read");
+        assert_eq!(joined.machine_id, into);
+
+        let split = store
+            .split(&environment.lock, joined.expected(), &approval(), 3_000)
+            .expect("with nothing held, a step's directory is flushed");
+        assert_eq!(environment.reopened(), split);
+        let first = Environment::create();
+        MachineStore::open(&first.lock, &first.paths(), 1_000).expect("and so is a first start's");
     }
 }
