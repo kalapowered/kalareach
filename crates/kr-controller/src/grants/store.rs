@@ -221,8 +221,9 @@ pub struct GrantDirectory {
     connection: std::sync::Mutex<Connection>,
     /// The action claims whose attempts are running in this daemon.
     live: Arc<LiveClaims>,
-    /// This host's clock floor, once the daemon has bound it ([`Self::bind_host_clock`]).
-    host_clock: std::sync::OnceLock<Arc<UtcFloor>>,
+    /// This host's clock floor and wall clock, once the daemon has bound them
+    /// ([`Self::bind_host_clock`]).
+    host_clock: std::sync::OnceLock<(Arc<UtcFloor>, crate::service::WallClock)>,
 }
 
 impl GrantDirectory {
@@ -341,7 +342,7 @@ impl GrantDirectory {
     /// writes the floor it stood on before its next decision, and an effect asked for again once
     /// that record is down is refused as expired.
     fn unanswerable(&self, bound: &Bound) -> ControllerError {
-        if let Some(floor) = self.host_clock.get()
+        if let Some((floor, _)) = self.host_clock.get()
             && !bound.recorded
         {
             floor.owe(bound.at_ms);
@@ -349,18 +350,18 @@ impl GrantDirectory {
         unrecorded()
     }
 
-    /// Binds this host's clock floor, so a grant's time bound is decided at the moment of the
-    /// effect that depends on it.
+    /// Binds this host's clock floor and wall clock, so a grant's time bound is decided at the
+    /// moment of the effect that depends on it.
     ///
     /// Until then a bound is decided at the reading its caller took, which is what a caller that
     /// keeps its own time wants: a test, or a tool reading a copy of the store. The daemon binds
-    /// its floor as it starts. From then on a delegation, a redemption and a transfer read this
-    /// host's wall clock inside the transaction that writes them, under that floor: a grant that
-    /// expires while the effect waits for the store's lock is found expired there, and nothing
-    /// that can expire is decided while the floor is owed its record
+    /// its floor and its wall clock as it starts. From then on a delegation, a redemption and a
+    /// transfer read that wall clock inside the transaction that writes them, under that floor: a
+    /// grant that expires while the effect waits for the store's lock is found expired there, and
+    /// nothing that can expire is decided while the floor is owed its record
     /// ([`UtcFloor::bound`]). A second binding is ignored.
-    pub fn bind_host_clock(&self, floor: Arc<UtcFloor>) {
-        let _ = self.host_clock.set(floor);
+    pub fn bind_host_clock(&self, floor: Arc<UtcFloor>, wall: crate::service::WallClock) {
+        let _ = self.host_clock.set((floor, wall));
     }
 
     /// What `expiry` comes to at the effect, for a caller that decided it at `admitted_ms`.
@@ -369,7 +370,7 @@ impl GrantDirectory {
     /// daemon has bound it; the caller's reading alone until then.
     fn bound_at_effect(&self, expiry: GrantExpiry, admitted_ms: u64) -> Bound {
         match self.host_clock.get() {
-            Some(floor) => floor.bound(expiry, admitted_ms.max(kr_ipc::now_ms().get())),
+            Some((floor, wall)) => floor.bound(expiry, admitted_ms.max(wall.now_ms())),
             None => Bound {
                 at_ms: admitted_ms,
                 passed: !expiry.is_valid_at(admitted_ms),

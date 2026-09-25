@@ -30,23 +30,38 @@ use crate::sharing::SharingService;
 
 /// The grants this host issued, under its current policy, as a delivery rule's recipient
 /// authority.
-#[derive(Debug)]
 pub struct GrantedRecipients {
     sharing: Arc<SharingService>,
     policy: Arc<Mutex<HostPolicy>>,
     environment_id: EnvironmentId,
-    clock: fn() -> u64,
+    clock: crate::service::WallClock,
+}
+
+impl std::fmt::Debug for GrantedRecipients {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GrantedRecipients")
+            .field("environment_id", &self.environment_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl GrantedRecipients {
-    /// Answers from `sharing`'s grants under `policy`, for the sessions of one environment.
+    /// Answers from `sharing`'s grants under `policy`, for the sessions of one environment, with
+    /// UTC read on `clock`, the daemon's wall clock.
     #[must_use]
     pub fn new(
         sharing: Arc<SharingService>,
         policy: Arc<Mutex<HostPolicy>>,
         environment_id: EnvironmentId,
+        clock: crate::service::WallClock,
     ) -> Self {
-        Self::at(sharing, policy, environment_id, || kr_ipc::now_ms().get())
+        Self {
+            sharing,
+            policy,
+            environment_id,
+            clock,
+        }
     }
 
     /// Answers against a clock of the caller's choosing, which is how a test holds a grant's
@@ -58,12 +73,12 @@ impl GrantedRecipients {
         environment_id: EnvironmentId,
         clock: fn() -> u64,
     ) -> Self {
-        Self {
+        Self::new(
             sharing,
             policy,
             environment_id,
-            clock,
-        }
+            crate::service::WallClock::from_fn(clock),
+        )
     }
 }
 
@@ -76,7 +91,7 @@ impl RecipientAuthority for GrantedRecipients {
         // The policy as it stands now, read once for this answer. A copy, so the lock is not held
         // across the rest of the question.
         let policy = self.policy.lock().ok()?.clone();
-        let now_ms = policy.settled_now((self.clock)());
+        let now_ms = policy.settled_now(self.clock.now_ms());
         if record.state(now_ms) != GrantState::Active {
             return None;
         }

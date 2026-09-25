@@ -227,6 +227,78 @@ impl kr_pairing::platform::PairingClock for PairingTime {
     }
 }
 
+/// A wall clock, read in UTC milliseconds.
+#[derive(Clone)]
+pub struct WallClock(Arc<dyn Fn() -> u64 + Send + Sync>);
+
+impl WallClock {
+    /// The machine's own wall clock.
+    #[must_use]
+    pub fn system() -> Self {
+        Self::from_fn(|| kr_ipc::now_ms().get())
+    }
+
+    /// A wall clock that reads `read`.
+    #[must_use]
+    pub fn from_fn(read: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
+        Self(Arc::new(read))
+    }
+
+    /// Its reading now, in UTC milliseconds.
+    #[must_use]
+    pub fn now_ms(&self) -> u64 {
+        (self.0)()
+    }
+}
+
+impl std::ops::Deref for WallClock {
+    type Target = dyn Fn() -> u64 + Send + Sync;
+
+    fn deref(&self) -> &Self::Target {
+        &*self.0
+    }
+}
+
+impl std::fmt::Debug for WallClock {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("WallClock")
+    }
+}
+
+/// The two clocks a daemon measures time on.
+///
+/// The continuous clock carries every deadline the daemon decides, and the wall clock every
+/// reading of UTC it decides from, raised into its floor first. [`Controller::start`] runs on the
+/// machine's own; a test can start a daemon on clocks it moves by hand, by the same path.
+#[derive(Clone)]
+pub struct Clocks {
+    /// The suspend-aware continuous clock.
+    pub continuous: Arc<dyn ContinuousClock>,
+    /// The wall clock.
+    pub wall: WallClock,
+}
+
+impl Clocks {
+    /// The machine's own clocks.
+    #[must_use]
+    pub fn system() -> Self {
+        Self {
+            continuous: Arc::new(SystemContinuousClock::new()),
+            wall: WallClock::system(),
+        }
+    }
+}
+
+impl std::fmt::Debug for Clocks {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Clocks")
+            .field("continuous", &self.continuous)
+            .field("wall", &self.wall)
+            .finish()
+    }
+}
+
 /// The control daemon.
 pub struct Controller {
     /// This daemon, as something a task started from a method that has no counted reference can
@@ -272,7 +344,9 @@ pub struct Controller {
     /// The compact form of the boot above, which is what an action window is bound to.
     boot_epoch: BootEpoch,
     /// The suspend-aware continuous clock every deadline this daemon decides is measured on.
-    clock: Arc<SystemContinuousClock>,
+    clock: Arc<dyn ContinuousClock>,
+    /// The wall clock every reading of UTC this daemon decides from is taken on.
+    wall: WallClock,
     /// The machine's own continuous clock, which is the one a deadline crosses a socket on.
     shared_clock: Arc<dyn kr_ipc::clock::SharedClock>,
     /// The action windows of every connection this daemon serves.
@@ -591,6 +665,25 @@ impl Controller {
     /// Returns an error when another daemon owns the environment, the registry cannot be opened,
     /// or the controller identity is missing.
     pub async fn start(setup: ControllerSetup) -> Result<Arc<Self>> {
+        Self::start_with(setup, Clocks::system()).await
+    }
+
+    /// Starts the daemon on the clocks a test gives it, by the same path [`Self::start`] takes on
+    /// the machine's own.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::start`].
+    #[cfg(feature = "testing")]
+    pub async fn start_on_clocks(setup: ControllerSetup, clocks: Clocks) -> Result<Arc<Self>> {
+        Self::start_with(setup, clocks).await
+    }
+
+    async fn start_with(setup: ControllerSetup, clocks: Clocks) -> Result<Arc<Self>> {
+        let Clocks {
+            continuous: clock,
+            wall,
+        } = clocks;
         setup.paths.create()?;
         // The lock comes before everything the environment owns: the registry's own creation and
         // migration, the persistent identity, the generation and the directory. Two daemons
@@ -649,7 +742,6 @@ impl Controller {
         let paths = setup.paths.clone();
         let recorded_revision = capability_revision(&paths);
         let started_at_ms = kr_ipc::now_ms();
-        let clock = Arc::new(SystemContinuousClock::new());
         let authority_revision = registry.authority_revision()?;
         let transfer = Arc::new(crate::transfer::TransferModule::open(&setup.paths).await?);
         let project = Arc::new(crate::project::ProjectModule::open(&setup.paths).await?);
@@ -700,7 +792,9 @@ impl Controller {
         let utc_floor = Arc::clone(policy.utc_floor());
         // The store decides a grant's time bound at the moment of its effect, on this host's own
         // clock and under the floor every other decision stands on.
-        sharing.grants().bind_host_clock(Arc::clone(&utc_floor));
+        sharing
+            .grants()
+            .bind_host_clock(Arc::clone(&utc_floor), wall.clone());
         // Written down again with the revision the registry reached. A start that cannot write it
         // still starts, with its floor owed its record: no decision that reads the clock is taken
         // until a write lands, and a personal grant that never expires is used as before. Stopping
@@ -747,7 +841,7 @@ impl Controller {
             &net::AnchorSources {
                 clock: &*clock,
                 boot_clock: &*shared_clock,
-                wall_clock: &net::wall_clock_now_ms,
+                wall_clock: &*wall,
                 boot: &setup.boot_identity,
                 devices: &devices,
                 floor: &utc_floor,
@@ -799,6 +893,7 @@ impl Controller {
                 Arc::clone(&sharing),
                 Arc::clone(&policy),
                 setup.environment_id,
+                wall.clone(),
             )),
             Arc::new(crate::push::sender::HostSigner::new(
                 device_keys.authorisation,
@@ -832,6 +927,7 @@ impl Controller {
             shared_clock,
             leases: crate::authority::AuthorityBarrier::new(generation, authority_revision),
             clock,
+            wall,
             network: std::sync::OnceLock::new(),
             supervisor: setup.supervisor,
             backup,
@@ -1986,7 +2082,7 @@ impl Controller {
     /// its record, so a store that cannot take the floor stops expiry decisions rather than
     /// letting them stand on a floor the next start will not find.
     fn settled_now_ms(&self) -> u64 {
-        let now_ms = kr_ipc::now_ms().get();
+        let now_ms = self.wall_now_ms();
         let mut policy = self
             .policy
             .lock()
@@ -2052,7 +2148,18 @@ impl Controller {
     /// The reading raises the floor, so whatever the caller decides from it holds for every later
     /// decision. It never waits, so it may be called from inside a poll.
     pub(crate) fn settled_utc_now(&self) -> u64 {
-        self.utc_floor.observe(kr_ipc::now_ms().get())
+        self.utc_floor.observe(self.wall_now_ms())
+    }
+
+    /// The wall clock this daemon reads UTC on, in milliseconds. A decision raises the floor with
+    /// the reading before it stands on it ([`Self::settled_utc_now`]).
+    pub(crate) fn wall_now_ms(&self) -> u64 {
+        self.wall.now_ms()
+    }
+
+    /// The wall clock itself, for a part of the daemon that reads it on its own.
+    pub(crate) fn wall_clock(&self) -> WallClock {
+        self.wall.clone()
     }
 
     /// Records a lapse found at `at_ms`: this host's reading of UTC is at least that from here
@@ -9468,7 +9575,6 @@ mod a_create_that_launches_nothing {
     use kr_protocol::method::{Method, MethodVersion};
     use kr_protocol::scalars::{DurationMs, Nullable};
     use kr_protocol::session::{LaunchProfile, Presentation, SessionCreateParams, ShellMode};
-    use kr_transport::clock::ContinuousClock as _;
     use kr_transport::window::{AcceptedDeadline, DeadlineBound};
 
     use crate::error::ControllerError;
@@ -11445,7 +11551,6 @@ mod a_close_a_worker_never_answers {
     use crate::error::ControllerError;
     use crate::service::{CLOSE_EXCHANGE, Controller, ControllerSetup};
     use crate::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
-    use kr_transport::clock::ContinuousClock as _;
 
     #[derive(Debug)]
     struct RefusingSupervisor;

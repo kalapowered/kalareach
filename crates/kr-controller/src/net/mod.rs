@@ -61,7 +61,7 @@ use kr_pairing::host::HostIdentity;
 use kr_protocol::ids::{ActorId, AuthorityRevision, ConnectionId, DeviceId, DeviceKeyRevision};
 use kr_protocol::pairing::NetworkConfig;
 use kr_protocol::scalars::EndpointKey;
-use kr_transport::clock::{ContinuousClock as _, ContinuousInstant};
+use kr_transport::clock::ContinuousInstant;
 use kr_transport::handshake::{HostEpochs, LocalIdentity, PairedDirectory};
 use kr_transport::listener::{AuthorisedSession, BoxFuture, HostHandler, ListenerConfig};
 use kr_transport::preauth::PairingSurface;
@@ -787,11 +787,6 @@ impl AnchorSources<'_> {
     }
 }
 
-/// The wall clock an anchor reads on a running host.
-pub(crate) fn wall_clock_now_ms() -> u64 {
-    kr_ipc::now_ms().get()
-}
-
 /// Returns the anchor `offline` is measured with, when the policy that holds it has just been
 /// restored, accepted or synchronised.
 ///
@@ -1028,8 +1023,7 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
     // The daemon's own clock, not a second one. Deadlines from the transport's action windows are
     // compared with deadlines the daemon decided, and a continuous instant is anchored privately:
     // two clocks would make those comparisons meaningless rather than merely imprecise.
-    let clock: Arc<dyn kr_transport::clock::ContinuousClock> =
-        Arc::clone(&controller.clock) as Arc<_>;
+    let clock: Arc<dyn kr_transport::clock::ContinuousClock> = Arc::clone(&controller.clock);
     // One record of every grant's lifetime, read by the connections this host admits and by the
     // owner confirmations it spends.
     let lifetimes = Arc::new(lifetimes::GrantLifetimes::new(
@@ -1037,6 +1031,7 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
         Arc::clone(&clock),
         Arc::clone(&controller.shared_clock),
         controller.boot_identity.clone(),
+        controller.wall_clock(),
     ));
     let rows = invitations::InvitationRows::new(Arc::clone(&devices), Arc::clone(&lifetimes));
     // Section 10: a host restart cancels every invitation it left unfinished, because a
@@ -1683,7 +1678,7 @@ impl Controller {
         AnchorSources {
             clock: &*self.clock,
             boot_clock: &*self.shared_clock,
-            wall_clock: &wall_clock_now_ms,
+            wall_clock: &*self.wall,
             boot: &self.boot_identity,
             devices: &self.devices,
             floor: &self.utc_floor,

@@ -121,6 +121,7 @@ fn lifetimes(directory: &Arc<DeviceDirectory>, clock: &ManualClock) -> Arc<Grant
         Arc::new(clock.clone()),
         Arc::new(ManualSharedClock::new()),
         kr_ipc::identity::boot_identity().expect("a boot identity"),
+        kr_controller::service::WallClock::system(),
     ))
 }
 

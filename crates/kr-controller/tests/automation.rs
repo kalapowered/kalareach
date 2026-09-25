@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use kr_controller::grants::GrantRecord;
-use kr_controller::service::{Controller, ControllerSetup};
+use kr_controller::service::{Clocks, Controller, ControllerSetup, WallClock};
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
 use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::client::LocalClient;
@@ -128,10 +128,15 @@ fn build() -> BuildId {
 }
 
 async fn host() -> Host {
+    host_on(Clocks::system()).await
+}
+
+/// A daemon on the clocks the test gives it.
+async fn host_on(clocks: Clocks) -> Host {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
-    let controller = start_daemon(&environment, environment_id)
+    let controller = start_daemon(&environment, environment_id, clocks)
         .await
         .unwrap_or_else(|error| panic!("the daemon starts: {error}"));
     let endpoint = environment.controller_endpoint().expect("an endpoint");
@@ -147,34 +152,39 @@ async fn host() -> Host {
     }
 }
 
-/// Starts a daemon on an environment, waiting out one that is still letting go of it.
+/// Starts a daemon on an environment and on `clocks`, waiting out one that is still letting go of
+/// the environment.
 async fn start_daemon(
     environment: &kr_ipc::paths::EnvironmentPaths,
     environment_id: EnvironmentId,
+    clocks: Clocks,
 ) -> kr_controller::error::Result<Arc<Controller>> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         let secrets = environment.secrets_dir();
-        let attempt = Controller::start(ControllerSetup {
-            paths: environment.clone(),
-            environment_id,
-            identity: Box::new(move || {
-                let store =
-                    open_store_in(&secrets).expect("a secret store for the test environment");
-                Ok(
-                    ControllerIdentity::open(store.store.as_ref(), environment_id, false)
-                        .expect("an identity"),
-                )
-            }),
-            secret_store: StoreSelection::File,
-            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-            supervisor: Box::new(RefusingSupervisor),
-            worker_program: PathBuf::from("/nonexistent/kr-worker"),
-            build_id: build(),
-            release: "0".to_owned(),
-            shell_packages: None,
-            terminal: Box::new(kr_controller::supervision::NoTerminal),
-        })
+        let attempt = Controller::start_on_clocks(
+            ControllerSetup {
+                paths: environment.clone(),
+                environment_id,
+                identity: Box::new(move || {
+                    let store =
+                        open_store_in(&secrets).expect("a secret store for the test environment");
+                    Ok(
+                        ControllerIdentity::open(store.store.as_ref(), environment_id, false)
+                            .expect("an identity"),
+                    )
+                }),
+                secret_store: StoreSelection::File,
+                boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+                supervisor: Box::new(RefusingSupervisor),
+                worker_program: PathBuf::from("/nonexistent/kr-worker"),
+                build_id: build(),
+                release: "0".to_owned(),
+                shell_packages: None,
+                terminal: Box::new(kr_controller::supervision::NoTerminal),
+            },
+            clocks.clone(),
+        )
         .await;
         match attempt {
             Err(kr_controller::error::ControllerError::AlreadyRunning { .. })
@@ -1517,7 +1527,7 @@ async fn a_start_that_fails_at_its_configuration_gate_dispatches_nothing() {
     let environment_id = temp.environment_id();
     // A first start makes the registry and the journal; then the daemon stops.
     drop(
-        start_daemon(&environment, environment_id)
+        start_daemon(&environment, environment_id, Clocks::system())
             .await
             .unwrap_or_else(|error| panic!("the first start: {error}")),
     );
@@ -1528,7 +1538,7 @@ async fn a_start_that_fails_at_its_configuration_gate_dispatches_nothing() {
         &narrowing_document(&[ActionRight::SessionView]),
     );
 
-    let Err(refused) = start_daemon(&environment, environment_id).await else {
+    let Err(refused) = start_daemon(&environment, environment_id, Clocks::system()).await else {
         panic!("the start does not pass its configuration gate");
     };
     assert!(
@@ -2240,50 +2250,35 @@ fn issue_grant(
 }
 
 /// The bounded offline validity holds a workflow's grant on the continuous clock it was anchored
-/// on, as it holds a device's own request. A decision taken after the wall clock was wound back
-/// reads UTC inside the bound again, and is refused all the same.
-///
-/// The daemon's clocks are its own and cannot be set from a test, so this works with what the
-/// daemon reads. The synchronisation the bound is measured from is an hour ahead of this host's
-/// wall clock, as a feed whose clock runs ahead of this host's would report it, so UTC, as the test
-/// gives it and as the host reads it for itself, stays inside the bound for that hour, and the
-/// refusal below can only be the continuous clock's. While the bound is an hour long a decision is
-/// permitted, and so is the same decision under a wall clock wound back. The owner then narrows
-/// the bound to 100 ms on the same synchronisation, which keeps the time already spent, and the
-/// test waits on the daemon's own continuous clock until more than that has passed since the bound
-/// was anchored: the decision is refused, although UTC is still inside it. Widening the bound again
-/// admits the same decision, which is the control: the refusal was the bound on the continuous
-/// clock and nothing the refusal left behind.
-///
-/// What it does not establish: it rests on the host not stalling for an hour. A stall or a
-/// suspension of an hour after the bound is set would run the hour-long bound out and fail a
-/// decision the test expects to be permitted. One of an hour and more between reading the wall
-/// clock and setting the bound would carry UTC past the synchronisation, and then UTC, not the
-/// continuous clock, could be what refuses the narrowed bound while every other step still passes.
-/// A controller that took its clocks from the test would let it advance them by hand instead.
+/// on, as it holds a device's own request. The daemon runs on clocks this test moves by hand: the
+/// continuous clock runs past the bound while the wall clock is wound back, and a decision taken
+/// then is refused all the same, although UTC, through the host's floor, is still inside the
+/// bound. Nothing here reads the machine's clocks and nothing sleeps.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_workflow_grant_is_held_to_the_offline_bound_on_the_continuous_clock() {
     use kr_automation::{AuthoritySource, AutomationError};
     use kr_controller::automation::HostGrants;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    const HOUR_MS: u64 = 60 * 60 * 1000;
-    let bounded = |maximum_offline_ms: u64, synchronised: u64| {
-        Some(kr_protocol::sharing::OfflineValidityPolicy {
-            maximum_offline_ms: kr_protocol::scalars::DurationMs::new(maximum_offline_ms),
-            last_synchronised_at_ms: Nullable::some(kr_protocol::scalars::TimestampMs::new(
-                synchronised,
-            )),
-        })
-    };
-
-    let host = host().await;
-    let now = kr_ipc::now_ms().get();
-    let synchronised = now + HOUR_MS;
+    const T: u64 = 1_767_225_600_000;
+    let continuous = kr_transport::clock::ManualClock::new();
+    let wall = Arc::new(AtomicU64::new(T));
+    let host = host_on(Clocks {
+        continuous: Arc::new(continuous.clone()),
+        wall: WallClock::from_fn({
+            let wall = Arc::clone(&wall);
+            move || wall.load(Ordering::SeqCst)
+        }),
+    })
+    .await;
     host.controller
-        .update_policy(|policy| policy.set_offline_validity(bounded(HOUR_MS, synchronised)))
-        .expect("the owner chooses an offline bound of an hour");
-    // The bound is anchored while the policy is set, so every reading from here is at or after it.
-    let anchored_by = host.controller.continuous_now();
+        .update_policy(|policy| {
+            policy.set_offline_validity(Some(kr_protocol::sharing::OfflineValidityPolicy {
+                maximum_offline_ms: kr_protocol::scalars::DurationMs::new(200),
+                last_synchronised_at_ms: Nullable::some(kr_protocol::scalars::TimestampMs::new(T)),
+            }));
+        })
+        .expect("the owner chooses an offline bound of a fifth of a second");
     let grant = issue_grant(
         &host,
         grant_id(21),
@@ -2292,40 +2287,26 @@ async fn a_workflow_grant_is_held_to_the_offline_bound_on_the_continuous_clock()
         GrantExpiry::Never,
     );
     let grants = HostGrants::for_daemon(&host.controller);
-    grants.grant(grant.grant_id, now).expect("inside the bound");
-    // The wall clock wound back five seconds is not, by itself, a reason to refuse.
-    grants
-        .grant(grant.grant_id, now - 5_000)
-        .expect("inside the bound, under a wall clock wound back");
+    grants.grant(grant.grant_id, T).expect("inside the bound");
 
-    // The same synchronisation, so the time already spent is kept: the bound now runs out 100 ms
-    // after it was anchored, on the continuous clock.
-    host.controller
-        .update_policy(|policy| policy.set_offline_validity(bounded(100, synchronised)))
-        .expect("the owner narrows the bound to 100 milliseconds");
-    while host
-        .controller
-        .continuous_now()
-        .saturating_duration_since(anchored_by)
-        <= std::time::Duration::from_millis(150)
-    {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+    // The control: a hundred milliseconds on both clocks, still inside the bound.
+    continuous.advance(std::time::Duration::from_millis(100));
+    wall.store(T + 100, Ordering::SeqCst);
+    grants
+        .grant(grant.grant_id, T + 100)
+        .expect("inside the bound a hundred milliseconds on");
+
+    // Two hundred more on the continuous clock, and the wall clock wound back five seconds. The
+    // host's floor holds UTC at T + 100, inside the bound, so only the continuous clock can refuse.
+    continuous.advance(std::time::Duration::from_millis(200));
+    wall.store(T - 5_000, Ordering::SeqCst);
     let refused = grants
-        .grant(grant.grant_id, now - 5_000)
+        .grant(grant.grant_id, T - 5_000)
         .expect_err("the bound ran out on the continuous clock");
     assert!(
         matches!(&refused, AutomationError::PermissionDenied(detail) if detail.contains("offline")),
         "{refused}"
     );
-
-    // The control: an hour again, on the same synchronisation, and the same decision is admitted.
-    host.controller
-        .update_policy(|policy| policy.set_offline_validity(bounded(HOUR_MS, synchronised)))
-        .expect("the owner widens the bound again");
-    grants
-        .grant(grant.grant_id, now - 5_000)
-        .expect("inside the widened bound, on the same continuous clock");
 
     host.clients.abort();
 }

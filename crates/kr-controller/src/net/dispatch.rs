@@ -62,7 +62,6 @@ use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::CanonicalSet;
 use kr_protocol::session::SessionListResult;
 use kr_transport::actor::ConnectionActor;
-use kr_transport::clock::ContinuousClock as _;
 use kr_transport::listener::{AuthorisedSession, ControlSender};
 use kr_transport::window::AcceptedDeadline;
 
@@ -2590,7 +2589,7 @@ impl RemoteConnection {
             claims_geometry,
             recipient_account: None,
             own_subject: None,
-            now_ms: super::super::wall_clock_ms(),
+            now_ms: self.controller.wall_now_ms(),
         };
         let decided = self
             .controller
@@ -2996,7 +2995,6 @@ mod write_boundary {
     use kr_protocol::envelope::{ControlEvent, ControlFrame};
     use kr_protocol::ids::{ActorId, ConnectionId, DeviceId};
     use kr_protocol::scalars::{DurationMs, Nullable};
-    use kr_transport::clock::ContinuousClock as _;
 
     use super::{Authorisation, FrameSink, RelayGrant, Relaying, RemoteOutput, Written};
     use crate::service::Controller;

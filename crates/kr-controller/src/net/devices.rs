@@ -57,7 +57,6 @@ pub struct HostRecords {
 /// decision, and writing it down. Each of them reads what the others wrote, so they share one
 /// boundary: without it an observation taken before an owner established the clock could land
 /// after it, and a decision cleared between an observation and its write would be lost.
-#[derive(Debug, Default)]
 pub struct ClockTrust {
     /// Held for the whole of every transition below.
     ///
@@ -65,9 +64,40 @@ pub struct ClockTrust {
     /// approval. The durable record is what a later run reads; this is what holds the decision
     /// while a write is failing.
     distrusted: std::sync::Mutex<bool>,
+    /// The wall clock this decision is about: the daemon's own.
+    wall: crate::service::WallClock,
+}
+
+impl std::fmt::Debug for ClockTrust {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ClockTrust")
+            .field("distrusted", &self.distrusted)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for ClockTrust {
+    /// A decision about the machine's own wall clock.
+    fn default() -> Self {
+        Self::new(crate::service::WallClock::system())
+    }
 }
 
 impl ClockTrust {
+    /// A decision about `wall`, trusted until a step back says otherwise.
+    #[must_use]
+    pub fn new(wall: crate::service::WallClock) -> Self {
+        Self {
+            distrusted: std::sync::Mutex::new(false),
+            wall,
+        }
+    }
+
+    fn wall_now(&self) -> TimestampMs {
+        TimestampMs::new(self.wall.now_ms())
+    }
+
     /// Samples the wall clock and says whether this host may decide against what it read.
     ///
     /// One operation, because the two halves are one decision: the clock is read, a rollback
@@ -84,7 +114,7 @@ impl ClockTrust {
     /// cannot tell decides nothing.
     pub fn sample(&self, devices: &DeviceDirectory) -> Result<Option<ObservedUtc>> {
         let mut distrusted = self.held();
-        let observed = devices.utc_at_least(kr_ipc::now_ms())?;
+        let observed = devices.utc_at_least(self.wall_now())?;
         if observed.behind_ms > CLOCK_TOLERANCE_MS {
             *distrusted = true;
             // The decision is in memory before anything is written, and the write is attempted
@@ -108,7 +138,7 @@ impl ClockTrust {
     /// Returns an error when the mark cannot be read or written.
     pub fn observe(&self, devices: &DeviceDirectory) -> Result<TimestampMs> {
         let mut distrusted = self.held();
-        let observed = devices.utc_at_least(kr_ipc::now_ms())?;
+        let observed = devices.utc_at_least(self.wall_now())?;
         if observed.behind_ms > CLOCK_TOLERANCE_MS {
             *distrusted = true;
             let _ = devices.note_clock_untrusted(observed.now);
@@ -124,7 +154,7 @@ impl ClockTrust {
     pub fn settle(&self, devices: &DeviceDirectory) -> Result<()> {
         let distrusted = self.held();
         if *distrusted && !devices.clock_untrusted()? {
-            devices.note_clock_untrusted(kr_ipc::now_ms())?;
+            devices.note_clock_untrusted(self.wall_now())?;
         }
         Ok(())
     }
@@ -142,7 +172,7 @@ impl ClockTrust {
         let mut distrusted = self.held();
         // Read inside the boundary, like every other reading of this clock: the moment the owner
         // established is the moment this host is at now, not one sampled before it got here.
-        devices.trust_clock(kr_ipc::now_ms())?;
+        devices.trust_clock(self.wall_now())?;
         *distrusted = false;
         Ok(())
     }

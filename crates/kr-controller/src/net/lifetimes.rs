@@ -62,6 +62,8 @@ pub struct GrantLifetimes {
     pending_expiry: Arc<PendingExpiry>,
     /// Whether this host may decide a grant's expiry from its own wall clock.
     clock_trust: Arc<ClockTrust>,
+    /// The daemon's wall clock, which dates an expiry this host observes.
+    wall: crate::service::WallClock,
 }
 
 impl std::fmt::Debug for GrantLifetimes {
@@ -73,13 +75,15 @@ impl std::fmt::Debug for GrantLifetimes {
 }
 
 impl GrantLifetimes {
-    /// Builds the lifetimes of the devices in `devices`, measured on `clock` in this boot.
+    /// Builds the lifetimes of the devices in `devices`, measured on `clock` in this boot, with
+    /// UTC read on `wall`.
     #[must_use]
     pub fn new(
         devices: Arc<DeviceDirectory>,
         clock: Arc<dyn ContinuousClock>,
         shared_clock: Arc<dyn kr_ipc::clock::SharedClock>,
         boot_identity: BootIdentity,
+        wall: crate::service::WallClock,
     ) -> Self {
         Self {
             devices,
@@ -89,8 +93,13 @@ impl GrantLifetimes {
             anchored: Mutex::new(BTreeMap::new()),
             anchoring: Mutex::new(()),
             pending_expiry: Arc::new(PendingExpiry::default()),
-            clock_trust: Arc::new(ClockTrust::default()),
+            clock_trust: Arc::new(ClockTrust::new(wall.clone())),
+            wall,
         }
+    }
+
+    fn wall_now(&self) -> TimestampMs {
+        TimestampMs::new(self.wall.now_ms())
     }
 
     /// Returns when this device's grant runs out, anchoring it the first time it is asked.
@@ -152,7 +161,7 @@ impl GrantLifetimes {
         let moment = self
             .clock_trust
             .observe(&self.devices)
-            .unwrap_or_else(|_| kr_ipc::now_ms());
+            .unwrap_or_else(|_| self.wall_now());
         self.pending_expiry.owe(record.device_id, moment);
         self.pending_expiry.settle(&self.devices);
         Ok(false)
@@ -180,7 +189,7 @@ impl GrantLifetimes {
                 if self.clock.now() < deadline {
                     return true;
                 }
-                self.pending_expiry.owe(device_id, kr_ipc::now_ms());
+                self.pending_expiry.owe(device_id, self.wall_now());
                 false
             }
             None => false,
@@ -237,7 +246,7 @@ impl GrantLifetimes {
         if remaining == 0 {
             // Run out. The tombstone is owed to the directory before anything tries to write it:
             // a write that fails here is retried by the host's own task rather than forgotten.
-            self.pending_expiry.owe(record.device_id, kr_ipc::now_ms());
+            self.pending_expiry.owe(record.device_id, self.wall_now());
             self.pending_expiry.settle(&self.devices);
             return Ok(Lifetime::Over);
         }
@@ -350,6 +359,7 @@ mod tests {
             Arc::new(clock.clone()),
             Arc::new(ManualSharedClock::new()),
             kr_ipc::identity::boot_identity().expect("a boot identity"),
+            crate::service::WallClock::system(),
         )
     }
 

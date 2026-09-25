@@ -111,7 +111,7 @@ impl Daemon {
                 last: settled,
             }
         });
-        let (now, kept) = reading_at(start, kr_ipc::now_ms().get(), at);
+        let (now, kept) = reading_at(start, daemon.wall_now_ms(), at);
         *anchor = Some(kept);
         now
     }
