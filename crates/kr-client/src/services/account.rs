@@ -58,6 +58,7 @@ use sha2::Digest as _;
 use subtle::ConstantTimeEq as _;
 use url::Url;
 
+use super::json::Unreadable;
 use super::{ServiceFuture, ServiceHttpAnswer};
 use crate::error::{ClientError, Result};
 
@@ -1079,20 +1080,24 @@ impl ManagedAccountService {
         Some(subject.to_owned())
     }
 
-    /// Reads a JSON answer.
-    fn json(answer: &ServiceHttpAnswer) -> Option<serde_json::Value> {
-        serde_json::from_slice(&answer.body).ok()
+    /// Reads a JSON answer, refusing one that names a member twice ([`super::json::read`]).
+    fn json(answer: &ServiceHttpAnswer) -> std::result::Result<serde_json::Value, Unreadable> {
+        super::json::read(&answer.body)
     }
 
     /// Whether a refused answer names an OAuth error.
     fn names_error(answer: &ServiceHttpAnswer) -> bool {
         Self::json(answer)
+            .ok()
             .and_then(|value| value.get("error").map(serde_json::Value::is_string))
             .unwrap_or(false)
     }
 }
 
 /// The payload of a compact JWT, as a JSON object.
+///
+/// Read like an answer, because it is one: claims that name a member twice could name two
+/// subjects, and a check made against one of them would not cover the other.
 fn id_token_claims(token: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
     let mut parts = token.split('.');
     let (_header, payload, _signature) = (parts.next()?, parts.next()?, parts.next()?);
@@ -1102,10 +1107,7 @@ fn id_token_claims(token: &str) -> Option<serde_json::Map<String, serde_json::Va
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload.trim_end_matches('='))
         .ok()?;
-    match serde_json::from_slice(&bytes).ok()? {
-        serde_json::Value::Object(claims) => Some(claims),
-        _ => None,
-    }
+    super::json::read(&bytes).ok()
 }
 
 /// A form body, encoded.
@@ -1122,6 +1124,14 @@ fn upstream(what: &str, status: u16) -> ClientError {
     ClientError::Host(ProtocolError::new(
         ErrorCode::UpstreamUnavailable,
         format!("the account service answered {what} with status {status}"),
+    ))
+}
+
+/// A success this client cannot read, with what was wrong with it and where, and nothing it held.
+fn unreadable(what: &str, fault: Unreadable) -> ClientError {
+    ClientError::Host(ProtocolError::new(
+        ErrorCode::UpstreamUnavailable,
+        format!("the account service answered {what} with status 200, and {fault}"),
     ))
 }
 
@@ -1142,7 +1152,7 @@ impl AccountService for ManagedAccountService {
                 }
                 return Err(upstream("the exchange", answer.status));
             }
-            let Some(value) = Self::json(&answer) else {
+            let Ok(value) = Self::json(&answer) else {
                 return Ok(Exchanged::Refused { leftover: None });
             };
             let expected = Expected {
@@ -1171,7 +1181,7 @@ impl AccountService for ManagedAccountService {
                 }
                 return Err(upstream("the refresh", answer.status));
             }
-            let Some(value) = Self::json(&answer) else {
+            let Ok(value) = Self::json(&answer) else {
                 return Ok(Refreshed::Refused { leftover: None });
             };
             let expected = Expected {
@@ -1217,7 +1227,8 @@ impl AccountService for ManagedAccountService {
             if answer.status != 200 {
                 return Err(upstream("the identity read", answer.status));
             }
-            let value = Self::json(&answer).ok_or_else(|| upstream("the identity read", 200))?;
+            let value =
+                Self::json(&answer).map_err(|fault| unreadable("the identity read", fault))?;
             let text = |name: &str| {
                 value
                     .get(name)
@@ -1247,7 +1258,7 @@ impl AccountService for ManagedAccountService {
             if answer.status != 200 {
                 return Err(upstream("the usage read", answer.status));
             }
-            let value = Self::json(&answer).ok_or_else(|| upstream("the usage read", 200))?;
+            let value = Self::json(&answer).map_err(|fault| unreadable("the usage read", fault))?;
             // The service answers `{ok, data}` around the summary; a refusal is `ok: false`.
             if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
                 return Err(upstream("the usage read", 200));

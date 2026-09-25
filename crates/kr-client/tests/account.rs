@@ -700,6 +700,114 @@ async fn an_exchange_answer_failing_a_check_is_refused_and_hands_back_its_refres
     ));
 }
 
+/// A service answering with exactly this text.
+fn answering_text(status: u16, text: &str) -> Arc<Scripted> {
+    Arc::new(Scripted {
+        answers: Mutex::new(VecDeque::from([ServiceHttpAnswer {
+            status,
+            body: text.as_bytes().to_vec(),
+        }])),
+        seen: Mutex::new(Vec::new()),
+    })
+}
+
+/// KR-REQ-04.19 and section 17: a token answer that names its access token twice is refused, and
+/// nothing of it is kept or handed back. Which token a reader kept would decide which one this
+/// device presents, and a text that says two things has no member this client can trust, the
+/// refresh token beside them included.
+#[tokio::test]
+async fn a_token_answer_that_names_its_access_token_twice_is_refused() {
+    let client = Client::Mobile;
+    let grant = granted(client, Redirect::AppLink);
+    let answer = token_answer(&claims(client, grant.nonce())).to_string();
+    let repeated = answer.replacen(
+        r#""access_token":"an-access-token""#,
+        r#""access_token":"an-access-token","access_token":"another-access-token""#,
+        1,
+    );
+    assert_ne!(
+        repeated, answer,
+        "the answer names its token once to begin with"
+    );
+
+    let http = answering_text(200, &repeated);
+    let outcome = service(&http, client)
+        .exchange(&grant)
+        .await
+        .expect("an answer");
+    assert!(
+        matches!(outcome, Exchanged::Refused { leftover: None }),
+        "{outcome:?}"
+    );
+
+    // The control: the same answer naming it once is issued.
+    let http = answering_text(200, &answer);
+    let Exchanged::Issued(issued) = service(&http, client)
+        .exchange(&grant)
+        .await
+        .expect("an answer")
+    else {
+        panic!("the answer naming its token once is issued");
+    };
+    assert_eq!(issued.access_token.expose(), "an-access-token");
+}
+
+/// KR-REQ-04.19 and section 17: an ID token whose claims name the subject twice fails its checks,
+/// like one naming another subject, and the answer's refresh token is handed back to be revoked.
+/// Which account signed in would otherwise depend on which of the two a reader kept.
+#[tokio::test]
+async fn an_id_token_that_names_its_subject_twice_is_refused_and_hands_back_its_refresh_token() {
+    let client = Client::Mobile;
+    let grant = granted(client, Redirect::AppLink);
+    let claims = claims(client, grant.nonce());
+    let payload = claims.to_string();
+    let repeated = payload.replacen(
+        r#""sub":"account-1""#,
+        r#""sub":"account-1","sub":"account-2""#,
+        1,
+    );
+    assert_ne!(
+        repeated, payload,
+        "the claims name the subject once to begin with"
+    );
+    let token = |payload: &str| {
+        let encode = |text: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(text);
+        format!(
+            "{}.{}.signature",
+            encode(r#"{"alg":"RS256","typ":"JWT"}"#),
+            encode(payload)
+        )
+    };
+
+    let mut answer = token_answer(&claims);
+    answer["id_token"] = serde_json::json!(token(&repeated));
+    let http = Scripted::answering(vec![(200, answer)]);
+    let Exchanged::Refused { leftover } = service(&http, client)
+        .exchange(&grant)
+        .await
+        .expect("an answer")
+    else {
+        panic!("an ID token naming its subject twice is refused");
+    };
+    assert_eq!(
+        leftover.map(|token| token.expose().to_owned()),
+        Some("a-refresh-token".to_owned())
+    );
+
+    // The control: the same token naming its subject once is issued to that subject.
+    let mut answer = token_answer(&claims);
+    answer["id_token"] = serde_json::json!(token(&payload));
+    let http = Scripted::answering(vec![(200, answer)]);
+    let Exchanged::Issued(issued) = service(&http, client)
+        .exchange(&grant)
+        .await
+        .expect("an answer")
+    else {
+        panic!("an ID token naming its subject once is issued");
+    };
+    assert_eq!(issued.subject, "account-1");
+}
+
 #[tokio::test]
 async fn a_refused_code_is_refused_and_a_failing_service_is_an_error() {
     let grant = granted(Client::Desktop, Redirect::Loopback);

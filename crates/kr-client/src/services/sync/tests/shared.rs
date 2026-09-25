@@ -1427,8 +1427,10 @@ async fn a_shared_write_names_its_home_and_epoch_and_reads_both_answering_refusa
         }
     );
 
-    // A retired refusal that does not name the head or names it twice, an answer naming an epoch
-    // without its revision, and the other refusals are not answers.
+    // A retired refusal that does not name the head, an answer naming an epoch without its
+    // revision, and the other refusals are not answers. Nor is a refusal that names the head's
+    // epoch twice: that is not a text this client reads at all, and without an envelope it reads
+    // a refusal's status says the answer came from something between here and the service.
     let mut half_head = written.clone();
     half_head
         .as_object_mut()
@@ -1444,7 +1446,7 @@ async fn a_shared_write_names_its_home_and_epoch_and_reads_both_answering_refusa
                 status: 409,
                 body: br#"{"ok":false,"error":{"code":"KEY_EPOCH_RETIRED","message":"retired","key_epoch":"1","key_epoch":"9","key_revision":"2"}}"#.to_vec(),
             },
-            ErrorCode::OutcomeUnknown,
+            ErrorCode::HostNotConfigured,
         ),
         (answered(half_head), ErrorCode::OutcomeUnknown),
         (refusal(409, "ID_CONFLICT", "reused"), ErrorCode::IdConflict),

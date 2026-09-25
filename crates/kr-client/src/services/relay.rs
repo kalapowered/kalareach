@@ -724,7 +724,8 @@ impl RelayLeaseService for ManagedRelayLeaseService {
 ///
 /// A body that is not this service's envelope is not a refusal at all, and it is not this caller's
 /// mistake either: it is a proxy's error page, a truncated answer, or something that is not this
-/// service. [`unreadable`] is what those become, classified by the status that carried them.
+/// service. [`unreadable`] is what those become, classified by the status that carried them, and a
+/// text that names one member twice anywhere is one of them ([`super::json::read`]).
 fn data_of(answer: &ServiceHttpAnswer) -> Result<serde_json::Value> {
     #[derive(Deserialize)]
     struct Envelope {
@@ -744,12 +745,12 @@ fn data_of(answer: &ServiceHttpAnswer) -> Result<serde_json::Value> {
         retry_after_seconds: Option<u64>,
     }
 
-    let Ok(envelope) = serde_json::from_slice::<Envelope>(&answer.body) else {
-        return Err(unreadable(
+    let envelope = super::json::read::<Envelope>(&answer.body).map_err(|fault| {
+        unreadable(
             answer.status,
-            "its answer is not one this client reads",
-        ));
-    };
+            &format!("its answer is not one this client reads: {fault}"),
+        )
+    })?;
 
     if envelope.ok {
         return envelope

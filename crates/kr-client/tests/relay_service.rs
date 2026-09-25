@@ -364,6 +364,42 @@ async fn an_exhausted_allowance_is_an_answer_with_the_grace_left() {
     assert!(answer.granted().is_none());
 }
 
+/// KR-REQ-04.19: a lease answer that names one member twice is not an answer this client reads.
+/// One reader would send traffic to the first relay and another to the second, and a lease may
+/// have been issued whichever it was, so it is an unknown outcome and nothing retries it.
+#[tokio::test]
+async fn a_lease_answer_that_names_a_member_twice_is_an_unknown_outcome() {
+    let answer = granted_answer();
+    let once = r#""relay_url":"https://relay-1.reach.kala.to""#;
+    let repeated = answer.replacen(
+        once,
+        r#""relay_url":"https://relay-1.reach.kala.to","relay_url":"https://relay-2.reach.kala.to""#,
+        1,
+    );
+    assert_ne!(
+        repeated, answer,
+        "the answer names the relay once to begin with"
+    );
+    let http = Recorder::new(&repeated);
+    let service = ManagedRelayLeaseService::new(
+        origin(),
+        http.clone(),
+        Installation::new(ServiceRequestSigner::Installation),
+    );
+
+    let error = service
+        .issue(&issue_request())
+        .await
+        .expect_err("a member named twice");
+    assert_eq!(error.code(), ErrorCode::OutcomeUnknown);
+    assert_eq!(error.code().retry_category(), RetryCategory::OutcomeUnknown);
+
+    // The control: the same answer naming it once is a lease.
+    http.answer_with(200, &answer);
+    let answer = service.issue(&issue_request()).await.expect("a lease");
+    assert!(answer.granted().is_some());
+}
+
 #[tokio::test]
 async fn a_refusal_arrives_as_the_code_the_service_named() {
     let http = Recorder::new(&granted_answer());

@@ -33,6 +33,7 @@ use kr_protocol::service::{
 };
 use serde::{Deserialize, Serialize};
 
+use super::json::Unreadable;
 use super::relay::{ServiceHttp, ServiceHttpAnswer, ServiceSigner};
 use crate::error::{ClientError, Result};
 use crate::retry::UserAction;
@@ -320,9 +321,9 @@ impl Answer {
 ///
 /// Most adapters want only the error it becomes. One that reads a refusal as an answer, because
 /// the code says something about the request the caller acts on, reads the code, and then those
-/// members as the shape its contract gives them. The code, the message and the retry delay were
-/// read from the answer directly, so an answer that names one of them twice is not a refusal this
-/// client reads, and neither is a member an adapter reads that the answer names twice.
+/// members as the shape its contract gives them. The answer was read through
+/// [`super::json::read`], so an answer that names any member twice, the code's and the ones an
+/// adapter reads among them, is not a refusal this client reads.
 pub(crate) struct Refusal {
     status: u16,
     code: String,
@@ -353,16 +354,15 @@ impl Refusal {
     ///
     /// # Errors
     ///
-    /// Returns an unknown outcome when the refusal does not carry them in that shape, a member `T`
-    /// names appearing twice included.
+    /// Returns an unknown outcome when the refusal does not carry them in that shape.
     pub(crate) fn members<T: for<'de> Deserialize<'de>>(&self, what: &str) -> Result<T> {
         #[derive(Deserialize)]
         struct Carried<T> {
             error: T,
         }
-        serde_json::from_slice::<Carried<T>>(&self.answer)
+        super::json::read::<Carried<T>>(&self.answer)
             .map(|carried| carried.error)
-            .map_err(|error| unreadable_answer(what, &error))
+            .map_err(|fault| unreadable_answer(what, fault))
     }
 
     /// The error the service named, with the delay it asked for when it named one.
@@ -401,7 +401,9 @@ fn plain_message(code: &str, message: String) -> String {
 ///
 /// A body that is not this service's envelope is not a refusal at all: it is something in front of
 /// the service, a truncated answer, or something that is not this service. [`unreadable`] is what
-/// those become, classified by the status that carried them.
+/// those become, classified by the status that carried them. A text that names one member twice,
+/// in the envelope or anywhere inside it, is one of them: [`super::json::read`] refuses it before
+/// any member is read.
 fn answer_of(answer: &ServiceHttpAnswer) -> Result<Answer> {
     #[derive(Deserialize)]
     struct Envelope {
@@ -422,12 +424,12 @@ fn answer_of(answer: &ServiceHttpAnswer) -> Result<Answer> {
         retry_after_seconds: Option<u64>,
     }
 
-    let Ok(envelope) = serde_json::from_slice::<Envelope>(&answer.body) else {
-        return Err(unreadable(
+    let envelope = super::json::read::<Envelope>(&answer.body).map_err(|fault| {
+        unreadable(
             answer.status,
-            "its answer is not one this client reads",
-        ));
-    };
+            &format!("its answer is not one this client reads: {fault}"),
+        )
+    })?;
 
     if envelope.ok {
         return envelope
@@ -535,15 +537,12 @@ fn unreadable(status: u16, what: &str) -> ClientError {
 /// The service answered, so whatever it did is done; what this client lacks is the answer. It is
 /// therefore an unknown outcome, like any other answer that could not be read.
 ///
-/// What it says about the answer is [`super::json_fault`] and nothing else: an answer carries
-/// whatever answered, and `serde_json`'s own message would quote the part it rejected.
-pub(crate) fn unreadable_answer(what: &str, error: &serde_json::Error) -> ClientError {
+/// What it says about the answer is [`super::json::Unreadable`] and nothing else: an answer
+/// carries whatever answered, and `serde_json`'s own message would quote the part it rejected.
+pub(crate) fn unreadable_answer(what: &str, fault: impl Into<Unreadable>) -> ClientError {
     ClientError::Host(ProtocolError::new(
         ErrorCode::OutcomeUnknown,
-        format!(
-            "this client cannot read {what}: {}",
-            super::json_fault(error)
-        ),
+        format!("this client cannot read {what}: {}", fault.into()),
     ))
 }
 
@@ -670,22 +669,81 @@ mod tests {
             assert!(matches!(error, ClientError::Host(_)), "{body}");
         }
 
-        // A member an adapter reads beside the code is held to the same rule.
+        // A member an adapter reads beside the code is held to the same rule, and so is one that
+        // nothing reads: the whole answer is refused before any member of it is read.
+        for body in [
+            r#"{"ok":false,"error":{"code":"KEY_EPOCH_RETIRED","message":"retired","key_epoch":"1","key_epoch":"2"}}"#,
+            r#"{"ok":false,"error":{"code":"RATE_LIMITED","message":"wait","detail":"a","detail":"b"}}"#,
+        ] {
+            let error = answer_of(&ServiceHttpAnswer {
+                status: 409,
+                body: body.as_bytes().to_vec(),
+            })
+            .expect_err("not a refusal this client reads");
+            assert!(matches!(error, ClientError::Host(_)), "{body}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("names one member of an object twice"),
+                "{error}"
+            );
+        }
+
+        // The control: the same refusal naming its epoch once carries it to the adapter.
         #[derive(Deserialize)]
         struct Epoch {
-            #[expect(dead_code, reason = "read only to hold the refusal to its shape")]
             key_epoch: String,
         }
         let answer = answer_of(&ServiceHttpAnswer {
             status: 409,
-            body: br#"{"ok":false,"error":{"code":"KEY_EPOCH_RETIRED","message":"retired","key_epoch":"1","key_epoch":"2"}}"#.to_vec(),
+            body: br#"{"ok":false,"error":{"code":"KEY_EPOCH_RETIRED","message":"retired","key_epoch":"1"}}"#.to_vec(),
         })
         .expect("a refusal");
         let Answer::Refused(refusal) = answer else {
             panic!("a refusal: {answer:?}");
         };
         assert_eq!(refusal.code(), "KEY_EPOCH_RETIRED");
-        assert!(refusal.members::<Epoch>("an epoch").is_err());
+        assert_eq!(
+            refusal
+                .members::<Epoch>("an epoch")
+                .expect("an epoch")
+                .key_epoch,
+            "1"
+        );
+    }
+
+    /// KR-REQ-04.19: a success whose `data` names a member twice, at any depth, is an answer this
+    /// client cannot read, which after a success is an unknown outcome; and what it says names the
+    /// rule and the place, not the text.
+    #[test]
+    fn a_success_that_names_a_member_twice_anywhere_is_an_unknown_outcome() {
+        for body in [
+            format!(
+                r#"{{"ok":true,"data":{{"note":"{NEVER_RENDERED}","note":"{NEVER_RENDERED}"}}}}"#
+            ),
+            format!(r#"{{"ok":true,"data":{{"pages":[{{"at":"1","at":"{NEVER_RENDERED}"}}]}}}}"#),
+            format!(r#"{{"ok":true,"ok":true,"data":{{"note":"{NEVER_RENDERED}"}}}}"#),
+        ] {
+            let error = answer_of(&ServiceHttpAnswer {
+                status: 200,
+                body: body.clone().into_bytes(),
+            })
+            .expect_err("a member named twice");
+            assert_eq!(error.code(), ErrorCode::OutcomeUnknown, "{body}");
+            for rendering in [
+                error.to_string(),
+                format!("{error:?}"),
+                format!("{error:#?}"),
+            ] {
+                assert!(!rendering.contains(NEVER_RENDERED), "{rendering}");
+            }
+            assert!(
+                error
+                    .to_string()
+                    .contains("names one member of an object twice at line 1"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

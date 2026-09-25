@@ -6,7 +6,7 @@
 //! storage, relay bandwidth and operation, and a fork can point these traits at its own
 //! infrastructure without changing anything else in the client.
 //!
-//! The traits and one null implementation live here, and eight modules hold the managed
+//! The traits and one null implementation live here, and nine modules hold the managed
 //! implementations this crate carries. [`account`] is the account sign-in: the request a system
 //! browser is handed, the checks on what comes back, and the grant a device keeps under one lock,
 //! with the account service's trait beside them. [`relay`] is the relay-lease client, because a lease is the
@@ -19,10 +19,11 @@
 //! compare-and-exchange service settings, a client's position and drafts are kept on. [`signed`] is
 //! the one signed call those of them that speak the section 23 `Services` group share, and [`http`]
 //! is the exchange underneath all of them: one gateway origin, finite deadlines, bounded answers
-//! and no retry of its own. A
-//! self-hosted deployment supplies its own, and a client with no managed service configured is a
-//! complete client: direct connections, local sessions, plugins, local descriptions and
-//! user-operated alternatives need none of these.
+//! and no retry of its own. [`json`] is the one reader of what any of them is answered, and it
+//! refuses an answer that names a member twice before anything reads it. A self-hosted deployment
+//! supplies its own, and a client with no managed service configured is a complete client: direct
+//! connections, local sessions, plugins, local descriptions and user-operated alternatives need
+//! none of these.
 //!
 //! # What is never rendered
 //!
@@ -81,10 +82,11 @@
 //! because what they render is whatever the redacted type gave them.
 //!
 //! The same rule covers what a failure says. `serde_json`'s own message quotes the value it
-//! rejected — `invalid type: string "..."` — so an error that carried that text would print
+//! rejected (`invalid type: string "..."`), so an error that carried that text would print
 //! through [`std::fmt::Display`] the very thing the Debug rule keeps out of `{:?}`. Nothing here
-//! formats a JSON error into a message: [`json_fault`] is what a caller is told instead, and it
-//! carries the class and the position and nothing that was in the document.
+//! formats a JSON error into a message: [`json_fault`] is what a caller is told instead, and
+//! [`json::Unreadable`] about an answer, and both carry the class and the position and nothing that
+//! was in the document.
 //!
 //! One thing is deliberately not covered by it. A refusal the service sent carries the service's
 //! own message, which is written to be shown to a person, and that message is in the error this
@@ -95,6 +97,7 @@
 pub mod account;
 pub mod authority;
 pub mod http;
+pub mod json;
 pub mod mailbox;
 pub mod relay;
 pub mod signed;
@@ -147,19 +150,10 @@ pub type ServiceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 
 /// `serde_json` names the value it rejected in its own message, and that value is a request body,
 /// an answer or a stored token. So this is what every failure of this kind in this module says
 /// instead: which kind of failure it was, and where in the document it happened. Both are useful
-/// to somebody diagnosing a mismatch and neither is anything that travelled.
+/// to somebody diagnosing a mismatch and neither is anything that travelled. It is the words
+/// [`json::Unreadable`] uses for an answer, so a failure reads the same wherever it arose.
 pub(crate) fn json_fault(error: &serde_json::Error) -> String {
-    let what = match error.classify() {
-        serde_json::error::Category::Io => "could not be read",
-        serde_json::error::Category::Syntax => "is not JSON",
-        serde_json::error::Category::Data => "is not the shape this client reads",
-        serde_json::error::Category::Eof => "ended early",
-    };
-    format!(
-        "it {what} at line {} column {}",
-        error.line(),
-        error.column()
-    )
+    json::Unreadable::from(error).to_string()
 }
 
 /// The bounds a transport carrying this crate's managed-service clients reads answers under.

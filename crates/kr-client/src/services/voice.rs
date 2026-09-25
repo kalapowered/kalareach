@@ -1174,7 +1174,8 @@ fn read_metadata(data: serde_json::Value) -> Result<VoiceMetadata> {
 ///
 /// A voice refusal carries the ordinary service code and the voice reason beside it, and the
 /// reason is what a caller acts on: an unknown creation is a state rather than a failure, and an
-/// exhausted allowance comes with the paths that still work.
+/// exhausted allowance comes with the paths that still work. A text that names one member twice
+/// anywhere is neither an answer nor a refusal ([`super::json::read`]).
 fn data_of(answer: &ServiceHttpAnswer) -> Result<serde_json::Value> {
     #[derive(Deserialize)]
     struct Envelope {
@@ -1193,12 +1194,12 @@ fn data_of(answer: &ServiceHttpAnswer) -> Result<serde_json::Value> {
         reason: Option<VoiceRefusalReason>,
     }
 
-    let Ok(envelope) = serde_json::from_slice::<Envelope>(&answer.body) else {
-        return Err(unreadable(
+    let envelope = super::json::read::<Envelope>(&answer.body).map_err(|fault| {
+        unreadable(
             answer.status,
-            "its answer is not one this client reads",
-        ));
-    };
+            &format!("its answer is not one this client reads: {fault}"),
+        )
+    })?;
 
     if envelope.ok {
         return envelope
@@ -1224,8 +1225,12 @@ fn data_of(answer: &ServiceHttpAnswer) -> Result<serde_json::Value> {
 ///
 /// The service reports an unknown creation and an unavailable service as refusals with a voice
 /// reason, and this is where the reason becomes the state a caller branches on. It is separate
-/// from [`ManagedVoiceService::start`] so a caller holding an answer from anywhere — a recorded
-/// exchange, a self-hosted broker — reads it the same way.
+/// from [`ManagedVoiceService::start`] so a caller holding an answer from anywhere, a recorded
+/// exchange or a self-hosted broker, reads it the same way.
+///
+/// An answer this client cannot read is a refusal for a reason it does not know, which nothing
+/// asks again for. A text that names one member twice anywhere is one of those
+/// ([`super::json::read`]): which call is running, or why none is, would depend on the reader.
 #[must_use]
 pub fn read_start_answer(answer: &ServiceHttpAnswer) -> VoiceStart {
     #[derive(Deserialize)]
@@ -1237,7 +1242,7 @@ pub fn read_start_answer(answer: &ServiceHttpAnswer) -> VoiceStart {
         error: Option<serde_json::Value>,
     }
 
-    let Ok(envelope) = serde_json::from_slice::<Envelope>(&answer.body) else {
+    let Ok(envelope) = super::json::read::<Envelope>(&answer.body) else {
         return refused(
             VoiceRefusalReason::Unrecognised,
             "The managed service answered something this client cannot read.".to_owned(),
@@ -1852,6 +1857,110 @@ mod tests {
             panic!("a refusal");
         };
         assert_eq!(refusal.reason, VoiceRefusalReason::Unrecognised);
+    }
+
+    /// A session as the service answers a start with it, in the text it arrives as.
+    fn session_answer() -> String {
+        serde_json::json!({
+            "ok": true,
+            "data": {
+                "callId": "call-1",
+                "attemptId": "attempt-1",
+                "providerSessionId": "provider-1",
+                "answerSdp": "v=0\r\n",
+                "model": "a-model",
+                "closesAt": "2026-09-21T10:00:00Z",
+                "reservationEndsAt": "2026-09-21T10:05:00Z",
+                "controlPath": "/api/voice/control",
+                "heartbeatSeconds": 10,
+                "sidebandReady": true,
+                "hold": {
+                    "reservationId": "res-1", "reserved": "300", "ceiling": "500",
+                    "deadline": "2026-09-21T10:05:00Z"
+                },
+                "reasoningHold": serde_json::Value::Null,
+                "rate": {
+                    "version": "1", "minorUnitsPerSecond": "2", "minimumSeconds": 60,
+                    "currency": "USD"
+                },
+                "latency": { "creationToAnswerMs": 120, "sidebandReadyMs": 40 },
+                "replayed": false,
+                "disclosure": []
+            }
+        })
+        .to_string()
+    }
+
+    /// KR-REQ-04.19: a session answer that names one member twice is not a call this client
+    /// reads. Which call is running would depend on the reader, so no call is running here, and
+    /// nothing asks again with the same offer.
+    #[test]
+    fn a_session_answer_that_names_a_member_twice_is_not_a_call_this_client_reads() {
+        let answer = session_answer();
+        let repeated = answer.replacen(
+            r#""callId":"call-1""#,
+            r#""callId":"call-1","callId":"call-2""#,
+            1,
+        );
+        assert_ne!(
+            repeated, answer,
+            "the session names its call once to begin with"
+        );
+        let start = read_start_answer(&ServiceHttpAnswer {
+            status: 200,
+            body: repeated.into_bytes(),
+        });
+        let VoiceStart::Refused(refusal) = &start else {
+            panic!("not a call this client reads: {start:?}");
+        };
+        assert_eq!(refusal.reason, VoiceRefusalReason::Unrecognised);
+        assert!(!start.may_ask_again());
+
+        // The control: the same answer naming it once is the call.
+        let start = read_start_answer(&ServiceHttpAnswer {
+            status: 200,
+            body: answer.into_bytes(),
+        });
+        assert_eq!(
+            start.session().map(|session| session.call_id.as_str()),
+            Some("call-1")
+        );
+    }
+
+    /// KR-REQ-04.19: a refusal that names its reason twice is not a refusal this client reads. One
+    /// reader would say the capacity is spent and asking again later is safe, another that a call
+    /// may exist and must never be asked for again, and the service said neither once.
+    #[test]
+    fn a_refusal_that_names_its_reason_twice_is_not_one_this_client_reads() {
+        let refusal = |reasons: &str| {
+            ServiceHttpAnswer {
+            status: 503,
+            body: format!(
+                r#"{{"ok":false,"error":{{"code":"INTERNAL",{reasons},"message":"Not now.","attemptId":"attempt-1"}}}}"#
+            )
+            .into_bytes(),
+        }
+        };
+        let start = read_start_answer(&refusal(
+            r#""reason":"service_capacity","reason":"creation_unknown""#,
+        ));
+        let VoiceStart::Refused(refused) = &start else {
+            panic!("not a refusal this client reads: {start:?}");
+        };
+        assert_eq!(refused.reason, VoiceRefusalReason::Unrecognised);
+        assert!(!start.may_ask_again());
+
+        // The controls: each reason named once is read as itself.
+        let VoiceStart::Refused(capacity) =
+            read_start_answer(&refusal(r#""reason":"service_capacity""#))
+        else {
+            panic!("a capacity refusal");
+        };
+        assert_eq!(capacity.reason, VoiceRefusalReason::ServiceCapacity);
+        assert!(matches!(
+            read_start_answer(&refusal(r#""reason":"creation_unknown""#)),
+            VoiceStart::CreationUnknown { .. }
+        ));
     }
 
     #[test]
