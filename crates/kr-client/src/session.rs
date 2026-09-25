@@ -784,6 +784,25 @@ impl Session {
         self.read(Method::HistoryPage, params).await
     }
 
+    /// Reads what an installed decoder read of one approval request and the decisions it offered.
+    ///
+    /// The answer is the record the host's approval ledger keeps: whose package's decoder read the
+    /// request, the request's original bytes and their digest, the decisions offered in the
+    /// upstream's order, the upstream's deadline and where the request stands now. It states what
+    /// the decoder offered, not that the decoder read the request correctly, and the original bytes
+    /// are there for a person to check the one against the other.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host's refusal. A resource of another instance, one no decoder interpreted and
+    /// one the host does not hold are one refusal, and the host does not say which it was.
+    pub async fn inspect_approval(
+        &self,
+        params: &kr_protocol::agent::AgentApprovalInspectParams,
+    ) -> Result<kr_protocol::agent::AgentApprovalInspectResult> {
+        self.read(Method::AgentApprovalInspect, params).await
+    }
+
     /// Writes one ordered batch of raw input under the lease this attachment holds.
     ///
     /// Raw input is the one write that is not a mutation. Section 9 makes it a separate ordered
