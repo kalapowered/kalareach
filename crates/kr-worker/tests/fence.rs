@@ -1816,6 +1816,20 @@ fn shell_quoted(path: &std::path::Path) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
 }
 
+/// A path that is not UTF-8 is refused, rather than quoted as the other path its lossy spelling
+/// would name. The path is only a value here: no file system is asked to hold it.
+#[cfg(unix)]
+#[test]
+#[should_panic(expected = "is not UTF-8")]
+fn a_probe_path_that_is_not_text_is_refused_rather_than_quoted() {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(
+        b"/tmp/kr-probes-\xff/bin/kr-probe".to_vec(),
+    ));
+    let _ = shell_quoted(&path);
+}
+
 /// The recording program works where its directory's name holds an apostrophe: a held start
 /// records its words and variables, waits for its release and then answers, and a script sourced
 /// by its quoted path runs it.
