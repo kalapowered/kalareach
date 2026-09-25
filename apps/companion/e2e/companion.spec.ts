@@ -623,19 +623,35 @@ test.describe('a session in a window 320 px wide', () => {
   }
 
   /**
-   * What in `root` runs past its own box, shown or clipped. Left out: an element that scrolls
-   * sideways on purpose, text kept for a screen reader alone, and the terminal's screen with the
-   * frame that holds it, because the screen is the host's columns, panned and zoomed, never wrapped.
+   * What in `root` runs past its own box, shown or clipped. Left out: a code block or a diff, which
+   * scroll sideways by design, text kept for a screen reader alone, and the terminal's screen with
+   * the frame that holds it, because the screen is the host's columns, panned and zoomed, never
+   * wrapped. What else the frame holds is checked against the frame by `pastTheTerminal`.
    */
   const runningPast = (root: Locator): Promise<string[]> =>
     root.evaluate((element) => {
       const found: string[] = []
       for (const each of [element, ...Array.from(element.querySelectorAll('*'))]) {
-        if (!(each instanceof HTMLElement) || each.closest('.terminal-surface, .visually-hidden')) continue
+        if (!(each instanceof HTMLElement)) continue
+        if (each.closest('.terminal-surface, .visually-hidden, .code-block, .diff-code')) continue
         if (each.querySelector('.terminal-surface')) continue
-        const across = getComputedStyle(each).overflowX
-        if (across === 'auto' || across === 'scroll') continue
         if (each.scrollWidth - each.clientWidth > 1) {
+          found.push(`${each.tagName.toLowerCase()}.${each.className} "${(each.textContent ?? '').slice(0, 40)}"`)
+        }
+      }
+      return found
+    })
+
+  /** What the terminal holds, its screen aside, that reaches past the frame's inner edges. */
+  const pastTheTerminal = (page: Page): Promise<string[]> =>
+    page.getByTestId('raw-terminal').evaluate((frame) => {
+      const left = frame.getBoundingClientRect().left + frame.clientLeft
+      const right = left + frame.clientWidth
+      const found: string[] = []
+      for (const each of Array.from(frame.querySelectorAll('*'))) {
+        if (!(each instanceof HTMLElement) || each.closest('.terminal-surface, .visually-hidden')) continue
+        const box = each.getBoundingClientRect()
+        if (box.width > 0 && (box.left < left - 1 || box.right > right + 1)) {
           found.push(`${each.tagName.toLowerCase()}.${each.className} "${(each.textContent ?? '').slice(0, 40)}"`)
         }
       }
@@ -722,6 +738,7 @@ test.describe('a session in a window 320 px wide', () => {
     wholeAndUnshrunk(narrow, wide, terminal)
     inReadingOrder(narrow)
     expect.soft(await runningPast(page.locator('main')), 'what runs past its own box').toEqual([])
+    expect.soft(await pastTheTerminal(page), 'what reaches past the terminal').toEqual([])
 
     // In View mode the heading says something else and the sizes can be pressed; it all still fits.
     await page.getByRole('tab', { name: 'View' }).click()
@@ -730,6 +747,7 @@ test.describe('a session in a window 320 px wide', () => {
     expect
       .soft(await runningPast(page.locator('main')), 'what runs past its own box in View mode')
       .toEqual([])
+    expect.soft(await pastTheTerminal(page), 'what reaches past the terminal in View mode').toEqual([])
     inReadingOrder(await placed(footer))
   })
 
@@ -780,6 +798,7 @@ test.describe('a session in a window 320 px wide', () => {
       }, target)
       expect.soft(await pageOverflow(page), `the page at ${target} px`).toBeLessThanOrEqual(1)
       expect.soft(await spill(page.locator('.terminal-footer')), `the footer at ${target} px`).toBeLessThanOrEqual(1)
+      expect.soft(await pastTheTerminal(page), `what reaches past the terminal at ${target} px`).toEqual([])
       const controls = [
         ...(await placed(page.locator('.session-header'))),
         ...(await placed(page.locator('.terminal-footer')))
