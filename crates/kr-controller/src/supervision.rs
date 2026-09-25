@@ -1160,16 +1160,29 @@ fn detached_command(
 
 /// Whether a Windows worker this daemon starts must be created outside the daemon's job.
 ///
-/// A worker outlives the daemon, so it must not be a member of a job that kills its members when
-/// the daemon closes. `job_flags` is the daemon's own job's limit flags, or `None` when it runs in
-/// no job. Breakaway is asked for only when that job kills on close; with no job, or a job that does
-/// not kill on close, the worker already outlives the daemon and joining the job is harmless.
+/// A worker outlives the daemon, so it must not be a member of a job that kills its members when the
+/// daemon closes. `job_flags` is the daemon's own job's limit flags, or `None` when it runs in no
+/// job. Breakaway is asked for when the job kills on close, and also when the job permits breakaway
+/// even without kill-on-close: breaking away out of a permitting job is free and takes the worker
+/// out of the whole job hierarchy the daemon sits in, which is what protects it when an outer job
+/// kills on close while the immediate one does not. With no job, or a job that neither kills on
+/// close nor permits breakaway (a runner's plain job), no breakaway is asked for: the worker either
+/// already outlives the daemon or could not break away in any case, and asking would be refused.
+///
+/// The reading is of the immediate job only; the operating system does not report an ancestor job's
+/// flags through this query. The one case it cannot see is an immediate job that forbids breakaway
+/// under an ancestor that kills on close: there the worker cannot be made independent by breakaway
+/// at all, and this returns false because breakaway would only be refused.
 #[cfg(not(unix))]
 #[must_use]
 fn worker_must_break_away(job_flags: Option<u32>) -> bool {
-    // `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
+    // `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, `_BREAKAWAY_OK` and `_SILENT_BREAKAWAY_OK`.
     const KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
-    job_flags.is_some_and(|flags| flags & KILL_ON_JOB_CLOSE != 0)
+    const BREAKAWAY_OK: u32 = 0x0000_0800;
+    const SILENT_BREAKAWAY_OK: u32 = 0x0000_1000;
+    job_flags.is_some_and(|flags| {
+        flags & KILL_ON_JOB_CLOSE != 0 || flags & (BREAKAWAY_OK | SILENT_BREAKAWAY_OK) != 0
+    })
 }
 
 /// How long the launcher's reported process is given to become readable.
@@ -1356,15 +1369,16 @@ mod tests {
     /// carries, with the outcome the start then has.
     #[cfg(not(unix))]
     #[test]
-    fn a_worker_breaks_away_only_from_a_kill_on_close_job() {
+    fn a_worker_breaks_away_from_a_kill_on_close_or_a_breakaway_permitting_job() {
         const KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
         const BREAKAWAY_OK: u32 = 0x0000_0800;
 
         // A scheduled task, as `win-run.sh` starts one: no job, so the worker already outlives the
         // daemon and the start is an ordinary create.
         assert!(!worker_must_break_away(None));
-        // A hosted continuous-integration runner: a job with no kill-on-close (flags 0x0), so the
-        // worker outlives the daemon and the start is an ordinary create.
+        // A hosted continuous-integration runner: a job with no kill-on-close and no breakaway
+        // (flags 0x0), so the worker outlives the daemon and the start is an ordinary create; asking
+        // to break away there would only be refused.
         assert!(!worker_must_break_away(Some(0)));
         // An interactive or SSH logon: a job that kills on close but permits breakaway, so the start
         // asks to break away and is admitted.
@@ -1374,6 +1388,10 @@ mod tests {
         // `cargo test`: a job that kills on close and forbids breakaway, so the start asks to break
         // away and is refused, which the daemon reports as its named failure.
         assert!(worker_must_break_away(Some(KILL_ON_JOB_CLOSE)));
+        // A permitting job that does not itself kill on close, such as the inner of a nested pair
+        // whose outer kills on close: the start still breaks away, which takes the worker out of the
+        // whole hierarchy rather than leaving it for the outer job to kill.
+        assert!(worker_must_break_away(Some(BREAKAWAY_OK)));
     }
 
     fn launch() -> WorkerLaunch {

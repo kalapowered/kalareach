@@ -517,7 +517,7 @@ jobs:
       # that decision for the four job contexts the product can be started in.
       - name: Decide a worker's breakaway from the daemon's job
         if: ${{ !cancelled() }}
-        run: cargo test --locked -p kr-controller --lib supervision::tests::a_worker_breaks_away_only_from_a_kill_on_close_job
+        run: cargo test --locked -p kr-controller --lib supervision::tests::a_worker_breaks_away_from_a_kill_on_close_or_a_breakaway_permitting_job
 
       # The environment feature store on this platform, among its tests the claim a controller of
       # the previous release wrote on it with its start in whole seconds, which the next owner
@@ -618,10 +618,17 @@ jobs:
       - name: The real-worker host tests, from the built executable
         if: ${{ !cancelled() }}
         run: |
-          cargo test --locked -p kr-worker --test host --no-run
-          $exe = Get-ChildItem target\debug\deps\host-*.exe |
-            Sort-Object LastWriteTime | Select-Object -Last 1
-          & $exe.FullName --ignored --test-threads=1 --nocapture `
+          $ErrorActionPreference = 'Stop'
+          # Build without running, and take the executable Cargo says it built rather than the newest
+          # file in the cache, so a failed build cannot fall through to a stale executable.
+          $json = cargo test --locked -p kr-worker --test host --no-run --message-format=json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = $json |
+            ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'host' -and $_.executable } |
+            Select-Object -Last 1 -ExpandProperty executable
+          if (-not $exe) { Write-Error 'cargo reported no host test executable'; exit 1 }
+          & $exe --ignored --test-threads=1 --nocapture `
             --skip a_daemon_restart_keeps_the_session_and_its_shell `
             --skip the_descriptor_is_published_whole_and_owner_only_and_names_the_worker `
             --skip a_worker_that_reports_it_could_not_start_leaves_no_directory
