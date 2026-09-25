@@ -6184,6 +6184,318 @@ async fn an_empty_collection_in_a_history_already_put_back_from_moves_nothing() 
     );
 }
 
+/// KR-REQ-20.13 across a restore, the control: an empty collection in a history this device has
+/// not met, answering a fetch that left before the device followed another restore, moves nothing.
+/// Recovery identities carry no order, so the answer cannot say which of the two restores came
+/// later, and the history the device reads is the one it keeps.
+#[tokio::test]
+async fn an_empty_collection_answering_a_fetch_made_before_the_device_moved_on_moves_nothing() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(GatedService::new());
+    let one = gated_client(directory.path(), "shared", &service);
+    let two = gated_client(directory.path(), "shared", &service);
+    let object_id = fresh_object_id().expect("an identity");
+    let collection = sync_collection(SyncObjectKind::Settings, object_id);
+    let theirs = object(
+        object_id,
+        2,
+        SyncBody::Settings(settings(&[("theme", "light")], &[])),
+        NOW,
+    );
+
+    // The service is put back empty under one recovery, and a fetch that leaves while this device
+    // reads the collection in no history at all finds it so; the answer is held on its way back.
+    let emptied = recovery(0xd6);
+    service.inner.put_back(&Export::default(), emptied).await;
+    service.hold_the_next_fetch().await;
+    let late = tokio::spawn({
+        let one = Arc::clone(&one);
+        async move {
+            one.fetch(
+                SyncObjectKind::Settings,
+                object_id,
+                TimestampMs::new(NOW + 1),
+            )
+            .await
+        }
+    });
+    service.wait_for_a_publication().await;
+
+    // Meanwhile the service is put back again, under another recovery, holding another device's
+    // settings, and another window follows the collection into that history.
+    let restored = recovery(0xd7);
+    service
+        .inner
+        .put_back(
+            &Export {
+                objects: [(collection.clone(), (at(2), sealed_object(&theirs)))].into(),
+                ..Export::default()
+            },
+            restored,
+        )
+        .await;
+    two.fetch(
+        SyncObjectKind::Settings,
+        object_id,
+        TimestampMs::new(NOW + 2),
+    )
+    .await
+    .expect("the collection put back is followed");
+
+    // The held answer names a history this device never met, to a call made before it moved on.
+    service.let_it_go();
+    let refused = late
+        .await
+        .expect("the task finished")
+        .expect_err("an answer from a history this device does not follow");
+    assert!(
+        matches!(refused, SyncError::UnfollowedHistory { .. }),
+        "{refused}"
+    );
+    assert_eq!(
+        one.store()
+            .checkpoint(object_id)
+            .expect("a note")
+            .expect("one stands")
+            .position,
+        in_history(at(2), Some(restored))
+    );
+    assert_eq!(
+        one.store().basis(object_id).expect("a history").recovery(),
+        Some(restored)
+    );
+}
+
+/// KR-REQ-20.13 across a restore: an empty collection in the history this device reads takes a
+/// note still naming a place in the history the collection was put back from. A reconciliation met
+/// the restore first, through the status of a lost publication: it moved the history and ended the
+/// request, and a status answer names no place for the note to follow.
+#[tokio::test]
+async fn an_empty_collection_in_the_history_this_device_reads_takes_a_note_left_in_the_one_it_replaced()
+ {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (client, object_id) = device_client(directory.path(), "one", &service);
+    let mut mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    // An export taken before this device's first write, the write, and a second publication lost
+    // on its way.
+    let archive = service.export().await;
+    publish_again(&client, &mut mine, NOW).await;
+    service.drop_the_next_request().await;
+    mine.revision = fresh_revision().expect("a revision");
+    client.store().put_object(&mine).expect("stored");
+    client
+        .publish(object_id, TimestampMs::new(NOW + 1))
+        .await
+        .expect_err("the request never arrived");
+
+    // The service is put back from the export, empty, and a reconciliation meets the restore
+    // through the lost publication's status.
+    let restored = recovery(0xd8);
+    service.put_back(&archive, restored).await;
+    let reconciled = client
+        .reconcile_unsettled(TimestampMs::new(NOW + 2))
+        .await
+        .expect("reconciled");
+    assert_eq!(reconciled.fenced, 1);
+    assert_eq!(
+        client
+            .store()
+            .basis(object_id)
+            .expect("a history")
+            .recovery(),
+        Some(restored)
+    );
+    assert_eq!(
+        client
+            .store()
+            .checkpoint(object_id)
+            .expect("a note")
+            .expect("it is still there")
+            .position,
+        at(1),
+        "the note still names a place in the history the restore replaced"
+    );
+
+    // A fetch finds the collection empty in the history this device reads. The history does not
+    // move, and the note, which names no place the collection holds, goes.
+    let absent = client
+        .fetch(
+            SyncObjectKind::Settings,
+            object_id,
+            TimestampMs::new(NOW + 3),
+        )
+        .await
+        .expect_err("the collection holds nothing");
+    assert_eq!(absent.code(), ErrorCode::UnknownSession, "{absent}");
+    assert_eq!(client.store().checkpoint(object_id).expect("a note"), None);
+    assert_eq!(
+        client
+            .store()
+            .basis(object_id)
+            .expect("a history")
+            .recovery(),
+        Some(restored)
+    );
+    assert_eq!(
+        publish_again(&client, &mut mine, NOW + 4).await,
+        Published::Accepted {
+            position: in_history(at(1), Some(restored))
+        }
+    );
+}
+
+/// KR-REQ-24.28 and KR-REQ-20.13 across a restore: an empty collection whose answer arrives after
+/// privacy mode fenced the generation it was asked under writes nothing, not even the history it
+/// names. A setting's fetch and a draft's are told the result is late, and a publication whose
+/// refusal was settled before the fence is told its result was discarded.
+#[tokio::test]
+async fn an_empty_collection_read_after_privacy_mode_moved_on_writes_nothing() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(GatedService::new());
+    let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
+    let object_id = fresh_object_id().expect("an identity");
+    let mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    client.store().put_object(&mine).expect("stored");
+    let noted = SyncCheckpoint {
+        position: at(1),
+        published_revision: Nullable::null(),
+    };
+    assert!(
+        client
+            .store()
+            .record_checkpoint(object_id, noted)
+            .expect("a note")
+    );
+    let draft = drafts
+        .create(draft_target(), "mine".to_owned(), TimestampMs::new(NOW))
+        .expect("a draft");
+    let draft_object = SyncObjectId::new(draft.draft_id.get());
+    drafts
+        .record_checkpoint(
+            draft.draft_id,
+            DraftCheckpoint {
+                position: at(1),
+                published_revision: Nullable::null(),
+            },
+        )
+        .expect("a note");
+
+    // The service is put back from an archive that held neither object.
+    let restored = recovery(0xd9);
+    service.inner.put_back(&Export::default(), restored).await;
+    let unchanged = |object: SyncObjectId| {
+        assert_eq!(
+            client.store().basis(object).expect("a history").recovery(),
+            None,
+            "the history the answer names is not followed"
+        );
+    };
+
+    // A setting's fetch, with privacy mode turned on while its answer is out.
+    service.hold_the_next_fetch().await;
+    let (fetched, ()) = tokio::join!(
+        client.fetch(
+            SyncObjectKind::Settings,
+            object_id,
+            TimestampMs::new(NOW + 1)
+        ),
+        async {
+            service.wait_for_a_publication().await;
+            client.fence(1).expect("privacy mode is on");
+            service.let_it_go();
+        }
+    );
+    assert!(
+        matches!(
+            fetched,
+            Err(SyncError::LateResult {
+                produced_under: 0,
+                current: 1
+            })
+        ),
+        "{fetched:?}"
+    );
+    unchanged(object_id);
+    assert_eq!(
+        client.store().checkpoint(object_id).expect("a note"),
+        Some(noted)
+    );
+
+    // A draft's fetch, the same way, once privacy mode is off again.
+    client.resume(2).expect("resumed");
+    service.hold_the_next_fetch().await;
+    let (fetched, ()) = tokio::join!(
+        sync.fetch_beside(&drafts, draft.draft_id, TimestampMs::new(NOW + 2)),
+        async {
+            service.wait_for_a_publication().await;
+            client.fence(3).expect("privacy mode is on");
+            service.let_it_go();
+        }
+    );
+    assert!(
+        matches!(
+            fetched,
+            Err(SyncError::LateResult {
+                produced_under: 2,
+                current: 3
+            })
+        ),
+        "{fetched:?}"
+    );
+    unchanged(draft_object);
+    assert_eq!(
+        drafts
+            .checkpoint(draft.draft_id)
+            .expect("a note")
+            .expect("it stands")
+            .position,
+        at(1)
+    );
+
+    // A setting's publication, refused because the restored collection holds nothing: the refusal
+    // is settled under the generation in force, and the fetch that follows it is answered after
+    // privacy mode fenced that generation.
+    client.resume(4).expect("resumed");
+    service.hold_the_next_fetch().await;
+    let (published, ()) = tokio::join!(
+        client.publish(object_id, TimestampMs::new(NOW + 3)),
+        async {
+            // The exchange first, then the fetch that follows its refusal.
+            service.wait_for_a_publication().await;
+            service.let_it_go();
+            service.wait_for_a_publication().await;
+            client.fence(5).expect("privacy mode is on");
+            service.let_it_go();
+        }
+    );
+    assert_eq!(
+        published.expect("an answer"),
+        Published::Discarded {
+            produced_under: 4,
+            current: 5
+        }
+    );
+    assert!(
+        client
+            .store()
+            .conflicts(object_id)
+            .expect("copies")
+            .is_empty(),
+        "nothing came down to keep"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // KR-REQ-18.05: encrypted settings sync, named beside the rest of the feature
 // ---------------------------------------------------------------------------
