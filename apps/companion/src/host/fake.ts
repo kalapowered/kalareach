@@ -282,7 +282,10 @@ export interface FakeHostControls {
   holdRegistrations(): () => void
 }
 
-/** A read the fake host can hold, named as the port names it. */
+/**
+ * A call the fake host can hold, named as the port names it: a read, or a window move, after whose
+ * answer a view reads its screen again.
+ */
 export type HeldRead =
   | 'connectionState'
   | 'accountStatus'
@@ -297,6 +300,7 @@ export type HeldRead =
   | 'storageStatus'
   | 'pluginList'
   | 'terminalProjection'
+  | 'attachmentViewport'
 
 /** The reads of one kind a test is holding. */
 export interface HeldReads {
@@ -743,12 +747,13 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     },
     // The window a view asks for is where its screen starts from then on: a number of rows above
     // the live screen, or the live screen itself.
-    attachmentViewport: (params) => {
-      const asked = params as { session_id?: string; viewport?: { rows_above?: number } } | null
-      const sessionId = asked?.session_id ?? SESSION_MAIN
-      rowsAbove.set(sessionId, Math.max(0, asked?.viewport?.rows_above ?? 0))
-      return Promise.resolve(settledAs('attachment.viewport', 'applied'))
-    },
+    attachmentViewport: (params) =>
+      reading('attachmentViewport', () => {
+        const asked = params as { session_id?: string; viewport?: { rows_above?: number } } | null
+        const sessionId = asked?.session_id ?? SESSION_MAIN
+        rowsAbove.set(sessionId, Math.max(0, asked?.viewport?.rows_above ?? 0))
+        return settledAs('attachment.viewport', 'applied')
+      }),
 
     pairingView: () => Promise.resolve(pairing),
     pairingSetOrigin: (origin) => {

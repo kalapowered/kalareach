@@ -9,12 +9,13 @@
 
 import { describe, expect, it } from 'vitest'
 import { act, render, screen, waitFor, within } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 
 import type { DocumentNode } from '@kalareach/plugin-sdk'
 
 import { App } from '../src/App'
 import { AppProvider } from '../src/app/state'
-import { fakeHost } from '../src/host/fake'
+import { fakeHost, type HeldReads } from '../src/host/fake'
 import type { HostEvent, HostPort } from '../src/host/port'
 import { animationFrame } from '../src/model/frame'
 
@@ -69,6 +70,29 @@ async function nextFrame(): Promise<void> {
       animationFrame(resolve)
     })
   })
+}
+
+/** Answers the held read at `index`, and lets everything that answer sets off run. */
+async function answer(held: HeldReads, index: number): Promise<void> {
+  await act(async () => {
+    held.answer(index)
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0)
+    })
+  })
+}
+
+/** Waits until `count` reads of a kind have been made. */
+async function made(held: HeldReads, count: number): Promise<void> {
+  await waitFor(() => {
+    expect(held.count).toBe(count)
+  })
+}
+
+const REFUSED = {
+  code: 'RESOURCE_UNAVAILABLE',
+  message: 'The host did not give the document.',
+  user_action: 'retry'
 }
 
 describe('the conversation reads its document once it is listening (KR-REQ-13.02)', () => {
@@ -181,6 +205,108 @@ describe('the conversation reads its document once it is listening (KR-REQ-13.02
     await waitFor(() => {
       expect(shown()).toEqual(DOCUMENT)
     })
+    expect(screen.queryByTestId('conversation-unread')).toBeNull()
+  })
+
+  it('installs only the newest of two reads, with every node streamed across both', async () => {
+    const { port, controls } = fakeHost()
+    const held = controls.hold('agentSnapshot')
+    openConversation(port)
+    await made(held, 1)
+
+    // A connection change that says the host is there reads the document again.
+    act(() => {
+      controls.setConnected(true)
+    })
+    await made(held, 2)
+    act(() => {
+      controls.appendNode(message('n-7', '1', 'Streamed while both reads were out.'))
+    })
+    await nextFrame()
+
+    await answer(held, 0)
+    expect(shown()).toEqual([])
+    await answer(held, 1)
+    expect(shown()).toEqual([...DOCUMENT, 'n-7'])
+  })
+
+  it('keeps a node that arrived before a later read ahead of one that arrived during it', async () => {
+    const { port, controls } = fakeHost()
+    let reads = 0
+    openConversation({
+      ...port,
+      agentSnapshot: (params) => {
+        reads += 1
+        return reads === 1 ? port.agentSnapshot(params) : Promise.reject(REFUSED)
+      }
+    })
+    await waitFor(() => {
+      expect(shown()).toEqual(DOCUMENT)
+    })
+
+    // n-7 is waiting for its frame when the host is heard to be back; the read that starts then is
+    // refused, and n-8 arrives while it is on its way.
+    act(() => {
+      controls.appendNode(message('n-7', '1', 'Before the second read.'))
+      controls.setConnected(true)
+      controls.emit(streamed(message('n-8', '1', 'During the second read.'), '9'))
+    })
+    await screen.findByTestId('conversation-unread')
+    await nextFrame()
+    expect(shown()).toEqual([...DOCUMENT, 'n-7', 'n-8'])
+  })
+
+  it('says why when it cannot follow the stream, and reads nothing', async () => {
+    const { port } = fakeHost()
+    openConversation({
+      ...port,
+      subscribe: () =>
+        Promise.reject({
+          code: 'INTERNAL',
+          message: 'The event stream could not be opened.',
+          user_action: 'retry'
+        })
+    })
+
+    const refusal = await screen.findByTestId('conversation-unread')
+    expect(within(refusal).getByText('The event stream could not be opened.')).toBeInTheDocument()
+    expect(shown()).toEqual([])
+  })
+
+  it('shows no refusal from before on a return to a session, until it has read it again', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    let refusing = true
+    render(
+      <AppProvider
+        port={{
+          ...port,
+          agentSnapshot: (params) =>
+            refusing && (params as { session_id?: string }).session_id === SESSION_MAIN
+              ? Promise.reject(REFUSED)
+              : port.agentSnapshot(params)
+        }}
+        initialPlace={{ view: 'sessions' }}
+      >
+        <App />
+      </AppProvider>
+    )
+    await person.click(await screen.findByTestId('session-row-2'))
+    await screen.findByText('Session 2 · Working')
+    await person.click(screen.getByRole('button', { name: 'Sessions' }))
+    await person.click(await screen.findByTestId('session-row-1'))
+    await screen.findByTestId('conversation-unread')
+
+    refusing = false
+    const held = controls.hold('agentSnapshot')
+    await person.click(screen.getByRole('tab', { name: 'Session 02' }))
+    await made(held, 1)
+    await person.click(screen.getByRole('tab', { name: 'Session 01' }))
+    await made(held, 2)
+    expect(screen.queryByTestId('conversation-unread')).toBeNull()
+
+    await answer(held, 1)
+    expect(shown()).toEqual(DOCUMENT)
     expect(screen.queryByTestId('conversation-unread')).toBeNull()
   })
 

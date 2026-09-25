@@ -88,32 +88,46 @@ export function RawTerminal({
       created.dispose()
       terminal.current = null
     }
-    // The terminal is recreated when the cell size changes, because xterm measures its cell once.
-  }, [zoom])
+    // The terminal is recreated when the cell size changes, because xterm measures its cell once,
+    // and for each session, so nothing written for one session can reach another's screen.
+  }, [zoom, sessionId])
 
-  const load = useCallback(() => {
-    const current = reads.current?.read() ?? null
-    if (current === null) return
-    ask(() => port.terminalProjection({ session_id: sessionId }))
-      .then((projection) => {
-        if (!current()) return
-        setShown({ sessionId, screen: projection })
-        setFailed(null)
-      })
-      .catch((error: unknown) => {
-        if (!current()) return
-        setFailed({ sessionId, message: failureMessage(error) })
-      })
-  }, [port, sessionId])
+  /**
+   * Reads this session's screen under `reading`, and shows the answer or the failure only while
+   * that read is the newest the watch has started and the watch is running.
+   */
+  const readUnder = useCallback(
+    (reading: Watch | null) => {
+      const current = reading?.read() ?? null
+      if (current === null) return
+      ask(() => port.terminalProjection({ session_id: sessionId }))
+        .then((projection) => {
+          if (!current()) return
+          setShown({ sessionId, screen: projection })
+          setFailed(null)
+        })
+        .catch((error: unknown) => {
+          if (!current()) return
+          setFailed({ sessionId, message: failureMessage(error) })
+        })
+    },
+    [port, sessionId]
+  )
 
   useEffect(() => {
-    const reading = watch([], load)
+    const reading: Watch = watch([], () => {
+      readUnder(reading)
+    })
     reads.current = reading
     return () => {
       reading.stop()
       if (reads.current === reading) reads.current = null
+      // What this watch read ends with it: a return to the session shows nothing from before until
+      // its screen has been read again.
+      setShown(null)
+      setFailed(null)
     }
-  }, [load])
+  }, [readUnder])
 
   // This session's screen as this renderer draws it at this cell size, or nothing before it has
   // been read.
@@ -124,9 +138,7 @@ export function RawTerminal({
     const created = terminal.current
     if (!created) return
     // Nothing is drawn but this session's screen: until it has been read, the terminal is empty.
-    created.reset()
-    if (!drawing) return
-    for (const line of drawing.lines) created.write(`${line}\r\n`)
+    paint(created, drawing?.lines ?? [])
   }, [drawing])
 
   // The wheel is read here rather than through a React handler, because the renderer inside this
@@ -155,8 +167,11 @@ export function RawTerminal({
         setZoom((current) => zoomBy(current, outcome.steps))
         return
       }
-      void port
-        .attachmentViewport(
+      // The move, and the read after it, belong to the watch this session's screen is read under:
+      // a move that answers after the view has changed session reads nothing.
+      const moving = reads.current
+      void ask(() =>
+        port.attachmentViewport(
           {
             attachment_id: attachmentId,
             session_id: sessionId,
@@ -164,7 +179,10 @@ export function RawTerminal({
           },
           subject
         )
-        .then(load)
+      )
+        .then(() => {
+          readUnder(moving)
+        })
         .catch(() => {
           // Nothing to say: the projection stays where it was.
         })
@@ -173,7 +191,7 @@ export function RawTerminal({
     return () => {
       element.removeEventListener('wheel', onWheel, { capture: true })
     }
-  }, [mode, port, sessionId, attachmentId, subject, load])
+  }, [mode, port, sessionId, attachmentId, subject, readUnder])
 
   const columns = Number(screen?.dimensions.columns ?? '0')
   const rows = Number(screen?.dimensions.rows ?? '0')
@@ -301,4 +319,16 @@ function drawScreen(
     return drawn.text
   })
   return { lines, substituted }
+}
+
+/**
+ * Replaces what `terminal` shows with `lines`.
+ *
+ * A renderer processes what it is written later than it is written, so a screen is replaced by one
+ * write that begins with a full reset (ESC c), not by a reset that takes effect at once: the reset
+ * then clears whatever an earlier write left, in the order the writes were made, and an earlier
+ * screen still waiting in the renderer can never be drawn over this one.
+ */
+export function paint(terminal: Terminal, lines: readonly string[]): void {
+  terminal.write(`\u001bc${lines.map((line) => `${line}\r\n`).join('')}`)
 }

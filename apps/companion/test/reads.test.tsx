@@ -7,14 +7,16 @@
  * for a session the screen has left.
  */
 
-import { describe, expect, it } from 'vitest'
-import { act, render, screen, waitFor, within } from '@testing-library/react'
+import { describe, expect, it, vi } from 'vitest'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { Terminal } from '@xterm/xterm'
 
 import { App } from '../src/App'
 import { AppProvider, type Place } from '../src/app/state'
 import { fakeHost, type HeldReads } from '../src/host/fake'
 import type { HostPort } from '../src/host/port'
+import { paint } from '../src/terminal/RawTerminal'
 
 function open(port: HostPort, initialPlace: Place): void {
   render(
@@ -373,10 +375,164 @@ describe('the raw terminal shows its newest read, and only for its own session',
     expect(screen.queryByText(/^(At the live end\.|Showing history from row)/)).toBeNull()
   })
 
+  /**
+   * Opens session 2 and then session 1 in tabs, and shows session 1's conversation: the view the
+   * person has in front of them when they change session in the same panel.
+   */
+  async function twoSessions(person: ReturnType<typeof userEvent.setup>): Promise<void> {
+    await person.click(await screen.findByTestId('session-row-2'))
+    await screen.findByText('Session 2 · Working')
+    await person.click(screen.getByRole('button', { name: 'Sessions' }))
+    await person.click(await screen.findByTestId('session-row-1'))
+    await screen.findByText('Session 1 · Waiting for you')
+  }
+
+  /** Everything a renderer holds, row by row, once everything written to it has been processed. */
+  async function drawn(terminal: Terminal): Promise<string> {
+    await new Promise<void>((resolve) => {
+      terminal.write('', resolve)
+    })
+    const buffer = terminal.buffer.active
+    const rows: string[] = []
+    for (let row = 0; row < buffer.length; row += 1) {
+      rows.push(buffer.getLine(row)?.translateToString(true) ?? '')
+    }
+    return rows.join('\n')
+  }
+
+  it('reads nothing for a session it has left when a window move answers late', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    open(port, { view: 'sessions' })
+    await twoSessions(person)
+    await person.click(screen.getByRole('tab', { name: 'Terminal' }))
+    expect(await screen.findByText('80×8')).toBeInTheDocument()
+    await person.click(screen.getByRole('tab', { name: 'View' }))
+
+    const moved = controls.hold('attachmentViewport')
+    const reads = controls.hold('terminalProjection')
+    wheel(120)
+    await made(moved, 1)
+    await person.click(screen.getByRole('tab', { name: 'Session 02' }))
+    await made(reads, 1)
+
+    // Session 1's window move answers after the view changed session, and session 2's read after it.
+    await answer(moved, 0)
+    await answer(reads, 0)
+    expect(screen.getByTestId('terminal-size').textContent).toBe('100×4')
+    expect(reads.count).toBe(1)
+  })
+
+  it('shows nothing it read before on a return to a session, until it has read it again', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    open(port, { view: 'sessions' })
+    await twoSessions(person)
+    await person.click(screen.getByRole('tab', { name: 'Terminal' }))
+    expect(await screen.findByText('80×8')).toBeInTheDocument()
+
+    const reads = controls.hold('terminalProjection')
+    await person.click(screen.getByRole('tab', { name: 'Session 02' }))
+    await made(reads, 1)
+    await person.click(screen.getByRole('tab', { name: 'Session 01' }))
+    await made(reads, 2)
+    expect(screen.queryByTestId('terminal-size')).toBeNull()
+    expect(screen.queryByTestId('palette-provenance')).toBeNull()
+
+    await answer(reads, 1)
+    expect(screen.getByTestId('terminal-size').textContent).toBe('80×8')
+  })
+
+  /**
+   * Holds what every renderer is given until the test lets it through, as a busy renderer does:
+   * a renderer processes what it is written later than it is written. Returns the function that
+   * lets everything held through, in the order it was written; a renderer the view has disposed
+   * of by then takes nothing.
+   */
+  function holdRendering(): () => void {
+    const waiting: {
+      readonly terminal: Terminal
+      readonly data: string | Uint8Array
+      readonly callback?: () => void
+    }[] = []
+    const holding = vi
+      .spyOn(Terminal.prototype, 'write')
+      .mockImplementation(function (this: Terminal, data: string | Uint8Array, callback?: () => void) {
+        waiting.push({ terminal: this, data, callback })
+      })
+    return () => {
+      holding.mockRestore()
+      for (const { terminal, data, callback } of waiting.splice(0)) {
+        try {
+          terminal.write(data, callback)
+        } catch {
+          // A disposed renderer refuses what it is given, which is what disposing of it is for.
+        }
+      }
+    }
+  }
+
+  it('draws nothing of a session it has left, however far its renderer had got', async () => {
+    const person = userEvent.setup()
+    const opened = vi.spyOn(Terminal.prototype, 'open')
+    const { port, controls } = fakeHost()
+    open(port, { view: 'sessions' })
+    await twoSessions(person)
+
+    const reads = controls.hold('terminalProjection')
+    const release = holdRendering()
+    await person.click(screen.getByRole('tab', { name: 'Terminal' }))
+    await made(reads, 1)
+    // Session 1's screen is painted, and the view changes session before the renderer has
+    // processed any of it.
+    await answer(reads, 0)
+    act(() => {
+      fireEvent.click(screen.getByRole('tab', { name: 'Session 02' }))
+    })
+    await made(reads, 2)
+    release()
+
+    // Session 2's screen has not been read, so the renderer in the view holds nothing at all.
+    const showing = opened.mock.contexts.at(-1) as Terminal
+    expect((await drawn(showing)).trim()).toBe('')
+  })
+
   it('shows the screen it read when nothing changed in between', async () => {
     const { port } = fakeHost()
     open(port, { view: 'session', sessionId: SESSION_MAIN, pane: 'terminal' })
     expect(await screen.findByText('80×8')).toBeInTheDocument()
     expect(position()).toBe('At the live end.')
+  })
+})
+
+describe('painting a screen', () => {
+  /** What a renderer holds once it has processed everything written to it. */
+  async function held(terminal: Terminal): Promise<string[]> {
+    await new Promise<void>((resolve) => {
+      terminal.write('', resolve)
+    })
+    const buffer = terminal.buffer.active
+    const rows: string[] = []
+    for (let row = 0; row < buffer.length; row += 1) {
+      const text = buffer.getLine(row)?.translateToString(true) ?? ''
+      if (text.length > 0) rows.push(text)
+    }
+    return rows
+  }
+
+  it('replaces the screen it painted before, even one the renderer has not processed yet', async () => {
+    const terminal = new Terminal({ scrollback: 0, allowProposedApi: true })
+    paint(terminal, ['first screen, row 1', 'first screen, row 2'])
+    paint(terminal, ['second screen'])
+    expect(await held(terminal)).toEqual(['second screen'])
+    terminal.dispose()
+  })
+
+  it('clears the renderer when there is nothing to paint', async () => {
+    const terminal = new Terminal({ scrollback: 0, allowProposedApi: true })
+    paint(terminal, ['a screen'])
+    paint(terminal, [])
+    expect(await held(terminal)).toEqual([])
+    terminal.dispose()
   })
 })

@@ -242,6 +242,9 @@ export function Conversation({
     return () => {
       started.stop()
       batcher.discard()
+      // A refusal belongs to the watch whose read it answered: a return to the session reads again
+      // and shows nothing from before until that read has answered.
+      setUnread(null)
     }
   }, [port, sessionId, batcher, update, returnRefusedText])
 
