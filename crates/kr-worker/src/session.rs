@@ -3074,10 +3074,16 @@ impl Session {
             return None;
         }
         let root_shell = self.root_identity()?;
+        // The line running now is the one whose block started last; answers another line was
+        // given describe another invocation.
+        let line = self
+            .command_blocks
+            .back()
+            .map(|block| block.prompt_generation);
         Some(crate::broker::adoption::Foreground {
             group: self.pty.foreground_group()?,
             root_shell,
-            answered: self.answered.executables.clone(),
+            answered: self.answered.for_line(line),
         })
     }
 
@@ -4337,6 +4343,20 @@ impl Answered {
     /// that runs more than this is a loop whose early answers no adoption needs.
     const RETAINED: usize = 16;
 
+    /// Returns the answers the line of `line`'s generation was given, and none for any other line:
+    /// a line that asked nothing, a pipeline for one, has no answer of an earlier line's.
+    #[cfg(any(unix, test))]
+    fn for_line(
+        &self,
+        line: Option<kr_protocol::root::PromptGeneration>,
+    ) -> Vec<(String, Option<kr_protocol::root::CommandBypassReason>)> {
+        if line.is_some() && line == self.generation {
+            self.executables.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Keeps one answer, forgetting the answers of an earlier generation.
     fn record(
         &mut self,
@@ -4353,5 +4373,42 @@ impl Answered {
             self.executables.remove(0);
         }
         self.executables.push((executable.to_owned(), bypass));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kr_protocol::root::{CommandBypassReason, PromptGeneration};
+
+    use super::Answered;
+
+    /// An adoption is given the bypass its own line was answered with, and none of an earlier
+    /// line's: a later line that asked nothing, such as a pipeline, inherits nothing.
+    #[test]
+    fn a_line_is_given_only_its_own_answers() {
+        let mut answered = Answered::default();
+        answered.record(
+            PromptGeneration::new(1),
+            "/usr/local/bin/claude",
+            Some(CommandBypassReason::AbsolutePath),
+        );
+        assert_eq!(
+            answered.for_line(Some(PromptGeneration::new(1))),
+            vec![(
+                "/usr/local/bin/claude".to_owned(),
+                Some(CommandBypassReason::AbsolutePath)
+            )]
+        );
+        assert!(
+            answered.for_line(Some(PromptGeneration::new(2))).is_empty(),
+            "the next line asked nothing"
+        );
+        assert!(answered.for_line(None).is_empty(), "no line is running");
+        answered.record(PromptGeneration::new(2), "/usr/local/bin/claude", None);
+        assert_eq!(
+            answered.for_line(Some(PromptGeneration::new(2))),
+            vec![("/usr/local/bin/claude".to_owned(), None)],
+            "a line's own answer replaces an earlier line's"
+        );
     }
 }
