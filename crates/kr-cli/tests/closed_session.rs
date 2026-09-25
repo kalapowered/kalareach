@@ -285,6 +285,39 @@ impl Host {
         }
     }
 
+    /// The process identifier of `session`'s root shell, as the daemon reads the session.
+    async fn root_shell(&self, session: &str) -> u64 {
+        let endpoint = self
+            .temp
+            .environment()
+            .controller_endpoint()
+            .expect("an endpoint");
+        let mut client = kr_ipc::client::LocalClient::connect(
+            &endpoint,
+            kr_protocol::local::LocalClientKind::Cli,
+            build(),
+        )
+        .await
+        .expect("reaches the daemon");
+        let read: kr_protocol::session::SessionReadResult = client
+            .request(
+                kr_protocol::method::Method::SessionRead,
+                &kr_protocol::session::SessionReadParams {
+                    session_id: session.parse().expect("an identifier"),
+                },
+            )
+            .await
+            .expect("the read reaches the daemon")
+            .expect("the daemon reads the session")
+            .to_typed()
+            .expect("a session read");
+        read.session
+            .root_process
+            .as_ref()
+            .map(|process| process.pid.get())
+            .expect("the session names its root shell")
+    }
+
     /// Waits until `session` reports `attachments` attachments.
     fn wait_for_attachments(&self, session: &str, attachments: u64) {
         let started = Instant::now();
@@ -405,6 +438,9 @@ async fn attaching_to_a_closed_session_answers_with_its_closure_and_starts_nothi
     let (session, display) = host.create();
     assert_eq!(host.starts(), 1, "one session, one worker");
 
+    // The shell the session runs, as its daemon reads it, which its closure has to name.
+    let shell = host.root_shell(&session).await;
+
     // While it is live, it attaches, on a real terminal; a close from another window ends that
     // attachment with the closure.
     let window = Window::attach(&host, &session);
@@ -443,8 +479,10 @@ async fn attaching_to_a_closed_session_answers_with_its_closure_and_starts_nothi
         assert!(
             document["closure"]["terminated"]
                 .as_array()
-                .is_some_and(|terminated| !terminated.is_empty()),
-            "the shell it terminated is named: {document}"
+                .is_some_and(|terminated| terminated
+                    .iter()
+                    .any(|process| process["pid"].as_u64() == Some(shell))),
+            "the shell it terminated, {shell}, is named: {document}"
         );
         assert!(document["closure"]["surviving"].is_array(), "{document}");
     }

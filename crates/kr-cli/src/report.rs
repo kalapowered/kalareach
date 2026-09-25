@@ -496,13 +496,21 @@ mod tests {
         };
         let rendered = closure(&record);
         assert_eq!(rendered["session_id"], json!(record.session_id.to_string()));
-        assert!(!rendered["session_epoch"].is_null(), "{rendered}");
+        assert_eq!(rendered["session_epoch"], json!("1"), "{rendered}");
         assert_eq!(rendered["terminated"][0]["pid"], json!(42));
+        assert_eq!(
+            rendered["terminated"][0]["start"],
+            json!({ "pid": "42", "source": "linux_proc_stat", "start_value": "7" }),
+            "{rendered}"
+        );
         assert_eq!(rendered["terminated"][0]["name"], json!("sh"));
         assert_eq!(rendered["terminated"][0]["forced"], json!(true));
-        assert!(rendered["terminated"][0]["start"].is_object(), "{rendered}");
-        assert_eq!(rendered["surviving"][0]["kind"], json!("desktop_resource"));
+        assert_eq!(
+            rendered["surviving"],
+            json!([{ "kind": "desktop_resource", "detail": "a window the broker opened" }])
+        );
         assert_eq!(rendered["reason"], json!("close_requested"));
+        assert_eq!(rendered["ownership_coverage"], json!("complete"));
         assert_eq!(rendered["closed_at_ms"], json!(9));
     }
 
