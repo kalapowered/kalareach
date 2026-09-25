@@ -44,6 +44,15 @@ struct Arguments {
     /// bench or a demonstration run, whose keys belong to the run and go with it.
     #[arg(long, value_enum, default_value_t = SecretStoreChoice::Platform)]
     secret_store: SecretStoreChoice,
+    /// Start in a session and a process group of its own, with no controlling terminal.
+    ///
+    /// For a command that starts this daemon on demand, as `kr new` does under the standalone
+    /// start: the daemon outlives that command, and nothing the terminal the command ran in does, a
+    /// hangup, an interrupt or the end of a login, reaches it. The process it is given must not
+    /// already lead a process group, which a process a program starts directly never does.
+    #[cfg(unix)]
+    #[arg(long)]
+    own_session: bool,
 }
 
 /// The store a daemon was told to keep its device keys in, as the command line spells it.
@@ -66,6 +75,15 @@ impl From<SecretStoreChoice> for StoreSelection {
 
 fn main() -> ExitCode {
     let arguments = Arguments::parse();
+    // First, before any thread exists: a session is the calling process's to leave, and nothing
+    // the terminal does may reach the daemon from here on.
+    #[cfg(unix)]
+    if arguments.own_session
+        && let Err(error) = rustix::process::setsid()
+    {
+        eprintln!("kr-controller: could not start a session of its own: {error}");
+        return ExitCode::FAILURE;
+    }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
