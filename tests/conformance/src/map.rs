@@ -374,7 +374,11 @@ fn rust_package(map: &mut Map, sources: &mut Sources, root: &Path, package: &Pac
         for helper in helpers {
             let callers: Vec<String> = uses[first_use..]
                 .iter()
-                .filter(|test| !unlisted && test.assumes.is_disjoint(&claimed))
+                .filter(|test| {
+                    !unlisted
+                        && test.assumes.is_disjoint(&claimed)
+                        && crates_named(&test.assumes, package)
+                })
                 .filter(|test| {
                     test.calls
                         .iter()
@@ -702,6 +706,17 @@ fn claimed_names(modules: &[Module], scope: &Scope) -> (BTreeSet<String>, bool) 
         }
     }
     (claimed, unlisted)
+}
+
+/// Whether every crate a trusted name starts at (`tokio::` for `#[tokio::test]`) is the registry
+/// crate of that name the package depends on; the tool roots `rustfmt::` and `clippy::` are
+/// tools, not crates.
+fn crates_named(assumes: &BTreeSet<String>, package: &Package) -> bool {
+    assumes
+        .iter()
+        .filter_map(|name| name.strip_suffix("::"))
+        .filter(|root| !matches!(*root, "rustfmt" | "clippy"))
+        .all(|root| package.registry_crates.contains(root))
 }
 
 /// Whether a call written in the module `from` by `path` reaches `helper`.
