@@ -306,7 +306,7 @@ fn a_source_outside_the_conventions_is_a_problem_and_keys_no_helper() {
             ("tests/chosen.rs:4", "a `cfg_attr` chooses"),
             (
                 "tests/escaped.rs:4",
-                "a `path` attribute whose value is written with an escape",
+                "a `path` attribute whose value is anything but a string of printable ASCII",
             ),
             ("tests/innerchosen.rs:3", "a `cfg_attr` chooses"),
             (
