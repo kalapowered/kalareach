@@ -207,11 +207,21 @@ impl InstalledLease {
         self.continuous_deadline
     }
 
-    /// Whether it is in force at both readings: before its continuous deadline and inside its
-    /// signed window on UTC.
+    /// Whether it is in force at both readings: before its continuous deadline, and before its
+    /// signed expiry on UTC.
+    ///
+    /// Its issue time is not asked again. Installation accepted it up to five seconds in this
+    /// host's future ([`LEASE_CLOCK_MARGIN_MS`]), so a lease is in force from the moment it is
+    /// installed, not from the moment this host's clock reaches its issue time.
     #[must_use]
     pub fn in_force(&self, now: ContinuousInstant, utc_ms: u64) -> bool {
-        now < self.continuous_deadline && self.lease.payload.is_valid_at(utc_ms)
+        now < self.continuous_deadline && self.unexpired_at(utc_ms)
+    }
+
+    /// Whether its signed expiry is still ahead of `utc_ms`.
+    #[must_use]
+    pub fn unexpired_at(&self, utc_ms: u64) -> bool {
+        utc_ms < self.lease.payload.expires_at_ms.get()
     }
 }
 

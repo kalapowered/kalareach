@@ -642,10 +642,14 @@ fn a_wall_clock_wound_back_does_not_lengthen_a_lease() {
 
 /// A lease the host's clock places more than five seconds in the future is refused; one four
 /// seconds ahead installs, ending on the continuous clock fifteen minutes less the margin later.
+/// Once installed it is in force at once, and answered as a repeat at once, although this host's
+/// clock has not reached its issue time; it ends at its continuous deadline, or at its signed
+/// expiry on UTC, whichever comes first.
 #[test]
 fn a_lease_from_the_hosts_future_is_refused_beyond_five_seconds() {
     let mut host = policy();
     let organisation = enrolled(&mut host);
+    let organisation_id = organisation.organisation_id;
     let clock = ManualClock::new();
     let (ada, phone) = (member("ada"), device());
     let ahead = organisation.lease(2, &ada, *phone.public(), T + 6_000, VIEW);
@@ -664,6 +668,183 @@ fn a_lease_from_the_hosts_future_is_refused_beyond_five_seconds() {
             .checked_add(Duration::from_millis(LEASE_MS - 5_000))
             .expect("a deadline")
     );
+
+    // In force at once, before this host's clock reaches the issue time.
+    assert_eq!(
+        host.lease_in_force(organisation_id, &ada, phone.public(), clock.now(), T),
+        Ok(&near)
+    );
+    let repeat = host
+        .install_lease(presented(&near, phone.public(), T, clock.now(), 1))
+        .expect("presented again at once, it is answered from its installation");
+    assert_eq!(repeat.change, LeaseChange::Repeat);
+
+    // It ends at its continuous deadline...
+    clock.advance(Duration::from_millis(LEASE_MS - 5_000));
+    assert_eq!(
+        host.lease_in_force(
+            organisation_id,
+            &ada,
+            phone.public(),
+            clock.now(),
+            T + 60_000
+        ),
+        Err(MembershipRefusal::LeaseExpired)
+    );
+    // ...or at its signed expiry on UTC, if that comes first.
+    let mut other = policy();
+    organisation.enrol(&mut other, T);
+    let early_clock = ManualClock::new();
+    other
+        .install_lease(presented(&near, phone.public(), T, early_clock.now(), 1))
+        .expect("installed on another host");
+    let expiry = near.payload.expires_at_ms.get();
+    assert_eq!(
+        other.lease_in_force(
+            organisation.organisation_id,
+            &ada,
+            phone.public(),
+            early_clock.now(),
+            expiry
+        ),
+        Err(MembershipRefusal::LeaseExpired)
+    );
+    other
+        .lease_in_force(
+            organisation.organisation_id,
+            &ada,
+            phone.public(),
+            early_clock.now(),
+            expiry - 1,
+        )
+        .expect("the control: a millisecond before its signed expiry it is in force");
+}
+
+/// Nothing that reads the clock is decided while the floor it would stand on is owed its record:
+/// not an enrolment, not a rotation, not a lease. Once the record lands, each is decided.
+#[test]
+fn nothing_that_reads_the_clock_is_decided_while_the_floor_is_owed_its_record() {
+    let mut organisation = Organisation::new(0x61, T - 2 * DAY_MS);
+    organisation.rotate(T - DAY_MS);
+    let mut host = policy();
+    // A decision stood on the floor at T, and its record has not landed.
+    host.utc_floor().owe(T);
+    let authority = organisation.authority(T);
+    assert_eq!(
+        host.verify_enrolment(&authority, Some(&reading(T))),
+        Err(ChainRefused::FloorUnrecorded)
+    );
+    host.utc_floor().wrote(T);
+    organisation.enrol(&mut host, T);
+
+    organisation.rotate(T + MINUTE_MS);
+    let at = T + 2 * MINUTE_MS;
+    host.utc_floor().owe(at);
+    assert_eq!(
+        host.accept_chain(&organisation.authority(at), Some(&reading(at))),
+        Err(ChainRefused::FloorUnrecorded)
+    );
+    let clock = ManualClock::new();
+    let (ada, phone) = (member("ada"), device());
+    let lease = organisation.lease(2, &ada, *phone.public(), T + 30_000, VIEW);
+    assert_eq!(
+        host.install_lease(presented(&lease, phone.public(), at, clock.now(), 1)),
+        Err(LeaseRefused::FloorUnrecorded)
+    );
+    assert!(
+        host.lease_record(organisation.organisation_id, &ada, phone.public())
+            .is_none(),
+        "nothing is recorded while the floor is owed"
+    );
+
+    // The control: once the record lands, both are decided.
+    host.utc_floor().wrote(at);
+    assert_eq!(
+        host.accept_chain(&organisation.authority(at), Some(&reading(at))),
+        Ok(ChainOutcome::Advanced {
+            to: PolicyKeyRevision::new(3),
+            dropped: Vec::new(),
+        })
+    );
+    host.install_lease(presented(&lease, phone.public(), at, clock.now(), 1))
+        .expect("revision 2 signed it before it was succeeded");
+}
+
+/// A lease record is let go of only in a write whose floor is past its issue time plus the longest
+/// lease: every lease it could stand for has expired by then, and stays refused afterwards.
+#[test]
+fn a_record_is_let_go_only_once_the_floor_shows_its_leases_expired() {
+    let mut host = policy();
+    let organisation = enrolled(&mut host);
+    let organisation_id = organisation.organisation_id;
+    let clock = ManualClock::new();
+    let (ada, phone) = (member("ada"), device());
+    let lease = organisation.lease(2, &ada, *phone.public(), T, VIEW);
+    host.install_lease(presented(&lease, phone.public(), T, clock.now(), 1))
+        .expect("installed");
+
+    // The control: with the floor at the last moment a lease it names could be live, the record
+    // is written down.
+    host.observe_utc(T + LEASE_MS);
+    assert_eq!(host.snapshot().lease_records.len(), 1);
+
+    host.observe_utc(T + LEASE_MS + 1);
+    let snapshot = host.snapshot();
+    assert!(
+        snapshot.lease_records.is_empty(),
+        "a floor past the lease's life lets the record go"
+    );
+    assert_eq!(snapshot.utc_floor_ms, TimestampMs::new(T + LEASE_MS + 1));
+
+    // Restored without the record, the lease is still refused: the floor written beside the
+    // pruning has passed its expiry, whatever the wall clock reads.
+    let mut restored = HostPolicy::restore(&snapshot, AuthorityRevision::new(1));
+    assert_eq!(
+        restored.install_lease(presented(
+            &lease,
+            phone.public(),
+            T + MINUTE_MS,
+            clock.now(),
+            2
+        )),
+        Err(LeaseRefused::Expired)
+    );
+    assert!(
+        restored
+            .lease_record(organisation_id, &ada, phone.public())
+            .is_none()
+    );
+}
+
+/// A link older than the anchor is let go of only once its successor has been signing for longer
+/// than any lease it signed can last, with the clock margin.
+#[test]
+fn a_link_is_let_go_only_once_no_lease_it_signed_can_be_live() {
+    let mut host = policy();
+    let mut organisation = enrolled(&mut host);
+    let organisation_id = organisation.organisation_id;
+    organisation.rotate(T + MINUTE_MS);
+    let first = T + 2 * MINUTE_MS;
+    host.accept_chain(&organisation.authority(first), Some(&reading(first)))
+        .expect("revision 3 is accepted");
+    organisation.rotate(T + 20 * MINUTE_MS);
+    let links = |host: &HostPolicy| {
+        host.enrolment(organisation_id)
+            .expect("enrolled")
+            .links()
+            .iter()
+            .map(|link| link.payload.key_revision.get())
+            .collect::<Vec<_>>()
+    };
+    // The control: two minutes after revision 3 took over, revision 2 is still kept.
+    assert_eq!(links(&host), vec![2, 3]);
+
+    // Revision 3 has signed for nineteen minutes when revision 4 is accepted: revision 2 can have
+    // signed no lease that is still live, and is let go of; revision 3 is kept.
+    let later = T + 20 * MINUTE_MS + 30_000;
+    host.accept_chain(&organisation.authority(later), Some(&reading(later)))
+        .expect("revision 4 is accepted");
+    assert_eq!(links(&host), vec![3, 4]);
 }
 
 /// Rule A: a lease digest is installed at most once on a host. A repeat in the run that installed

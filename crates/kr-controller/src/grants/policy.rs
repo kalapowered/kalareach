@@ -675,8 +675,8 @@ impl HostPolicy {
                     });
                 }
                 let Some(lease) = installed
+                    .find(|installed| installed.unexpired_at(now_ms))
                     .map(super::organisation::InstalledLease::lease)
-                    .find(|lease| lease.payload.is_valid_at(now_ms))
                 else {
                     return Err(Refusal::MembershipUnusable {
                         refusal: MembershipRefusal::LeaseExpired,
@@ -752,7 +752,7 @@ impl HostPolicy {
                 seen = Some(MembershipRefusal::NoLease);
                 continue;
             }
-            if !installed.any(|installed| installed.lease().payload.is_valid_at(now_ms)) {
+            if !installed.any(|installed| installed.unexpired_at(now_ms)) {
                 seen = Some(MembershipRefusal::LeaseExpired);
                 continue;
             }
