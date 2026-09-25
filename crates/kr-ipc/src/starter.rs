@@ -181,12 +181,13 @@ pub fn leave_claim(environment: &EnvironmentPaths, claim: &StartClaim) -> Result
 /// starters looking at once, one takes each claim and every other finds it taken. A claim that has
 /// lapsed is taken like any other and not returned, so nothing acts on it; the claim and its marker
 /// stay for the rest of the boot, so the request cannot be taken again. A claim, and its marker,
-/// from an earlier boot are removed. A name in the directory that is not a claim is left alone.
+/// from an earlier boot are removed. A claim that cannot be read is passed over, since nothing
+/// could act on it. A name in the directory that is not a claim is left alone.
 ///
 /// # Errors
 ///
-/// Returns an error when the directory cannot be read, or a claim cannot be read or taken for a
-/// reason other than another starter taking it first.
+/// Returns an error when the directory cannot be read, or a claim's taken marker cannot be
+/// created for a reason other than another starter creating it first.
 pub fn take_claim(
     environment: &EnvironmentPaths,
     boot: &BootIdentity,
@@ -214,24 +215,19 @@ pub fn take_claim(
     for request in requests {
         let path = directory.join(format!("{request}.{CLAIM}"));
         let marker = directory.join(format!("{request}.{TAKEN}"));
-        let claim = match read_claim(&path) {
-            Ok(claim) => claim,
-            // Another starter removed it, as an earlier boot's, while this one was looking: the
-            // other claims are still looked at.
-            Err(IpcError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
-                continue;
-            }
-            Err(error) => return Err(error),
+        // A claim that cannot be read is passed over rather than ending the look: nothing could
+        // act on it, and the claims after it are still looked at. Another starter removing it as
+        // an earlier boot's while this one reads is the ordinary case, which Windows reports as
+        // the name gone or as access refused to a file whose removal is under way.
+        let Ok(claim) = read_claim(&path) else {
+            continue;
         };
         if claim.boot != *boot {
             // An earlier boot's request: its deadline is on a clock that has restarted, and
-            // nothing can act on it now.
+            // nothing can act on it now. Whichever starter's removal takes, it goes; one that
+            // fails here because another is removing it too changes nothing.
             for stale in [&marker, &path] {
-                match std::fs::remove_file(stale) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(IpcError::io("remove", stale, error)),
-                }
+                let _ = std::fs::remove_file(stale);
             }
             continue;
         }
@@ -1810,6 +1806,25 @@ mod tests {
             .filter(|taken| *taken)
             .count();
         assert_eq!(taken, 1);
+    }
+
+    /// A claim that cannot be read is passed over, and a live claim beside it is still taken.
+    #[test]
+    fn a_claim_that_cannot_be_read_is_passed_over() {
+        let host = TempHost::create();
+        let environment = host.environment();
+        let live = claim(60_000);
+        leave_claim(&environment, &live).expect("the live claim");
+        for _ in 0..4 {
+            let garbled = environment
+                .start_claims_dir()
+                .join(format!("{}.{CLAIM}", crate::new_uuid()));
+            std::fs::write(&garbled, b"not a claim").expect("a claim nobody could read");
+        }
+        let taken = take_claim(&environment, &boot(1), 5_000)
+            .expect("the look succeeds")
+            .expect("the live claim is taken");
+        assert_eq!(taken.claim(), &live);
     }
 
     /// Starters racing over a directory that holds claims of an earlier boot as well as a live one
