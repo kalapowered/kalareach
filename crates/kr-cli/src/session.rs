@@ -1967,12 +1967,15 @@ mod tests {
             .expect("a map")
         };
         let payload = planted(MARKER);
-        // The negative control: the decoder's own message, which the outcome carried whole,
-        // quotes the key.
+        // The negative control: the decoder's failure keeps the key it refused in a field of its
+        // own, which a rendering that copied the failure's fields would quote.
         let unread = payload
             .to_typed::<ClosureRecord>()
             .expect_err("not a closure");
-        assert!(unread.to_string().contains(MARKER), "{unread}");
+        assert!(
+            matches!(&unread, kr_cbor::CborError::UnknownField { field, .. } if field == MARKER),
+            "{unread}"
+        );
 
         let outcome = super::closed(&payload, false);
         assert!(matches!(outcome, AttachOutcome::ClosureUnreadable { .. }));

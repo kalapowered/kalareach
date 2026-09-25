@@ -450,10 +450,13 @@ mod tests {
         let refused =
             kr_cbor::to_canonical_vec(&frame(&[ActionRight::SessionView, ActionRight::VoiceUse]))
                 .expect_err("a frame carrying voice.use is not encoded");
-        assert!(
-            refused.to_string().contains("never travels to a worker"),
-            "{refused}"
-        );
+        // The refusal's reason is kept in the failure's own field; what the failure says is its
+        // rule.
+        let reason = match &refused {
+            kr_cbor::CborError::Serialize { message } => message.as_str(),
+            other => panic!("a refusal to write the frame, not {other}"),
+        };
+        assert!(reason.contains("never travels to a worker"), "{reason}");
 
         // Decoding refuses it too, whatever wrote it.
         let read = |rights: &[&'static str]| {

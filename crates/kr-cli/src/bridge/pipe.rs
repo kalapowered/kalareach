@@ -200,12 +200,15 @@ mod tests {
         use crate::shown::marker::{MARKER, assert_unmarked, failure_renderings};
 
         let payload = planted_payload(MARKER);
-        // The negative control: the decoder's own message, which the refusal carried whole,
-        // quotes the key.
+        // The negative control: the decoder's failure keeps the key it refused in a field of its
+        // own, which a rendering that copied the failure's fields would quote.
         let decoded =
             kr_protocol::wire::decode::<BridgeFrame>(&payload, &StreamKind::Control.cbor_limits())
                 .expect_err("not a bridge frame");
-        assert!(decoded.to_string().contains(MARKER), "{decoded}");
+        assert!(
+            matches!(&decoded, kr_cbor::CborError::UnknownField { field, .. } if field == MARKER),
+            "{decoded}"
+        );
 
         let error = read_planted(&payload);
         assert!(matches!(error, PipeError::Frame(_)), "{error}");

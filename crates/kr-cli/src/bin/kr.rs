@@ -1653,12 +1653,16 @@ mod tests {
             .expect("one member"),
         );
         let answer = kr_protocol::envelope::ParamsValue::from(named);
-        // The negative control: the decoder's own failure names the member.
+        // The negative control: the decoder's failure keeps the member it refused in a field of
+        // its own.
         let refused = answer
             .to_typed::<kr_protocol::recovery::EventsSnapshotResult>()
             .map(|_| ())
             .expect_err("not a snapshot");
-        assert!(refused.to_string().contains(MARKER), "{refused}");
+        assert!(
+            matches!(&refused, kr_cbor::CborError::UnknownField { field, .. } if field == MARKER),
+            "{refused}"
+        );
         let said = attachments_read(Some(Ok(Ok(answer)))).expect_err("not read");
         assert!(!said.as_str().contains(MARKER), "{said}");
         assert!(!format!("{said:?}").contains(MARKER), "{said:?}");
