@@ -2655,7 +2655,9 @@ impl WorkerService {
             Method::AgentCapabilities => self.agent_capabilities(&request.params),
             Method::AgentSnapshot => self.agent_snapshot(&request.params, caller),
             Method::AgentCommands => self.agent_commands(&request.params),
-            Method::AgentApprovalInspect => self.agent_approval_inspect(state, &request.params),
+            Method::AgentApprovalInspect => {
+                self.agent_approval_inspect(state, &request.params, caller)
+            }
             _ => Err(WorkerError::InvalidArgument(format!(
                 "{} is not a read this worker serves",
                 method.as_str()
@@ -4820,8 +4822,11 @@ impl WorkerService {
     ///
     /// A local caller reads the whole record, as it reads the whole retained agent history: its
     /// authority is the operating-system identity the listener authenticated, and section 10's
-    /// history rule narrows a grant, of which there is none. The method table serves this read on
-    /// the local socket only, so no caller acting under a grant reaches it.
+    /// history rule narrows a grant, of which there is none. A caller acting under a grant is
+    /// refused with the reason instead, whichever socket the daemon heard it on: the grant's
+    /// history scope does not reach this worker with a forwarded read, so nothing here can hold
+    /// the record to it. A paired device does not get this far, because the method table serves
+    /// the read on the local socket only.
     ///
     /// The original source travels whole with the answer, so the answer is held to what this
     /// connection said it can receive: a peer that declared a smaller control frame is refused
@@ -4830,8 +4835,19 @@ impl WorkerService {
         &self,
         state: &ConnectionState,
         params: &ParamsValue,
+        caller: &Caller,
     ) -> Result<ParamsValue> {
         let params: kr_protocol::agent::AgentApprovalInspectParams = parse(params)?;
+        if caller.acts_under_a_grant() {
+            return Err(WorkerError::Broker(
+                crate::broker::BrokerError::UnsupportedCapability {
+                    detail: "an approval's record is narrowed to the history scope of the grant a \
+                             caller acts under, and that scope does not reach this worker with a \
+                             forwarded read; the local owner reads it"
+                        .to_owned(),
+                },
+            ));
+        }
         let record = self.broker.inspect_approval(&params)?;
         let measured = Self::answer_bytes(&record);
         if measured > Self::frame_bytes(state) {
@@ -5547,6 +5563,16 @@ impl Caller {
     #[must_use]
     pub const fn is_remote(&self) -> bool {
         self.ingress.is_remote()
+    }
+
+    /// Returns true when this caller's authority is a grant rather than the operating-system
+    /// identity of a local caller.
+    ///
+    /// A grant is what section 10's history rule narrows. A caller that reached the host over a
+    /// network transport acts under one whatever its envelope names.
+    #[must_use]
+    pub const fn acts_under_a_grant(&self) -> bool {
+        self.grant_id.is_present() || self.is_remote()
     }
 
     /// Returns the paired device this caller is, when it is one.
