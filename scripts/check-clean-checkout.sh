@@ -8,6 +8,7 @@
 #   scripts/check-clean-checkout.sh --only setup,check      run only these step groups
 #   scripts/check-clean-checkout.sh --skip demonstrations   run every group but these
 #   scripts/check-clean-checkout.sh --no-steps              make the refusals and run nothing
+#   scripts/check-clean-checkout.sh --list                  print the steps a run would take
 #   scripts/check-clean-checkout.sh --commits <range>       check these commits' messages
 #   scripts/check-clean-checkout.sh --self-test             prove each refusal on a planted defect
 #
@@ -46,7 +47,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 usage: check-clean-checkout.sh [--commit <rev>] [--repo <path or URL>] [--commits <range>]
-                               [--only <groups>] [--skip <groups>] [--no-steps]
+                               [--only <groups>] [--skip <groups>] [--no-steps] [--list]
                                [--keep-going] [--keep]
        check-clean-checkout.sh --self-test
 
@@ -56,6 +57,7 @@ usage: check-clean-checkout.sh [--commit <rev>] [--repo <path or URL>] [--commit
   --only <groups>      run only these step groups, comma-separated
   --skip <groups>      run every step group except these, comma-separated
   --no-steps           make the refusals and run no step
+  --list               make the refusals and print the selected steps instead of running them
   --keep-going         run every selected step even after one fails
   --keep               keep the clone and the directories the run used
   --self-test          check each refusal against a fixture repository planted with its defect
@@ -71,6 +73,7 @@ commits=""
 only=""
 skip=""
 run_steps=1
+list_steps=0
 keep_going=0
 keep=0
 self_test=0
@@ -82,6 +85,7 @@ while [ "$#" -gt 0 ]; do
     --only) only="${2:?--only needs a group list}"; shift 2 ;;
     --skip) skip="${2:?--skip needs a group list}"; shift 2 ;;
     --no-steps) run_steps=0; shift ;;
+    --list) list_steps=1; shift ;;
     --keep-going) keep_going=1; shift ;;
     --keep) keep=1; shift ;;
     --self-test) self_test=1; shift ;;
@@ -452,6 +456,7 @@ Signed-off-by: fixture <fixture@example.invalid>"
   expect "--keep-going still fails the run" refuse "one or more steps failed" --keep-going
   expect "--skip leaves the failing group out" pass "== step setup.4 exit 0" --skip check
   expect "--only runs the named group alone" pass "== step setup.4 exit 0" --only setup
+  expect "--list prints the steps and runs none" pass "check.4: false" --list
 
   directory="$work/no-steps"
   make_fixture "$directory"
@@ -573,6 +578,10 @@ while IFS="$(printf '\t')" read -r group command; do
     index=0
   fi
   index=$((index + 1))
+  if [ "$list_steps" -eq 1 ]; then
+    echo "$group.$index: $command"
+    continue
+  fi
   echo "== step $group.$index: $command"
   started="$SECONDS"
   rc=0
@@ -589,6 +598,9 @@ done <<EOF
 $steps
 EOF
 
+if [ "$list_steps" -eq 1 ]; then
+  exit 0
+fi
 if [ "$failed" -ne 0 ]; then
   say "one or more steps failed at $commit"
   exit 1
