@@ -1,0 +1,37 @@
+[package]
+name = "kr-e2e-agents"
+description = "Qualification cases for the bundled agent connectors: a real host, a paired owner device and a vendor agent build started from a managed shell"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[test]]
+name = "cases"
+
+[dependencies]
+# The host, the paired device, the terminal windows and the process record: the cross-boundary
+# checkpoint's own harness, used as a library.
+kr-e2e-m1b = { path = "../m1b" }
+# A plugin action's parameters are canonical CBOR.
+kr-cbor.workspace = true
+kr-client = { workspace = true, features = ["terminal"] }
+# The owner-confirmation digest of an installation.
+kr-controller.workspace = true
+# Process identities, the host's directories and placing a binary on the internal disk.
+kr-ipc = { workspace = true, features = ["testing"] }
+kr-protocol.workspace = true
+# Where the host's configuration document lives, as the host itself works it out.
+kr-worker.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# Signals by recorded process.
+rustix = { workspace = true, features = ["process"] }
+
+[lints]
+workspace = true
