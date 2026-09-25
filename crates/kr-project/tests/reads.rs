@@ -500,12 +500,9 @@ mod linux {
         let location = fixture.work().join("location");
         std::fs::create_dir(&location).expect("a location");
         let planted = location.join("planted-program");
-        std::fs::write(&planted, "#!/bin/sh\necho planted-program-ran\n").expect("a program");
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o700))
-                .expect("it is marked executable");
-        }
+        // Placed rather than written here, so no child another test starts can hold it open for
+        // writing and have the kernel refuse it as busy, which is not the refusal under test.
+        support::place_script(&planted, "#!/bin/sh\necho planted-program-ran\n");
         let shell = Path::new("/bin/sh");
         let run = |helpers: Vec<PathBuf>| {
             run_enclosed(
