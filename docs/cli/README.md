@@ -589,13 +589,14 @@ this device cannot be removed afterwards, the command says the worker took the a
 cannot be read after an attempt, the command says so beside what the attempt established, never in
 place of it, and exits with 1.
 
-`kr question drafts` reads each kept answer's question again. An answer whose question is still
-pending at the revision it answered is offered, and stays kept. Any other is retired: its question
-was answered, cancelled or expired, moved to another revision, or its session is gone; the command
-does not send it, and it is no longer kept. An answer whose question its session no longer lists,
-while the session's daemon does not record the session ended, is unlisted: it stays kept and is not
-offered, and `kr question send` neither sends nor retires it. The command sends nothing, however
-often it runs. `kr question send` is the one way a kept answer is sent: it reads the question once
+`kr question drafts` reads each kept answer's question again and finds the answer offered, unlisted
+or retired. An answer whose question is still pending at the revision it answered is offered, and
+stays kept. An answer whose question its session no longer lists, while the session's daemon does
+not record the session ended, is unlisted: it stays kept and is not offered, and `kr question send`
+neither sends nor retires it. Every other answer is retired: its question was answered, cancelled or
+expired, or moved to another revision, or its session no longer lists it and the daemon records the
+session ended. The command does not send a retired answer, and it is no longer kept. The command
+sends nothing, however often it runs. `kr question send` is the one way a kept answer is sent: it reads the question once
 more and sends the answer only while that question is still what the person answered. An answer
 whose outcome was not known is retired by the next `kr question drafts` if it did arrive, so it is
 never sent twice. When `kr question send` cannot send it, the failure keeps its own code and says

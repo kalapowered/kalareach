@@ -176,8 +176,9 @@ pub async fn answer(
 /// Reads the questions of every kept answer again, and says of each whether it can still be sent.
 ///
 /// A kept answer whose question is still pending at the revision it answers is offered and stays
-/// kept. Any other is retired: this sends nothing, and it is no longer kept. Nothing is sent,
-/// however often this runs.
+/// kept. One whose session does not list its question, while the daemon's record does not say the
+/// session ended, is unlisted and stays kept. Any other is retired: this sends nothing, and it is
+/// no longer kept. Nothing is sent, however often this runs.
 ///
 /// # Errors
 ///
