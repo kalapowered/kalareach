@@ -31,9 +31,22 @@ registers a listener asynchronously and drops whatever it publishes before then.
 therefore resolves only once it is registered, and a screen reads the state it follows only after
 that, so no change can fall between the two. Nor does a screen show an answer once its listeners
 have stopped, or when they could not be registered. A change that arrives before the read's answer
-is at least as new as that answer, and the screen keeps it. The phone's inbox reads again on each change
-and shows only the newest read's answer. In a session, when the launch surface was read at an older
+is at least as new as that answer, and the screen keeps it. A screen that reads again, on a change,
+a retry, a refresh or an action, shows only its newest read's answer, and the raw terminal view shows
+nothing it read for a session it has left. The conversation reads its document once its stream
+listener is registered, and again when the host is heard to be back: the nodes the stream delivers
+meanwhile follow the document in the order they arrived, and a node the document already holds is
+replaced only by a newer revision of it. In a session, when the launch surface was read at an older
 prompt generation than the view has heard since, its buttons start disabled.
+
+Nothing claims contact, or its loss, before an answer says which. Until the first answer the
+desktop's bar and the phone's say they are checking the connection, with no status dot, and a phone
+session opened from a notification shows no banner about the host.
+
+Each raw terminal view, on the desktop and on the phone, reads the session's snapshot and says how
+the host presents it: the session's output directly, or a viewport with the host's reason in the
+host's own words. It reads the summary of its own attachment and no other, and a viewport whose
+worker reported no reason says so, and is never shown as direct.
 
 ## The boundary
 
