@@ -14,9 +14,18 @@
 //! | A Windows job object | every descendant, including one that detached | complete |
 //! | The terminal's process group | everything that stayed in the group | incomplete |
 //!
-//! On a Unix host without a delegated control group, a descendant that calls `setsid` leaves the
-//! group and stops being visible. Nothing here pretends otherwise: such a host reports incomplete
-//! coverage and lists what it confirmed.
+//! On a Unix host without a delegated control group, the last row is read in one of two ways. On
+//! Linux the worker is the child subreaper, so a process whose parent exits becomes the worker's
+//! own child rather than the first process's, and the session's processes are read from the
+//! worker's process tree: the root shell and everything below it, a job that called `setsid`
+//! included, and each process the worker adopted from the root shell's session, with everything
+//! below that. It reads nothing about any other process on the host, so what it costs follows the
+//! session rather than the host. What it leaves out is a process that called `setsid` and whose
+//! parent then exited: nothing ties that one to this session any more, and it is the deliberate
+//! escape section 7 lets outlive the terminal. Elsewhere the session's processes are the
+//! terminal's, and a descendant that calls `setsid` leaves the terminal and stops being visible.
+//! Nothing here pretends otherwise: such a host reports incomplete coverage and lists what it
+//! confirmed.
 
 use std::collections::BTreeMap;
 
@@ -255,12 +264,18 @@ impl OwnedProcesses {
         let OwnershipBoundary::TerminalGroup { group, terminal } = self.boundary else {
             return;
         };
-        // The terminal, where the kernel names it: an interactive shell puts each job in its own
-        // process group, so the group finds the shell and nothing it started, while every one of
-        // those jobs keeps the terminal.
-        let members = match terminal {
-            Some(terminal) => kr_ipc::identity::processes_on_terminal(terminal),
-            None => kr_ipc::identity::processes_in_group(group),
+        // The worker's own tree, where the platform keeps one this can read.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let tree = self.tree();
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let tree: Option<Vec<u32>> = None;
+        // Otherwise the terminal, where the kernel names it: an interactive shell puts each job in
+        // its own process group, so the group finds the shell and nothing it started, while every
+        // one of those jobs keeps the terminal.
+        let members = match (tree, terminal) {
+            (Some(tree), _) => Ok(tree),
+            (None, Some(terminal)) => kr_ipc::identity::processes_on_terminal(terminal),
+            (None, None) => kr_ipc::identity::processes_in_group(group),
         };
         let Ok(members) = members else {
             return;
@@ -276,6 +291,50 @@ impl OwnedProcesses {
                 });
             }
         }
+    }
+
+    /// Returns the session's processes as this worker's own process tree holds them: the root
+    /// shell and everything below it, and each process this worker adopted from the root shell's
+    /// session, with everything below that.
+    ///
+    /// Only a worker that is the child subreaper holds a process whose parent exits, and only a
+    /// kernel that lists each process's children can be read this way; without either this is
+    /// none, and the caller reads the terminal instead. A child of this worker's that is in
+    /// another session is not this session's: it is one of the worker's own, or of another
+    /// session this process hosts, or a process that called `setsid` after its parent exited,
+    /// which nothing ties to this session any more.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn tree(&self) -> Option<Vec<u32>> {
+        if !matches!(rustix::process::child_subreaper(), Ok(Some(_))) {
+            return None;
+        }
+        let root = u32::try_from(self.root.pid.get()).ok()?;
+        let session_of = |pid: u32| {
+            i32::try_from(pid)
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+                .and_then(|pid| rustix::process::getsid(Some(pid)).ok())
+        };
+        let session = session_of(root)?;
+        let mut pending = vec![root];
+        for child in kr_ipc::identity::children_of(std::process::id()).ok()? {
+            if child != root && session_of(child) == Some(session) {
+                pending.push(child);
+            }
+        }
+        let mut members = Vec::new();
+        let mut walked = std::collections::BTreeSet::new();
+        while let Some(pid) = pending.pop() {
+            if !walked.insert(pid) {
+                continue;
+            }
+            members.push(pid);
+            // A process that ended meanwhile has nothing below it to walk.
+            if let Ok(children) = kr_ipc::identity::children_of(pid) {
+                pending.extend(children);
+            }
+        }
+        Some(members)
     }
 
     /// Records every process the session's job object currently holds.
@@ -491,15 +550,6 @@ pub fn boundary_for(_group: Option<i32>, root: &ProcessStartIdentity) -> Ownersh
 #[cfg(not(windows))]
 #[must_use]
 pub fn boundary_for(group: Option<i32>, root: &ProcessStartIdentity) -> OwnershipBoundary {
-    #[cfg(target_os = "linux")]
-    {
-        // A worker that is a child subreaper becomes the parent of every orphaned descendant, so
-        // one that leaves its process group is still this worker's to account for.
-        let _ = rustix::process::set_child_subreaper(Some(
-            rustix::process::Pid::from_raw(std::process::id().cast_signed())
-                .unwrap_or(rustix::process::Pid::INIT),
-        ));
-    }
     let group = group
         .and_then(|group| u32::try_from(group).ok())
         .unwrap_or_else(|| u32::try_from(root.pid.get()).unwrap_or_default());
@@ -508,6 +558,23 @@ pub fn boundary_for(group: Option<i32>, root: &ProcessStartIdentity) -> Ownershi
         .and_then(|pid| kr_ipc::identity::controlling_terminal(pid).ok())
         .flatten();
     OwnershipBoundary::TerminalGroup { group, terminal }
+}
+
+/// Makes this worker the parent of every process of its session whose own parent exits, where the
+/// platform lets it: on Linux, the child subreaper.
+///
+/// Called before the root shell starts, so that nothing the shell's startup files leave behind is
+/// handed to the first process in the moment before; a process that ends up there is outside the
+/// worker's tree, and so outside what [`OwnedProcesses::observe`] reads. Elsewhere there is nothing
+/// to set, and the terminal is what the session's processes are read from.
+pub fn adopt_orphans() {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let _ = rustix::process::set_child_subreaper(Some(
+            rustix::process::Pid::from_raw(std::process::id().cast_signed())
+                .unwrap_or(rustix::process::Pid::INIT),
+        ));
+    }
 }
 
 /// Asks every process the boundary holds to stop.
