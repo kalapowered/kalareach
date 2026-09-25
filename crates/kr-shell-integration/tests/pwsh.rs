@@ -101,12 +101,11 @@ fn a_shell_whose_bridge_has_gone_still_consumes_an_eligible_gesture() {
 }
 
 /// KR-REQ-07.37
-#[test]
-fn a_takeover_ends_a_pending_key_wait_and_keeps_the_edit_buffer() {
-    shellpkg::a_takeover_ends_a_pending_key_wait_and_keeps_the_buffer(PWSH);
-}
-
-/// KR-REQ-07.37
+///
+/// This editor runs a nested read of its own for each operation that waits for another key, and
+/// nothing of this package's runs on the reader's thread while one is running, so it has no key
+/// wait a takeover or a cancellation can end. What a cancellation does to a reader with nothing in
+/// progress is this case; the takeover case the other packages have is not one of this editor's.
 #[test]
 fn a_cancellation_that_ends_nothing_leaves_the_next_sequence_alone() {
     shellpkg::a_cancellation_that_ends_nothing_leaves_the_next_sequence_alone(PWSH);
