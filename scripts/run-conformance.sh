@@ -367,7 +367,9 @@ if selected applications && [ "$family" != windows ]; then
     arguments+=(--applications "$KR_CONFORMANCE_APPLICATIONS")
 fi
 
-if selected typescript && [ "$family" != windows ]; then
+# The report reads the TypeScript tests with the packages' own compiler wherever that group is
+# selected, on Windows as well, where it lists them without running them.
+if selected typescript; then
     pnpm install --frozen-lockfile
 fi
 
