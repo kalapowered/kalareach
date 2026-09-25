@@ -23,9 +23,13 @@
 # toolchains are used as they are installed: rustup's own directory is kept, and
 # rust-toolchain.toml picks the toolchain from it. On macOS the fresh home directory gets a keychain
 # of its own as its default, removed with it, so nothing a step runs finds no keychain and asks the
-# person at the machine for one. The account's own keychain settings are read before and after that
-# is set up, and a run that changed them puts them back and stops. The system log is read after
-# every step, and a run stops when SecurityAgent opened a dialog, or when the log cannot be read.
+# person at the machine for one. That is set up only once this account's own default keychain and
+# search list have been read and hold something, and they are read again afterwards: when they are
+# not exactly as first read, the values first read are written back and confirmed, and the run
+# stops. Nothing else is ever written to them. KR_CLEAN_CHECKOUT_SECURITY and
+# KR_CLEAN_CHECKOUT_KEYCHAIN name another security program and another platform, for the self-test.
+# The system log is read after every step, and a run stops when SecurityAgent opened a dialog, or
+# when the log cannot be read.
 #
 # Before any step runs, the clone is refused when:
 #
@@ -142,6 +146,12 @@ inherited=(USER LOGNAME SHELL TERM LANG LC_ALL LC_CTYPE TZ XDG_RUNTIME_DIR DEVEL
   CARGO_NET_GIT_FETCH_WITH_CLI LIBCLANG_PATH LLVM_CONFIG_PATH)
 
 rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
+
+# The security program the macOS keychain set-up calls, and the platform that decides whether it
+# runs. The self-test points them at a stand-in, which is how it tries every order of failure
+# without touching this account's own keychain settings.
+security_program="${KR_CLEAN_CHECKOUT_SECURITY:-/usr/bin/security}"
+keychain_platform="${KR_CLEAN_CHECKOUT_KEYCHAIN:-$(uname -s)}"
 
 say() {
   printf 'check-clean-checkout: %s\n' "$*"
@@ -438,6 +448,62 @@ replace_readme() {
   commit_fixture "$1" "Replace the README"
 }
 
+# Writes a stand-in for security(1) into a directory. It keeps this account's settings apart from
+# the fresh home directory's, or both in one place when its state directory holds a file `shared`,
+# records every call, and fails this account's n-th query of a setting when the state directory
+# holds a file `fail-<setting>-<n>`. This account's settings start as a default keychain and a
+# search list of two, one of them with a space in its path.
+make_fake_security() {
+  local directory="$1" account="$2"
+  mkdir -p "$directory/state/account" "$directory/state/fresh"
+  {
+    echo '#!/usr/bin/env bash'
+    printf 'state=%q\n' "$directory/state"
+    printf 'account=%q\n' "$account"
+    cat <<'EOF'
+if [ "$HOME" = "$account" ]; then caller=account; else caller=fresh; fi
+if [ -e "$state/shared" ]; then where="$state/account"; else where="$state/$caller"; fi
+printf '%s %s\n' "$caller" "$*" >> "$state/calls"
+last=""
+for last; do :; done
+case "$1" in
+  default-keychain|list-keychains)
+    setting="$1"
+    shift
+    if [ "${1:-}" = -d ]; then shift 2; fi
+    if [ "${1:-}" = -s ]; then
+      shift
+      printf '%s\n' "$@" > "$where/$setting"
+      exit 0
+    fi
+    if [ "$caller" = account ]; then
+      count=$(( $(cat "$state/count-$setting" 2>/dev/null || echo 0) + 1 ))
+      echo "$count" > "$state/count-$setting"
+      if [ -e "$state/fail-$setting-$count" ]; then
+        echo "security: the query failed" >&2
+        exit 1
+      fi
+    fi
+    if [ ! -s "$where/$setting" ]; then
+      echo "security: nothing is set" >&2
+      exit 1
+    fi
+    while IFS= read -r path; do printf '    "%s"\n' "$path"; done < "$where/$setting"
+    ;;
+  create-keychain) : > "${last:?}" ;;
+  set-keychain-settings) ;;
+  delete-keychain) rm -f "${last:?}" ;;
+  *) echo "security: $1 is not stood in for" >&2; exit 1 ;;
+esac
+EOF
+  } > "$directory/security"
+  chmod +x "$directory/security"
+  printf '%s\n' /account/Library/Keychains/login.keychain-db \
+    > "$directory/state/account/default-keychain"
+  printf '%s\n' /account/Library/Keychains/login.keychain-db \
+    "/account/Library/Keychains/Build Keys.keychain-db" > "$directory/state/account/list-keychains"
+}
+
 self_test() {
   local work failures=0 case_name expected needle directory output rc
   work="${TMPDIR:-/tmp}"
@@ -624,6 +690,60 @@ and say why on the next line"
 true'
   expect "a block that is never closed is refused" refuse "block is not closed"
 
+  # The macOS keychain set-up, against the stand-in, so every order of failure is tried without
+  # touching this account's own keychain settings.
+  directory="$work/clean"
+  local fake="$work/fake-security" first_list flag
+  first_list="$(printf '%s\n%s' /account/Library/Keychains/login.keychain-db \
+    "/account/Library/Keychains/Build Keys.keychain-db")"
+  keychain_case() {
+    local label="$1" want="$2" phrase="$3"
+    shift 3
+    rm -rf "${fake:?}"
+    make_fake_security "$fake" "$HOME"
+    for flag in "$@"; do
+      : > "$fake/state/$flag"
+    done
+    export KR_CLEAN_CHECKOUT_SECURITY="$fake/security" KR_CLEAN_CHECKOUT_KEYCHAIN=Darwin
+    expect "$label" "$want" "$phrase" --no-steps
+    unset KR_CLEAN_CHECKOUT_SECURITY KR_CLEAN_CHECKOUT_KEYCHAIN
+  }
+  # Holds that this account's settings in the stand-in are the ones it started with.
+  account_kept() {
+    if [ "$(cat "$fake/state/account/default-keychain")" \
+      = /account/Library/Keychains/login.keychain-db ] \
+      && [ "$(cat "$fake/state/account/list-keychains")" = "$first_list" ]; then
+      echo "self-test: $1 ok"
+    else
+      echo "self-test: $1 FAILED"
+      sed 's/^/    /' "$fake/state/calls"
+      failures=$((failures + 1))
+    fi
+  }
+  keychain_case "the fresh home directory's keychain is set up where it lives" pass \
+    "keychain of its own"
+  account_kept "the set-up leaves this account's settings as they were"
+  keychain_case "a set-up that reaches this account's settings is refused" refuse \
+    "have been put back" shared
+  account_kept "what the set-up changed is written back, a path with a space in it included"
+  for flag in fail-default-keychain-1 fail-list-keychains-1; do
+    keychain_case "settings that cannot be read before the set-up stop the run ($flag)" refuse \
+      "cannot be read" "$flag"
+    if grep -q -E '^fresh | -s' "$fake/state/calls"; then
+      echo "self-test: nothing is written when the settings cannot be read ($flag) FAILED"
+      sed 's/^/    /' "$fake/state/calls"
+      failures=$((failures + 1))
+    else
+      echo "self-test: nothing is written when the settings cannot be read ($flag) ok"
+    fi
+  done
+  keychain_case "settings that cannot be read back are written back from the first reading" \
+    refuse "have been put back" fail-list-keychains-2
+  account_kept "the settings written back are the ones first read"
+  keychain_case "a write-back that cannot be confirmed names what the settings were" refuse \
+    "Build Keys.keychain-db" shared fail-list-keychains-3
+  account_kept "a write-back that cannot be confirmed still writes the settings first read"
+
   directory="$work/no-steps"
   make_fixture "$directory"
   sed '/clean-checkout:/d' "$directory/README.md" > "$directory/README.new"
@@ -713,7 +833,7 @@ cleanup() {
     return
   fi
   if [ -n "$keychain" ]; then
-    clean /usr/bin/security delete-keychain "$keychain" 2>/dev/null || true
+    clean "$security_program" delete-keychain "$keychain" 2>/dev/null || true
   fi
   chmod -R u+w "${root:?}" 2>/dev/null || true
   rm -rf "${root:?}" "${step_tmp:?}"
@@ -729,51 +849,78 @@ for tool in "${tools[@]}"; do
   fi
 done
 
-# Prints the keychain paths a `security` listing names, one per line, spaces kept.
-keychain_paths() {
-  "$@" 2>/dev/null | sed -e 's/^[[:space:]]*"//' -e 's/"[[:space:]]*$//' || true
+# Prints the paths a security listing names, one per line, with the indentation and the quotes
+# around each removed and every other character kept.
+listed_paths() {
+  sed -e 's/^[[:space:]]*"//' -e 's/"[[:space:]]*$//'
+}
+
+# Prints one of this account's own keychain settings as security prints it, and fails when
+# security cannot read it.
+account_setting() {
+  "$security_program" "$1" -d user 2>/dev/null
+}
+
+# Returns success when this account's own settings read back exactly as they were first read.
+account_unchanged() {
+  local default list
+  default="$(account_setting default-keychain)" \
+    && list="$(account_setting list-keychains)" \
+    && [ "$default" = "$own_default_listing" ] \
+    && [ "$list" = "$own_list_listing" ]
 }
 
 # Gives the fresh home directory a keychain of its own as its default and its whole search list.
 make_keychain() {
   keychain="$root/home/Library/Keychains/login.keychain-db"
   mkdir -p "$root/home/Library/Keychains" \
-    && clean /usr/bin/security create-keychain -p "" "$keychain" \
-    && clean /usr/bin/security set-keychain-settings "$keychain" \
-    && clean /usr/bin/security default-keychain -d user -s "$keychain" \
-    && clean /usr/bin/security list-keychains -d user -s "$keychain"
+    && clean "$security_program" create-keychain -p "" "$keychain" \
+    && clean "$security_program" set-keychain-settings "$keychain" \
+    && clean "$security_program" default-keychain -d user -s "$keychain" \
+    && clean "$security_program" list-keychains -d user -s "$keychain"
 }
 
-if [ "$(uname -s)" = Darwin ]; then
-  own_default="$(keychain_paths /usr/bin/security default-keychain -d user)"
-  own_list="$(keychain_paths /usr/bin/security list-keychains -d user)"
+# The set-up runs only once this account's own default keychain and search list have been read and
+# hold something; nothing else is ever written back to them. They are read again afterwards, and
+# when they are not exactly what was first read, what was first read is written back, read again
+# to confirm it, and the run stops either way.
+if [ "$keychain_platform" = Darwin ]; then
+  if ! own_default_listing="$(account_setting default-keychain)" \
+    || ! own_list_listing="$(account_setting list-keychains)"; then
+    say "refused: this account's own default keychain and search list cannot be read, so the fresh"
+    say "home directory's keychain is not set up and nothing runs"
+    exit 1
+  fi
+  own_default="$(printf '%s\n' "$own_default_listing" | listed_paths | head -n 1)"
   own_paths=()
   while IFS= read -r line; do
     if [ -n "$line" ]; then
       own_paths+=("$line")
     fi
   done <<EOF
-$own_list
+$(printf '%s\n' "$own_list_listing" | listed_paths)
 EOF
+  if [ -z "$own_default" ] || [ "${#own_paths[@]}" -eq 0 ]; then
+    say "refused: this account has no default keychain or an empty search list to compare against,"
+    say "so the fresh home directory's keychain is not set up and nothing runs"
+    exit 1
+  fi
   made=0
   if make_keychain; then
     made=1
   fi
-  if [ "$(keychain_paths /usr/bin/security default-keychain -d user)" != "$own_default" ] \
-    || [ "$(keychain_paths /usr/bin/security list-keychains -d user)" != "$own_list" ]; then
-    if [ -n "$own_default" ]; then
-      /usr/bin/security default-keychain -d user -s "$own_default" || true
-    fi
-    /usr/bin/security list-keychains -d user -s ${own_paths[@]+"${own_paths[@]}"} || true
-    if [ "$(keychain_paths /usr/bin/security default-keychain -d user)" = "$own_default" ] \
-      && [ "$(keychain_paths /usr/bin/security list-keychains -d user)" = "$own_list" ]; then
-      say "refused: this account's own keychain settings changed when the fresh home directory's"
-      say "keychain was set up; they have been put back"
+  if ! account_unchanged; then
+    "$security_program" default-keychain -d user -s "$own_default" || true
+    "$security_program" list-keychains -d user -s "${own_paths[@]}" || true
+    if account_unchanged; then
+      say "refused: this account's own keychain settings changed, or could not be read back, when"
+      say "the fresh home directory's keychain was set up; they have been put back"
     else
-      say "refused: this account's own keychain settings changed when the fresh home directory's"
-      say "keychain was set up, and could not be put back. They were: default $own_default;"
+      say "refused: this account's own keychain settings changed, or could not be read back, when"
+      say "the fresh home directory's keychain was set up, and could not be put back. They were:"
+      say "default: $own_default"
       say "search list:"
-      printf '%s\n' "$own_list" | sed 's/^/  /'
+      printf '  %s\n' "${own_paths[@]}"
     fi
     exit 1
   fi
