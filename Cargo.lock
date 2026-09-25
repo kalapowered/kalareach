@@ -4477,6 +4477,7 @@ dependencies = [
  "hmac 0.13.0",
  "keyring",
  "kr-cbor",
+ "kr-flush",
  "kr-protocol",
  "libc",
  "libsodium-sys-stable",

@@ -17,6 +17,8 @@ hkdf.workspace = true
 hmac.workspace = true
 keyring.workspace = true
 kr-cbor.workspace = true
+# The host's shared directory flush, which the directory store's names are flushed through.
+kr-flush.workspace = true
 libc.workspace = true
 kr-protocol.workspace = true
 libsodium-sys-stable.workspace = true
