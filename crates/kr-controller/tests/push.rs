@@ -10,6 +10,8 @@
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
+mod organisation_support;
+
 use kr_controller::push::DeliveryModule;
 use kr_controller::push::credentials::{CredentialRenewal, HeldCredentials};
 use kr_controller::service::net::devices::DeviceRecord;
@@ -4164,6 +4166,7 @@ fn a_policy_that_stops_honouring_the_grant_before_dispatch_stops_the_message() {
         Arc::clone(&sharing),
         Arc::clone(&policy),
         environment_id,
+        Arc::new(kr_transport::clock::ManualClock::new()),
         || NOW,
     );
     let destination = DestinationRecord {
@@ -5427,4 +5430,176 @@ async fn both_loops_ask_within_their_own_shares_while_the_gateway_retries() {
         "and the sweep about one unknown outcome, from its own share: {questions:?}"
     );
     assert_eq!(gateway.delivered(), vec![fresh], "the send went ahead");
+}
+
+/// Rule C for push: a delivery rule's stored grant is decided per message on both of its
+/// deadlines. With UTC moved past one grant's expiry while its continuous deadline is still ahead,
+/// the next message under it admits nothing; with the continuous clock past another grant's anchor
+/// while UTC is still before its expiry, neither does the next message under that one. No
+/// authority revision moves: nothing has left the host to be fenced. The control: before either
+/// deadline both rules admit their recipient.
+#[test]
+fn a_push_rule_under_a_stored_grant_stops_when_its_expiry_passes() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let host = DeviceId::new(uuid(1));
+    let sharing =
+        Arc::new(kr_controller::sharing::SharingService::in_memory(host).expect("a grant store"));
+    let environment_id = kr_protocol::ids::EnvironmentId::new(uuid(70));
+    for (byte, lifetime_ms) in [(73, 60_000), (77, 120_000)] {
+        sharing
+            .grants()
+            .issue(
+                &kr_controller::grants::GrantRecord {
+                    grant: Grant {
+                        grant_id: GrantId::new(uuid(byte)),
+                        issuer_device_id: host,
+                        actions: [kr_protocol::rights::ActionRight::SessionView]
+                            .into_iter()
+                            .collect(),
+                        expiry: GrantExpiry::At {
+                            expires_at_ms: TimestampMs::new(NOW + lifetime_ms),
+                        },
+                        ..dummy_grant(DeviceId::new(uuid(74)))
+                    },
+                    session_id: None,
+                    issued_at_ms: NOW - 1_000,
+                    activated_at_ms: Some(NOW - 500),
+                    revoked_at_ms: None,
+                    revoked_by_parent: None,
+                },
+                || Ok(()),
+            )
+            .expect("the grant is written");
+    }
+    let policy = Arc::new(Mutex::new(kr_controller::grants::HostPolicy::personal(
+        AuthorityRevision::new(1),
+    )));
+    let wall = Arc::new(AtomicU64::new(NOW));
+    let continuous = kr_transport::clock::ManualClock::new();
+    let recipients = kr_controller::push::authority::GrantedRecipients::at(
+        Arc::clone(&sharing),
+        Arc::clone(&policy),
+        environment_id,
+        Arc::new(continuous.clone()),
+        {
+            let wall = Arc::clone(&wall);
+            move || wall.load(Ordering::SeqCst)
+        },
+    );
+    let rule = |byte| DeliveryRule {
+        name: "on a question".to_owned(),
+        grant_id: Some(GrantId::new(uuid(byte))),
+    };
+    for byte in [73, 77] {
+        assert!(
+            recipients.scope_for(&rule(byte)).is_some(),
+            "the control: before either deadline the rule admits its recipient"
+        );
+    }
+
+    wall.store(NOW + 61_000, Ordering::SeqCst);
+    assert!(
+        recipients.scope_for(&rule(73)).is_none(),
+        "the next message after its expiry admits nothing"
+    );
+    assert!(recipients.scope_for(&rule(77)).is_some());
+    continuous.advance(std::time::Duration::from_secs(121));
+    assert!(
+        recipients.scope_for(&rule(77)).is_none(),
+        "the next message after its anchor on the continuous clock admits nothing"
+    );
+    assert_eq!(
+        policy
+            .lock()
+            .expect("the policy is not poisoned")
+            .authority_revision(),
+        AuthorityRevision::new(1),
+        "no revision moves"
+    );
+}
+
+/// An organisation delivery rule admits its recipient while the device its grant names is bound
+/// to a member with a live lease. The control: another member's live lease, on that member's own
+/// device, admits nothing for it.
+#[test]
+fn an_organisation_delivery_rule_admits_its_bound_recipient_with_a_live_lease() {
+    use kr_controller::grants::organisation::LeasePresentation;
+    use organisation_support::{Organisation, T, member, presented};
+
+    let host = DeviceId::new(uuid(1));
+    let recipient = DeviceId::new(uuid(75));
+    let sharing =
+        Arc::new(kr_controller::sharing::SharingService::in_memory(host).expect("a grant store"));
+    let environment_id = kr_protocol::ids::EnvironmentId::new(uuid(70));
+    let mut policy = kr_controller::grants::HostPolicy::personal(AuthorityRevision::new(1));
+    let mut organisation = Organisation::new(0x61, T - 2 * 24 * 60 * 60 * 1000);
+    organisation.rotate(T - 24 * 60 * 60 * 1000);
+    organisation.enrol(&mut policy, T);
+    let view = [kr_protocol::rights::ActionRight::SessionView];
+    sharing
+        .grants()
+        .issue(
+            &kr_controller::grants::GrantRecord {
+                grant: Grant {
+                    grant_id: GrantId::new(uuid(76)),
+                    issuer_device_id: host,
+                    actions: view.into_iter().collect(),
+                    organisation: Nullable::some(kr_protocol::grant::OrganisationRequirement {
+                        organisation_id: organisation.organisation_id,
+                        policy_revision: AuthorityRevision::new(1),
+                    }),
+                    ..dummy_grant(recipient)
+                },
+                session_id: None,
+                issued_at_ms: T - 1_000,
+                activated_at_ms: Some(T - 500),
+                revoked_at_ms: None,
+                revoked_by_parent: None,
+            },
+            || Ok(()),
+        )
+        .expect("the grant is written");
+    let clock = kr_transport::clock::ManualClock::new();
+    let now = kr_transport::clock::ContinuousClock::now(&clock);
+
+    // Another member holds a live lease, on that member's own device.
+    let (laptop, phone) = (
+        organisation_support::device(),
+        organisation_support::device(),
+    );
+    let other = organisation.lease(2, &member("bea"), *laptop.public(), T, &view);
+    policy
+        .install_lease(presented(&other, laptop.public(), T, now, 1))
+        .expect("the other member's lease installs");
+    let shared = Arc::new(Mutex::new(policy.clone()));
+    let recipients = kr_controller::push::authority::GrantedRecipients::at(
+        Arc::clone(&sharing),
+        Arc::clone(&shared),
+        environment_id,
+        Arc::new(clock.clone()),
+        || T + 60_000,
+    );
+    let rule = DeliveryRule {
+        name: "on a question".to_owned(),
+        grant_id: Some(GrantId::new(uuid(76))),
+    };
+    assert!(
+        recipients.scope_for(&rule).is_none(),
+        "the control: another member's lease admits nothing for this recipient"
+    );
+
+    // The recipient's device binds on its own lease.
+    let own = organisation.lease(2, &member("ada"), *phone.public(), T, &view);
+    policy
+        .install_lease(LeasePresentation {
+            device_id: recipient,
+            ..presented(&own, phone.public(), T, now, 1)
+        })
+        .expect("the recipient's lease installs and binds its device");
+    *shared.lock().expect("the policy is not poisoned") = policy;
+    assert!(
+        recipients.scope_for(&rule).is_some(),
+        "its bound recipient's live lease admits it"
+    );
 }

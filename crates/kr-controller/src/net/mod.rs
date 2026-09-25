@@ -902,6 +902,10 @@ async fn keep_the_record(
         if let Some(controller) = controller.upgrade() {
             controller.keep_offline_time();
             controller.settle_floor();
+            // The stored grants' ends this host found and could not write yet.
+            controller
+                .lifetimes()
+                .settle_stored(controller.sharing().grants());
         }
     }
 }

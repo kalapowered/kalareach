@@ -116,12 +116,27 @@ fn open_unowned(path: &Path) -> (Arc<DeviceDirectory>, InvitationRows) {
 
 /// The grant lifetimes of `directory`'s devices, measured on `clock` in this boot.
 fn lifetimes(directory: &Arc<DeviceDirectory>, clock: &ManualClock) -> Arc<GrantLifetimes> {
+    lifetimes_on(
+        directory,
+        clock,
+        kr_controller::service::WallClock::system(),
+    )
+}
+
+/// The grant lifetimes of `directory`'s devices, measured on `clock` in this boot, with UTC read on
+/// `wall`.
+fn lifetimes_on(
+    directory: &Arc<DeviceDirectory>,
+    clock: &ManualClock,
+    wall: kr_controller::service::WallClock,
+) -> Arc<GrantLifetimes> {
     Arc::new(GrantLifetimes::new(
         Arc::clone(directory),
         Arc::new(clock.clone()),
         Arc::new(ManualSharedClock::new()),
         kr_ipc::identity::boot_identity().expect("a boot identity"),
-        kr_controller::service::WallClock::system(),
+        wall,
+        Arc::new(kr_controller::grants::policy::UtcFloor::default()),
     ))
 }
 
@@ -1352,6 +1367,85 @@ fn an_owner_grant_that_runs_out_before_the_commit_commits_nothing() {
     );
     assert!(rows.commitment(invitation_id).expect("readable").is_none());
     assert!(rows.events_after(None, 10).expect("readable").is_empty());
+    let expired = directory
+        .record_for_device(device_id)
+        .expect("readable")
+        .expect("the owner's device");
+    assert!(
+        expired.expired_at_ms.is_some(),
+        "the expiry found inside the transaction is on record"
+    );
+}
+
+/// An owner device's grant that runs out by UTC first, its continuous deadline still ahead, is
+/// judged on both clocks inside the transaction that spends its answer: the commit commits nothing,
+/// and the expiry goes on record. The control is the grant in force before its expiry, which the
+/// host anchors as spending an answer does.
+#[test]
+fn an_owner_grant_that_runs_out_by_utc_first_commits_nothing() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let temp = tempfile::TempDir::new().expect("a directory on the internal disk");
+    let path = temp.path().join("registry.sqlite3");
+    let now = kr_ipc::now_ms().get();
+    let wall = Arc::new(AtomicU64::new(now));
+    let clock = ManualClock::new();
+    let directory = Arc::new(DeviceDirectory::open(&path).expect("the registry database opens"));
+    directory
+        .commit(&owner_device())
+        .expect("the host's owner device");
+    prepare(&directory).expect("the pairing tables exist");
+    let rows = InvitationRows::new(
+        Arc::clone(&directory),
+        lifetimes_on(
+            &directory,
+            &clock,
+            kr_controller::service::WallClock::from_fn({
+                let wall = Arc::clone(&wall);
+                move || wall.load(Ordering::SeqCst)
+            }),
+        ),
+    );
+    let mut harness = Harness::answering(
+        rows.clone(),
+        ConfirmationChannel::OwnerDevicePresence,
+        HostEnrolment::Enrolled,
+    );
+    let device_id = DeviceId::new(kr_ipc::new_uuid());
+    let record = owner_device_with(
+        &harness.owner_keys,
+        device_id,
+        GrantExpiry::At {
+            expires_at_ms: TimestampMs::new(now + 60_000),
+        },
+    );
+    directory.commit(&record).expect("the owner's device");
+    harness.owner_device_id = Some(device_id);
+    assert!(rows.lifetimes().in_force(&record).expect("decided"));
+
+    let mut host = harness.issue();
+    bind(&harness, &mut host);
+    let invitation_id = host.invitation_id();
+    let before = rows
+        .load(invitation_id)
+        .expect("readable")
+        .expect("a record");
+    // UTC runs past the grant's expiry; the continuous clock does not move.
+    wall.store(now + 61_000, Ordering::SeqCst);
+
+    let refused = approve(&harness, &mut host);
+    assert!(
+        matches!(refused, Err(PairingError::OwnerConfirmationRequired)),
+        "{refused:?}"
+    );
+    assert_eq!(
+        rows.load(invitation_id)
+            .expect("readable")
+            .expect("a record"),
+        before
+    );
+    assert!(rows.commitment(invitation_id).expect("readable").is_none());
+    rows.lifetimes().settle();
     let expired = directory
         .record_for_device(device_id)
         .expect("readable")

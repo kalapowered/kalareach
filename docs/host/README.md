@@ -3491,6 +3491,21 @@ could have issued it.
 has decided from and uses the later of that and the current clock, so winding the clock back past a
 deadline does not revive a grant the host has already refused.
 
+**A grant's time bound is decided at the effect, on both of its deadlines.** The first time anything
+on the host asks about a grant with an expiry in a boot, the host anchors it on the machine's
+continuous clock: the time left before its expiry, read against the host's UTC floor under a clock
+it trusts. The anchor is written down for that boot, so a daemon restarted in the same boot reads it
+back instead of deriving it again. An end found on either clock is written down too, as the grant's
+tombstone, and every later boot reads the tombstone before it derives anything. A grant holds while
+both deadlines are ahead: the anchor on the continuous clock, and its expiry in UTC under the floor.
+A delegation, a redemption and a transfer take the stored grant's anchor before their transaction
+and test both deadlines inside the transaction that writes the effect, so a grant that runs out
+while the effect waits for the store is found run out there, whichever clock ran out first. While
+the floor is owed its record, nothing that can expire is decided. And an expiring grant with no
+anchor in this boot is not in force while the clock is distrusted, because nothing proves it; a
+grant that does not expire reads no clock at all. Workflows, push delivery and the owner checks read
+the same anchors.
+
 **Delegation narrows.** A child grant can never reach further than its parent in rights, resources,
 history or lifetime, and it can never drop an organisation requirement its parent carries. The rule
 is checked where a grant is composed and again where it is written, so it does not depend on a

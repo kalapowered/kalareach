@@ -3449,6 +3449,12 @@ mod write_boundary {
                 },
             );
             let grants = crate::automation::HostGrants::for_daemon(&controller);
+            // The grant's anchor in this boot is taken the first time anything asks, which writes;
+            // it is asked here, before storage is held, so the decision below waits only on the
+            // floor's write.
+            grants
+                .grant(grant_id, kr_ipc::now_ms().get())
+                .expect("the grant stands before it runs out");
 
             // Another writer holds storage, so the write that decision owes waits with the lock
             // held.

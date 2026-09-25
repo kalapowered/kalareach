@@ -2065,7 +2065,7 @@ fn the_intersection_finds_the_lease_through_the_bindings_key() {
     use kr_delivery::producer::RecipientAuthority as _;
 
     const AT_MS: u64 = T + 6 * 60 * 1000;
-    let clock = kr_transport::clock::SystemContinuousClock::new();
+    let clock = ManualClock::new();
     let sharing = Arc::new(
         kr_controller::sharing::SharingService::in_memory(device_id(0xf0)).expect("a grant store"),
     );
@@ -2121,6 +2121,7 @@ fn the_intersection_finds_the_lease_through_the_bindings_key() {
         Arc::clone(&sharing),
         Arc::clone(&shared),
         environment_id(0xe0),
+        Arc::new(clock.clone()),
         || AT_MS,
     );
     let rule = kr_delivery::destination::DeliveryRule {

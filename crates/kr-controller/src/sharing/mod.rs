@@ -325,13 +325,11 @@ impl SharingService {
                         detail: "the grant this one delegates from has been revoked".to_owned(),
                     });
                 }
-                // Under the store's own rule, so no expiry is answered from a reading this host
-                // has not written down. The store decides it again where the delegation is
-                // written, so a parent that runs out while this waits is found expired there.
-                if self
-                    .grants
-                    .bound_passed(parent.grant.expiry, request.now_ms)?
-                {
+                // Under the store's own rule, on both of the parent's deadlines, so no expiry is
+                // answered from a reading this host has not written down. The store decides it
+                // again where the delegation is written, so a parent that runs out while this
+                // waits is found expired there.
+                if self.grants.lapsed(&parent, request.now_ms)? {
                     return Err(ControllerError::PermissionDenied {
                         detail: "the grant this one delegates from has expired".to_owned(),
                     });

@@ -13,6 +13,8 @@
 
 #![cfg(not(windows))]
 
+mod organisation_support;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -3172,4 +3174,264 @@ async fn mutually_triggering_workflows_exhaust_one_budget_across_a_daemon_proces
         );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+}
+
+/// Rule C for a workflow: a stored grant is anchored once in this boot and decided on both of its
+/// deadlines before every node. With UTC moved past one grant's expiry while its continuous
+/// deadline is still ahead, the next node under it is refused; with the continuous clock past
+/// another grant's anchor while UTC is still before its expiry, so is the next node under that
+/// one. No authority revision moves: nothing left the controller. The control: before either
+/// deadline, both grants stand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_workflow_under_a_stored_grant_stops_when_either_deadline_passes() {
+    use kr_automation::{AuthoritySource, AutomationError};
+    use kr_controller::automation::HostGrants;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const T: u64 = 1_767_225_600_000;
+    let continuous = kr_transport::clock::ManualClock::new();
+    let wall = Arc::new(AtomicU64::new(T));
+    let host = host_on(Clocks {
+        continuous: Arc::new(continuous.clone()),
+        wall: WallClock::from_fn({
+            let wall = Arc::clone(&wall);
+            move || wall.load(Ordering::SeqCst)
+        }),
+    })
+    .await;
+    let revision = host.controller.policy().authority_revision();
+    let by_utc = issue_grant(
+        &host,
+        grant_id(27),
+        another_device(),
+        &[ActionRight::ChangesetCreate],
+        GrantExpiry::At {
+            expires_at_ms: kr_protocol::scalars::TimestampMs::new(T + 60_000),
+        },
+    );
+    let by_continuous = issue_grant(
+        &host,
+        grant_id(28),
+        another_device(),
+        &[ActionRight::ChangesetCreate],
+        GrantExpiry::At {
+            expires_at_ms: kr_protocol::scalars::TimestampMs::new(T + 120_000),
+        },
+    );
+    let grants = HostGrants::for_daemon(&host.controller);
+    grants
+        .grant(by_utc.grant_id, T)
+        .expect("the control: before either deadline");
+    grants
+        .grant(by_continuous.grant_id, T)
+        .expect("the control: before either deadline");
+
+    // UTC runs past the first grant's expiry while the continuous clock moves one second.
+    continuous.advance(std::time::Duration::from_secs(1));
+    wall.store(T + 61_000, Ordering::SeqCst);
+    let refused = grants
+        .grant(by_utc.grant_id, T + 61_000)
+        .expect_err("the first grant ran out in UTC");
+    assert!(
+        matches!(&refused, AutomationError::PermissionDenied(detail) if detail.contains("expired")),
+        "{refused}"
+    );
+    grants
+        .grant(by_continuous.grant_id, T + 61_000)
+        .expect("the second grant stands");
+
+    // The continuous clock runs past the second grant's anchor while UTC stays before its expiry.
+    continuous.advance(std::time::Duration::from_secs(120));
+    let refused = grants
+        .grant(by_continuous.grant_id, T + 62_000)
+        .expect_err("the second grant ran out on the continuous clock");
+    assert!(
+        matches!(&refused, AutomationError::PermissionDenied(detail) if detail.contains("expired")),
+        "{refused}"
+    );
+    assert_eq!(
+        host.controller.policy().authority_revision(),
+        revision,
+        "no lapse moves the revision"
+    );
+
+    host.clients.abort();
+}
+
+/// KR-REQ-23.52: the owner installs a workflow whose execution grant is a member device's
+/// organisation grant. It is refused while that device is bound to no member, installed once the
+/// device binds on a live lease, and its node is decided while the lease lasts and refused after
+/// it. The control: the member's grant does not reach workflow.install itself, since no role
+/// ceiling carries automation.manage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owner_managed_workflow_runs_under_a_members_organisation_grant_while_its_lease_lasts() {
+    use kr_automation::{AuthoritySource, AutomationError};
+    use kr_controller::automation::HostGrants;
+    use kr_controller::grants::organisation::LeasePresentation;
+    use organisation_support::{LEASE_MS, Organisation, T, member, reading};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+    let continuous = kr_transport::clock::ManualClock::new();
+    let wall = Arc::new(AtomicU64::new(T));
+    let host = host_on(Clocks {
+        continuous: Arc::new(continuous.clone()),
+        wall: WallClock::from_fn({
+            let wall = Arc::clone(&wall);
+            move || wall.load(Ordering::SeqCst)
+        }),
+    })
+    .await;
+    let mut control = client(&host).await;
+    let mut organisation = Organisation::new(0x51, T - 2 * DAY_MS);
+    organisation.rotate(T - DAY_MS);
+    let revision = host.controller.policy().authority_revision();
+    host.controller
+        .update_policy(|policy| organisation.enrol(policy, T))
+        .expect("the enrolment is written down");
+
+    let member_device = another_device();
+    let grant = Grant {
+        grant_id: grant_id(29),
+        parent_grant_id: Nullable::null(),
+        issuer_device_id: kr_protocol::ids::DeviceId::new(host.environment_id.get()),
+        recipient_device_id: member_device,
+        authority_revision: revision,
+        environment_selector: EnvironmentSelector::Any,
+        session_selector: SessionSelector::Any,
+        actions: [ActionRight::TerminalInput].into_iter().collect(),
+        history: HistoryScope {
+            lower_bound_ms: Nullable::null(),
+            include_live_screen: false,
+            named_questions: CanonicalSet::new(),
+            named_approvals: CanonicalSet::new(),
+        },
+        expiry: GrantExpiry::Never,
+        organisation: Nullable::some(kr_protocol::grant::OrganisationRequirement {
+            organisation_id: organisation.organisation_id,
+            policy_revision: revision,
+        }),
+    };
+    let record = GrantRecord {
+        grant: grant.clone(),
+        session_id: None,
+        issued_at_ms: 1_000,
+        activated_at_ms: Some(1_000),
+        revoked_at_ms: None,
+        revoked_by_parent: None,
+    };
+    host.controller
+        .sharing()
+        .grants()
+        .issue(&record, || Ok(()))
+        .expect("the grant is written");
+    let document = definition(
+        workflow_id(29),
+        grant.grant_id,
+        "under a member's organisation grant",
+        WorkflowNode {
+            node_id: "tests".to_owned(),
+            action_kind: WorkflowActionKind::RunTests,
+            action_params: tests_params(),
+            declared_environment: Nullable::null(),
+        },
+    );
+    let installing = WorkflowInstallParams {
+        workflow_id: document.workflow_id,
+        revision: document.revision,
+        definition: document.clone(),
+        grant_reference: document.grant_reference,
+    };
+
+    // The member's device is bound to nobody, so no lease answers for the grant.
+    let refused = failure(
+        control
+            .mutate(
+                Method::WorkflowInstall,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &installing,
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+
+    // The device binds on a live lease, and the owner installs the workflow.
+    let key = organisation_support::device();
+    let lease = organisation.lease(
+        2,
+        &member("ada"),
+        *key.public(),
+        T,
+        &[ActionRight::TerminalInput],
+    );
+    host.controller
+        .update_policy(|policy| {
+            policy.install_lease(LeasePresentation {
+                lease: &lease,
+                device_id: member_device,
+                proven_key: key.public(),
+                reading: Some(reading(T)),
+                now: kr_transport::clock::ContinuousClock::now(&continuous),
+                generation: host.controller.generation(),
+            })
+        })
+        .expect("the lease is written down")
+        .expect("the lease installs and binds the device");
+    install(&mut control, &host, &document).await;
+
+    // Its node is decided while the lease lasts.
+    let grants = HostGrants::for_daemon(&host.controller);
+    let held = grants
+        .grant(grant.grant_id, T + 60_000)
+        .expect("the member's lease answers");
+    kr_automation::authority::check_node(&held, &document, &document.nodes[0], host.environment_id)
+        .expect("the node is inside the grant");
+
+    // The control: the member's grant does not reach workflow.install itself.
+    let managing = Grant {
+        actions: [ActionRight::AutomationManage, ActionRight::TerminalInput]
+            .into_iter()
+            .collect(),
+        ..grant.clone()
+    };
+    let asked = kr_controller::grants::decide(
+        &managing,
+        &GrantRecord {
+            grant: managing.clone(),
+            ..record.clone()
+        },
+        &mut host.controller.policy(),
+        kr_controller::grants::AccessRequest {
+            method: Method::WorkflowInstall,
+            ingress: kr_protocol::actor::ActorIngress::PairedDevice,
+            environment_id: host.environment_id,
+            session_id: None,
+            claims_geometry: false,
+            own_subject: None,
+            now_ms: T + 60_000,
+            continuous_now: kr_transport::clock::ContinuousClock::now(&continuous),
+        },
+    );
+    assert_eq!(
+        asked,
+        Err(kr_controller::grants::Refusal::MissingRight {
+            right: ActionRight::AutomationManage
+        }),
+        "no role ceiling carries automation.manage"
+    );
+
+    // Once the lease has ended, the node is refused.
+    continuous.advance(std::time::Duration::from_millis(LEASE_MS));
+    wall.store(T + LEASE_MS, Ordering::SeqCst);
+    let refused = grants
+        .grant(grant.grant_id, T + LEASE_MS)
+        .expect_err("the lease has ended");
+    assert!(
+        matches!(&refused, AutomationError::PermissionDenied(detail) if detail.contains("lease")),
+        "{refused}"
+    );
+
+    host.clients.abort();
 }

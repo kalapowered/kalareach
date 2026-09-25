@@ -1292,8 +1292,9 @@ fn consume(
 /// established by another pairing. Revocation, expiry tombstones and the owner record are written
 /// to this same database, so reading them here, in the transaction that records the effect, is the
 /// boundary they share: an effect commits only under the authority standing at that moment. A grant
-/// that expires is judged by the deadline the host time contract anchored for it, against the
-/// continuous clock read now, after every wait before this transaction.
+/// that expires is judged on both clocks: by the deadline the host time contract anchored for it,
+/// against the continuous clock read now, after every wait before this transaction, and by its
+/// expiry against this host's reading of UTC through the floor, which touches no connection.
 fn signer_still_authorised(
     transaction: &Connection,
     lifetimes: &GrantLifetimes,
@@ -1344,7 +1345,7 @@ fn signer_still_authorised(
                     && uuid(Some(device_id)).is_ok_and(|device_id| {
                         decode::<Grant>(grant).is_ok_and(|grant| {
                             grant.permits(ActionRight::HostManage)
-                                && lifetimes.in_force_now(DeviceId::new(device_id), grant.expiry)
+                                && lifetimes.in_force_now(DeviceId::new(device_id), &grant)
                         })
                     })
             });

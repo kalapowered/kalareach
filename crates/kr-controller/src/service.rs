@@ -804,11 +804,6 @@ impl Controller {
             None => crate::grants::HostPolicy::personal(authority_revision),
         };
         let utc_floor = Arc::clone(policy.utc_floor());
-        // The store decides a grant's time bound at the moment of its effect, on this host's own
-        // clock and under the floor every other decision stands on.
-        sharing
-            .grants()
-            .bind_host_clock(Arc::clone(&utc_floor), wall.clone());
         // Written down again with the revision the registry reached. A start that cannot write it
         // still starts, with its floor owed its record: no decision that reads the clock is taken
         // until a write lands, and a personal grant that never expires is used as before. Stopping
@@ -855,7 +850,17 @@ impl Controller {
             Arc::clone(&shared_clock),
             setup.boot_identity.clone(),
             wall.clone(),
+            Arc::clone(&utc_floor),
         ));
+        // The store decides a grant's time bound at the moment of its effect, on this host's own
+        // clocks, under the floor every other decision stands on and from the same anchors.
+        sharing
+            .grants()
+            .bind_host_clock(crate::grants::store::HostClock {
+                floor: Arc::clone(&utc_floor),
+                wall: wall.clone(),
+                lifetimes: Arc::clone(&lifetimes),
+            });
         let offline_anchor = net::offline_anchor(
             policy
                 .lock()
@@ -917,8 +922,7 @@ impl Controller {
                 Arc::clone(&sharing),
                 Arc::clone(&policy),
                 setup.environment_id,
-                wall.clone(),
-                Arc::clone(&clock),
+                Arc::clone(&lifetimes),
             )),
             Arc::new(crate::push::sender::HostSigner::new(
                 device_keys.authorisation,
@@ -2286,6 +2290,48 @@ impl Controller {
         }
     }
 
+    /// A grant's own bound in this boot, anchoring it the first time anything asks: a grant in the
+    /// grant store through that store, a paired device's pairing grant through its record. A grant
+    /// neither holds is not this host's, and nothing is in force under it.
+    fn grant_anchor(
+        &self,
+        record: &crate::grants::GrantRecord,
+    ) -> Result<net::lifetimes::Anchored> {
+        // A grant that does not expire has no deadline on either clock.
+        if record.grant.expiry == kr_protocol::grant::GrantExpiry::Never {
+            return Ok(net::lifetimes::Anchored::Unlimited);
+        }
+        let grants = self.sharing.grants();
+        if let Some(stored) = grants.record(record.grant.grant_id)? {
+            return self.lifetimes.stored(grants, &stored);
+        }
+        match self
+            .devices
+            .devices()?
+            .into_iter()
+            .find(|device| device.grant.grant_id == record.grant.grant_id)
+        {
+            Some(device) => self.lifetimes.paired(&device),
+            None => Ok(net::lifetimes::Anchored::Over),
+        }
+    }
+
+    /// Writes down that a grant ran out on the continuous clock: a stored grant's tombstone in the
+    /// grant store, a paired device's in its record, each owed until the write lands.
+    fn note_grant_lapse(&self, record: &crate::grants::GrantRecord) {
+        let grants = self.sharing.grants();
+        if matches!(grants.record(record.grant.grant_id), Ok(Some(_))) {
+            self.lifetimes.owe_stored_expiry(record.grant.grant_id);
+            self.lifetimes.settle_stored(grants);
+        } else {
+            self.lifetimes.pending_expiry().owe(
+                record.grant.recipient_device_id,
+                TimestampMs::new(self.wall_now_ms()),
+            );
+            self.lifetimes.settle();
+        }
+    }
+
     /// Removes a revoked device's bindings from every organisation this host is enrolled in, so
     /// no lease answers for it again.
     ///
@@ -2509,6 +2555,16 @@ impl Controller {
         if self.utc_floor.is_owed() && policy.stands_on_the_clock(&record.grant, ingress) {
             return Err(unwritten());
         }
+        // The grant's own bound in this boot, anchored the first time anything asks, on the floor
+        // just written. It is read against the continuous clock after every wait.
+        let anchored = self.grant_anchor(record).map_err(|error| match error {
+            ControllerError::ClockUntrusted { detail } => {
+                kr_automation::AutomationError::PermissionDenied(format!(
+                    "grant {grant_id}: {detail}"
+                ))
+            }
+            other => kr_automation::AutomationError::AuthorityUnavailable(other.to_string()),
+        })?;
         let waited = self.clock.now().saturating_duration_since(read_at);
         let now_ms = now_ms.saturating_add(u64::try_from(waited.as_millis()).unwrap_or(u64::MAX));
         // The bound a remote holder under a personal grant is held to, which is the policy's own
@@ -2525,7 +2581,21 @@ impl Controller {
             now_ms,
             self.clock.now(),
         )
-        .map(|intersection| intersection.rights);
+        .map(|intersection| intersection.rights)
+        .and_then(|rights| {
+            // Its anchor on the continuous clock, read now: a grant that ran out there is refused
+            // whatever the wall clock says, and its end is written down.
+            if anchored.holds_at(self.clock.now()) {
+                return Ok(rights);
+            }
+            self.note_grant_lapse(record);
+            Err(crate::grants::Refusal::Expired {
+                expired_at_ms: match record.grant.expiry {
+                    kr_protocol::grant::GrantExpiry::At { expires_at_ms } => expires_at_ms.get(),
+                    kr_protocol::grant::GrantExpiry::Never => now_ms,
+                },
+            })
+        });
         let decided = match (decided, offline) {
             (Ok(rights), Some(offline)) => {
                 let lapsed = crate::grants::Refusal::OfflineValidityLapsed {
@@ -12447,7 +12517,7 @@ mod a_floor_owed_its_record {
     /// A personal grant a workflow runs under, held by a device that reaches this host remotely.
     fn held(controller: &Controller, expiry: GrantExpiry) -> GrantRecord {
         let device_id = DeviceId::new(kr_ipc::new_uuid());
-        GrantRecord {
+        let record = GrantRecord {
             grant: Grant {
                 grant_id: GrantId::new(kr_ipc::new_uuid()),
                 parent_grant_id: Nullable::null(),
@@ -12471,7 +12541,14 @@ mod a_floor_owed_its_record {
             activated_at_ms: Some(1),
             revoked_at_ms: None,
             revoked_by_parent: None,
-        }
+        };
+        // Written into the grant store, as a grant a workflow names is.
+        controller
+            .sharing()
+            .grants()
+            .issue(&record, || Ok(()))
+            .expect("the grant is written");
+        record
     }
 
     /// While the floor is owed its record, a workflow's grant that reads the clock is not decided,

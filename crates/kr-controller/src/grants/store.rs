@@ -42,6 +42,7 @@ use crate::sharing::invitation::{InvitationRecord, state_of};
 
 use super::durable::{StoredFeed, StoredPolicy};
 use super::policy::{Bound, UtcFloor};
+use crate::service::net::lifetimes::Anchored;
 
 use crate::error::{ControllerError, Result};
 
@@ -221,9 +222,20 @@ pub struct GrantDirectory {
     connection: std::sync::Mutex<Connection>,
     /// The action claims whose attempts are running in this daemon.
     live: Arc<LiveClaims>,
-    /// This host's clock floor and wall clock, once the daemon has bound them
+    /// This host's clocks and every grant's anchor, once the daemon has bound them
     /// ([`Self::bind_host_clock`]).
-    host_clock: std::sync::OnceLock<(Arc<UtcFloor>, crate::service::WallClock)>,
+    host_clock: std::sync::OnceLock<HostClock>,
+}
+
+/// This host's clocks as the daemon binds them to the store ([`GrantDirectory::bind_host_clock`]).
+#[derive(Clone, Debug)]
+pub struct HostClock {
+    /// The clock floor every decision on this host stands on.
+    pub floor: Arc<UtcFloor>,
+    /// The daemon's wall clock.
+    pub wall: crate::service::WallClock,
+    /// Every grant's anchor in this boot, on the daemon's continuous clock.
+    pub lifetimes: Arc<crate::service::net::lifetimes::GrantLifetimes>,
 }
 
 impl GrantDirectory {
@@ -270,7 +282,8 @@ impl GrantDirectory {
                      issued_at_ms      INTEGER NOT NULL,
                      activated_at_ms   INTEGER,
                      revoked_at_ms     INTEGER,
-                     revoked_by_parent BLOB
+                     revoked_by_parent BLOB,
+                     expired_at_ms     INTEGER
                  );
                  CREATE INDEX IF NOT EXISTS grants_by_parent ON grants (parent_grant_id);
                  CREATE INDEX IF NOT EXISTS grants_by_device ON grants (recipient_device_id);
@@ -305,6 +318,11 @@ impl GrantDirectory {
                      grant_id      BLOB PRIMARY KEY NOT NULL,
                      recorded_at_ms INTEGER NOT NULL
                  );
+                 CREATE TABLE IF NOT EXISTS grant_deadlines (
+                     grant_id         BLOB PRIMARY KEY NOT NULL,
+                     boot_value       BLOB NOT NULL,
+                     deadline_boot_ms INTEGER NOT NULL
+                 );
                  CREATE TABLE IF NOT EXISTS organisation_events (
                      sequence        INTEGER PRIMARY KEY NOT NULL,
                      organisation_id BLOB NOT NULL,
@@ -317,6 +335,7 @@ impl GrantDirectory {
             )
             .map_err(ControllerError::registry)?;
         migrate_receipts(&connection)?;
+        migrate_grants(&connection)?;
         migrate_policy(&connection)?;
         Ok(Self {
             connection: std::sync::Mutex::new(connection),
@@ -351,26 +370,122 @@ impl GrantDirectory {
     /// writes the floor it stood on before its next decision, and an effect asked for again once
     /// that record is down is refused as expired.
     fn unanswerable(&self, bound: &Bound) -> ControllerError {
-        if let Some((floor, _)) = self.host_clock.get()
+        if let Some(clock) = self.host_clock.get()
             && !bound.recorded
         {
-            floor.owe(bound.at_ms);
+            clock.floor.owe(bound.at_ms);
         }
         unrecorded()
     }
 
-    /// Binds this host's clock floor and wall clock, so a grant's time bound is decided at the
-    /// moment of the effect that depends on it.
+    /// Whether a stored grant has lapsed for an effect its caller decided at `admitted_ms`, on
+    /// both of its deadlines, for a check made before the effect's own transaction.
     ///
-    /// Until then a bound is decided at the reading its caller took, which is what a caller that
-    /// keeps its own time wants: a test, or a tool reading a copy of the store. The daemon binds
-    /// its floor and its wall clock as it starts. From then on a delegation, a redemption and a
-    /// transfer read that wall clock inside the transaction that writes them, under that floor: a
-    /// grant that expires while the effect waits for the store's lock is found expired there, and
-    /// nothing that can expire is decided while the floor is owed its record
-    /// ([`UtcFloor::bound`]). A second binding is ignored.
-    pub fn bind_host_clock(&self, floor: Arc<UtcFloor>, wall: crate::service::WallClock) {
-        let _ = self.host_clock.set((floor, wall));
+    /// # Errors
+    ///
+    /// Returns `CLOCK_UNTRUSTED` when an expiring grant has no anchor in this boot and the clock
+    /// cannot give it one, and a `STORAGE_UNAVAILABLE` refusal when its UTC bound cannot be answered
+    /// now ([`Self::bound_passed`]).
+    pub fn lapsed(&self, record: &GrantRecord, admitted_ms: u64) -> Result<bool> {
+        let anchored = self.anchor_before_effect(record)?;
+        let lapsed = self.passed_at_effect(
+            record.grant.grant_id,
+            record.grant.expiry,
+            admitted_ms,
+            anchored,
+        );
+        self.settle_tombstones();
+        lapsed
+    }
+
+    /// A stored grant's anchor in this boot, taken before an effect's transaction, because taking
+    /// it can write to this store ([`GrantLifetimes::stored`]).
+    ///
+    /// `None` until the daemon binds its clocks: a store read by a test or a tool decides a bound
+    /// in UTC alone, at its caller's reading.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CLOCK_UNTRUSTED` when an expiring grant has no anchor in this boot and the clock
+    /// cannot give it one: nothing proves such a grant in force, so the effect does not happen.
+    ///
+    /// [`GrantLifetimes::stored`]: crate::service::net::lifetimes::GrantLifetimes::stored
+    fn anchor_before_effect(&self, record: &GrantRecord) -> Result<Option<Anchored>> {
+        self.host_clock
+            .get()
+            .map(|clock| clock.lifetimes.stored(self, record))
+            .transpose()
+    }
+
+    /// The anchor of the grant `record` delegates from, taken before the delegation's transaction.
+    fn parent_anchor_before_effect(&self, record: &GrantRecord) -> Result<Option<Anchored>> {
+        let Some(parent_grant_id) = record.grant.parent_grant_id.as_ref().copied() else {
+            return Ok(None);
+        };
+        match self.record(parent_grant_id)? {
+            Some(parent) => self.anchor_before_effect(&parent),
+            // The transaction refuses a parent this host does not hold.
+            None => Ok(None),
+        }
+    }
+
+    /// Whether a stored grant's bound has passed at the effect, on both of its deadlines: its
+    /// anchor on the continuous clock, taken before the transaction, against that clock now, and
+    /// its expiry in UTC under the floor ([`Self::bound_passed`]).
+    ///
+    /// An end found on the continuous clock is owed the grant's tombstone, which is written once
+    /// the transaction is over ([`Self::settle_tombstones`]).
+    fn passed_at_effect(
+        &self,
+        grant_id: GrantId,
+        expiry: GrantExpiry,
+        admitted_ms: u64,
+        anchored: Option<Anchored>,
+    ) -> Result<bool> {
+        if self.lapsed_on_the_continuous_clock(grant_id, anchored) {
+            return Ok(true);
+        }
+        self.bound_passed(expiry, admitted_ms)
+    }
+
+    /// Whether a grant anchored as `anchored` has run out on the continuous clock now, owing its
+    /// tombstone when it has.
+    fn lapsed_on_the_continuous_clock(
+        &self,
+        grant_id: GrantId,
+        anchored: Option<Anchored>,
+    ) -> bool {
+        let (Some(anchored), Some(clock)) = (anchored, self.host_clock.get()) else {
+            return false;
+        };
+        if anchored.holds_at(clock.lifetimes.continuous_now()) {
+            return false;
+        }
+        clock.lifetimes.owe_stored_expiry(grant_id);
+        true
+    }
+
+    /// Writes down the tombstones an effect found owed, once its transaction is over and the
+    /// store's connection is free.
+    fn settle_tombstones(&self) {
+        if let Some(clock) = self.host_clock.get() {
+            clock.lifetimes.settle_stored(self);
+        }
+    }
+
+    /// Binds this host's clocks and every grant's anchor, so a grant's time bound is decided at
+    /// the moment of the effect that depends on it, on both of its deadlines.
+    ///
+    /// Until then a bound is decided in UTC at the reading its caller took, which is what a caller
+    /// that keeps its own time wants: a test, or a tool reading a copy of the store. The daemon
+    /// binds its clocks as it starts. From then on a delegation, a redemption and a transfer take
+    /// the stored grant's anchor in this boot before their transaction, and inside it test the
+    /// anchor against the continuous clock and the grant's expiry against the wall clock under the
+    /// floor: a grant that runs out while the effect waits for the store's lock is found run out
+    /// there, on either clock, and nothing that can expire is decided while the floor is owed its
+    /// record ([`UtcFloor::bound`]). A second binding is ignored.
+    pub fn bind_host_clock(&self, clock: HostClock) {
+        let _ = self.host_clock.set(clock);
     }
 
     /// What `expiry` comes to at the effect, for a caller that decided it at `admitted_ms`.
@@ -379,7 +494,9 @@ impl GrantDirectory {
     /// daemon has bound it; the caller's reading alone until then.
     fn bound_at_effect(&self, expiry: GrantExpiry, admitted_ms: u64) -> Bound {
         match self.host_clock.get() {
-            Some((floor, wall)) => floor.bound(expiry, admitted_ms.max(wall.now_ms())),
+            Some(clock) => clock
+                .floor
+                .bound(expiry, admitted_ms.max(clock.wall.now_ms())),
             None => Bound {
                 at_ms: admitted_ms,
                 passed: !expiry.is_valid_at(admitted_ms),
@@ -447,18 +564,21 @@ impl GrantDirectory {
     ) -> Result<()> {
         let encoded = kr_cbor::to_canonical_vec(&record.grant)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        let parent_anchor = self.parent_anchor_before_effect(record)?;
         // The parent check and the write are one transaction. Checking first and writing after
         // would prove the parent stood before the write rather than at it, and a revocation that
         // landed in between would leave a live child of a revoked parent. The caller's admission
         // is asked in the same place, for the same reason: the wait for the store's lock and the
         // parent read can each outlast it.
-        self.in_transaction(|connection| {
-            check_parent(connection, record, |expiry, at| {
-                self.bound_passed(expiry, at)
+        let issued = self.in_transaction(|connection| {
+            check_parent(connection, record, |parent, expiry, at| {
+                self.passed_at_effect(parent, expiry, at, parent_anchor)
             })?;
             still_admitted()?;
             write_grant(connection, record, &encoded)
-        })
+        });
+        self.settle_tombstones();
+        issued
     }
 
     /// Returns one grant's record, revoked or not.
@@ -801,9 +921,10 @@ impl GrantDirectory {
         let encoded_preview = kr_cbor::to_canonical_vec(preview)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         let recipient = record.grant.recipient_device_id;
-        self.in_transaction(|connection| {
-            check_parent(connection, record, |expiry, at| {
-                self.bound_passed(expiry, at)
+        let parent_anchor = self.parent_anchor_before_effect(record)?;
+        let issued = self.in_transaction(|connection| {
+            check_parent(connection, record, |parent, expiry, at| {
+                self.passed_at_effect(parent, expiry, at, parent_anchor)
             })?;
             still_admitted()?;
             write_grant(connection, record, &encoded_grant)?;
@@ -830,7 +951,9 @@ impl GrantDirectory {
                 ));
             }
             Ok(())
-        })
+        });
+        self.settle_tombstones();
+        issued
     }
 
     /// Returns one invitation's record.
@@ -871,12 +994,21 @@ impl GrantDirectory {
         device_id: DeviceId,
         now_ms: u64,
     ) -> Result<Grant> {
+        // The anchor of the grant the invitation carries, taken before the transaction, because
+        // taking it can write to this store.
+        let grant_anchor = match self.invitation(invitation_id)? {
+            Some(invitation) => match self.record(invitation.grant_id)? {
+                Some(record) => self.anchor_before_effect(&record),
+                None => Ok(None),
+            },
+            None => Ok(None),
+        };
         // The refusal travels out of the transaction as a *value*, so the transaction commits and
         // the refusal is raised afterwards. An error would roll the transaction back, and one of
         // the things it writes is that the invitation expired: rolling that back would let a
         // later call with an earlier clock reading redeem an invitation this host has already
         // refused as expired.
-        self.in_transaction(|connection| {
+        let redeemed = self.in_transaction(|connection| {
             let Some(invitation) = read_invitation_within(connection, invitation_id)? else {
                 return Ok(Err(ControllerError::InvalidArgument(
                     "this host holds no such invitation".to_owned(),
@@ -919,6 +1051,18 @@ impl GrantDirectory {
             if record.revoked_at_ms.is_some() {
                 return Ok(Err(refusal("that invitation's grant has been revoked")));
             }
+            // A grant this host could not anchor in this boot is not in force here: nothing proves
+            // it. Its anchor on the continuous clock is read against that clock now, so a grant
+            // that ran out while this waited for the store is found run out here, whatever the wall
+            // clock says; its end goes on record as the grant's, and the invitation is left as it
+            // is.
+            let grant_anchor = match grant_anchor {
+                Ok(anchored) => anchored,
+                Err(error) => return Ok(Err(error)),
+            };
+            if self.lapsed_on_the_continuous_clock(record.grant.grant_id, grant_anchor) {
+                return Ok(Err(refusal("that invitation has expired")));
+            }
             let grant_bound = self.bound_at_effect(record.grant.expiry, now_ms);
             if grant_bound.passed {
                 settle_invitation(connection, invitation_id, InvitationState::Expired)?;
@@ -957,7 +1101,9 @@ impl GrantDirectory {
                 ));
             }
             Ok(Ok(record.grant))
-        })?
+        });
+        self.settle_tombstones();
+        redeemed?
     }
 
     /// Withdraws an invitation and the proposal it carries, in one transaction.
@@ -1015,7 +1161,11 @@ impl GrantDirectory {
     ) -> Result<GrantRevocation> {
         let encoded = kr_cbor::to_canonical_vec(&replacement.grant)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-        self.in_transaction(|connection| {
+        let source_anchor = match self.record(source_grant_id)? {
+            Some(source) => self.anchor_before_effect(&source)?,
+            None => None,
+        };
+        let transferred = self.in_transaction(|connection| {
             let source = read_one(connection, source_grant_id)?.ok_or_else(|| {
                 ControllerError::PermissionDenied {
                     detail: "this host holds no such grant".to_owned(),
@@ -1026,8 +1176,16 @@ impl GrantDirectory {
                     detail: "a grant nobody has redeemed carries no control to transfer".to_owned(),
                 });
             }
-            // Its expiry at the moment of the transfer, not at the moment it was asked for.
-            if source.revoked_at_ms.is_some() || self.bound_passed(source.grant.expiry, now_ms)? {
+            // Its bound at the moment of the transfer, on both clocks, not at the moment it was
+            // asked for.
+            if source.revoked_at_ms.is_some()
+                || self.passed_at_effect(
+                    source_grant_id,
+                    source.grant.expiry,
+                    now_ms,
+                    source_anchor,
+                )?
+            {
                 return Err(ControllerError::PermissionDenied {
                     detail: "that grant is no longer valid, so there is no control to transfer"
                         .to_owned(),
@@ -1036,7 +1194,9 @@ impl GrantDirectory {
             check(&source)?;
             write_grant(connection, replacement, &encoded)?;
             Self::revoke_within(connection, source_grant_id, now_ms)
-        })
+        });
+        self.settle_tombstones();
+        transferred
     }
 
     // --- Fence debt -------------------------------------------------------------------------
@@ -1457,6 +1617,102 @@ impl GrantDirectory {
             .collect()
     }
 
+    /// Records the deadline this host derived for one stored grant in the boot it is running in,
+    /// on the machine's boot-scoped clock, as a paired device's is recorded
+    /// ([`crate::service::net::devices::DeviceDirectory::record_grant_deadline`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the row cannot be written.
+    pub fn record_grant_deadline(
+        &self,
+        grant_id: GrantId,
+        boot: &kr_protocol::identity::BootIdentity,
+        deadline_boot_ms: u64,
+    ) -> Result<()> {
+        self.with(|connection| {
+            connection.execute(
+                "INSERT INTO grant_deadlines (grant_id, boot_value, deadline_boot_ms)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT (grant_id) DO UPDATE
+                     SET boot_value = ?2, deadline_boot_ms = ?3",
+                params![
+                    grant_id.get().as_bytes().as_slice(),
+                    boot.value.as_slice(),
+                    i64::try_from(deadline_boot_ms).unwrap_or(i64::MAX),
+                ],
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Returns the deadline this host derived for one stored grant in the boot it is running in.
+    ///
+    /// A deadline from an earlier boot is not returned: the clock it was measured on has gone with
+    /// that boot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the table cannot be read.
+    pub fn grant_deadline_in(
+        &self,
+        grant_id: GrantId,
+        boot: &kr_protocol::identity::BootIdentity,
+    ) -> Result<Option<u64>> {
+        let row: Option<(Vec<u8>, i64)> = self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT boot_value, deadline_boot_ms FROM grant_deadlines WHERE grant_id = ?1",
+                    params![grant_id.get().as_bytes().as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+        })?;
+        Ok(row
+            .filter(|(recorded, _)| recorded.as_slice() == boot.value.as_slice())
+            .map(|(_, deadline)| u64::try_from(deadline).unwrap_or_default()))
+    }
+
+    /// Records that a stored grant was found to have run out, at `at_ms`.
+    ///
+    /// The first record stays, and a grant with one is never in force again in any boot, whatever
+    /// the wall clock says ([`crate::service::net::lifetimes::GrantLifetimes::stored`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the row cannot be written.
+    pub fn record_grant_expiry(&self, grant_id: GrantId, at_ms: u64) -> Result<()> {
+        self.with(|connection| {
+            connection.execute(
+                "UPDATE grants SET expired_at_ms = ?2
+                  WHERE grant_id = ?1 AND expired_at_ms IS NULL",
+                params![
+                    grant_id.get().as_bytes().as_slice(),
+                    i64::try_from(at_ms).unwrap_or(i64::MAX),
+                ],
+            )
+        })?;
+        Ok(())
+    }
+
+    /// When a stored grant was found to have run out, when it has been.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the row cannot be read.
+    pub fn grant_expired_at(&self, grant_id: GrantId) -> Result<Option<u64>> {
+        let at: Option<Option<i64>> = self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT expired_at_ms FROM grants WHERE grant_id = ?1",
+                    params![grant_id.get().as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .optional()
+        })?;
+        Ok(at.flatten().map(|at| u64::try_from(at).unwrap_or_default()))
+    }
+
     /// Reads this host's stored authority-feed state, if it has one.
     ///
     /// # Errors
@@ -1539,7 +1795,7 @@ pub struct BindingEvent {
 fn check_parent(
     connection: &Connection,
     record: &GrantRecord,
-    bound_passed: impl FnOnce(GrantExpiry, u64) -> Result<bool>,
+    bound_passed: impl FnOnce(GrantId, GrantExpiry, u64) -> Result<bool>,
 ) -> Result<()> {
     let Some(parent_grant_id) = record.grant.parent_grant_id.as_ref().copied() else {
         return Ok(());
@@ -1561,7 +1817,7 @@ fn check_parent(
             detail: "the grant this one delegates from has been revoked".to_owned(),
         });
     }
-    if bound_passed(parent.grant.expiry, record.issued_at_ms)? {
+    if bound_passed(parent_grant_id, parent.grant.expiry, record.issued_at_ms)? {
         return Err(ControllerError::PermissionDenied {
             detail: "the grant this one delegates from has expired".to_owned(),
         });
@@ -1778,6 +2034,33 @@ fn migrate_receipts(connection: &Connection) -> Result<()> {
     transaction.commit().map_err(ControllerError::registry)
 }
 
+/// Adds the stored grants' expiry tombstone to a `grants` table an earlier build created without
+/// it. Every row gains an empty tombstone: no earlier build recorded a stored grant's end, and
+/// each is decided again from its expiry the first time anything asks in this boot.
+///
+/// One immediate transaction, which reads the shape inside it, so two processes opening one store
+/// at once change it once. Remove it once no supported upgrade starts from a build whose `grants`
+/// table lacks the column.
+fn migrate_grants(connection: &Connection) -> Result<()> {
+    let transaction =
+        rusqlite::Transaction::new_unchecked(connection, rusqlite::TransactionBehavior::Immediate)
+            .map_err(ControllerError::registry)?;
+    let columns: BTreeSet<String> = transaction
+        .prepare("SELECT name FROM pragma_table_info('grants')")
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| row.get(0))?
+                .collect::<rusqlite::Result<BTreeSet<String>>>()
+        })
+        .map_err(ControllerError::registry)?;
+    if !columns.contains("expired_at_ms") {
+        transaction
+            .execute_batch("ALTER TABLE grants ADD COLUMN expired_at_ms INTEGER;")
+            .map_err(ControllerError::registry)?;
+    }
+    transaction.commit().map_err(ControllerError::registry)
+}
+
 /// Upgrades the stored policy row, once, from the shape earlier builds wrote.
 ///
 /// Earlier builds wrote each enrolment as two numbers, a pinned key revision and a pinned policy
@@ -1862,7 +2145,7 @@ struct EarlierEnrolment {
 
 /// The refusal of an effect whose time bound this host cannot decide now, because the clock floor
 /// it would stand on is owed its record ([`UtcFloor::bound`]). It passes once the floor is written.
-fn unrecorded() -> ControllerError {
+pub(crate) fn unrecorded() -> ControllerError {
     ControllerError::Refused {
         code: ErrorCode::StorageUnavailable,
         detail: super::FLOOR_UNRECORDED.to_owned(),

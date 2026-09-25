@@ -26,6 +26,7 @@ use kr_protocol::sharing::GrantState;
 use kr_worker::history_filter::ViewerScope;
 
 use crate::grants::{AccessRequest, HostPolicy};
+use crate::service::net::lifetimes::GrantLifetimes;
 use crate::sharing::SharingService;
 
 /// The grants this host issued, under its current policy, as a delivery rule's recipient
@@ -34,9 +35,9 @@ pub struct GrantedRecipients {
     sharing: Arc<SharingService>,
     policy: Arc<Mutex<HostPolicy>>,
     environment_id: EnvironmentId,
-    clock: crate::service::WallClock,
-    /// The continuous clock a membership lease's continuous deadline is compared with.
-    continuous: Arc<dyn kr_transport::clock::ContinuousClock>,
+    /// Every grant's anchor in this boot, with the clocks a grant and a membership lease are both
+    /// decided on.
+    lifetimes: Arc<GrantLifetimes>,
 }
 
 impl std::fmt::Debug for GrantedRecipients {
@@ -50,41 +51,57 @@ impl std::fmt::Debug for GrantedRecipients {
 
 impl GrantedRecipients {
     /// Answers from `sharing`'s grants under `policy`, for the sessions of one environment, with
-    /// UTC read on `clock`, the daemon's wall clock, and a lease's continuous deadline compared
-    /// with `continuous`, the daemon's continuous clock.
+    /// each grant's own bound and a membership lease decided on the clocks of `lifetimes`, the
+    /// daemon's.
     #[must_use]
     pub fn new(
         sharing: Arc<SharingService>,
         policy: Arc<Mutex<HostPolicy>>,
         environment_id: EnvironmentId,
-        clock: crate::service::WallClock,
-        continuous: Arc<dyn kr_transport::clock::ContinuousClock>,
+        lifetimes: Arc<GrantLifetimes>,
     ) -> Self {
         Self {
             sharing,
             policy,
             environment_id,
-            clock,
-            continuous,
+            lifetimes,
         }
     }
 
-    /// Answers against a clock of the caller's choosing, which is how a test holds a grant's
-    /// expiry still.
+    /// Answers on clocks of the caller's choosing, with anchors of its own, which is how a test
+    /// holds a grant's expiry still: `continuous`, the clock a grant's anchor and a membership
+    /// lease's continuous deadline are compared on, and `clock`, the wall clock.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the in-memory records the anchors are kept in cannot be opened, or this boot
+    /// cannot be identified.
     #[must_use]
     pub fn at(
         sharing: Arc<SharingService>,
         policy: Arc<Mutex<HostPolicy>>,
         environment_id: EnvironmentId,
-        clock: fn() -> u64,
+        continuous: Arc<dyn kr_transport::clock::ContinuousClock>,
+        clock: impl Fn() -> u64 + Send + Sync + 'static,
     ) -> Self {
-        Self::new(
-            sharing,
-            policy,
-            environment_id,
+        let floor = Arc::clone(
+            policy
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .utc_floor(),
+        );
+        let lifetimes = Arc::new(GrantLifetimes::new(
+            Arc::new(
+                crate::service::net::devices::DeviceDirectory::in_memory()
+                    .expect("an in-memory device directory"),
+            ),
+            continuous,
+            Arc::new(kr_ipc::clock::SystemSharedClock),
+            kr_ipc::identity::boot_identity().expect("this boot's identity"),
             crate::service::WallClock::from_fn(clock),
-            Arc::new(kr_transport::clock::SystemContinuousClock::new()),
-        )
+            floor,
+        ));
+        Self::new(sharing, policy, environment_id, lifetimes)
     }
 }
 
@@ -97,8 +114,20 @@ impl RecipientAuthority for GrantedRecipients {
         // The policy as it stands now, read once for this answer. A copy, so the lock is not held
         // across the rest of the question.
         let policy = self.policy.lock().ok()?.clone();
-        let now_ms = policy.settled_now(self.clock.now_ms());
+        // This host's reading of UTC through its floor, which the reading raises, so a clock
+        // wound back after this message does not revive the grant for the next one.
+        let now_ms = self.lifetimes.settled_utc_now();
         if record.state(now_ms) != GrantState::Active {
+            return None;
+        }
+        // The grant's own bound in this boot, on the continuous clock as well as in UTC: an
+        // expiring grant this host cannot anchor, or one that ran out on either clock, admits
+        // nothing.
+        if !self
+            .lifetimes
+            .stored_in_force(self.sharing.grants(), &record)
+            .ok()?
+        {
             return None;
         }
         let grant = &record.grant;
@@ -122,7 +151,7 @@ impl RecipientAuthority for GrantedRecipients {
                     claims_geometry: false,
                     own_subject: None,
                     now_ms,
-                    continuous_now: self.continuous.now(),
+                    continuous_now: self.lifetimes.continuous_now(),
                 },
                 now_ms,
             )
@@ -213,7 +242,13 @@ mod tests {
     }
 
     fn recipients(sharing: &Arc<SharingService>) -> GrantedRecipients {
-        GrantedRecipients::at(Arc::clone(sharing), personal(), environment(), || NOW)
+        GrantedRecipients::at(
+            Arc::clone(sharing),
+            personal(),
+            environment(),
+            Arc::new(kr_transport::clock::ManualClock::new()),
+            || NOW,
+        )
     }
 
     #[test]
@@ -311,6 +346,7 @@ mod tests {
             Arc::clone(&sharing),
             Arc::clone(&policy),
             environment(),
+            Arc::new(kr_transport::clock::ManualClock::new()),
             || NOW,
         );
         assert!(recipients.scope_for(&rule(Some(10))).is_some());
@@ -324,9 +360,9 @@ mod tests {
         assert_eq!(recipients.scope_for(&rule(Some(10))), None);
     }
 
-    /// An organisation grant's lease is per member, and this host attributes no member to the
-    /// recipient of an external message, so the grant admits nothing rather than being answered by
-    /// somebody else's lease.
+    /// An organisation grant answers only to the lease of the member its recipient device is bound
+    /// to. On a host that is not enrolled in the organisation, and so binds nobody in it, the grant
+    /// admits nothing rather than being answered by somebody else's lease.
     #[test]
     fn an_organisation_grant_admits_nothing_for_a_recipient_no_lease_answers_for() {
         let sharing = Arc::new(SharingService::in_memory(host()).expect("a store"));

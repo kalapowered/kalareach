@@ -2265,3 +2265,273 @@ async fn revoking_a_shared_grant_completes_through_the_dispatch_barrier() {
         "nothing active is left after the revocation"
     );
 }
+
+/// Starts a daemon over `temp` on the clocks the test gives it.
+async fn start_daemon_on(
+    temp: &kr_ipc::testing::TempHost,
+    clocks: kr_controller::service::Clocks,
+) -> Arc<Controller> {
+    let environment = temp.environment();
+    let environment_id = temp.environment_id();
+    let secrets = environment.secrets_dir();
+    Controller::start_on_clocks(
+        ControllerSetup {
+            paths: environment.clone(),
+            environment_id,
+            identity: Box::new(move || {
+                let store =
+                    open_store_in(&secrets).expect("a secret store for the test environment");
+                Ok(
+                    ControllerIdentity::open(store.store.as_ref(), environment_id, false)
+                        .expect("an identity"),
+                )
+            }),
+            secret_store: StoreSelection::File,
+            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+            supervisor: Box::new(SilentSupervisor),
+            worker_program: std::path::PathBuf::from("/nonexistent/kr-worker"),
+            build_id: BuildId::new("kr-test/0").expect("a build identifier"),
+            release: "0".to_owned(),
+            shell_packages: None,
+            terminal: Box::new(kr_controller::supervision::NoTerminal),
+        },
+        clocks,
+    )
+    .await
+    .expect("the daemon starts")
+}
+
+/// One of the grant store's three effects that act under a stored grant.
+#[derive(Clone, Copy, Debug)]
+enum Effect {
+    Delegation,
+    Redemption,
+    Transfer,
+}
+
+/// Rule C at the grant store's effects: a delegation, a redemption and a transfer, each under a
+/// stored grant with an expiry anchored in this boot. Another writer holds the registry; the
+/// operation passes its early check and waits for the store's transaction; only the continuous
+/// clock moves past the grant's anchor, with the wall clock, and so UTC under the floor, still
+/// before its expiry; the registry is released. The effect is refused inside its transaction, and
+/// nothing it would have written is there. Controls: the same sequence with no clock movement
+/// commits the effect; and with the clock distrusted, an expiring grant this boot never anchored is
+/// refused while a grant that does not expire is transferred.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stored_grants_effect_tests_both_of_its_deadlines() {
+    for effect in [Effect::Delegation, Effect::Redemption, Effect::Transfer] {
+        for advanced in [true, false] {
+            an_effect_waiting_for_the_store(effect, advanced).await;
+        }
+    }
+    an_expiring_grant_this_boot_never_anchored_is_refused_under_a_distrusted_clock().await;
+}
+
+async fn an_effect_waiting_for_the_store(effect: Effect, advanced: bool) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let now = kr_ipc::now_ms().get();
+    let continuous = kr_transport::clock::ManualClock::new();
+    let wall = Arc::new(AtomicU64::new(now));
+    let controller = start_daemon_on(
+        &temp,
+        kr_controller::service::Clocks {
+            continuous: Arc::new(continuous.clone()),
+            wall: kr_controller::service::WallClock::from_fn({
+                let wall = Arc::clone(&wall);
+                move || wall.load(Ordering::SeqCst)
+            }),
+        },
+    )
+    .await;
+    let environment_id = controller.paths().environment_id();
+
+    // The stored grant the effect acts under: a one-hour grant, redeemed, or for a redemption the
+    // one its open invitation carries.
+    let (grant, invitation) = match effect {
+        Effect::Delegation | Effect::Transfer => {
+            (shared_and_redeemed(&controller, 1, device_id(0xf1)), None)
+        }
+        Effect::Redemption => {
+            let shared = controller
+                .sharing()
+                .share(
+                    &ShareRequest {
+                        environment_id,
+                        issuer_device_id: DeviceId::new(environment_id.get()),
+                        recipient_device_id: device_id(0xf1),
+                        authority_revision: controller.policy().authority_revision(),
+                        now_ms: now,
+                        ..share(SessionRole::Owner, 1)
+                    },
+                    || Ok(()),
+                )
+                .expect("the host shares a session");
+            let record = controller
+                .sharing()
+                .grants()
+                .record(grant_id(1))
+                .expect("readable")
+                .expect("the proposal");
+            (record.grant, Some(shared.preview.invitation_id))
+        }
+    };
+    let record = controller
+        .sharing()
+        .grants()
+        .record(grant.grant_id)
+        .expect("readable")
+        .expect("the grant");
+    // Anchored in this boot: its deadline on the continuous clock is an hour away.
+    assert!(
+        !controller
+            .sharing()
+            .grants()
+            .lapsed(&record, now)
+            .expect("decided"),
+        "the grant stands before either deadline"
+    );
+
+    // Another writer holds the registry, so the effect waits for its transaction.
+    let registry = rusqlite::Connection::open(temp.environment().registry_database())
+        .expect("opens the registry");
+    registry
+        .execute_batch("BEGIN IMMEDIATE;")
+        .expect("the registry is held");
+    let operation = {
+        let controller = Arc::clone(&controller);
+        let grant = grant.clone();
+        tokio::spawn(async move {
+            match effect {
+                Effect::Delegation => delegate(&controller, &grant, 5).map(|_| ()),
+                Effect::Redemption => controller
+                    .sharing()
+                    .redeem(invitation.expect("an invitation"), device_id(0xf1), now + 1)
+                    .map(|_| ()),
+                Effect::Transfer => transfer_to_another(&controller, &grant, grant_id(9)).await,
+            }
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    if advanced {
+        // Past the grant's anchor on the continuous clock; UTC stays where it was.
+        continuous.advance(Duration::from_secs(60 * 60 + 1));
+    }
+    registry
+        .execute_batch("ROLLBACK;")
+        .expect("the registry is released");
+    let outcome = operation.await.expect("the operation ends");
+
+    let grants = controller.sharing().grants();
+    if advanced {
+        let refused = outcome.expect_err("the grant ran out on the continuous clock");
+        assert_eq!(
+            refused.code(),
+            kr_protocol::error::ErrorCode::PermissionDenied,
+            "{effect:?}: {refused}"
+        );
+        match effect {
+            Effect::Delegation => {
+                assert!(grants.record(grant_id(5)).expect("readable").is_none());
+                assert!(
+                    grants
+                        .invitation(invitation_id(5))
+                        .expect("readable")
+                        .is_none()
+                );
+            }
+            Effect::Redemption => {
+                let proposal = grants
+                    .record(grant.grant_id)
+                    .expect("readable")
+                    .expect("the proposal");
+                assert!(proposal.activated_at_ms.is_none(), "nothing redeemed it");
+                assert_eq!(
+                    grants
+                        .invitation(invitation.expect("an invitation"))
+                        .expect("readable")
+                        .expect("the invitation")
+                        .state,
+                    kr_protocol::sharing::InvitationState::Open,
+                    "the invitation is as it was"
+                );
+            }
+            Effect::Transfer => {
+                assert!(grants.record(grant_id(9)).expect("readable").is_none());
+                assert!(
+                    grants
+                        .record(grant.grant_id)
+                        .expect("readable")
+                        .expect("the source")
+                        .revoked_at_ms
+                        .is_none(),
+                    "the source is not revoked"
+                );
+            }
+        }
+        assert!(
+            grants
+                .grant_expired_at(grant.grant_id)
+                .expect("readable")
+                .is_some(),
+            "{effect:?}: the grant's end is written down"
+        );
+    } else {
+        outcome.unwrap_or_else(|error| panic!("{effect:?}: the control commits: {error}"));
+    }
+    drop(controller);
+}
+
+async fn an_expiring_grant_this_boot_never_anchored_is_refused_under_a_distrusted_clock() {
+    let (_temp, controller) = daemon().await;
+    let now = kr_ipc::now_ms().get();
+    let expiring = shared_and_redeemed(&controller, 1, device_id(0xf1));
+    let fresh = Grant {
+        grant_id: grant_id(3),
+        ..expiring.clone()
+    };
+    let lasting = Grant {
+        grant_id: grant_id(4),
+        expiry: GrantExpiry::Never,
+        ..expiring.clone()
+    };
+    for grant in [&fresh, &lasting] {
+        controller
+            .sharing()
+            .grants()
+            .issue(
+                &GrantRecord {
+                    grant: grant.clone(),
+                    session_id: Some(session_id(0xa0)),
+                    issued_at_ms: now,
+                    activated_at_ms: Some(now),
+                    revoked_at_ms: None,
+                    revoked_by_parent: None,
+                },
+                || Ok(()),
+            )
+            .expect("the grant is written");
+    }
+    // The host has recorded a moment an hour ahead of its wall clock, which is what a clock stepped
+    // back an hour looks like to it.
+    controller
+        .devices()
+        .utc_at_least(kr_protocol::scalars::TimestampMs::new(now + 60 * 60 * 1000))
+        .expect("the mark");
+
+    transfer_to_another(&controller, &fresh, grant_id(9))
+        .await
+        .expect_err("nothing proves an expiring grant this boot never anchored");
+    assert!(
+        controller
+            .sharing()
+            .grants()
+            .record(grant_id(9))
+            .expect("readable")
+            .is_none()
+    );
+    transfer_to_another(&controller, &lasting, grant_id(10))
+        .await
+        .expect("the control: a grant that does not expire reads no clock");
+}
