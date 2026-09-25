@@ -1324,6 +1324,16 @@ impl Asked {
         limits.max_requests.saturating_sub(self.total).min(by_time)
     }
 
+    /// How many of the questions asked so far the host's window still holds at `at`, a moment no
+    /// earlier than the last question counted.
+    fn in_window_at(&self, at: tokio::time::Instant, limits: &PreAuthLimits) -> usize {
+        let window = limits.window + WINDOW_MARGIN;
+        self.recent
+            .iter()
+            .filter(|sent| at.saturating_duration_since(**sent) < window)
+            .count()
+    }
+
     /// Counts one question, sent at `now`.
     fn asked(&mut self, now: tokio::time::Instant) {
         self.total += 1;
@@ -1358,8 +1368,8 @@ fn cutoff(asked: &Asked, attempt_call: tokio::time::Instant) -> tokio::time::Ins
 ///
 /// Before the cutoff the device asks at its pace, and from four questions before the end it looks
 /// for a fresh connection before each one; the last question before the cutoff is kept while fresh
-/// connections fail, and so is one the host's window would hold back past the cutoff. At the
-/// cutoff the kept question goes as soon as the host's window has room:
+/// connections fail, and so is one that would leave the host's window no room at the cutoff. At the
+/// cutoff the kept question goes, the window having kept room for it:
 /// at the connection's own last call it is the connection's last, and after the attempt's last
 /// call every answer is final, so the device goes on asking there at its pace and looks for no
 /// other connection.
@@ -1376,15 +1386,20 @@ fn plan(
     };
     let cutoff = cutoff(asked, attempt_call);
     if now >= cutoff {
-        return if window.is_zero() {
-            Next::Ask
+        if window.is_zero() {
+            return Next::Ask;
+        }
+        // At the connection's own last call a full window leaves it no question the host is sure
+        // to answer, and a question asked later could meet a connection the host has ended.
+        return if now >= asked.last_call() {
+            Next::LetGo
         } else {
             Next::Wait(window)
         };
     }
     let until = cutoff - now;
     // A window that stays full past the cutoff leaves the connection no question before it: the
-    // device looks elsewhere meanwhile, and keeps the question for when the window has room.
+    // device looks elsewhere meanwhile.
     if window > until {
         return Next::LookFirst {
             within: until,
@@ -1393,6 +1408,16 @@ fn plan(
     }
     if !window.is_zero() {
         return Next::Wait(window);
+    }
+    // A question now must leave the window room for the one at the cutoff: a question that would
+    // take its last slot through the cutoff is the one kept for it.
+    if until < limits.window + WINDOW_MARGIN
+        && asked.in_window_at(cutoff, limits) + 1 >= limits.max_requests_per_window
+    {
+        return Next::LookFirst {
+            within: until,
+            keep: true,
+        };
     }
     let left = asked.left(now, cutoff, limits);
     if left <= CHANGE_WITH_LEFT {
@@ -2132,22 +2157,51 @@ mod tests {
         assert_eq!(plan(&mut idle, at(60), far, &limits), Next::LetGo);
     }
 
-    /// KR-REQ-10.23: the host's window is full and stays full past the connection's last call, as
-    /// after a slow start whose challenge and proof went late. Waiting for the window would put the
-    /// next question after the call, with less time than the call leaves for an answer. The device
-    /// looks for a fresh connection instead, keeps the question, and asks it once the window has
-    /// room; nothing goes on the connection after that.
+    /// KR-REQ-10.23: the question kept for a connection's last call always finds the host's window
+    /// with room. A question that would take the window's last slot through the call is kept for
+    /// the call instead, so the kept question goes at the call itself, never later.
     #[test]
-    fn a_window_full_past_the_cutoff_sends_the_device_looking() {
+    fn the_hosts_window_keeps_room_for_the_question_at_the_last_call() {
         let limits = PreAuthLimits::default();
         let start = tokio::time::Instant::now();
         let at = |seconds: u64| start + Duration::from_secs(seconds);
         let far = at(600);
-        // The challenge and the proof at 42 s, then two status questions.
+        // A slow start: the challenge and the proof at 42 s, eight seconds before the call.
+        let mut asked = Asked::after(2, start, at(42));
+        assert_eq!(asked.last_call(), at(50));
+        assert_eq!(
+            plan(&mut asked, at(42), far, &limits),
+            Next::LookFirst {
+                within: Duration::from_secs(8),
+                keep: false
+            }
+        );
+        asked.asked(at(42));
+        // A fourth question at 45 s would fill the window until 56 s, past the call: it is kept.
+        assert_eq!(
+            plan(&mut asked, at(45), far, &limits),
+            Next::LookFirst {
+                within: Duration::from_secs(5),
+                keep: true
+            }
+        );
+        assert_eq!(plan(&mut asked, at(50), far, &limits), Next::Ask);
+        asked.asked(at(50));
+        assert_eq!(plan(&mut asked, at(51), far, &limits), Next::LetGo);
+    }
+
+    /// KR-REQ-10.23: a window that is full through a connection's last call, however it came to be,
+    /// leaves the connection no question the host is sure to answer. The device looks for a fresh
+    /// connection until the call, and then lets this one go rather than ask late.
+    #[test]
+    fn a_window_full_through_the_last_call_lets_the_connection_go() {
+        let limits = PreAuthLimits::default();
+        let start = tokio::time::Instant::now();
+        let at = |seconds: u64| start + Duration::from_secs(seconds);
+        let far = at(600);
         let mut asked = Asked::after(2, start, at(42));
         asked.asked(at(42));
         asked.asked(at(45));
-        assert_eq!(asked.last_call(), at(50));
         assert_eq!(
             plan(&mut asked, at(48), far, &limits),
             Next::LookFirst {
@@ -2155,14 +2209,16 @@ mod tests {
                 keep: true
             }
         );
-        // At the call the window still has no room; the question goes as soon as it has.
+        assert_eq!(plan(&mut asked, at(50), far, &limits), Next::LetGo);
+        // The attempt's own last call is not the connection's end: there the device waits for the
+        // window and asks.
+        let mut asked = Asked::after(2, start, at(10));
+        asked.asked(at(10));
+        asked.asked(at(13));
         assert_eq!(
-            plan(&mut asked, at(50), far, &limits),
-            Next::Wait(Duration::from_secs(3))
+            plan(&mut asked, at(15), at(15), &limits),
+            Next::Wait(Duration::from_secs(6))
         );
-        assert_eq!(plan(&mut asked, at(53), far, &limits), Next::Ask);
-        asked.asked(at(53));
-        assert_eq!(plan(&mut asked, at(56), far, &limits), Next::LetGo);
     }
 
     /// KR-REQ-10.23: a host that counts the questions it refuses, and keeps a window longer than
