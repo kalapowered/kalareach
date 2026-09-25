@@ -677,22 +677,20 @@ jobs:
           path: /tmp/kr-shell-packages
           if-no-files-found: error
 
-      # The build above is a step of this job, so an absent package here is a failure rather than
-      # a skip, which is what KR_REQUIRE_SHELL_PACKAGES says.
+      # The cases that drive a package are left out of a run that has built none, such as the rust
+      # job's. This job built them above, so it runs those cases with --include-ignored, and a
+      # package that is missing, or is not the one this tree gives, fails the case that needed it.
       - name: Drive the built packages through the contract
-        env:
-          KR_REQUIRE_SHELL_PACKAGES: "1"
         run: |
           cargo test --locked -p kr-shell-integration \
-            --test zsh --test bash --test fish --test pwsh -- --test-threads=1
+            --test zsh --test bash --test fish --test pwsh -- --test-threads=1 --include-ignored
 
       # Section 7 qualifies the packages against the startup customisations people run. The
-      # customisations are pinned by digest and fetched once here, and a package or a customisation
-      # that is missing is a failure rather than a skip, because both are steps of this job.
+      # customisations are pinned by digest and fetched once here. The checks that need a package
+      # or a customisation are left out of an ordinary run, and this job has both, so it runs them
+      # with --include-ignored, where a package or a customisation that is missing fails.
       - name: Qualify the packages against the startup customisations
         env:
-          KR_REQUIRE_SHELL_PACKAGES: "1"
-          KR_REQUIRE_SHELL_STACKS: "1"
           KR_TEST_ARTIFACTS_DIR: /tmp/kr-shell-qualification
         run: |
           bash scripts/fetch-shell-stacks.sh
@@ -701,7 +699,8 @@ jobs:
           # a second copy of the first; the pinned build is put back afterwards.
           CPPFLAGS="-DKR_QUALIFICATION_BUILD=1" bash scripts/build-shells.sh --zsh --no-upstream-tests
           bash scripts/build-shells.sh --zsh --no-upstream-tests
-          cargo test --locked -p kr-shell-integration --test qualification -- --test-threads=1
+          cargo test --locked -p kr-shell-integration --test qualification -- \
+            --test-threads=1 --include-ignored
           cat /tmp/kr-shell-qualification/qualification-cases.tsv
 
   typescript:

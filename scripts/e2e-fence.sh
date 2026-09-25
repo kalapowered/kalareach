@@ -555,9 +555,11 @@ fi
 
 echo
 echo "4. the corpus, against the packages this run stood behind"
-if ! KR_REQUIRE_SHELL_PACKAGES=1 KR_REQUIRE_SHELL_STACKS=1 KR_TEST_ARTIFACTS_DIR="$artifacts" \
+# The checks that need the packages and the customisations are left out of an ordinary run. This
+# one built the first and fetched the second, so it includes them, and a missing one fails.
+if ! KR_TEST_ARTIFACTS_DIR="$artifacts" \
     CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" \
-    cargo test -p kr-shell-integration --test qualification -- --test-threads=1 \
+    cargo test -p kr-shell-integration --test qualification -- --test-threads=1 --include-ignored \
     >"$run_root/qualification.log" 2>&1; then
   tail -60 "$run_root/qualification.log"
   fail "the qualification did not hold"

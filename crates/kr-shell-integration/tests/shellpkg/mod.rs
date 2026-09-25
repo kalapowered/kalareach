@@ -51,9 +51,6 @@ pub const REPLY: Duration = Duration::from_secs(20);
 /// How long the step given to an editor that only reaches its queue when the reader steps lasts.
 pub const STEP: Duration = Duration::from_millis(60);
 
-/// The environment variable that turns a missing package into a failure rather than a skip.
-pub const REQUIRE: &str = "KR_REQUIRE_SHELL_PACKAGES";
-
 /// Which side of the endpoint has gone, or `None` where it is whole.
 ///
 /// A write that found the peer gone and a read that reached the end of the stream are separate
@@ -164,7 +161,7 @@ impl Package {
     ///
     /// # Errors
     ///
-    /// Returns the reason a test should skip: this tree's package has not been built here.
+    /// Returns why this tree's package is not here.
     pub fn find(kind: ShellKind) -> Result<Self, String> {
         let name = kind.as_str();
         let root = cache_root().join(name);
@@ -229,25 +226,24 @@ impl Package {
         })
     }
 
-    /// Returns the package, or prints the reason and returns `None` so the test can stop.
+    /// Returns this tree's built package, for a check that drives it.
+    ///
+    /// Every check that drives a package is left out of an ordinary run, which has no packages, and
+    /// runs with `--include-ignored` where the packages have been built: continuous integration's
+    /// shell-packages job, `scripts/e2e-fence.sh` and the build box's verification. A run that
+    /// includes it has said the packages are there, so one that is not fails and says why.
     ///
     /// # Panics
     ///
-    /// Panics when [`REQUIRE`] is set, which is what continuous integration does: there the build
-    /// is a step of the same job, so an absent package is a failure rather than a skip.
+    /// Panics when this tree's package is not here.
     #[must_use]
-    pub fn found(kind: ShellKind) -> Option<Self> {
-        match Self::find(kind) {
-            Ok(package) => Some(package),
-            Err(reason) => {
-                assert!(
-                    std::env::var_os(REQUIRE).is_none(),
-                    "{REQUIRE} is set and this tree's package is not here: {reason}"
-                );
-                println!("skipped: {reason}");
-                None
-            }
-        }
+    pub fn built(kind: ShellKind) -> Self {
+        Self::find(kind).unwrap_or_else(|reason| {
+            panic!(
+                "this check drives this tree's built {} package, which is not here: {reason}",
+                kind.as_str()
+            )
+        })
     }
 
     /// The patches the identity record names, as the handshake must declare them.
