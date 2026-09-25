@@ -607,6 +607,7 @@ mod tests {
             "broker_stream",
             "broker_client_requests",
             "broker_events",
+            "broker_connections",
         ] {
             let store = store(name).expect("every named store is declared");
             assert!(
