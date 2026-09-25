@@ -3275,10 +3275,9 @@ async fn a_revocation_whose_record_was_never_written_is_answered_from_the_rows_a
 /// bound, and ended before its fence, still has its withdrawal read back whole, and its retry
 /// settles the fence it owes.
 ///
-/// The retry raises that fence and is then refused on its own connection, as every retry that
-/// raises one is; the answer a later retry would carry names more grants than one control frame
-/// may hold, which the caller's decoder refuses whatever produced it. What is asserted is the
-/// record and the fence.
+/// The attempt stops with the daemon that made it, and the next start raises that fence; the answer
+/// a retry would carry names more grants than one control frame may hold, which the caller's
+/// decoder refuses whatever produced it. What is asserted is the record and the fence, raised once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_withdrawal_larger_than_one_message_is_read_back_and_its_fence_settled() {
     let host = Serving::start().await;
@@ -3354,6 +3353,10 @@ async fn a_withdrawal_larger_than_one_message_is_read_back_and_its_fence_settled
         "every grant the revocation withdrew"
     );
 
+    drop(client);
+    let host = host.restart().await;
+    let controller = &host.controller;
+    let mut client = host.client().await;
     let _ = client.repeat(&mutation).await;
     assert_eq!(
         controller.policy().authority_revision().get(),
@@ -3371,11 +3374,11 @@ async fn a_withdrawal_larger_than_one_message_is_read_back_and_its_fence_settled
     );
 }
 
-/// KR-REQ-09.08 and 10.45: a revocation whose attempt withdrew its grant and ended before its fence
-/// ran is answered once that fence has run. The fence is the one the withdrawal owed and it runs
-/// once. Like every connection that fence withdraws, the one whose retry raised it is told to open
-/// a new connection; the retry on the new one is answered, and carries the revision the fence
-/// advanced to.
+/// KR-REQ-09.08 and 10.45: a revocation whose attempt withdrew its grant and stopped before its
+/// fence ran is answered once that fence has run. The attempt stops with the daemon that made it,
+/// so the fence the withdrawal owed is raised by the next start, once, before anything is served;
+/// the retry is answered from the rows, carries the revision that fence advanced to, and raises no
+/// second one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unfinished_revocation_pays_the_fence_it_still_owes_before_it_is_answered() {
     let host = Serving::start().await;
@@ -3443,25 +3446,14 @@ async fn an_unfinished_revocation_pays_the_fence_it_still_owes_before_it_is_answ
             .is_empty(),
         "the withdrawal owes its fence"
     );
-
-    let fenced = client
-        .repeat(&mutation)
-        .await
-        .expect("the daemon answers")
-        .expect_err("the fence the retry raised withdrew this connection's registration too");
-    assert_eq!(
-        fenced.code,
-        kr_protocol::error::ErrorCode::PermissionDenied,
-        "{fenced:?}"
-    );
-    assert!(
-        fenced.message.contains("open a new connection"),
-        "{fenced:?}"
-    );
+    // The attempt stops before its fence, with the daemon that made it.
+    drop(client);
+    let host = host.restart().await;
+    let controller = &host.controller;
     assert_eq!(
         controller.policy().authority_revision().get(),
         before.get() + 1,
-        "the fence the withdrawal owed ran"
+        "the start raised the fence the withdrawal owed"
     );
 
     let mut client = host.client().await;

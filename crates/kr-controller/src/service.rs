@@ -1824,9 +1824,10 @@ impl Controller {
     /// Raises the one barrier every restrictive change on this host is retired by.
     ///
     /// Inside the registry critical section that advances the revision, the barrier captures every
-    /// published debt, and every debt on disk that is not pending (a change that took effect and
-    /// whose barrier no attempt raised, such as one that stopped between its restriction and its
-    /// barrier), advances the revision once for all of them and drops
+    /// published debt, and nothing else: memory is the one record of which debts a barrier may
+    /// take, so no row read from disk can be captured before its restriction, twice, or after an
+    /// earlier barrier captured it. A row on disk that no change of this run holds is published only
+    /// by a start, before anything is served. It advances the revision once for all of them and drops
     /// them from memory; the connections admitted under what they withdrew are deregistered in the
     /// same section. Their rows are deleted once the announcement has gone out. With nothing
     /// captured it advances nothing and reports the barrier as it stands, which is how a debt that
@@ -1846,17 +1847,7 @@ impl Controller {
     pub(crate) async fn barrier(&self) -> Result<RevocationBarrier> {
         let captured = {
             let mut registry = self.registry.lock().await;
-            let on_disk = self.sharing.grants().fence_owed()?;
-            let captured = {
-                let debts = self.debts();
-                let mut captured = debts.published.clone();
-                for debt in on_disk {
-                    if !debts.pending.contains_key(&debt) && !debts.retiring.contains(&debt) {
-                        captured.entry(debt).or_insert(Reach::Host);
-                    }
-                }
-                captured
-            };
+            let captured = self.debts().published.clone();
             if captured.is_empty() {
                 None
             } else {
@@ -7053,11 +7044,11 @@ impl Controller {
         // wider one is fenced; a reading that decided nothing lifts nothing.
         //
         // A ceiling that moves is a restrictive change: its debt is written before the ceiling
-        // moves, and published once it has. A debt this cannot write is held in memory alone, so
-        // the barrier below still runs for it and a failed one still refuses; the durable record of
-        // what this environment accepted is what brings the fence back after a stop, because it is
-        // advanced only once every effect landed.
+        // moves, and published once it has. A ceiling whose debt cannot be written does not move:
+        // the acceptance reports that, and is attempted again by the next one, since the record of
+        // what this environment accepted advances only once every effect landed.
         let mut ceiling_debt = None;
+        let mut ceiling_failure = None;
         let (rights, ceiling_moved) = {
             let mut held = self
                 .rights_ceiling
@@ -7069,20 +7060,24 @@ impl Controller {
                 let configured = crate::config::ceilings::configured_rights(&document.ceilings);
                 moved = *held != configured;
                 if moved {
-                    ceiling_debt = Some(
-                        self.owe_debt("a change of the rights ceiling", Reach::Host)
-                            .unwrap_or_else(|error| {
-                                eprintln!(
-                                    "kr-controller: the fence debt of a ceiling change could not \
-                                     be written, so it is held in memory: {error}"
-                                );
-                                crate::grants::store::DebtId::fresh()
-                            }),
-                    );
-                }
-                *held = configured;
-                if moved {
-                    self.advance_authority_epoch();
+                    match self.owe_debt("a change of the rights ceiling", Reach::Host) {
+                        Ok(debt) => {
+                            ceiling_debt = Some(debt);
+                            *held = configured;
+                            self.advance_authority_epoch();
+                        }
+                        Err(error) => {
+                            moved = false;
+                            ceiling_failure = Some(
+                                Sentence::new()
+                                    .stated(
+                                        "the rights ceiling did not change, because the fence its \
+                                         change owes could not be written down: ",
+                                    )
+                                    .withheld(ContentClass::Message, &error.to_string()),
+                            );
+                        }
+                    }
                 }
             }
             if let Some(debt) = ceiling_debt {
@@ -7108,7 +7103,17 @@ impl Controller {
         // anything, and a reading that let the debt go would leave the work admitted under the
         // withdrawn ceiling admitted.
         owed.fences_dispatch |= ceiling_moved || !self.debts().published.is_empty();
+        // A ceiling that did not move withdrew nothing, so it owes no fence of its own; a debt an
+        // earlier barrier left published is still raised.
+        let fence_now = (owed.fences_dispatch && ceiling_failure.is_none())
+            || !self.debts().published.is_empty();
         let (sessions, mut failure) = self.apply_session_limit(&resolver, &state).await;
+        if let Some(problem) = ceiling_failure {
+            failure = Some(match failure {
+                Some(earlier) => earlier.stated("; ").sentence(&problem),
+                None => problem,
+            });
+        }
         if sessions.from_document {
             // Recorded the moment the registry took it, separately from everything below. A later
             // effect that fails does not put this number back, and a state that said it had would
@@ -7121,7 +7126,7 @@ impl Controller {
         // decided nothing that survived it.
         let (owed_before, mut unreadable) = self.fence_owed().await;
         let mut barrier = None;
-        if owed.fences_dispatch {
+        if fence_now {
             // Attempted whatever else failed, because the values above are already in force: the
             // narrower ceiling decides every request from here on, and the work admitted under the
             // one it replaced is dispatchable until the revision advances. An effect that failed
@@ -13105,6 +13110,38 @@ mod one_barrier_for_every_restriction {
         controller.publish_debts(&[(second, Reach::Host)]);
         controller.barrier().await.expect("a barrier");
         assert_eq!(revision(&controller).await, before + 3);
+        assert!(owed(&controller).is_empty());
+        drop(controller);
+    }
+
+    /// The barrier captures only what this run holds as published and reads no row from disk, so a
+    /// row no change of this run holds is neither captured before its restriction nor twice: only
+    /// a start publishes it, and that start's barrier retires it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_row_no_change_of_this_run_holds_is_captured_only_by_a_start() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = super::a_floor_owed_its_record::daemon(&temp).await;
+        let before = revision(&controller).await;
+        let row = controller
+            .sharing()
+            .grants()
+            .owe_fence("a change this run does not hold", kr_ipc::now_ms().get())
+            .expect("written");
+        controller.barrier().await.expect("a barrier");
+        assert_eq!(
+            revision(&controller).await,
+            before,
+            "a row read from disk is not captured"
+        );
+        assert_eq!(owed(&controller), vec![row]);
+        controller.check_fence().expect("and it refuses nothing");
+
+        let controller = restarted(controller, &temp).await;
+        assert_eq!(
+            revision(&controller).await,
+            before + 1,
+            "the start publishes it and its barrier retires it"
+        );
         assert!(owed(&controller).is_empty());
         drop(controller);
     }
