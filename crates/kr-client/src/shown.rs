@@ -646,16 +646,17 @@ impl Shown {
     /// store directory, or a path built from those, fixed names and identifiers.
     ///
     /// It is said whole, because where a store is kept is what somebody diagnosing it needs. A name
-    /// found by listing a directory is not this: [`Self::stored`] is.
+    /// found by listing a directory is not this: [`Self::stored`] is. Like every path said here, it
+    /// is said with the platform's own separator throughout.
     #[must_use]
     pub fn root(path: &Path) -> Self {
-        Self::decided(path.display().to_string())
+        Self::decided(spelled(path))
     }
 
     /// A fixed name this program writes under a directory it was configured with.
     #[must_use]
     pub fn within(root: &Path, name: &'static str) -> Self {
-        Self::decided(root.join(name).display().to_string())
+        Self::decided(spelled(&root.join(name)))
     }
 
     /// A file in a store: said whole when its name is one the store writes, and otherwise as its
@@ -675,9 +676,10 @@ impl Shown {
             return Self::root(path);
         }
         match path.parent() {
-            Some(directory) => Self::decided(format!(
-                "{}/[a name this store did not write]",
-                directory.display()
+            Some(directory) => Self::decided(assemble(
+                spelled(directory),
+                &[Piece::Name("[a name this store did not write]")],
+                std::path::MAIN_SEPARATOR_STR,
             )),
             None => Self::said("[a name this store did not write]"),
         }
@@ -704,10 +706,7 @@ impl Shown {
             .filter(|root| path.starts_with(root))
             .max_by_key(|root| root.components().count());
         let (start, rest) = match root {
-            Some(root) => (
-                root.display().to_string(),
-                path.strip_prefix(root).unwrap_or(path),
-            ),
+            Some(root) => (spelled(root), path.strip_prefix(root).unwrap_or(path)),
             None => (String::new(), path),
         };
         let pieces = rest
@@ -847,6 +846,25 @@ enum Piece<'a> {
     Root,
     /// A name, or its placeholder.
     Name(&'a str),
+}
+
+/// A path as text, with the platform's own separator between every two of its parts.
+///
+/// On Windows either slash separates the parts of a path, so a root written with one and a name
+/// joined with the other would be said with both; here each is the platform's own. Elsewhere only
+/// `/` separates, and a backslash is a character of a name, so the text is the path's.
+fn spelled(path: &Path) -> String {
+    path.display()
+        .to_string()
+        .chars()
+        .map(|character| {
+            if std::path::is_separator(character) {
+                std::path::MAIN_SEPARATOR
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 /// Joins the parts of a path after `start` with `separator`, as text: a placeholder is kept where a
