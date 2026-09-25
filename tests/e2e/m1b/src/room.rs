@@ -222,10 +222,11 @@ fn host_and_port(authority: &str) -> Result<(&str, u16), String> {
 /// still served the record to every question that concluded within `within`.
 ///
 /// Each question is [`serves_record`] with `probe`: a served candidate learns so at once, and one
-/// that is served nothing learns it only when `probe` has passed. A question is started only while
-/// all of it can end inside `within`: opening the socket, the probe and closing the socket. None
-/// runs past `within` whatever happens: one still running then is cut short, and it answers
-/// nothing.
+/// that is served nothing learns it only when `probe` has passed. Everything here runs against one
+/// deadline, `within` after the call: a question starts only when all of it (opening the socket,
+/// the probe and closing the socket) fits before the deadline, it is cut short at the deadline,
+/// an answer counts only when it came before the deadline, and the pause between two questions
+/// ends at the deadline at the latest. So nothing here runs past `within`.
 ///
 /// # Errors
 ///
@@ -240,17 +241,22 @@ pub async fn stops_serving(
     let deadline = started + within;
     let question = OPEN_DEADLINE + probe + CLOSE_DEADLINE;
     loop {
-        if started.elapsed() + question > within {
+        if tokio::time::Instant::now() + question > deadline {
             return Ok(None);
         }
-        match tokio::time::timeout_at(deadline, serves_record(origin, locator, probe)).await {
-            Err(_) => return Ok(None),
-            Ok(served) => {
-                if !served? {
-                    return Ok(Some(started.elapsed()));
-                }
-            }
+        let Ok(served) =
+            tokio::time::timeout_at(deadline, serves_record(origin, locator, probe)).await
+        else {
+            return Ok(None);
+        };
+        let served = served?;
+        let answered = tokio::time::Instant::now();
+        if answered > deadline {
+            return Ok(None);
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        if !served {
+            return Ok(Some(answered - started));
+        }
+        tokio::time::sleep_until((answered + Duration::from_secs(1)).min(deadline)).await;
     }
 }
