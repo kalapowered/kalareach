@@ -309,7 +309,10 @@ if ($Receipt) {
         )
     }
 
-    Set-Content -LiteralPath $Receipt -Value $lines -Encoding utf8NoBOM
+    # A line feed alone ends each line, on every platform: the release copies this record into
+    # its archive for people to check, and a Unix tool reads a carriage return as part of a line's
+    # last field.
+    Set-Content -LiteralPath $Receipt -Value (($lines -join "`n") + "`n") -NoNewline -Encoding utf8NoBOM
     Write-Host "Record of what was accepted: $Receipt"
 }
 

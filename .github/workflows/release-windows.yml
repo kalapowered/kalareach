@@ -405,8 +405,12 @@ jobs:
             $notes += ('{0}  {1}' -f $digest, $relative)
           }
 
+          # Each record people check ends its lines in a line feed alone, whatever the runner's own
+          # convention: a Unix tool reads a carriage return as part of a line's last field, and
+          # shasum, like the sha256sum macOS ships, then reports the named file missing.
           Copy-Item -LiteralPath $receipt -Destination (Join-Path $payload 'signatures.txt')
-          Add-Content -LiteralPath (Join-Path $payload 'signatures.txt') -Value $notes -Encoding utf8NoBOM
+          Add-Content -LiteralPath (Join-Path $payload 'signatures.txt') `
+            -Value (($notes -join "`n") + "`n") -NoNewline -Encoding utf8NoBOM
           $inventory['signatures.txt'] =
             (Get-FileHash -LiteralPath (Join-Path $payload 'signatures.txt') -Algorithm SHA256).Hash.ToLowerInvariant()
 
@@ -450,7 +454,7 @@ jobs:
 
           $digest = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
           Set-Content -LiteralPath (Join-Path $release 'SHA256SUMS') `
-            -Value "$digest  $(Split-Path -Leaf $archive)" -Encoding utf8NoBOM
+            -Value "$digest  $(Split-Path -Leaf $archive)`n" -NoNewline -Encoding utf8NoBOM
 
           Write-Host "$signed signed artefacts and $($unsigned.Count) data files in $(Split-Path -Leaf $archive)"
           "directory=$release" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
