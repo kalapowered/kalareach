@@ -340,6 +340,54 @@ struct Attribute {
 }
 
 impl Attribute {
+    /// Whether the attribute is taken to define and bind nothing: the built-in lint, test,
+    /// documentation and configuration attributes, the tool attributes, `tokio::test`, which runs a
+    /// test's body as written on a runtime, and a `derive` of the standard library's traits, which
+    /// adds implementations only. Any other attribute may be a macro that defines items where the
+    /// source cannot show them.
+    fn inert(&self) -> bool {
+        const BUILT_IN: &[&str] = &[
+            "allow",
+            "cfg",
+            "cold",
+            "deny",
+            "doc",
+            "expect",
+            "forbid",
+            "ignore",
+            "inline",
+            "must_use",
+            "non_exhaustive",
+            "repr",
+            "should_panic",
+            "test",
+            "track_caller",
+            "warn",
+        ];
+        const DERIVES: &[&str] = &[
+            "Clone",
+            "Copy",
+            "Debug",
+            "Default",
+            "Eq",
+            "Hash",
+            "Ord",
+            "PartialEq",
+            "PartialOrd",
+        ];
+        let path: Vec<&str> = self.path.iter().map(String::as_str).collect();
+        match path.as_slice() {
+            ["derive"] => self
+                .arguments
+                .iter()
+                .filter_map(Token::ident)
+                .all(|name| DERIVES.contains(&name)),
+            [name] => BUILT_IN.contains(name),
+            ["tokio", "test"] | ["rustfmt" | "clippy", ..] => true,
+            _ => false,
+        }
+    }
+
     fn is_test(&self) -> bool {
         self.path.last().is_some_and(|last| last == "test")
     }
@@ -693,7 +741,9 @@ fn classify(
                     .filter_map(|t| t.ident().map(str::to_owned))
                     .collect()
             });
-            let calls = body.map_or_else(BTreeSet::new, |(from, to)| calls(&tokens[from..to]));
+            let opaque = !attributes.iter().all(Attribute::inert);
+            let calls =
+                body.map_or_else(BTreeSet::new, |(from, to)| calls(&tokens[from..to], opaque));
             let imports = body.map_or_else(Vec::new, |(from, to)| body_imports(&tokens[from..to]));
             Classified::Test(Test {
                 name: name.unwrap_or_default(),
@@ -854,18 +904,35 @@ fn use_tree(tokens: &[Token], mut at: usize, prefix: &[String], found: &mut Vec<
 ///   name shows after a full stop or `::`, or before `::` or `!`, it is a method, a field, part of
 ///   a path or a macro, which binds nothing, and it does not count; a type annotation that starts
 ///   at the root (`name: ::std::...`) is no path and counts.
-/// * The body invokes no macro but those [`transparent`] names, because any other expansion may
-///   define an item of that name where the body cannot show it.
+/// * Neither the body nor the test's own attributes invoke a macro but those [`transparent`] names
+///   and the attributes [`Attribute::inert`] names, because any other expansion, a derive's or an
+///   attribute macro's included, may define an item of that name where the source cannot show it.
 ///
 /// So a call the body may have bound for itself is never taken for a function of the module. A
 /// body's `use` declarations are the map's to read.
-fn calls(tokens: &[Token]) -> BTreeSet<Vec<String>> {
+fn calls(tokens: &[Token], opaque: bool) -> BTreeSet<Vec<String>> {
     let mut found = BTreeSet::new();
     // Every name the body shows other than in a call, a method, a path or a macro.
     let mut elsewhere: BTreeSet<&str> = BTreeSet::new();
-    // Whether the body invokes a macro whose expansion may bind a name out of sight.
-    let mut opaque = false;
+    // Whether a macro, the test's own attributes included, may bind a name out of sight.
+    let mut opaque = opaque;
+    // The end of an attribute being passed over.
+    let mut skip_to = 0;
     for (index, token) in tokens.iter().enumerate() {
+        if index < skip_to {
+            continue;
+        }
+        if token.is_punct('#') {
+            let open =
+                index + usize::from(tokens.get(index + 1).is_some_and(|t| t.is_punct('!'))) + 1;
+            if tokens.get(open).is_some_and(|t| t.is_punct('['))
+                && let Some(close) = matching(tokens, open)
+            {
+                opaque |= !attribute(&tokens[open + 1..close], token.line).inert();
+                skip_to = close + 1;
+            }
+            continue;
+        }
         let Some(name) = token.ident() else {
             continue;
         };
@@ -1196,7 +1263,7 @@ mod tests {
 
     #[test]
     fn a_name_the_body_binds_for_itself_is_no_call_of_a_function_of_the_module() {
-        let read = |body: &str| calls(&lex(body).expect("lexes"));
+        let read = |body: &str| calls(&lex(body).expect("lexes"), false);
         let shared = vec!["shared".to_owned()];
         for body in [
             "let shared = || 1; shared();",
@@ -1223,6 +1290,11 @@ mod tests {
             "helpers::defines_it! {} shared();",
             "include!(\"cases.rs\"); shared();",
             "std::include!(\"cases.rs\"); shared();",
+            // So may an attribute macro or a derive other than the standard library's.
+            "#[make_shared] struct Fixture; shared();",
+            "#[derive(Debug, helpers::Shared)] struct Fixture; shared();",
+            "#[cfg_attr(unix, make_shared)] fn inner() {} shared();",
+            "#![make_shared] shared();",
         ] {
             assert!(!read(body).contains(&shared), "{body}: {:?}", read(body));
         }
@@ -1270,9 +1342,32 @@ mod tests {
             "let value = serde_json::json!({ \"a\": 1 }); shared();",
             "tokio::select! { _ = first => {} } shared();",
             "let pinned = std::pin::pin!(future); shared();",
+            // Built-in and tool attributes, and a derive of the standard library's traits, bind
+            // nothing either.
+            "#![allow(unused)] #[derive(Debug, Clone)] struct Fixture; shared();",
+            "#[cfg(unix)] #[rustfmt::skip] let x = 1; #[expect(clippy::no_effect)] shared();",
         ] {
             assert!(read(body).contains(&shared), "{body}: {:?}", read(body));
         }
+    }
+
+    #[test]
+    fn a_test_whose_own_attributes_may_be_macros_keeps_only_the_calls_that_pass_over_its_body() {
+        let modules = scan_text(
+            "#[tokio::test(flavor = \"multi_thread\")]\n#[ignore = \"needs a device\"]\nasync fn plain() { shared(); }\n\n#[test]\n#[make_shared]\nfn wrapped() { shared(); crate::shared(); }\n",
+            true,
+        );
+        let tests = tests_of(&modules[0]);
+        let shared = vec!["shared".to_owned()];
+        assert!(tests[0].calls.contains(&shared), "{:?}", tests[0].calls);
+        assert!(!tests[1].calls.contains(&shared), "{:?}", tests[1].calls);
+        assert!(
+            tests[1]
+                .calls
+                .contains(&vec!["crate".to_owned(), "shared".to_owned()]),
+            "{:?}",
+            tests[1].calls
+        );
     }
 
     #[test]

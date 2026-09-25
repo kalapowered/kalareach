@@ -630,7 +630,8 @@ impl Scope {
 /// a module with macro-made items, at a glob it cannot follow and at a visibility it cannot work
 /// out, and a call it gives up on keys nothing. So a key is never one the compiler would not make;
 /// a call the reading cannot follow leaves the helper's identifiers as references, which the result
-/// lists.
+/// lists. A call whose first name the calling body may bind for itself never comes here: the
+/// reading of the body leaves it out.
 fn reaches(
     path: &[String],
     from: &[String],
