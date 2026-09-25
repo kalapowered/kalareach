@@ -1982,153 +1982,8 @@ impl Broker {
         deadline_ms: Option<TimestampMs>,
         now: TimestampMs,
     ) -> Result<PendingResource> {
-        let mut state = self.state();
-        // Interpreting a request into something a person answers is rich work. While the journal
-        // is faulted the native forwarding path continues and this does not.
-        state.volatile.require_rich_work()?;
-        let binding = state
-            .bindings
-            .get(&binding_id)
-            .ok_or_else(|| unknown_binding(binding_id))?;
-        if !binding.grants.holds(BrokerGrant::ApprovalInterpreter) {
-            return Err(BrokerError::Grant(
-                kr_protocol::broker::GrantError::NotHeld {
-                    grant: BrokerGrant::ApprovalInterpreter,
-                },
-            ));
-        }
-        if let Some(reason) = binding.rich_disabled.as_ref() {
-            return Err(BrokerError::UnsupportedCapability {
-                detail: format!("this binding's rich capabilities are disabled: {reason}"),
-            });
-        }
-        let pending = state
-            .arbitration
-            .get(resource_id)
-            .ok_or_else(|| BrokerError::unknown(format!("no pending resource {resource_id}")))?
-            .resource
-            .clone();
-        if pending.state != PendingState::Pending {
-            return Err(BrokerError::Arbitration(
-                kr_protocol::gateway::ArbitrationError::AlreadyResolved {
-                    state: pending.state,
-                },
-            ));
-        }
-        let binding = state
-            .bindings
-            .get(&binding_id)
-            .ok_or_else(|| unknown_binding(binding_id))?;
-        if binding.application_instance_id != pending.application_instance_id {
-            return Err(BrokerError::denied(format!(
-                "binding {binding_id} is not bound to {}",
-                pending.application_instance_id
-            )));
-        }
-        if !binding.may_decode(&pending.method) {
-            return Err(BrokerError::denied(format!(
-                "this binding is not trusted to decode {}",
-                pending.method
-            )));
-        }
-        let trust = binding
-            .trust
-            .as_ref()
-            .ok_or_else(|| BrokerError::denied("this binding holds no decoding trust"))?;
-        trust.check_projection(&projection)?;
-        let plugin_id = binding.plugin_id.clone();
-        let publisher_id = binding.publisher_id.clone();
-        let package_digest = binding.package_digest;
-        let application_instance_id = pending.application_instance_id;
-
-        // The frame is the one *this request* was recorded from. A caller naming any other would
-        // put one request's bytes in another's ledger row, so it does not get to name one.
-        let handle = state
-            .arbitration
-            .source_of(resource_id)
-            .cloned()
-            .ok_or_else(|| BrokerError::PreconditionFailed {
-                detail: format!("{resource_id} was not recorded from a source event of its own"),
-            })?;
-        let handle = &handle;
-        let instance = state
-            .instances
-            .get(&application_instance_id)
-            .ok_or_else(|| unknown_instance(application_instance_id))?;
-        let frame = instance.frames.get(handle).cloned().ok_or_else(|| {
-            BrokerError::PreconditionFailed {
-                detail: format!(
-                    "source event {handle} has already been consumed, so {resource_id} has already \
-                     been interpreted"
-                ),
-            }
-        })?;
-        if frame.generation != instance.source_generation {
-            return Err(BrokerError::PreconditionFailed {
-                detail: format!(
-                    "source event {handle} is from generation {} and the binding is at {}",
-                    frame.generation, instance.source_generation
-                ),
-            });
-        }
-        // Section 11 requires the ledger to retain the original source, and a partial copy is not
-        // the original. A request too large to keep whole is not turned into an approval: it is
-        // still forwarded opaquely on the native path, which depends on nothing this host stores.
-        if frame.bytes().len() > MAX_RETAINED_SOURCE_BYTES {
-            return Err(BrokerError::UnsupportedCapability {
-                detail: format!(
-                    "source event {handle} is {} bytes and an approval's original source is \
-                     retained whole up to {MAX_RETAINED_SOURCE_BYTES}",
-                    frame.bytes().len()
-                ),
-            });
-        }
-
-        let entry = DecoderLedgerEntry {
-            binding_id,
-            plugin_id,
-            publisher_id,
-            package_digest,
-            method: pending.method.clone(),
-            upstream_request_id: pending.request.upstream.clone(),
-            source_generation: frame.generation,
-            source_digest: frame.digest,
-            source_bytes: Bytes::from(frame.bytes().to_vec()),
-            projection,
-            deadline_ms: Nullable::from(deadline_ms),
-            decoded_at: now,
-        };
-        let interpreted = PendingResource {
-            kind: PendingKind::Approval,
-            deadline_ms: Nullable::from(deadline_ms),
-            interpretation_verified: true,
-            ..pending
-        };
-        // A recorded request becoming an answerable approval is a durable change of that resource,
-        // so its own event goes in the same transaction as the change.
-        let event = state.next_transition_event(
-            &interpreted,
-            now,
-            crate::broker::ledger::TransitionCause::Interpreted,
-            None,
-        );
-        let admitted = state.stored(now, "an interpretation", |ledger| {
-            ledger.admit_resource(handle, binding_id, &entry, &interpreted, now, &event)
-        })?;
-        if !admitted {
-            return Err(BrokerError::PreconditionFailed {
-                detail: format!("source event {handle} has already produced an interpretation"),
-            });
-        }
-        state.remember(&event);
-        state.publish(&interpreted, &event);
-        state
-            .arbitration
-            .set_interpretation(resource_id, interpreted.clone(), binding_id)?;
-        if let Some(instance) = state.instances.get_mut(&application_instance_id) {
-            instance.release(handle);
-        }
-        Ok(interpreted)
+        self.state()
+            .interpret_in(binding_id, resource_id, projection, deadline_ms, now)
     }
 
     /// Returns the decoder entry behind one pending resource.
@@ -3028,7 +2883,9 @@ impl Broker {
         installed_protocol_version: &str,
     ) -> Result<()> {
         let mut state = self.state();
-        if state.gateway.connection(connection).is_some() {
+        // A live connection of either kind: an identifier a channel holds is live too, and
+        // restoring it as a declarative connection would give one identifier two readers.
+        if state.gateway.contains(connection) {
             return Err(BrokerError::denied(format!(
                 "{connection} is a live connection, and a restoration is not a replacement"
             )));
@@ -3613,6 +3470,163 @@ impl BrokerState {
             return None;
         }
         self.finish_recovery(generation, now).ok()
+    }
+
+    /// Verifies a decoder's interpretation under the lock the caller holds. See
+    /// [`Broker::interpret`].
+    fn interpret_in(
+        &mut self,
+        binding_id: BrokerBindingId,
+        resource_id: PendingResourceId,
+        projection: DecodedProjection,
+        deadline_ms: Option<TimestampMs>,
+        now: TimestampMs,
+    ) -> Result<PendingResource> {
+        // Interpreting a request into something a person answers is rich work. While the journal
+        // is faulted the native forwarding path continues and this does not.
+        self.volatile.require_rich_work()?;
+        let binding = self
+            .bindings
+            .get(&binding_id)
+            .ok_or_else(|| unknown_binding(binding_id))?;
+        if !binding.grants.holds(BrokerGrant::ApprovalInterpreter) {
+            return Err(BrokerError::Grant(
+                kr_protocol::broker::GrantError::NotHeld {
+                    grant: BrokerGrant::ApprovalInterpreter,
+                },
+            ));
+        }
+        if let Some(reason) = binding.rich_disabled.as_ref() {
+            return Err(BrokerError::UnsupportedCapability {
+                detail: format!("this binding's rich capabilities are disabled: {reason}"),
+            });
+        }
+        let pending = self
+            .arbitration
+            .get(resource_id)
+            .ok_or_else(|| BrokerError::unknown(format!("no pending resource {resource_id}")))?
+            .resource
+            .clone();
+        if pending.state != PendingState::Pending {
+            return Err(BrokerError::Arbitration(
+                kr_protocol::gateway::ArbitrationError::AlreadyResolved {
+                    state: pending.state,
+                },
+            ));
+        }
+        let binding = self
+            .bindings
+            .get(&binding_id)
+            .ok_or_else(|| unknown_binding(binding_id))?;
+        if binding.application_instance_id != pending.application_instance_id {
+            return Err(BrokerError::denied(format!(
+                "binding {binding_id} is not bound to {}",
+                pending.application_instance_id
+            )));
+        }
+        if !binding.may_decode(&pending.method) {
+            return Err(BrokerError::denied(format!(
+                "this binding is not trusted to decode {}",
+                pending.method
+            )));
+        }
+        let trust = binding
+            .trust
+            .as_ref()
+            .ok_or_else(|| BrokerError::denied("this binding holds no decoding trust"))?;
+        trust.check_projection(&projection)?;
+        let plugin_id = binding.plugin_id.clone();
+        let publisher_id = binding.publisher_id.clone();
+        let package_digest = binding.package_digest;
+        let application_instance_id = pending.application_instance_id;
+
+        // The frame is the one *this request* was recorded from. A caller naming any other would
+        // put one request's bytes in another's ledger row, so it does not get to name one.
+        let handle = self
+            .arbitration
+            .source_of(resource_id)
+            .cloned()
+            .ok_or_else(|| BrokerError::PreconditionFailed {
+                detail: format!("{resource_id} was not recorded from a source event of its own"),
+            })?;
+        let handle = &handle;
+        let instance = self
+            .instances
+            .get(&application_instance_id)
+            .ok_or_else(|| unknown_instance(application_instance_id))?;
+        let frame = instance.frames.get(handle).cloned().ok_or_else(|| {
+            BrokerError::PreconditionFailed {
+                detail: format!(
+                    "source event {handle} has already been consumed, so {resource_id} has already \
+                     been interpreted"
+                ),
+            }
+        })?;
+        if frame.generation != instance.source_generation {
+            return Err(BrokerError::PreconditionFailed {
+                detail: format!(
+                    "source event {handle} is from generation {} and the binding is at {}",
+                    frame.generation, instance.source_generation
+                ),
+            });
+        }
+        // Section 11 requires the ledger to retain the original source, and a partial copy is not
+        // the original. A request too large to keep whole is not turned into an approval: it is
+        // still forwarded opaquely on the native path, which depends on nothing this host stores.
+        if frame.bytes().len() > MAX_RETAINED_SOURCE_BYTES {
+            return Err(BrokerError::UnsupportedCapability {
+                detail: format!(
+                    "source event {handle} is {} bytes and an approval's original source is \
+                     retained whole up to {MAX_RETAINED_SOURCE_BYTES}",
+                    frame.bytes().len()
+                ),
+            });
+        }
+
+        let entry = DecoderLedgerEntry {
+            binding_id,
+            plugin_id,
+            publisher_id,
+            package_digest,
+            method: pending.method.clone(),
+            upstream_request_id: pending.request.upstream.clone(),
+            source_generation: frame.generation,
+            source_digest: frame.digest,
+            source_bytes: Bytes::from(frame.bytes().to_vec()),
+            projection,
+            deadline_ms: Nullable::from(deadline_ms),
+            decoded_at: now,
+        };
+        let interpreted = PendingResource {
+            kind: PendingKind::Approval,
+            deadline_ms: Nullable::from(deadline_ms),
+            interpretation_verified: true,
+            ..pending
+        };
+        // A recorded request becoming an answerable approval is a durable change of that resource,
+        // so its own event goes in the same transaction as the change.
+        let event = self.next_transition_event(
+            &interpreted,
+            now,
+            crate::broker::ledger::TransitionCause::Interpreted,
+            None,
+        );
+        let admitted = self.stored(now, "an interpretation", |ledger| {
+            ledger.admit_resource(handle, binding_id, &entry, &interpreted, now, &event)
+        })?;
+        if !admitted {
+            return Err(BrokerError::PreconditionFailed {
+                detail: format!("source event {handle} has already produced an interpretation"),
+            });
+        }
+        self.remember(&event);
+        self.publish(&interpreted, &event);
+        self.arbitration
+            .set_interpretation(resource_id, interpreted.clone(), binding_id)?;
+        if let Some(instance) = self.instances.get_mut(&application_instance_id) {
+            instance.release(handle);
+        }
+        Ok(interpreted)
     }
 
     /// Runs writes made under this lock during a recovery, taking the store's lock without waiting.

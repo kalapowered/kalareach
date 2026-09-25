@@ -30,12 +30,12 @@ use std::sync::{Arc, Mutex, Weak};
 
 use kr_protocol::broker::{
     ActionProvenance, DecodedProjection, InstanceCapabilityIdentity, InstanceCapabilityRecord,
-    InstanceCapabilityState, InstanceEvidenceSource, InstanceInvalidation,
+    InstanceCapabilityState, InstanceEvidenceSource, InstanceInvalidation, MethodTableVersionText,
 };
 use kr_protocol::gateway::{GatewayMode, PendingResource};
 use kr_protocol::ids::{
     ApplicationInstanceId, CapabilityId, CapabilityRevision, EnvironmentId, GatewayConnectionId,
-    PendingResourceId, SessionId,
+    PendingResourceId, PublisherId, SessionId,
 };
 use kr_protocol::scalars::{Nullable, TimestampMs};
 
@@ -164,9 +164,16 @@ pub async fn serve(
         )))
     });
     let mut writing = tokio::spawn(write_answers(Arc::clone(&broker), writer, outgoing));
+    // The channel ends with whichever of its three ends comes first. A writer that could not write
+    // leaves a connection nothing can answer on, however long the reader stays open.
+    let mut writer_ended = false;
     let why = tokio::select! {
         biased;
         () = until => "the launch it belongs to ended".to_owned(),
+        stopped = &mut writing => {
+            writer_ended = true;
+            stopped.unwrap_or_else(|error| format!("the channel's writer stopped: {error}"))
+        }
         why = read_until_ended(&launch, connection, &mut reader) => why,
     };
     let settled = broker
@@ -178,9 +185,10 @@ pub async fn serve(
     }
     // What was already queued may still go out, for as long as a connection's writes are given at
     // teardown; the resources they answer were settled as what may have happened.
-    if tokio::time::timeout(crate::broker::attach::TEARDOWN_DEADLINE, &mut writing)
-        .await
-        .is_err()
+    if !writer_ended
+        && tokio::time::timeout(crate::broker::attach::TEARDOWN_DEADLINE, &mut writing)
+            .await
+            .is_err()
     {
         writing.abort();
         let _ = (&mut writing).await;
@@ -216,9 +224,7 @@ async fn read_until_ended(
                 resource: Some(resource),
                 ..
             }) => {
-                launch
-                    .broker
-                    .note_relayed_approval(launch.application_instance_id, now);
+                launch.broker.note_relayed_approval(connection, now);
                 // A request no binding may decode stays recorded and unanswerable here.
                 let _ = launch.broker.interpret_declared(resource.resource_id, now);
             }
@@ -239,12 +245,14 @@ struct Outgoing {
     written: tokio::sync::oneshot::Sender<Result<()>>,
 }
 
-/// Writes admitted answers on the channel, one at a time, until the channel is shut.
+/// Writes admitted answers on the channel, one at a time, until the channel is shut or a write
+/// fails, and says which.
 async fn write_answers(
     broker: Arc<Broker>,
     mut writer: BridgeWriter,
     mut outgoing: tokio::sync::mpsc::Receiver<Outgoing>,
-) {
+) -> String {
+    let mut why = "the channel was shut".to_owned();
     while let Some(Outgoing { frame, written }) = outgoing.recv().await {
         broker.at_channel_write_pause().await;
         let result = tokio::time::timeout(BRIDGE_FRAME_DEADLINE, writer.write_frame(&frame))
@@ -257,14 +265,19 @@ async fn write_answers(
                     ),
                 })
             });
-        let failed = result.is_err();
+        let failed = result
+            .as_ref()
+            .err()
+            .map(|error| format!("the channel's writer could not write an answer: {error}"));
         let _ = written.send(result);
         // A write that failed leaves the connection unusable, and the answers behind it are told.
-        if failed {
+        if let Some(failed) = failed {
+            why = failed;
             break;
         }
     }
     writer.close().await;
+    why
 }
 
 /// What carries answers out on one channel.
@@ -457,12 +470,17 @@ impl Broker {
                 ),
             });
         }
+        let publisher_id = PublisherId::new(connector.manifest().publisher_id.as_str())
+            .map_err(|error| BrokerError::invalid(format!("the package's publisher: {error}")))?;
         let connection = state.mint_connection();
         state.gateway.open_channel(ChannelConnection {
             connection,
             application_instance_id,
             process: bridge.identity.clone(),
             plugin_id: connector.plugin_id(),
+            publisher_id,
+            package_digest: connector.package_digest(),
+            version: version.to_owned(),
             table: Arc::new(table.clone()),
             offered: connector.offered_decisions(),
         });
@@ -534,7 +552,9 @@ impl Broker {
         }
         state.channel_evidence(
             application_instance_id,
-            Some("the application's channel closed, so nothing relays an answer to it"),
+            Evidence::Withdrawn(
+                "the application's channel closed, so nothing relays an answer to it",
+            ),
             now,
         );
         Some(settled)
@@ -542,13 +562,37 @@ impl Broker {
 
     /// Records that a channel relayed an approval: the application relays only to a channel it
     /// registered, so the instance's approval capability is available from a live binding.
-    pub fn note_relayed_approval(
-        &self,
-        application_instance_id: ApplicationInstanceId,
-        now: TimestampMs,
-    ) {
-        self.state()
-            .channel_evidence(application_instance_id, None, now);
+    ///
+    /// The record names what established it: the executable the launch hashed, the version a
+    /// signed record names for it, the connector package by its identifier, hash and publisher,
+    /// and the launch profile.
+    pub fn note_relayed_approval(&self, connection: GatewayConnectionId, now: TimestampMs) {
+        let mut state = self.state();
+        let Some(channel) = state.gateway.channel(connection) else {
+            return;
+        };
+        let application_instance_id = channel.application_instance_id;
+        let mut identity = InstanceCapabilityIdentity {
+            schema_version: Nullable::some(MethodTableVersionText(channel.version.clone())),
+            plugin_id: Nullable::some(channel.plugin_id.clone()),
+            package_digest: Nullable::some(channel.package_digest),
+            publisher_id: Nullable::some(channel.publisher_id.clone()),
+            ..InstanceCapabilityIdentity::default()
+        };
+        if let Some(instance) = state.instances.get(&application_instance_id) {
+            identity.binary_digest = Nullable::from(
+                instance
+                    .process
+                    .as_ref()
+                    .map(|launched| launched.handle.executable_digest),
+            );
+            identity.profile_id = Nullable::from(instance.profile_id.clone());
+        }
+        state.channel_evidence(
+            application_instance_id,
+            Evidence::Available(Box::new(identity)),
+            now,
+        );
     }
 
     /// Interprets one resource a channel relayed, from the connector table's own decision
@@ -571,8 +615,10 @@ impl Broker {
         resource_id: PendingResourceId,
         now: TimestampMs,
     ) -> Result<Option<PendingResource>> {
+        // One lock for the choice of decoder and the interpretation it commits, so the binding
+        // chosen for this channel's package is the one whose trust the interpretation records.
+        let mut state = self.state();
         let (binding_id, projection) = {
-            let state = self.state();
             let pending = state
                 .arbitration
                 .get(resource_id)
@@ -588,9 +634,14 @@ impl Broker {
                          gives it a meaning"
                     ))
                 })?;
+            // A binding of exactly the package whose table the channel reads: the same identifier
+            // at other bytes or from another publisher is another decoder, whose meaning this
+            // table's answer would not carry.
             let Some(binding) = state.bindings.values().find(|binding| {
                 binding.application_instance_id == pending.application_instance_id
                     && binding.plugin_id == channel.plugin_id
+                    && binding.publisher_id == channel.publisher_id
+                    && binding.package_digest == channel.package_digest
                     && binding.may_decode(&pending.method)
             }) else {
                 return Ok(None);
@@ -604,7 +655,8 @@ impl Broker {
                 },
             )
         };
-        self.interpret(binding_id, resource_id, projection, None, now)
+        state
+            .interpret_in(binding_id, resource_id, projection, None, now)
             .map(Some)
     }
 
@@ -648,16 +700,24 @@ impl Broker {
     async fn at_channel_write_pause(&self) {}
 }
 
+/// What a channel says about its instance's approval capability.
+enum Evidence<'a> {
+    /// Available from the live channel, established by this identity.
+    Available(Box<InstanceCapabilityIdentity>),
+    /// Unavailable, for this reason, since the channel closed.
+    Withdrawn(&'a str),
+}
+
 impl BrokerState {
-    /// Records what a channel says about the instance's approval capability: available from a
-    /// live binding, or unavailable for `unavailable`'s reason once it has closed.
+    /// Records what a channel says about the instance's approval capability.
     ///
     /// Only a change is recorded, as the next revision of the capability's record, so a stream of
-    /// relayed approvals does not move the revision a client read.
+    /// relayed approvals does not move the revision a client read. A withdrawal keeps the identity
+    /// the evidence was established by.
     fn channel_evidence(
         &mut self,
         application_instance_id: ApplicationInstanceId,
-        unavailable: Option<&str>,
+        evidence: Evidence<'_>,
         now: TimestampMs,
     ) {
         let Ok(capability_id) = CapabilityId::new(APPROVAL_CAPABILITY) else {
@@ -668,17 +728,28 @@ impl BrokerState {
             .map(application_instance_id)
             .record(&capability_id)
             .cloned();
-        let usable = unavailable.is_none();
-        match held.as_ref() {
-            // Nothing to say an approval is unavailable about when nothing said it was available.
-            None if !usable => return,
-            Some(record) if record.state.is_usable() == usable => return,
-            // Only the channel's own evidence is withdrawn by the channel.
-            Some(record) if !usable && record.source != InstanceEvidenceSource::LiveBinding => {
-                return;
+        let (state, identity, reason) = match evidence {
+            Evidence::Available(identity) => {
+                if held.as_ref().is_some_and(|record| record.state.is_usable()) {
+                    return;
+                }
+                (InstanceCapabilityState::QualifiedAvailable, *identity, None)
             }
-            _ => {}
-        }
+            Evidence::Withdrawn(reason) => {
+                // Only the channel's own evidence is withdrawn by the channel, and there is nothing
+                // to withdraw where nothing said the capability was available.
+                let Some(record) = held.as_ref().filter(|record| {
+                    record.state.is_usable() && record.source == InstanceEvidenceSource::LiveBinding
+                }) else {
+                    return;
+                };
+                (
+                    InstanceCapabilityState::TemporarilyUnavailable,
+                    record.identity.clone(),
+                    Some(reason.to_owned()),
+                )
+            }
+        };
         if !self.instances.contains_key(&application_instance_id) {
             return;
         }
@@ -687,13 +758,9 @@ impl BrokerState {
             capability_id,
             capability_version: "1".to_owned(),
             application_instance_id,
-            identity: InstanceCapabilityIdentity::default(),
+            identity,
             revision: CapabilityRevision::new(revision.saturating_add(1)),
-            state: if usable {
-                InstanceCapabilityState::QualifiedAvailable
-            } else {
-                InstanceCapabilityState::TemporarilyUnavailable
-            },
+            state,
             source: InstanceEvidenceSource::LiveBinding,
             invalidated_by: [
                 InstanceInvalidation::BinaryChanged,
@@ -701,7 +768,7 @@ impl BrokerState {
             ]
             .into_iter()
             .collect(),
-            disabled_reason: Nullable::from(unavailable.map(str::to_owned)),
+            disabled_reason: Nullable::from(reason),
             observed_at: now,
         });
     }

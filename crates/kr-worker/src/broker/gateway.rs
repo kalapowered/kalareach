@@ -196,6 +196,14 @@ pub struct ChannelConnection {
     pub process: ProcessStartIdentity,
     /// The connector package whose table reads it.
     pub plugin_id: kr_protocol::ids::PluginId,
+    /// That package's publisher.
+    pub publisher_id: kr_protocol::ids::PublisherId,
+    /// The installed package's hash: a decoder speaks for this channel only as a binding of
+    /// exactly this package.
+    pub package_digest: kr_protocol::scalars::Digest256,
+    /// The version of the application the table is qualified for here, as a signed record names it
+    /// for the executable's digest.
+    pub version: String,
     /// That table, from the installed package, qualified against the running version.
     pub table: std::sync::Arc<ConnectorManifest>,
     /// The decisions a request this channel relays is offered when the table gives it meaning,

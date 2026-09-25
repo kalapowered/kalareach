@@ -152,7 +152,17 @@ struct Channel {
 impl Channel {
     /// Hands one admitted channel, started by `starter`, to the consumer.
     fn open(launch: ChannelLaunch, number: u8, starter: ProcessStartIdentity) -> Self {
-        let (ours, theirs) = tokio::io::duplex(64 * 1024);
+        Self::open_with(launch, number, starter, 64 * 1024)
+    }
+
+    /// The same, over a connection that holds at most `buffer` bytes each way unread.
+    fn open_with(
+        launch: ChannelLaunch,
+        number: u8,
+        starter: ProcessStartIdentity,
+        buffer: usize,
+    ) -> Self {
+        let (ours, theirs) = tokio::io::duplex(buffer);
         let (reader, writer) = tokio::io::split(theirs);
         let admitted = AdmittedBridge {
             surface: BridgeSurface::Channel,
@@ -219,6 +229,15 @@ impl Channel {
             .expect("the channel says something or closes in time")
             .expect("the channel reads")?;
         Some(serde_json::from_str(&line).expect("a frame is JSON"))
+    }
+
+    /// Waits for the consumer to end while the channel server's end stays open, and says how it
+    /// did.
+    async fn ended_while_open(&mut self) -> ChannelEnd {
+        tokio::time::timeout(LIVENESS_DEADLINE, &mut self.served)
+            .await
+            .expect("the consumer ends in time")
+            .expect("the consumer's task joins")
     }
 
     /// Waits for the consumer to end, and says how it did.
@@ -987,4 +1006,250 @@ async fn kr_req_12_18_answering_follows_the_installations_grants() {
     );
     channel.close().await;
     let _ = channel.ended().await;
+}
+
+/// The approval capability's record for one instance.
+fn approval_evidence(
+    broker: &Broker,
+    number: u8,
+) -> Option<kr_protocol::broker::InstanceCapabilityRecord> {
+    broker
+        .capabilities(instance(number))
+        .record(&kr_protocol::ids::CapabilityId::new("agent.approval").expect("valid"))
+        .cloned()
+}
+
+/// KR-REQ-12.18: a channel whose writer cannot deliver an answer, because the application stopped
+/// reading it, is closed however long its reading end stays open: its transports go, what it
+/// relayed is settled, the approval evidence is withdrawn with the identity that established it,
+/// and the instance can open its channel again.
+#[tokio::test]
+async fn kr_req_12_18_a_channel_whose_writer_fails_is_closed_while_its_reader_is_open() {
+    let broker = memory_broker();
+    register(&broker, 2);
+    let package = Package::new();
+    package.bind(&broker, 2);
+    // A connection that holds 64 bytes unread: an answer does not fit while nothing reads it.
+    let mut channel = Channel::open_with(
+        package.launch(&broker, 2, Some(fixture::QUALIFIED_VERSION)),
+        2,
+        launched(2),
+        64,
+    );
+    channel.relay("abcde").await;
+    eventually("the approval is interpreted", || {
+        relayed(&broker, 2, "abcde").is_some_and(|resource| resource.interpretation_verified)
+    })
+    .await;
+    let resource = relayed(&broker, 2, "abcde").expect("recorded");
+    let connection = resource.request.connection;
+    let evidence = approval_evidence(&broker, 2).expect("the relayed approval is evidence");
+    assert!(evidence.state.is_usable());
+    assert_eq!(
+        evidence.identity.package_digest.as_ref(),
+        Some(&package.connector.package_digest()),
+        "the evidence names the package that established it"
+    );
+    assert_eq!(
+        evidence
+            .identity
+            .schema_version
+            .as_ref()
+            .map(|version| version.0.as_str()),
+        Some(fixture::QUALIFIED_VERSION)
+    );
+    assert_eq!(
+        evidence.identity.binary_digest.as_ref(),
+        Some(&Digest256::from_bytes([3; 32])),
+        "and the executable the launch hashed"
+    );
+
+    let answering = {
+        let broker = Arc::clone(&broker);
+        let params = respond(2, &resource, "allow");
+        tokio::spawn(async move {
+            broker
+                .agent_approval_respond(&caller(), &params, TimestampMs::new(5))
+                .await
+                .map(|(result, _)| result)
+        })
+    };
+    let ChannelEnd::Ended { why, .. } = channel.ended_while_open().await else {
+        panic!("the channel was served");
+    };
+    assert!(why.contains("writer"), "{why}");
+    assert!(
+        answering.await.expect("the answer's task joins").is_err(),
+        "an answer that could not be written is not an applied one"
+    );
+    assert!(
+        broker.connection_dispatch(connection).is_none(),
+        "nothing carries answers on the closed channel"
+    );
+    assert_eq!(
+        broker
+            .pending(resource.resource_id)
+            .map(|resource| resource.state),
+        Some(PendingState::Uncertain),
+        "the answer went and nothing says whether it arrived"
+    );
+    let withdrawn = approval_evidence(&broker, 2).expect("the record is kept");
+    assert_eq!(
+        withdrawn.state,
+        kr_protocol::broker::InstanceCapabilityState::TemporarilyUnavailable
+    );
+    assert_eq!(withdrawn.identity, evidence.identity, "with its identity");
+
+    let mut again = Channel::open(
+        package.launch(&broker, 2, Some(fixture::QUALIFIED_VERSION)),
+        2,
+        launched(2),
+    );
+    again.relay("fghij").await;
+    eventually("the instance's next channel is served", || {
+        relayed(&broker, 2, "fghij").is_some()
+    })
+    .await;
+    again.close().await;
+    assert!(matches!(again.ended().await, ChannelEnd::Ended { .. }));
+}
+
+/// KR-REQ-12.18: only a binding of exactly the package whose table the channel reads gives what it
+/// relays a meaning. A binding of the same identifier at other bytes interprets nothing, and a
+/// binding of the package itself does.
+#[tokio::test]
+async fn kr_req_12_18_only_the_channels_own_package_interprets_what_it_relays() {
+    let broker = memory_broker();
+    register(&broker, 2);
+    let package = Package::new();
+    let other = Digest256::from_bytes([7; 32]);
+    let trust = decoding_trust(&package.connector, TimestampMs::new(1)).map(|trust| {
+        kr_protocol::broker::DecodingTrust {
+            package_digest: other,
+            ..trust
+        }
+    });
+    broker
+        .bind(
+            binding(9),
+            instance(2),
+            package.connector.plugin_id(),
+            PublisherId::new("kalareach").expect("valid"),
+            other,
+            BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
+            trust,
+            TimestampMs::new(1),
+        )
+        .expect("the same identifier at other bytes is bound");
+    let mut channel = Channel::open(
+        package.launch(&broker, 2, Some(fixture::QUALIFIED_VERSION)),
+        2,
+        launched(2),
+    );
+    channel.relay("abcde").await;
+    // A second frame recorded means the first has been handled whole, its interpretation included.
+    channel.relay("fghij").await;
+    eventually("both approvals are recorded", || {
+        relayed(&broker, 2, "fghij").is_some()
+    })
+    .await;
+    assert!(
+        !relayed(&broker, 2, "abcde")
+            .expect("recorded")
+            .interpretation_verified,
+        "another package's binding gives it no meaning"
+    );
+
+    package.bind(&broker, 2);
+    channel.relay("kmnop").await;
+    eventually("the package's own binding interprets it", || {
+        relayed(&broker, 2, "kmnop").is_some_and(|resource| resource.interpretation_verified)
+    })
+    .await;
+    channel.close().await;
+    assert!(matches!(channel.ended().await, ChannelEnd::Ended { .. }));
+}
+
+/// KR-REQ-12.18: a channel's identifier is a live connection, so restoring a declarative connection
+/// under it is refused, and the channel goes on being served.
+#[tokio::test]
+async fn kr_req_12_18_a_channels_identifier_is_not_restored_as_another_connection() {
+    use kr_protocol::gateway::{
+        DeclarativeEntry, DeclarativeTable, NativeMethodClass, RichMethodEntry, RichMethodTable,
+        RichOperation,
+    };
+    use kr_protocol::ids::{MethodTableVersion, PluginId, UpstreamMethod};
+    let broker = memory_broker();
+    register(&broker, 2);
+    let package = Package::new();
+    let mut channel = Channel::open(
+        package.launch(&broker, 2, Some(fixture::QUALIFIED_VERSION)),
+        2,
+        launched(2),
+    );
+    channel.relay("abcde").await;
+    eventually("the approval is recorded", || {
+        relayed(&broker, 2, "abcde").is_some()
+    })
+    .await;
+    let connection = relayed(&broker, 2, "abcde")
+        .expect("recorded")
+        .request
+        .connection;
+    let declarative = PluginId::new("kalareach.codex").expect("valid");
+    let mut table = DeclarativeTable {
+        plugin_id: declarative.clone(),
+        publisher_id: PublisherId::new("kalareach").expect("valid"),
+        table_version: MethodTableVersion::new(1),
+        upstream_protocol_version: "1".to_owned(),
+        digest: Digest256::from_bytes([1; 32]),
+        framing: NativeFraming::JsonLines,
+        request_id_field: "id".to_owned(),
+        response_id_field: "id".to_owned(),
+        method_field: "method".to_owned(),
+        params_field: "params".to_owned(),
+        result_field: "result".to_owned(),
+        error_field: "error".to_owned(),
+        entries: vec![DeclarativeEntry {
+            method: UpstreamMethod::new("session/update").expect("valid"),
+            class: NativeMethodClass::Observation,
+            expects_response: false,
+            approval_option_field: Nullable::null(),
+            reverse: Nullable::null(),
+        }],
+    };
+    table.digest = table.canonical_digest().expect("encodable");
+    let rich = RichMethodTable {
+        table_version: MethodTableVersion::new(1),
+        upstream_protocol_version: "1".to_owned(),
+        entries: vec![RichMethodEntry {
+            method: UpstreamMethod::new("session/cancel").expect("valid"),
+            class: NativeMethodClass::Mutation,
+            required_right: kr_protocol::rights::ActionRight::AgentCancel,
+            operation: Nullable::some(RichOperation::TurnCancel),
+            provenance: kr_protocol::broker::ActionProvenance::UpstreamTypedRpc,
+        }],
+    };
+    broker
+        .pin_table(instance(2), table, rich)
+        .expect("a declarative table is pinned");
+    let refused = broker
+        .restore_native_connection(
+            connection,
+            instance(2),
+            &[9; 32],
+            &launched(2),
+            &declarative,
+            "1",
+        )
+        .expect_err("a live channel's identifier is not restored");
+    assert!(refused.to_string().contains("live connection"), "{refused}");
+
+    channel.relay("fghij").await;
+    eventually("the channel is still served", || {
+        relayed(&broker, 2, "fghij").is_some()
+    })
+    .await;
+    channel.close().await;
+    assert!(matches!(channel.ended().await, ChannelEnd::Ended { .. }));
 }
