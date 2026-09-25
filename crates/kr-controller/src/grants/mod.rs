@@ -175,6 +175,23 @@ pub enum Refusal {
 }
 
 impl Refusal {
+    /// Whether the clock decided this refusal: a grant's expiry, a lapsed offline bound or a lapsed
+    /// membership lease.
+    ///
+    /// Such a refusal is answered only once the clock floor it stood on is on disk: before that, a
+    /// clock wound back before the next start would decide the other way.
+    #[must_use]
+    pub const fn is_clock_decided(&self) -> bool {
+        matches!(
+            self,
+            Self::Expired { .. }
+                | Self::OfflineValidityLapsed { .. }
+                | Self::MembershipUnusable {
+                    refusal: MembershipRefusal::LeaseExpired
+                }
+        )
+    }
+
     /// The sentence a caller is told.
     #[must_use]
     pub fn detail(&self) -> String {

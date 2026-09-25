@@ -265,6 +265,18 @@ impl std::fmt::Debug for WallClock {
     }
 }
 
+/// Whether a device may present a membership lease for an organisation
+/// ([`Controller::present_membership_lease`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Standing {
+    /// It holds a live grant that requires the organisation, and its pairing stands.
+    Holds,
+    /// It does not.
+    Lacks,
+    /// A lapse decides it, and the clock floor that lapse was found on is not on disk yet.
+    Unrecorded,
+}
+
 /// The two clocks a daemon measures time on.
 ///
 /// The continuous clock carries every deadline the daemon decides, and the wall clock every
@@ -2083,9 +2095,13 @@ impl Controller {
 
     /// Decides a membership lease a device presents to this host, and installs it when it is new.
     ///
-    /// The device has to hold a live grant on this host that requires the lease's organisation:
-    /// its pairing grant while it is paired, or a redeemed grant naming it as recipient that is
-    /// neither revoked nor expired. Everything the lease itself states is then
+    /// A paired device presents on its pairing's standing: paired, and its grant in force on both
+    /// clocks. The device has to hold a live grant on this host that requires the lease's
+    /// organisation: its pairing grant, or a redeemed grant naming it as recipient that is neither
+    /// revoked nor expired. Both are decided under the policy's lock, which is held until the lease
+    /// is published; a revocation records the device revoked before it removes the device's
+    /// bindings under the same lock, so a presentation either finds the device revoked or makes a
+    /// binding the revocation then removes. Everything the lease itself states is then
     /// [`crate::grants::HostPolicy::install_lease`]'s, at this host's reading of UTC while its
     /// clock is trusted and on the continuous clock every deadline here is measured on. The first
     /// lease a device presents in an organisation binds it to that lease's account and key; a lease
@@ -2119,14 +2135,16 @@ impl Controller {
         use crate::grants::organisation::{LeaseChange, LeasePresentation};
 
         let organisation_id = lease.payload.organisation_id;
-        if !self.holds_organisation_grant(device_id, organisation_id)? {
-            return Ok(Err(LeaseRefused::NoOrganisationGrant));
-        }
         let reading = self.lifetimes.clock_trust().sample(&self.devices)?;
         let mut held = self
             .policy
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match self.organisation_standing(device_id, organisation_id, &held)? {
+            Standing::Holds => {}
+            Standing::Lacks => return Ok(Err(LeaseRefused::NoOrganisationGrant)),
+            Standing::Unrecorded => return Ok(Err(LeaseRefused::FloorUnrecorded)),
+        }
         let mut candidate = held.clone();
         let installed = match candidate.install_lease(LeasePresentation {
             lease,
@@ -2192,38 +2210,80 @@ impl Controller {
         Ok(Ok(installed))
     }
 
-    /// Whether `device_id` holds a live grant on this host that requires membership of
-    /// `organisation_id`: its pairing grant while it is paired, or a redeemed grant naming it as
-    /// recipient that is neither revoked nor expired.
-    fn holds_organisation_grant(
+    /// Whether `device_id` may present a lease for `organisation_id`, decided with the policy's lock
+    /// held as `policy`.
+    ///
+    /// A paired device needs its pairing to stand: paired, and its grant in force on both clocks
+    /// (UTC through this host's floor, the continuous clock through the grant's anchor in this
+    /// boot). Then it needs a live grant that requires the organisation: its pairing grant, or a
+    /// redeemed grant naming it as recipient that is neither revoked nor expired. A lapse found at
+    /// a reading the floor on disk does not cover yet is owed that record, and is answered as
+    /// unrecorded until the record is written.
+    fn organisation_standing(
         &self,
         device_id: kr_protocol::ids::DeviceId,
         organisation_id: kr_protocol::ids::OrganisationId,
-    ) -> Result<bool> {
+        policy: &std::sync::MutexGuard<'_, crate::grants::HostPolicy>,
+    ) -> Result<Standing> {
         let requires = |grant: &kr_protocol::grant::Grant| {
             grant
                 .organisation
                 .as_ref()
                 .is_some_and(|requirement| requirement.organisation_id == organisation_id)
         };
+        let wall_now = self.wall_now_ms();
         if let Some(record) = self.devices.record_for_device(device_id)? {
             if !record.is_paired() {
-                return Ok(false);
+                return Ok(Standing::Lacks);
+            }
+            let bound = self.utc_floor.bound(record.grant.expiry, wall_now);
+            if bound.owed {
+                return Ok(Standing::Unrecorded);
+            }
+            if bound.passed {
+                return Ok(self.lapse_standing(policy, bound));
+            }
+            if !self.lifetimes.in_force(&record)? {
+                return Ok(Standing::Lacks);
             }
             if requires(&record.grant) {
-                return Ok(true);
+                return Ok(Standing::Holds);
             }
         }
-        let now_ms = self.settled_utc_now();
-        Ok(self
-            .sharing
-            .grants()
-            .records_for_device(device_id)?
-            .iter()
-            .any(|record| {
-                record.state(now_ms) == kr_protocol::sharing::GrantState::Active
-                    && requires(&record.grant)
-            }))
+        let mut lapsed = None;
+        for stored in self.sharing.grants().records_for_device(device_id)? {
+            if stored.revoked_at_ms.is_some() || !stored.is_active() || !requires(&stored.grant) {
+                continue;
+            }
+            let bound = self.utc_floor.bound(stored.grant.expiry, wall_now);
+            if bound.owed {
+                return Ok(Standing::Unrecorded);
+            }
+            if !bound.passed {
+                return Ok(Standing::Holds);
+            }
+            lapsed = Some(bound);
+        }
+        Ok(lapsed.map_or(Standing::Lacks, |bound| self.lapse_standing(policy, bound)))
+    }
+
+    /// What a grant found lapsed at `bound` leaves of a device's standing: none, answered once the
+    /// floor it was found on is on disk, and unrecorded until then.
+    fn lapse_standing(
+        &self,
+        policy: &std::sync::MutexGuard<'_, crate::grants::HostPolicy>,
+        bound: crate::grants::policy::Bound,
+    ) -> Standing {
+        if bound.recorded {
+            return Standing::Lacks;
+        }
+        let floor = policy.utc_floor_ms();
+        self.owe_floor(policy);
+        if self.utc_floor.written() < floor {
+            Standing::Unrecorded
+        } else {
+            Standing::Lacks
+        }
     }
 
     /// Removes a revoked device's bindings from every organisation this host is enrolled in, so
@@ -2489,11 +2549,7 @@ impl Controller {
             (decided, _) => decided,
         };
         decided.map_err(|refusal| {
-            if matches!(
-                refusal,
-                crate::grants::Refusal::Expired { .. }
-                    | crate::grants::Refusal::OfflineValidityLapsed { .. }
-            ) {
+            if refusal.is_clock_decided() {
                 // A refusal the clock decided is one a clock wound back before the next start
                 // would otherwise revive, so it is answered only once its floor is on disk.
                 let floor = policy.utc_floor_ms();

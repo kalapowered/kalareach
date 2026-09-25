@@ -1298,12 +1298,100 @@ async fn a_device_without_an_organisation_grant_cannot_bind() {
             .is_empty()
     );
 
+    // Nor can a device whose organisation grant has run out, although no expiry is recorded yet.
+    let tablet = device();
+    let mut lapsed = member_device(0x47, *tablet.public(), Some((organisation_id, revision)));
+    lapsed.grant.expiry = GrantExpiry::At {
+        expires_at_ms: TimestampMs::new(now - 1_000),
+    };
+    controller.devices().commit(&lapsed).expect("paired");
+    assert!(lapsed.expired_at_ms.is_none(), "no expiry is recorded");
+    let lease = organisation.lease(2, &member("ada"), *tablet.public(), now, VIEW);
+    assert_eq!(
+        controller
+            .present_membership_lease(lapsed.device_id, tablet.public(), &lease)
+            .expect("storage"),
+        Err(LeaseRefused::NoOrganisationGrant)
+    );
+    assert!(binding_of(&controller, organisation_id, lapsed.device_id).is_none());
+
     let lease = organisation.lease(2, &member("ada"), *phone.public(), now, VIEW);
     let installed = controller
         .present_membership_lease(paired.device_id, phone.public(), &lease)
         .expect("storage")
         .expect("the control: the device with one binds");
     assert!(installed.bound);
+}
+
+/// A presentation and a revocation of its device cannot interleave so that the revoked device
+/// ends up bound: the presentation decides the device's standing under the policy's lock and
+/// holds it until the binding is published, so a revocation recorded while the presentation waited
+/// for that lock is seen. The control: the same wait with no revocation binds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_revoked_while_its_presentation_waits_is_not_bound() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let (controller, organisation, revision, now) = enrolled_daemon(&temp, 0x34).await;
+    let organisation_id = organisation.organisation_id;
+
+    for (byte, revoked) in [(0x48, true), (0x49, false)] {
+        let phone = device();
+        let key = *phone.public();
+        let paired = member_device(byte, key, Some((organisation_id, revision)));
+        let device_id = paired.device_id;
+        controller.devices().commit(&paired).expect("paired");
+        let lease = organisation.lease(2, &member("ada"), key, now, VIEW);
+
+        // Another change of the policy holds its lock while the presentation starts.
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let controller = Arc::clone(&controller);
+            tokio::task::spawn_blocking(move || {
+                controller
+                    .update_policy(|_| {
+                        held_tx.send(()).expect("the test waits");
+                        release_rx.recv().expect("the test releases");
+                    })
+                    .expect("the policy is written down");
+            })
+        };
+        held_rx.recv().expect("the lock is held");
+        let presenting = {
+            let controller = Arc::clone(&controller);
+            tokio::task::spawn_blocking(move || {
+                controller
+                    .present_membership_lease(device_id, &key, &lease)
+                    .expect("storage")
+            })
+        };
+        // Long enough for the presentation to reach the lock.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if revoked {
+            assert!(
+                controller
+                    .devices()
+                    .revoke(device_id, TimestampMs::new(now))
+                    .expect("the record is written"),
+                "the device is revoked"
+            );
+        }
+        release_tx.send(()).expect("the holder waits");
+        holder.await.expect("the holder ends");
+        let outcome = presenting.await.expect("presented");
+        if revoked {
+            assert_eq!(
+                outcome,
+                Err(LeaseRefused::NoOrganisationGrant),
+                "the revocation is seen"
+            );
+            assert!(
+                binding_of(&controller, organisation_id, device_id).is_none(),
+                "and nothing is bound"
+            );
+        } else {
+            assert!(outcome.expect("the control: the device binds").bound);
+        }
+    }
 }
 
 /// One device presenting two members' leases at once is bound to exactly one of them. The

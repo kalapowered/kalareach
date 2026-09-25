@@ -1038,3 +1038,111 @@ pub(crate) fn restored_records(stored: &[StoredLeaseRecord]) -> BTreeMap<LeaseHo
         })
         .collect()
 }
+
+/// An organisation's policy-signing authority with one revision, for this crate's own tests.
+#[cfg(test)]
+pub(crate) mod testing {
+    use kr_crypto::keys::AuthorisationKeyPair;
+    use kr_crypto::sign::SigningTranscript;
+    use kr_protocol::account::{
+        MEMBERSHIP_LEASE_DOMAIN, MEMBERSHIP_LEASE_MAX_LIFETIME_MS, MembershipLease,
+        MembershipLeasePayload, POLICY_AUTHORITY_DOMAIN, POLICY_AUTHORITY_HEAD_DOMAIN,
+        POLICY_AUTHORITY_HEAD_MAX_LIFETIME_MS, PolicyAuthority, PolicyAuthorityHead,
+        PolicyAuthorityHeadPayload, PolicyAuthorityLink, PolicyAuthorityLinkPayload, TeamRole,
+    };
+    use kr_protocol::ids::{AccountId, OrganisationId, PolicyKeyRevision};
+    use kr_protocol::rights::ActionRight;
+    use kr_protocol::scalars::{AuthorisationKey, Nullable, Signature64, TimestampMs, Uuid};
+
+    /// An organisation whose one revision takes over at the moment it is made for.
+    pub(crate) struct TestOrganisation {
+        /// The organisation.
+        pub(crate) organisation_id: OrganisationId,
+        key: AuthorisationKeyPair,
+        link: PolicyAuthorityLink,
+    }
+
+    impl TestOrganisation {
+        /// An organisation named by `byte`, whose revision takes over at `not_before_ms`.
+        pub(crate) fn new(byte: u8, not_before_ms: u64) -> Self {
+            let organisation_id = OrganisationId::new(Uuid::from_bytes([byte; 16]));
+            let key = AuthorisationKeyPair::generate().expect("a policy-signing key");
+            let payload = PolicyAuthorityLinkPayload {
+                organisation_id,
+                key_revision: PolicyKeyRevision::new(1),
+                previous_key_revision: Nullable::null(),
+                public_key: *key.public(),
+                not_before_ms: TimestampMs::new(not_before_ms),
+            };
+            let link = PolicyAuthorityLink {
+                signature: sign(&key, POLICY_AUTHORITY_DOMAIN, payload.signing_input()),
+                payload,
+            };
+            Self {
+                organisation_id,
+                key,
+                link,
+            }
+        }
+
+        /// The published authority, with a head issued at `issued_ms`.
+        pub(crate) fn authority(&self, issued_ms: u64) -> PolicyAuthority {
+            let payload = PolicyAuthorityHeadPayload {
+                organisation_id: self.organisation_id,
+                key_revision: PolicyKeyRevision::new(1),
+                issued_at_ms: TimestampMs::new(issued_ms),
+                expires_at_ms: TimestampMs::new(issued_ms + POLICY_AUTHORITY_HEAD_MAX_LIFETIME_MS),
+            };
+            PolicyAuthority {
+                organisation_id: self.organisation_id,
+                chain: vec![self.link.clone()],
+                head: PolicyAuthorityHead {
+                    signature: sign(
+                        &self.key,
+                        POLICY_AUTHORITY_HEAD_DOMAIN,
+                        payload.signing_input(),
+                    ),
+                    payload,
+                },
+            }
+        }
+
+        /// A fifteen-minute lease for `account` on the device holding `device_key`, issued at
+        /// `issued_ms` under the owner role.
+        pub(crate) fn lease(
+            &self,
+            account: &AccountId,
+            device_key: AuthorisationKey,
+            issued_ms: u64,
+            rights: &[ActionRight],
+        ) -> MembershipLease {
+            let payload = MembershipLeasePayload {
+                organisation_id: self.organisation_id,
+                account_id: account.clone(),
+                device_key,
+                role: TeamRole::Owner,
+                maximum_grants: rights.iter().copied().collect(),
+                issued_at_ms: TimestampMs::new(issued_ms),
+                expires_at_ms: TimestampMs::new(issued_ms + MEMBERSHIP_LEASE_MAX_LIFETIME_MS),
+                key_revision: PolicyKeyRevision::new(1),
+            };
+            MembershipLease {
+                signature: sign(&self.key, MEMBERSHIP_LEASE_DOMAIN, payload.signing_input()),
+                payload,
+            }
+        }
+    }
+
+    fn sign(
+        key: &AuthorisationKeyPair,
+        domain: &str,
+        signing_input: Result<Vec<u8>, kr_cbor::CborError>,
+    ) -> Signature64 {
+        let transcript = SigningTranscript::from_canonical_bytes(
+            domain,
+            signing_input.expect("a signing input"),
+        )
+        .expect("a transcript");
+        kr_crypto::sign::sign(key, &transcript).expect("a signature")
+    }
+}

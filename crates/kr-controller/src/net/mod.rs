@@ -1622,12 +1622,11 @@ impl Controller {
         };
         if matches!(
             &decided,
-            Err(crate::config::ceilings::CeilingRefusal::Refused(
-                crate::grants::Refusal::Expired { .. }
-                    | crate::grants::Refusal::OfflineValidityLapsed { .. },
-            ))
+            Err(crate::config::ceilings::CeilingRefusal::Refused(refusal))
+                if refusal.is_clock_decided()
         ) {
-            // A refusal the clock decided is answered only once the floor it stood on is on disk,
+            // A refusal the clock decided (an expiry, a lapsed offline bound, a lapsed lease) is
+            // answered only once the floor it stood on is on disk,
             // as a workflow's is: before that, a clock wound back before the next start would
             // decide the other way, so the answer states no lapse. An expiry found here still
             // stops the connection's frames, which records nothing ([`Refusal::ExpiryUnrecorded`]).
@@ -1993,6 +1992,162 @@ mod tests {
             .expect_err("the refusal outlives the daemon that made it");
         assert!(
             matches!(refused, CeilingRefusal::Refused(Refusal::Expired { .. })),
+            "{refused:?}"
+        );
+        drop(controller);
+    }
+
+    /// Enrols `controller` in `organisation` at `now` and installs a lease issued then for a member
+    /// on a device of its own, which binds it. Returns that device's organisation grant.
+    fn leased_member(
+        controller: &Controller,
+        organisation: &crate::grants::organisation::testing::TestOrganisation,
+        now: u64,
+    ) -> (Grant, GrantRecord) {
+        let reading = super::devices::ObservedUtc {
+            now: TimestampMs::new(now),
+            behind_ms: 0,
+        };
+        let revision = controller.policy().authority_revision();
+        controller
+            .update_policy(|policy| {
+                let verified = policy
+                    .verify_enrolment(&organisation.authority(now), Some(&reading))
+                    .expect("the chain verifies");
+                policy.enrol(verified).expect("the host enrols");
+            })
+            .expect("the enrolment is written down");
+        let (grant, record) = granted(GrantExpiry::Never, revision);
+        let grant = Grant {
+            organisation: Nullable::some(kr_protocol::grant::OrganisationRequirement {
+                organisation_id: organisation.organisation_id,
+                policy_revision: revision,
+            }),
+            ..grant
+        };
+        let record = GrantRecord {
+            grant: grant.clone(),
+            ..record
+        };
+        let key = kr_crypto::keys::AuthorisationKeyPair::generate().expect("a device key");
+        let account = kr_protocol::ids::AccountId::new("ada").expect("an account");
+        let lease = organisation.lease(&account, *key.public(), now, &[ActionRight::SessionView]);
+        controller
+            .update_policy(|policy| {
+                policy.install_lease(crate::grants::organisation::LeasePresentation {
+                    lease: &lease,
+                    device_id: grant.recipient_device_id,
+                    proven_key: key.public(),
+                    reading: Some(reading),
+                    now: controller.clock.now(),
+                    generation: controller.generation(),
+                })
+            })
+            .expect("the lease is written down")
+            .expect("the lease installs and binds the device");
+        (grant, record)
+    }
+
+    /// A lease that lapsed by the wall clock is a refusal the clock decided, as a grant's expiry
+    /// is: while the floor it was found on cannot be written, a paired device is told the floor is
+    /// unrecorded rather than that the lease expired, which a clock wound back before the next
+    /// start could reverse. Once the floor is on disk, the lapse is answered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lapsed_lease_is_answered_only_once_its_floor_is_written() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = daemon(&temp).await;
+        let now = kr_ipc::now_ms().get();
+        let organisation =
+            crate::grants::organisation::testing::TestOrganisation::new(0x21, now - 60 * 60 * 1000);
+        let (grant, record) = leased_member(&controller, &organisation, now);
+        let (lasting, lasting_record) =
+            granted(GrantExpiry::Never, controller.policy().authority_revision());
+        controller
+            .decide_for_device(&grant, &record, listing(&temp, now))
+            .expect("the lease answers");
+
+        let lapsed_at = now + crate::grants::HostPolicy::maximum_lease_lifetime_ms();
+        let registry = refuse_policy_writes(&temp);
+        let refused = controller
+            .decide_for_device(&grant, &record, listing(&temp, lapsed_at))
+            .expect_err("the lease has lapsed by this reading");
+        assert!(
+            matches!(refused, CeilingRefusal::Refused(Refusal::FloorUnrecorded)),
+            "the lapse is not answered while its floor is not on disk: {refused:?}"
+        );
+        assert!(written_floor(&controller) < lapsed_at, "the write failed");
+
+        // The control: once storage takes the floor, the lapse is answered.
+        allow_policy_writes(&registry);
+        controller
+            .decide_for_device(&lasting, &lasting_record, listing(&temp, now))
+            .expect("a grant that does not expire is served");
+        assert!(written_floor(&controller) >= lapsed_at);
+        let refused = controller
+            .decide_for_device(&grant, &record, listing(&temp, now))
+            .expect_err("the lease stays lapsed");
+        assert!(
+            matches!(
+                refused,
+                CeilingRefusal::Refused(Refusal::MembershipUnusable {
+                    refusal: kr_protocol::sharing::MembershipRefusal::LeaseExpired
+                })
+            ),
+            "{refused:?}"
+        );
+        drop(controller);
+    }
+
+    /// The same for a workflow's dispatch under a member device's organisation grant: while the
+    /// floor a lapsed lease was found on cannot be written, authority is unavailable, and once it
+    /// is written the lapse is answered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_workflow_under_a_lapsed_lease_is_answered_only_once_its_floor_is_written() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = daemon(&temp).await;
+        let now = kr_ipc::now_ms().get();
+        let organisation =
+            crate::grants::organisation::testing::TestOrganisation::new(0x22, now - 60 * 60 * 1000);
+        let (_, record) = leased_member(&controller, &organisation, now);
+        controller
+            .decide_for_workflow(
+                &record,
+                ActorIngress::PairedDevice,
+                now,
+                controller.clock.now(),
+            )
+            .expect("the lease answers");
+
+        let lapsed_at = now + crate::grants::HostPolicy::maximum_lease_lifetime_ms();
+        let registry = refuse_policy_writes(&temp);
+        let refused = controller
+            .decide_for_workflow(
+                &record,
+                ActorIngress::PairedDevice,
+                lapsed_at,
+                controller.clock.now(),
+            )
+            .expect_err("the lease has lapsed by this reading");
+        assert!(
+            matches!(
+                refused,
+                kr_automation::AutomationError::AuthorityUnavailable(_)
+            ),
+            "the lapse is not answered while its floor is not on disk: {refused:?}"
+        );
+
+        // The control: once storage takes the floor, the lapse is answered.
+        allow_policy_writes(&registry);
+        let refused = controller
+            .decide_for_workflow(
+                &record,
+                ActorIngress::PairedDevice,
+                now,
+                controller.clock.now(),
+            )
+            .expect_err("the lease stays lapsed");
+        assert!(
+            matches!(refused, kr_automation::AutomationError::PermissionDenied(_)),
             "{refused:?}"
         );
         drop(controller);
