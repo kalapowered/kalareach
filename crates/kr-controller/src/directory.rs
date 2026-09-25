@@ -164,10 +164,20 @@ impl Directory {
     /// Keeps how a worker in the directory has just described its session.
     ///
     /// A worker that has left the directory had its closure recorded while it was being asked,
-    /// and the record is the answer from then on, so what it said is not kept.
+    /// and the record is the answer from then on, so what it said is not kept. A description that
+    /// puts the session earlier in its lifecycle than the one kept is not kept either: the
+    /// lifecycle only moves forward, so such an answer is one an earlier moment gave and a later
+    /// one overtook.
     pub fn heard(&mut self, session_id: SessionId, read: &SessionReadResult) {
-        if self.verified.contains_key(&session_id) {
-            self.heard.entry(session_id).or_default().session = Some(read.session.clone());
+        if !self.verified.contains_key(&session_id) {
+            return;
+        }
+        let kept = &mut self.heard.entry(session_id).or_default().session;
+        if kept
+            .as_ref()
+            .is_none_or(|kept| stage(read.session.state) >= stage(kept.state))
+        {
+            *kept = Some(read.session.clone());
         }
     }
 
@@ -178,15 +188,29 @@ impl Directory {
         }
     }
 
+    /// Returns a worker in the directory whose description of its session this daemon does not
+    /// have: one it has not heard from since it started.
+    #[must_use]
+    pub fn undescribed(&self, session_id: SessionId) -> Option<KnownWorker> {
+        let described = self
+            .heard
+            .get(&session_id)
+            .is_some_and(|heard| heard.session.is_some());
+        (!described)
+            .then(|| self.verified.get(&session_id).cloned())
+            .flatten()
+    }
+
     /// Describes a session whose worker has stopped answering, where its end is under way.
     ///
     /// A worker that has finished its closure stops answering before the kernel says its process
-    /// has ended, and until then no closure can be recorded. The session is what its worker last
-    /// said it was, and `closing` where the worker had not said so but had accepted a close this
-    /// daemon passed to it: the closure is this daemon's to record once the kernel says the worker
-    /// has gone. The rest of a read is left unsaid. The endpoint, the launch profile and the
-    /// launches waiting on the worker are how a client reaches a worker that no longer answers,
-    /// and the last command block is the session's content, which only its worker hands out.
+    /// has ended, and until the kernel says so this daemon neither takes the session over from
+    /// its worker nor writes a closure of its own for it. The session is what its worker last said
+    /// it was, and `closing` where the worker had not said so but had accepted a close this daemon
+    /// passed to it: what is left of the closure is this daemon's to record. The rest of a read is
+    /// left unsaid. The endpoint, the launch profile and the launches waiting on the worker are how
+    /// a client reaches a worker that no longer answers, and the last command block is the
+    /// session's content, which only its worker hands out.
     ///
     /// Nothing is described where no end is under way, or where the worker has not answered this
     /// daemon since it started. That is a worker this daemon cannot reach, and nothing here says
@@ -209,6 +233,17 @@ impl Directory {
             last_command_block: Nullable::null(),
             outstanding_launches: Nullable::null(),
         })
+    }
+}
+
+/// Where a state is in the session lifecycle, which only moves forward: creating, live, closing,
+/// closed.
+const fn stage(state: SessionState) -> u8 {
+    match state {
+        SessionState::Creating => 0,
+        SessionState::Live => 1,
+        SessionState::Closing => 2,
+        SessionState::Closed => 3,
     }
 }
 

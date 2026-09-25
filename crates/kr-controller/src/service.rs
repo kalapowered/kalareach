@@ -149,6 +149,13 @@ enum Review {
 /// How long one worker is given to say what it has outstanding.
 pub const DEMAND_PATIENCE: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// How long a worker that has just accepted a close is given to describe its session.
+///
+/// A closure keeps its worker answering for at least the drain it runs after the acceptance
+/// ([`kr_worker::session::DRAIN_PERIOD`]), so a worker that answers at all answers well inside
+/// this.
+pub const DESCRIPTION_PATIENCE: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// How long the whole scan of what this host has outstanding may take.
 pub const DEMAND_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -7910,20 +7917,30 @@ impl Controller {
         let workers: Vec<KnownWorker> = self.directory.lock().await.iter().cloned().collect();
         for worker in workers {
             let session_id = worker.descriptor.session_id;
-            match self.read_from_worker(&worker).await {
-                Ok(read) => sessions.push(read.session),
-                // As for a read: a session whose closure is recorded is listed with the closed
-                // sessions or not at all, and one whose worker is on its way out is listed as this
-                // daemon last knew it.
+            let session = match self.read_from_worker(&worker).await {
+                Ok(read) => Some(read.session),
+                // As for a read, and in the same order: a session whose closure is recorded is
+                // listed with the closed sessions below, and one whose worker is on its way out is
+                // listed as this daemon last knew it.
                 Err(_) => {
                     if matches!(self.reconcile(session_id).await, Ok(None)) {
-                        let recorded = self.registry.lock().await.closure(session_id);
                         let ending = self.directory.lock().await.ending(session_id);
-                        if let (Ok(None), Some(read)) = (recorded, ending) {
-                            sessions.push(read.session);
+                        let recorded = self.registry.lock().await.closure(session_id);
+                        match (recorded, ending) {
+                            (Ok(None), Some(read)) => Some(read.session),
+                            _ => None,
                         }
+                    } else {
+                        None
                     }
                 }
+            };
+            // A session that has closed is listed only where closed sessions were asked for,
+            // whether its worker said so or this daemon's record did.
+            if let Some(session) = session
+                && (params.include_closed || session.state != SessionState::Closed)
+            {
+                sessions.push(session);
             }
         }
         if params.include_closed {
@@ -7976,11 +7993,16 @@ impl Controller {
                 // closing, as its worker last described it (`Directory::ending`). Only where this
                 // daemon has no word of an end is there nothing to answer with, and that read is
                 // refused as one to try again.
+                //
+                // The directory is asked before the registry. A closure is written to the registry
+                // before its worker leaves the directory, so a worker found gone from the
+                // directory has its closure in the registry by the time the registry is asked, and
+                // the closure is the answer wherever there is one.
                 Err(error) => {
                     if self.reconcile(params.session_id).await?.is_none() {
+                        let ending = self.directory.lock().await.ending(params.session_id);
                         let recorded = self.registry.lock().await.closure(params.session_id)?;
                         if recorded.is_none() {
-                            let ending = self.directory.lock().await.ending(params.session_id);
                             return match ending {
                                 Some(read) => encode(&read),
                                 None => Err(error),
@@ -8736,11 +8758,25 @@ impl Controller {
     /// Settles what follows a worker's acceptance of a close this daemon passed to it.
     ///
     /// The session is closing from here until its closure is recorded, which is what a read that
-    /// meets the worker on its way out is answered with (`Directory::ending`). Something also has
-    /// to notice when the worker finishes, so the tombstone is written and the descriptor removed
-    /// rather than left pointing at a process that has gone.
+    /// meets the worker on its way out is answered with (`Directory::ending`). That answer is the
+    /// session as its worker described it, so a worker this daemon has not heard from since it
+    /// started is asked now, before the caller has the acceptance: the worker does not begin
+    /// stopping anything until then, and it goes on answering through the drain after that. Where
+    /// it does not answer in time there is no description, and a read that meets its end is
+    /// refused as one to try again. Something also has to notice when the worker finishes, so the
+    /// tombstone is written and the descriptor removed rather than left pointing at a process that
+    /// has gone.
     pub(crate) async fn close_accepted(self: &Arc<Self>, session_id: SessionId) {
-        self.directory.lock().await.accepted_close(session_id);
+        let undescribed = {
+            let mut directory = self.directory.lock().await;
+            directory.accepted_close(session_id);
+            directory.undescribed(session_id)
+        };
+        if let Some(worker) = undescribed {
+            let _ = self
+                .read_from_worker_within(&worker, Some(DESCRIPTION_PATIENCE))
+                .await;
+        }
         tokio::spawn(Arc::clone(self).watch_closure(session_id, ClosureReason::CloseRequested));
     }
 
@@ -9449,12 +9485,14 @@ impl Controller {
                 .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?,
             Err(error) => return Err(ControllerError::InvalidArgument(error.to_string())),
         };
-        drop(held);
-        // Kept for the moment this worker can no longer be asked (`Directory::ending`).
+        // Kept for the moment this worker can no longer be asked (`Directory::ending`), while the
+        // link is still held: every exchange with this worker runs over it in turn, so what the
+        // worker said is kept in the order it said it.
         self.directory
             .lock()
             .await
             .heard(worker.descriptor.session_id, &read);
+        drop(held);
         Ok(read)
     }
 
@@ -13100,7 +13138,7 @@ mod a_read_that_meets_a_worker_on_its_way_out {
     //! registry names that process as the session's worker, as it names a real one.
 
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
     use kr_ipc::endpoint::Listener;
     use kr_ipc::framed::split;
@@ -13125,15 +13163,14 @@ mod a_read_that_meets_a_worker_on_its_way_out {
 
     /// A worker whose session a test moves along, and which goes when the test says so.
     ///
-    /// It answers a read with its session as live until it is sent a close, which it accepts by
-    /// saying the session is closing, as a worker does before it stops anything; a test can also
-    /// start the closing itself, as a shell that exits does. Told to go, it goes the way a worker
-    /// that has finished its closure goes: at the next read it is sent, its endpoint stops
-    /// accepting, and then the connection that read is waiting on ends unanswered.
-    #[derive(Default)]
+    /// It answers a read with the state a test has put its session in, live to begin with, and
+    /// accepts a close by saying the session is closing, as a worker does before it stops
+    /// anything. Told to go, it goes the way a worker that has finished its closure goes: at the
+    /// next read it is sent, its endpoint stops accepting, and then the connection that read is
+    /// waiting on ends unanswered.
     struct Scripted {
-        /// Whether its session is closing.
-        closing: AtomicBool,
+        /// The state its session is in.
+        state: std::sync::Mutex<SessionState>,
         /// The read it goes at, once a test has set one.
         end: std::sync::Mutex<Option<End>>,
         /// Tells the endpoint to stop accepting.
@@ -13151,6 +13188,32 @@ mod a_read_that_meets_a_worker_on_its_way_out {
     }
 
     impl Scripted {
+        /// A worker whose session is live.
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                state: std::sync::Mutex::new(SessionState::Live),
+                end: std::sync::Mutex::new(None),
+                going: Notify::new(),
+                gone: Notify::new(),
+            })
+        }
+
+        /// Puts the session in `state`, which every later answer says.
+        fn set(&self, state: SessionState) {
+            *self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = state;
+        }
+
+        /// The state the session is in.
+        fn state(&self) -> SessionState {
+            *self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+
         /// Has this worker go at the next read it is sent. The first half says when that read has
         /// arrived, and the worker goes once the second is sent or dropped.
         fn end_at_next_read(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
@@ -13163,20 +13226,43 @@ mod a_read_that_meets_a_worker_on_its_way_out {
                 Some(End { arrived, go: going });
             (arrival, go)
         }
+
+        /// How this worker answers a read: its session in the state it is in, with the worker's
+        /// own closure once it has closed, and the last command the session ran, which is its
+        /// content beside its description.
+        fn answer(&self, session_id: SessionId) -> SessionReadResult {
+            let mut read = fake::read_result(session_id);
+            read.session.state = self.state();
+            if read.session.state == SessionState::Closed {
+                read.session.closure = Nullable::some(closure_of(session_id));
+            }
+            read.last_command_block = Nullable::some(RootCommandBlockParams {
+                session_id,
+                prompt_generation: PromptGeneration(U64::new(1)),
+                command: "make test".to_owned(),
+                started_at_ms: kr_ipc::now_ms(),
+                duration_ms: Nullable::null(),
+                exit_status: Nullable::null(),
+                cwd: "/work".to_owned(),
+                cwd_revision: CwdRevision(U64::new(1)),
+            });
+            read
+        }
     }
 
-    /// The last command a scripted worker's session ran, which every read it answers carries: the
-    /// session's content, beside its description.
-    fn command_block(session_id: SessionId) -> RootCommandBlockParams {
-        RootCommandBlockParams {
+    /// A closure of `session_id` that a close requested.
+    fn closure_of(session_id: SessionId) -> ClosureRecord {
+        ClosureRecord {
             session_id,
-            prompt_generation: PromptGeneration(U64::new(1)),
-            command: "make test".to_owned(),
-            started_at_ms: kr_ipc::now_ms(),
-            duration_ms: Nullable::null(),
-            exit_status: Nullable::null(),
-            cwd: "/work".to_owned(),
-            cwd_revision: CwdRevision(U64::new(1)),
+            session_epoch: SessionEpoch::V1,
+            reason: ClosureReason::CloseRequested,
+            root_exit_code: Nullable::null(),
+            root_signal: Nullable::null(),
+            terminated: Vec::new(),
+            surviving: Vec::new(),
+            ownership_coverage: OwnershipCoverage::Complete,
+            durability: Durability::Durable,
+            closed_at_ms: kr_protocol::scalars::TimestampMs::new(1),
         }
     }
 
@@ -13237,18 +13323,15 @@ mod a_read_that_meets_a_worker_on_its_way_out {
                                     script.gone.notified().await;
                                     return;
                                 }
-                                let mut read = fake::read_result(identity.session_id());
-                                if script.closing.load(Ordering::Acquire) {
-                                    read.session.state = SessionState::Closing;
-                                }
-                                read.last_command_block =
-                                    Nullable::some(command_block(identity.session_id()));
-                                vec![respond(request.request_id, &read)]
+                                let answer = script.answer(identity.session_id());
+                                vec![respond(request.request_id, &answer)]
                             }
                             (None, ControlFrame::Forwarded(forwarded))
                                 if forwarded.mutation.method == Method::SessionClose.into() =>
                             {
-                                script.closing.store(true, Ordering::Release);
+                                if script.state() == SessionState::Live {
+                                    script.set(SessionState::Closing);
+                                }
                                 vec![respond(
                                     forwarded.mutation.request_id,
                                     &SessionCloseResult {
@@ -13276,6 +13359,7 @@ mod a_read_that_meets_a_worker_on_its_way_out {
 
     /// A daemon with a scripted worker in its directory, and the registry's own row for that
     /// worker. The row names this test's process, which is the process the kernel is asked about.
+    /// The daemon has not heard from the worker yet, as after a start that found it running.
     async fn scripted(script: &Arc<Scripted>) -> Silent {
         let script = Arc::clone(script);
         let world = fake::fake_world(move |listener, identity, endpoint_text| {
@@ -13317,6 +13401,46 @@ mod a_read_that_meets_a_worker_on_its_way_out {
             .map(|value| value.to_typed().expect("decodes"))
     }
 
+    /// Reads the session through the daemon on a task of its own.
+    fn read_in_turn(
+        world: &Silent,
+    ) -> tokio::task::JoinHandle<crate::error::Result<SessionReadResult>> {
+        let controller = Arc::clone(&world.controller);
+        let params = ParamsValue::from_typed(&SessionReadParams {
+            session_id: world.session_id,
+        })
+        .expect("encodes");
+        tokio::spawn(async move {
+            controller
+                .session_read(&params)
+                .await
+                .map(|value| value.to_typed().expect("decodes"))
+        })
+    }
+
+    /// Lists the sessions through the daemon, as a client's `session.list` does, and returns each
+    /// one's identity and state.
+    async fn list(world: &Silent, include_closed: bool) -> Vec<(SessionId, SessionState)> {
+        let listed: SessionListResult = world
+            .controller
+            .session_list(
+                &ParamsValue::from_typed(&SessionListParams {
+                    environment_id: Nullable::null(),
+                    include_closed,
+                })
+                .expect("encodes"),
+            )
+            .await
+            .expect("the daemon lists its sessions")
+            .to_typed()
+            .expect("decodes");
+        listed
+            .sessions
+            .iter()
+            .map(|session| (session.session_id, session.state))
+            .collect()
+    }
+
     /// Closes the session through the daemon, and returns what the worker accepted it with.
     async fn close(world: &Silent) -> SessionCloseResult {
         world
@@ -13346,11 +13470,11 @@ mod a_read_that_meets_a_worker_on_its_way_out {
     }
 
     /// A read that meets the end of a worker whose close this daemon accepted is answered from
-    /// this daemon's own record: the session is closing, and its closure is this host's to record
-    /// once the kernel says the worker has ended.
+    /// this daemon's own record: the session is closing, and what is left of its closure is this
+    /// host's to record once the kernel says the worker has ended.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_read_that_meets_the_end_of_a_worker_whose_close_was_accepted_answers_closing() {
-        let script = Arc::new(Scripted::default());
+        let script = Scripted::new();
         let world = scripted(&script).await;
         let live = read(&world).await.expect("the worker answers");
         assert_eq!(live.session.state, SessionState::Live);
@@ -13386,14 +13510,61 @@ mod a_read_that_meets_a_worker_on_its_way_out {
         world.serving.abort();
     }
 
+    /// A worker this daemon has not heard from since it started is asked to describe its session
+    /// when it accepts a close, so a read that meets its end is answered from its own description
+    /// even though no read reached it before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_read_that_meets_the_end_of_a_worker_never_read_before_its_close_answers_closing() {
+        let script = Scripted::new();
+        let world = scripted(&script).await;
+        assert_eq!(close(&world).await.state, SessionState::Closing);
+
+        let (_arrived, go) = script.end_at_next_read();
+        drop(go);
+        let answer = read(&world)
+            .await
+            .expect("a closing session is answered for from this daemon's own record");
+        assert_eq!(
+            answer.session,
+            SessionSummary {
+                state: SessionState::Closing,
+                created_at_ms: answer.session.created_at_ms,
+                ..fake::read_result(world.session_id).session
+            },
+            "the session as its worker described it when it accepted the close"
+        );
+        assert!(!recorded(&world).await);
+        world.serving.abort();
+    }
+
     /// A session that began closing on its own is answered for the same way: its worker said it
     /// was closing, and that is what the session still is when the worker stops answering.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_read_that_meets_the_end_of_a_worker_that_said_it_was_closing_answers_closing() {
-        let script = Arc::new(Scripted::default());
+        let script = Scripted::new();
         let world = scripted(&script).await;
         // The shell exits, and the worker begins the closure itself.
-        script.closing.store(true, Ordering::Release);
+        script.set(SessionState::Closing);
+        let closing = read(&world).await.expect("the worker answers");
+        assert_eq!(closing.session.state, SessionState::Closing);
+
+        let (_arrived, go) = script.end_at_next_read();
+        drop(go);
+        let answer = read(&world)
+            .await
+            .expect("a closing session is answered for from this daemon's own record");
+        assert_eq!(answer.session, closing.session);
+        assert!(!recorded(&world).await);
+        world.serving.abort();
+    }
+
+    /// An answer that puts the session earlier in its lifecycle than an answer this daemon already
+    /// has does not take it back there: it is one an earlier moment gave, and a later one overtook.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_answer_overtaken_by_a_later_one_does_not_move_the_session_back() {
+        let script = Scripted::new();
+        let world = scripted(&script).await;
+        script.set(SessionState::Closing);
         assert_eq!(
             read(&world)
                 .await
@@ -13402,14 +13573,24 @@ mod a_read_that_meets_a_worker_on_its_way_out {
                 .state,
             SessionState::Closing
         );
+        // An answer from before the closing began, arriving after the one that said it had.
+        script.set(SessionState::Live);
+        assert_eq!(
+            read(&world)
+                .await
+                .expect("the worker answers")
+                .session
+                .state,
+            SessionState::Live,
+            "the worker's own answer is passed on as it stands"
+        );
 
         let (_arrived, go) = script.end_at_next_read();
         drop(go);
         let answer = read(&world)
             .await
-            .expect("a closing session is answered for from this daemon's own record");
+            .expect("the closing this daemon heard of is still what it answers from");
         assert_eq!(answer.session.state, SessionState::Closing);
-        assert!(!recorded(&world).await);
         world.serving.abort();
     }
 
@@ -13417,33 +13598,15 @@ mod a_read_that_meets_a_worker_on_its_way_out {
     /// with that closure.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_read_that_meets_the_end_of_a_worker_whose_closure_was_recorded_answers_it() {
-        let script = Arc::new(Scripted::default());
+        let script = Scripted::new();
         let world = scripted(&script).await;
         assert_eq!(close(&world).await.state, SessionState::Closing);
 
         let (arrived, go) = script.end_at_next_read();
-        let reading = tokio::spawn({
-            let controller = Arc::clone(&world.controller);
-            let params = ParamsValue::from_typed(&SessionReadParams {
-                session_id: world.session_id,
-            })
-            .expect("encodes");
-            async move { controller.session_read(&params).await }
-        });
+        let reading = read_in_turn(&world);
         arrived.await.expect("the read reaches the worker");
         // The closure is recorded while the read waits on the worker.
-        let record = ClosureRecord {
-            session_id: world.session_id,
-            session_epoch: SessionEpoch::V1,
-            reason: ClosureReason::CloseRequested,
-            root_exit_code: Nullable::null(),
-            root_signal: Nullable::null(),
-            terminated: Vec::new(),
-            surviving: Vec::new(),
-            ownership_coverage: OwnershipCoverage::Complete,
-            durability: Durability::Durable,
-            closed_at_ms: kr_ipc::now_ms(),
-        };
+        let record = closure_of(world.session_id);
         world
             .controller
             .retire(&record)
@@ -13451,12 +13614,59 @@ mod a_read_that_meets_a_worker_on_its_way_out {
             .expect("the closure is recorded");
         drop(go);
 
-        let answer: SessionReadResult = reading
+        let answer = reading
             .await
             .expect("the read finishes")
-            .expect("a closed session is answered with its closure")
-            .to_typed()
-            .expect("decodes");
+            .expect("a closed session is answered with its closure");
+        assert_eq!(answer.session.state, SessionState::Closed);
+        assert_eq!(answer.session.closure.0, Some(record));
+        world.serving.abort();
+    }
+
+    /// A read whose worker goes while the session's closure is being recorded answers the
+    /// closure, however the recording and the read's look at what this daemon holds interleave.
+    ///
+    /// The directory is held here from before the worker goes, so the read, once it has met the
+    /// worker's end and asked the kernel, waits for it. The closure is then recorded as a closure's
+    /// recording does it, the registry first and the worker out of the directory after, and only
+    /// then may the read look at either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_read_that_meets_the_end_of_a_worker_as_its_closure_is_recorded_answers_it() {
+        let script = Scripted::new();
+        let world = scripted(&script).await;
+        assert_eq!(close(&world).await.state, SessionState::Closing);
+
+        let (arrived, go) = script.end_at_next_read();
+        let reading = read_in_turn(&world);
+        arrived.await.expect("the read reaches the worker");
+        let mut directory = world.controller.directory.lock().await;
+        drop(go);
+        // The read has met the worker's end once it gives up the worker's control path.
+        let started = std::time::Instant::now();
+        while !world.controller.leases.is_fenced(world.session_id) {
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "the read did not meet the worker's end"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Long enough for it to have asked the kernel and to be waiting on what is held here.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let record = closure_of(world.session_id);
+        world
+            .controller
+            .registry
+            .lock()
+            .await
+            .record_closure(&record)
+            .expect("the closure is recorded");
+        directory.remove(world.session_id);
+        drop(directory);
+
+        let answer = reading
+            .await
+            .expect("the read finishes")
+            .expect("a closed session is answered with its closure");
         assert_eq!(answer.session.state, SessionState::Closed);
         assert_eq!(answer.session.closure.0, Some(record));
         world.serving.abort();
@@ -13466,39 +13676,42 @@ mod a_read_that_meets_a_worker_on_its_way_out {
     /// closing rather than leaving it out.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_list_that_meets_the_end_of_a_worker_whose_close_was_accepted_lists_it_closing() {
-        let script = Arc::new(Scripted::default());
+        let script = Scripted::new();
         let world = scripted(&script).await;
-        assert_eq!(
-            read(&world)
-                .await
-                .expect("the worker answers")
-                .session
-                .state,
-            SessionState::Live
-        );
         assert_eq!(close(&world).await.state, SessionState::Closing);
 
         let (_arrived, go) = script.end_at_next_read();
         drop(go);
-        let listed: SessionListResult = world
-            .controller
-            .session_list(
-                &ParamsValue::from_typed(&SessionListParams {
-                    environment_id: Nullable::null(),
-                    include_closed: false,
-                })
-                .expect("encodes"),
-            )
-            .await
-            .expect("the daemon lists its sessions")
-            .to_typed()
-            .expect("decodes");
-        let listed: Vec<_> = listed
-            .sessions
-            .iter()
-            .map(|session| (session.session_id, session.state))
-            .collect();
-        assert_eq!(listed, vec![(world.session_id, SessionState::Closing)]);
+        assert_eq!(
+            list(&world, false).await,
+            vec![(world.session_id, SessionState::Closing)]
+        );
+        world.serving.abort();
+    }
+
+    /// A session whose worker says it has closed is listed only where closed sessions were asked
+    /// for, whether the worker says so itself or this daemon answers for a worker on its way out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_session_its_worker_says_has_closed_is_listed_only_with_the_closed_sessions() {
+        let script = Scripted::new();
+        let world = scripted(&script).await;
+        // The worker has finished its closure and not yet gone.
+        script.set(SessionState::Closed);
+        assert_eq!(list(&world, false).await, Vec::new());
+        assert_eq!(
+            list(&world, true).await,
+            vec![(world.session_id, SessionState::Closed)]
+        );
+
+        // It goes while a list is waiting on it, and its endpoint is gone for the one after.
+        let (_arrived, go) = script.end_at_next_read();
+        drop(go);
+        assert_eq!(list(&world, false).await, Vec::new());
+        assert_eq!(
+            list(&world, true).await,
+            vec![(world.session_id, SessionState::Closed)]
+        );
+        assert!(!recorded(&world).await);
         world.serving.abort();
     }
 
@@ -13507,7 +13720,7 @@ mod a_read_that_meets_a_worker_on_its_way_out {
     /// still running, and the read is refused as something to try again.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_read_that_meets_a_live_workers_connection_ending_is_refused_for_now() {
-        let script = Arc::new(Scripted::default());
+        let script = Scripted::new();
         let world = scripted(&script).await;
         assert_eq!(
             read(&world)
@@ -13528,6 +13741,23 @@ mod a_read_that_meets_a_worker_on_its_way_out {
             refused.code().retry_category().permits_automatic_retry(),
             "and a read may be asked again: {refused}"
         );
+        assert!(!recorded(&world).await);
+        world.serving.abort();
+    }
+
+    /// Nor is a worker this daemon has not heard from at all, and whose close it has not passed
+    /// on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_read_that_meets_the_end_of_a_worker_never_heard_from_is_refused_for_now() {
+        let script = Scripted::new();
+        let world = scripted(&script).await;
+
+        let (_arrived, go) = script.end_at_next_read();
+        drop(go);
+        let refused = read(&world)
+            .await
+            .expect_err("nothing this daemon holds says what the session is now");
+        assert_eq!(refused.code(), ErrorCode::ResourceUnavailable, "{refused}");
         assert!(!recorded(&world).await);
         world.serving.abort();
     }
