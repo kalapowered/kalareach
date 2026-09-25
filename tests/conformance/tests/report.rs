@@ -1031,7 +1031,7 @@ fn the_end_to_end_group_runs_what_the_end_to_end_script_runs() {
 
 /// The `cargo test` commands a job of the landing workflow runs, each as one line: a folded value
 /// is joined, and each line of a literal block is its own command.
-fn workflow_tests(job: &str) -> Vec<String> {
+fn workflow_commands(job: &str, program: &str) -> Vec<String> {
     let workflow = std::fs::read_to_string(
         repository()
             .join(".github")
@@ -1082,7 +1082,7 @@ fn workflow_tests(job: &str) -> Vec<String> {
         commands.extend(
             found
                 .into_iter()
-                .filter(|command| command.starts_with("cargo test")),
+                .filter(|command| command.starts_with(program)),
         );
     }
     commands
@@ -1103,12 +1103,17 @@ fn without_display(command: &str) -> String {
 
 #[test]
 fn the_platform_plans_run_what_the_landing_workflow_runs_there() {
-    // Windows: every `cargo test` of the workflow's Windows job is a step, and every step is one.
-    let mut workflow: Vec<String> = workflow_tests("windows")
+    // Windows: every `cargo test` of the workflow's Windows job is a step, and every test step is
+    // one; what the plan builds first, the Windows job builds too.
+    let mut workflow: Vec<String> = workflow_commands("windows", "cargo test")
         .iter()
         .map(|command| without_display(command))
         .collect();
-    let mut planned: Vec<String> = plan::steps(Platform::Windows, &Group::ALL, "/tmp/e", None)
+    let (builds, tests): (Vec<Step>, Vec<Step>) =
+        plan::steps(Platform::Windows, &Group::ALL, "/tmp/e", None)
+            .into_iter()
+            .partition(|step| step.command.get(1).is_some_and(|word| word == "build"));
+    let mut planned: Vec<String> = tests
         .iter()
         .map(|step| without_display(&step.line()))
         .collect();
@@ -1116,9 +1121,18 @@ fn the_platform_plans_run_what_the_landing_workflow_runs_there() {
     workflow.dedup();
     planned.sort();
     assert_eq!(planned, workflow, "the Windows job's tests");
+    let built = workflow_commands("windows", "cargo build");
+    assert!(!builds.is_empty());
+    for step in &builds {
+        assert!(
+            built.contains(&step.line()),
+            "{} among {built:?}",
+            step.line()
+        );
+    }
 
     // macOS: the workspace step leaves out what the workflow's macOS job leaves out, by name.
-    let workspace = workflow_tests("macos")
+    let workspace = workflow_commands("macos", "cargo test")
         .into_iter()
         .find(|command| command.starts_with("cargo test --locked --workspace"))
         .expect("the macOS job's workspace run");

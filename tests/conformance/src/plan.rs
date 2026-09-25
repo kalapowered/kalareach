@@ -268,18 +268,6 @@ const MACOS_SKIPS: &[(&str, &str)] = &[
         "needs podman, which the macOS runner does not have; the Linux run hosts it",
     ),
     (
-        "a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again",
-        "writes the platform's credential store, which the landing workflow's companion job does with its switch set",
-    ),
-    (
-        "the_built_packages_are_qualified_where_this_run_has_them",
-        "launches a built shell package, and this run builds none; the landing workflow's shell-packages job builds them and drives them",
-    ),
-    (
-        "a_real_qualified_package_registers_and_qualifies_on_this_hosts_endpoint",
-        "launches a built shell package, and this run builds none; the landing workflow's shell-packages job builds them and drives them",
-    ),
-    (
         "a_repository_whose_own_data_is_on_another_filesystem_is_captured",
         "needs a second filesystem, which the landing workflow's macOS job attaches for it",
     ),
@@ -537,6 +525,9 @@ pub fn steps(
     steps
 }
 
+/// The variable that lets the one case that writes this machine's credential store run.
+pub const SECRET_STORE_VARIABLE: &str = "KR_TEST_PLATFORM_SECRET_STORE";
+
 /// The variable naming the cache the fetch step installed the applications into.
 pub const APPLICATIONS_VARIABLE: &str = "KR_CONFORMANCE_APPLICATIONS";
 
@@ -605,14 +596,56 @@ fn windows() -> Vec<Step> {
             format!("on Windows only the cases named `{filter}` of this target are qualified"),
         )
     };
-    let mut steps = vec![
+    let qualified_only = |what: &str, arguments: &[&str], filter: &str| {
+        let mut step = Step::cargo(Group::Rust, what, arguments);
+        step.filter = Some(only(filter));
+        step
+    };
+    let breakaway = "supervision::tests::a_worker_breaks_away_from_a_kill_on_close_or_a_breakaway_permitting_job";
+    let credential = "sync::keys::tests::a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again";
+    vec![
+        // The pairing tests run `kr` against a control daemon they find built beside them, and a
+        // test that starts a worker through the environment's scheduled task registers the
+        // daemon as that task's starter, so both are built before the suites run.
+        Step {
+            reading: Reading::Build,
+            ..Step::cargo(
+                Group::Rust,
+                "the control daemon and the worker the suites start",
+                &[
+                    "build",
+                    "--locked",
+                    "-p",
+                    "kr-controller",
+                    "-p",
+                    "kr-worker",
+                ],
+            )
+        },
         Step::cargo(
             Group::Rust,
-            "the terminal engine, the repository boundary and the attach client",
-            &["test", "--locked", "-p", "kr-term", "-p", "kr-project", "-p", "kr-cli"],
+            "the terminal engine, the repository boundary, the attach client and pairing",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-term",
+                "-p",
+                "kr-project",
+                "-p",
+                "kr-cli",
+            ],
         ),
-        Step::cargo(Group::Rust, "the worker's library", &["test", "--locked", "-p", "kr-worker", "--lib"]),
-        Step::cargo(Group::Rust, "the settings-sync store", &["test", "--locked", "-p", "kr-client", "--test", "sync"]),
+        Step::cargo(
+            Group::Rust,
+            "the worker's library",
+            &["test", "--locked", "-p", "kr-worker", "--lib"],
+        ),
+        Step::cargo(
+            Group::Rust,
+            "the settings-sync store",
+            &["test", "--locked", "-p", "kr-client", "--test", "sync"],
+        ),
         Step::cargo(
             Group::Rust,
             "a pseudo-console, PowerShell and the session job object",
@@ -621,38 +654,123 @@ fn windows() -> Vec<Step> {
         Step::cargo(
             Group::Rust,
             "a launched agent's helper placed by its job",
-            &["test", "--locked", "-p", "kr-worker", "--test", "question_bindings"],
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-worker",
+                "--test",
+                "question_bindings",
+            ],
         ),
         Step::cargo(
             Group::Rust,
             "the local endpoint, the descriptors and the process identity",
             &["test", "--locked", "-p", "kr-ipc", "--test", "windows"],
         ),
-        Step::cargo(Group::Rust, "the local IPC library", &["test", "--locked", "-p", "kr-ipc", "--lib"]).skipping(&[
-            (
-                "framed::tests::a_checked_write_asks_before_every_transport_write",
-                "not qualified on Windows's named pipes",
-            ),
-            (
-                "framed::tests::a_peer_that_stops_reading_blocks_the_attempt_rather_than_holding_the_writer",
-                "not qualified on Windows's named pipes",
-            ),
-        ]),
+        Step::cargo(
+            Group::Rust,
+            "the local IPC library",
+            &["test", "--locked", "-p", "kr-ipc", "--lib"],
+        ),
         Step::cargo(
             Group::Rust,
             "what a question's caller token reaches",
-            &["test", "--locked", "-p", "kr-worker", "--test", "questions_answer"],
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-worker",
+                "--test",
+                "questions_answer",
+            ],
         ),
         Step::cargo(
             Group::Rust,
             "controller and local authority at a worker's pipe",
             &["test", "--locked", "-p", "kr-worker", "--test", "authority"],
         ),
-        Step::cargo(Group::Rust, "the attention store", &["test", "--locked", "-p", "kr-attention"]),
+        qualified_only(
+            "the registry's records of a previous release's workers",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-controller",
+                "--lib",
+                "registry",
+            ],
+            "registry",
+        ),
+        qualified_only(
+            "a worker's breakaway from the daemon's job",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-controller",
+                "--lib",
+                breakaway,
+            ],
+            breakaway,
+        ),
+        qualified_only(
+            "the environment's scheduled task, registered, read back and run",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-controller",
+                "--lib",
+                "supervision::windows",
+            ],
+            "supervision::windows",
+        ),
+        Step::cargo(
+            Group::Rust,
+            "a start through the environment's scheduled task",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-controller",
+                "--test",
+                "task_supervisor",
+            ],
+        ),
+        Step::cargo(
+            Group::Rust,
+            "the attention store",
+            &["test", "--locked", "-p", "kr-attention"],
+        ),
+        Step::cargo(
+            Group::Rust,
+            "the client's stores and their directory flush",
+            &["test", "--locked", "-p", "kr-client", "--lib"],
+        ),
         Step::cargo(
             Group::Rust,
             "the PowerShell bridge client over a named pipe",
-            &["test", "--locked", "-p", "kr-shell-integration", "--test", "pwsh_windows"],
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-shell-integration",
+                "--test",
+                "pwsh_windows",
+            ],
+        ),
+        qualified_only(
+            "the reference bridge over a real endpoint",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-shell-integration",
+                "--lib",
+                "host::scripted::",
+            ],
+            "host::scripted::",
         ),
         // The landing workflow runs these three with `--nocapture`, so that a case that could not
         // build what it needs says so; `--show-output` prints the same, under each test's name.
@@ -669,67 +787,55 @@ fn windows() -> Vec<Step> {
         Step::cargo(
             Group::Rust,
             "filesystem authority and access-control lists",
-            &["test", "--locked", "-p", "kr-transfer", "--lib", "--test", "authority"],
-        ),
-        // The one case that writes this machine's credential store runs only where the run was
-        // started with KR_TEST_PLATFORM_SECRET_STORE=1, as the conformance workflow's runner is;
-        // anywhere else it says it did nothing and is not run.
-        Step::cargo(
-            Group::Rust,
-            "a collection key kept in this machine's credential store",
             &[
                 "test",
                 "--locked",
                 "-p",
-                "kr-client",
+                "kr-transfer",
                 "--lib",
-                "--",
-                "--exact",
-                "sync::keys::tests::a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again",
+                "--test",
+                "authority",
             ],
         ),
-    ];
-    let mut registry = Step::cargo(
-        Group::Rust,
-        "the registry's records of a previous release's workers",
-        &[
-            "test",
-            "--locked",
-            "-p",
-            "kr-controller",
-            "--lib",
-            "registry",
-        ],
-    );
-    registry.filter = Some(only("registry"));
-    let mut store = Step::cargo(
-        Group::Rust,
-        "the settings-sync store's directory flush",
-        &[
-            "test",
-            "--locked",
-            "-p",
-            "kr-client",
-            "--lib",
-            "sync::store",
-        ],
-    );
-    store.filter = Some(only("sync::store"));
-    let mut scripted = Step::cargo(
-        Group::Rust,
-        "the reference bridge over a real endpoint",
-        &[
-            "test",
-            "--locked",
-            "-p",
-            "kr-shell-integration",
-            "--lib",
-            "host::scripted::",
-        ],
-    );
-    scripted.filter = Some(only("host::scripted::"));
-    steps.extend([registry, store, scripted]);
-    steps
+        // The one case that writes this machine's credential store is ignored in an ordinary run,
+        // and fails before it writes unless KR_TEST_PLATFORM_SECRET_STORE=1 says the run may, as
+        // the conformance workflow's runner does.
+        Step {
+            needs: vec![SECRET_STORE_VARIABLE],
+            ..Step::cargo(
+                Group::Rust,
+                "a collection key kept in this machine's credential store",
+                &[
+                    "test",
+                    "--locked",
+                    "-p",
+                    "kr-client",
+                    "--lib",
+                    "--",
+                    "--ignored",
+                    "--exact",
+                    credential,
+                ],
+            )
+        },
+        Step::cargo(
+            Group::Rust,
+            "the persistence suite",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-worker",
+                "--test",
+                "persistence",
+            ],
+        ),
+        Step::cargo(
+            Group::Rust,
+            "the real-worker host tests, through the environment's scheduled task",
+            &["test", "--locked", "-p", "kr-worker", "--test", "host"],
+        ),
+    ]
 }
 
 /// Why a group runs nothing on `platform`, where it does not.
