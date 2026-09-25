@@ -253,10 +253,12 @@ impl Shell {
     /// Waits until the launch the confirmation pause holds is committed, its launcher waiting to be
     /// told.
     ///
-    /// That is the one point between a launch's admission and its program's exec at which a test
-    /// can change the program whatever the machine's load: the launcher execs only on the word the
-    /// pause holds back, and it waits for that word for the commit deadline, which the change takes
-    /// a small part of.
+    /// That is the point between a launch's admission and its program's exec at which a test changes
+    /// the program: the launcher execs only on the word the pause holds back. It waits for that word
+    /// for the commit deadline only, and then runs what was typed, so a test that changes the program
+    /// also holds the launcher at a barrier ([`Shell::launcher_until`]) that it lets go only once the
+    /// change is complete: whichever route the launcher then takes, it cannot execute the program
+    /// before the change, or while the program's file is open for writing.
     fn at_the_confirmation(&self, arrived: tokio::sync::oneshot::Receiver<()>) {
         self.runtime
             .block_on(async { tokio::time::timeout(LIVENESS, arrived).await })
@@ -366,6 +368,65 @@ impl Shell {
         arguments.extend(vector.iter().cloned());
         let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
         self.placed.command(&arguments)
+    }
+
+    /// The launcher's command line for an answer, held before it executes the program, on
+    /// whichever route it took, until `barrier` exists.
+    fn launcher_until(
+        &self,
+        executable: &Path,
+        vector: &[String],
+        barrier: &Path,
+    ) -> std::process::Command {
+        let mut arguments = vec![
+            "launch".to_owned(),
+            "--hold-before-exec".to_owned(),
+            barrier.display().to_string(),
+            "--".to_owned(),
+            executable.display().to_string(),
+        ];
+        arguments.extend(vector.iter().cloned());
+        let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+        self.placed.command(&arguments)
+    }
+
+    /// Waits for the report a launched program writes, and says what became of the launcher's
+    /// process when none comes: its exit status and what it said.
+    fn report_from(&self, name: &str, child: &mut std::process::Child) -> BTreeMap<String, String> {
+        let path = self.reports.join(name);
+        let started = Instant::now();
+        let mut exited: Option<Instant> = None;
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                return text
+                    .lines()
+                    .filter_map(|line| line.split_once('='))
+                    .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                    .collect();
+            }
+            if exited.is_none() && matches!(child.try_wait(), Ok(Some(_))) {
+                exited = Some(Instant::now());
+            }
+            let gone = exited.is_some_and(|at| at.elapsed() > Duration::from_secs(2));
+            if gone || started.elapsed() >= LIVENESS {
+                match child.try_wait().ok().flatten() {
+                    Some(status) => {
+                        let mut said = String::new();
+                        if let Some(stderr) = child.stderr.as_mut() {
+                            let _ = std::io::Read::read_to_string(stderr, &mut said);
+                        }
+                        panic!(
+                            "the program reported by now: the launcher's process ended with \
+                             {status} and said: {said}"
+                        );
+                    }
+                    None => panic!(
+                        "the program reported by now: the launcher's process is still running"
+                    ),
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// Starts the launcher for an answer, with its variable, writing its report under `name`.
@@ -861,8 +922,9 @@ fn kr_req_11_34_the_launched_program_s_hook_moves_the_binding_and_a_replaced_one
     let answer = shell.establish_for(&swapped);
     let go = shell.placed.host.root().join("go-swapped");
     let go_text = go.display().to_string();
+    let changed = shell.placed.host.root().join("swapped.changed");
     let (arrived, release) = shell.backends.pause_before_confirming();
-    let mut held = shell.launcher(&swapped, &Shell::answered(), None);
+    let mut held = shell.launcher_until(&swapped, &Shell::answered(), &changed);
     shell.prepare(
         &mut held,
         Some(&answer),
@@ -874,11 +936,12 @@ fn kr_req_11_34_the_launched_program_s_hook_moves_the_binding_and_a_replaced_one
             ("LINGER", "2"),
         ],
     );
-    let held = held.spawn().expect("the launcher starts");
+    let mut held = held.spawn().expect("the launcher starts");
     shell.at_the_confirmation(arrived);
     retarget(&swapped, another);
+    std::fs::write(&changed, "").expect("the change is complete");
     release.send(()).expect("the launch goes on");
-    let report = shell.report("swapped");
+    let report = shell.report_from("swapped", &mut held);
     assert_eq!(report["registered"], "yes", "the launch went ahead");
     retarget(&swapped, program);
     std::fs::write(&go, "").expect("the hook may run");
@@ -1302,8 +1365,9 @@ fn kr_req_05_09_a_replacement_that_maps_the_hashed_program_is_refused() {
     // longer than a launcher waits.
     let python = python3();
     let answer = shell.establish_with(&path, &typed);
+    let changed = shell.placed.host.root().join("mapped.changed");
     let (arrived, release) = shell.backends.pause_before_confirming();
-    let mut held = shell.launcher(&path, &Shell::answered_for(&typed), None);
+    let mut held = shell.launcher_until(&path, &Shell::answered_for(&typed), &changed);
     let mapped = program.display().to_string();
     shell.prepare(
         &mut held,
@@ -1316,11 +1380,12 @@ fn kr_req_05_09_a_replacement_that_maps_the_hashed_program_is_refused() {
             ("LINGER", "2"),
         ],
     );
-    let held = held.spawn().expect("the launcher starts");
+    let mut held = held.spawn().expect("the launcher starts");
     shell.at_the_confirmation(arrived);
     retarget(&path, &python);
+    std::fs::write(&changed, "").expect("the change is complete");
     release.send(()).expect("the launch goes on");
-    let report = shell.report("mapped");
+    let report = shell.report_from("mapped", &mut held);
     assert_eq!(report["registered"], "yes", "the launch went ahead");
     let instance = instance_of(&report);
     hooked(&shell, "mapped");
@@ -1344,8 +1409,18 @@ fn kr_req_05_09_a_program_rewritten_in_place_after_it_was_hashed_is_refused() {
     let program = shell.placed.host.root().join("bin").join("rewritten");
     std::fs::copy("/bin/bash", &program).expect("a copy of the program, which Linux runs anywhere");
     let answer = shell.establish_for(&program);
+    // The changed bytes are made before the launch, so the window holds only the write itself.
+    let mut bytes = std::fs::read(&program).expect("the program's bytes");
+    // The file's last byte, in its section headers, which nothing reads to run it.
+    if let Some(last) = bytes.last_mut() {
+        *last ^= 0xff;
+    }
+    let modified = std::fs::metadata(&program)
+        .and_then(|metadata| metadata.modified())
+        .expect("its modification time");
+    let changed = shell.placed.host.root().join("rewritten.changed");
     let (arrived, release) = shell.backends.pause_before_confirming();
-    let mut held = shell.launcher(&program, &Shell::answered(), None);
+    let mut held = shell.launcher_until(&program, &Shell::answered(), &changed);
     shell.prepare(
         &mut held,
         Some(&answer),
@@ -1356,17 +1431,10 @@ fn kr_req_05_09_a_program_rewritten_in_place_after_it_was_hashed_is_refused() {
             ("LINGER", "2"),
         ],
     );
-    let held = held.spawn().expect("the launcher starts");
+    let mut held = held.spawn().expect("the launcher starts");
     shell.at_the_confirmation(arrived);
-    let mut bytes = std::fs::read(&program).expect("the program's bytes");
-    // The file's last byte, in its section headers, which nothing reads to run it.
-    if let Some(last) = bytes.last_mut() {
-        *last ^= 0xff;
-    }
-    let modified = std::fs::metadata(&program)
-        .and_then(|metadata| metadata.modified())
-        .expect("its modification time");
     {
+        // Through the page cache the kernel executes from, so nothing needs to reach the disk.
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .open(&program)
@@ -1375,10 +1443,11 @@ fn kr_req_05_09_a_program_rewritten_in_place_after_it_was_hashed_is_refused() {
             .expect("its bytes written back, one changed");
         file.set_modified(modified)
             .expect("its modification time put back");
-        file.sync_all().expect("written");
     }
+    // Closed: the launcher may execute the file now without its being busy.
+    std::fs::write(&changed, "").expect("the change is complete");
     release.send(()).expect("the launch goes on");
-    let report = shell.report("rewritten");
+    let report = shell.report_from("rewritten", &mut held);
     assert_eq!(report["registered"], "yes", "the launch went ahead");
     let instance = instance_of(&report);
     hooked(&shell, "rewritten");
@@ -1528,8 +1597,9 @@ fn kr_req_05_09_a_code_directory_copied_into_changed_code_vouches_for_nothing() 
     let path = shell.placed.host.root().join("bin").join("stale");
     std::os::unix::fs::symlink(&changed, &path).expect("the program");
     let answer = shell.establish_for(&path);
+    let replaced = shell.placed.host.root().join("stale.changed");
     let (arrived, release) = shell.backends.pause_before_confirming();
-    let mut held = shell.launcher(&path, &Shell::answered(), None);
+    let mut held = shell.launcher_until(&path, &Shell::answered(), &replaced);
     shell.prepare(
         &mut held,
         Some(&answer),
@@ -1540,11 +1610,12 @@ fn kr_req_05_09_a_code_directory_copied_into_changed_code_vouches_for_nothing() 
             ("LINGER", "2"),
         ],
     );
-    let held = held.spawn().expect("the launcher starts");
+    let mut held = held.spawn().expect("the launcher starts");
     shell.at_the_confirmation(arrived);
     retarget(&path, program);
+    std::fs::write(&replaced, "").expect("the change is complete");
     release.send(()).expect("the launch goes on");
-    let report = shell.report("stale");
+    let report = shell.report_from("stale", &mut held);
     assert_eq!(report["registered"], "yes", "the launch went ahead");
     let instance = instance_of(&report);
     hooked(&shell, "stale");

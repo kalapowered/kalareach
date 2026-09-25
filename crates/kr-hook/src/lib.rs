@@ -39,10 +39,12 @@ pub fn run(command: cli::Command) -> std::process::ExitCode {
         } => claude_code::channel::run(),
         cli::Command::Launch {
             hold_after_admission,
+            hold_before_exec,
             invocation,
         } => launch::run(
             &invocation,
             hold_after_admission.map(std::time::Duration::from_millis),
+            hold_before_exec.as_deref(),
         ),
         cli::Command::Relay { close_after_hello } => match relay::run(close_after_hello) {
             Ok(()) => std::process::ExitCode::SUCCESS,

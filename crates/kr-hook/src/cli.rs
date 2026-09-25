@@ -61,6 +61,13 @@ pub enum Command {
         /// it is named by nothing a shell runs.
         #[arg(long, hide = true, value_name = "MILLISECONDS")]
         hold_after_admission: Option<u64>,
+        /// Waits, before the program is executed on any route, until this file exists.
+        ///
+        /// It exists for the host's own tests, which change the executable while a launch waits
+        /// to be told it is committed, and must not have the program executed before the change
+        /// is complete; it is named by nothing a shell runs.
+        #[arg(long, hide = true, value_name = "PATH")]
+        hold_before_exec: Option<std::path::PathBuf>,
         /// The executable and its argument vector.
         #[arg(last = true, required = true, num_args = 2.., value_name = "INVOCATION")]
         invocation: Vec<std::ffi::OsString>,
@@ -133,6 +140,7 @@ mod tests {
             .expect("the launcher"),
             Command::Launch {
                 hold_after_admission: None,
+                hold_before_exec: None,
                 invocation: ["/usr/local/bin/claude", "claude", "--resume"]
                     .into_iter()
                     .map(std::ffi::OsString::from)
@@ -151,6 +159,7 @@ mod tests {
             .expect("a separator in the invocation is the invocation's"),
             Command::Launch {
                 hold_after_admission: None,
+                hold_before_exec: None,
                 invocation: ["/usr/local/bin/claude", "claude", "--", "--help"]
                     .into_iter()
                     .map(std::ffi::OsString::from)
