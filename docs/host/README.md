@@ -1735,6 +1735,28 @@ What a device reaches, in order:
    it presents a generation token, so a device's attachment, subscription and input lane belong to a
    connection of their own without displacing the daemon's authority connection.
 
+Each read a paired device may make is decided in one place, method by method: a service answers
+it, or it is refused by name with its reason. A test walks the method table and fails on any read
+the table admits for a device that is neither served nor refused by name. The reads that go to a
+session's worker travel over the one link a connection holds, so a connection reads the questions
+and agent state of the session it serves. `question.read` is answered by that worker and narrowed
+to the grant's history scope: a device sees a question its grant names, or one asked at or after
+the moment its grant reaches back to, so a device whose grant keeps no history and names no
+question sees none. Asking for one question outside that scope is refused rather than answered
+empty. `agent.capabilities` and `agent.commands` name their session inside the subject they read,
+and that session is the one the grant is checked against and the read is routed to. `grant.list`
+answers with the grants the device issued and everything delegated from them, and it needs
+`session.share`.
+
+Five reads are refused as `UNSUPPORTED_CAPABILITY`, with the read and the reason in the message:
+
+* `session.describe`, because this host runs no description service; `session.read` and
+  `session.list` carry a session's metadata and verified state.
+* `agent.snapshot`, because the shared history filter does not reach an agent's retained history,
+  and an answer could carry more than the grant covers.
+* `upload.status`, `download.begin` and `download.chunk`, because a transfer's chunks travel on an
+  attachment-chunk stream and this host opens none on a network connection.
+
 What the grant decides, for every request:
 
 * **Expiry.** A grant that has run out is refused, and once it has been found expired it stays
