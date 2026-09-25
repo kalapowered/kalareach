@@ -428,6 +428,48 @@ fn a_target_no_step_runs_is_not_run_with_the_reason() {
 }
 
 #[test]
+fn a_test_whose_step_stopped_after_building_it_is_not_run_with_the_steps_error() {
+    // Cargo cannot take a runner whose path has a space in it, so the step stops after its build,
+    // before its tests are listed or run.
+    let evidence = tempfile::tempdir().expect("an evidence directory");
+    let target = std::env::temp_dir().join("kr-conformance-fixture-target-forms-lib");
+    let options = Options {
+        root: tree("forms"),
+        evidence: kr_conformance::evidence::check_directory(evidence.path()).expect("inside"),
+        selection: Some(vec![Group::Rust]),
+        all_terminals: false,
+        platform: Platform::current(),
+        case_tables: &[],
+        lanes: &[],
+        applications: None,
+        steps: Some(vec![Step::cargo(
+            Group::Rust,
+            "the library's tests",
+            &["test", "--locked", "--lib"],
+        )]),
+        lister: std::env::temp_dir()
+            .join("a directory with spaces")
+            .join("kr-conformance"),
+        environment: vec![(
+            "CARGO_TARGET_DIR".to_owned(),
+            target.to_string_lossy().into_owned(),
+        )],
+    };
+    let document = report::run(&options, &mut |_| {}).expect("runs");
+    assert!(document.steps[0].error.is_some(), "{:?}", document.steps[0]);
+    let record = &document.identifiers["KR-REQ-02.03"];
+    assert_eq!(record.verdict, Verdict::NotRun);
+    let reason = record.tests[0].reason.as_deref().unwrap_or_default();
+    assert!(
+        reason.starts_with("`cargo test --locked --lib")
+            && reason.contains("built this target and did not run it")
+            && reason.contains("its path has a space in it"),
+        "{reason}"
+    );
+    assert!(!document.passed(), "a step that stopped fails the run");
+}
+
+#[test]
 fn a_run_asked_for_every_terminal_names_each_one_as_not_run_and_fails_until_its_runs_exist() {
     let evidence = tempfile::tempdir().expect("an evidence directory");
     let target = std::env::temp_dir().join("kr-conformance-fixture-target-forms-lib");
