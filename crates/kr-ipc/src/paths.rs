@@ -3191,6 +3191,11 @@ mod tests {
             "the same absent list reads the same"
         );
         assert_ne!(
+            access(&directory.described("no-list-recorded", "D:AINO_ACCESS_CONTROL")),
+            absent,
+            "an absent list that records inheritance"
+        );
+        assert_ne!(
             access(&directory.described("no-list-protected", "D:PNO_ACCESS_CONTROL")),
             absent,
             "an absent list protected from its directory"
