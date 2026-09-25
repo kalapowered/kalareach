@@ -682,11 +682,14 @@ struct BrokerState {
     /// the connector publisher's semantic trust grant." A table presented at connection time is
     /// compared with this, so a package cannot open a connection with a table nobody installed.
     pinned_tables: BTreeMap<(ApplicationInstanceId, PluginId), PinnedTable>,
-    /// The package whose pinned tables each open declarative connection reads with.
+    /// The installed package each connection identifier belongs to, for good.
     ///
-    /// It is the pin's package as it stood when the connection opened, or was restored: a pin
-    /// replaced afterwards changes nothing about a connection already reading with the old one. A
-    /// channel names its own package and is not held here.
+    /// A declarative connection takes its pin's package when it opens, and a pin replaced while it
+    /// is open changes nothing about it; a channel names its own package and is held here from
+    /// the first request it records. An identifier keeps its package after its connection closes
+    /// and across a restart, which reads it back from the ledger for every identifier that still
+    /// holds an unresolved resource. Its requests are that package's, so a restoration under
+    /// another package's tables is refused: those tables would read, answer and reconcile them.
     connection_packages: BTreeMap<GatewayConnectionId, PackageIdentity>,
     /// Every observer of this broker's transitions.
     ///
@@ -839,6 +842,11 @@ impl Broker {
         let stream_generation = ledger.advance_stream_generation()?;
         let announced: BTreeMap<PendingResourceId, u64> =
             ledger.latest_events()?.into_iter().collect();
+        // And each identifier that still holds an unresolved resource keeps the package it
+        // recorded its requests under, so a restart refuses a restoration under another package's
+        // tables as the process before it did.
+        let connection_packages: BTreeMap<GatewayConnectionId, PackageIdentity> =
+            ledger.connection_packages()?.into_iter().collect();
         Ok(Self {
             state: Mutex::new(BrokerState {
                 session_id,
@@ -859,7 +867,7 @@ impl Broker {
                 drafts: None,
                 connection_dispatch: BTreeMap::new(),
                 pinned_tables: BTreeMap::new(),
-                connection_packages: BTreeMap::new(),
+                connection_packages,
                 watchers: crate::broker::duplex::Observatory::new(),
                 announced,
                 next_event,
@@ -2547,15 +2555,18 @@ impl Broker {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut written: Vec<(PendingResource, Option<BrokerBindingId>, bool)> = Vec::new();
         for _ in 0..RECOVERY_PASSES {
-            let (records, closing, row, applied) = {
+            let (records, packages, closing, row, applied) = {
                 let state = self.state();
                 state.may_recover()?;
                 let mut closing = state.volatile.gap().cloned().ok_or_else(|| {
                     BrokerError::invalid("the gateway is fenced with no gap open")
                 })?;
                 closing.closed_at = Nullable::some(now);
+                let records = state.arbitration.volatile_records();
+                let packages = state.packages_of(&records);
                 (
-                    state.arbitration.volatile_records(),
+                    records,
+                    packages,
                     closing,
                     state.volatile.row(),
                     state.faults_applied,
@@ -2570,9 +2581,12 @@ impl Broker {
                 .cloned()
                 .collect();
             let sequence = match recorder.as_mut() {
-                Some(recorder) => recorder.commit_recovery(&fresh, &closing, row)?,
+                Some(recorder) => recorder.commit_recovery(&fresh, &packages, &closing, row)?,
                 // A ledger held in memory: one connection, no file, nothing to wait on.
-                None => self.state().ledger.commit_recovery(&fresh, &closing, row)?,
+                None => self
+                    .state()
+                    .ledger
+                    .commit_recovery(&fresh, &packages, &closing, row)?,
             };
             written = records;
             let mut state = self.state();
@@ -3006,7 +3020,8 @@ impl Broker {
     /// # Errors
     ///
     /// Returns [`BrokerError::PermissionDenied`] when the identifier is live, belongs to another
-    /// instance, or names no retained resource of this one, and whatever
+    /// instance, names no retained resource of this one, or recorded its requests under another
+    /// package than the one whose tables would restore it, and whatever
     /// [`Broker::open_native_connection`] refuses.
     pub fn restore_native_connection(
         &self,
@@ -3077,6 +3092,27 @@ impl Broker {
             ));
         }
         let pinned = state.pinned_table(application_instance_id, plugin_id)?;
+        // The identifier keeps the package it recorded its requests under, across a restart too.
+        // Another package's tables would read those requests, correlate the native client's
+        // answers to them and reconcile them in that package's terms, so they do not get the
+        // identifier.
+        match state.connection_packages.get(&connection) {
+            Some(recorded) if *recorded == pinned.package => {}
+            Some(recorded) => {
+                return Err(BrokerError::denied(format!(
+                    "{connection} holds requests of {}, and a restoration under the tables of {} \
+                     would read them in another package's terms",
+                    recorded.name(),
+                    pinned.package.beside(recorded)
+                )));
+            }
+            None => {
+                return Err(BrokerError::denied(format!(
+                    "{connection} names no package this host recorded its requests under, so \
+                     nothing says whose requests they are"
+                )));
+            }
+        }
         state.gateway.open_native(
             connection,
             application_instance_id,
@@ -3084,9 +3120,7 @@ impl Broker {
             pinned.table,
             pinned.rich,
             installed_protocol_version,
-        )?;
-        state.connection_packages.insert(connection, pinned.package);
-        Ok(())
+        )
     }
 
     /// Returns one gateway connection as the broker holds it.
@@ -3152,7 +3186,6 @@ impl Broker {
     pub fn close_connection(&self, connection: GatewayConnectionId) {
         let mut state = self.state();
         state.gateway.close(connection);
-        state.connection_packages.remove(&connection);
         state.connection_dispatch.remove(&connection);
         // Its upstream is out of reach from here, so what it keeps is its own to say.
         state.continuous.remove(&connection);
@@ -3986,8 +4019,8 @@ impl BrokerState {
         );
     }
 
-    /// Returns the package whose table one open connection reads with: a channel's own, or the
-    /// pin a declarative connection opened with. A connection that is not open reads with none.
+    /// Returns the package one connection identifier belongs to: an open channel's own, or the
+    /// one held for the identifier since its connection opened or recorded its first request.
     fn connection_package(&self, connection: GatewayConnectionId) -> Option<PackageIdentity> {
         if let Some(channel) = self.gateway.channel(connection) {
             return Some(PackageIdentity {
@@ -3997,6 +4030,29 @@ impl BrokerState {
             });
         }
         self.connection_packages.get(&connection).cloned()
+    }
+
+    /// Returns the package each connection of these records belongs to, for the recovery that
+    /// commits them: a connection whose first request was recorded inside the gap has its package
+    /// written with it.
+    fn packages_of(
+        &self,
+        records: &[(PendingResource, Option<BrokerBindingId>, bool)],
+    ) -> Vec<(GatewayConnectionId, ApplicationInstanceId, PackageIdentity)> {
+        let mut packages: BTreeMap<GatewayConnectionId, (ApplicationInstanceId, PackageIdentity)> =
+            BTreeMap::new();
+        for (resource, _, _) in records {
+            let connection = resource.request.connection;
+            if let Some(package) = self.connection_package(connection) {
+                packages
+                    .entry(connection)
+                    .or_insert((resource.application_instance_id, package));
+            }
+        }
+        packages
+            .into_iter()
+            .map(|(connection, (instance, package))| (connection, instance, package))
+            .collect()
     }
 
     /// Returns what one method of one connection asks this host to perform, when it asks for
@@ -4101,8 +4157,15 @@ impl BrokerState {
             crate::broker::ledger::TransitionCause::Recorded,
             None,
         );
+        // The request is the package's whose table read it, and it stays that package's whatever
+        // becomes of the connection: the package is kept with the source frame, held for the
+        // identifier, and written with the record, so a restart knows it too.
+        let recorder = self.connection_package(connection);
         if self.volatile.writes_are_durable() {
-            match self.ledger.record_opaque(&resource, &event) {
+            match self
+                .ledger
+                .record_opaque(&resource, recorder.as_ref(), &event)
+            {
                 Ok(()) => {}
                 // The store failed under a native request. The fence goes up here, in memory, and
                 // the request is kept as what it now is: a resource of the gap, announced and not
@@ -4125,9 +4188,11 @@ impl BrokerState {
         // A request recorded while a recovery is running belongs to an upstream that has not said
         // what it still holds, so it joins what that recovery owes.
         self.volatile.owe_one(application_instance_id, connection);
-        // The request is the package's whose table read it, and it stays that package's whatever
-        // becomes of the connection.
-        let recorder = self.connection_package(connection);
+        if let Some(recorder) = recorder.as_ref() {
+            self.connection_packages
+                .entry(connection)
+                .or_insert_with(|| recorder.clone());
+        }
         if let Some(instance) = self.instances.get_mut(&application_instance_id) {
             instance.retain(source_frame, recorder);
         }

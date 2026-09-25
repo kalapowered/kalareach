@@ -1353,11 +1353,10 @@ fn kr_req_11_26_on_a_live_connection_only_the_recording_packages_decoder_interpr
 }
 
 /// KR-REQ-11.26: a declarative connection's requests stay the recording package's after the
-/// connection closes and its identifier is restored under another package's tables. The restoring
-/// package's decoder is refused the recorder's request, and an answer to what the recorder's
-/// decoder interpreted is refused on the connection that now reads another package's table, and
-/// stays answerable. Restored under the recorder's own tables, the answer goes and the request is
-/// the recorder's decoder's to read.
+/// connection closes. Its identifier is not restored under another package's tables, and another
+/// package's decoder is refused the recorder's request. Restored under the recorder's own tables,
+/// with a transport bound again, the answer to what the recorder's decoder interpreted goes, and
+/// the request it has not read yet is its decoder's to read.
 #[tokio::test]
 async fn kr_req_11_26_a_restored_identifier_leaves_its_requests_the_recording_packages() {
     let broker = broker_with(
@@ -1379,7 +1378,7 @@ async fn kr_req_11_26_a_restored_identifier_leaves_its_requests_the_recording_pa
             rich_table(),
         )
         .expect("another package's tables are pinned");
-    broker
+    let refusal = broker
         .restore_native_connection(
             connection,
             instance(2),
@@ -1388,8 +1387,11 @@ async fn kr_req_11_26_a_restored_identifier_leaves_its_requests_the_recording_pa
             &other_package().plugin_id,
             "1",
         )
-        .expect("the identifier is restored under the other package's tables");
-    let _elsewhere = carry_answers(&broker);
+        .expect_err("the identifier is not restored under another package's tables");
+    assert!(
+        matches!(refusal, BrokerError::PermissionDenied { .. }),
+        "{refusal}"
+    );
     let refusal = broker
         .interpret(
             binding(10),
@@ -1398,14 +1400,7 @@ async fn kr_req_11_26_a_restored_identifier_leaves_its_requests_the_recording_pa
             None,
             TimestampMs::new(5),
         )
-        .expect_err("the restoring package's decoder does not read the recorder's request");
-    assert!(
-        matches!(refusal, BrokerError::PermissionDenied { .. }),
-        "{refusal}"
-    );
-    let refusal = answer(&broker, interpreted.resource_id, "allow", 6)
-        .await
-        .expect_err("an answer written with another package's table is refused");
+        .expect_err("another package's decoder does not read the recorder's request");
     assert!(
         matches!(refusal, BrokerError::PermissionDenied { .. }),
         "{refusal}"
@@ -1413,10 +1408,9 @@ async fn kr_req_11_26_a_restored_identifier_leaves_its_requests_the_recording_pa
     assert_eq!(
         broker.pending(interpreted.resource_id).expect("held").state,
         PendingState::Pending,
-        "and the request stays answerable"
+        "and the recorder's request stays answerable"
     );
 
-    broker.close_connection(connection);
     broker
         .restore_native_connection(
             connection,
@@ -1452,10 +1446,11 @@ async fn kr_req_11_26_a_restored_identifier_leaves_its_requests_the_recording_pa
 }
 
 /// KR-REQ-11.26 and KR-REQ-11.27: a connection identifier keeps the package it first recorded
-/// requests under, for good. Restoring it under another package's tables is refused, in the process
-/// that recorded its requests and in one that restarted from the ledger, for a connection whose
-/// first request was recorded inside a gap as well. Restored under its own package's tables, the
-/// native client's answer settles what it recorded.
+/// requests under, for good. Restoring it under another package's tables is refused in the process
+/// that recorded its requests, and after a restart, which reads the package back from the request's
+/// own record; restored under its own package's tables, the native client's answer settles what it
+/// recorded. A connection whose first request was recorded inside a gap has its package committed
+/// with the gap, and a later restart refuses it the same way.
 #[tokio::test]
 async fn kr_req_11_26_a_connection_identifier_keeps_its_package_across_a_restart() {
     let mut store = common::SharedStore::open();
@@ -1482,6 +1477,17 @@ async fn kr_req_11_26_a_connection_identifier_keeps_its_package_across_a_restart
             )
             .expect("another package's tables are pinned");
     };
+    let open = |broker: &Broker| {
+        broker
+            .open_native_connection(
+                instance(2),
+                &CREDENTIAL,
+                &process_identity(41, 900),
+                &package(),
+                "1",
+            )
+            .expect("the native connection is authenticated")
+    };
     let restore = |broker: &Broker, connection: GatewayConnectionId, plugin_id: &PluginId| {
         broker.restore_native_connection(
             connection,
@@ -1492,89 +1498,84 @@ async fn kr_req_11_26_a_connection_identifier_keeps_its_package_across_a_restart
             "1",
         )
     };
+    let refused = |outcome: Result<(), BrokerError>, what: &str| {
+        let refusal = outcome.expect_err(what);
+        assert!(
+            matches!(refusal, BrokerError::PermissionDenied { .. }),
+            "{what}: {refusal}"
+        );
+    };
 
-    let (recorded, gapped) = {
+    let recorded = {
         let broker =
             Broker::open(Some(&path), session(), store.health()).expect("the broker opens");
         register_and_pin(&broker);
-        let connection = broker
-            .open_native_connection(
-                instance(2),
-                &CREDENTIAL,
-                &process_identity(41, 900),
-                &package(),
-                "1",
-            )
-            .expect("the native connection is authenticated");
+        let connection = open(&broker);
         let recorded = forward(&broker, "11", 2).expect("recorded");
         broker.close_connection(connection);
-        let refusal = restore(&broker, connection, &other.plugin_id)
-            .expect_err("another package's tables do not read this identifier's requests");
-        assert!(
-            matches!(refusal, BrokerError::PermissionDenied { .. }),
-            "{refusal}"
+        refused(
+            restore(&broker, connection, &other.plugin_id),
+            "another package's tables do not read this identifier's requests",
         );
+        recorded.resource_id
+    };
 
-        // A connection whose first request is recorded inside a gap: its package is committed
-        // with the gap.
-        let gapped_connection = broker
-            .open_native_connection(
-                instance(2),
-                &CREDENTIAL,
-                &process_identity(41, 900),
-                &package(),
-                "1",
+    let gapped = {
+        let broker =
+            Broker::open(Some(&path), session(), store.health()).expect("the broker reopens");
+        register_and_pin(&broker);
+        let connection = GatewayConnectionId::new(1);
+        refused(
+            restore(&broker, connection, &other.plugin_id),
+            "the restart reads whose requests the identifier holds",
+        );
+        restore(&broker, connection, &package()).expect("restored under its own package's tables");
+        let answered = broker
+            .native_answer_through(
+                connection,
+                br#"{"id":11,"result":{"outcome":"allow"}}"#,
+                TimestampMs::new(3),
+                |_| Ok(()),
             )
-            .expect("a second native connection is authenticated");
+            .expect("the native client's answer is carried");
+        assert_eq!(answered.resource_id, recorded);
+        assert_eq!(answered.state, PendingState::Resolved);
+
+        let gapped = open(&broker);
         broker
             .refuse_ledger_writes(true)
             .expect("the store is put in query-only mode");
-        let gapped = broker
+        let during = broker
             .forward_native(
-                gapped_connection,
+                gapped,
                 permission_frame("21").as_bytes(),
-                TimestampMs::new(3),
+                TimestampMs::new(4),
             )
             .expect("the native request is still recorded")
             .1
             .expect("it expects a response");
         assert_eq!(
-            gapped.durability,
+            during.durability,
             kr_protocol::session::Durability::Volatile
         );
         broker
             .refuse_ledger_writes(false)
             .expect("the store takes writes again");
-        store.recover_journal(4);
+        store.recover_journal(5);
         broker
-            .recover(TimestampMs::new(4))
+            .recover(TimestampMs::new(5))
             .expect("the gap is committed");
-        (recorded.resource_id, gapped_connection)
+        gapped
     };
 
     let restarted =
         Broker::open(Some(&path), session(), JournalHealth::shared()).expect("the broker reopens");
     register_and_pin(&restarted);
-    for connection in [GatewayConnectionId::new(1), gapped] {
-        let refusal = restore(&restarted, connection, &other.plugin_id)
-            .expect_err("the restart knows whose requests the identifier holds");
-        assert!(
-            matches!(refusal, BrokerError::PermissionDenied { .. }),
-            "{connection}: {refusal}"
-        );
-        restore(&restarted, connection, &package())
-            .expect("restored under its own package's tables");
-    }
-    let answered = restarted
-        .native_answer_through(
-            GatewayConnectionId::new(1),
-            br#"{"id":11,"result":{"outcome":"allow"}}"#,
-            TimestampMs::new(5),
-            |_| Ok(()),
-        )
-        .expect("the native client's answer is carried");
-    assert_eq!(answered.resource_id, recorded);
-    assert_eq!(answered.state, PendingState::Resolved);
+    refused(
+        restore(&restarted, gapped, &other.plugin_id),
+        "the gap committed whose requests the identifier holds",
+    );
+    restore(&restarted, gapped, &package()).expect("restored under its own package's tables");
 }
 
 /// KR-REQ-11.25: narrowing an installation's grants narrows a component package's trust with them.
