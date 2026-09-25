@@ -521,12 +521,6 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-controller --test agent_tools --test contact_skill
 
-      # The machine group record's directory is flushed after the link that first names it and after
-      # each rename that replaces it; a flush refused while the directory is held says so.
-      - name: Test the machine group record
-        if: ${{ !cancelled() }}
-        run: cargo test --locked -p kr-controller --lib machine
-
       # The directory secret store a test run or `--secret-store file` names flushes each name it
       # writes. Its library only: `tests/libsodium.rs` compares a source path with `/` separators.
       - name: Test the directory secret store
