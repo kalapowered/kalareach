@@ -167,7 +167,9 @@ a build.
    credential. It has never had either.
 2. A federated credential on that application, `github-release-signing`: issuer
    `https://token.actions.githubusercontent.com`, audience `api://AzureADTokenExchange`, subject
-   `repo:kalapowered/kalareach:environment:release-signing`.
+   `repo:kalapowered@290383971/kalareach@1371146076:environment:release-signing`. GitHub puts the
+   owner's and the repository's numeric IDs in the subject beside their names, and those IDs are
+   never given to anything else.
 3. The GitHub environment `release-signing`, with a required reviewer and deployment branch and tag
    policies allowing `main` and `host/v*`.
 4. The Artifact Signing Certificate Profile Signer role, granted to that application's service
@@ -204,13 +206,18 @@ environment or a different repository, and it breaks immediately: Entra refuses 
 
 The fix is to make the credential's subject match again. Either put the job back in the
 `release-signing` environment, or add a federated credential whose subject is the new one. The
-subject a run presents is `repo:<owner>/<repository>:environment:<environment>`, and the failure
+subject a run presents is
+`repo:<owner>@<owner id>/<repository>@<repository id>:environment:<environment>`, and the failure
 names what it presented, so the value to add is in the log. Nothing is regenerated and nothing is
 copied anywhere: a federated credential is a statement about which token to trust, and editing it is
 editing that statement.
 
-The same applies to renaming the repository or moving it to another organisation. The subject
-carries the owner and the name.
+Renaming the repository or moving it to another owner changes the subject too, because it carries
+the names beside the IDs, so either one needs the credential's subject updated. What the IDs add is
+that a repository that later takes this name, under this owner or any other, presents different IDs
+and cannot sign. GitHub's
+[immutable subject claims](https://docs.github.com/en/actions/reference/security/oidc#immutable-subject-claims)
+reference describes the format.
 
 ## Rotation and recovery
 
@@ -285,9 +292,10 @@ run is suspected, or signing access must be revoked immediately:
         deletes or archives the compromised environment `release-signing`.
      2. The Entra application administrator creates a new application registration and service principal,
         configured with a federated credential scoped strictly to the new environment subject
-        (`repo:kalapowered/kalareach:environment:release-signing-v2`). The old application registration
-        and service principal are deleted. Because the new federated credential requires the new subject,
-        any stolen OIDC token minted under the old environment subject is rejected by Entra ID.
+        (`repo:kalapowered@290383971/kalareach@1371146076:environment:release-signing-v2`). The old
+        application registration and service principal are deleted. Because the new federated
+        credential requires the new subject, any stolen OIDC token minted under the old environment
+        subject is rejected by Entra ID.
      3. The Azure subscription owner or User Access Administrator grants `Artifact Signing Certificate
         Profile Signer` to the *new* service principal at the certificate profile scope.
      4. The GitHub repository administrator updates the `AZURE_CLIENT_ID` repository variable to the new
