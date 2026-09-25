@@ -5399,6 +5399,18 @@ fn upload_objects(connection: &rusqlite::Connection) -> i64 {
         .expect("the schema")
 }
 
+/// How many objects of the release table a database holds: the table and its rules.
+fn release_objects(connection: &rusqlite::Connection) -> i64 {
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+              WHERE tbl_name = 'releases' AND name NOT GLOB 'sqlite_*'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("the schema")
+}
+
 fn schema_version(connection: &rusqlite::Connection) -> i64 {
     connection
         .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
@@ -5406,7 +5418,7 @@ fn schema_version(connection: &rusqlite::Connection) -> i64 {
 }
 
 /// Writes a store back to the schema the previous build wrote: this build's schema without the
-/// upload table and its rules, at version 6.
+/// upload and release tables and their rules, at version 6.
 fn as_version_6(state: &std::path::Path) {
     let connection =
         rusqlite::Connection::open(state.join("backup.sqlite")).expect("the backup store");
@@ -5417,15 +5429,22 @@ fn as_version_6(state: &std::path::Path) {
              DROP TRIGGER an_upload_keeps_what_it_is;
              DROP TRIGGER an_acknowledged_part_is_never_withdrawn;
              DROP TABLE uploads;
+             DROP TRIGGER a_release_is_written_once;
+             DROP TRIGGER only_an_object_of_an_unknown_generation_is_released;
+             DROP TRIGGER an_object_a_held_generation_names_is_not_released;
+             DROP TRIGGER a_release_is_never_changed;
+             DROP TRIGGER a_release_is_never_taken_back;
+             DROP TABLE releases;
              UPDATE schema_version SET version = 6;",
         )
         .expect("the store is written back to version 6");
     assert_eq!(upload_objects(&connection), 0);
+    assert_eq!(release_objects(&connection), 0);
     assert_eq!(schema_version(&connection), 6);
 }
 
 /// A store the previous build wrote is brought to this build's schema once, by the step that adds
-/// the upload table, and keeps everything it had recorded.
+/// the upload and release tables, and keeps everything it had recorded.
 #[test]
 fn a_version_6_store_is_brought_to_this_builds_schema_once_and_keeps_what_it_recorded() {
     let (_root, state) = state_directory();
@@ -5458,6 +5477,11 @@ fn a_version_6_store_is_brought_to_this_builds_schema_once_and_keeps_what_it_rec
         upload_objects(&connection),
         5,
         "the table and its four rules"
+    );
+    assert_eq!(
+        release_objects(&connection),
+        6,
+        "the table and its five rules"
     );
     drop(connection);
 
@@ -5497,6 +5521,134 @@ fn a_version_6_store_holding_a_rule_this_build_never_wrote_is_refused_and_left_a
         rusqlite::Connection::open(state.join("backup.sqlite")).expect("the backup store");
     assert_eq!(schema_version(&connection), 6);
     assert_eq!(upload_objects(&connection), 0);
+    assert_eq!(release_objects(&connection), 0);
+}
+
+/// That the service no longer holds an object is written down once, only for an object of a
+/// generation whose outcome is unknown, and only when no generation this host still holds names
+/// it. Once written it is never changed or taken back, and a restart reads it back.
+#[test]
+fn a_release_is_written_once_only_for_what_no_held_generation_names_and_never_unsaid() {
+    let (_root, state) = state_directory();
+    let producer = Producer::generate();
+    // Two generations, each naming an object of its own and the same encrypted manifest.
+    let first = [stage(1, "a.cbor", b"one")];
+    let second = [stage(2, "b.cbor", b"two")];
+    let (one, two) = {
+        let service = BackupService::open(&state).expect("a backup service");
+        service
+            .reconcile(TimestampMs::new(4_000))
+            .expect("the startup reconciliation");
+        service
+            .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+            .expect("the writer is enrolled");
+        let mut admitted = Vec::new();
+        for (generation, objects) in [(1, &first), (2, &second)] {
+            let attempt = service
+                .admit(
+                    &producer.seal(generation, objects),
+                    objects,
+                    producer.writer.key_id(),
+                    TimestampMs::new(5_000 + generation),
+                )
+                .expect("the generation is admitted")
+                .sequence;
+            service
+                .note_dispatched(attempt, EXECUTOR, TimestampMs::new(5_100))
+                .expect("its upload leaves");
+            admitted.push(attempt);
+        }
+        (admitted[0], admitted[1])
+    };
+    let (generation_one, generation_two) = (BackupGeneration::new(1), BackupGeneration::new(2));
+    let (own, shared) = (object_id(1), object_id(0xf0));
+    let mut store = BackupStore::open(&state).expect("the backup store");
+
+    // A generation still producing releases nothing.
+    let producing =
+        store.note_object_released(archive_id(), generation_one, own, TimestampMs::new(6_000));
+    assert!(producing.is_err(), "{producing:?}");
+
+    // The first generation ends with its outcome unknown: an object only it names is released, and
+    // the manifest name the second generation, still producing, names too is not.
+    store
+        .note_attempt_stopped(one, TimestampMs::new(6_100))
+        .expect("its upload stops");
+    store
+        .cancel_production(
+            archive_id(),
+            generation_one,
+            "given up",
+            TimestampMs::new(6_100),
+        )
+        .expect("its production ends");
+    store
+        .note_object_released(archive_id(), generation_one, own, TimestampMs::new(7_000))
+        .expect("an object only it names is released");
+    let named = store.note_object_released(
+        archive_id(),
+        generation_one,
+        shared,
+        TimestampMs::new(7_000),
+    );
+    assert!(named.is_err(), "{named:?}");
+
+    // Once the second generation ends that way too, the name they share is released.
+    store
+        .note_attempt_stopped(two, TimestampMs::new(8_000))
+        .expect("its upload stops");
+    store
+        .cancel_production(
+            archive_id(),
+            generation_two,
+            "given up",
+            TimestampMs::new(8_000),
+        )
+        .expect("its production ends");
+    store
+        .note_object_released(
+            archive_id(),
+            generation_one,
+            shared,
+            TimestampMs::new(9_000),
+        )
+        .expect("the shared name is released");
+
+    // Written once: the same answer again is taken and changes nothing.
+    store
+        .note_object_released(archive_id(), generation_one, own, TimestampMs::new(10_000))
+        .expect("taken again");
+    let released = |store: &BackupStore| -> Vec<(BackupObjectId, Option<TimestampMs>)> {
+        store
+            .objects(archive_id(), generation_one)
+            .expect("a read")
+            .into_iter()
+            .map(|object| (object.object_id, object.released_at_ms))
+            .collect()
+    };
+    let expected = vec![
+        (own, Some(TimestampMs::new(7_000))),
+        (shared, Some(TimestampMs::new(9_000))),
+    ];
+    assert_eq!(released(&store), expected);
+    drop(store);
+
+    // Nothing that writes to the database changes one or takes one back.
+    let connection =
+        rusqlite::Connection::open(state.join("backup.sqlite")).expect("the backup store");
+    for statement in [
+        "UPDATE releases SET released_at_ms = 1",
+        "DELETE FROM releases",
+        "INSERT INTO releases (archive_id, backup_generation, object_id, released_at_ms)
+         SELECT archive_id, backup_generation, object_id, 1 FROM releases",
+    ] {
+        assert!(connection.execute_batch(statement).is_err(), "{statement}");
+    }
+    drop(connection);
+
+    // A restart reads it back.
+    let store = BackupStore::open(&state).expect("the store opens again");
+    assert_eq!(released(&store), expected);
 }
 
 // ---------------------------------------------------------------------------------------------

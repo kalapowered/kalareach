@@ -1,5 +1,6 @@
-//! `backup.sqlite`: the generations this host has produced, their objects, their upload state and
-//! the outbox that carries them to the service.
+//! `backup.sqlite`: the generations this host has produced, their objects, their upload state, the
+//! outbox that carries them to the service, and the objects the service no longer holds after this
+//! host asked for their deletion.
 //!
 //! # One transaction per state transition
 //!
@@ -43,10 +44,10 @@ use crate::error::{ControllerError, Result};
 pub const SCHEMA_VERSION: i64 = 7;
 
 /// The schema version the previous build wrote, which is this build's schema without the upload
-/// table and its rules.
+/// and release tables and their rules.
 ///
 /// Remove it, with the step that reads it, once no supported host can still hold a store at this
-/// version: when the releases that wrote one are outside the installed-version upgrade window that
+/// version: when the builds that wrote one are outside the installed-version upgrade window that
 /// section 24 keeps host migrators for.
 const VERSION_WITHOUT_UPLOADS: i64 = 6;
 
@@ -525,6 +526,12 @@ pub struct ObjectRecord {
     /// It never decreases, and it is never touched by a removal: what a service holds and where
     /// the ciphertext is are two facts, and each is recorded on its own terms.
     pub acknowledged_bytes: u64,
+    /// When the service said it no longer holds this object, after this host asked for its
+    /// deletion because no publication can name it.
+    ///
+    /// Written once and never taken back. What was acknowledged stays as it was: the service did
+    /// hold the object, and this says that it holds it no longer.
+    pub released_at_ms: Option<TimestampMs>,
 }
 
 impl ObjectRecord {
@@ -784,12 +791,12 @@ impl BackupStore {
 
     /// Takes a store the previous build wrote, at schema version 6, to this build's schema, once.
     ///
-    /// This build's schema is version 6's with the upload table and its rules added and nothing
-    /// else changed, so a version-6 store gains exactly those, in one transaction with the new
-    /// version. What it then holds is compared with this build's schema inside that transaction, so
-    /// a version-6 store holding anything this build does not define is refused as any other store
-    /// is, and is left as it was found. What it recorded is kept: the upload table starts empty,
-    /// which is what a store that could not record an upload holds.
+    /// This build's schema is version 6's with the upload and release tables and their rules added
+    /// and nothing else changed, so a version-6 store gains exactly those, in one transaction with
+    /// the new version. What it then holds is compared with this build's schema inside that
+    /// transaction, so a version-6 store holding anything this build does not define is refused as
+    /// any other store is, and is left as it was found. What it recorded is kept: both tables start
+    /// empty, which is what a store that could record neither an upload nor a release holds.
     ///
     /// Remove this step with [`VERSION_WITHOUT_UPLOADS`].
     fn migrate_from_version_6(&mut self) -> Result<()> {
@@ -800,6 +807,9 @@ impl BackupStore {
             .map_err(ControllerError::registry)?;
         transaction
             .run_script(UPLOADS)
+            .map_err(ControllerError::registry)?;
+        transaction
+            .run_script(RELEASES)
             .map_err(ControllerError::registry)?;
         transaction
             .run(
@@ -893,8 +903,85 @@ macro_rules! uploads_definition {
     };
 }
 
-/// What a version-6 store gains on its way to this build's schema.
+/// Each object the storage service no longer holds after this host asked for its deletion, and
+/// when the service said so.
+///
+/// It is the record that lets the storage of a generation no publication can name be given back
+/// once, and never asked for again. Its rules: a release is written once and is never changed or
+/// taken back; only an object of a generation whose production ended with its outcome unknown is
+/// released; and an object is released only when every generation this host records that names it
+/// ended that way too. So no object that a producing, complete or published generation names is
+/// ever written down as gone. It holds identities and an instant, as the rest of the store does.
+///
+/// One text, in [`DEFINITION`] and in the step that brings a version-6 store to this schema, so the
+/// two cannot write these objects differently.
+macro_rules! releases_definition {
+    () => {
+        "
+                 CREATE TABLE IF NOT EXISTS releases (
+                     archive_id        BLOB NOT NULL,
+                     backup_generation INTEGER NOT NULL,
+                     object_id         BLOB NOT NULL,
+                     released_at_ms    INTEGER NOT NULL,
+                     PRIMARY KEY (archive_id, backup_generation, object_id),
+                     FOREIGN KEY (archive_id, backup_generation, object_id)
+                         REFERENCES objects (archive_id, backup_generation, object_id)
+                 );
+                 CREATE TRIGGER IF NOT EXISTS a_release_is_written_once
+                 BEFORE INSERT ON releases
+                 WHEN EXISTS (SELECT 1 FROM releases
+                               WHERE archive_id = NEW.archive_id
+                                 AND backup_generation = NEW.backup_generation
+                                 AND object_id = NEW.object_id)
+                 BEGIN
+                     SELECT RAISE(ABORT, 'that the service no longer holds an object is written \
+                                          down once');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS only_an_object_of_an_unknown_generation_is_released
+                 BEFORE INSERT ON releases
+                 WHEN NOT EXISTS (SELECT 1 FROM generations
+                                   WHERE archive_id = NEW.archive_id
+                                     AND backup_generation = NEW.backup_generation
+                                     AND production = 'cancelled'
+                                     AND remote = 'unknown')
+                 BEGIN
+                     SELECT RAISE(ABORT, 'only an object of a generation whose production ended \
+                                          with its outcome unknown is released');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS an_object_a_held_generation_names_is_not_released
+                 BEFORE INSERT ON releases
+                 WHEN EXISTS (SELECT 1 FROM objects
+                                JOIN generations
+                                  ON generations.archive_id = objects.archive_id
+                                 AND generations.backup_generation = objects.backup_generation
+                               WHERE objects.archive_id = NEW.archive_id
+                                 AND objects.object_id = NEW.object_id
+                                 AND NOT (generations.production = 'cancelled'
+                                          AND generations.remote = 'unknown'))
+                 BEGIN
+                     SELECT RAISE(ABORT, 'an object named by a generation this host still holds \
+                                          is not released');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS a_release_is_never_changed
+                 BEFORE UPDATE ON releases
+                 BEGIN
+                     SELECT RAISE(ABORT, 'that the service no longer holds an object is never \
+                                          changed');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS a_release_is_never_taken_back
+                 BEFORE DELETE ON releases
+                 BEGIN
+                     SELECT RAISE(ABORT, 'that the service no longer holds an object is never \
+                                          unsaid');
+                 END;"
+    };
+}
+
+/// What a version-6 store gains on its way to this build's schema: the upload table and its rules.
 const UPLOADS: Statement = sql!(uploads_definition!());
+
+/// And the release table and its rules.
+const RELEASES: Statement = sql!(releases_definition!());
 
 /// Everything one backup store is: its tables, its indexes, and the rules it enforces.
 const DEFINITION: Statement = sql!(concat!(
@@ -1306,6 +1393,7 @@ const DEFINITION: Statement = sql!(concat!(
                  END;
                  ",
     uploads_definition!(),
+    releases_definition!(),
     "
                  INSERT INTO privacy_state (id, current_generation, enabled) VALUES (0, 0, 0);"
 ));
@@ -2205,10 +2293,16 @@ impl BackupStore {
         let mut statement = self
             .connection
             .prepared(sql!(
-                "SELECT archive_id, backup_generation, object_id, encrypted_hash, encrypted_len,
-                        staged_path, local_state, acknowledged_bytes
-                 FROM objects WHERE archive_id = ?1 AND backup_generation = ?2
-                 ORDER BY object_id"
+                "SELECT objects.archive_id, objects.backup_generation, objects.object_id,
+                        encrypted_hash, encrypted_len, staged_path, local_state,
+                        acknowledged_bytes, releases.released_at_ms
+                 FROM objects
+                 LEFT JOIN releases
+                   ON releases.archive_id = objects.archive_id
+                  AND releases.backup_generation = objects.backup_generation
+                  AND releases.object_id = objects.object_id
+                 WHERE objects.archive_id = ?1 AND objects.backup_generation = ?2
+                 ORDER BY objects.object_id"
             ))
             .map_err(ControllerError::registry)?;
         let rows = statement
@@ -2366,6 +2460,56 @@ impl BackupStore {
             )
             .map_err(ControllerError::registry)?;
         Ok(forgotten > 0)
+    }
+
+    /// Records that the service no longer holds one object, which this host asked it to delete.
+    ///
+    /// The service answered the deletion, or answered that it holds no object under that identity;
+    /// either way nothing of it is charged beyond the service's tombstone window. A release already
+    /// written is left as it is, so an answer recorded twice records it once. The store's rules
+    /// refuse a release for an object whose generation did not end with its outcome unknown, and for
+    /// one a generation this host still holds names.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
+    pub fn note_object_released(
+        &mut self,
+        archive_id: ArchiveId,
+        backup_generation: BackupGeneration,
+        object_id: BackupObjectId,
+        now_ms: TimestampMs,
+    ) -> Result<()> {
+        let archive = archive_id.get().as_bytes().to_vec();
+        let generation = i64::try_from(backup_generation.get()).unwrap_or(i64::MAX);
+        let object = object_id.get().as_bytes().to_vec();
+        let transaction = self
+            .connection
+            .writing()
+            .map_err(ControllerError::registry)?;
+        let written: i64 = transaction
+            .read_one(
+                sql!(
+                    "SELECT COUNT(*) FROM releases
+                  WHERE archive_id = ?1 AND backup_generation = ?2 AND object_id = ?3"
+                ),
+                params![archive, generation, object],
+                |row| row.get(0),
+            )
+            .map_err(ControllerError::registry)?;
+        if written == 0 {
+            transaction
+                .run(
+                    sql!(
+                        "INSERT INTO releases
+                         (archive_id, backup_generation, object_id, released_at_ms)
+                     VALUES (?1, ?2, ?3, ?4)"
+                    ),
+                    params![archive, generation, object, millis(now_ms)],
+                )
+                .map_err(ControllerError::registry)?;
+        }
+        transaction.commit().map_err(ControllerError::registry)
     }
 
     /// Returns one object's upload in progress, if it has one.
@@ -4191,6 +4335,7 @@ fn read_object(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<ObjectRecord>
     let path: String = row.get(5)?;
     let local_state: String = row.get(6)?;
     let acknowledged: i64 = row.get(7)?;
+    let released: Option<i64> = row.get(8)?;
     Ok((|| {
         Ok(ObjectRecord {
             archive_id: ArchiveId::new(uuid(&archive, "an archive identifier")?),
@@ -4205,6 +4350,8 @@ fn read_object(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<ObjectRecord>
             staged_path: PathBuf::from(path),
             local_state: LocalState::parse(&local_state)?,
             acknowledged_bytes: u64::try_from(acknowledged).unwrap_or(0),
+            released_at_ms: released
+                .map(|value| TimestampMs::new(u64::try_from(value).unwrap_or(0))),
         })
     })())
 }
