@@ -8272,6 +8272,11 @@
           "const": "standalone",
           "description": "The standalone headless profile, for a host with no service manager to ask: a command\nthat finds no daemon running starts `kr-controller` itself, detached from the command,\nin a session of its own and with the environment's own directories. The daemon takes\nthe environment's singleton lock and advances its generation as every daemon does, so\nseveral commands starting one at once leave one daemon.",
           "type": "string"
+        },
+        {
+          "const": "service",
+          "description": "This user's own service manager: a per-user definition of the daemon, a launchd job on\nmacOS and a systemd user unit on Linux, which `kr host startup` wrote and recorded. A\ncommand that finds no daemon running asks the manager to start it, and the manager is\nthe daemon's parent. It starts one process for the job however many commands ask, and\nthe daemon takes the environment's singleton lock and advances its generation as every\ndaemon does.",
+          "type": "string"
         }
       ]
     },
