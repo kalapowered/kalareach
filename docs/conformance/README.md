@@ -53,12 +53,13 @@ them unnoticed.
 
 Every `cargo test` step that keeps each test's output captured runs with `--show-output`, which
 prints what every passing test wrote under its name. A step that shows the output as it is written,
-with `--nocapture`, keeps its script's command. Before a step runs, its tests are built, and every
-test binary the build made is asked for its list and then has to be run and read: a binary that
-does not list, one the log never ran, and a log that cannot be read are each the step's error. A target whose manifest
+with `--nocapture`, keeps its script's command. Before a step runs, its tests are built and listed
+through Cargo, package by package, and every test binary the build made then has to be run and
+read: a listing that fails, a binary the log never ran, and a log that cannot be read are each the
+step's error. A target whose manifest
 gives it a harness of its own (`harness = false`) is a program that prints neither a list nor
-verdicts: it is not asked for a list, it is run with the step, its exit status is the step's, and a
-comment on it is a reference.
+verdicts: it is never named in a listing, it is run with the step, its exit status is the step's,
+and a comment on it is a reference.
 
 A test that no selected group runs on this platform is reported as not run, with the reason. It is
 never reported as passed.
