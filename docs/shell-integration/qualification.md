@@ -24,9 +24,12 @@ states.
 The corpus on its own is `cargo test -p kr-shell-integration --test qualification`. With no package
 built and no customisation fetched it says so and stops; with `KR_REQUIRE_SHELL_PACKAGES` or
 `KR_REQUIRE_SHELL_STACKS` set, either absence is a failure instead, which is what continuous
-integration does. It writes the same evidence to `KR_TEST_ARTIFACTS_DIR`, or, where that is unset,
-to a directory it makes for itself in the system's temporary directory, named `kr-test-artifacts-`
-and a random suffix, and keeps. Evidence it cannot write fails the run.
+integration does. A package counts as built only when it is this tree's: the identity the
+installation's `current` names has to be the one this tree's inputs give, by the rule the build
+names the package with, and a build of anything else is reported with both identities. It writes the
+same evidence to `KR_TEST_ARTIFACTS_DIR`, or, where that is unset, to a directory it makes for
+itself in the system's temporary directory, named `kr-test-artifacts-` and a random suffix, and
+keeps. Evidence it cannot write fails the run.
 
 ## The corpus
 

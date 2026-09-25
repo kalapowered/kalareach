@@ -155,11 +155,16 @@ fn cache_root() -> PathBuf {
 }
 
 impl Package {
-    /// Finds the built package, or says why it is not there.
+    /// Finds this tree's own built package, or says why it is not there.
+    ///
+    /// The installation's `current` names a build, and a build is named by a digest of what it was
+    /// built from, so the build it names is this tree's only when that is the identity this tree's
+    /// inputs give. A build of other inputs, left by a build of another tree, is not this tree's
+    /// package, and a suite that drove it would be testing somebody else's patches.
     ///
     /// # Errors
     ///
-    /// Returns the reason a test should skip: the package has not been built here.
+    /// Returns the reason a test should skip: this tree's package has not been built here.
     pub fn find(kind: ShellKind) -> Result<Self, String> {
         let name = kind.as_str();
         let root = cache_root().join(name);
@@ -189,6 +194,16 @@ impl Package {
                 format!("{} has no identity record ({error})", record_path.display())
             })?)
             .map_err(|error| format!("{} does not decode ({error})", record_path.display()))?;
+        let tree = identity::tree_identity(kind, &record).map_err(|error| {
+            format!("the identity this tree gives the {name} package cannot be worked out: {error}")
+        })?;
+        if tree != identity {
+            return Err(format!(
+                "{} names {name} {identity}, and this tree's inputs give {tree}, so the package \
+                 there was built from something other than this tree; {how}",
+                pointer.display()
+            ));
+        }
         let executable = PathBuf::from(
             record["shell"]["executable"]
                 .as_str()
@@ -227,7 +242,7 @@ impl Package {
             Err(reason) => {
                 assert!(
                     std::env::var_os(REQUIRE).is_none(),
-                    "{REQUIRE} is set and the package is missing: {reason}"
+                    "{REQUIRE} is set and this tree's package is not here: {reason}"
                 );
                 println!("skipped: {reason}");
                 None
@@ -2112,6 +2127,7 @@ fn a_terminal_that_stopped_reading_ends_a_write_at_its_deadline() {
 mod cases;
 mod commands;
 mod dialect;
+mod identity;
 mod inbox;
 mod stacks;
 
