@@ -1,6 +1,6 @@
 {
   "name": "@kalareach/protocol",
-  "version": "0.32.0",
+  "version": "0.33.0",
   "description": "KalaReach protocol types, KR-CBOR-1 codec and conformance fixtures",
   "license": "BSD-3-Clause",
   "type": "module",
