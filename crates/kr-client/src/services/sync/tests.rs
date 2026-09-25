@@ -596,6 +596,81 @@ async fn an_exchange_answer_is_passed_through_as_the_service_stated_it() {
     assert_eq!(unreadable.code(), ErrorCode::OutcomeUnknown);
 }
 
+/// KR-REQ-20.13: a copy is what a refused write leaves, so an answer that says the write applied and
+/// names a copy of it says two contrary things. It is not one this client reads, whichever kind of
+/// collection answered it: a caller told `Applied` would move its note on, and the copy the answer
+/// also names would be one no resolution is ever pointed at.
+#[tokio::test]
+async fn an_applied_answer_that_names_a_copy_is_not_one_this_client_reads() {
+    let (client, recorder) = sync_client();
+    let object = identity(7);
+    let bytes = published(&sealed(b"theme=dark"));
+    let copy = copy_summary(object, identity(0x44), revision(4));
+    let collection = shared::shared_collection(shared::installation(0x41), 0x42);
+
+    for (state, record, current) in [
+        ("written", summary(object, revision(9), "4"), Some(revision(9))),
+        ("removed", serde_json::Value::Null, None),
+    ] {
+        recorder.answering(vec![exchanged(state, record, current, "4", copy.clone())]);
+        let unreadable = client
+            .compare_exchange(&settings_of(object), identity(8), now_ms(), None, &bytes)
+            .await
+            .expect_err("an applied write and a copy at once");
+        assert_eq!(unreadable.code(), ErrorCode::OutcomeUnknown, "{state}");
+        assert!(
+            unreadable.to_string().contains("names a copy"),
+            "{state}: {unreadable}"
+        );
+
+        let unreadable = client
+            .exchange_shared(
+                &collection,
+                &settings_of(object),
+                0,
+                identity(8),
+                now_ms(),
+                None,
+                &bytes,
+            )
+            .await
+            .expect_err("an applied write and a copy at once, in a shared collection");
+        assert_eq!(unreadable.code(), ErrorCode::OutcomeUnknown, "{state}");
+    }
+
+    // The control: the same answers naming no copy are applied writes, as they always were.
+    for (state, record, current, expected) in [
+        (
+            "written",
+            summary(object, revision(9), "4"),
+            Some(revision(9)),
+            SyncPosition::at(4, revision(9), None),
+        ),
+        (
+            "removed",
+            serde_json::Value::Null,
+            None,
+            SyncPosition::removed_at(4, None),
+        ),
+    ] {
+        recorder.answering(vec![exchanged(
+            state,
+            record,
+            current,
+            "4",
+            serde_json::Value::Null,
+        )]);
+        assert_eq!(
+            client
+                .compare_exchange(&settings_of(object), identity(8), now_ms(), None, &bytes)
+                .await
+                .expect("an applied write"),
+            SyncExchanged::Applied { position: expected },
+            "{state}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_status_answer_is_what_the_receipt_recorded() {
     let (client, recorder) = sync_client();

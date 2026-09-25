@@ -2350,6 +2350,12 @@ fn read<T: for<'de> Deserialize<'de>>(data: serde_json::Value, what: &'static st
 fn exchanged(answer: ExchangeAnswer, object_id: SyncObjectId) -> Result<SyncExchanged> {
     let recovery = answer.recovery_id;
     Ok(match answer.state {
+        // A copy is what a refused write leaves, so an applied write that names one says two
+        // contrary things. A caller told it applied would move its note on, and the copy the
+        // answer also names would be one no resolution is ever pointed at.
+        ExchangeState::Written | ExchangeState::Removed if answer.conflict.0.is_some() => {
+            return Err(contrary("an applied write that names a copy"));
+        }
         // Where the service put the write, as it stated it. A removal's place, and a place of
         // nought, come back as the service said them rather than as something a caller would
         // rather read: a caller that publishes writes declines both, and that is its decision.
