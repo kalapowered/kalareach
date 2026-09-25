@@ -17,38 +17,15 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use kr_controller::supervision::windows::{
-    LogonType, TaskDefinition, TaskSupervisor, register, remove, run,
-};
+use kr_controller::supervision::windows::testing::{TestTask, built_binary};
+use kr_controller::supervision::windows::{TaskSupervisor, run};
 use kr_controller::supervision::{LaunchOutcome, ServiceLaunch, WorkerSupervisor};
 use kr_ipc::starter::{Reached, StartClaim, connect, current_session, in_any_job};
 use kr_ipc::testing::TempHost;
 
-/// The environment's task, registered for this test and removed however it ends.
-struct Registered(TaskDefinition);
-
-impl Registered {
-    fn for_environment(host: &TempHost, starter: &Path) -> Self {
-        let logon = if current_session().expect("this session") == 0 {
-            LogonType::S4U
-        } else {
-            LogonType::InteractiveToken
-        };
-        let definition = TaskDefinition::new(
-            kr_ipc::starter::current_user_sid().expect("this account"),
-            &host.environment(),
-            starter,
-            logon,
-        );
-        register(&definition).expect("the environment's task is registered");
-        Self(definition)
-    }
-}
-
-impl Drop for Registered {
-    fn drop(&mut self) {
-        let _ = remove(&self.0);
-    }
+/// The environment's task, registered for this test's environment and removed however it ends.
+fn registered(host: &TempHost, starter: &Path) -> TestTask {
+    TestTask::register(&host.environment(), starter).expect("the environment's task is registered")
 }
 
 /// This build's control daemon, which the task runs as its starter.
@@ -84,13 +61,28 @@ fn end(identity: &kr_protocol::identity::ProcessStartIdentity) {
     }
 }
 
+/// A suite that is not this package's finds this package's daemon where the build put it, beside
+/// its own executable: the same binary the build gave this package's tests.
+#[test]
+fn a_suite_finds_the_built_daemon_beside_itself() {
+    let found = built_binary("kr-controller").expect("the daemon is built");
+    assert_eq!(
+        std::fs::canonicalize(found).expect("the found binary"),
+        std::fs::canonicalize(starter()).expect("the binary the build names")
+    );
+    assert!(
+        built_binary("kr-no-such-binary").is_err(),
+        "a binary that was not built is not found"
+    );
+}
+
 /// A service started through the task is the process the starter reported, runs in this
 /// process's login session, is outside every job where the task's own job lets it leave, and the
 /// environment's login session is recorded.
 #[test]
 fn a_service_is_started_by_the_environments_task_and_not_by_this_process() {
     let host = TempHost::create();
-    let _task = Registered::for_environment(&host, &starter());
+    let _task = registered(&host, &starter());
     let supervisor = TaskSupervisor::new(host.environment(), &starter()).expect("the supervisor");
     let outcome = supervisor.start_service(&waiting_service(&host));
     let LaunchOutcome::Started(identity) = outcome else {
@@ -157,7 +149,7 @@ fn with_no_task_a_start_names_the_setup_step_and_leaves_nothing_waiting() {
 #[test]
 fn a_task_that_runs_another_program_is_refused_before_it_is_run() {
     let host = TempHost::create();
-    let _task = Registered::for_environment(&host, &system("whoami.exe"));
+    let _task = registered(&host, &system("whoami.exe"));
     let supervisor = TaskSupervisor::new(host.environment(), &starter()).expect("the supervisor");
     let outcome = supervisor.start_service(&waiting_service(&host));
     let LaunchOutcome::NotStarted { detail } = outcome else {
@@ -174,7 +166,7 @@ fn a_task_that_runs_another_program_is_refused_before_it_is_run() {
 #[test]
 fn a_launch_the_starter_cannot_create_is_nothing_started() {
     let host = TempHost::create();
-    let _task = Registered::for_environment(&host, &starter());
+    let _task = registered(&host, &starter());
     let supervisor = TaskSupervisor::new(host.environment(), &starter()).expect("the supervisor");
     let mut launch = waiting_service(&host);
     launch.program = host.root().join("no-such-program.exe");
@@ -194,14 +186,14 @@ fn a_launch_the_starter_cannot_create_is_nothing_started() {
 fn a_starter_with_only_a_lapsed_claim_takes_it_and_starts_nothing() {
     let host = TempHost::create();
     let environment = host.environment();
-    let task = Registered::for_environment(&host, &starter());
+    let task = registered(&host, &starter());
     let claim = StartClaim {
         request: kr_ipc::new_uuid(),
         boot: kr_ipc::identity::boot_identity().expect("this boot"),
         deadline_boot_ms: kr_ipc::clock::boot_elapsed_ms(),
     };
     kr_ipc::starter::leave_claim(&environment, &claim).expect("a lapsed claim");
-    run(&task.0).expect("the task is run");
+    run(task.definition()).expect("the task is run");
     let marker = environment
         .start_claims_dir()
         .join(format!("{}.taken", claim.request));

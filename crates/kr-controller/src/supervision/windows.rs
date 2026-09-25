@@ -1123,6 +1123,97 @@ mod launching {
     }
 }
 
+/// For suites that host a daemon on Windows: the environment's task registered for a test's own
+/// temporary environment, and the supervisor that starts through it.
+///
+/// A daemon a test hosts runs inside `cargo test`'s job, which kills its members when it closes
+/// and forbids breakaway, so a worker it created itself would die with the test. Through the task
+/// it creates nothing itself: the task's starter creates the worker, outside that job.
+#[cfg(all(windows, feature = "testing"))]
+pub mod testing {
+    use std::path::{Path, PathBuf};
+
+    use kr_ipc::paths::EnvironmentPaths;
+
+    use super::{LogonType, TaskDefinition, TaskSupervisor, register, remove};
+
+    /// The logon this host can register a task with: the one the setup step registers in a
+    /// session where the user is signed in, and the one without a session in session 0, where a
+    /// test host runs with nobody signed in.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating system's error when this process's session cannot be read.
+    pub fn logon_for_this_session() -> std::io::Result<LogonType> {
+        Ok(if kr_ipc::starter::current_session()? == 0 {
+            LogonType::S4U
+        } else {
+            LogonType::InteractiveToken
+        })
+    }
+
+    /// Finds a binary this workspace built for the test running now.
+    ///
+    /// No one package's `CARGO_BIN_EXE_` names both `kr-controller` and `kr-worker`, so a suite
+    /// finds them where the build put them: beside the directory its own executable is in, which
+    /// is `target/<profile>/deps`.
+    ///
+    /// # Errors
+    ///
+    /// Returns what to build when the binary is not there.
+    pub fn built_binary(name: &str) -> Result<PathBuf, String> {
+        let _ = name;
+        Err("not built yet".to_owned())
+    }
+
+    /// The environment's task, registered for a test and removed when this is dropped, and only
+    /// if it is still that environment's own.
+    ///
+    /// It belongs to the test's host tree rather than to a daemon, so a daemon the test stops and
+    /// starts again finds the same task.
+    #[derive(Debug)]
+    pub struct TestTask {
+        definition: TaskDefinition,
+    }
+
+    impl TestTask {
+        /// Registers `environment`'s task, running `starter`, with the logon this host allows.
+        ///
+        /// # Errors
+        ///
+        /// Returns what went wrong when the account, the session or the registration failed.
+        pub fn register(environment: &EnvironmentPaths, starter: &Path) -> Result<Self, String> {
+            let _ = (environment, starter);
+            Err("not built yet".to_owned())
+        }
+
+        /// The definition registered.
+        #[must_use]
+        pub const fn definition(&self) -> &TaskDefinition {
+            &self.definition
+        }
+    }
+
+    impl Drop for TestTask {
+        fn drop(&mut self) {
+            let _ = remove(&self.definition);
+        }
+    }
+
+    /// Registers `environment`'s task, running the `kr-controller` built beside this test, and
+    /// returns it with the supervisor that starts through it.
+    ///
+    /// # Errors
+    ///
+    /// Returns what went wrong: the starter not built, or the task not registered.
+    pub fn supervisor(
+        environment: &EnvironmentPaths,
+    ) -> Result<(TestTask, TaskSupervisor), String> {
+        let _ = environment;
+        Err("not built yet".to_owned())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use kr_ipc::testing::TempHost;
