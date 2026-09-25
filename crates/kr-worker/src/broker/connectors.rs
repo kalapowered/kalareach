@@ -494,7 +494,7 @@ pub mod fixture {
     /// The digest of the Claude Code executable the connector is qualified against, macOS arm64.
     pub const QUALIFIED_DIGEST: [u8; 32] = [
         0xbd, 0x24, 0x56, 0x62, 0xfb, 0x8a, 0x0e, 0x32, 0x1b, 0x3b, 0xf1, 0x33, 0xe9, 0x30, 0x37,
-        0x1d, 0x65, 0x63, 0xc3, 0x87, 0x52, 0x78, 0x85, 0xf3, 0x0b, 0x26, 0x13, 0xae, 0x3a, 0xba,
+        0x1d, 0x65, 0x63, 0xc3, 0x87, 0x52, 0x78, 0x85, 0xf3, 0x0b, 0x26, 0x13, 0xae, 0xf3, 0xba,
         0x14, 0xd6,
     ];
     use crate::broker::bridge::BridgeSurface;
@@ -778,6 +778,22 @@ pub mod fixture {
             .collect::<BTreeSet<_>>(),
             qualified: Vec::new(),
         })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        /// The digest the connector's qualification record publishes for that executable, in the
+        /// form the record writes it.
+        const PUBLISHED: &str = "bd245662fb8a0e321b3bf133e930371d6563c387527885f30b2613aef3ba14d6";
+
+        #[test]
+        fn the_qualified_digest_is_the_one_the_qualification_record_publishes() {
+            let written: String = super::QUALIFIED_DIGEST
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            assert_eq!(written, PUBLISHED);
+        }
     }
 }
 
