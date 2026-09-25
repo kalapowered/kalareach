@@ -1136,7 +1136,8 @@ impl<'a> Resolver<'a> {
         };
         cases
             .iter()
-            .map(|case| {
+            .zip(case_names(file, cases))
+            .map(|(case, test)| {
                 let run = match &case.outcome {
                     LibtestOutcome::Passed => RunRecord {
                         step: index + 1,
@@ -1169,7 +1170,7 @@ impl<'a> Resolver<'a> {
                         .join(" > ")
                 );
                 record(
-                    format!("{file} {}", case.titles.join(" > ")),
+                    test,
                     run.outcome.clone(),
                     run.reason.clone(),
                     vec![run],
@@ -1241,6 +1242,32 @@ impl<'a> Resolver<'a> {
         }
         failed.into_iter().collect()
     }
+}
+
+/// The name of each test a run reported at one place: the file and the titles the run gave it.
+/// Rows of one table can share a title; each is a test of its own, told apart by its place among
+/// the rows with that title, and the command that selects the title runs them all.
+fn case_names(file: &str, cases: &[crate::vitest::Case]) -> Vec<String> {
+    cases
+        .iter()
+        .enumerate()
+        .map(|(at, case)| {
+            let titles = case.titles.join(" > ");
+            let rows = cases
+                .iter()
+                .filter(|other| other.titles == case.titles)
+                .count();
+            if rows > 1 {
+                let row = cases[..=at]
+                    .iter()
+                    .filter(|other| other.titles == case.titles)
+                    .count();
+                format!("{file} {titles} (row {row} of the {rows} with this title)")
+            } else {
+                format!("{file} {titles}")
+            }
+        })
+        .collect()
 }
 
 /// Combines a test's runs into one outcome and reason, or `None` when nothing ran it.
@@ -1430,6 +1457,22 @@ mod tests {
             Some(Outcome::Ignored)
         );
         assert_eq!(combine(&[]), None);
+    }
+
+    #[test]
+    fn rows_that_share_a_title_are_told_apart_by_their_place_among_them() {
+        let case = |title: &str| crate::vitest::Case {
+            titles: vec!["relay".to_owned(), title.to_owned()],
+            outcome: LibtestOutcome::Passed,
+        };
+        assert_eq!(
+            case_names("t.test.ts", &[case("sends"), case("sends"), case("stops")]),
+            [
+                "t.test.ts relay > sends (row 1 of the 2 with this title)",
+                "t.test.ts relay > sends (row 2 of the 2 with this title)",
+                "t.test.ts relay > stops",
+            ]
+        );
     }
 
     #[test]
