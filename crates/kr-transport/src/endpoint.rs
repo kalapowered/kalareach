@@ -14,7 +14,8 @@
 //! `ALL_PROXY` when those are set.
 //!
 //! [`connect`] is the dialling half: it opens a connection and, when a relay the connection needed
-//! turned this endpoint away, says so rather than reporting a peer that did not answer.
+//! turned this endpoint away, or the network refused the relay's WebSocket upgrade, says so rather
+//! than reporting a peer that did not answer.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::task::{Context, Poll};
@@ -152,8 +153,9 @@ async fn bind(
         .map_err(|error| TransportError::Bind(error.to_string()))
 }
 
-/// Opens a connection to `peer`, and names the relay that turned this endpoint away when that is
-/// why no path opened.
+/// Opens a connection to `peer`, and names the relay that could not be used when that is why no
+/// path opened: one that turned this endpoint away, or one whose WebSocket upgrade the network
+/// refused.
 ///
 /// iroh keeps the reason a relay gave for refusing this endpoint, but only for this endpoint's home
 /// relay, and only as the latest thing that relay said. So the relay status is followed for the
@@ -170,15 +172,25 @@ async fn bind(
 /// the handshake and fell silent times out the same way. What is reported is that a relay on the
 /// route had turned this endpoint away when the attempt ran out.
 ///
+/// A network that blocks WebSocket upgrades lets the relay's HTTPS through and answers the upgrade
+/// the relay connection starts with something other than `101 Switching Protocols`, such as `403`.
+/// The relay itself never answered, so that is not the relay's refusal: it is a connection that
+/// could not be established, reported under the same rules as a refusal, naming the relay and the
+/// status the upgrade was refused with. The status is read from the error the relay status keeps
+/// for the latest attempt to reach the relay, which is the only place iroh reports it. When the
+/// route holds both, a relay's own refusal is reported first, because it says what may still work.
+///
 /// An endpoint with no IP transport of its own has nothing but relays to try, so once every relay
-/// on its route has refused it the attempt ends there rather than at its deadline. An endpoint that
-/// can take a direct path lets the attempt run, because an address hint or local discovery can
-/// still open one, and the refusal is the reason only if none does.
+/// on its route has refused it, or cannot be upgraded to, the attempt ends there rather than at its
+/// deadline: only a change outside this endpoint can open a path, iroh goes on dialling the relays
+/// on its own, and an attempt made once they admit it succeeds. An endpoint that can take a direct
+/// path lets the attempt run, because an address hint or local discovery can still open one, and
+/// the refusal is the reason only if none does.
 ///
 /// # Errors
 ///
 /// Returns [`TransportError::RelayRefused`] when a relay on the route had refused this endpoint as
-/// described, and [`TransportError::Connect`] for any other failure.
+/// described, and [`TransportError::Connect`] for any other failure, a refused upgrade included.
 pub async fn connect(
     endpoint: &Endpoint,
     peer: impl Into<EndpointAddr>,
@@ -237,8 +249,8 @@ where
             if let Poll::Ready(outcome) = ended {
                 return decided(outcome, &mut followed, &mut route, direct).await;
             }
-            if let Some((relay, reason)) = followed.refusals().throughout(&relays) {
-                return Err(refused(relay, reason, direct));
+            if let Some((relay, refusal)) = followed.refusals().throughout(&relays) {
+                return Err(refused(relay, refusal, direct));
             }
         }
         tokio::select! {
@@ -259,8 +271,9 @@ where
 
 /// Decides what an ended attempt comes to.
 ///
-/// A connection is a connection. A failure is a relay's refusal only when the attempt timed out
-/// before connecting and a relay on its route, as the status stands now, had refused this endpoint.
+/// A connection is a connection. A failure is a relay's refusal, or a refused upgrade, only when
+/// the attempt timed out before connecting and a relay on its route, as the status stands now, had
+/// refused this endpoint or could not be upgraded to.
 async fn decided<T, S, F, R>(
     outcome: std::result::Result<T, ConnectingError>,
     followed: &mut Followed<S>,
@@ -282,7 +295,7 @@ where
     let relays = route().await;
     followed.refresh();
     Err(match followed.refusals().on(&relays) {
-        Some((relay, reason)) => refused(relay, reason, direct),
+        Some((relay, refusal)) => refused(relay, refusal, direct),
         None => TransportError::Connect(error.to_string()),
     })
 }
@@ -319,12 +332,23 @@ async fn route(
     relays
 }
 
-/// Returns the failure a refusal by `relay` is.
-fn refused(relay: &RelayUrl, reason: &str, direct: bool) -> TransportError {
-    TransportError::RelayRefused(RelayRefusal::from_reason(relay.clone(), reason, direct))
+/// Returns the failure `refusal`, met at `relay`, is.
+///
+/// A refused upgrade stays a connection that could not be established, which is what it is on the
+/// wire as well: the relay never answered, so it did not refuse anything.
+fn refused(relay: &RelayUrl, refusal: &Refusal, direct: bool) -> TransportError {
+    match refusal {
+        Refusal::Relay(reason) => {
+            TransportError::RelayRefused(RelayRefusal::from_reason(relay.clone(), reason, direct))
+        }
+        Refusal::Upgrade(status) => TransportError::Connect(format!(
+            "the network refused the WebSocket upgrade to the relay {relay} with HTTP status \
+             {status}"
+        )),
+    }
 }
 
-/// What one relay's status says about whether it refuses this endpoint.
+/// What one relay's status says about whether it can be used.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RelayObservation {
     relay: RelayUrl,
@@ -332,7 +356,11 @@ struct RelayObservation {
     connected: bool,
     /// The reason the relay gave, when it refused the endpoint's latest attempt to reach it.
     refused: Option<String>,
-    /// Whether the latest attempt to reach the relay failed, for that reason or any other.
+    /// The HTTP status the relay's WebSocket upgrade was refused with, when that is how the latest
+    /// attempt to reach it ended.
+    upgrade_refused: Option<u16>,
+    /// Whether the latest attempt to reach the relay failed, for either of those reasons or any
+    /// other.
     failed: bool,
 }
 
@@ -342,9 +370,42 @@ impl RelayObservation {
             relay: status.url().clone(),
             connected: status.is_connected(),
             refused: status.auth_denied_reason().map(ToOwned::to_owned),
+            upgrade_refused: status.last_error().and_then(|error| upgrade_refusal(error)),
             failed: status.last_error().is_some(),
         }
     }
+}
+
+/// Returns the HTTP status a relay's WebSocket upgrade was refused with, when `error` says that is
+/// how an attempt to reach the relay ended.
+///
+/// iroh reports why an attempt failed only as a chain of errors meant to be displayed, so the chain
+/// is searched for the two public types a refused upgrade appears as with the pinned iroh-relay and
+/// tokio-websockets: tokio-websockets' refusal of any answer but `101 Switching Protocols`, which
+/// is what an answer such as `403` produces, and iroh-relay's own unexpected-status error, which it
+/// keeps for an answer that got past that check. The blocked-upgrade test reads a real refusal
+/// through this, so a release that reports it differently fails there rather than here.
+fn upgrade_refusal(error: &(dyn std::error::Error + 'static)) -> Option<u16> {
+    use tokio_websockets::upgrade::Error as UpgradeError;
+
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if let Some(iroh_relay::client::ConnectError::UnexpectedUpgradeStatus { code, .. }) =
+            error.downcast_ref()
+        {
+            return Some(code.as_u16());
+        }
+        if let Some(tokio_websockets::Error::Upgrade(UpgradeError::DidNotSwitchProtocols(code))) =
+            error.downcast_ref()
+        {
+            return Some(*code);
+        }
+        if let Some(UpgradeError::DidNotSwitchProtocols(code)) = error.downcast_ref() {
+            return Some(*code);
+        }
+        current = error.source();
+    }
+    None
 }
 
 /// Where the relay status is read from while an attempt runs.
@@ -418,25 +479,40 @@ impl<S: RelayStatuses> Followed<S> {
     }
 }
 
-/// The refusals this endpoint's relays last gave it, by relay.
+/// Why a relay cannot be used, as its status last said.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Refusal {
+    /// The relay turned this endpoint away, giving this reason.
+    Relay(String),
+    /// The network refused the relay's WebSocket upgrade with this HTTP status.
+    Upgrade(u16),
+}
+
+/// The refusals this endpoint's relays last met, by relay.
 #[derive(Debug, Default)]
-struct Refusals(BTreeMap<RelayUrl, String>);
+struct Refusals(BTreeMap<RelayUrl, Refusal>);
 
 impl Refusals {
     /// Takes in the relay status as it stands now, which is every relay iroh reports on.
     ///
-    /// A refusal stands while the endpoint dials the relay again, because the relay has said
-    /// nothing newer. It ends when the relay admits the endpoint, when the latest attempt failed
-    /// for another cause, since then the refusal is no longer why the relay cannot be reached, and
-    /// when the relay leaves the status, since nothing that relay says afterwards is reported and
-    /// what it said last can no longer be known to be current.
+    /// A refusal stands while the endpoint dials the relay again, because nothing newer has been
+    /// said. It ends when the relay admits the endpoint, when the latest attempt failed for another
+    /// cause, since then the refusal is no longer why the relay cannot be reached, and when the
+    /// relay leaves the status, since nothing said about that relay afterwards is reported and what
+    /// was said last can no longer be known to be current. A relay's own refusal is kept over a
+    /// refused upgrade in the same status, because the relay answered.
     fn observe(&mut self, snapshot: impl IntoIterator<Item = RelayObservation>) {
         let mut reported = BTreeSet::new();
         for observation in snapshot {
             reported.insert(observation.relay.clone());
-            match observation.refused {
-                Some(reason) => {
-                    self.0.insert(observation.relay, reason);
+            let refusal = match (observation.refused, observation.upgrade_refused) {
+                (Some(reason), _) => Some(Refusal::Relay(reason)),
+                (None, Some(status)) => Some(Refusal::Upgrade(status)),
+                (None, None) => None,
+            };
+            match refusal {
+                Some(refusal) => {
+                    self.0.insert(observation.relay, refusal);
                 }
                 None if observation.connected || observation.failed => {
                     self.0.remove(&observation.relay);
@@ -447,16 +523,28 @@ impl Refusals {
         self.0.retain(|relay, _| reported.contains(relay));
     }
 
-    /// Returns the refusal of the first relay on `route` that refused, if one did.
-    fn on<'a>(&'a self, route: &'a BTreeSet<RelayUrl>) -> Option<(&'a RelayUrl, &'a str)> {
-        route
-            .iter()
-            .find_map(|relay| self.0.get(relay).map(|reason| (relay, reason.as_str())))
+    /// Returns the refusal to report for `route`: the first relay on it that turned this endpoint
+    /// away, or else the first whose upgrade the network refused. A relay's own refusal comes first
+    /// because it says what may still work.
+    fn on<'a>(&'a self, route: &'a BTreeSet<RelayUrl>) -> Option<(&'a RelayUrl, &'a Refusal)> {
+        let first = |kind: fn(&Refusal) -> bool| {
+            route.iter().find_map(|relay| {
+                self.0
+                    .get(relay)
+                    .filter(|refusal| kind(refusal))
+                    .map(|refusal| (relay, refusal))
+            })
+        };
+        first(|refusal| matches!(refusal, Refusal::Relay(_)))
+            .or_else(|| first(|refusal| matches!(refusal, Refusal::Upgrade(_))))
     }
 
-    /// Returns the refusal to report when every relay on `route` refused, which leaves an endpoint
+    /// Returns the refusal to report when no relay on `route` can be used, which leaves an endpoint
     /// with no direct transport nothing else to try.
-    fn throughout<'a>(&'a self, route: &'a BTreeSet<RelayUrl>) -> Option<(&'a RelayUrl, &'a str)> {
+    fn throughout<'a>(
+        &'a self,
+        route: &'a BTreeSet<RelayUrl>,
+    ) -> Option<(&'a RelayUrl, &'a Refusal)> {
         if route.is_empty() || !route.iter().all(|relay| self.0.contains_key(relay)) {
             return None;
         }
@@ -692,12 +780,175 @@ mod tests {
             relay: relay(name),
             connected: false,
             refused: Some(reason.to_owned()),
+            upgrade_refused: None,
             failed: true,
         }
     }
 
+    /// A relay whose WebSocket upgrade the network refused with `status` on the latest attempt.
+    fn blocked(name: &str, status: u16) -> RelayObservation {
+        RelayObservation {
+            relay: relay(name),
+            connected: false,
+            refused: None,
+            upgrade_refused: Some(status),
+            failed: true,
+        }
+    }
+
+    /// The refusal a relay gives when the allowance is spent, as [`refusing`] observes it.
+    fn spent() -> Refusal {
+        Refusal::Relay("allowance_spent: spent".to_owned())
+    }
+
     fn relays(names: &[&str]) -> BTreeSet<RelayUrl> {
         names.iter().map(|name| relay(name)).collect()
+    }
+
+    /// An error that wraps another, as the chain iroh keeps for a failed attempt does.
+    #[derive(Debug)]
+    struct Wrapping(Box<dyn std::error::Error + Send + Sync + 'static>);
+
+    impl std::fmt::Display for Wrapping {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("the attempt failed")
+        }
+    }
+
+    impl std::error::Error for Wrapping {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(self.0.as_ref())
+        }
+    }
+
+    /// KR-REQ-10.02: the status a refused upgrade was answered with is found wherever the chain of
+    /// errors that ended the attempt holds it, in either form the pinned libraries report it in,
+    /// and nothing else in a chain is read as one.
+    #[test]
+    fn a_refused_upgrade_is_found_in_the_chain_that_ended_the_attempt() {
+        let websocket = || {
+            tokio_websockets::Error::Upgrade(
+                tokio_websockets::upgrade::Error::DidNotSwitchProtocols(403),
+            )
+        };
+        assert_eq!(upgrade_refusal(&websocket()), Some(403));
+        assert_eq!(
+            upgrade_refusal(&Wrapping(Box::new(Wrapping(Box::new(websocket()))))),
+            Some(403)
+        );
+        assert_eq!(
+            upgrade_refusal(&Wrapping(Box::new(
+                tokio_websockets::upgrade::Error::DidNotSwitchProtocols(407)
+            ))),
+            Some(407)
+        );
+        for other in [
+            Wrapping(Box::new(std::io::Error::from(
+                std::io::ErrorKind::ConnectionRefused,
+            ))),
+            Wrapping(Box::new(tokio_websockets::Error::Upgrade(
+                tokio_websockets::upgrade::Error::WrongWebSocketAccept,
+            ))),
+        ] {
+            assert_eq!(upgrade_refusal(&other), None, "{other:?}");
+        }
+    }
+
+    /// KR-REQ-10.02: a refused upgrade is a connection's reason under the rules a refusal is, and
+    /// it stays a connection that could not be established, naming the relay and the status: the
+    /// relay never answered, so it is not the relay's refusal.
+    #[tokio::test]
+    async fn a_refused_upgrade_is_the_reason_a_timed_out_attempt_names() {
+        let status = Scripted::default();
+        status.set(vec![blocked("relay-1", 403)]);
+        let error = through_relays(
+            async { Err::<(), _>(timed_out()) },
+            status.reader(),
+            true,
+            || async { relays(&["relay-1"]) },
+        )
+        .await
+        .expect_err("the attempt failed");
+        let TransportError::Connect(message) = &error else {
+            panic!("a refused upgrade is a connection that could not be established: {error}");
+        };
+        assert_eq!(
+            message,
+            "the network refused the WebSocket upgrade to the relay \
+             https://relay-1.reach.kala.to/ with HTTP status 403"
+        );
+        assert_eq!(
+            error.to_protocol_error().code,
+            kr_protocol::error::ErrorCode::ResourceUnavailable
+        );
+    }
+
+    /// KR-REQ-10.02: an endpoint with no direct transport stops at once when no relay on its route
+    /// can be used, whether the relay refused it or the network refused the upgrade. A relay's own
+    /// refusal is the one reported when the route holds both, and a route whose only relays could
+    /// not be upgraded to is reported as that.
+    #[tokio::test]
+    async fn a_relay_only_endpoint_whose_route_cannot_be_used_stops_at_once() {
+        let status = Scripted::default();
+        status.set(vec![blocked("relay-1", 403)]);
+        let error = through_relays(
+            std::future::pending::<std::result::Result<(), ConnectingError>>(),
+            status.reader(),
+            false,
+            || async { relays(&["relay-1"]) },
+        )
+        .await
+        .expect_err("a route that cannot be used");
+        assert!(
+            matches!(&error, TransportError::Connect(message) if message.contains("403")),
+            "{error}"
+        );
+
+        let status = Scripted::default();
+        status.set(vec![
+            blocked("relay-1", 403),
+            refusing("relay-2", "stopping: this relay is stopping"),
+        ]);
+        let error = through_relays(
+            std::future::pending::<std::result::Result<(), ConnectingError>>(),
+            status.reader(),
+            false,
+            || async { relays(&["relay-1", "relay-2"]) },
+        )
+        .await
+        .expect_err("a route that cannot be used");
+        assert!(
+            matches!(&error, TransportError::RelayRefused(refusal)
+                if refusal.relay == relay("relay-2")),
+            "{error}"
+        );
+    }
+
+    /// KR-REQ-10.02: a refused upgrade lasts as a refusal does. It stands while the relay is
+    /// dialled again, and ends when the relay admits the endpoint or the latest attempt failed for
+    /// another cause. A relay that cannot be upgraded to is still waited for while another relay
+    /// on the route might carry the attempt.
+    #[test]
+    fn a_refused_upgrade_lasts_until_the_relay_is_reached_or_fails_otherwise() {
+        let only = relays(&["relay-1"]);
+        let upgrade = Refusal::Upgrade(403);
+        let mut refusals = Refusals::default();
+        refusals.observe([blocked("relay-1", 403)]);
+        assert_eq!(refusals.on(&only), Some((&relay("relay-1"), &upgrade)));
+        assert_eq!(refusals.throughout(&relays(&["relay-1", "relay-2"])), None);
+
+        refusals.observe([redialling("relay-1")]);
+        assert_eq!(refusals.on(&only), Some((&relay("relay-1"), &upgrade)));
+
+        refusals.observe([RelayObservation {
+            upgrade_refused: None,
+            ..blocked("relay-1", 403)
+        }]);
+        assert_eq!(refusals.on(&only), None, "it failed for another cause");
+
+        refusals.observe([blocked("relay-1", 403)]);
+        refusals.observe([admitted("relay-1")]);
+        assert_eq!(refusals.on(&only), None, "the relay was reached");
     }
 
     /// KR-REQ-17.40: a refusal is a connection's reason only when the relay that gave it is on
@@ -714,19 +965,16 @@ mod tests {
         assert_eq!(refusals.throughout(&relays(&[])), None);
 
         let only = relays(&["relay-1"]);
-        assert_eq!(
-            refusals.on(&only),
-            Some((&relay("relay-1"), "allowance_spent: spent"))
-        );
+        assert_eq!(refusals.on(&only), Some((&relay("relay-1"), &spent())));
         assert_eq!(
             refusals.throughout(&only),
-            Some((&relay("relay-1"), "allowance_spent: spent"))
+            Some((&relay("relay-1"), &spent()))
         );
 
         let both = relays(&["relay-1", "relay-2"]);
         assert_eq!(
             refusals.on(&both),
-            Some((&relay("relay-1"), "allowance_spent: spent")),
+            Some((&relay("relay-1"), &spent())),
             "a failed attempt through both is reported as the refusal it met"
         );
         assert_eq!(
@@ -741,7 +989,7 @@ mod tests {
         ]);
         assert_eq!(
             refusals.throughout(&both),
-            Some((&relay("relay-1"), "allowance_spent: spent"))
+            Some((&relay("relay-1"), &spent()))
         );
     }
 
@@ -754,6 +1002,7 @@ mod tests {
             relay: relay("relay-1"),
             connected: false,
             refused: None,
+            upgrade_refused: None,
             failed: false,
         };
         let unreachable = RelayObservation {
@@ -801,6 +1050,7 @@ mod tests {
             relay: relay("relay-2"),
             connected: false,
             refused: None,
+            upgrade_refused: None,
             failed: false,
         }]);
         assert_eq!(refusals.on(&first), None, "another relay became home");
@@ -815,6 +1065,7 @@ mod tests {
             relay: relay(name),
             connected: true,
             refused: None,
+            upgrade_refused: None,
             failed: false,
         }
     }
@@ -828,6 +1079,7 @@ mod tests {
             relay: relay(name),
             connected: false,
             refused: None,
+            upgrade_refused: None,
             failed: false,
         }
     }

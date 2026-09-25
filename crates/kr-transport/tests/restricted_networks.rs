@@ -18,9 +18,10 @@ use futures::StreamExt as _;
 use iroh::address_lookup::{AddressLookup as _, PkarrResolver};
 use iroh::endpoint::Connection;
 use iroh::endpoint::RelayStatus;
-use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, Watcher as _};
-use kr_transport::ALPN;
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, TransportAddr, Watcher as _};
+use kr_protocol::error::ErrorCode;
 use kr_transport::config::{DiscoveryConfig, EndpointConfig, PublishedAddresses, PublisherPolicy};
+use kr_transport::{ALPN, TransportError};
 use support::front::RelayFront;
 use support::pkarr::PkarrRelay;
 use support::proxy::{HttpProxy, authority};
@@ -29,6 +30,12 @@ use tokio::task::JoinHandle;
 
 /// How long anything the machine has to do may take before the test calls it a failure.
 const PATIENCE: Duration = Duration::from_secs(60);
+
+/// How soon an endpoint with nothing but relays it cannot use learns that it cannot connect.
+///
+/// A third of the attempt's own 30-second deadline: a failure inside it was decided by what the
+/// relay status said, not by the attempt running out.
+const AT_ONCE: Duration = Duration::from_secs(10);
 
 fn loopback() -> Option<SocketAddr> {
     Some("127.0.0.1:0".parse().expect("a loopback address"))
@@ -220,6 +227,112 @@ async fn a_client_whose_proxy_stops_never_goes_around_it() {
 
     drop(connection);
     client.endpoint.close().await;
+    host.endpoint.close().await;
+}
+
+/// KR-REQ-10.02: a network that blocks the WebSocket upgrade does not stand in the way of a direct
+/// path. The relay's front passes ordinary requests to the relay and answers the relay connection's
+/// upgrade with 403, so neither endpoint gets onto the relay; the client still reaches the host at
+/// the host's direct address.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blocked_upgrade_leaves_a_direct_path_open() {
+    let relay = LocalRelay::spawn().await;
+    let front = RelayFront::refusing_upgrades(&relay, 403);
+    let config = EndpointConfig {
+        relay_urls: vec![front.url.clone()],
+        relay_ca_roots: front.ca_roots.clone(),
+        bind_addr: loopback(),
+        ..EndpointConfig::default()
+    };
+    let host = support::side(&config, 1, true).await;
+    let client = support::side(&config, 2, false).await;
+    eventually("the relay connection's upgrade is refused", || {
+        front.refused_upgrades() > 0
+    })
+    .await;
+
+    let accepting = accept_one(&host);
+    let mut route = EndpointAddr::new(host.endpoint.id()).with_relay_url(front.url.clone());
+    for socket in host.endpoint.bound_sockets() {
+        route = route.with_ip_addr(socket);
+    }
+    let connection = dial(&client, route)
+        .await
+        .expect("the direct path carries the connection");
+    let accepted = accepting.await.expect("the host task");
+    assert_eq!(accepted.remote_id(), client.endpoint.id());
+    assert!(
+        connection
+            .paths()
+            .iter()
+            .any(|path| matches!(path.remote_addr(), TransportAddr::Ip(_))),
+        "the connection runs on a direct path"
+    );
+
+    drop(connection);
+    client.endpoint.close().await;
+    host.endpoint.close().await;
+}
+
+/// KR-REQ-10.02: a network that blocks the WebSocket upgrade, for an endpoint whose only path is
+/// the relay. The relay-only client stands for a network that blocks UDP as well. The front passes
+/// the relay latency probe, so the client makes the relay its home and tries to connect to it, and
+/// answers the upgrade with 403. The attempt to reach the host ends at once rather than at its
+/// deadline, in a connection failure that names the relay and says the network refused the upgrade
+/// with status 403: `RESOURCE_UNAVAILABLE` on the wire, and never the relay's own refusal, because
+/// the relay never answered. The same client reaches the host through a front that lets the
+/// upgrade through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relay_only_attempt_whose_upgrade_is_refused_says_so() {
+    let relay = LocalRelay::spawn().await;
+    let host = support::side(&relay_only(&relay.url, &relay.ca_roots), 1, true).await;
+    online(&host, "the host reaches its relay").await;
+
+    let blocking = RelayFront::refusing_upgrades(&relay, 403);
+    let client = support::side(&relay_only(&blocking.url, &blocking.ca_roots), 2, false).await;
+    let started = Instant::now();
+    let error = dial(
+        &client,
+        EndpointAddr::new(host.endpoint.id()).with_relay_url(blocking.url.clone()),
+    )
+    .await
+    .expect_err("no path reaches the host");
+    let took = started.elapsed();
+    let TransportError::Connect(message) = &error else {
+        panic!("a refused upgrade is a connection that could not be established: {error}");
+    };
+    assert_eq!(
+        *message,
+        format!(
+            "the network refused the WebSocket upgrade to the relay {} with HTTP status 403",
+            blocking.url
+        )
+    );
+    assert_eq!(
+        error.to_protocol_error().code,
+        ErrorCode::ResourceUnavailable
+    );
+    assert!(
+        took < AT_ONCE,
+        "a client with nothing but the blocked relay is told within {AT_ONCE:?}: it took {took:?}"
+    );
+    assert!(blocking.refused_upgrades() > 0);
+    client.endpoint.close().await;
+
+    let passing = RelayFront::passing(&relay);
+    let unblocked = support::side(&relay_only(&passing.url, &passing.ca_roots), 3, false).await;
+    let accepting = accept_one(&host);
+    let connection = dial(
+        &unblocked,
+        EndpointAddr::new(host.endpoint.id()).with_relay_url(passing.url.clone()),
+    )
+    .await
+    .expect("with the upgrade let through the relay carries the connection");
+    let accepted = accepting.await.expect("the host task");
+    assert_eq!(accepted.remote_id(), unblocked.endpoint.id());
+
+    drop(connection);
+    unblocked.endpoint.close().await;
     host.endpoint.close().await;
 }
 

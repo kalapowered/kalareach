@@ -21,6 +21,10 @@ pub enum TransportError {
     #[error("the iroh endpoint could not be bound: {0}")]
     Bind(String),
     /// A connection could not be established.
+    ///
+    /// That includes a relay the network would not let this endpoint upgrade to, which the message
+    /// names with the HTTP status the upgrade was refused with. The relay itself never answered, so
+    /// that is not a [`Self::RelayRefused`].
     #[error("the connection could not be established: {0}")]
     Connect(String),
     /// A relay on the route had turned this endpoint away when the attempt to reach the peer timed

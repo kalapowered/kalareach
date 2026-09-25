@@ -10,6 +10,7 @@ pub mod conditions;
 pub mod front;
 pub mod pkarr;
 pub mod proxy;
+pub mod tls;
 
 use std::sync::Arc;
 

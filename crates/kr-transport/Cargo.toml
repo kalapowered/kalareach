@@ -28,15 +28,21 @@ serde.workspace = true
 rustls-pki-types.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+# Read, not used to connect: a relay's WebSocket upgrade that the network refused is reported in
+# this crate's error types, which is where the refused status is found.
+tokio-websockets.workspace = true
 tracing.workspace = true
 url.workspace = true
 
 [dev-dependencies]
 iroh = { workspace = true, features = ["test-utils"] }
 iroh-relay = { workspace = true, features = ["server", "test-utils"] }
+# Certificates from an authority a test makes, for the relay front and the intercepting proxy.
+rcgen.workspace = true
 serde_json.workspace = true
 # The loopback proxy and relay front the network tests stand between an endpoint and its relay.
 tokio = { workspace = true, features = ["io-util", "net"] }
+tokio-rustls.workspace = true
 
 [lints]
 workspace = true

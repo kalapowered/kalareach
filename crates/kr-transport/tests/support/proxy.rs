@@ -283,7 +283,7 @@ fn content_length(head: &str) -> Option<u64> {
 }
 
 /// Reads one head, up to and including the empty line that ends it.
-async fn read_head<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> Option<String> {
+pub async fn read_head<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> Option<String> {
     let mut head = String::new();
     loop {
         let before = head.len();
