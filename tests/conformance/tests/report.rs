@@ -1,11 +1,11 @@
 //! The report over trees of its own, whose every key and every outcome is known in advance.
 //!
 //! Each tree under `tests/fixtures/` is a Cargo workspace of its own, so the repository's
-//! workspace never builds it: `forms` keys rows in every form the report reads and ignores
-//! nothing, `outcomes` has a test that passes, one that fails and ones that are ignored, `known`
-//! has a test that records a known difference, and `refused` names a row past the end of section
-//! 21's table and a bare section. The runs build into a target directory of their own under the
-//! platform's temporary directory.
+//! workspace never builds it: `forms` keys rows in every form the report reads, ignores nothing
+//! and has a documentation test, `outcomes` has a test that passes, one that fails and ones that
+//! are ignored, `known` has a test that records a known difference, and `refused` names a row past
+//! the end of section 21's table and a bare section. The runs build into a target directory of
+//! their own under the platform's temporary directory.
 //!
 //! KR-REQ-29.01.
 

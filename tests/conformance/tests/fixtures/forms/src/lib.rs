@@ -8,7 +8,12 @@ pub struct Case {
     pub input: u8,
 }
 
-/// The cases.
+/// The cases. Rustdoc builds the example into a program of its own, which Cargo runs through
+/// the same runner as the test binaries.
+///
+/// ```
+/// assert_eq!(forms::CASES[0].input, 1);
+/// ```
 pub const CASES: &[Case] = &[Case {
     covers: "KR-REQ-02.02 row one",
     input: 1,

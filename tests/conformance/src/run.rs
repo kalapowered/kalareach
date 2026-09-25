@@ -9,10 +9,11 @@
 //! What the build names is what the run is held to. Every test binary it built is listed, by the
 //! step's own command with this program as Cargo's runner, and has to be run and read; a listing
 //! that fails, a binary the log never ran, and a log that cannot be read are each the step's error,
-//! so a step can never pass on less output than it was built for. A target with a harness of its
-//! own (`harness = false`) is a program that prints neither a list nor verdicts: the runner does
-//! not run it while the tests are listed, it is run with the step, and only its exit status, which
-//! is the step's, counts.
+//! so a step can never pass on less output than it was built for. Cargo hands the same runner to
+//! rustdoc, whose programs of documentation tests are none of the build's and are keyed nowhere,
+//! so the listing passes over them. A target with a harness of its own (`harness = false`) is a
+//! program that prints neither a list nor verdicts: the runner does not run it while the tests are
+//! listed, it is run with the step, and only its exit status, which is the step's, counts.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -301,12 +302,13 @@ fn host(place: &Place<'_>) -> Result<String, String> {
 /// step's, features and all, and Cargo gives each binary its environment; with this program as
 /// Cargo's runner, which frames each binary's list with the binary's own path, so each list is
 /// known to be that binary's. A target with a harness of its own is a program that would run
-/// rather than list, so the runner does not run it.
+/// rather than list, so the runner does not run it. Rustdoc runs the programs of a crate's
+/// documentation tests through the same runner, and [`read_listing`] passes over them.
 ///
 /// # Errors
 ///
-/// Returns the listing that failed, a binary that did not list exactly once, or one the build did
-/// not make: a binary that lists nothing would have its tests judged from the run alone.
+/// Returns the listing that failed, and a listing [`read_listing`] cannot read: a binary that
+/// lists nothing would have its tests judged from the run alone.
 fn list(
     step: &Step,
     place: &Place<'_>,
@@ -357,32 +359,75 @@ fn list(
                 .map_or_else(|| "by a signal".to_owned(), |code| code.to_string())
         ));
     }
+    read_listing(&String::from_utf8_lossy(&output.stdout), executables, &own)
+}
+
+/// Reads what a step's listing printed into the tests each binary of the build's listed; `own`
+/// names, by file name, the binaries with a harness of their own, which the runner does not run.
+///
+/// Cargo hands its runner to rustdoc as well, and rustdoc runs the programs it builds of a crate's
+/// documentation tests through it, possibly several at once. Those programs are none of the
+/// build's, and documentation tests are keyed nowhere, so their frames and what they print are
+/// passed over, as is a list rustdoc prints itself. A line is a binary's only while that binary is
+/// the one program open: Cargo runs its test binaries one at a time, before any documentation
+/// test, so a binary of the build's whose frame overlaps another program's cannot have its list
+/// told apart, and that is the step's error.
+///
+/// # Errors
+///
+/// Returns a binary of the build's run beside another program, a frame that ends where none began
+/// or never ends, a binary with a standard harness that did not list its tests once and exit 0,
+/// and one the build made that the listing never ran.
+fn read_listing(
+    output: &str,
+    executables: &BTreeMap<String, TargetId>,
+    own: &[&str],
+) -> Result<BTreeMap<TargetId, BTreeSet<String>>, String> {
     let mut listed = BTreeMap::new();
-    let mut current: Option<(String, BTreeSet<String>, usize)> = None;
-    for line in libtest::plain(&String::from_utf8_lossy(&output.stdout)).lines() {
+    // The binary of the build's that is open, with the names and counts it has listed so far.
+    let mut current: Option<(String, &TargetId, BTreeSet<String>, usize)> = None;
+    // The other programs open: rustdoc's.
+    let mut others: Vec<String> = Vec::new();
+    for line in libtest::plain(output).lines() {
         if let Some(executable) = line.strip_prefix(LISTING_BEGIN) {
-            current = Some((executable.to_owned(), BTreeSet::new(), 0));
-        } else if let Some(rest) = line.strip_prefix(LISTING_END) {
-            let Some((executable, names, counts)) = current.take() else {
-                return Err("the listing ended a binary it never began".to_owned());
-            };
-            let (ended, status) = rest.rsplit_once('\t').unwrap_or((rest, ""));
-            if ended != executable {
-                return Err(format!("the listing began {executable} and ended {ended}"));
+            let target = executables.get(&file_name(executable));
+            let open = current
+                .as_ref()
+                .map(|(open, ..)| open)
+                .or_else(|| others.last());
+            if let Some(open) = open
+                && (target.is_some() || current.is_some())
+            {
+                return Err(format!(
+                    "the listing ran {executable} while {open} was running, so their lists cannot \
+                     be told apart"
+                ));
             }
+            match target {
+                Some(target) => current = Some((executable.to_owned(), target, BTreeSet::new(), 0)),
+                None => others.push(executable.to_owned()),
+            }
+        } else if let Some(rest) = line.strip_prefix(LISTING_END) {
+            let (ended, status) = rest.rsplit_once('\t').unwrap_or((rest, ""));
+            if let Some(at) = others.iter().position(|other| other == ended) {
+                others.remove(at);
+                continue;
+            }
+            let Some((_, target, names, counts)) =
+                current.take().filter(|(open, ..)| open == ended)
+            else {
+                return Err(format!("the listing ended {ended}, which it had not begun"));
+            };
             if status == "skipped" {
                 continue;
             }
-            let target = executables.get(&file_name(&executable)).ok_or_else(|| {
-                format!("the listing ran {executable}, which the step's build did not make")
-            })?;
             if status != "0" || counts != 1 {
                 return Err(format!(
                     "{target} did not list its tests (exit {status}, {counts} lists)"
                 ));
             }
             listed.insert(target.clone(), names);
-        } else if let Some((_, names, counts)) = current.as_mut() {
+        } else if let Some((_, _, names, counts)) = current.as_mut() {
             if let Some(name) = line
                 .strip_suffix(": test")
                 .or_else(|| line.strip_suffix(": bench"))
@@ -392,6 +437,9 @@ fn list(
                 *counts += 1;
             }
         }
+    }
+    if let Some((executable, ..)) = current {
+        return Err(format!("the listing began {executable} and never ended it"));
     }
     let unlisted: Vec<String> = executables
         .iter()
@@ -520,10 +568,148 @@ fn run_logged(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
-    use super::{Binary, file_name, is_count, reconcile};
+    use super::{Binary, LISTING_BEGIN, LISTING_END, file_name, is_count, read_listing, reconcile};
     use crate::workspace::{TargetId, TargetKind};
+
+    fn test_target(name: &str) -> TargetId {
+        TargetId {
+            package: "p".to_owned(),
+            kind: TargetKind::Test,
+            name: name.to_owned(),
+        }
+    }
+
+    fn begin(executable: &str) -> String {
+        format!("{LISTING_BEGIN}{executable}\n")
+    }
+
+    fn end(executable: &str, status: &str) -> String {
+        format!("{LISTING_END}{executable}\t{status}\n")
+    }
+
+    /// A binary of the build's listing `names`, framed as the lister frames it.
+    fn listing(executable: &str, names: &[&str]) -> String {
+        let mut text = begin(executable);
+        for name in names {
+            text.push_str(&format!("{name}: test\n"));
+        }
+        text.push_str(&format!("\n{} tests, 0 benchmarks\n", names.len()));
+        text.push_str(&end(executable, "0"));
+        text
+    }
+
+    #[test]
+    fn a_listing_reads_the_builds_binaries_and_passes_over_the_documentation_tests_run_with_them() {
+        let executables = BTreeMap::from([
+            ("t-1".to_owned(), test_target("t")),
+            ("u-2.exe".to_owned(), test_target("u")),
+            ("own-3".to_owned(), test_target("own")),
+        ]);
+        let merged = "/tmp/rustdoctestA1/rust_out";
+        let another = r"C:\Users\R\AppData\Local\Temp\rustdoctestB2\rust_out.exe";
+        let output = [
+            listing("/w/target/debug/deps/t-1", &["a::one", "a::two"]),
+            listing(r"D:\w\target\debug\deps\u-2.exe", &["b"]),
+            begin("/w/target/debug/deps/own-3"),
+            end("/w/target/debug/deps/own-3", "skipped"),
+            // Two programs of documentation tests at once, their lines mixed.
+            begin(merged),
+            begin(another),
+            "src/lib.rs - f (line 3): test\n".to_owned(),
+            "src/lib.rs - g (line 9): test\n\n1 test, 0 benchmarks\n".to_owned(),
+            end(merged, "0"),
+            "\n1 test, 0 benchmarks\n".to_owned(),
+            end(another, "0"),
+            // Documentation tests rustdoc lists itself, running no program.
+            "src/lib.rs - h (line 20): test\n\n1 test, 0 benchmarks\n".to_owned(),
+        ]
+        .concat();
+        let listed = read_listing(&output, &executables, &["own-3"]).expect("reads");
+        let names = |names: &[&str]| -> BTreeSet<String> {
+            names.iter().map(|name| (*name).to_owned()).collect()
+        };
+        assert_eq!(
+            listed,
+            BTreeMap::from([
+                (test_target("t"), names(&["a::one", "a::two"])),
+                (test_target("u"), names(&["b"])),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_listing_that_cannot_be_told_apart_or_is_short_is_the_steps_error() {
+        let executables = BTreeMap::from([
+            ("t-1".to_owned(), test_target("t")),
+            ("u-2".to_owned(), test_target("u")),
+        ]);
+        let first = "/w/target/debug/deps/t-1";
+        let second = "/w/target/debug/deps/u-2";
+        let doctests = "/tmp/rustdoctestA1/rust_out";
+        let read = |parts: &[String]| read_listing(&parts.concat(), &executables, &[]);
+        let fails = |parts: &[String], what: &str| match read(parts) {
+            Err(error) => assert!(error.contains(what), "{error:?} names {what:?}"),
+            Ok(listed) => panic!("read as {listed:?}, where {what:?} was due"),
+        };
+        assert!(read(&[listing(first, &["a"]), listing(second, &["b"])]).is_ok());
+        fails(
+            &[
+                begin(first),
+                begin(doctests),
+                "a: test\n\n1 test, 0 benchmarks\n".to_owned(),
+                end(doctests, "0"),
+                end(first, "0"),
+                listing(second, &["b"]),
+            ],
+            "cannot be told apart",
+        );
+        fails(
+            &[
+                begin(doctests),
+                listing(first, &["a"]),
+                end(doctests, "0"),
+                listing(second, &["b"]),
+            ],
+            "cannot be told apart",
+        );
+        fails(&[listing(first, &["a"])], "did not run p --test u");
+        fails(
+            &[
+                begin(first),
+                "a: test\n".to_owned(),
+                end(first, "0"),
+                listing(second, &["b"]),
+            ],
+            "did not list its tests (exit 0, 0 lists)",
+        );
+        fails(
+            &[
+                begin(first),
+                "\n0 tests, 0 benchmarks\n".to_owned(),
+                end(first, "101"),
+                listing(second, &["b"]),
+            ],
+            "did not list its tests (exit 101",
+        );
+        fails(
+            &[
+                end(doctests, "0"),
+                listing(first, &["a"]),
+                listing(second, &["b"]),
+            ],
+            "had not begun",
+        );
+        fails(
+            &[
+                listing(first, &["a"]),
+                begin(second),
+                "b: test\n".to_owned(),
+            ],
+            "never ended",
+        );
+    }
 
     #[test]
     fn a_step_is_held_to_every_test_binary_its_build_made() {
