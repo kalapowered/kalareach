@@ -1048,16 +1048,26 @@ fn follow_bridge(
     );
 }
 
-/// What one package's installation wants of its bridge: `Ok(Some(None))` for nothing,
-/// `Ok(Some(Some(_)))` for a release's recipe, and `Ok(None)` when the installed package is not
-/// whole here, so what it wants cannot be read and its bridge is left as it is.
+/// What one package's installation wants of its native bridge.
+enum WantedBridge {
+    /// Nothing: the package is not installed, the grant does not hold, or the release carries no
+    /// recipe.
+    Nothing,
+    /// One release's recipe.
+    Release(Box<native_bridge::BridgeTarget>),
+    /// The installed package is not whole here, so what it wants cannot be read, and its bridge
+    /// is left as it is.
+    Unknown,
+}
+
+/// What one package's installation wants of its bridge.
 fn wanted_bridge(
     catalogue: &Catalogue,
     environment_id: EnvironmentId,
     plugin_id: &PluginId,
-) -> CatalogueResult<Option<Option<native_bridge::BridgeTarget>>> {
+) -> CatalogueResult<WantedBridge> {
     let Some(installation) = catalogue.installation(environment_id, plugin_id)? else {
-        return Ok(Some(None));
+        return Ok(WantedBridge::Nothing);
     };
     // The grant is what permits the bridge: a release installed without it, or an installation
     // that withdrew it, wants none.
@@ -1065,19 +1075,19 @@ fn wanted_bridge(
         .effective_capabilities(environment_id, plugin_id)?
         .contains(&PluginCapability::NativeBridgeInstall)
     {
-        return Ok(Some(None));
+        return Ok(WantedBridge::Nothing);
     }
     let store = catalogue.store_of(&installation);
     let package = match store.check_package(installation.package_digest)? {
         kr_plugin_catalogue::PackageCheck::Complete(package) => package,
         kr_plugin_catalogue::PackageCheck::Missing { .. }
-        | kr_plugin_catalogue::PackageCheck::Corrupt { .. } => return Ok(None),
+        | kr_plugin_catalogue::PackageCheck::Corrupt { .. } => return Ok(WantedBridge::Unknown),
     };
     let manifest = package.manifest();
     let Some(recipe) = manifest.native_bridge.as_ref().cloned() else {
-        return Ok(Some(None));
+        return Ok(WantedBridge::Nothing);
     };
-    Ok(Some(Some(native_bridge::BridgeTarget {
+    let target = native_bridge::BridgeTarget {
         plugin_id: plugin_id.clone(),
         package_digest: installation.package_digest,
         package_dir: store.package_dir(installation.package_digest),
@@ -1088,29 +1098,33 @@ fn wanted_bridge(
         // version an executable is. The recipe's version requirement then refuses the recipe
         // rather than guessing.
         qualified: Vec::new(),
-    })))
+    };
+    Ok(WantedBridge::Release(Box::new(target)))
 }
 
 /// Runs one reconciliation and says what went wrong, where something did.
 fn reconcile_bridge(
     bridges: &native_bridge::NativeBridges,
     plugin_id: &PluginId,
-    wanted: CatalogueResult<Option<Option<native_bridge::BridgeTarget>>>,
+    wanted: CatalogueResult<WantedBridge>,
 ) {
-    match wanted {
-        Ok(Some(wanted)) => {
-            if let Err(error) = bridges.reconcile(plugin_id, wanted.as_ref()) {
-                eprintln!(
-                    "kr-controller: the native bridge of {plugin_id} was not reconciled, and is \
-                     reconciled again when this daemon next starts: {error}"
-                );
-            }
+    let wanted = match wanted {
+        Ok(WantedBridge::Nothing) => None,
+        Ok(WantedBridge::Release(target)) => Some(target),
+        Ok(WantedBridge::Unknown) => return,
+        Err(error) => {
+            eprintln!(
+                "kr-controller: what the installation of {plugin_id} wants of its native bridge \
+                 could not be read: {error}"
+            );
+            return;
         }
-        Ok(None) => {}
-        Err(error) => eprintln!(
-            "kr-controller: what the installation of {plugin_id} wants of its native bridge \
-             could not be read: {error}"
-        ),
+    };
+    if let Err(error) = bridges.reconcile(plugin_id, wanted.as_deref()) {
+        eprintln!(
+            "kr-controller: the native bridge of {plugin_id} was not reconciled, and is reconciled \
+             again when this daemon next starts: {error}"
+        );
     }
 }
 
