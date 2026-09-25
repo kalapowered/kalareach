@@ -10,15 +10,19 @@
 //! attaches at startup: one [`HttpService`] per origin, built the first time the origin is asked
 //! for and kept, so the calls to one gateway share one set of connections. Every rule the managed
 //! transport keeps holds here unchanged: HTTPS off loopback, no redirects, no retry of a request
-//! that may have arrived, finite deadlines and a bounded answer.
+//! that may have arrived, finite deadlines and a bounded answer. Every exchange goes through the
+//! proxy this host's configuration document selected when the daemon started, or directly when it
+//! selected none, so a webhook address that proxy cannot reach fails through it rather than going
+//! around it.
 //!
 //! A test attaches a recorder instead, which is how a test sees exactly what left the host.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use kr_client::services::{HttpService, ServiceHttp};
+use kr_client::services::{HttpDeadlines, HttpService, ResponseLimits, ServiceHttp};
 use kr_protocol::service::GatewayOrigin;
+use kr_transport::config::ProxyUrl;
 
 /// Where the delivery service's exchanges go.
 pub trait DeliveryTransports: std::fmt::Debug + Send + Sync {
@@ -31,16 +35,24 @@ pub trait DeliveryTransports: std::fmt::Debug + Send + Sync {
 }
 
 /// The managed transport of every origin delivery reaches, built on first use.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ManagedTransports {
     built: Mutex<BTreeMap<String, Arc<HttpService>>>,
+    /// The proxy every one of them goes through, or none.
+    proxy: Option<ProxyUrl>,
 }
 
 impl ManagedTransports {
-    /// Builds an empty set; each origin's transport is built the first time it is asked for.
+    /// Builds an empty set whose transports go through `proxy`, or directly when that is `None`;
+    /// each origin's transport is built the first time it is asked for.
+    ///
+    /// A shipped daemon passes the proxy its configuration document selected when it started.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(proxy: Option<ProxyUrl>) -> Self {
+        Self {
+            built: Mutex::default(),
+            proxy,
+        }
     }
 }
 
@@ -54,8 +66,13 @@ impl DeliveryTransports for ManagedTransports {
             return Ok(Arc::clone(transport) as Arc<dyn ServiceHttp>);
         }
         let transport = Arc::new(
-            HttpService::new(origin.clone())
-                .map_err(|error| format!("no transport reaches {origin}: {error}"))?,
+            HttpService::through(
+                origin.clone(),
+                HttpDeadlines::default(),
+                ResponseLimits::default(),
+                self.proxy.as_ref(),
+            )
+            .map_err(|error| format!("no transport reaches {origin}: {error}"))?,
         );
         built.insert(origin.as_str().to_owned(), Arc::clone(&transport));
         Ok(transport as Arc<dyn ServiceHttp>)
@@ -84,7 +101,7 @@ mod tests {
 
     #[test]
     fn one_origin_is_one_transport_and_two_origins_are_two() {
-        let transports = ManagedTransports::new();
+        let transports = ManagedTransports::new(None);
         let gateway = GatewayOrigin::new("https://reach.invalid").expect("an origin");
         let hooks = GatewayOrigin::new("https://hooks.invalid").expect("an origin");
         let first = transports.to(&gateway).expect("a transport");

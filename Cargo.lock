@@ -4437,7 +4437,6 @@ dependencies = [
  "rusqlite",
  "rustix",
  "rustls",
- "rustls-platform-verifier",
  "schemars 1.2.2",
  "serde",
  "serde_json",

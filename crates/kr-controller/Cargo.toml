@@ -39,10 +39,10 @@ kr-voice.workspace = true
 kr-attention.workspace = true
 kr-worker.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
-# Mail submission, opened on a TLS stream verified against the platform's trust store, with no
-# way to switch the verification off. The rendezvous room's socket is kr-client's.
+# Mail submission, opened on a TLS stream verified against the platform's trust, which kr-client
+# builds for every TLS client here, with no way to switch the verification off. The rendezvous
+# room's socket is kr-client's.
 rustls.workspace = true
-rustls-platform-verifier.workspace = true
 # The older answer shape a compatibility reader accepts publishes its schema like any protocol
 # message, so it is checked before typed decoding like any other.
 schemars.workspace = true

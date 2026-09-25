@@ -3537,6 +3537,42 @@ impl Controller {
         self.delivery_runtime.attach_transport(transports)
     }
 
+    /// The proxy this host's outbound HTTPS goes through: the configuration document's
+    /// `network.proxy_url` as this daemon read it when it started, or `None` when it named none.
+    ///
+    /// It is the reading the network endpoint was built from, so the endpoint, the rendezvous,
+    /// delivery and the plugin catalogue never go through two different proxies, and an edit
+    /// applies to all of them at the next start.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::InvalidArgument`] naming `network.proxy_url` when the address it
+    /// holds is not one this host can use as a proxy.
+    pub fn started_proxy(&self) -> Result<Option<kr_transport::config::ProxyUrl>> {
+        Self::proxy_of(&self.started)
+    }
+
+    /// The proxy `started` selects, read as the network endpoint reads it.
+    fn proxy_of(
+        started: &crate::config::Started,
+    ) -> Result<Option<kr_transport::config::ProxyUrl>> {
+        started
+            .network
+            .proxy_url()
+            .map(|value| {
+                value
+                    .parse()
+                    .map_err(|error: kr_transport::config::ProxyUrlError| {
+                        ControllerError::InvalidArgument(format!(
+                            "network.proxy_url in this host's configuration document ({}) is not \
+                             usable: {error}",
+                            kr_protocol::hostinfo::configuration::FILE_NAME
+                        ))
+                    })
+            })
+            .transpose()
+    }
+
     /// The environment's automation service.
     #[must_use]
     pub const fn automation(&self) -> &Arc<crate::automation::AutomationModule> {

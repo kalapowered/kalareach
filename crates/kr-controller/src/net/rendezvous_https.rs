@@ -3,12 +3,14 @@
 //! Reserving and releasing a locator are JSON requests over HTTPS to the service's pairing routes,
 //! made through the managed-service transport, [`HttpService`]: certificate and host name
 //! verification, finite deadlines, a bounded answer and no redirects. Each request goes to the
-//! origin the invitation names, so the service the owner chose is the one contacted.
+//! origin the invitation names, so the service the owner chose is the one contacted, and it goes
+//! through the proxy this host's configuration document selects when it selects one.
 //!
 //! The host's room socket is kr-client's room socket in the host's role
 //! ([`kr_client::pairing::room::RoomConnector`]): a WebSocket at
-//! `wss://<origin>/api/pair/room/<locator>/host`, verified against the platform's trust store and
-//! proven with the reservation's control token in `KR-Pair-Control-Token`. The relay (see
+//! `wss://<origin>/api/pair/room/<locator>/host`, verified against the platform's trust, opened
+//! through the same proxy as a `CONNECT` tunnel when one is selected, and proven with the
+//! reservation's control token in `KR-Pair-Control-Token`. The relay (see
 //! [`super::rendezvous::serve_room`]) reads it, and a socket that ends is answered by attaching
 //! again. A socket that did not open is the service being unavailable, except an origin that
 //! cannot be addressed at all, which is a configuration error; that is what the host has always
@@ -47,6 +49,7 @@ use kr_protocol::ids::InvitationId;
 use kr_protocol::pairing::{Locator, RendezvousOrigin};
 use kr_protocol::scalars::{Digest256, TimestampMs, to_base64url};
 use kr_protocol::service::GatewayOrigin;
+use kr_transport::config::ProxyUrl;
 use kr_transport::listener::BoxFuture;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -78,25 +81,38 @@ pub struct HttpsRendezvous {
     runtime: tokio::runtime::Handle,
     /// What the host's room sockets are opened with.
     room: RoomConnector,
+    /// The proxy every request and room socket goes through, or none.
+    proxy: Option<ProxyUrl>,
 }
 
 impl HttpsRendezvous {
     /// Builds the client on the runtime of the calling task, which runs its requests, with room
-    /// sockets verified against the platform's trust store.
+    /// sockets verified against the platform's trust.
+    ///
+    /// `proxy` is the one this host's configuration document selects: the reservations, the
+    /// releases and the room sockets all go through it, and with none they all go directly.
     ///
     /// # Errors
     ///
     /// Returns a reason when called outside a runtime, or when the platform's verifier cannot be
     /// set up.
-    pub fn new() -> Result<Self, String> {
-        Self::with_connector(RoomConnector::platform().map_err(|error| error.to_string())?)
+    pub fn new(proxy: Option<ProxyUrl>) -> Result<Self, String> {
+        let room = RoomConnector::platform()
+            .map_err(|error| error.to_string())?
+            .through(proxy.clone());
+        Self::with_connector(room, proxy)
     }
 
-    /// Builds the client with the connector its room sockets are opened with.
-    fn with_connector(room: RoomConnector) -> Result<Self, String> {
+    /// Builds the client with the connector its room sockets are opened with, and the proxy its
+    /// requests go through.
+    fn with_connector(room: RoomConnector, proxy: Option<ProxyUrl>) -> Result<Self, String> {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| "the rendezvous client runs its requests on the daemon's runtime")?;
-        Ok(Self { runtime, room })
+        Ok(Self {
+            runtime,
+            room,
+            proxy,
+        })
     }
 
     /// Reserves `locator` at `origin` for `invitation_id`. False when the locator is taken.
@@ -122,7 +138,8 @@ impl HttpsRendezvous {
             advertised_expires_at_ms,
             control_token_hash,
         )?;
-        let answer: ReserveAnswer = control(origin, RESERVE_PATH, &body).await?;
+        let answer: ReserveAnswer =
+            control(origin, RESERVE_PATH, &body, self.proxy.as_ref()).await?;
         Ok(answer.reserved)
     }
 
@@ -141,7 +158,7 @@ impl HttpsRendezvous {
         control_token: &SymmetricKey,
     ) -> kr_pairing::Result<()> {
         let body = release_body(locator, control_token)?;
-        let _: ReleaseAnswer = control(origin, RELEASE_PATH, &body).await?;
+        let _: ReleaseAnswer = control(origin, RELEASE_PATH, &body, self.proxy.as_ref()).await?;
         Ok(())
     }
 }
@@ -306,15 +323,17 @@ fn json<T: Serialize>(body: &T) -> kr_pairing::Result<Vec<u8>> {
     })
 }
 
-/// Sends one control request to `origin` and reads its answer.
+/// Sends one control request to `origin`, through `proxy` when there is one, and reads its answer.
 async fn control<T: Answer>(
     origin: &RendezvousOrigin,
     path: &str,
     body: &[u8],
+    proxy: Option<&ProxyUrl>,
 ) -> kr_pairing::Result<T> {
     let gateway = GatewayOrigin::new(origin.as_str()).map_err(configuration)?;
-    let transport = HttpService::with(gateway, CONTROL_DEADLINES, ResponseLimits::default())
-        .map_err(|error| failed(&error))?;
+    let transport =
+        HttpService::through(gateway, CONTROL_DEADLINES, ResponseLimits::default(), proxy)
+            .map_err(|error| failed(&error))?;
     let address = format!("{}{path}", origin.as_str());
     let answer = transport
         .post_json(&address, body, &[])
@@ -688,7 +707,7 @@ mod tests {
         });
 
         let origin = RendezvousOrigin::new(format!("https://127.0.0.1:{port}")).expect("an origin");
-        let refused = HttpsRendezvous::new()
+        let refused = HttpsRendezvous::new(None)
             .expect("a client")
             .reserve(
                 &origin,
@@ -723,7 +742,7 @@ mod tests {
         let port = listener.local_addr().expect("an address").port();
         drop(listener);
         let origin = RendezvousOrigin::new(format!("https://127.0.0.1:{port}")).expect("an origin");
-        let rendezvous = HttpsRendezvous::new().expect("a client");
+        let rendezvous = HttpsRendezvous::new(None).expect("a client");
         let released = tokio::task::spawn_blocking(move || {
             rendezvous.release_locator(
                 &origin,
@@ -770,7 +789,7 @@ mod tests {
                 .expect("protocol versions")
                 .with_root_certificates(roots)
                 .with_no_client_auth();
-            HttpsRendezvous::with_connector(RoomConnector::with_tls(tls)).expect("a client")
+            HttpsRendezvous::with_connector(RoomConnector::with_tls(tls), None).expect("a client")
         }
 
         /// TLS presenting a certificate for 127.0.0.1 that this authority issued.

@@ -165,10 +165,12 @@ impl NetworkSetup {
             ),
         };
         // A host whose platform cannot verify a service's certificate offers no code invitation,
-        // and says so when one is asked for.
-        let rendezvous = rendezvous_https::HttpsRendezvous::new()
-            .ok()
-            .map(|service| Arc::new(service) as Arc<dyn rendezvous::Rendezvous>);
+        // and says so when one is asked for. The rendezvous goes through the proxy the endpoint
+        // goes through, the one this document selects, or none.
+        let rendezvous =
+            rendezvous_https::HttpsRendezvous::new(settings.endpoint.proxy_url.clone())
+                .ok()
+                .map(|service| Arc::new(service) as Arc<dyn rendezvous::Rendezvous>);
         Ok(Some(Self {
             settings,
             secrets,
