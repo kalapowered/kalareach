@@ -718,7 +718,13 @@ fn attribute(tokens: &[Token], line: usize) -> Attribute {
 
 /// Where the item that starts at `start` ends (exclusive).
 fn item_end(tokens: &[Token], start: usize) -> usize {
-    let structure = significant(&tokens[start..]);
+    // The keyword follows a visibility and a few qualifiers, well within the item's first tokens.
+    let structure: Vec<Token> = tokens[start..]
+        .iter()
+        .filter(|token| !token.is_comment())
+        .take(64)
+        .cloned()
+        .collect();
     let keyword = structure.get(head(&structure)).and_then(Token::ident);
     let extern_crate = keyword == Some("extern");
     let ends_at_semicolon =
