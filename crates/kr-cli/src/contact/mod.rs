@@ -118,12 +118,23 @@ fn poll_duration(asked: Option<DurationMs>) -> DurationMs {
 use crate::error::{CliError, Result as CliResult};
 
 /// One choice an `ask_user` select offers.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, Deserialize, Serialize, JsonSchema)]
 pub struct ChoiceInput {
     /// The stable identifier an answer names. It does not change with the label.
     pub choice_id: String,
     /// What the person reads.
     pub label: String,
+}
+
+impl std::fmt::Debug for ChoiceInput {
+    /// How long its identifier and its label are, never what they say: an agent wrote both.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ChoiceInput")
+            .field("choice_id_bytes", &self.choice_id.len())
+            .field("label_bytes", &self.label.len())
+            .finish()
+    }
 }
 
 /// What kind of answer a question asks for.
@@ -149,7 +160,7 @@ impl From<AskType> for QuestionKind {
 }
 
 /// The parameters of `ask_user`.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, Deserialize, Serialize, JsonSchema)]
 pub struct AskUserParams {
     /// Your own unpredictable identifier for this request. Repeating it with the same payload
     /// returns the same question instead of asking twice.
@@ -179,8 +190,28 @@ pub struct AskUserParams {
     pub wait_seconds: Option<u64>,
 }
 
+impl std::fmt::Debug for AskUserParams {
+    /// The kind of question and how long each text is, never what the agent wrote.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AskUserParams")
+            .field("request_id_bytes", &self.request_id.len())
+            .field(
+                "agent_name_bytes",
+                &self.agent_name.as_ref().map(String::len),
+            )
+            .field("context_bytes", &self.context.len())
+            .field("question_bytes", &self.question.len())
+            .field("kind", &self.kind)
+            .field("choices", &self.choices)
+            .field("expiry_seconds", &self.expiry_seconds)
+            .field("wait_seconds", &self.wait_seconds)
+            .finish()
+    }
+}
+
 /// The parameters of `wait_for_answer`.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, Deserialize, Serialize, JsonSchema)]
 pub struct WaitForAnswerParams {
     /// The question `ask_user` returned.
     pub question_id: String,
@@ -194,13 +225,40 @@ pub struct WaitForAnswerParams {
     pub wait_seconds: Option<u64>,
 }
 
+impl std::fmt::Debug for WaitForAnswerParams {
+    /// The question and the wait, never the caller token, which is what proves the caller asked.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WaitForAnswerParams")
+            .field(
+                "question_id",
+                &crate::shown::parsed_identifier::<QuestionId>(&self.question_id),
+            )
+            .field("wait_seconds", &self.wait_seconds)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The parameters of `cancel_question`.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, Deserialize, Serialize, JsonSchema)]
 pub struct CancelQuestionParams {
     /// The question `ask_user` returned.
     pub question_id: String,
     /// The caller token `ask_user` returned with it.
     pub caller_token: String,
+}
+
+impl std::fmt::Debug for CancelQuestionParams {
+    /// The question, never the caller token.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CancelQuestionParams")
+            .field(
+                "question_id",
+                &crate::shown::parsed_identifier::<QuestionId>(&self.question_id),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 /// How urgent a notification is.
@@ -226,7 +284,7 @@ impl From<NotificationSeverity> for AlertSeverity {
 }
 
 /// The parameters of `send_notification`.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, Deserialize, Serialize, JsonSchema)]
 pub struct SendNotificationParams {
     /// Your own identifier for this alert. Repeating it with the same text raises nothing new.
     pub dedup_id: String,
@@ -240,6 +298,26 @@ pub struct SendNotificationParams {
     /// A link into this host's own session, when there is one.
     #[serde(default)]
     pub safe_session_link: Option<String>,
+}
+
+impl std::fmt::Debug for SendNotificationParams {
+    /// The severity and how long each text is, never what the agent wrote.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SendNotificationParams")
+            .field("dedup_id_bytes", &self.dedup_id.len())
+            .field(
+                "agent_name_bytes",
+                &self.agent_name.as_ref().map(String::len),
+            )
+            .field("text_bytes", &self.text.len())
+            .field("severity", &self.severity)
+            .field(
+                "safe_session_link_bytes",
+                &self.safe_session_link.as_ref().map(String::len),
+            )
+            .finish()
+    }
 }
 
 /// How long the server waits, on its way out, for the calls it is still finishing.
@@ -944,6 +1022,74 @@ fn hex_of(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tool call's parameters render as their kinds, their numbers and their lengths: never an
+    /// agent's text, and never a caller token.
+    #[test]
+    fn a_tool_calls_parameters_render_without_what_the_agent_sent() {
+        use crate::shown::marker::{MARKER, assert_unmarked};
+
+        let ask = AskUserParams {
+            request_id: MARKER.to_owned(),
+            agent_name: Some(MARKER.to_owned()),
+            context: MARKER.to_owned(),
+            question: MARKER.to_owned(),
+            kind: AskType::Select,
+            choices: Some(vec![ChoiceInput {
+                choice_id: MARKER.to_owned(),
+                label: MARKER.to_owned(),
+            }]),
+            expiry_seconds: Some(60),
+            wait_seconds: None,
+        };
+        let wait = WaitForAnswerParams {
+            question_id: MARKER.to_owned(),
+            caller_token: MARKER.to_owned(),
+            wait_seconds: Some(30),
+        };
+        let cancel = CancelQuestionParams {
+            question_id: MARKER.to_owned(),
+            caller_token: MARKER.to_owned(),
+        };
+        let notify = SendNotificationParams {
+            dedup_id: MARKER.to_owned(),
+            agent_name: None,
+            text: MARKER.to_owned(),
+            severity: NotificationSeverity::Warning,
+            safe_session_link: Some(MARKER.to_owned()),
+        };
+        // The negative control is each field: every one holds the marker, and the derived form
+        // printed them all.
+        assert_eq!(
+            format!("{ask:?}"),
+            "AskUserParams { request_id_bytes: 14, agent_name_bytes: Some(14), context_bytes: 14, \
+             question_bytes: 14, kind: Select, choices: Some([ChoiceInput { choice_id_bytes: 14, \
+             label_bytes: 14 }]), expiry_seconds: Some(60), wait_seconds: None }"
+        );
+        assert_eq!(
+            format!("{wait:?}"),
+            "WaitForAnswerParams { question_id: \"[not an identifier]\", wait_seconds: Some(30), \
+             .. }"
+        );
+        assert_eq!(
+            format!("{cancel:?}"),
+            "CancelQuestionParams { question_id: \"[not an identifier]\", .. }"
+        );
+        assert_eq!(
+            format!("{notify:?}"),
+            "SendNotificationParams { dedup_id_bytes: 14, agent_name_bytes: None, text_bytes: 14, \
+             severity: Warning, safe_session_link_bytes: Some(14) }"
+        );
+        assert_unmarked(
+            "a tool call's parameters",
+            &[
+                format!("{ask:#?}"),
+                format!("{wait:#?}"),
+                format!("{cancel:#?}"),
+                format!("{notify:#?}"),
+            ],
+        );
+    }
 
     #[test]
     fn a_token_survives_the_round_trip_the_agent_holds_it_through() {

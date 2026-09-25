@@ -120,6 +120,16 @@ impl fmt::Display for Usage {
 
 impl Plain for Usage {}
 
+/// What an identifier someone typed or sent says: the identifier when the text is one, and that it
+/// is not one otherwise. The text itself is never repeated.
+#[must_use]
+pub fn parsed_identifier<T: std::str::FromStr + Plain>(text: &str) -> Shown {
+    text.parse::<T>().map_or_else(
+        |_| Shown::said("[not an identifier]"),
+        |identifier| shown!("{}", identifier),
+    )
+}
+
 /// What a failure to start the tool server says: its kind, never what a client sent.
 #[must_use]
 pub fn tool_server(error: &rmcp::service::ServerInitializeError) -> Shown {

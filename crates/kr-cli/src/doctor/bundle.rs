@@ -43,7 +43,7 @@ pub const CONTENT_PREFIX: &str = "content/";
 pub const SESSIONS_ENTRY: &str = "content/sessions.json";
 
 /// One content-bearing entry a person selected.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Content {
     /// The entry's name inside the archive, under [`CONTENT_PREFIX`].
     ///
@@ -58,6 +58,19 @@ pub struct Content {
     pub describes: Sentence,
     /// The bytes.
     pub bytes: Vec<u8>,
+}
+
+impl std::fmt::Debug for Content {
+    /// The entry, what it holds as the command says it, and how many bytes: never the bytes, which
+    /// are the content a person selected to send.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Content")
+            .field("entry", &self.entry)
+            .field("describes", &Shown::sentence(&self.describes))
+            .field("bytes", &self.bytes.len())
+            .finish()
+    }
 }
 
 impl Content {
