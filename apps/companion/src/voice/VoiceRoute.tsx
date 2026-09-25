@@ -24,7 +24,7 @@ import {
   type RunningCall
 } from './model'
 import { useApp } from '../app/state'
-import { failureMessage as portFailureMessage } from '../host/port'
+import { failureMessage as portFailureMessage, watch } from '../host/port'
 import type { HostPort, VoiceCallState } from '../host/port'
 import type { VoiceAction, VoiceDelegateParams } from '@kalareach/protocol'
 import type { Surface } from '../mobile/platform'
@@ -233,12 +233,11 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
       .catch(() => {
         if (current) setHostReachable(false)
       })
-    const stop = port.subscribe((event) => {
-      const body = event.body as { kind?: string; connected?: boolean } | null
-      if (body?.kind === 'connection' && typeof body.connected === 'boolean') {
-        setHostReachable(body.connected)
-      }
-    })
+    const stop = watch([
+      port.onConnection((state) => {
+        if (current) setHostReachable(state.connected)
+      })
+    ])
     return () => {
       current = false
       stop()
@@ -249,7 +248,7 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
   // device's own connection, never to the service, and what the row says is what the host answered.
   useEffect(() => {
     if (!call) return undefined
-    return port.subscribe((event) => {
+    return watch([port.subscribe((event) => {
       const body = event.body as {
         kind?: string
         delegation_id?: string
@@ -285,7 +284,7 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
         setCall,
         setNotice
       )
-    })
+    })])
   }, [call, port])
 
   const actions = useMemo<VoiceSurfaceActions>(

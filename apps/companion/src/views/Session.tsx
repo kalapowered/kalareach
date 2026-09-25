@@ -13,7 +13,7 @@ import type { SessionReadResult } from '@kalareach/protocol'
 
 import { Badge, Banner, Button, Card, CommitButton, Segmented, Sheet, Switch, ThemeChooser } from '../components/ui'
 import { useApp } from '../app/state'
-import { failureMessage, type SessionSubject } from '../host/port'
+import { failureMessage, watch, type SessionSubject } from '../host/port'
 import type { LaunchSurface } from '../model/pending'
 import { Conversation, outcomeMessage, receiptTone } from './Conversation'
 import { RawTerminal } from '../terminal/RawTerminal'
@@ -56,22 +56,26 @@ export function Session({
 
   useEffect(load, [load])
 
-  useEffect(() => {
-    const stop = port.subscribe((event) => {
-      const body = event.body as { kind?: string; connected?: boolean; prompt_generation?: string }
-      if (body.kind === 'connection' && typeof body.connected === 'boolean') {
-        setConnected(body.connected)
-      }
-      if (body.kind === 'prompt_generation' && body.prompt_generation) {
-        // The launch surface is only valid at the generation it was read at. A generation that
-        // moved disables the buttons rather than silently launching against the new prompt.
-        setSurface((current) =>
-          current ? { ...current, prompt_generation: body.prompt_generation! } : current
-        )
-      }
-    })
-    return stop
-  }, [port])
+  useEffect(
+    () =>
+      watch([
+        port.onConnection((state) => {
+          setConnected(state.connected)
+        }),
+        port.subscribe((event) => {
+          const body = event.body as { kind?: string; prompt_generation?: string }
+          if (body.kind === 'prompt_generation' && body.prompt_generation) {
+            // The launch surface is only valid at the generation it was read at. A generation
+            // that moved disables the buttons rather than silently launching against the new
+            // prompt.
+            setSurface((current) =>
+              current ? { ...current, prompt_generation: body.prompt_generation! } : current
+            )
+          }
+        })
+      ]),
+    [port]
+  )
 
   const summary = session?.session
   const state = summary ? describeApplicationState(summary) : null

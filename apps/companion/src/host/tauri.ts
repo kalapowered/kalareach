@@ -233,74 +233,30 @@ export function tauriPort(): HostPort {
     accountSignInCancel: () => call<undefined>('account_sign_in_cancel', {}),
     accountSignOut: () => call<AccountView>('account_sign_out', {}),
     accountUsage: () => call<UsageView>('account_usage', {}),
-    onAccount(listener: (view: AccountView) => void) {
-      let stop: (() => void) | null = null
-      let cancelled = false
-      void listen<AccountView>(ACCOUNT_EVENT, (event) => {
-        listener(event.payload)
-      }).then((unlisten) => {
-        if (cancelled) unlisten()
-        else stop = unlisten
-      })
-      return () => {
-        cancelled = true
-        stop?.()
-      }
-    },
+    onAccount: (listener) => listening<AccountView>(ACCOUNT_EVENT, listener),
 
-    subscribe(listener: (event: HostEvent) => void) {
-      const stops: (() => void)[] = []
-      let cancelled = false
-      const keep = (unlisten: () => void) => {
-        if (cancelled) unlisten()
-        else stops.push(unlisten)
-      }
-
-      void listen<PublishedEvent>(HOST_EVENT, (event) => {
+    subscribe: (listener: (event: HostEvent) => void) =>
+      listening<PublishedEvent>(HOST_EVENT, (published) => {
         listener({
-          stream_id: event.payload.stream_id,
-          sequence: event.payload.sequence,
-          body: { kind: event.payload.event_type, payload: event.payload.payload }
+          stream_id: published.stream_id,
+          sequence: published.sequence,
+          body: { kind: published.event_type, payload: published.payload }
         })
-      }).then(keep)
+      }),
 
-      void listen<ConnectionState>(CONNECTION_EVENT, (event) => {
-        listener({
-          stream_id: '',
-          sequence: '',
-          body: { kind: 'connection', connected: event.payload.connected }
-        })
-      }).then(keep)
-
-      return () => {
-        cancelled = true
-        for (const stop of stops) stop()
-      }
-    },
-
-    onFilesDropped(listener: (files: readonly DroppedFile[]) => void) {
-      let stop: (() => void) | null = null
-      let cancelled = false
-      // The backend records the paths first and then publishes them, so a path the page sees here
-      // is one the backend will accept for exactly one upload.
-      void listen<string[]>(DROPPED_EVENT, (event) => {
+    // The backend records the paths first and then publishes them, so a path the page sees here is
+    // one the backend will accept for exactly one upload.
+    onFilesDropped: (listener: (files: readonly DroppedFile[]) => void) =>
+      listening<string[]>(DROPPED_EVENT, (paths) => {
         listener(
-          event.payload.map((path) => ({
+          paths.map((path) => ({
             name: path.split(/[\\/]/).pop() ?? path,
             media_type: 'application/octet-stream',
             byte_len: 0,
             path
           }))
         )
-      }).then((unlisten) => {
-        if (cancelled) unlisten()
-        else stop = unlisten
       })
-      return () => {
-        cancelled = true
-        stop?.()
-      }
-    }
   }
 }
 

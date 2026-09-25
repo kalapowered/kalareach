@@ -13,7 +13,7 @@ import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react
 
 import { useApp } from '../app/state'
 import { Toast } from '../components/ui'
-import { failureMessage } from '../host/port'
+import { failureMessage, watch } from '../host/port'
 import {
   AccountGlyph,
   AttentionGlyph,
@@ -138,10 +138,7 @@ export function MobileApp({
         })
     }
     read()
-    const stop = port.subscribe((event) => {
-      const body = event.body as { kind?: string }
-      if (body.kind === 'connection') read()
-    })
+    const stop = watch([port.onConnection(read)])
     return () => {
       watching = false
       stop()

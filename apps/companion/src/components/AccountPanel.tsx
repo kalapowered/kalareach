@@ -19,7 +19,7 @@
 
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react'
 
-import type { HostPort } from '../host/port'
+import { watch, type HostPort } from '../host/port'
 import { minimumTarget, type Surface } from '../mobile/platform'
 import {
   SIGN_IN_HELP,
@@ -79,9 +79,11 @@ export function useAccount(port: HostPort): AccountHandle {
       .catch(() => {
         if (live) show({ state: 'signed_out', outcome: null })
       })
-    const stop = port.onAccount((next) => {
-      if (live) show(next)
-    })
+    const stop = watch([
+      port.onAccount((next) => {
+        if (live) show(next)
+      })
+    ])
     return () => {
       live = false
       stop()

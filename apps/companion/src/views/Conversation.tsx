@@ -31,6 +31,7 @@ import { useApp, useSession } from '../app/state'
 import {
   failureCode,
   failureMessage,
+  watch,
   type DroppedFile,
   type SessionSubject
 } from '../host/port'
@@ -192,7 +193,7 @@ export function Conversation({
   }, [port, sessionId])
 
   useEffect(() => {
-    const stop = port.subscribe((event) => {
+    const stop = watch([port.subscribe((event) => {
       const body = event.body as { kind?: string; node?: DocumentNode; receipt?: unknown }
       // An event belongs to the stream it names. A view showing one session ignores another's
       // rather than folding it into what the person is looking at.
@@ -214,7 +215,7 @@ export function Conversation({
         // A refusal that arrives later is the same refusal: the text comes back then too.
         if (refused) returnRefusedText(refused)
       }
-    })
+    })])
     return stop
   }, [port, batcher, sessionId, update, returnRefusedText])
 
@@ -354,7 +355,7 @@ export function Conversation({
     [port, state.draft.draftId, subject, update, say]
   )
 
-  useEffect(() => port.onFilesDropped(attach), [port, attach])
+  useEffect(() => watch([port.onFilesDropped(attach)]), [port, attach])
 
   // Losing contact removes the association, not the draft. That is a fact about the connection, so
   // it is derived here rather than written into the stored draft: the text, the revision and the

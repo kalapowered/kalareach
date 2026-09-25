@@ -60,7 +60,7 @@ describe('the connection indicator', () => {
 
   it('keeps a change it heard over a state it read before the change', async () => {
     const { port, controls } = shell()
-    const release = controls.holdConnectionState()
+    const held = controls.hold('connectionState')
     const { container } = render(
       <AppProvider port={port} initialPlace={{ view: 'plugins' }}>
         <App />
@@ -74,7 +74,7 @@ describe('the connection indicator', () => {
       controls.setConnected(false)
     })
     await act(async () => {
-      release()
+      held.release()
       await Promise.resolve()
     })
     expect(indicator(container)).toBe(UNREACHABLE)

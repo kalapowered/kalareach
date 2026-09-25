@@ -285,6 +285,10 @@ describe('the semantic view', () => {
         <App />
       </AppProvider>
     )
+    // The window hears a drop once its listener is registered, which completes after the render.
+    await act(async () => {
+      await Promise.resolve()
+    })
     controls.dropFiles([
       { name: 'diagram.png', media_type: 'image/png', byte_len: 10, path: '/tmp/diagram.png' }
     ])

@@ -656,14 +656,70 @@ export interface HostPort {
   /** The account's usage, and nothing about money. */
   accountUsage(): Promise<UsageView>
 
-  /** Where the device stands, each time it changes by itself. The returned function unsubscribes. */
-  onAccount(listener: (view: AccountView) => void): () => void
+  /**
+   * Tells `listener` where the device stands each time that changes by itself. Resolves, with the
+   * function that stops it, once the listener is registered: nothing published before then
+   * reaches it.
+   */
+  onAccount(listener: (view: AccountView) => void): Promise<() => void>
 
-  /** Subscribes to the host's events. The returned function unsubscribes. */
-  subscribe(listener: (event: HostEvent) => void): () => void
+  /**
+   * Tells `listener` each event the host publishes. Resolves, with the function that stops it,
+   * once the listener is registered: nothing published before then reaches it. The connection's
+   * own changes are `onConnection`'s.
+   */
+  subscribe(listener: (event: HostEvent) => void): Promise<() => void>
 
-  /** The files the platform handed this window, as they are dropped. */
-  onFilesDropped(listener: (files: readonly DroppedFile[]) => void): () => void
+  /**
+   * Tells `listener` the files the platform hands this window, as they are dropped. Resolves, with
+   * the function that stops it, once the listener is registered.
+   */
+  onFilesDropped(listener: (files: readonly DroppedFile[]) => void): Promise<() => void>
+}
+
+/**
+ * Listens, and then reads.
+ *
+ * Every listener the port registers resolves once it is registered. This registers all of
+ * `registrations` and, once every one of them is, calls `listening`: a view reads there the state
+ * its listeners follow, so no change they would hear can fall between the read and the listeners.
+ * The returned function stops them all, including one whose registration completes after it was
+ * called, and `listening` is never called after it. A registration that fails stops the others and
+ * goes to `failed`.
+ */
+export function watch(
+  registrations: readonly Promise<() => void>[],
+  listening: () => void = () => undefined,
+  failed: (failure: unknown) => void = () => undefined
+): () => void {
+  let watching = true
+  const stops: (() => void)[] = []
+  const stopAll = () => {
+    for (const stop of stops.splice(0)) stop()
+  }
+  void Promise.allSettled(
+    registrations.map((registration) =>
+      registration.then((stop) => {
+        if (watching) stops.push(stop)
+        else stop()
+      })
+    )
+  ).then((settled) => {
+    if (!watching) return
+    const refused = settled.find(
+      (each): each is PromiseRejectedResult => each.status === 'rejected'
+    )
+    if (refused === undefined) {
+      listening()
+      return
+    }
+    stopAll()
+    failed(refused.reason)
+  })
+  return () => {
+    watching = false
+    stopAll()
+  }
 }
 
 /** One row of the projected screen, as the raw view draws it. */

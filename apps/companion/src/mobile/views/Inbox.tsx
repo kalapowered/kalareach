@@ -15,7 +15,7 @@ import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react
 
 import { Banner, Button, CommitButton, Sheet } from '../../components/ui'
 import { useApp } from '../../app/state'
-import { failureMessage } from '../../host/port'
+import { failureMessage, watch } from '../../host/port'
 import type { AttentionEntry, AttentionInbox } from '../../model/pending'
 import { ask } from '../model/call'
 import { count, emptyMessage, filter, locationOf, order, type InboxFilter } from '../model/inbox'
@@ -68,11 +68,13 @@ export function Inbox({
 
   useEffect(() => {
     read()
-    const stop = port.subscribe((event) => {
-      const body = event.body as { kind?: string }
-      if (body.kind === 'attention' || body.kind === 'connection') read()
-    })
-    return stop
+    return watch([
+      port.subscribe((event) => {
+        const body = event.body as { kind?: string }
+        if (body.kind === 'attention') read()
+      }),
+      port.onConnection(read)
+    ])
   }, [port, read])
 
   const rows = useMemo(() => (inbox ? order(inbox) : []), [inbox])

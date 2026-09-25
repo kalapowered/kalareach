@@ -189,13 +189,14 @@ export interface FakeHostControls {
   appendNode(node: DocumentNode, sessionId?: string): void
   /** Moves the prompt generation on, which disables the launch buttons. */
   changePromptGeneration(): void
-  /** Marks the host as unreachable, or reachable again. */
+  /** Marks the host as unreachable, or reachable again, and says so as native code does. */
   setConnected(connected: boolean): void
   /**
-   * Holds the answer to every connection state read from now on, as a slow backend would, until
-   * the returned function is called. Each answer is the state when it was read.
+   * Holds every answer to `read` from now on, as a slow backend would, until the test answers it.
+   * Each answer is what the host held when the read was made, a refusal included, so a test can
+   * change the host while a read is on its way and answer reads in any order.
    */
-  holdConnectionState(): () => void
+  hold(read: HeldRead): HeldReads
   /** Hands the window a set of dropped files. */
   dropFiles(files: readonly DroppedFile[]): void
   /** What the interface asked the platform to save, in order. */
@@ -273,11 +274,33 @@ export interface FakeHostControls {
   /** The references the page asked to review, in order. */
   readonly reviewed: string[]
   /**
-   * Holds every listener the page registers from now on (pairing, confirmations, the connection
-   * and host events), as the desktop shell's registration does until it completes: nothing
-   * published meanwhile reaches it. Returns the function that completes the registrations.
+   * Holds every listener the page registers from now on (the connection, host events, the
+   * account, pairing, confirmations and dropped files), as the desktop shell's registration does
+   * until it completes: nothing published meanwhile reaches it. Returns the function that completes
+   * the registrations.
    */
   holdRegistrations(): () => void
+}
+
+/** A read the fake host can hold, named as the port names it. */
+export type HeldRead =
+  | 'connectionState'
+  | 'accountStatus'
+  | 'attentionRead'
+  | 'sessionRead'
+  | 'launchSurface'
+
+/** The reads of one kind a test is holding. */
+export interface HeldReads {
+  /** How many reads have been held so far. */
+  readonly count: number
+  /**
+   * Answers the read at `index`, counting from the first one held, with what it read. A read that
+   * has not been made yet, or has been answered, is left alone.
+   */
+  answer(index: number): void
+  /** Answers every read still held, oldest first, and holds no more. */
+  release(): void
 }
 
 /** The fake host, and the controls a test drives it with. */
@@ -313,7 +336,6 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
   let reviewOutcome: ReviewOutcome = 'confirmed'
   const reviewed: string[] = []
   let registering: Promise<void> = Promise.resolve()
-  let holding = false
   /** Adds `listener` to `set` once registration completes, and resolves then with its stop. */
   const register = <T,>(
     set: Set<(value: T) => void>,
@@ -389,13 +411,37 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     reason: connected ? null : 'this host cannot be contacted right now'
   })
   const connectionListeners = new Set<(state: ConnectionState) => void>()
-  let stateHeld: Promise<void> | null = null
+
+  /** The answers each held kind of read is waiting to give, in the order the reads were made. */
+  const holds = new Map<HeldRead, (() => void)[]>()
+  /**
+   * Answers a read with what the host holds now: at once, or when the test answers it while it
+   * holds this kind of read. A refusal is kept as the answer too, and arrives as a rejection then,
+   * as a refusal from native code does.
+   */
+  const reading = <T,>(read: HeldRead, answer: () => T): Promise<T> => {
+    const waiting = holds.get(read)
+    if (waiting === undefined) return Promise.resolve(answer())
+    let settle: (resolve: (value: T) => void, reject: (reason: unknown) => void) => void
+    try {
+      const value = answer()
+      settle = (resolve) => {
+        resolve(value)
+      }
+    } catch (refusal: unknown) {
+      settle = (_, reject) => {
+        reject(refusal)
+      }
+    }
+    return new Promise<T>((resolve, reject) => {
+      waiting.push(() => {
+        settle(resolve, reject)
+      })
+    })
+  }
 
   const port: HostPort = {
-    connectionState: () => {
-      const state = connectionNow()
-      return stateHeld === null ? Promise.resolve(state) : stateHeld.then(() => state)
-    },
+    connectionState: () => reading('connectionState', connectionNow),
     onConnection: (listener) => register(connectionListeners, listener),
 
     environmentCapabilities: (params) => {
@@ -431,13 +477,14 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       requireConnection()
       return Promise.resolve(sessions())
     },
-    sessionRead: (params) => {
-      requireConnection()
-      const sessionId = (params as { session_id?: string }).session_id ?? SESSION_MAIN
-      const found = sessions().sessions.find((session) => session.session_id === sessionId)
-      if (!found) refuse('UNKNOWN_SESSION', 'That session is not on this host.')
-      return Promise.resolve({ endpoint: null, session: found } as unknown as SessionReadResult)
-    },
+    sessionRead: (params) =>
+      reading('sessionRead', () => {
+        requireConnection()
+        const sessionId = (params as { session_id?: string }).session_id ?? SESSION_MAIN
+        const found = sessions().sessions.find((session) => session.session_id === sessionId)
+        if (!found) refuse('UNKNOWN_SESSION', 'That session is not on this host.')
+        return { endpoint: null, session: found } as unknown as SessionReadResult
+      }),
     sessionClose: (params) => {
       requireConnection()
       const sessionId = (params as { session_id?: string }).session_id ?? SESSION_MAIN
@@ -459,10 +506,11 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       })
     },
 
-    launchSurface: () => {
-      requireConnection()
-      return Promise.resolve(fakeLaunchSurface(true, String(promptGeneration)))
-    },
+    launchSurface: () =>
+      reading('launchSurface', () => {
+        requireConnection()
+        return fakeLaunchSurface(true, String(promptGeneration))
+      }),
     shellLaunch: (params) => {
       requireConnection()
       const asked = params as { expected_prompt_generation?: string; expected_buffer_revision?: string }
@@ -600,10 +648,11 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
         oldest_retained_row: 0,
         eviction_marker: null
       }),
-    attentionRead: () => {
-      requireConnection()
-      return Promise.resolve(attention(acknowledged))
-    },
+    attentionRead: () =>
+      reading('attentionRead', () => {
+        requireConnection()
+        return attention(acknowledged)
+      }),
     attentionAcknowledge: (params) => {
       const id = (params as { attention_id?: string }).attention_id
       if (id) acknowledged.add(id)
@@ -954,7 +1003,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
 
     voiceCallState: () => Promise.resolve(voiceCallState(voice)),
 
-    accountStatus: () => Promise.resolve(accountView),
+    accountStatus: () => reading('accountStatus', () => accountView),
     accountSignIn: () => {
       signIns += 1
       setAccount({ state: 'browser_open' })
@@ -984,29 +1033,10 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
             heldUsage.push(resolve)
           })
         : Promise.resolve(accountUsage),
-    onAccount(listener) {
-      accountListeners.add(listener)
-      return () => accountListeners.delete(listener)
-    },
+    onAccount: (listener) => register(accountListeners, listener),
 
-    subscribe(listener) {
-      let stopped = false
-      const add = () => {
-        if (!stopped) listeners.add(listener)
-      }
-      // As the shell's: a listener registered while registrations are held hears nothing until
-      // they complete.
-      if (holding) void registering.then(add)
-      else add()
-      return () => {
-        stopped = true
-        listeners.delete(listener)
-      }
-    },
-    onFilesDropped(listener) {
-      dropListeners.add(listener)
-      return () => dropListeners.delete(listener)
-    }
+    subscribe: (listener) => register(listeners, listener),
+    onFilesDropped: (listener) => register(dropListeners, listener)
   }
 
   const controls: FakeHostControls = {
@@ -1048,21 +1078,26 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     },
     setConnected(next) {
       connected = next
-      emit({
-        stream_id: 'session_state',
-        sequence: '0',
-        body: { kind: 'connection', connected: next }
-      })
       for (const listener of connectionListeners) listener(connectionNow())
     },
-    holdConnectionState() {
-      let release = () => {}
-      stateHeld = new Promise((resolve) => {
-        release = resolve
-      })
-      return () => {
-        release()
-        stateHeld = null
+    hold(read) {
+      const waiting: (() => void)[] = []
+      holds.set(read, waiting)
+      const answer = (index: number) => {
+        if (index < 0 || index >= waiting.length) return
+        const settle = waiting[index]
+        waiting[index] = answered
+        settle()
+      }
+      return {
+        get count() {
+          return waiting.length
+        },
+        answer,
+        release() {
+          if (holds.get(read) === waiting) holds.delete(read)
+          for (let index = 0; index < waiting.length; index += 1) answer(index)
+        }
       }
     },
     dropFiles(files) {
@@ -1133,19 +1168,22 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     reviewed,
     holdRegistrations() {
       let complete = () => {}
-      holding = true
       registering = new Promise((resolve) => {
         complete = resolve
       })
       return () => {
         complete()
-        holding = false
         registering = Promise.resolve()
       }
     }
   }
 
   return { port, controls }
+}
+
+/** What a held read's place holds once it has been answered. */
+function answered(): void {
+  // An answer is given once.
 }
 
 /** The scripted call, held apart from the host's own state because it is this device's. */
