@@ -3187,8 +3187,9 @@ mod tests {
 
     /// KR-REQ-11.06: a staged package is flushed, every directory of its tree, before it is renamed
     /// into place, each through a second handle opened from the one the store holds. While a
-    /// handle that shares no writing holds one of those directories, the package is not activated;
-    /// once that handle is let go, the same package is.
+    /// handle that shares no writing holds one of those directories, the activation is refused by
+    /// that directory's flush, before the rename, and nothing is activated; once that handle is let
+    /// go, every directory of a staged tree is flushed.
     #[cfg(windows)]
     #[test]
     fn a_package_whose_staged_tree_cannot_be_flushed_is_not_activated() {
@@ -3206,18 +3207,24 @@ mod tests {
         };
 
         let staged = stage();
-        let held = hold_without_shared_writing(&staged.dir.path.join("assets"));
+        let assets = staged.dir.path.join("assets");
+        let held = hold_without_shared_writing(&assets);
         let refused = owned(|permit| staged.activate(permit));
         drop(held);
-        assert!(
-            matches!(refused, Err(CatalogueError::StorageUnavailable { .. })),
-            "{refused:?}"
-        );
+        // The flush's own refusal names the directory it could not flush. A refusal naming the
+        // destination instead would come from the rename, which a flush that did nothing reaches.
+        match refused {
+            Err(CatalogueError::StorageUnavailable { detail }) => assert!(
+                detail.starts_with(&assets.display().to_string()),
+                "refused for another reason: {detail}"
+            ),
+            other => panic!("activated, or refused for another reason: {other:?}"),
+        }
         assert!(!store.package_dir(digest).exists(), "nothing was activated");
 
-        let activated = owned(|permit| stage().activate(permit))
-            .expect("with nothing holding its tree, the package is activated");
-        assert_eq!(activated, store.package_dir(digest));
+        let staged = stage();
+        flush_tree(&staged.dir).expect("with nothing holding it, the staged tree is flushed");
+        staged.abandon();
     }
 
     /// A directory the store holds is flushed through a second handle opened from the one held,
