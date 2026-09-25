@@ -66,6 +66,10 @@ pub struct Target {
     pub src_path: PathBuf,
     /// Whether `cargo test` builds and runs it without being asked by name.
     pub tested_by_default: bool,
+    /// Whether it runs under the standard test harness. A target whose manifest entry says
+    /// `harness = false` is a program of its own: it prints no list and no verdicts the report can
+    /// read, and only its exit status says anything.
+    pub harness: bool,
 }
 
 /// One package of the workspace.
@@ -77,6 +81,8 @@ pub struct Package {
     pub version: String,
     /// Its targets.
     pub targets: Vec<Target>,
+    /// Its manifest.
+    pub manifest: PathBuf,
 }
 
 /// Reads the workspace whose manifest is at `root`, through `cargo metadata`.
@@ -104,7 +110,60 @@ pub fn read(root: &Path) -> Result<Vec<Package>, String> {
     }
     let value: Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("cargo metadata wrote something that is not JSON: {error}"))?;
-    parse(&value)
+    let mut packages = parse(&value)?;
+    // Cargo's description leaves the harness out, so each manifest says it.
+    for package in &mut packages {
+        let manifest = std::fs::read_to_string(&package.manifest).map_err(|error| {
+            format!("{} could not be read: {error}", package.manifest.display())
+        })?;
+        let own = own_harnesses(&manifest, &package.name);
+        for target in &mut package.targets {
+            target.harness = !own.contains(&(target.id.kind, target.id.name.clone()));
+        }
+    }
+    Ok(packages)
+}
+
+/// The targets a manifest gives a harness of their own (`harness = false`), each by the kind of
+/// table it is declared in and its name. A `[lib]` table without a name is the package's library.
+fn own_harnesses(manifest: &str, package: &str) -> Vec<(TargetKind, String)> {
+    let mut found = Vec::new();
+    let mut table: Option<TargetKind> = None;
+    let mut name: Option<String> = None;
+    let mut own = false;
+    let mut close = |table: Option<TargetKind>, name: Option<String>, own: bool| {
+        if let (Some(kind), true) = (table, own) {
+            found.push((kind, name.unwrap_or_else(|| package.replace('-', "_"))));
+        }
+    };
+    for line in manifest.lines() {
+        let line = line.split('#').next().unwrap_or_default().trim();
+        if line.starts_with('[') {
+            close(table, name.take(), own);
+            table = match line {
+                "[lib]" => Some(TargetKind::Lib),
+                "[[bin]]" => Some(TargetKind::Bin),
+                "[[test]]" => Some(TargetKind::Test),
+                "[[bench]]" => Some(TargetKind::Bench),
+                "[[example]]" => Some(TargetKind::Example),
+                _ => None,
+            };
+            own = false;
+            continue;
+        }
+        if table.is_none() {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            match (key.trim(), value.trim()) {
+                ("name", value) => name = Some(value.trim_matches('"').to_owned()),
+                ("harness", "false") => own = true,
+                _ => {}
+            }
+        }
+    }
+    close(table, name, own);
+    found
 }
 
 /// Reads packages out of `cargo metadata`'s output.
@@ -133,6 +192,7 @@ pub fn parse(value: &Value) -> Result<Vec<Package>, String> {
             .ok_or("a package without a name")?
             .to_owned();
         let version = package["version"].as_str().unwrap_or_default().to_owned();
+        let manifest = PathBuf::from(package["manifest_path"].as_str().unwrap_or_default());
         let mut targets = Vec::new();
         for target in package["targets"]
             .as_array()
@@ -178,12 +238,14 @@ pub fn parse(value: &Value) -> Result<Vec<Package>, String> {
                 },
                 src_path,
                 tested_by_default: tested,
+                harness: true,
             });
         }
         packages.push(Package {
             name,
             version,
             targets,
+            manifest,
         });
     }
     packages.sort_by(|a, b| a.name.cmp(&b.name));
@@ -229,6 +291,37 @@ mod tests {
             ]
         );
         assert_eq!(packages[0].targets[1].id.to_string(), "a --test flow");
+    }
+
+    #[test]
+    fn a_target_the_manifest_gives_its_own_harness_is_found_by_its_table_and_name() {
+        let manifest = "\
+[package]
+name = \"companion-tauri\"
+
+[[bin]]
+name = \"kalareach-companion\"
+path = \"src/main.rs\"
+
+# Opens real windows, so it has its own main thread.
+[[test]]
+name = \"navigation\"
+harness = false # its own main
+
+[[test]]
+name = \"ordinary\"
+
+[build-dependencies]
+harness = false
+";
+        assert_eq!(
+            own_harnesses(manifest, "companion-tauri"),
+            [(TargetKind::Test, "navigation".to_owned())]
+        );
+        assert_eq!(
+            own_harnesses("[lib]\nharness = false\n", "a-crate"),
+            [(TargetKind::Lib, "a_crate".to_owned())]
+        );
     }
 
     #[test]
