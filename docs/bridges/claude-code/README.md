@@ -216,7 +216,7 @@ A line past the bound ends the connection. So does a line the connection cuts sh
 Whatever happens, a hook writes exactly `{}` to standard output and exits 0. It waits for the worker
 for at most 500 milliseconds from its start and then answers anyway, and it never waits for a
 person. A diagnostic goes to standard error only after the answer, and is waited for until those 500
-milliseconds are up, or for 100 milliseconds after an answer that came at them: a standard error
+milliseconds are up or until 100 milliseconds after the answer, whichever is later: a standard error
 nobody reads cannot hold the hook longer, and a line not written by then may be lost when the hook
 ends. Claude Code writes standard error to its debug log for an exit-0 hook and shows it to nobody.
 A report counts only if the worker admits its hook while the hook is still running: the worker

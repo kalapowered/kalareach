@@ -14,8 +14,8 @@
 //! shortest timeout any registration names (one second, for a session ending). When that passes,
 //! the answer is written and the process ends, whatever is still in flight. The answer goes before
 //! anything the run says about itself: a diagnostic goes to standard error after it, and is waited
-//! for only until the same deadline, or for [`DIAGNOSTIC_ALLOWANCE`] after an answer that came at
-//! it, so a standard error nobody reads can hold neither the answer nor, past that, the end.
+//! for until the same deadline or [`DIAGNOSTIC_ALLOWANCE`] after the answer, whichever is later, so
+//! a standard error nobody reads can hold neither the answer nor, past that, the end.
 
 use std::time::Duration;
 
@@ -146,7 +146,7 @@ pub fn run(application: &'static Application) -> std::process::ExitCode {
     };
     // The application waits for the answer, and a standard error nobody reads can hold a write to
     // it for as long as nobody reads it. So the answer goes first, and the diagnostic gets what
-    // remains of the deadline, or the allowance when the answer used the deadline up.
+    // remains of the deadline, and at least the allowance after the answer.
     answer();
     if let Some(failure) = failure {
         let by = (started + HOOK_DEADLINE).max(std::time::Instant::now() + DIAGNOSTIC_ALLOWANCE);
