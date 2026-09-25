@@ -452,6 +452,16 @@ async fn kr_req_12_18_only_the_applications_own_channel_is_served_and_only_what_
     let package = Package::new();
     let launch = || package.launch(&broker, 2, Some(fixture::QUALIFIED_VERSION));
 
+    // A program the application runs inherits its variables and starts a channel of its own. It is
+    // tried while no channel of the instance is open, so its starter alone refuses it.
+    let mut nested = Channel::open(launch(), 2, channel_process(9));
+    assert_eq!(
+        nested.next().await,
+        None,
+        "a nested program's channel is closed"
+    );
+    assert!(matches!(nested.ended().await, ChannelEnd::Refused(_)));
+
     let mut first = Channel::open(launch(), 2, launched(2));
     first.relay("abcde").await;
     eventually("the first channel is served", || {
@@ -465,15 +475,6 @@ async fn kr_req_12_18_only_the_applications_own_channel_is_served_and_only_what_
         "a second channel is closed unread"
     );
     assert!(matches!(second.ended().await, ChannelEnd::Refused(_)));
-
-    // A program the application runs inherits its variables and starts a channel of its own.
-    let mut nested = Channel::open(launch(), 2, channel_process(9));
-    assert_eq!(
-        nested.next().await,
-        None,
-        "a nested program's channel is closed"
-    );
-    assert!(matches!(nested.ended().await, ChannelEnd::Refused(_)));
 
     // A message into the session travels from this host, and never arrives from the application.
     first
