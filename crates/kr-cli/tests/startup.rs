@@ -2284,6 +2284,19 @@ impl ServiceHost {
         chosen
     }
 
+    /// Has the test's user manager read its unit files again, as a person does after changing
+    /// one.
+    #[cfg(target_os = "linux")]
+    fn reload(&self) {
+        let reloaded = bounded(self.manager.systemctl(&["daemon-reload"]), STREAMS_DEADLINE)
+            .expect("the manager reloads");
+        assert!(
+            reloaded.status.success(),
+            "the manager reloads: {}",
+            String::from_utf8_lossy(&reloaded.stderr)
+        );
+    }
+
     /// Closes a session this test created, through the daemon that holds it.
     fn close(&self, created: &Value) {
         let session = created["session_id"]
@@ -2804,9 +2817,7 @@ fn a_manager_holding_anything_but_the_definition_kr_wrote_is_not_asked_to_start_
             "[Service]\nExecStart=\nExecStart=/bin/true\n",
         )
         .expect("a drop-in");
-        let reloaded = bounded(host.manager.systemctl(&["daemon-reload"]), STREAMS_DEADLINE)
-            .expect("the manager reloads");
-        assert!(reloaded.status.success());
+        host.reload();
     }
 
     let output = start(host.new_session()).finish("kr new");
@@ -2871,6 +2882,128 @@ fn a_manager_holding_anything_but_the_definition_kr_wrote_is_not_asked_to_start_
         output.status.success(),
         "{created}; it said {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    host.close(&created);
+}
+
+/// KR-REQ-07.12: on Linux no drop-in changes the command the user manager runs for the daemon,
+/// wherever the drop-in is: in the directory every service reads, or in the unit's own directory
+/// reached through a link to a directory that is also named `service.d`.
+///
+/// For each, `kr new` names the command the manager would run and the setup action, and nothing
+/// is started. Once the person has removed it, `kr new` goes on.
+#[cfg(target_os = "linux")]
+#[test]
+fn no_drop_in_anywhere_changes_the_command_the_user_manager_runs() {
+    let Some(host) = ServiceHost::create() else {
+        return;
+    };
+    host.select_service();
+    let units = host
+        .definition()
+        .parent()
+        .expect("the user unit directory")
+        .to_path_buf();
+    let own = units.join(format!("{}.service.d", host.label()));
+    let linked = host.tree.root().join("overrides/service.d");
+    for (place, drop_in) in [
+        (
+            "a drop-in every service reads",
+            units.join("service.d/zz-command.conf"),
+        ),
+        (
+            "a drop-in in the unit's own directory, linked to one named service.d",
+            linked.join("zz-command.conf"),
+        ),
+    ] {
+        let directory = drop_in.parent().expect("a drop-in directory");
+        std::fs::create_dir_all(directory).expect("a drop-in directory");
+        std::fs::write(&drop_in, "[Service]\nExecStart=\nExecStart=/bin/true\n")
+            .expect("a drop-in");
+        if directory == linked {
+            std::os::unix::fs::symlink(&linked, &own).expect("the unit's own directory, linked");
+        }
+        host.reload();
+
+        let output = start(host.new_session()).finish("kr new");
+        let failure = document(&output, "kr new");
+        assert_eq!(failure["code"], "HOST_NOT_CONFIGURED", "{place}: {failure}");
+        let message = failure["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("/bin/true"),
+            "{place}: the failure names the command the manager would run: {message}"
+        );
+        assert!(
+            message.contains("kr host startup --set service"),
+            "{place}: and the setup action: {message}"
+        );
+        assert_eq!(host.daemon(), None, "{place}: nothing was started");
+        assert!(!host.answers(), "{place}: nothing answers");
+
+        std::fs::remove_file(&drop_in).expect("the person removes the drop-in");
+        if own.is_symlink() {
+            std::fs::remove_file(&own).expect("and the link");
+        }
+        host.reload();
+    }
+
+    let output = start(host.new_session()).finish("kr new once the drop-ins are gone");
+    let created = document(&output, "kr new");
+    assert!(
+        output.status.success(),
+        "{created}; it said {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    host.close(&created);
+}
+
+/// KR-REQ-07.12: on Linux a drop-in that leaves the command alone is the person's own. `kr host
+/// startup --set service` takes the definition and names the drop-in, and `kr new` has the user
+/// manager start the daemon under it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_drop_in_that_leaves_the_command_alone_is_the_persons_and_the_daemon_starts_under_it() {
+    let Some(host) = ServiceHost::create() else {
+        return;
+    };
+    let own = host
+        .definition()
+        .with_file_name(format!("{}.service.d", host.label()));
+    std::fs::create_dir_all(&own).expect("the unit's own drop-in directory");
+    let drop_in = own.join("10-host-policy.conf");
+    std::fs::write(
+        &drop_in,
+        "[Service]\nEnvironment=KR_TEST_HOST_POLICY=kept\n",
+    )
+    .expect("a drop-in");
+
+    let chosen = host.select_service();
+    assert!(
+        chosen["notes"]
+            .as_array()
+            .is_some_and(|notes| notes.iter().any(|note| note
+                .as_str()
+                .is_some_and(|note| note.contains(&drop_in.display().to_string())))),
+        "the setup names the drop-in the manager reads: {chosen}"
+    );
+
+    let output = start(host.new_session()).finish("kr new");
+    let created = document(&output, "kr new");
+    assert!(
+        output.status.success(),
+        "{created}; it said {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let pid = host
+        .daemon()
+        .expect("the service manager reports the daemon it started");
+    host.assert_started_by_the_manager(pid);
+    let environment = std::fs::read(format!("/proc/{pid}/environ")).expect("its environment");
+    assert!(
+        environment
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == b"KR_TEST_HOST_POLICY=kept"),
+        "the manager started the daemon under the person's drop-in"
     );
     host.close(&created);
 }
