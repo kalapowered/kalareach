@@ -1681,9 +1681,12 @@ impl StagedPackage {
         )?;
         // Every directory between the package and a file it declares has to be a directory, not a
         // link: a rename through a linked directory would write outside the package. The whole
-        // package is checked before anything is replaced, so a refusal changes nothing.
+        // package is checked before anything is replaced, so a refusal changes nothing. How many of
+        // those directories are there already is kept: the rest are made by this repair.
+        let mut present: BTreeMap<&str, usize> = BTreeMap::new();
         for relative in self.written.keys() {
             let mut directory = package.try_clone()?;
+            let mut depth = 0;
             for component in Path::new(relative)
                 .parent()
                 .into_iter()
@@ -1704,9 +1707,11 @@ impl StagedPackage {
                             Path::new(part),
                             false,
                         )?;
+                        depth += 1;
                     }
                 }
             }
+            present.insert(relative.as_str(), depth);
         }
         let mut replaced: Vec<PathBuf> = Vec::new();
         let stopped = |replaced: &[PathBuf], error: CatalogueError| {
@@ -1721,12 +1726,15 @@ impl StagedPackage {
                 }
             }
         };
-        // Every directory from a replaced file up to the package's own holds a new entry, a
-        // replaced file or a directory created for one, so each of them is flushed, for the kind
-        // of name it holds: a file's for the directory a file was renamed into, whatever else it
-        // holds, and a directory's for each one above it.
-        let mut touched: BTreeMap<PathBuf, (Area, NameKind)> = BTreeMap::new();
-        for relative in self.written.keys() {
+        // Every directory from a replaced file up to the package's own is flushed, each for the
+        // kind of name it gained: a file's for the directory a file was renamed into, whatever else
+        // it gained, and a directory's for one this repair made a directory in. A directory above
+        // the file that gained nothing, because what is below it was there already, is flushed on
+        // Unix as it always was, since a flush there asks nothing of the directory. On Windows a
+        // flush opens the directory with the right to add to it, which such a directory may not
+        // grant and which this repair did not use, so it is left alone.
+        let mut touched: BTreeMap<PathBuf, (Area, Option<NameKind>)> = BTreeMap::new();
+        for (relative, depth_present) in &present {
             let relative = Path::new(relative);
             let staged = self.dir.path.join(relative);
             let target = package.path.join(relative);
@@ -1755,7 +1763,12 @@ impl StagedPackage {
             let mut directory = package
                 .try_clone()
                 .map_err(|error| stopped(&replaced, error))?;
-            for component in relative.parent().into_iter().flat_map(Path::components) {
+            for (depth, component) in relative
+                .parent()
+                .into_iter()
+                .flat_map(Path::components)
+                .enumerate()
+            {
                 let next = open_child(
                     &directory.dir,
                     &directory.path.join(component),
@@ -1763,15 +1776,25 @@ impl StagedPackage {
                     false,
                 )
                 .map_err(|error| stopped(&replaced, error))?;
-                touched
+                let made_here = depth >= *depth_present;
+                let (_, gained) = touched
                     .entry(directory.path.clone())
-                    .or_insert((directory, NameKind::Directory));
+                    .or_insert((directory, None));
+                if made_here && gained.is_none() {
+                    *gained = Some(NameKind::Directory);
+                }
                 directory = next;
             }
-            touched.insert(directory.path.clone(), (directory, NameKind::File));
+            touched.insert(directory.path.clone(), (directory, Some(NameKind::File)));
         }
-        for (directory, kind) in touched.values() {
-            flushed_after_publication(directory, &package.path, *kind)?;
+        for (directory, gained) in touched.values() {
+            match gained {
+                Some(kind) => flushed_after_publication(directory, &package.path, *kind)?,
+                None if cfg!(unix) => {
+                    flushed_after_publication(directory, &package.path, NameKind::Directory)?;
+                }
+                None => {}
+            }
         }
         Ok(())
     }
@@ -3247,17 +3270,17 @@ mod tests {
         printed
     }
 
-    /// Refuses this account the right to add a file to one directory, and nothing else, until it
-    /// is dropped.
+    /// Refuses this account the right to add one kind of name to one directory, and nothing else,
+    /// until it is dropped.
     #[cfg(windows)]
-    struct AddingFilesRefused {
+    struct AddingRefused {
         directory: PathBuf,
         account: String,
     }
 
     #[cfg(windows)]
-    impl AddingFilesRefused {
-        fn on(directory: &Path) -> Self {
+    impl AddingRefused {
+        fn on(directory: &Path, kind: NameKind) -> Self {
             use std::os::windows::fs::OpenOptionsExt as _;
 
             /// The right to add a file to a directory.
@@ -3267,6 +3290,12 @@ mod tests {
             /// What lets a program open a directory at all.
             const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 
+            // The right refused, as the list names it, and as a handle asks for it; then the
+            // right left alone.
+            let (entry, refused_right, kept_right) = match kind {
+                NameKind::File => ("WD", FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY),
+                NameKind::Directory => ("AD", FILE_ADD_SUBDIRECTORY, FILE_ADD_FILE),
+            };
             let printed = run_program(
                 "whoami.exe",
                 &[
@@ -3293,7 +3322,7 @@ mod tests {
                 &[
                     directory.as_os_str(),
                     "/deny".as_ref(),
-                    format!("*{account}:(WD)").as_ref(),
+                    format!("*{account}:({entry})").as_ref(),
                 ],
             );
             let refused = Self {
@@ -3309,18 +3338,19 @@ mod tests {
             // The list is what refuses it: an account holding a privilege that overrides lists
             // would be let through, and for it this arrangement cannot be made.
             assert_eq!(
-                open(FILE_ADD_FILE)
-                    .expect_err("adding a file is refused")
+                open(refused_right)
+                    .expect_err("the right is refused")
                     .kind(),
-                std::io::ErrorKind::PermissionDenied
+                std::io::ErrorKind::PermissionDenied,
+                "{kind:?}"
             );
-            open(FILE_ADD_SUBDIRECTORY).expect("adding a directory is not");
+            open(kept_right).expect("and the other right is not");
             refused
         }
     }
 
     #[cfg(windows)]
-    impl Drop for AddingFilesRefused {
+    impl Drop for AddingRefused {
         fn drop(&mut self) {
             let _ = std::process::Command::new("icacls.exe")
                 .arg(&self.directory)
@@ -3351,7 +3381,38 @@ mod tests {
             .write(&path("assets/icon.txt"), b"icon")
             .expect("written");
 
-        let refused = AddingFilesRefused::on(&package);
+        let refused = AddingRefused::on(&package, NameKind::File);
+        let repaired = owned(|permit| staged.activate(permit));
+        drop(refused);
+        assert_eq!(repaired.expect("the repair is made and flushed"), package);
+        assert_eq!(
+            std::fs::read(package.join("assets").join("icon.txt")).expect("the repaired file"),
+            b"icon"
+        );
+    }
+
+    /// KR-REQ-11.06: a directory a repair passes through without changing is not asked for a
+    /// right the repair did not use. Here `assets` is already in place and the package's own
+    /// directory may gain a file and not a directory: the repair renames the missing file into
+    /// `assets`, flushes `assets` with the right to add a file, leaves the package's directory,
+    /// which gained nothing, unflushed, and reports success.
+    #[cfg(windows)]
+    #[test]
+    fn a_repair_asks_nothing_of_a_directory_it_did_not_change() {
+        let (_directory, store) = store();
+        let digest = PayloadDigest::of(b"manifest");
+        let package = store.package_dir(digest);
+        std::fs::create_dir_all(package.join("assets")).expect("a package already in place");
+        std::fs::write(package.join("plugin.json"), b"manifest").expect("its manifest, intact");
+        let mut staged = store.stage_package(digest).expect("a staging directory");
+        staged
+            .write(&path("plugin.json"), b"manifest")
+            .expect("written");
+        staged
+            .write(&path("assets/icon.txt"), b"icon")
+            .expect("written");
+
+        let refused = AddingRefused::on(&package, NameKind::Directory);
         let repaired = owned(|permit| staged.activate(permit));
         drop(refused);
         assert_eq!(repaired.expect("the repair is made and flushed"), package);
