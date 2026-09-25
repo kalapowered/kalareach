@@ -120,24 +120,24 @@ struct Host {
 }
 
 impl Host {
-    /// Builds a host, or returns `None` when the worker this suite launches is not built.
+    /// Builds a host, with a copy of the worker this suite launches beside it.
     ///
     /// The suite starts a real worker process, and the only place a test can look for it is beside
-    /// its own binary. A target directory that holds the test but not the worker is a partial
-    /// build rather than a failure of anything this suite checks, so it says so and stops.
-    fn create() -> Option<Self> {
-        let worker_build = worker_program()?;
+    /// its own binary; a build that has not produced one fails here and says so
+    /// ([`worker_program`]).
+    fn create() -> Self {
+        let worker_build = worker_program();
         let temp = teardown::Tree::create();
         let environment_id = temp.environment_id();
         let worker = temp.root().join("kr-worker");
         // Started once here, where nothing is timed, so the operating system's check of a new
         // executable is not paid inside a create's rendezvous.
         kr_ipc::testing::place_and_start_once(&worker_build, &worker, &["--version"]);
-        Some(Self {
+        Self {
             temp,
             worker,
             environment_id,
-        })
+        }
     }
 
     fn paths(&self) -> kr_ipc::paths::EnvironmentPaths {
@@ -226,7 +226,7 @@ impl Host {
 /// Panics when the build has not produced one. A suite that skipped instead would report a pass
 /// for something it never ran, which is worse than a failure: this is why every test here is
 /// `#[ignore]`d and run by `scripts/end-to-end.sh`, which builds the worker first.
-fn worker_program() -> Option<PathBuf> {
+fn worker_program() -> PathBuf {
     let mut directory = std::env::current_exe().expect("the test binary");
     directory.pop();
     if directory.file_name().is_some_and(|name| name == "deps") {
@@ -243,7 +243,7 @@ fn worker_program() -> Option<PathBuf> {
          `cargo build -p kr-worker` or run `scripts/end-to-end.sh`, which does",
         worker.display()
     );
-    Some(worker)
+    worker
 }
 
 struct RunningDaemon {
@@ -343,16 +343,15 @@ async fn create(client: &mut LocalClient, host: &Host) -> SessionCreateResult {
 ///
 /// Read from the process table rather than from anything this test arranged: what is being checked
 /// is what the process actually got, and a launch that quietly inherited a directory looks exactly
-/// like one that was given the right one until the kernel is asked. `None` means this platform has
-/// no way to ask; a platform that has one and refuses to answer is a failure, not a skip.
-fn working_directory_of(pid: u32) -> Option<PathBuf> {
+/// like one that was given the right one until the kernel is asked. Linux and macOS answer that for
+/// another process, and a refusal to answer fails here. So does a platform this suite knows no way
+/// to ask, because a comparison that could not be made is not one that passed.
+fn working_directory_of(pid: u32) -> PathBuf {
     #[cfg(target_os = "linux")]
     {
-        Some(
-            std::fs::read_link(format!("/proc/{pid}/cwd")).unwrap_or_else(|error| {
-                panic!("the working directory of process {pid} could not be read: {error}")
-            }),
-        )
+        std::fs::read_link(format!("/proc/{pid}/cwd")).unwrap_or_else(|error| {
+            panic!("the working directory of process {pid} could not be read: {error}")
+        })
     }
     #[cfg(target_os = "macos")]
     {
@@ -360,19 +359,19 @@ fn working_directory_of(pid: u32) -> Option<PathBuf> {
             .args(["-a", "-d", "cwd", "-p", &pid.to_string(), "-Fn"])
             .output()
             .unwrap_or_else(|error| panic!("the process table could not be read: {error}"));
-        Some(
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .find_map(|line| line.strip_prefix('n').map(PathBuf::from))
-                .unwrap_or_else(|| {
-                    panic!("the process table named no working directory for process {pid}")
-                }),
-        )
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|line| line.strip_prefix('n').map(PathBuf::from))
+            .unwrap_or_else(|| {
+                panic!("the process table named no working directory for process {pid}")
+            })
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = pid;
-        None
+        panic!(
+            "this suite knows no way to ask this platform for the working directory of process \
+             {pid}, so the check that the host put its worker there cannot run here"
+        )
     }
 }
 
@@ -408,14 +407,7 @@ fn runs_where_the_host_put_it(host: &Host, session_id: SessionId) {
         "and the binary it started is not inside it either: {}",
         host.worker.display()
     );
-    let Some(actual) = working_directory_of(pid) else {
-        // Nothing to compare against rather than a comparison that failed. Saying so is better
-        // than a pass that checked nothing.
-        eprintln!(
-            "skipped: this platform does not report another process's working directory here"
-        );
-        return;
-    };
+    let actual = working_directory_of(pid);
     assert_eq!(
         std::fs::canonicalize(&actual).unwrap_or(actual),
         expected,
@@ -968,9 +960,7 @@ async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor()
     // KR-REQ-01.07: a device pairs with the host and uses a live session over iroh with no
     // KalaReach account configured, and no relay, discovery or managed service either: both
     // endpoints are loopback iroh endpoints and nothing else.
-    let Some(host) = Host::create() else {
-        return;
-    };
+    let host = Host::create();
     let owner = DeviceKeys::generate().expect("owner keys");
     let daemon = host.start(loopback(), &owner).await;
     let mut local = host.client().await;
@@ -1224,9 +1214,7 @@ fn undialable(
 #[ignore = "starts a control daemon; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_pairing_invitation_carries_the_hosts_current_direct_addresses() {
-    let Some(host) = Host::create() else {
-        return;
-    };
+    let host = Host::create();
     let owner = DeviceKeys::generate().expect("owner keys");
     let daemon = host.start(loopback(), &owner).await;
 
@@ -1286,9 +1274,7 @@ async fn a_pairing_invitation_carries_the_hosts_current_direct_addresses() {
 #[ignore = "starts a control daemon; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_on_every_interface_hints_the_addresses_it_found_there() {
-    let Some(host) = Host::create() else {
-        return;
-    };
+    let host = Host::create();
     let everywhere = EndpointConfig::default();
     assert_eq!(everywhere.bind_addr, None, "the host names no bind address");
     let owner = DeviceKeys::generate().expect("owner keys");
@@ -1338,9 +1324,7 @@ async fn a_host_on_every_interface_hints_the_addresses_it_found_there() {
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_revoked_device_is_fenced_before_it_is_served_again() {
-    let Some(host) = Host::create() else {
-        return;
-    };
+    let host = Host::create();
     let owner = DeviceKeys::generate().expect("owner keys");
     let daemon = host.start(loopback(), &owner).await;
     let mut local = host.client().await;
@@ -1522,9 +1506,7 @@ async fn ended(session: &Session, session_id: SessionId, why: &str) {
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_narrowing_after_a_failed_widening_fences_the_subscription_the_widening_admitted() {
-    let Some(host) = Host::create() else {
-        return;
-    };
+    let host = Host::create();
     let owner = DeviceKeys::generate().expect("owner keys");
     let daemon = host.start(loopback(), &owner).await;
     let widened = subscribed_under_a_failed_widening(&host, &daemon, &owner).await;
@@ -1581,9 +1563,7 @@ async fn a_narrowing_after_a_failed_widening_fences_the_subscription_the_widenin
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fence_a_narrowing_could_not_raise_is_raised_by_the_next_reading() {
-    let Some(host) = Host::create() else {
-        return;
-    };
+    let host = Host::create();
     let owner = DeviceKeys::generate().expect("owner keys");
     let daemon = host.start(loopback(), &owner).await;
     let widened = subscribed_under_a_failed_widening(&host, &daemon, &owner).await;
@@ -1657,9 +1637,7 @@ async fn a_fence_a_narrowing_could_not_raise_is_raised_by_the_next_reading() {
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_grant_the_clock_floor_expired_ends_the_subscription_and_stays_expired() {
-    let Some(host) = Host::create() else {
-        return;
-    };
+    let host = Host::create();
     let owner = DeviceKeys::generate().expect("owner keys");
     let daemon = host.start(loopback(), &owner).await;
     let mut local = host.client().await;
@@ -1743,9 +1721,7 @@ const TICKING_COMMAND: &str = "while :; do printf 'kala%s-tick\\n' reach; sleep 
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lapsed_offline_bound_stops_a_running_subscription_and_leaves_the_grant() {
-    let Some(host) = Host::create() else {
-        return;
-    };
+    let host = Host::create();
     let owner = DeviceKeys::generate().expect("owner keys");
     let daemon = host.start(loopback(), &owner).await;
     let mut local = host.client().await;
@@ -1854,9 +1830,7 @@ async fn a_lapsed_offline_bound_stops_a_running_subscription_and_leaves_the_gran
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_session_runs_over_a_local_socket_and_over_the_network() {
-    let Some(host) = Host::create() else {
-        return;
-    };
+    let host = Host::create();
     let owner = DeviceKeys::generate().expect("owner keys");
     let daemon = host.start(loopback(), &owner).await;
     let mut local = host.client().await;
@@ -1913,9 +1887,7 @@ async fn one_session_runs_over_a_local_socket_and_over_the_network() {
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_remote_path_ending_takes_neither_the_worker_nor_a_local_attachment() {
-    let Some(host) = Host::create() else {
-        return;
-    };
+    let host = Host::create();
     let owner = DeviceKeys::generate().expect("owner keys");
     let daemon = host.start(loopback(), &owner).await;
     let mut local = host.client().await;
@@ -2213,9 +2185,7 @@ impl Drop for LocalRelay {
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_pairs_and_attaches_through_a_relay_and_losing_it_leaves_the_session() {
-    let Some(host) = Host::create() else {
-        return;
-    };
+    let host = Host::create();
     let mut relay = LocalRelay::spawn().await;
     let owner = DeviceKeys::generate().expect("owner keys");
     // Neither endpoint has a direct path: two loopback endpoints reach each other directly
@@ -2381,9 +2351,7 @@ const DISCONNECT_PATIENCE: Duration = Duration::from_secs(90);
 async fn a_relay_quota_disconnect_leaves_the_terminal_worker_running() {
     use iroh::Watcher as _;
 
-    let Some(host) = Host::create() else {
-        return;
-    };
+    let host = Host::create();
     let relay = LocalRelay::spawn().await;
     let owner = DeviceKeys::generate().expect("owner keys");
     // Neither endpoint has a direct path, so the relay is the whole of the remote path and its
@@ -2588,9 +2556,7 @@ async fn a_relay_quota_disconnect_leaves_the_terminal_worker_running() {
 #[ignore = "starts a control daemon; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_exhausted_relay_is_the_reported_reason_a_new_connection_fails() {
-    let Some(host) = Host::create() else {
-        return;
-    };
+    let host = Host::create();
     let relay = LocalRelay::spawn().await;
     let owner = DeviceKeys::generate().expect("owner keys");
     // The host has its direct path and the relay.
@@ -2742,9 +2708,7 @@ fn viewer_proposal(session_selector: SessionSelector) -> ProposedGrant {
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_devices_grant_bounds_what_it_can_reach() {
-    let Some(host) = Host::create() else {
-        return;
-    };
+    let host = Host::create();
     let owner = DeviceKeys::generate().expect("owner keys");
     let daemon = host.start(loopback(), &owner).await;
     let mut local = host.client().await;
@@ -2913,9 +2877,7 @@ async fn a_devices_grant_bounds_what_it_can_reach() {
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_listing_names_only_the_sessions_a_grant_admits() {
-    let Some(host) = Host::create() else {
-        return;
-    };
+    let host = Host::create();
     let owner = DeviceKeys::generate().expect("owner keys");
     let daemon = host.start(loopback(), &owner).await;
     let mut local = host.client().await;
@@ -2984,9 +2946,7 @@ async fn a_listing_names_only_the_sessions_a_grant_admits() {
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_same_method_answers_both_ingresses_alike_once_the_grant_admits_the_subject() {
-    let Some(host) = Host::create() else {
-        return;
-    };
+    let host = Host::create();
     let owner = DeviceKeys::generate().expect("owner keys");
     let daemon = host.start(loopback(), &owner).await;
     let mut local = host.client().await;
@@ -3224,9 +3184,7 @@ impl Drop for ServiceInOutage {
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_control_plane_outage_leaves_local_terminal_use_working() {
-    let Some(host) = Host::create() else {
-        return;
-    };
+    let host = Host::create();
     let service = ServiceInOutage::start();
     let outage = service.address;
     let config = EndpointConfig {
@@ -3684,9 +3642,7 @@ async fn asked_in_a_new_session(host: &Host, local: &mut LocalClient) -> Asked {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_question_is_answered_only_with_the_respond_right_for_its_session_and_enlarges_no_grant()
 {
-    let Some(host) = Host::create() else {
-        return;
-    };
+    let host = Host::create();
     let owner = DeviceKeys::generate().expect("owner keys");
     let daemon = host.start(loopback(), &owner).await;
     let mut local = host.client().await;
@@ -3861,9 +3817,7 @@ async fn a_question_is_answered_only_with_the_respond_right_for_its_session_and_
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_reads_the_questions_and_agent_state_of_a_session_its_grant_reaches() {
-    let Some(host) = Host::create() else {
-        return;
-    };
+    let host = Host::create();
     let owner = DeviceKeys::generate().expect("owner keys");
     let daemon = host.start(loopback(), &owner).await;
     let mut local = host.client().await;
