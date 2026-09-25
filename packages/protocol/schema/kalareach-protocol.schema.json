@@ -17721,7 +17721,7 @@
             }
           ],
           "default": null,
-          "description": "The HTTP proxy the endpoint reaches its relays and Pkarr servers through, as an absolute\n`http` or `https` origin such as `http://proxy.example.com:3128`. The DNS lookup does\nnot use it. It is this machine's own choice: no invitation or host bundle carries it.\nIt names no user and no password, because a proxy that needs credentials is not\nsupported."
+          "description": "The HTTP proxy this host's outbound HTTPS goes through, as an absolute `http` or\n`https` origin such as `http://proxy.example.com:3128`: the network endpoint's relays\nand Pkarr servers, the rendezvous, delivery and webhooks, and plugin repositories.\nNothing goes around it, so an address it cannot reach fails. Name lookups and mail\nsubmission do not use it. It is this machine's own choice: no invitation or host bundle\ncarries it. It names no user and no password, because a proxy that needs credentials is\nnot supported."
         },
         "relay_only": {
           "anyOf": [
