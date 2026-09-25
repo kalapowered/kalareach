@@ -1483,58 +1483,63 @@ impl Controller {
     }
 
     /// Challenges a worker against a key this daemon already holds, presents its generation, and
-    /// asks the worker to describe its session ([`crate::directory::describe`]).
+    /// then asks the worker to describe its session ([`crate::directory::describe`]), which it may
+    /// not do.
     async fn challenge(
         &self,
         endpoint: &Endpoint,
         worker_public_key: &kr_protocol::scalars::AuthorisationKey,
         session_id: SessionId,
-    ) -> Result<(kr_protocol::worker::WorkerVerifyProof, SessionSummary)> {
+    ) -> Result<(
+        kr_protocol::worker::WorkerVerifyProof,
+        Option<SessionSummary>,
+    )> {
         let identity = &self.identity;
         let generation = self.generation;
         let boot = self.boot_identity.clone();
         let endpoint_text = endpoint.as_text();
-        tokio::time::timeout(crate::directory::RECONNECT_TIMEOUT, async move {
-            let mut client =
-                LocalClient::connect(endpoint, LocalClientKind::Controller, self.build_id.clone())
-                    .await?;
-            let proof = client
-                .challenge_worker(
-                    worker_public_key,
-                    session_id,
-                    SessionEpoch::V1,
-                    &endpoint_text,
+        let (proof, mut client) =
+            tokio::time::timeout(crate::directory::RECONNECT_TIMEOUT, async move {
+                let mut client = LocalClient::connect(
+                    endpoint,
+                    LocalClientKind::Controller,
+                    self.build_id.clone(),
                 )
                 .await?;
-            client
-                .present_generation(move |nonce| {
-                    identity
-                        .generation_token(generation, &boot, nonce)
-                        .map_err(kr_ipc::IpcError::from)
-                })
-                .await?;
-            let described = crate::directory::describe(&mut client, session_id)
-                .await
-                .map_err(ControllerError::supervision)?;
-            Ok::<_, ControllerError>((proof, described))
-        })
-        .await
-        .map_err(|_| {
-            ControllerError::supervision(
-                "the worker did not prove itself and describe its session in time",
-            )
-        })?
+                let proof = client
+                    .challenge_worker(
+                        worker_public_key,
+                        session_id,
+                        SessionEpoch::V1,
+                        &endpoint_text,
+                    )
+                    .await?;
+                client
+                    .present_generation(move |nonce| {
+                        identity
+                            .generation_token(generation, &boot, nonce)
+                            .map_err(kr_ipc::IpcError::from)
+                    })
+                    .await?;
+                Ok::<_, ControllerError>((proof, client))
+            })
+            .await
+            .map_err(|_| {
+                ControllerError::supervision("the worker did not answer its challenge in time")
+            })??;
+        let described = crate::directory::describe(&mut client, session_id).await;
+        Ok((proof, described))
     }
 
     /// Records a recovered worker and republishes its descriptor, and admits the worker with the
-    /// description of its session it gave when it was challenged.
+    /// description of its session it gave after its challenge, where it gave one.
     async fn adopt(
         &self,
         display_number: kr_protocol::session::DisplayNumber,
         worker_public_key: &kr_protocol::scalars::AuthorisationKey,
         proof: &kr_protocol::worker::WorkerVerifyProof,
         endpoint: &Endpoint,
-        described: SessionSummary,
+        described: Option<SessionSummary>,
     ) -> Result<()> {
         let record = WorkerRecord {
             session_id: proof.session_id,
@@ -1571,7 +1576,7 @@ impl Controller {
                 descriptor,
                 endpoint: endpoint.clone(),
             },
-            Some(described),
+            described,
         )
         .await;
         Ok(())
@@ -13204,14 +13209,14 @@ mod a_read_that_meets_a_worker_on_its_way_out {
     //! registry names that process as the session's worker, as it names a real one.
 
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use kr_ipc::endpoint::Listener;
     use kr_ipc::framed::split;
     use kr_ipc::verify::WorkerIdentity;
     use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Response};
-    use kr_protocol::error::ErrorCode;
+    use kr_protocol::error::{ErrorCode, ProtocolError};
     use kr_protocol::frame::StreamKind;
     use kr_protocol::identity::WorkerProfile;
     use kr_protocol::ids::{AuthorityRevision, ConnectionId, RequestId, SessionEpoch, SessionId};
@@ -13243,6 +13248,8 @@ mod a_read_that_meets_a_worker_on_its_way_out {
         dimensions: std::sync::Mutex<Dimensions>,
         /// How many reads have reached it.
         reads: AtomicUsize,
+        /// Whether it refuses to describe its session.
+        refusing: AtomicBool,
         /// The read it goes at, once a test has set one.
         end: std::sync::Mutex<Option<End>>,
         /// Tells the endpoint to stop accepting.
@@ -13266,6 +13273,7 @@ mod a_read_that_meets_a_worker_on_its_way_out {
                 state: std::sync::Mutex::new(SessionState::Live),
                 dimensions: std::sync::Mutex::new(INVISIBLE_DEFAULT_DIMENSIONS),
                 reads: AtomicUsize::new(0),
+                refusing: AtomicBool::new(false),
                 end: std::sync::Mutex::new(None),
                 going: Notify::new(),
                 gone: Notify::new(),
@@ -13286,6 +13294,11 @@ mod a_read_that_meets_a_worker_on_its_way_out {
                 .dimensions
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = dimensions;
+        }
+
+        /// Has this worker refuse to describe its session, or answer again.
+        fn refuse_reads(&self, refusing: bool) {
+            self.refusing.store(refusing, Ordering::Release);
         }
 
         /// How many reads have reached this worker.
@@ -13415,8 +13428,18 @@ mod a_read_that_meets_a_worker_on_its_way_out {
                                     script.gone.notified().await;
                                     return;
                                 }
-                                let answer = script.answer(identity.session_id());
-                                vec![respond(request.request_id, &answer)]
+                                if script.refusing.load(Ordering::Acquire) {
+                                    vec![ControlFrame::Response(Response {
+                                        request_id: request.request_id,
+                                        outcome: Outcome::Error(ProtocolError::new(
+                                            ErrorCode::ResourceUnavailable,
+                                            "this worker does not describe its session",
+                                        )),
+                                    })]
+                                } else {
+                                    let answer = script.answer(identity.session_id());
+                                    vec![respond(request.request_id, &answer)]
+                                }
                             }
                             (None, ControlFrame::Forwarded(forwarded))
                                 if forwarded.mutation.method == Method::SessionClose.into() =>
@@ -13698,30 +13721,41 @@ mod a_read_that_meets_a_worker_on_its_way_out {
         world.serving.abort();
     }
 
-    /// A worker that proves itself when a daemon starts but does not describe its session is not
-    /// admitted: it is left for the next look, as a worker that fails its challenge is.
+    /// A worker that proves itself when a daemon starts but does not describe its session is
+    /// admitted all the same, because a close has to be able to reach every worker that has proved
+    /// itself; the description it did not give is what it gives when it next answers.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_worker_that_does_not_describe_its_session_at_a_start_is_not_admitted() {
+    async fn a_worker_that_does_not_describe_its_session_at_a_start_can_still_be_closed() {
         let script = Scripted::new();
         let world = scripted(&script).await;
-        // The worker goes at the read the start sends it, once it has proved itself.
-        let (_arrived, go) = script.end_at_next_read();
-        drop(go);
+        script.refuse_reads(true);
         let world = restarted(world).await;
-        assert_eq!(script.reads(), 1);
-        let directory = world.controller.directory.lock().await;
+        assert_eq!(script.reads(), 1, "the start asks for the description");
         assert!(
-            directory.get(world.session_id).is_none(),
-            "a worker this daemon has no description from is not in its directory"
+            world
+                .controller
+                .directory
+                .lock()
+                .await
+                .get(world.session_id)
+                .is_some(),
+            "the worker that proved itself is admitted"
         );
-        assert!(
-            directory
-                .quarantined
-                .iter()
-                .any(|quarantined| quarantined.session_id == world.session_id),
-            "it is left out as a worker that did not answer is"
+        assert_eq!(
+            close(&world).await.state,
+            SessionState::Closing,
+            "and a close reaches it"
         );
-        drop(directory);
+
+        script.refuse_reads(false);
+        assert_eq!(
+            read(&world)
+                .await
+                .expect("the worker answers")
+                .session
+                .state,
+            SessionState::Closing
+        );
         world.serving.abort();
     }
 

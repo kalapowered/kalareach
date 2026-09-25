@@ -10,8 +10,8 @@
 //!
 //! Beside each worker is what it last said about its session. A worker that has finished its
 //! closure stops answering before the kernel says its process has ended, and in between that is
-//! what the daemon knows of the session. A worker this daemon finds when it starts is admitted
-//! with its own description of its session, asked for over the connection it proved itself on.
+//! what the daemon knows of the session. A worker this daemon finds when it starts is asked for
+//! its description over the connection it proved itself on.
 //!
 //! Nothing here kills a worker. A daemon restart is not a reason to end a shell.
 
@@ -31,8 +31,8 @@ use kr_protocol::worker::WorkerDescriptor;
 use crate::error::Result;
 use crate::registry::Registry;
 
-/// How long one worker has to answer its challenge, accept a generation and describe its session
-/// during a rebuild.
+/// How long one worker has to answer its challenge and accept a generation during a rebuild, and
+/// then, separately, to describe its session ([`describe`]).
 ///
 /// A silent endpoint is a reason to quarantine one descriptor, never a reason for the daemon not
 /// to finish starting.
@@ -130,7 +130,7 @@ impl Directory {
                             descriptor,
                             endpoint,
                         },
-                        Some(described),
+                        described,
                     );
                 }
                 Err(reason) => directory.quarantined.push(Quarantined {
@@ -150,9 +150,10 @@ impl Directory {
 
     /// Adds a worker, with its own description of its session where this daemon has one.
     ///
-    /// A worker found at a start or recovered later is admitted only with one ([`describe`]). A
-    /// worker the rendezvous has just established has none yet, and the create waiting on it asks
-    /// for one at once.
+    /// Proving itself is what admits a worker, because a close has to be able to reach every
+    /// worker that has. A worker found at a start or recovered later is asked for its description
+    /// as it is admitted ([`describe`]), and a worker the rendezvous has just established is asked
+    /// by the create waiting on it; either may be admitted without one.
     pub fn insert(&mut self, worker: KnownWorker, described: Option<SessionSummary>) {
         let session_id = worker.descriptor.session_id;
         self.verified.insert(session_id, worker);
@@ -265,11 +266,11 @@ pub struct Reconnect<'a> {
 async fn reconnect_to(
     descriptor: &WorkerDescriptor,
     reconnect: &Reconnect<'_>,
-) -> std::result::Result<(Endpoint, SessionSummary), String> {
+) -> std::result::Result<(Endpoint, Option<SessionSummary>), String> {
     let endpoint = Endpoint::from_path(&descriptor.endpoint).map_err(|error| error.to_string())?;
     // Bounded, because starting the daemon must not depend on a worker that never answers. A
     // descriptor that runs out of time is quarantined like any other that fails its challenge.
-    let described = tokio::time::timeout(RECONNECT_TIMEOUT, async {
+    let mut client = tokio::time::timeout(RECONNECT_TIMEOUT, async {
         let mut client = LocalClient::connect(
             &endpoint,
             LocalClientKind::Controller,
@@ -292,32 +293,35 @@ async fn reconnect_to(
             })
             .await
             .map_err(|error| error.to_string())?;
-        describe(&mut client, descriptor.session_id).await
+        Ok::<_, String>(client)
     })
     .await
-    .map_err(|_| "the worker did not prove itself and describe its session in time".to_owned())??;
+    .map_err(|_| "the worker did not answer its challenge in time".to_owned())??;
+    let described = describe(&mut client, descriptor.session_id).await;
     Ok((endpoint, described))
 }
 
-/// Asks a worker this daemon has just verified to describe its session.
+/// Asks a worker this daemon has just verified to describe its session, over the connection it
+/// proved itself on.
 ///
-/// A worker is admitted with its own description, so a read that later meets it on its way out is
-/// answered from what the worker said ([`Directory::ending`]). A worker that proves itself and
-/// does not describe its session is not admitted yet: it is asked again, challenge and all, when
-/// the daemon next looks for its workers. An answer from a worker of an earlier build is read as
-/// that build wrote it.
-///
-/// # Errors
-///
-/// Returns why the worker did not describe its session.
+/// The description is what a read that later meets the worker on its way out is answered from
+/// ([`Directory::ending`]). It is asked for with a bound of its own, after the worker has proved
+/// itself, and a worker that does not give one in time, or refuses, is admitted without it: a
+/// close has to be able to reach it all the same. An answer from a worker of an earlier build is
+/// read as that build wrote it.
 pub(crate) async fn describe(
     client: &mut LocalClient,
     session_id: SessionId,
-) -> std::result::Result<SessionSummary, String> {
-    let answer = client
-        .request(Method::SessionRead, &SessionReadParams { session_id })
-        .await
-        .map_err(|error| error.to_string())?;
-    let value = answer.map_err(|refused| refused.to_string())?;
-    crate::service::reported_read(&value).map(|read| read.session)
+) -> Option<SessionSummary> {
+    let answer = tokio::time::timeout(
+        RECONNECT_TIMEOUT,
+        client.request(Method::SessionRead, &SessionReadParams { session_id }),
+    )
+    .await
+    .ok()?
+    .ok()?
+    .ok()?;
+    crate::service::reported_read(&answer)
+        .ok()
+        .map(|read| read.session)
 }
