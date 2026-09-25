@@ -13,8 +13,8 @@ fn launch() -> Launch {
         .after("printf 'kr-after-htop\\n'; read -r _")
 }
 
-fn no_query_reached_the_terminal(session: &Session) {
-    let reached = queries::find(&session.received());
+async fn no_query_reached_the_terminal(session: &Session) {
+    let reached = queries::find(&session.received().await);
     assert!(
         reached.is_empty(),
         "a query reached the attached terminal: {}",
@@ -56,7 +56,7 @@ async fn htop_draws_its_screen_on_the_alternate_screen_and_leaves_it() {
         !screen.shows("F10Quit"),
         "htop's screen stayed on the primary screen:\n{screen}"
     );
-    no_query_reached_the_terminal(&session);
+    no_query_reached_the_terminal(&session).await;
 }
 
 /// KR-ACC-004, KR-REQ-27.04: htop turns mouse reporting on, and a click on the Quit label of its
@@ -86,5 +86,5 @@ async fn a_click_on_htops_quit_label_ends_it() {
         })
         .await;
     assert_eq!(screen.buffer, ProjectedBuffer::Primary, "{screen}");
-    no_query_reached_the_terminal(&session);
+    no_query_reached_the_terminal(&session).await;
 }
