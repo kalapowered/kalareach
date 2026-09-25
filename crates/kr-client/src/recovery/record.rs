@@ -221,7 +221,8 @@ impl RecordFile {
             let _ = std::fs::remove_file(&self.partial);
             return Err(storage(&self.path, source));
         }
-        sync_directory(&self.directory).map_err(|source| storage(&self.directory, source))
+        kr_ipc::paths::flush_directory(&self.directory, kr_ipc::paths::NameKind::File)
+            .map_err(|source| storage(&self.directory, source))
     }
 }
 
@@ -266,21 +267,4 @@ fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         let _ = std::fs::remove_file(path);
     }
     written
-}
-
-/// Flushes a directory entry, so a name that was replaced stays that way after a crash.
-///
-/// Unix only. This build flushes no directory on Windows and makes no claim there that a record it
-/// wrote survives losing power; what holds on both is that a record is flushed before it is renamed
-/// into place, so a reader never finds one half written.
-fn sync_directory(directory: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        std::fs::File::open(directory)?.sync_all()?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = directory;
-    }
-    Ok(())
 }

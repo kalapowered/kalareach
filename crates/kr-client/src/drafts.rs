@@ -40,6 +40,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use kr_ipc::paths::{NameKind, flush_directory, flush_path_names};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{
     AgentBindingRevision, ApplicationInstanceId, AttachmentId, DeviceId, DraftId, DraftRevision,
@@ -96,14 +97,6 @@ const CHECKPOINT_EXTENSION: &str = "sync";
 
 /// The extension of a draft being written, which is not yet a draft.
 const PARTIAL_EXTENSION: &str = "partial";
-
-/// How many links the walk over a store's path follows before it gives up.
-///
-/// A backstop rather than the rule. Every kernel this runs on applies a limit of its own, usually
-/// lower than this, and refuses to open through a longer chain before the walk ever sees it. What
-/// this is for is the walk itself: a bound it holds to whatever the filesystem underneath it does.
-#[cfg(unix)]
-const MAX_PATH_LINKS: usize = 40;
 
 /// The name of the store's lock.
 const LOCK_NAME: &str = "store.lock";
@@ -888,7 +881,8 @@ impl DraftStore {
     /// The caller holds the exclusive lock.
     fn remove_file(&self, path: &Path) -> Result<()> {
         remove_if_present(path)?;
-        sync_directory(&self.directory).map_err(|source| storage(&self.directory, source))?;
+        flush_directory(&self.directory, NameKind::File)
+            .map_err(|source| storage(&self.directory, source))?;
         Ok(())
     }
 
@@ -1038,7 +1032,8 @@ impl DraftStore {
             let _ = std::fs::remove_file(&temporary);
             return Err(storage(path, source).into());
         }
-        sync_directory(&self.directory).map_err(|source| storage(&self.directory, source))?;
+        flush_directory(&self.directory, NameKind::File)
+            .map_err(|source| storage(&self.directory, source))?;
         Ok(())
     }
 
@@ -1208,7 +1203,7 @@ pub(crate) fn private_directory(directory: &Path) -> std::io::Result<()> {
             }
             Err(error) => return Err(error),
         }
-        sync_directory(holder_of(path))?;
+        flush_directory(holder_of(path), NameKind::Directory)?;
     }
     if !directory.is_dir() {
         return Err(std::io::Error::new(
@@ -1262,129 +1257,6 @@ pub(crate) fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         let _ = std::fs::remove_file(path);
     }
     written
-}
-
-/// Flushes a directory entry, so a name that was replaced survives a crash.
-///
-/// Unix only. This build flushes no directory on Windows and makes no claim there that a name it
-/// acknowledged survives losing power. What holds on both is that the new contents are written and
-/// flushed before anything renames them into place, so a reader never sees a file half written.
-pub(crate) fn sync_directory(directory: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        std::fs::File::open(directory)?.sync_all()?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = directory;
-    }
-    Ok(())
-}
-
-/// Flushes the directory entry of every name this store's path is made of.
-///
-/// Creating the levels this call was missing is not enough. Another opener may have created one a
-/// moment ago and not yet flushed it, and a store that returned success under such a name would be
-/// a store whose own path a crash could lose. Flushing them all costs a handful of metadata
-/// operations once per store, which is what opening one is.
-///
-/// A path is a chain of names, and losing any one of them leaves a store nothing reaches. The chain
-/// is not only the components a caller spelled: a link is a name in a directory, it leads
-/// somewhere, and the rest of the path continues from there. So this resolves the path the way the
-/// kernel does, one component at a time, flushing the directory each name lives in and continuing
-/// from a link's target when it meets one. Following it once is what makes [`MAX_PATH_LINKS`] the
-/// same bound the kernel applies rather than a count of repeated work.
-///
-/// A failure is reported. A store that cannot open the directories its own path is made of cannot
-/// establish that the path survives a crash, and saying so is better than returning success that
-/// means less than it looks.
-#[cfg(unix)]
-fn flush_path_names(directory: &Path) -> std::io::Result<()> {
-    use std::collections::VecDeque;
-    use std::ffi::OsString;
-
-    /// The components of one path, as owned names, so a link's target can be spliced into the walk.
-    fn parts(path: &Path) -> Vec<OsString> {
-        path.components()
-            .map(|component| component.as_os_str().to_os_string())
-            .collect()
-    }
-
-    let start = if directory.is_absolute() {
-        directory.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(directory)
-    };
-    let mut remaining: VecDeque<OsString> = parts(&start).into();
-    let mut resolved = PathBuf::new();
-    let mut flushed: Vec<PathBuf> = Vec::new();
-    let mut followed = 0_usize;
-
-    while let Some(name) = remaining.pop_front() {
-        // A file cannot be called `.` or `..`, and only the root component is `/`, so what a name
-        // means is not ambiguous.
-        if name == std::path::MAIN_SEPARATOR_STR {
-            resolved.push(&name);
-            continue;
-        }
-        if name == "." {
-            continue;
-        }
-        if name == ".." {
-            resolved.pop();
-            continue;
-        }
-
-        // The directory this name lives in, which is what holds it.
-        let holder = resolved.clone();
-        if !flushed.contains(&holder) {
-            sync_directory(&holder)?;
-            flushed.push(holder.clone());
-        }
-        resolved.push(&name);
-
-        // A failure here is reported rather than skipped. It can be the filesystem refusing to say,
-        // or a name something removed while this walk was going through it; either way, what the
-        // walk cannot see it cannot make durable, and saying so is the answer.
-        if !std::fs::symlink_metadata(&resolved)?
-            .file_type()
-            .is_symlink()
-        {
-            continue;
-        }
-        followed += 1;
-        if followed > MAX_PATH_LINKS {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "{} follows more than {MAX_PATH_LINKS} links",
-                    directory.display()
-                ),
-            ));
-        }
-        // The rest of the path continues from the target: an absolute one starts again at the root,
-        // a relative one from the directory the link itself lives in.
-        let target = std::fs::read_link(&resolved)?;
-        resolved = if target.is_absolute() {
-            PathBuf::new()
-        } else {
-            holder
-        };
-        for part in parts(&target).into_iter().rev() {
-            remaining.push_front(part);
-        }
-    }
-    Ok(())
-}
-
-/// Windows offers no directory handle to flush, so there is nothing to walk.
-#[cfg(not(unix))]
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "the Unix half of this function reports what it could not flush"
-)]
-fn flush_path_names(_directory: &Path) -> std::io::Result<()> {
-    Ok(())
 }
 
 impl From<DraftError> for ClientError {
@@ -2263,7 +2135,7 @@ mod tests {
         // first is the kernel's: most refuse a path of this many links themselves, at a figure of
         // their own, and the bound here is what answers on one that does not.
         let mut too_many = base.clone();
-        for _ in 0..(MAX_PATH_LINKS + 1) {
+        for _ in 0..(kr_ipc::paths::MAX_PATH_LINKS + 1) {
             too_many.push("hop");
         }
         too_many.push("drafts");

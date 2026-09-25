@@ -8,22 +8,18 @@
 //!
 //! # Durability
 //!
-//! On Unix the directory entry is flushed after every rename, so a write the reconciler has
-//! returned from survives a crash or a power loss. On Windows the new contents are flushed before
-//! the rename, but nothing here flushes the directory entry, and this store makes no claim there
-//! that a replacement survives losing power: after a power loss a Windows device can come back
-//! with the file as it stood before its last writes. For the membership that means a removal the
-//! owner recorded, or a candidate's dispatch mark, can be lost with the power. A lost removal is
-//! asked for again by the owner, who is shown it no longer pending; a lost dispatch mark makes the
-//! device mark and send the same record again under the same request identity, which the service
-//! answers from its receipt rather than applying twice. A crash of the process alone loses nothing
-//! on either platform.
+//! The new contents are flushed before the rename, and the directory entry after it, so a write the
+//! reconciler has returned from survives a crash or a power loss. On Windows the entry is flushed
+//! through a handle on the directory that may add a file to it, which is what the operating system
+//! asks of a flush there.
 
 use std::path::{Path, PathBuf};
 
+use kr_ipc::paths::{NameKind, flush_directory, flush_path_names};
+
 use super::MembershipError;
 use super::facts::{Facts, Kinds};
-use crate::sync::store::{Lock, flush_path_names, private_directory, sync_directory, write_whole};
+use crate::sync::store::{Lock, private_directory, write_whole};
 
 /// The name of the file the facts are kept in.
 const FACTS_NAME: &str = "membership.facts";
@@ -135,7 +131,8 @@ impl MembershipFile {
             let _ = std::fs::remove_file(&partial);
             return Err(storage(&path, source));
         }
-        sync_directory(&self.directory).map_err(|source| storage(&self.directory, source))
+        flush_directory(&self.directory, NameKind::File)
+            .map_err(|source| storage(&self.directory, source))
     }
 
     /// Removes every partial file. The caller holds the lock.
@@ -154,7 +151,8 @@ impl MembershipFile {
                 }
             }
         }
-        sync_directory(&self.directory).map_err(|source| storage(&self.directory, source))
+        flush_directory(&self.directory, NameKind::File)
+            .map_err(|source| storage(&self.directory, source))
     }
 }
 
