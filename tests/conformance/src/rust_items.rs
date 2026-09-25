@@ -157,7 +157,8 @@ pub struct Module {
     pub docs: Vec<Comment>,
     /// Its entries, in source order.
     pub entries: Vec<Entry>,
-    /// The macros its `macro_rules!` items define, by name.
+    /// The macros a `macro_rules!` anywhere in its file defines, by name, those inside functions
+    /// included: a file's top module holds them all.
     pub macros: Vec<String>,
     /// Whether it brings in names its source does not list: an item under `#[macro_use]`, an
     /// `extern crate`, or a macro invoked among its items, whose expansion may define anything.
@@ -280,6 +281,9 @@ fn scan_file(
         &module.directory,
         &mut parsed,
     );
+    if let Some(Parsed::Module(top)) = parsed.first_mut() {
+        top.macros = macro_definitions(&tokens);
+    }
     for entry in parsed {
         match entry {
             Parsed::Module(scanned) => modules.push(scanned),
@@ -361,11 +365,12 @@ struct Attribute {
 impl Attribute {
     /// The names this attribute is taken on trust by, when it leaves what it is on as written, and
     /// `None` when it may rewrite or add to it. The built-in attributes, whose names no macro may
-    /// take, and the tool attributes need no trust. `#[test]` and `#[derive]` are macros of the
-    /// standard library's prelude, a derive of the standard library's traits adds implementations
-    /// only, and `#[tokio::test]` runs the test's block as written on a runtime; each is trusted by
-    /// the names it is known by, which the map holds against what the target defines and imports.
-    /// Any other attribute may be a macro that rewrites what it is on.
+    /// take, need no trust. The `rustfmt` and `clippy` tool attributes are trusted by their roots,
+    /// `#[test]` and `#[derive]` are macros of the standard library's prelude, a derive of the
+    /// standard library's traits adds implementations only, and `#[tokio::test]` runs the test's
+    /// block as written on a runtime; each is trusted by the names it is known by, which the map
+    /// holds against what the target defines and imports. Any other attribute may be a macro that
+    /// rewrites what it is on.
     fn trusted(&self) -> Option<Vec<String>> {
         const BUILT_IN: &[&str] = &[
             "allow",
@@ -403,7 +408,7 @@ impl Attribute {
         let path: Vec<&str> = self.path.iter().map(String::as_str).collect();
         match path.as_slice() {
             [name] if BUILT_IN.contains(name) => Some(Vec::new()),
-            ["rustfmt" | "clippy", ..] => Some(Vec::new()),
+            [root @ ("rustfmt" | "clippy"), ..] => Some(vec![format!("{root}::")]),
             ["test"] => Some(vec!["test".to_owned()]),
             ["tokio", "test"] => Some(vec!["tokio::".to_owned()]),
             ["derive"] => {
@@ -424,6 +429,12 @@ impl Attribute {
             }
             _ => None,
         }
+    }
+
+    /// Whether the attribute is a built-in one, which no macro may take the name of, and so leaves
+    /// a module or an item as written with nothing taken on trust.
+    fn inert(&self) -> bool {
+        self.trusted().is_some_and(|names| names.is_empty())
     }
 
     fn is_test(&self) -> bool {
@@ -493,12 +504,16 @@ fn parse_module(
                 at += 1;
             }
             Tok::Punct('#') => {
-                let inner = tokens.get(at + 1).is_some_and(|t| t.is_punct('!'));
-                let open = at + if inner { 2 } else { 1 };
-                let Some(close) = tokens
-                    .get(open)
-                    .filter(|t| t.is_punct('['))
-                    .and_then(|_| matching(tokens, open))
+                let after = next_significant(tokens, at + 1);
+                let inner = after.is_some_and(|next| tokens[next].is_punct('!'));
+                let open = if inner {
+                    after.and_then(|bang| next_significant(tokens, bang + 1))
+                } else {
+                    after
+                };
+                let Some((open, close)) = open
+                    .filter(|&open| tokens[open].is_punct('['))
+                    .and_then(|open| matching(tokens, open).map(|close| (open, close)))
                 else {
                     at += 1;
                     continue;
@@ -514,7 +529,7 @@ fn parse_module(
                     if attribute.is_cfg_test() {
                         module.test_code = true;
                     }
-                    module.rewritable |= attribute.trusted().is_none();
+                    module.rewritable |= !attribute.inert();
                 } else {
                     attributes.push(attribute);
                 }
@@ -532,28 +547,30 @@ fn parse_module(
                 let end = item_end(tokens, at);
                 let item = &tokens[at..end];
                 let cfg_test = attributes.iter().any(Attribute::is_cfg_test);
-                let keyword = head(item);
-                let word = |offset: usize| item.get(keyword + offset).and_then(Token::ident);
-                let bang =
-                    |offset: usize| item.get(keyword + offset).is_some_and(|t| t.is_punct('!'));
-                let invoked = item
+                let structure = significant(item);
+                let keyword = head(&structure);
+                let word = |offset: usize| structure.get(keyword + offset).and_then(Token::ident);
+                let punct = |offset: usize, c: char| {
+                    structure
+                        .get(keyword + offset)
+                        .is_some_and(|t| t.is_punct(c))
+                };
+                let opens = |offset: usize| ['(', '[', '{'].into_iter().any(|c| punct(offset, c));
+                let definition = word(0) == Some("macro_rules")
+                    && punct(1, '!')
+                    && word(2).is_some()
+                    && opens(3);
+                let invoked = structure
                     .get(keyword..)
                     .and_then(|rest| {
                         rest.iter()
                             .position(|t| !t.is_punct(':') && t.ident().is_none())
                     })
-                    .is_some_and(|stop| bang(stop) && stop > 0);
-                if word(0) == Some("macro_rules")
-                    && bang(1)
-                    && let Some(defined) = word(2)
-                {
-                    module.macros.push(defined.to_owned());
-                } else if invoked {
-                    module.unlisted_names = true;
-                }
-                module.unlisted_names |= (word(0) == Some("extern") && word(1) == Some("crate"))
+                    .is_some_and(|stop| stop > 0 && punct(stop, '!'));
+                module.unlisted_names |= (invoked && !definition)
+                    || (word(0) == Some("extern") && word(1) == Some("crate"))
                     || attributes.iter().any(|a| a.path == ["macro_use"]);
-                let rewrites = rewritable || attributes.iter().any(|a| a.trusted().is_none());
+                let rewrites = module.rewritable || attributes.iter().any(|a| !a.inert());
                 let entry = classify(item, &attributes, attached, token.line);
                 match entry {
                     Classified::Test(test) => module.entries.push(Entry::Test(test)),
@@ -672,6 +689,7 @@ fn matching(tokens: &[Token], open: usize) -> Option<usize> {
 }
 
 fn attribute(tokens: &[Token], line: usize) -> Attribute {
+    let tokens = &significant(tokens);
     let mut path = Vec::new();
     let mut at = 0;
     while let Some(token) = tokens.get(at) {
@@ -700,8 +718,8 @@ fn attribute(tokens: &[Token], line: usize) -> Attribute {
 
 /// Where the item that starts at `start` ends (exclusive).
 fn item_end(tokens: &[Token], start: usize) -> usize {
-    let head = head(&tokens[start..]);
-    let keyword = tokens.get(start + head).and_then(Token::ident);
+    let structure = significant(&tokens[start..]);
+    let keyword = structure.get(head(&structure)).and_then(Token::ident);
     let extern_crate = keyword == Some("extern");
     let ends_at_semicolon =
         extern_crate || matches!(keyword, Some("const" | "static" | "type" | "use"));
@@ -775,13 +793,17 @@ fn classify(
     attached: Vec<Comment>,
     line: usize,
 ) -> Classified {
-    let at = head(tokens);
-    let keyword = tokens
+    let structure = significant(tokens);
+    let at = head(&structure);
+    let keyword = structure
         .get(at)
         .and_then(Token::ident)
         .unwrap_or_default()
         .to_owned();
-    let name = tokens.get(at + 1).and_then(Token::ident).map(str::to_owned);
+    let name = structure
+        .get(at + 1)
+        .and_then(Token::ident)
+        .map(str::to_owned);
     let body = tokens
         .iter()
         .position(|t| t.is_punct('{'))
@@ -814,20 +836,20 @@ fn classify(
             let imports = body.map_or_else(Vec::new, |(from, to)| body_imports(&tokens[from..to]));
             Classified::Test(Test {
                 name: name.unwrap_or_default(),
-                line: tokens[at].line,
+                line: structure.get(at).map_or(line, |token| token.line),
                 attached,
                 inside: comments_in(body),
                 uses,
                 calls: read.calls,
                 assumes: read.assumes,
                 imports,
-                visibility: visibility(&tokens[..at]),
+                visibility: visibility(&structure[..at]),
             })
         }
         "mod" => {
             let name = name.unwrap_or_default();
             match body {
-                Some((from, to)) if tokens.get(at + 2).is_some_and(|t| t.is_punct('{')) => {
+                Some((from, to)) if structure.get(at + 2).is_some_and(|t| t.is_punct('{')) => {
                     Classified::InlineModule {
                         name,
                         body: (from, to),
@@ -847,12 +869,19 @@ fn classify(
                 inside: comments_in(range),
                 covers: range.map_or_else(Vec::new, |(from, to)| covers(&tokens[from..to])),
                 imports: Vec::new(),
-                visibility: visibility(&tokens[..at]),
-                rewritable: attributes.iter().any(|a| a.trusted().is_none()),
+                visibility: visibility(&structure[..at]),
+                rewritable: attributes.iter().any(|a| !a.inert()),
             })
         }
         _ => {
-            let is_macro = tokens.get(at + 1).is_some_and(|t| t.is_punct('!'));
+            let is_macro = structure.get(at + 1).is_some_and(|t| t.is_punct('!'));
+            // A function's inner attributes, at the start of its body, are its own.
+            let inner = keyword == "fn"
+                && body.is_some_and(|(from, to)| {
+                    inner_attributes(&tokens[from..to])
+                        .iter()
+                        .any(|a| !a.inert())
+                });
             Classified::Item(Item {
                 kind: if is_macro {
                     "macro".to_owned()
@@ -870,25 +899,113 @@ fn classify(
                 covers: Vec::new(),
                 imports: if keyword == "use" {
                     let mut found = Vec::new();
-                    use_tree(tokens, at + 1, &[], &mut found);
+                    use_tree(&structure, at + 1, &[], &mut found);
                     found
                 } else {
                     Vec::new()
                 },
-                visibility: visibility(&tokens[..at]),
-                rewritable: attributes.iter().any(|a| a.trusted().is_none()),
+                visibility: visibility(&structure[..at]),
+                rewritable: inner || attributes.iter().any(|a| !a.inert()),
             })
         }
     }
 }
 
 /// The `use` declarations written inside a function's body, each as what it brings in.
-fn body_imports(tokens: &[Token]) -> Vec<Import> {
+///
+/// A macro definition in the body and the arguments of a standard macro that are no code, such as
+/// `stringify!`'s, hold no declaration, and are passed over.
+fn body_imports(body: &[Token]) -> Vec<Import> {
+    let tokens = significant(body);
     let mut found = Vec::new();
+    let mut skip_to = 0;
     for (index, token) in tokens.iter().enumerate() {
-        if token.ident() == Some("use") {
-            use_tree(tokens, index + 1, &[], &mut found);
+        if index < skip_to {
+            continue;
         }
+        let Some(name) = token.ident() else {
+            continue;
+        };
+        if let Some(end) = passed_over(&tokens, index) {
+            skip_to = end;
+        } else if name == "use" {
+            use_tree(&tokens, index + 1, &[], &mut found);
+        }
+    }
+    found
+}
+
+/// Where the tokens a reading passes over end, when the name at `index` starts them: a macro
+/// definition (`macro_rules! name { ... }`), which runs only where the macro is invoked, or the
+/// arguments of a standard macro that are no code ([`NO_CODE`]).
+fn passed_over(tokens: &[Token], index: usize) -> Option<usize> {
+    let punct = |at: usize, c: char| tokens.get(at).is_some_and(|t| t.is_punct(c));
+    let opens = |at: usize| ['(', '[', '{'].into_iter().any(|c| punct(at, c));
+    let name = tokens[index].ident()?;
+    let open = if name == "macro_rules"
+        && punct(index + 1, '!')
+        && tokens.get(index + 2).and_then(Token::ident).is_some()
+        && opens(index + 3)
+    {
+        index + 3
+    } else if NO_CODE.contains(&name)
+        && punct(index + 1, '!')
+        && opens(index + 2)
+        && !(index >= 2 && punct(index - 1, ':') && punct(index - 2, ':'))
+    {
+        index + 2
+    } else {
+        return None;
+    };
+    Some(matching(tokens, open).map_or(tokens.len(), |close| close + 1))
+}
+
+/// A copy of `tokens` without their comments, for reading structure: a comment may stand
+/// between any two tokens.
+fn significant(tokens: &[Token]) -> Vec<Token> {
+    tokens
+        .iter()
+        .filter(|token| !token.is_comment())
+        .cloned()
+        .collect()
+}
+
+/// The index of the first token from `from` that is not a comment.
+fn next_significant(tokens: &[Token], from: usize) -> Option<usize> {
+    (from..tokens.len()).find(|&at| !tokens[at].is_comment())
+}
+
+/// Every macro a `macro_rules!` in `tokens` defines, by name, wherever it stands.
+fn macro_definitions(tokens: &[Token]) -> Vec<String> {
+    let tokens = significant(tokens);
+    let mut names = Vec::new();
+    for index in 0..tokens.len() {
+        if tokens[index].ident() == Some("macro_rules")
+            && tokens.get(index + 1).is_some_and(|t| t.is_punct('!'))
+            && let Some(name) = tokens.get(index + 2).and_then(Token::ident)
+            && tokens
+                .get(index + 3)
+                .is_some_and(|t| t.is_punct('(') || t.is_punct('[') || t.is_punct('{'))
+            && !names.iter().any(|known| known == name)
+        {
+            names.push(name.to_owned());
+        }
+    }
+    names
+}
+
+/// The inner attributes (`#![...]`) a body opens with.
+fn inner_attributes(body: &[Token]) -> Vec<Attribute> {
+    let tokens = significant(body);
+    let mut found = Vec::new();
+    let mut at = 0;
+    while tokens.get(at).is_some_and(|t| t.is_punct('#'))
+        && tokens.get(at + 1).is_some_and(|t| t.is_punct('!'))
+        && tokens.get(at + 2).is_some_and(|t| t.is_punct('['))
+        && let Some(close) = matching(&tokens, at + 2)
+    {
+        found.push(attribute(&tokens[at + 3..close], tokens[at].line));
+        at = close + 1;
     }
     found
 }
@@ -1021,8 +1138,10 @@ const NO_CODE: &[&str] = &[
 /// and [`NO_CODE`] ones passed over, and the attributes [`Attribute::trusted`] names. The names
 /// they are taken on trust by are returned, for the map to hold against what the target defines
 /// and imports. Any other macro, a macro the body defines, or any other attribute, in the body or
-/// on the test, may rewrite or re-scope any call, so none is kept. The definition of a macro in the
-/// body is passed over: it runs only where the macro is invoked.
+/// on the test, may rewrite or re-scope any call, so none is kept; so is a `cfg` in the body, which
+/// may compile a call out of this platform's build. A macro definition (`macro_rules! name {`, in
+/// full) in the body is passed over: it runs only where the macro is invoked. A module the body
+/// declares is a scope of its own, and is passed over too.
 ///
 /// A path that starts at `crate`, `self` or `super` passes over the body's own scope. Any other
 /// call is kept only when the body shows its first name nowhere but in calls, methods, paths and
@@ -1067,7 +1186,9 @@ fn calls(body: &[Token], attributes: &[Attribute]) -> Read {
             if punct(Some(open), '[')
                 && let Some(close) = matching(&tokens, open)
             {
-                match attribute(&tokens[open + 1..close], token.line).trusted() {
+                let attribute = attribute(&tokens[open + 1..close], token.line);
+                // `cfg` may compile a statement, a call with it, out of this platform's build.
+                match attribute.trusted().filter(|_| attribute.path != ["cfg"]) {
                     Some(names) => read.assumes.extend(names),
                     None => opaque = true,
                 }
@@ -1078,22 +1199,33 @@ fn calls(body: &[Token], attributes: &[Attribute]) -> Read {
         let Some(name) = token.ident() else {
             continue;
         };
-        if name == "macro_rules" && punct(after(1), '!') {
-            if let Some(defined) = tokens.get(index + 2).and_then(Token::ident) {
-                defined_here.insert(defined);
+        if let Some(end) = passed_over(&tokens, index) {
+            if name == "macro_rules" {
+                if let Some(defined) = tokens.get(index + 2).and_then(Token::ident) {
+                    defined_here.insert(defined);
+                }
+            } else if defined_here.contains(name) {
+                opaque = true;
+            } else {
+                read.assumes.insert(name.to_owned());
             }
-            if opens(after(3)) {
-                skip_to = matching(&tokens, index + 3).map_or(tokens.len(), |close| close + 1);
-            }
+            skip_to = end;
+            continue;
+        }
+        // A module the body declares is a scope of its own, which its calls are resolved from;
+        // its name is bound in the body.
+        if name == "mod"
+            && let Some(declared) = tokens.get(index + 1).and_then(Token::ident)
+            && punct(after(2), '{')
+        {
+            elsewhere.insert(declared);
+            skip_to = matching(&tokens, index + 2).map_or(tokens.len(), |close| close + 1);
             continue;
         }
         if punct(after(1), '!') && opens(after(2)) {
             let standard = path_to(&tokens, index).0.len() == 1 && !defined_here.contains(name);
             if standard && RUN_AS_WRITTEN.contains(&name) {
                 read.assumes.insert(name.to_owned());
-            } else if standard && NO_CODE.contains(&name) {
-                read.assumes.insert(name.to_owned());
-                skip_to = matching(&tokens, index + 2).map_or(tokens.len(), |close| close + 1);
             } else {
                 opaque = true;
             }
@@ -1396,6 +1528,10 @@ mod tests {
             "#[cfg_attr(unix, make_shared)] fn inner() {} shared();",
             "#![make_shared] shared();",
             "# /* a gap */ [make_shared] struct Fixture; shared();",
+            // A raw `r#macro_rules` is an invocation of a macro of that name, not a definition.
+            "r#macro_rules!(); shared();",
+            // A `cfg` may compile the call out of the build.
+            "#[cfg(any())] shared();",
         ] {
             assert!(!read(body).contains(&shared), "{body}: {:?}", read(body));
         }
@@ -1427,6 +1563,12 @@ mod tests {
             );
         }
         assert!(read("in_module!(self::shared()); crate::shared();").is_empty());
+        // A module the body declares is a scope of its own: its calls are not the test's to
+        // resolve, and its name is bound in the body.
+        assert!(
+            read("mod inner { fn shared() {} pub fn run() { self::shared(); } } inner::run();")
+                .is_empty()
+        );
         // What a definition names is no call of it, and a macro the body defines and never
         // invokes calls nothing.
         for body in [
@@ -1452,7 +1594,7 @@ mod tests {
             "assert_eq!(shared(), 1); println!(\"{}\", 1);",
             "let v = vec![1]; println!(\"{v:?}\"); shared();",
             "#![allow(unused)] #[derive(Debug, Clone)] struct Fixture; shared();",
-            "#[cfg(unix)] #[rustfmt::skip] let x = 1; #[expect(clippy::no_effect)] shared();",
+            "#[rustfmt::skip] let x = 1; #[expect(clippy::no_effect)] shared();",
         ] {
             assert!(read(body).contains(&shared), "{body}: {:?}", read(body));
         }
@@ -1462,16 +1604,24 @@ mod tests {
         );
         // What the reading took on trust is returned with the calls.
         let trusted = calls(
-            &lex("assert_eq!(shared(), 1); #[derive(Clone)] struct F; let t = stringify!(x);")
+            &lex("assert_eq!(shared(), 1); #[derive(Clone)] struct F; let t = stringify!(x); #[rustfmt::skip] let y = 2;")
                 .expect("lexes"),
             &[],
         )
         .assumes;
-        let names: BTreeSet<String> = ["assert_eq", "derive", "Clone", "stringify"]
+        let names: BTreeSet<String> = ["assert_eq", "derive", "Clone", "stringify", "rustfmt::"]
             .into_iter()
             .map(str::to_owned)
             .collect();
         assert_eq!(trusted, names);
+        // A macro the body defines after invoking it is out of this reading's sight: the name is
+        // handed on as trusted, for the map to hold against the target's definitions.
+        let later = calls(
+            &lex("println!(); shared(); #[macro_export] macro_rules! println { () => {} }")
+                .expect("lexes"),
+            &[],
+        );
+        assert!(later.calls.contains(&shared) && later.assumes.contains("println"));
     }
 
     #[test]
@@ -1505,6 +1655,40 @@ mod tests {
             assert!(scan_text(text, true)[0].unlisted_names, "{text}");
         }
         assert!(!scan_text("fn plain() {}\nconst X: u8 = 1;\n", true)[0].unlisted_names);
+        // Every definition in the file counts, inside functions and past comments too, and an
+        // invocation of a macro named `macro_rules` is none.
+        let modules = scan_text(
+            "fn f() {\n    #[macro_export]\n    macro_rules! println { () => {} }\n}\nmacro_rules /* a gap */ ! assert_eq { () => {} }\nfn g() { r#macro_rules!(); }\n",
+            true,
+        );
+        assert_eq!(modules[0].macros, ["println", "assert_eq"]);
+        // An import is read past comments.
+        let modules = scan_text("use std::stringify /* a gap */ as println;\n", true);
+        let Entry::Item(item) = &modules[0].entries[0] else {
+            panic!("an item: {:?}", modules[0].entries);
+        };
+        assert_eq!(
+            item.imports,
+            [Import::Name {
+                name: "println".to_owned(),
+                path: vec!["std".to_owned(), "stringify".to_owned()],
+            }]
+        );
+    }
+
+    #[test]
+    fn a_body_imports_nothing_it_writes_as_text_or_in_a_macro_definition() {
+        let found = body_imports(
+            &lex("let _ = stringify!(use external::*;); macro_rules! m { () => { use hidden::*; } } use other::name;")
+                .expect("lexes"),
+        );
+        assert_eq!(
+            found,
+            [Import::Name {
+                name: "name".to_owned(),
+                path: vec!["other".to_owned(), "name".to_owned()],
+            }]
+        );
     }
 
     #[test]
@@ -1535,6 +1719,33 @@ mod tests {
         };
         assert!(item("renamed").rewritable);
         assert!(!item("kept").rewritable);
+        // Past comments, from an enclosing module's inner attribute, from a function's own inner
+        // attribute, and for any attribute that is not built in.
+        let modules = scan_text(
+            "# /* a gap */ [rewrite_all]\nmod gapped {}\nmod outer {\n    #![rewrite]\n    mod inner {}\n}\nfn inside() {\n    #![rewrite]\n}\nfn plain() {\n    #![allow(unused)]\n}\n#[rustfmt::skip]\nfn formatted() {}\n",
+            true,
+        );
+        let module = |path: &[&str]| {
+            modules
+                .iter()
+                .find(|module| module.path == path)
+                .expect("the module")
+        };
+        assert!(module(&["gapped"]).rewritable);
+        assert!(module(&["outer", "inner"]).rewritable);
+        let item = |name: &str| {
+            module(&[])
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    Entry::Item(item) if item.name.as_deref() == Some(name) => Some(item),
+                    _ => None,
+                })
+                .expect("the item")
+        };
+        assert!(item("inside").rewritable);
+        assert!(!item("plain").rewritable);
+        assert!(item("formatted").rewritable);
     }
 
     #[test]

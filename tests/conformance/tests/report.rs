@@ -191,6 +191,17 @@ fn a_call_a_macro_or_attribute_may_rewrite_move_or_rename_keys_nothing() {
         ("KR-REQ-03.17", "which an attribute may rewrite"),
         ("KR-REQ-03.18", "which an attribute may rewrite"),
         ("KR-REQ-03.19", "which no test calls"),
+        ("KR-REQ-03.20", "which no test calls"),
+        ("KR-REQ-03.21", "which no test calls"),
+        ("KR-REQ-03.22", "which no test calls"),
+        ("KR-REQ-03.23", "which no test calls"),
+        ("KR-REQ-03.24", "which no test calls"),
+        ("KR-REQ-03.25", "which no test calls"),
+        ("KR-REQ-03.26", "which an attribute may rewrite"),
+        ("KR-REQ-03.27", "which an attribute may rewrite"),
+        ("KR-REQ-03.28", "which no test calls"),
+        ("KR-REQ-03.29", "which no test calls"),
+        ("KR-REQ-03.30", "which its module defines more than once"),
     ] {
         let row = identifier(row);
         assert!(
@@ -206,10 +217,19 @@ fn a_call_a_macro_or_attribute_may_rewrite_move_or_rename_keys_nothing() {
             map.references.get(&row)
         );
     }
+    let keyed = keyed(&map);
     assert_eq!(
-        keyed(&map).get("KR-REQ-03.14"),
+        keyed.get("KR-REQ-03.14"),
         Some(&vec![(
             "flow calls_the_case_plainly".to_owned(),
+            Binding::CalledFunction
+        )])
+    );
+    // A `use` written as text imports nothing, so it leaves the rest of its target proved.
+    assert_eq!(
+        keyed.get("KR-REQ-03.31"),
+        Some(&vec![(
+            "strings calls_the_case_beside_text".to_owned(),
             Binding::CalledFunction
         )])
     );
