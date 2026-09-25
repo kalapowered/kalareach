@@ -11,11 +11,12 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 import { AppProvider } from '../../src/app/state'
 import { fakeHost, type FakeHostControls } from '../../src/host/fake'
+import type { HostPort } from '../../src/host/port'
 import { Shell } from '../../src/mobile/entry'
 import { MobileApp, type MobileBuild } from '../../src/mobile/MobileApp'
 import { PURCHASE_WORDS } from '../../src/model/account'
@@ -424,5 +425,202 @@ describe('what a build must not let happen twice (KR-ACC-012)', () => {
     })
     // It is a warning about durability, not about the draft: the text is still there.
     expect(screen.getByLabelText('Message this session')).toHaveValue('a')
+  })
+})
+
+describe('the shell and the inbox read once they are listening (KR-REQ-13.02)', () => {
+  /** The phone, opened on the inbox, against a host the test has prepared. */
+  function openPhone(port: HostPort): void {
+    render(
+      <AppProvider port={port}>
+        <MobileApp surface="ios" storage={null} />
+      </AppProvider>
+    )
+  }
+
+  /** What the bar along the top says about the connection. */
+  const topBar = () => document.querySelector('.m-connection')?.textContent ?? ''
+
+  /** Whether the inbox shows the entry `id`. */
+  const shows = (id: string) => document.querySelector(`[data-attention="${id}"]`) !== null
+
+  /** Waits for the inbox to show what a read answered. */
+  async function inboxRead(): Promise<void> {
+    await waitFor(() => {
+      expect(shows('a-2')).toBe(true)
+    })
+  }
+
+  /** Another device answers `id`: the host drops it from the inbox and says the inbox changed. */
+  async function answeredElsewhere(
+    port: HostPort,
+    controls: FakeHostControls,
+    id: string
+  ): Promise<void> {
+    await act(async () => {
+      await port.attentionAcknowledge({ attention_id: id }, {})
+      controls.emit({ stream_id: 'attention', sequence: id, body: { kind: 'attention' } })
+    })
+  }
+
+  const UNREACHABLE = 'this host cannot be contacted right now'
+
+  it('shows a host lost while the shell registers its listener', async () => {
+    const { port, controls } = fakeHost()
+    const complete = controls.holdRegistrations()
+    openPhone(port)
+
+    act(() => {
+      controls.setConnected(false)
+    })
+    await act(async () => {
+      complete()
+      await Promise.resolve()
+    })
+
+    await waitFor(() => {
+      expect(topBar()).toBe(UNREACHABLE)
+    })
+  })
+
+  it('keeps a lost connection it heard over a read that answers after it', async () => {
+    const { port, controls } = fakeHost()
+    const held = controls.hold('connectionState')
+    openPhone(port)
+    await waitFor(() => {
+      expect(held.count).toBe(1)
+    })
+
+    act(() => {
+      controls.setConnected(false)
+    })
+    // The first read was made while the host was reached, and answers only now.
+    await act(async () => {
+      held.answer(0)
+      await Promise.resolve()
+    })
+    expect(topBar()).toBe(UNREACHABLE)
+  })
+
+  it('leaves the newer connection state when two reads answer in reverse order', async () => {
+    const { port, controls } = fakeHost()
+    const held = controls.hold('connectionState')
+    openPhone(port)
+    await waitFor(() => {
+      expect(held.count).toBe(1)
+    })
+
+    act(() => {
+      controls.setConnected(false)
+    })
+    await act(async () => {
+      held.answer(1)
+      await Promise.resolve()
+    })
+    await act(async () => {
+      held.answer(0)
+      await Promise.resolve()
+    })
+    expect(topBar()).toBe(UNREACHABLE)
+  })
+
+  it('shows the connection it read when nothing changed in between', async () => {
+    const { port, controls } = fakeHost()
+    const held = controls.hold('connectionState')
+    openPhone(port)
+    await waitFor(() => {
+      expect(held.count).toBe(1)
+    })
+
+    await act(async () => {
+      held.answer(0)
+      await Promise.resolve()
+    })
+    expect(topBar()).toBe('In contact with this host')
+  })
+
+  it('shows an inbox change made while its listeners register', async () => {
+    const { port, controls } = fakeHost()
+    const complete = controls.holdRegistrations()
+    openPhone(port)
+
+    await answeredElsewhere(port, controls, 'a-1')
+    await act(async () => {
+      complete()
+      await Promise.resolve()
+    })
+
+    await inboxRead()
+    expect(shows('a-1')).toBe(false)
+  })
+
+  it('shows no inbox read that a change it heard has overtaken', async () => {
+    const { port, controls } = fakeHost()
+    const held = controls.hold('attentionRead')
+    openPhone(port)
+    await waitFor(() => {
+      expect(held.count).toBe(1)
+    })
+
+    await answeredElsewhere(port, controls, 'a-1')
+    await waitFor(() => {
+      expect(held.count).toBe(2)
+    })
+    // The first read was made before the change, and answers first.
+    await act(async () => {
+      held.answer(0)
+      await Promise.resolve()
+    })
+    expect(shows('a-1')).toBe(false)
+
+    await act(async () => {
+      held.answer(1)
+      await Promise.resolve()
+    })
+    await inboxRead()
+    expect(shows('a-1')).toBe(false)
+  })
+
+  it('leaves the newer inbox when two reads answer in reverse order', async () => {
+    const { port, controls } = fakeHost()
+    const held = controls.hold('attentionRead')
+    openPhone(port)
+    await waitFor(() => {
+      expect(held.count).toBe(1)
+    })
+
+    await answeredElsewhere(port, controls, 'a-1')
+    await waitFor(() => {
+      expect(held.count).toBe(2)
+    })
+    await act(async () => {
+      held.answer(1)
+      await Promise.resolve()
+    })
+    await inboxRead()
+    expect(shows('a-1')).toBe(false)
+
+    await act(async () => {
+      held.answer(0)
+      await Promise.resolve()
+    })
+    expect(shows('a-1')).toBe(false)
+    expect(shows('a-2')).toBe(true)
+  })
+
+  it('shows the inbox it read when nothing changed in between', async () => {
+    const { port, controls } = fakeHost()
+    const held = controls.hold('attentionRead')
+    openPhone(port)
+    await waitFor(() => {
+      expect(held.count).toBe(1)
+    })
+
+    await act(async () => {
+      held.answer(0)
+      await Promise.resolve()
+    })
+    await inboxRead()
+    for (const id of ['a-1', 'a-2', 'a-3', 'a-4']) expect(shows(id)).toBe(true)
   })
 })

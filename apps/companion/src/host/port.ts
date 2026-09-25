@@ -725,6 +725,61 @@ export function watch(
   return end
 }
 
+/**
+ * Follows one state whose every change carries the state itself.
+ *
+ * `listen` registers for its changes and `read` asks for it once that registration is complete,
+ * so no change falls between the two. `show` is given every change heard, and the read's answer
+ * only when no change was heard first: a change heard before the answer is at least as new as it.
+ * `failed` is given a failure to register or to read, on the same terms. The returned function
+ * stops following, including a registration that completes after it was called.
+ */
+export function follow<T>(
+  listen: (listener: (value: T) => void) => Promise<() => void>,
+  read: () => Promise<T>,
+  show: (value: T) => void,
+  failed: (failure: unknown) => void
+): () => void {
+  let following = true
+  let heard = false
+  const answered = (settle: () => void) => {
+    if (following && !heard) settle()
+  }
+  const stop = watch(
+    [
+      listen((value) => {
+        if (!following) return
+        heard = true
+        show(value)
+      })
+    ],
+    () => {
+      // A port can refuse before it returns a promise; that refusal is an answer like any other.
+      void (async () => {
+        try {
+          const value = await read()
+          answered(() => {
+            show(value)
+          })
+        } catch (failure: unknown) {
+          answered(() => {
+            failed(failure)
+          })
+        }
+      })()
+    },
+    (failure) => {
+      answered(() => {
+        failed(failure)
+      })
+    }
+  )
+  return () => {
+    following = false
+    stop()
+  }
+}
+
 /** One row of the projected screen, as the raw view draws it. */
 export interface ProjectedRow {
   /** The row's stable identity above the live screen. */

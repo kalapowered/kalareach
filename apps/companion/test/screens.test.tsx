@@ -12,6 +12,7 @@ import userEvent from '@testing-library/user-event'
 import { App } from '../src/App'
 import { AppProvider, type Place } from '../src/app/state'
 import { fakeHost, type FakeHostControls } from '../src/host/fake'
+import type { HostPort } from '../src/host/port'
 import { CommitButton } from '../src/components/ui'
 
 function start(initialPlace: Place = { view: 'attention' }): { controls: FakeHostControls } {
@@ -296,6 +297,133 @@ describe('the semantic view', () => {
     const refusal = await screen.findByTestId('insertion-refusal')
     expect(refusal.textContent).toMatch(/kept/)
     expect(refusal.textContent).toMatch(/terminal/)
+  })
+})
+
+describe('the session view reads once it is listening (KR-REQ-13.02, KR-REQ-13.11)', () => {
+  /** The application on the main session, against a host the test has prepared. */
+  function openSession(port: HostPort): void {
+    render(
+      <AppProvider
+        port={port}
+        initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' }}
+      >
+        <App />
+      </AppProvider>
+    )
+  }
+
+  const LOST = 'Not in contact with this host'
+
+  it('shows a host lost while its listeners register', async () => {
+    const { port, controls } = fakeHost()
+    const complete = controls.holdRegistrations()
+    openSession(port)
+
+    act(() => {
+      controls.setConnected(false)
+    })
+    await act(async () => {
+      complete()
+      await Promise.resolve()
+    })
+
+    expect((await screen.findAllByText(LOST)).length).toBeGreaterThan(0)
+  })
+
+  // KR-REQ-13.11: a generation that moved while the view registered is the one its surface is
+  // read at, so no button is ever drawn at the old one and a launch names the prompt that is there.
+  it('names the prompt generation that moved while its listeners registered', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    const complete = controls.holdRegistrations()
+    openSession(port)
+
+    act(() => {
+      controls.changePromptGeneration()
+    })
+    await act(async () => {
+      complete()
+      await Promise.resolve()
+    })
+
+    const codex = within(await screen.findByTestId('launch-surface')).getByRole('button', {
+      name: /Codex/
+    })
+    expect(codex).toBeEnabled()
+    await person.click(codex)
+    expect(await screen.findByText('Codex started.')).toBeInTheDocument()
+  })
+
+  it('keeps a lost connection it heard over a session read that answers after it', async () => {
+    const { port, controls } = fakeHost()
+    const held = controls.hold('sessionRead')
+    openSession(port)
+    await waitFor(() => {
+      expect(held.count).toBe(1)
+    })
+
+    act(() => {
+      controls.setConnected(false)
+    })
+    expect((await screen.findAllByText(LOST)).length).toBeGreaterThan(0)
+    // The read was made while the host was reached, and its answer arrives only now: the session
+    // it describes is shown, and the connection stays as it was heard.
+    await act(async () => {
+      held.release()
+      await Promise.resolve()
+    })
+    await screen.findByText('Session 1 · Waiting for you')
+    expect(screen.queryAllByText(LOST).length).toBeGreaterThan(0)
+  })
+
+  // KR-REQ-13.11: the surface was read at the old generation and answers after the new one was
+  // heard, so its buttons are drawn disabled.
+  it('disables the launch buttons when the generation moves before the surface read answers', async () => {
+    const { port, controls } = fakeHost()
+    const held = controls.hold('launchSurface')
+    openSession(port)
+    await waitFor(() => {
+      expect(held.count).toBe(1)
+    })
+
+    act(() => {
+      controls.changePromptGeneration()
+    })
+    await act(async () => {
+      held.release()
+      await Promise.resolve()
+    })
+
+    const surface = await screen.findByTestId('launch-surface')
+    expect(within(surface).getByRole('button', { name: /Codex/ })).toBeDisabled()
+    expect(screen.getByTestId('launch-stale')).toBeInTheDocument()
+  })
+
+  it('shows what it read when nothing changed in between', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    const session = controls.hold('sessionRead')
+    const surface = controls.hold('launchSurface')
+    openSession(port)
+    await waitFor(() => {
+      expect([session.count, surface.count]).toEqual([1, 1])
+    })
+
+    await act(async () => {
+      session.release()
+      surface.release()
+      await Promise.resolve()
+    })
+
+    await screen.findByText('Session 1 · Waiting for you')
+    expect(screen.queryAllByText(LOST)).toHaveLength(0)
+    const codex = within(screen.getByTestId('launch-surface')).getByRole('button', {
+      name: /Codex/
+    })
+    expect(codex).toBeEnabled()
+    await person.click(codex)
+    expect(await screen.findByText('Codex started.')).toBeInTheDocument()
   })
 })
 

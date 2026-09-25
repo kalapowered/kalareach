@@ -11,7 +11,7 @@
  * pocket press decides nothing.
  */
 
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 
 import { Banner, Button, CommitButton, Sheet } from '../../components/ui'
 import { useApp } from '../../app/state'
@@ -53,29 +53,45 @@ export function Inbox({
   const [open, setOpen] = useState<AttentionEntry | null>(null)
   const target = minimumTarget(surface)
 
+  // Reads are counted, and only the newest one's answer is shown: two reads can answer in either
+  // order, and an answer that a later read has overtaken never replaces what the later one says.
+  const reads = useRef(0)
   const read = useCallback(() => {
+    reads.current += 1
+    const made = reads.current
     ask(() => port.attentionRead({}))
       .then((answer) => {
+        if (made !== reads.current) return
         setInbox(answer)
         setError(null)
       })
       .catch((failure: unknown) => {
+        if (made !== reads.current) return
         // A host that cannot be read is a host out of contact, which is a state the inbox has. It
         // is never a claim that anything on it failed.
         setError(failureMessage(failure))
       })
   }, [port])
 
-  useEffect(() => {
-    read()
-    return watch([
-      port.subscribe((event) => {
-        const body = event.body as { kind?: string }
-        if (body.kind === 'attention') read()
-      }),
-      port.onConnection(read)
-    ])
-  }, [port, read])
+  // The inbox is read once its listeners are registered, so no change falls between the read and
+  // them, and read again on each change they hear.
+  useEffect(
+    () =>
+      watch(
+        [
+          port.subscribe((event) => {
+            const body = event.body as { kind?: string }
+            if (body.kind === 'attention') read()
+          }),
+          port.onConnection(read)
+        ],
+        read,
+        (failure) => {
+          setError(failureMessage(failure))
+        }
+      ),
+    [port, read]
+  )
 
   const rows = useMemo(() => (inbox ? order(inbox) : []), [inbox])
   const counts = useMemo(() => (inbox ? count(inbox) : null), [inbox])

@@ -19,7 +19,7 @@
 
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react'
 
-import { watch, type HostPort } from '../host/port'
+import { follow, type HostPort } from '../host/port'
 import { minimumTarget, type Surface } from '../mobile/platform'
 import {
   SIGN_IN_HELP,
@@ -69,26 +69,20 @@ export function useAccount(port: HostPort): AccountHandle {
     setView(next)
   }, [])
 
-  useEffect(() => {
-    let live = true
-    port
-      .accountStatus()
-      .then((next) => {
-        if (live) show(next)
-      })
-      .catch(() => {
-        if (live) show({ state: 'signed_out', outcome: null })
-      })
-    const stop = watch([
-      port.onAccount((next) => {
-        if (live) show(next)
-      })
-    ])
-    return () => {
-      live = false
-      stop()
-    }
-  }, [port, show])
+  // Where the device stands is read once the listener is registered, so no change falls between
+  // the two, and a change heard before the read answers is the newer one.
+  useEffect(
+    () =>
+      follow(
+        (listener) => port.onAccount(listener),
+        () => port.accountStatus(),
+        show,
+        () => {
+          show({ state: 'signed_out', outcome: null })
+        }
+      ),
+    [port, show]
+  )
 
   const readUsage = useCallback(() => {
     const asked = current.current

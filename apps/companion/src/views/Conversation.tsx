@@ -110,7 +110,8 @@ export function Conversation({
   readonly sessionId: string
   readonly subject: SessionSubject
   readonly connected: boolean
-  readonly launch: LaunchSurface | null
+  /** The launch surface as it was read, and the prompt's generation as the view knows it now. */
+  readonly launch: { readonly surface: LaunchSurface; readonly promptGeneration: string } | null
   readonly onLaunched: () => void
 }): ReactNode {
   const { port, say } = useApp()
@@ -569,9 +570,10 @@ export function Conversation({
         />
       </div>
 
-      {launch?.prompt_is_empty ? (
+      {launch?.surface.prompt_is_empty ? (
         <LaunchSurfaceView
-          surface={launch}
+          surface={launch.surface}
+          promptGeneration={launch.promptGeneration}
           subject={subject}
           sessionId={sessionId}
           connected={connected}
@@ -1006,12 +1008,15 @@ function ControlButton({
  */
 function LaunchSurfaceView({
   surface,
+  promptGeneration,
   subject,
   sessionId,
   connected,
   onLaunched
 }: {
   readonly surface: LaunchSurface
+  /** The prompt's generation now, which a read that answered late may already be behind. */
+  readonly promptGeneration: string
   readonly subject: SessionSubject
   readonly sessionId: string
   readonly connected: boolean
@@ -1022,7 +1027,7 @@ function LaunchSurfaceView({
   // and reading the surface again is what makes them usable: a person looks at the prompt, and the
   // refreshed proof is what re-enables the buttons.
   const [drawnAt, setDrawnAt] = useState(surface.prompt_generation)
-  const stale = drawnAt !== surface.prompt_generation || !connected
+  const stale = drawnAt !== promptGeneration || !connected
 
   return (
     <section className="launch-surface" data-testid="launch-surface" data-stale={stale}>
@@ -1048,7 +1053,7 @@ function LaunchSurfaceView({
                     {
                       session_id: sessionId,
                       command: { arguments: [...profile.arguments] },
-                      expected_prompt_generation: surface.prompt_generation,
+                      expected_prompt_generation: promptGeneration,
                       expected_buffer_revision: surface.buffer_revision
                     },
                     subject
@@ -1081,7 +1086,7 @@ function LaunchSurfaceView({
             <Button
               data-testid="launch-refresh"
               onClick={() => {
-                setDrawnAt(surface.prompt_generation)
+                setDrawnAt(promptGeneration)
               }}
             >
               I have looked at the prompt

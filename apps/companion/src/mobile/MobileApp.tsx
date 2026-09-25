@@ -13,7 +13,7 @@ import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react
 
 import { useApp } from '../app/state'
 import { Toast } from '../components/ui'
-import { failureMessage, watch } from '../host/port'
+import { failureMessage, follow } from '../host/port'
 import {
   AccountGlyph,
   AttentionGlyph,
@@ -28,7 +28,6 @@ import { Inbox } from './views/Inbox'
 import { MobileHosts, MobileSessions } from './views/Places'
 import { MobileSession } from './views/MobileSession'
 import type { Channel } from '../model/account'
-import { ask } from './model/call'
 import { useKeyboardInset, useLifecycle } from './useLifecycle'
 import { detectSurface, type Surface } from './platform'
 import './mobile.css'
@@ -124,26 +123,23 @@ export function MobileApp({
     }
   }, [])
 
-  useEffect(() => {
-    let watching = true
-    const read = () => {
-      ask(() => port.connectionState())
-        .then((state) => {
-          if (!watching) return
+  // The connection is read once its listener is registered, so no change falls between the two.
+  // Each change native code publishes carries the state and its reason, so nothing is read again,
+  // and a change heard before the read answers is the newer one.
+  useEffect(
+    () =>
+      follow(
+        (listener) => port.onConnection(listener),
+        () => port.connectionState(),
+        (state) => {
           setConnection({ connected: state.connected, reason: state.reason })
-        })
-        .catch((failure: unknown) => {
-          if (!watching) return
+        },
+        (failure) => {
           setConnection({ connected: false, reason: failureMessage(failure) })
-        })
-    }
-    read()
-    const stop = watch([port.onConnection(read)])
-    return () => {
-      watching = false
-      stop()
-    }
-  }, [port])
+        }
+      ),
+    [port]
+  )
 
   const destinations = useMemo<readonly Destination[]>(
     () => [
