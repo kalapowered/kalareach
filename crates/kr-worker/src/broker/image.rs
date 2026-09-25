@@ -287,36 +287,82 @@ pub fn verify_image(
     verified: &VerifiedFiles,
     stop: &AtomicBool,
 ) -> Result<(), String> {
-    let link = std::path::PathBuf::from(format!("/proc/{}/exe", process.pid.get()));
-    let file = open_without_waiting(&link).map_err(|error| {
-        format!(
-            "the image of process {} cannot be read: {error}",
-            process.pid
-        )
-    })?;
-    let before = regular_identity(&file, &link)?;
-    let known = before == identity.hashed.file
-        || verified
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(&before);
-    let same = known || {
-        let hashed = hash_file(&file, &link, before.size, Vec::<NoDirectory>::new(), stop)?;
-        let after = regular_identity(&file, &link)?;
-        hashed.is_some_and(|(digest, _)| digest == identity.hashed.digest) && after == before
-    };
-    still_registered(process)?;
-    if same {
-        verified
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(before);
-        Ok(())
-    } else {
-        Err(format!(
-            "process {} executes other code than the file its launch presented",
-            process.pid
-        ))
+    OpenedImage::open(process)?.check(process, identity, verified, stop)
+}
+
+/// The file a process executes, opened through `/proc/<pid>/exe`, and its identity then.
+#[cfg(target_os = "linux")]
+struct OpenedImage {
+    link: std::path::PathBuf,
+    file: std::fs::File,
+    identity: FileIdentity,
+}
+
+#[cfg(target_os = "linux")]
+impl OpenedImage {
+    fn open(process: &ProcessStartIdentity) -> Result<Self, String> {
+        let link = std::path::PathBuf::from(format!("/proc/{}/exe", process.pid.get()));
+        let file = open_without_waiting(&link).map_err(|error| {
+            format!(
+                "the image of process {} cannot be read: {error}",
+                process.pid
+            )
+        })?;
+        let identity = regular_identity(&file, &link)?;
+        Ok(Self {
+            link,
+            file,
+            identity,
+        })
+    }
+
+    /// Checks the opened file against what was hashed, then that the process still executes it:
+    /// an exec while the file was hashed shows as another file at the link.
+    fn check(
+        &self,
+        process: &ProcessStartIdentity,
+        identity: &ExecutableIdentity,
+        verified: &VerifiedFiles,
+        stop: &AtomicBool,
+    ) -> Result<(), String> {
+        let before = self.identity;
+        let known = before == identity.hashed.file
+            || verified
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&before);
+        let same = known || {
+            let hashed = hash_file(
+                &self.file,
+                &self.link,
+                before.size,
+                Vec::<NoDirectory>::new(),
+                stop,
+            )?;
+            let after = regular_identity(&self.file, &self.link)?;
+            hashed.is_some_and(|(digest, _)| digest == identity.hashed.digest) && after == before
+        };
+        let now = open_without_waiting(&self.link)
+            .map_err(|error| {
+                format!(
+                    "the image of process {} cannot be read: {error}",
+                    process.pid
+                )
+            })
+            .and_then(|file| regular_identity(&file, &self.link))?;
+        still_registered(process)?;
+        if same && now == before {
+            verified
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(before);
+            Ok(())
+        } else {
+            Err(format!(
+                "process {} executes other code than the file its launch presented",
+                process.pid
+            ))
+        }
     }
 }
 
@@ -340,7 +386,9 @@ pub fn verify_image(
         .map_err(|_| format!("{} is not a process identifier", process.pid))?;
     let running = code_signature::of_process(pid)?;
     still_registered(process)?;
-    if identity.hashed.code_directories.contains(&running) {
+    // Read again after the start check: an exec in between shows as another hash.
+    let again = code_signature::of_process(pid)?;
+    if running == again && identity.hashed.code_directories.contains(&running) {
         Ok(())
     } else {
         Err(format!(
@@ -928,6 +976,50 @@ mod tests {
         let refused = read_identity(&exe, &HashedFiles::default(), &AtomicBool::new(true))
             .expect_err("stopped");
         assert!(refused.contains("stopped"), "{refused}");
+    }
+
+    /// On Linux, a process that execs another program after its image was opened and before the
+    /// check ends is refused, although the file opened first holds the digest that was hashed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_exec_during_the_check_is_refused() {
+        use std::io::Write as _;
+        let mut child = std::process::Command::new("/bin/bash")
+            .args(["-c", "read line; exec /bin/sleep 5"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("bash starts");
+        let process =
+            kr_ipc::identity::process_start_identity(child.id()).expect("the child is identified");
+        let bash = identity_of(Path::new("/bin/bash"));
+        let opened = OpenedImage::open(&process).expect("its image is opened");
+        child
+            .stdin
+            .as_mut()
+            .expect("its input")
+            .write_all(b"go\n")
+            .expect("it is told to exec");
+        let link = format!("/proc/{}/exe", child.id());
+        let started = std::time::Instant::now();
+        while std::fs::read_link(&link).is_ok_and(|target| target.ends_with("bash")) {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "it execs"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let result = opened.check(
+            &process,
+            &bash,
+            &VerifiedFiles::default(),
+            &AtomicBool::new(false),
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            result.is_err(),
+            "the process no longer executes what was checked"
+        );
     }
 
     #[test]

@@ -103,8 +103,10 @@ pub enum BackendState {
 /// The commit (the state, the guard, the supervision) and the confirmation (still committed, then
 /// the one line the launcher execs on) each run under the lock, and so does retirement. So a
 /// retirement is either before the commit, which then fails; between the two, which withholds the
-/// confirmation; or after the confirmation, when the program has been told and started, like a
-/// session that closes while its program runs.
+/// confirmation; or after the confirmation. The successful write of the confirmation is the
+/// launch's commitment point: a launcher may still be between reading it and its exec when a later
+/// retirement lands, and it then runs the program with the flags and without a backend, as a session
+/// that closes a moment after its program started leaves it.
 struct Lifecycle {
     state: tokio::sync::watch::Sender<BackendState>,
     lock: Mutex<()>,
