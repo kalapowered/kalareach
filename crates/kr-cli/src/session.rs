@@ -1960,10 +1960,13 @@ mod tests {
     fn a_closure_that_cannot_be_read_does_not_repeat_what_it_held() {
         use crate::shown::marker::{MARKER, assert_unmarked, failure_renderings};
 
-        let payload = kr_protocol::envelope::ParamsValue::from_typed(
-            &std::collections::BTreeMap::from([(MARKER, 1_u64)]),
-        )
-        .expect("a map");
+        let planted = |key: &str| {
+            kr_protocol::envelope::ParamsValue::from_typed(&std::collections::BTreeMap::from([(
+                key, 1_u64,
+            )]))
+            .expect("a map")
+        };
+        let payload = planted(MARKER);
         // The negative control: the decoder's own message, which the outcome carried whole,
         // quotes the key.
         let unread = payload
@@ -1974,6 +1977,15 @@ mod tests {
         let outcome = super::closed(&payload, false);
         assert!(matches!(outcome, AttachOutcome::ClosureUnreadable { .. }));
         assert_eq!(status(&outcome), 1);
+        // The neutral control: another key is reported in the same words, which name the rule the
+        // record broke.
+        let neutral = super::closed(&planted("neutral-value"), false);
+        assert_eq!(outcome.detail(), neutral.detail());
+        assert!(
+            neutral.detail().as_str().contains(unread.rule()),
+            "{}",
+            neutral.detail()
+        );
         assert_unmarked(
             "an unreadable closure",
             &[outcome.detail().into_string(), format!("{outcome:?}")],

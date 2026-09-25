@@ -321,3 +321,30 @@ fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
     written
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::rendering::{NEVER_RENDERED, renders_only};
+
+    /// A write's record renders the origin as a diagnostic names one and the place the write
+    /// compared against, exactly: never the locator, and never the origin's credentials.
+    #[test]
+    fn a_write_record_renders_only_its_origin_and_its_place() {
+        let record = WriteRecord {
+            context: RecoveryContext {
+                service_origin: format!("https://{NEVER_RENDERED}@reach.example"),
+                bundle_locator: NEVER_RENDERED.to_owned(),
+            },
+            expected: Nullable::null(),
+            request_id: Uuid::from_bytes([2; 16]),
+            signed_at_ms: TimestampMs::new(6),
+            sent: Digest256::from_bytes([3; 32]),
+            known: Known::Unsettled,
+        };
+        renders_only(
+            &record,
+            "WriteRecord{service_origin:\"<notprinted>\",expected:Nullable(None),..}",
+        );
+    }
+}

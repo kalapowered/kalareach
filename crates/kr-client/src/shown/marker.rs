@@ -517,13 +517,23 @@ mod cases {
             assert!(said.contains(expected), "{said}");
             assert!(!said.contains(NEUTRAL), "{said}");
         }
+        // A local connection's failure names the file by the names the host's tree writes, and
+        // replaces a name a listing could have found.
         let said = ClientError::Ipc(kr_ipc::IpcError::Io {
             operation: "read",
-            path: std::path::PathBuf::from("/runtime"),
+            path: std::path::Path::new("/nowhere-configured")
+                .join(NEUTRAL)
+                .join("sessions")
+                .join("0e1f9a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b.kr"),
             source: std::io::Error::from_raw_os_error(2),
         })
         .to_string();
-        assert!(said.starts_with("read /runtime: "), "{said}");
+        assert!(
+            said.starts_with(
+                "read /[a name]/[a name]/sessions/0e1f9a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b.kr: "
+            ),
+            "{said}"
+        );
         assert!(said.ends_with("(os error 2)"), "{said}");
     }
 
@@ -694,6 +704,24 @@ mod cases {
                 Err(error) => assert_unmarked(&planted.at, &failure_renderings(error)),
             }
         }
+
+        // The neutral control: a refused object says which file and the rule its bytes broke,
+        // and nothing it held.
+        let mut refused = 0;
+        for planted in cbor_plantings(&value, NEUTRAL) {
+            std::fs::write(&path, &planted.input).expect("written");
+            if let Err(error) = store.object(object_id) {
+                refused += 1;
+                let said = error.to_string();
+                assert!(
+                    said.contains(&format!("{}.object could not be read", object_id.get())),
+                    "{}: {said}",
+                    planted.at
+                );
+                assert!(!said.contains(NEUTRAL), "{}: {said}", planted.at);
+            }
+        }
+        assert!(refused > 0, "the neutral plantings are refused too");
     }
 
     /// What a service serves as a sealed object is read without a word of it reaching a failure.
@@ -775,6 +803,62 @@ mod cases {
         let said = broken.to_string();
         assert!(said.contains("line 1"), "{said}");
         assert_unmarked("a broken document", &failure_renderings(broken));
+    }
+
+    /// A stored sign-in names none of what it holds, whatever the file says: every text leaf, key and
+    /// other leaf of the document planted in turn and read through the store's own reader.
+    #[test]
+    fn a_stored_grant_says_nothing_of_what_it_holds() {
+        use crate::services::account::{Client, ISSUER, StoredGrant};
+
+        let document = |planted: &str| {
+            serde_json::json!({
+                "grantId": planted,
+                "revision": 3,
+                "issuer": ISSUER,
+                "clientId": Client::Desktop.id(),
+                "subject": planted,
+                "email": planted,
+                "name": planted,
+                "nonce": planted,
+                "refreshToken": planted,
+                "accessToken": planted,
+                "accessExpiresAtMs": 1_700_000_000_000_u64,
+                "scopes": [planted, "voice"],
+            })
+        };
+        // The negative control: the document as written reads, and holds the marker in every
+        // text field, the grant's identifier among them.
+        let whole = serde_json::to_vec(&document(MARKER)).expect("a document");
+        let grant = StoredGrant::read(&whole).expect("the document reads");
+        assert_eq!(grant.grant_id(), MARKER);
+        assert_unmarked("a stored grant", &debug_renderings(&grant));
+        let (mut read, mut refused) = (0, 0);
+        for planted in json_plantings(&document("a-stored-value"), MARKER) {
+            let bytes = serde_json::to_vec(&planted.input).expect("a document");
+            match StoredGrant::read(&bytes) {
+                Ok(grant) => {
+                    read += 1;
+                    assert_unmarked(&planted.at, &debug_renderings(&grant));
+                }
+                Err(error) => {
+                    refused += 1;
+                    assert_unmarked(&planted.at, &failure_renderings(error));
+                }
+            }
+        }
+        assert!(read > 0 && refused > 0, "{read} read, {refused} refused");
+        // The neutral control: a document that is not one says the class of the fault and where
+        // it is, and nothing it held.
+        let said = StoredGrant::read(format!("{{\"grantId\": {NEUTRAL}").as_bytes())
+            .expect_err("not a document")
+            .to_string();
+        assert!(
+            said.starts_with("STORAGE_UNAVAILABLE: the stored sign-in could not be read: "),
+            "{said}"
+        );
+        assert!(said.contains("line 1"), "{said}");
+        assert!(!said.contains(NEUTRAL), "{said}");
     }
 
     /// Each type that holds a document, an origin, a locator or bytes renders what it is and none
@@ -875,6 +959,86 @@ mod cases {
         };
         assert_unmarked("a migration record", &debug_renderings(&record));
         assert_unmarked("a migration record", &[record.describe().into_string()]);
+
+        // The rest of the named renderings, each exactly.
+        renders_only(
+            &draft,
+            "Draft{draft_id:DraftId(Uuid(06060606-0606-0606-0606-060606060606)),\
+             revision:DraftRevision(U64(2)),device_id:DeviceId(Uuid(\
+             01010101-0101-0101-0101-010101010101)),target:DraftTarget{session_id:SessionId(\
+             Uuid(03030303-0303-0303-0303-030303030303)),application_instance_id:Nullable(None),\
+             agent_binding_revision:Nullable(None)},state:Open,text_bytes:14,attachments:0,\
+             conflict_of:Nullable(None),retained:Nullable(None),created_at_ms:TimestampMs(U64(1)),\
+             updated_at_ms:TimestampMs(U64(2))}",
+        );
+        renders_only(
+            &subject,
+            "Subject{environment_id:EnvironmentId(Uuid(02020202-0202-0202-0202-020202020202)),\
+             session_id:None,device_id:None,declared_media_type_bytes:14,\
+             original_file_name_bytes:14}",
+        );
+        renders_only(
+            &access,
+            "ServiceAccess{policy:Account,service_origin:\"<notprinted>\"}",
+        );
+        renders_only(
+            &painted,
+            "Painted{bytes:14,comparison:Comparison{runs_replaced:0,cells_clipped:0,\
+             rows_clipped:0,clusters_replaced:0,pending_wrap:false,cursor_outside:false,\
+             soft_wraps:0,truncated_rows:0,rows_outside:0,cells_outside:0,keyboard_withheld:false,\
+             keyboard_stack:0,controls_dropped:0,rows_unreachable:0,geometry_withheld:false}}",
+        );
+        let question = kr_protocol::question::Question {
+            question_id: kr_protocol::ids::QuestionId::new(uuid(8)),
+            revision: kr_protocol::ids::QuestionRevision::new(1),
+            state: kr_protocol::question::QuestionState::Pending,
+            session_id: SessionId::new(uuid(3)),
+            session_epoch: kr_protocol::ids::SessionEpoch::V1,
+            kind: kr_protocol::question::QuestionKind::Confirm,
+            context: MARKER.to_owned(),
+            question: MARKER.to_owned(),
+            choices: vec![kr_protocol::question::QuestionChoice::something_else()],
+            source: kr_protocol::question::QuestionSource {
+                application_instance_id: kr_protocol::ids::ApplicationInstanceId::new(uuid(9)),
+                process: kr_protocol::identity::ProcessStartIdentity::new(
+                    42,
+                    kr_protocol::identity::ProcessStartSource::LinuxProcStat,
+                    7,
+                ),
+                executable: Nullable::some(MARKER.to_owned()),
+                agent_label: Nullable::some(MARKER.to_owned()),
+                connection_id: kr_protocol::ids::ConnectionId::new(uuid(10)),
+                launch_channel: false,
+                session_member: true,
+                ancestry: true,
+                agent_binding_revision: Nullable::null(),
+            },
+            created_at_ms: TimestampMs::new(1_000),
+            expires_at_ms: TimestampMs::new(2_000),
+            answer: Nullable::null(),
+            resolved_at_ms: Nullable::null(),
+        };
+        renders_only(
+            &crate::answers::Answered::Sent(Box::new(question)),
+            "Sent{question_id:QuestionId(Uuid(08080808-0808-0808-0808-080808080808)),\
+             revision:QuestionRevision(U64(1)),state:Pending,..}",
+        );
+        let rendered = crate::controls::read_document(&[serde_json::json!({
+            "id": "greeting",
+            "revision": "1",
+            "body": { "kind": "markdown", "source": MARKER }
+        })]);
+        renders_only(&rendered[0], "Node{controls:0,..}");
+        renders_only(
+            &crate::encoder::KeyEvent {
+                key: crate::encoder::Key::Char('k'),
+                base: Some('k'),
+                modifiers: crate::encoder::Modifiers::default(),
+                kind: crate::encoder::KeyEventKind::Press,
+            },
+            "KeyEvent{key:Char(..),base:Some(\"..\"),modifiers:Modifiers{shift:false,\
+             alt:false,control:false,superkey:false},kind:Press}",
+        );
     }
 
     /// Nothing a reader here does is written to a log: every event raised while planted drafts are

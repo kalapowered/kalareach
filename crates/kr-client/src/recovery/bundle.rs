@@ -1606,3 +1606,73 @@ fn diagnose_applied(held: Option<SyncPosition>, found: SyncPosition) -> Result<(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::rendering::{NEVER_RENDERED, renders_only};
+
+    fn context() -> RecoveryContext {
+        RecoveryContext {
+            service_origin: format!("https://{NEVER_RENDERED}@reach.example/{NEVER_RENDERED}"),
+            bundle_locator: NEVER_RENDERED.to_owned(),
+        }
+    }
+
+    fn position() -> SyncPosition {
+        SyncPosition::at(
+            1,
+            crate::services::SyncRevision::new(kr_protocol::scalars::Uuid::from_bytes([7; 16])),
+            None,
+        )
+    }
+
+    /// A writer's evidence and a finished migration render what they are, exactly: never the
+    /// locator, the origin's credentials, or the updated kit's origins and seed.
+    #[test]
+    fn a_writer_and_a_migration_render_only_what_they_are() {
+        let enabled = WriterEnabled {
+            writer_key_id: kr_protocol::scalars::KeyId::from_bytes([1; 32]),
+            context: context(),
+            bundle_revision: 3,
+            bundle_position: position(),
+        };
+        renders_only(
+            &enabled,
+            "WriterEnabled{writer_key_id:KeyId(AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE),\
+             service_origin:\"<notprinted>\",bundle_revision:3,bundle_position:SyncPosition{\
+             write_sequence:1,revision:Nullable(Some(SyncRevision(Uuid(\
+             07070707-0707-0707-0707-070707070707)))),recovery:Nullable(None)},..}",
+        );
+        let record = MigrationRecord {
+            from: context(),
+            to: RecoveryContext {
+                service_origin: "https://reach.example:8443".to_owned(),
+                bundle_locator: NEVER_RENDERED.to_owned(),
+            },
+            bundle_revision: 4,
+            bundle_position: position(),
+            verified_at_ms: TimestampMs::new(5),
+        };
+        let rendered_record = "MigrationRecord{from:\"<notprinted>\",\
+                               to:\"https://reach.example:8443\",bundle_revision:4,\
+                               bundle_position:SyncPosition{write_sequence:1,revision:Nullable(\
+                               Some(SyncRevision(Uuid(07070707-0707-0707-0707-070707070707)))),\
+                               recovery:Nullable(None)},verified_at_ms:TimestampMs(U64(5)),..}";
+        renders_only(&record, rendered_record);
+        let migrated = Migrated {
+            record,
+            updated_kit: kr_protocol::archive::RecoveryKit {
+                profile_version: kr_protocol::scalars::U64::new(1),
+                seed: kr_protocol::scalars::SecretBytes32::from_bytes([9; 32]),
+                seed_checksum: kr_protocol::scalars::Bytes::new(NEVER_RENDERED.as_bytes().to_vec()),
+                service_origins: vec![NEVER_RENDERED.to_owned()],
+                bundle_locator: NEVER_RENDERED.to_owned(),
+            },
+        };
+        renders_only(
+            &migrated,
+            &format!("Migrated{{record:{rendered_record},updated_kit_origins:1,..}}"),
+        );
+    }
+}

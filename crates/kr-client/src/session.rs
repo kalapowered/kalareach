@@ -1058,3 +1058,45 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) -> bool {
     }
     true
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::rendering::{NEVER_RENDERED, renders_only};
+
+    fn receipt() -> Receipt {
+        Receipt {
+            action_id: ActionId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16])),
+            actor_id: kr_protocol::ids::ActorId::new("device:test").expect("a principal"),
+            method: Method::SessionCreate.into(),
+            method_version: kr_protocol::method::MethodVersion::V1,
+            revision: kr_protocol::scalars::U64::new(2),
+            state: kr_protocol::receipt::ReceiptState::Dispatching,
+            reason: Nullable::null(),
+            payload_digest: kr_protocol::scalars::Digest256::from_bytes([0; 32]),
+            accepted_deadline_ms: Nullable::null(),
+            error: Nullable::null(),
+            updated_at_ms: kr_protocol::scalars::TimestampMs::new(0),
+        }
+    }
+
+    /// An answer and a settlement render which kind they are and, for a receipt, the action and
+    /// its state, exactly: never a result a host sent.
+    #[test]
+    fn an_answer_and_a_settlement_render_only_their_kind_and_the_receipts_place() {
+        let result =
+            ParamsValue::from_typed(&BTreeMap::from([("text", NEVER_RENDERED)])).expect("a result");
+        let receipt_rendered = "Receipt{action_id:ActionId(Uuid(\
+                                01010101-0101-0101-0101-010101010101)),state:Dispatching,..}";
+        renders_only(&Settled::Result(result.clone()), "Result(..)");
+        renders_only(&Settled::Receipt(Box::new(receipt())), receipt_rendered);
+        renders_only(
+            &Answer::Response(kr_protocol::envelope::Response {
+                request_id: RequestId::new(1),
+                outcome: kr_protocol::envelope::Outcome::Ok(result),
+            }),
+            "Response(..)",
+        );
+        renders_only(&Answer::Receipt(Box::new(receipt())), receipt_rendered);
+    }
+}

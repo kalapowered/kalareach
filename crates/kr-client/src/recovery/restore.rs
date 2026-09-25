@@ -284,3 +284,31 @@ impl FreshRestore {
         kr_crypto::backup::admit_for_restore(candidates)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::rendering::{NEVER_RENDERED, renders_only};
+
+    /// The material a restore trusts renders where it was read, as a diagnostic names an origin,
+    /// and how much it holds, exactly: never the locator.
+    #[test]
+    fn trusted_material_renders_only_where_it_was_read_and_how_much_it_holds() {
+        let material = TrustedMaterial {
+            context: RecoveryContext {
+                service_origin: "https://reach.example".to_owned(),
+                bundle_locator: NEVER_RENDERED.to_owned(),
+            },
+            trusted_writers: Vec::new(),
+            trusted_producers: Vec::new(),
+            collections: Vec::new(),
+            checkpoints: Vec::new(),
+            bundle_revision: 8,
+        };
+        renders_only(
+            &material,
+            "TrustedMaterial{service_origin:\"https://reach.example\",trusted_writers:0,\
+             trusted_producers:0,collections:0,checkpoints:0,bundle_revision:8,..}",
+        );
+    }
+}

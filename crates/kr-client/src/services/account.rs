@@ -1596,7 +1596,12 @@ impl StoredGrant {
         self.scopes.iter().any(|held| held == scope)
     }
 
-    fn read(bytes: &[u8]) -> Result<Self> {
+    /// Reads a stored grant.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage failure when the document is not one this build wrote.
+    pub(crate) fn read(bytes: &[u8]) -> Result<Self> {
         let document: GrantDocument = serde_json::from_slice(bytes).map_err(|error| {
             storage(crate::shown!(
                 "the stored sign-in could not be read: {}",

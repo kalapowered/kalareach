@@ -173,14 +173,24 @@ mod tests {
         BridgeFrame::Refused(ProtocolError::new(ErrorCode::PermissionDenied, "no"))
     }
 
-    /// A frame the peer sent that is not one this bridge reads, with the marker as a map key where
+    /// A frame the peer sent that is not one this bridge reads, with `planted` as a map key where
     /// the frame's own variant would be.
-    fn marked_payload() -> Vec<u8> {
+    fn planted_payload(planted: &str) -> Vec<u8> {
         let value = kr_protocol::envelope::ParamsValue::from_typed(
-            &std::collections::BTreeMap::from([(crate::shown::marker::MARKER, 1_u64)]),
+            &std::collections::BTreeMap::from([(planted, 1_u64)]),
         )
         .expect("a map");
         kr_cbor::encode(value.as_value())
+    }
+
+    /// Reads one frame whose payload is `payload`.
+    fn read_planted(payload: &[u8]) -> PipeError {
+        let mut stream = u32::try_from(payload.len())
+            .expect("fits")
+            .to_be_bytes()
+            .to_vec();
+        stream.extend_from_slice(payload);
+        read_frame(&mut stream.as_slice()).expect_err("a refusal")
     }
 
     /// A frame that is not a bridge frame is refused by the rule it broke and where, never by what
@@ -189,7 +199,7 @@ mod tests {
     fn a_frame_that_cannot_be_read_is_refused_without_what_it_held() {
         use crate::shown::marker::{MARKER, assert_unmarked, failure_renderings};
 
-        let payload = marked_payload();
+        let payload = planted_payload(MARKER);
         // The negative control: the decoder's own message, which the refusal carried whole,
         // quotes the key.
         let decoded =
@@ -197,13 +207,13 @@ mod tests {
                 .expect_err("not a bridge frame");
         assert!(decoded.to_string().contains(MARKER), "{decoded}");
 
-        let mut stream = u32::try_from(payload.len())
-            .expect("fits")
-            .to_be_bytes()
-            .to_vec();
-        stream.extend_from_slice(&payload);
-        let error = read_frame(&mut stream.as_slice()).expect_err("a refusal");
+        let error = read_planted(&payload);
         assert!(matches!(error, PipeError::Frame(_)), "{error}");
+        // The neutral control: the same frame with another key is refused in the same words, and
+        // those words name the rule the frame broke.
+        let neutral = read_planted(&planted_payload("neutral-value"));
+        assert_eq!(error.to_string(), neutral.to_string());
+        assert!(neutral.to_string().contains(decoded.rule()), "{neutral}");
         let carried = write_carried_payload(&mut Vec::new(), &payload).expect_err("a refusal");
         for refused in [error, carried] {
             assert_unmarked(
