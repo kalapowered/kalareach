@@ -1060,17 +1060,25 @@ many commands ask at once. `kr new` itself installs nothing: a definition that h
 not write, or that was changed after kr wrote it stops the command with `HOST_NOT_CONFIGURED`, names
 the file, and says to run `kr host startup --set service`. The command never writes it again. The
 same goes for a definition in the domain the environment's default execution profile no longer
-implies, which the setup, run again, rewrites; and for a manager holding anything under the
-definition's label but that definition, such as an earlier form of the job, or a drop-in for the
-unit other than the ones every service reads. kr leaves what a manager holds to the person: it
-names the remedy, `launchctl bootout <domain>/<label>` or deleting the drop-in, and the setup takes
-the definition once it has been applied. kr ends no daemon, so it never runs `launchctl bootout`
-itself.
+implies, which the setup, run again, rewrites; and for a manager that would run anything but that
+definition. On macOS that is a job launchd holds under the definition's label from another file or
+in an earlier form. On Linux it is a unit the user manager loads from another file, or whose
+commands are not exactly the one the definition names, whichever file or drop-in they come from:
+kr compares the manager's own record of every command, program, arguments and flags, word for word.
+A drop-in that leaves the command alone and sets the daemon's environment, limits or timeouts is
+the host's or yours, and the manager applies it; `--set service` names each drop-in the manager
+reads for the unit. kr leaves what a manager holds to the person: it names the remedy, `launchctl
+bootout <domain>/<label>` or the drop-ins to look in, and the setup takes the definition once it
+has been applied. kr ends no daemon, so it never runs `launchctl bootout` itself.
 
 | Platform | The definition | Where it is loaded |
 | --- | --- | --- |
 | macOS | a launchd job, `~/Library/LaunchAgents/kr-controller-<environment>.plist` | your graphical domain when the environment's sessions are desktop-bound by default, your background domain when they are headless |
 | Linux | a systemd user unit, `kr-controller-<environment>.service` in `$XDG_CONFIG_HOME/systemd/user`, `~/.config/systemd/user` by default | the user manager, with no `[Install]` section, so nothing enables it |
+
+On Linux, kr reads what the user manager holds over the manager's own socket,
+`$XDG_RUNTIME_DIR/systemd/private`, which `systemctl --user` also connects to first. A host whose
+user manager does not answer there has no service start.
 
 The daemon is the `kr-controller` installed beside `kr`, told this installation's runtime and state
 roots, working in the environment's state directory and writing to its `controller.log`. The
@@ -1085,9 +1093,10 @@ changed since kr wrote it, and leaves it exactly as it is.
 record, and end nothing. Setup, removal and `kr new` take turns: each holds the environment's
 `controller-service.lock` while it looks at or changes the definition or the manager's job, and
 `kr host startup` holds it until the configuration document is written too. A daemon the manager is
-running keeps serving; launchd keeps its job, which nothing starts again, until you log out, and the
-user manager forgets the unit once the daemon stops. A definition changed after kr wrote it is no longer kr's to remove,
-so it stays where it is and the command says so. `kr doctor` reports whether the definition matches
+running keeps serving. launchd keeps the job until its domain ends: the graphical domain ends at
+logout, and the background domain can outlive it. kr asks it to start nothing more, though a start requested just before
+may still complete. The user manager forgets the unit once the daemon stops. A definition changed
+after kr wrote it is no longer kr's to remove, so it stays where it is and the command says so. `kr doctor` reports whether the definition matches
 what kr wrote.
 
 `standalone` is for a host with no service manager set up to start the daemon: `kr new` runs the
