@@ -38,18 +38,20 @@
 //! be what kr wrote goes back by a link, which never replaces a file that took its place, or stays
 //! aside, and the command says where.
 //!
-//! What the manager holds has to be exactly the definition as well, by one rule for each manager.
-//! launchd must hold the job from kr's file, running exactly its program, arguments and working
-//! directory, or hold nothing, in which case the start request loads it. The user manager must load
-//! the unit from kr's file, read no drop-in for it but the ones in a `service.d` directory, which
-//! every service on the host reads, and have nothing to reload; then what it runs is what the file
-//! says, and nothing is read back out of its description of the command.
+//! What the manager would run has to be exactly the definition as well, by one rule for each
+//! manager. launchd must hold the job from kr's file, running exactly its program, arguments and
+//! working directory, or hold nothing, in which case the start request loads it; the check before a
+//! start request and the request itself each decide from what launchd holds when they ask. The user
+//! manager must load the unit from kr's file, have nothing to reload, and hold exactly one command
+//! for it, the file's, compared word for word with the manager's own typed record of it, with the
+//! start type the file gives and no other command; whatever else a drop-in sets, such as the
+//! daemon's environment or limits, is the host's and the person's.
 //!
 //! kr never ends a daemon, and never asks a manager to: it loads a definition and asks for a start,
 //! and nothing else. A manager holding another form of the job, or another definition under its
-//! label, is named with what removes it, `launchctl bootout` or deleting a drop-in, which is the
-//! person's to run. Removing a definition leaves a running daemon running: launchd keeps its job
-//! until the domain ends, and the user manager keeps a running unit whose file has gone until it
+//! label, is named with its remedy, `launchctl bootout` or the drop-ins to look in, which is the
+//! person's to apply. Removing a definition leaves a running daemon running: launchd keeps its job
+//! until its domain ends, and the user manager keeps a running unit whose file has gone until it
 //! stops.
 //!
 //! Every change `kr host startup` makes and every start request holds the environment's
@@ -1080,7 +1082,7 @@ mod platform {
 
     /// What launchd holds under one target.
     #[derive(Debug, PartialEq, Eq)]
-    enum Job {
+    pub(super) enum Job {
         NotLoaded,
         Loaded(Loaded),
     }
@@ -1235,23 +1237,39 @@ mod platform {
         }
     }
 
+    /// What a start request does with what launchd holds under the definition's label.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) enum Next {
+        /// Nothing is held yet: the definition is loaded first.
+        Load,
+        /// Exactly the definition is held: the job is started.
+        Start,
+    }
+
+    /// Decides [`Next`] from what launchd holds: anything but exactly the definition, or nothing,
+    /// is a refusal naming its remedy. The check before a start request and the start request
+    /// itself both decide by this, each from what launchd holds when it asks.
+    pub(super) fn next(found: &Job, expected: &Definition) -> std::result::Result<Next, Refusal> {
+        match found {
+            Job::NotLoaded => Ok(Next::Load),
+            Job::Loaded(loaded) => match held_otherwise(loaded, expected) {
+                None => Ok(Next::Start),
+                Some(why) => Err(Refusal::NotSetUp(format!("{why}; then {SETUP_ACTION}"))),
+            },
+        }
+    }
+
     /// Checks, for a start request, that launchd holds exactly the checked definition under its
     /// label, or nothing yet.
     pub(super) fn check(
         record: &Record,
         expected: &Definition,
     ) -> std::result::Result<(), Refusal> {
-        match job(&record.target()).map_err(Refusal::Failed)? {
-            Job::NotLoaded => Ok(()),
-            Job::Loaded(loaded) => match held_otherwise(&loaded, expected) {
-                None => Ok(()),
-                Some(why) => Err(Refusal::NotSetUp(format!("{why}; then {SETUP_ACTION}"))),
-            },
-        }
+        next(&job(&record.target()).map_err(Refusal::Failed)?, expected).map(|_| ())
     }
 
     /// What launchd still holds of a definition kr is removing, or has moved away from, told
-    /// rather than changed: launchd keeps a job it loaded until the domain ends, and a job that
+    /// rather than changed: launchd keeps a job it loaded until its domain ends, and a job that
     /// runs a daemon keeps it running.
     pub(super) fn release(record: &Record) -> Vec<String> {
         let target = record.target();
@@ -1260,11 +1278,11 @@ mod platform {
             Ok(Job::Loaded(loaded)) if !loaded.from(&record.path) => Vec::new(),
             Ok(Job::Loaded(Loaded { pid: Some(pid), .. })) => vec![format!(
                 "the daemon launchd started (process {pid}) keeps serving, and launchd keeps its \
-                 job {target} until the domain ends"
+                 job {target} until its domain ends"
             )],
             Ok(Job::Loaded(_)) => vec![format!(
-                "launchd keeps the job {target}, which runs nothing and which nothing starts, \
-                 until the domain ends"
+                "launchd keeps the job {target} until its domain ends; kr asks it to start \
+                 nothing more, though a start requested earlier may still complete"
             )],
             Err(why) => vec![format!("launchd could not be asked about {target}: {why}")],
         }
@@ -1279,13 +1297,16 @@ mod platform {
     /// Asks launchd to start the job the record names, with the environment's service lock held
     /// since the check. It is loaded first where launchd holds nothing under its label, as after a
     /// restart until the domain has loaded it again.
+    ///
+    /// The lock keeps other kr commands out, not other `launchctl` callers, so what launchd holds
+    /// is decided again here, from what it holds now.
     pub(super) fn start(
         record: &Record,
         expected: &Definition,
     ) -> std::result::Result<Asked, Refusal> {
         let domain = record.domain.as_deref().unwrap_or_default();
         let target = record.target();
-        if job(&target).map_err(Refusal::Failed)? == Job::NotLoaded {
+        if next(&job(&target).map_err(Refusal::Failed)?, expected)? == Next::Load {
             load(domain, &record.path).map_err(Refusal::Failed)?;
             match job(&target).map_err(Refusal::Failed)? {
                 Job::Loaded(loaded) if held_otherwise(&loaded, expected).is_none() => {}
@@ -1313,13 +1334,19 @@ mod platform {
 #[cfg(target_os = "linux")]
 mod platform {
     //! The systemd user manager.
+    //!
+    //! What it holds is read from it as typed values, over the socket of its own that `systemctl
+    //! --user` connects to first, so every path and every argument arrives as one whole value
+    //! rather than as text to take apart. It is changed through `systemctl --user`: `daemon-reload`
+    //! and `start`.
 
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     use kr_ipc::paths::EnvironmentPaths;
 
     use super::{
-        Asked, Definition, Manager, Record, Refusal, SETUP_ACTION, refused, run, same_file, text,
+        Asked, Definition, MANAGER_BOUND, Manager, Record, Refusal, SETUP_ACTION, refused, run,
+        same_file, text,
     };
     use crate::error::{CliError, Result};
 
@@ -1347,17 +1374,94 @@ mod platform {
         }
     }
 
-    /// Whether a user manager answers: one that answers a property query exists. Having the
-    /// `systemctl` program proves only that it is installed.
+    /// Whether a user manager answers on its own socket, which is where kr reads what it holds.
+    /// Having the `systemctl` program proves only that it is installed.
     pub(super) fn available() -> Result<()> {
-        succeeded(&["show", "--property=Version", "--value"])
-            .map(|_| ())
-            .map_err(|why| {
-                CliError::Usage(format!(
-                    "this host has no user service manager to start the daemon: {why}; kr host \
-                     startup --set standalone has kr new start it itself instead"
-                ))
+        ask(|connection| {
+            connection
+                .call_method(
+                    None::<&str>,
+                    MANAGER_PATH,
+                    Some(PROPERTIES_INTERFACE),
+                    "Get",
+                    &(MANAGER_INTERFACE, "Version"),
+                )
+                .map(|_| ())
+                .map_err(|error| format!("it did not say its version: {error}"))
+        })
+        .map_err(|why| {
+            CliError::Usage(format!(
+                "this host has no user service manager to start the daemon: {why}; kr host \
+                 startup --set standalone has kr new start it itself instead"
+            ))
+        })
+    }
+
+    const MANAGER_PATH: &str = "/org/freedesktop/systemd1";
+    const MANAGER_INTERFACE: &str = "org.freedesktop.systemd1.Manager";
+    const UNIT_INTERFACE: &str = "org.freedesktop.systemd1.Unit";
+    const SERVICE_INTERFACE: &str = "org.freedesktop.systemd1.Service";
+    const PROPERTIES_INTERFACE: &str = "org.freedesktop.DBus.Properties";
+
+    /// The signature of a property that lists commands the manager runs for a service, each with
+    /// its program, its arguments as separate words and its flags: every `Exec…Ex` property.
+    const COMMANDS: &str = "a(sasasttttuii)";
+
+    /// Where the user manager answers a connection of its own: the socket `systemctl --user`
+    /// connects to first.
+    fn private_socket() -> std::result::Result<PathBuf, String> {
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|directory| directory.is_absolute())
+            .map(|directory| directory.join("systemd/private"))
+            .ok_or_else(|| {
+                "XDG_RUNTIME_DIR does not name the directory the user manager answers in".to_owned()
             })
+    }
+
+    /// Puts `question` to the user manager over a connection to its own socket, peer to peer, and
+    /// gives up after [`MANAGER_BOUND`] whatever the manager is doing: the connection and every
+    /// call on it happen on a thread of their own, which is left to end by itself.
+    fn ask<T: Send + 'static>(
+        question: impl FnOnce(&zbus::blocking::Connection) -> std::result::Result<T, String>
+        + Send
+        + 'static,
+    ) -> std::result::Result<T, String> {
+        let socket = private_socket()?;
+        let place = socket.display().to_string();
+        let (answer, answered) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("user manager question".to_owned())
+            .spawn(move || {
+                let asked = std::os::unix::net::UnixStream::connect(&socket)
+                    .map_err(|error| {
+                        format!(
+                            "the user manager does not answer at {}: {error}",
+                            socket.display()
+                        )
+                    })
+                    .and_then(|stream| {
+                        zbus::blocking::connection::Builder::async_io_unix_stream(stream)
+                            .p2p()
+                            .method_timeout(MANAGER_BOUND)
+                            .build()
+                            .map_err(|error| {
+                                format!(
+                                    "the user manager at {} did not take a connection: {error}",
+                                    socket.display()
+                                )
+                            })
+                    })
+                    .and_then(|connection| question(&connection));
+                let _ = answer.send(asked);
+            })
+            .map_err(|error| format!("the user manager could not be asked: {error}"))?;
+        answered.recv_timeout(MANAGER_BOUND).unwrap_or_else(|_| {
+            Err(format!(
+                "the user manager at {place} did not answer within {} seconds",
+                MANAGER_BOUND.as_secs()
+            ))
+        })
     }
 
     /// The user manager has no domains to choose between.
@@ -1443,52 +1547,59 @@ mod platform {
         })
     }
 
-    /// What the user manager holds under one unit name, as `systemctl --user show` describes it.
-    #[derive(Debug, Default, PartialEq, Eq)]
-    pub(super) struct Unit {
-        load_state: String,
-        fragment: Option<PathBuf>,
-        drop_ins: Vec<PathBuf>,
-        need_reload: bool,
-        pid: Option<u32>,
+    /// One command the user manager runs for a unit, as the manager holds it: the program, every
+    /// argument as a word of its own with the program's name first, and the command's flags.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(super) struct Command {
+        pub(super) program: String,
+        pub(super) arguments: Vec<String>,
+        pub(super) flags: Vec<String>,
     }
 
-    /// The properties [`Unit`] is read from.
-    const PROPERTIES: &str =
-        "--property=LoadState,FragmentPath,DropInPaths,NeedDaemonReload,MainPID";
+    impl std::fmt::Display for Command {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "{} with the arguments {:?} and the flags {:?}",
+                self.program, self.arguments, self.flags
+            )
+        }
+    }
 
-    /// The directory of drop-ins every service on the host reads, whatever its name.
-    const EVERY_SERVICE: &str = "service.d";
+    /// What the user manager holds under one unit name, read from the manager itself as typed
+    /// values rather than from a command's printout of them.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    pub(super) struct Unit {
+        pub(super) load_state: String,
+        pub(super) fragment: Option<PathBuf>,
+        pub(super) drop_ins: Vec<PathBuf>,
+        pub(super) need_reload: bool,
+        pub(super) start_type: String,
+        /// Every command the manager runs for the unit, under the property that lists it; a
+        /// property that lists none is left out.
+        pub(super) commands: Vec<(String, Vec<Command>)>,
+        pub(super) pid: Option<u32>,
+    }
+
+    /// The property that lists the command the daemon runs as.
+    const START: &str = "ExecStartEx";
+
+    /// The flag a command carries when its line starts with `:`: no environment expansion.
+    const NO_ENVIRONMENT_EXPANSION: &str = "no-env-expand";
+
+    /// How the unit kr writes is started.
+    const START_TYPE: &str = "exec";
 
     impl Unit {
-        /// Reads what `systemctl --user show` printed for [`PROPERTIES`].
-        pub(super) fn read(printed: &str) -> Self {
-            let field = |key: &str| {
-                printed
-                    .lines()
-                    .find_map(|line| line.strip_prefix(key)?.strip_prefix('=').map(str::to_owned))
-            };
-            Self {
-                load_state: field("LoadState").unwrap_or_default(),
-                fragment: field("FragmentPath")
-                    .filter(|path| !path.is_empty())
-                    .map(PathBuf::from),
-                drop_ins: drop_ins(&field("DropInPaths").unwrap_or_default()),
-                need_reload: field("NeedDaemonReload").as_deref() == Some("yes"),
-                pid: field("MainPID")
-                    .and_then(|pid| pid.parse().ok())
-                    .filter(|pid| *pid != 0),
-            }
-        }
-
-        /// Why the manager would not run exactly the file `definition` names, when it would not.
+        /// Why the user manager would not run the definition kr wrote as kr wrote it, when it
+        /// would not.
         ///
-        /// The rule is that the manager reads kr's file and nothing else of this unit: the unit is
-        /// loaded from that file, and every drop-in that applies to it is in a `service.d`
-        /// directory, which every service on the host reads. A drop-in anywhere else, the unit's
-        /// own, a prefix of its name or an alias, is refused whatever it holds. Under the rule the
-        /// command the manager runs is the file's, which kr checked byte for byte, so nothing is
-        /// read back out of the manager's own account of the command.
+        /// The manager has to load the unit from kr's file and run one command for it: the one
+        /// the file names, its program, arguments and flags exactly, started the way the file
+        /// says, and no other command before, after or in place of it. The commands are compared
+        /// as the manager holds them, word for word, whichever file or drop-in they came from.
+        /// Whatever else a drop-in sets for the unit, its environment, limits or timeouts, is
+        /// the host's and the person's own, and kr leaves it to them.
         pub(super) fn difference(&self, definition: &Definition) -> Option<String> {
             let name = definition.target();
             match &self.fragment {
@@ -1509,63 +1620,176 @@ mod platform {
                     ));
                 }
             }
-            let others: Vec<String> = self
-                .drop_ins
-                .iter()
-                .filter(|drop_in| {
-                    drop_in
-                        .parent()
-                        .and_then(Path::file_name)
-                        .is_none_or(|directory| directory != EVERY_SERVICE)
-                })
-                .map(|drop_in| drop_in.display().to_string())
-                .collect();
-            (!others.is_empty()).then(|| {
+            let written = Command {
+                program: definition.program.clone(),
+                arguments: definition.arguments.clone(),
+                flags: vec![NO_ENVIRONMENT_EXPANSION.to_owned()],
+            };
+            let mut held = Vec::new();
+            for (property, commands) in &self.commands {
+                if property == START && commands.as_slice() == std::slice::from_ref(&written) {
+                    continue;
+                }
+                let listed: Vec<String> = commands.iter().map(ToString::to_string).collect();
+                held.push(format!("{property} {}", listed.join("; ")));
+            }
+            if !self.commands.iter().any(|(property, _)| property == START) {
+                held.push(format!("{START} with no command"));
+            }
+            if self.start_type != START_TYPE {
+                held.push(format!("Type {}", self.start_type));
+            }
+            (!held.is_empty()).then(|| {
                 format!(
-                    "the user manager reads drop-ins for {name} besides the ones every service \
-                     reads, {}, which change what kr wrote; remove them",
-                    others.join(", ")
+                    "the user manager would not run {name} as kr wrote it: it holds {}, where kr \
+                     wrote {START} {written} and Type {START_TYPE}, and no other command; {}",
+                    held.join(", "),
+                    self.reads()
                 )
             })
         }
+
+        /// The drop-ins the manager reads for the unit, for a person to look in.
+        pub(super) fn reads(&self) -> String {
+            if self.drop_ins.is_empty() {
+                return "it reads no drop-in for it".to_owned();
+            }
+            let listed: Vec<String> = self
+                .drop_ins
+                .iter()
+                .map(|drop_in| drop_in.display().to_string())
+                .collect();
+            format!("the drop-ins it reads for it are {}", listed.join(", "))
+        }
     }
 
-    /// The drop-in files `DropInPaths` lists, which it separates with spaces.
-    ///
-    /// A drop-in file's name ends in `.conf`, and the manager reads no other, so a list is split
-    /// after each name that ends so: a path with a space in it stays one path.
-    pub(super) fn drop_ins(listed: &str) -> Vec<PathBuf> {
-        let mut paths = Vec::new();
-        let mut current = String::new();
-        for word in listed.split(' ') {
-            if !current.is_empty() {
-                current.push(' ');
+    type Properties = std::collections::HashMap<String, zbus::zvariant::OwnedValue>;
+
+    /// Every property of `interface` on the unit object at `path`.
+    fn all(
+        connection: &zbus::blocking::Connection,
+        path: &zbus::zvariant::OwnedObjectPath,
+        interface: &str,
+    ) -> std::result::Result<Properties, String> {
+        connection
+            .call_method(
+                None::<&str>,
+                path.as_str(),
+                Some(PROPERTIES_INTERFACE),
+                "GetAll",
+                &(interface,),
+            )
+            .and_then(|reply| reply.body().deserialize::<Properties>())
+            .map_err(|error| format!("the user manager did not describe {interface}: {error}"))
+    }
+
+    /// One property taken out of those read, as the type the manager's interface gives it.
+    fn take_property<T>(properties: &mut Properties, name: &str) -> std::result::Result<T, String>
+    where
+        T: TryFrom<zbus::zvariant::OwnedValue>,
+        T::Error: std::fmt::Display,
+    {
+        let value = properties
+            .remove(name)
+            .ok_or_else(|| format!("the user manager does not say what {name} is"))?;
+        T::try_from(value).map_err(|error| {
+            format!("the user manager's {name} is not what systemd's interface describes: {error}")
+        })
+    }
+
+    /// Reads what the user manager holds under the unit `name`, loading it as `systemctl show`
+    /// does where the manager has not.
+    fn read(
+        connection: &zbus::blocking::Connection,
+        name: &str,
+    ) -> std::result::Result<Unit, String> {
+        let path: zbus::zvariant::OwnedObjectPath = connection
+            .call_method(
+                None::<&str>,
+                MANAGER_PATH,
+                Some(MANAGER_INTERFACE),
+                "LoadUnit",
+                &(name,),
+            )
+            .and_then(|reply| reply.body().deserialize())
+            .map_err(|error| format!("the user manager did not load {name}: {error}"))?;
+        let mut unit = all(connection, &path, UNIT_INTERFACE)?;
+        let mut service = all(connection, &path, SERVICE_INTERFACE)?;
+        let fragment: String = take_property(&mut unit, "FragmentPath")?;
+        let drop_ins: Vec<String> = take_property(&mut unit, "DropInPaths")?;
+        let pid: u32 = take_property(&mut service, "MainPID")?;
+        let start_type: String = take_property(&mut service, "Type")?;
+        let mut commands = Vec::new();
+        for (property, value) in service.drain() {
+            if value.value_signature().to_string() != COMMANDS {
+                continue;
             }
-            current.push_str(word);
-            if word.ends_with(".conf") {
-                paths.push(PathBuf::from(std::mem::take(&mut current)));
+            type Held = (
+                String,
+                Vec<String>,
+                Vec<String>,
+                u64,
+                u64,
+                u64,
+                u64,
+                u32,
+                i32,
+                i32,
+            );
+            let held = Vec::<Held>::try_from(value).map_err(|error| {
+                format!("the user manager's {property} is not a list of commands: {error}")
+            })?;
+            if held.is_empty() {
+                continue;
             }
+            let listed = held
+                .into_iter()
+                .map(|(program, arguments, flags, ..)| Command {
+                    program,
+                    arguments,
+                    flags,
+                })
+                .collect();
+            commands.push((property, listed));
         }
-        if !current.trim().is_empty() {
-            paths.push(PathBuf::from(current));
-        }
-        paths
+        commands.sort_by(|one, other| one.0.cmp(&other.0));
+        Ok(Unit {
+            load_state: take_property(&mut unit, "LoadState")?,
+            fragment: (!fragment.is_empty()).then(|| PathBuf::from(fragment)),
+            drop_ins: drop_ins.into_iter().map(PathBuf::from).collect(),
+            need_reload: take_property(&mut unit, "NeedDaemonReload")?,
+            start_type,
+            commands,
+            pid: (pid != 0).then_some(pid),
+        })
     }
 
     fn unit(name: &str) -> std::result::Result<Unit, String> {
-        let output = succeeded(&["show", PROPERTIES, name])?;
-        Ok(Unit::read(&String::from_utf8_lossy(&output.stdout)))
+        let name = name.to_owned();
+        ask(move |connection| read(connection, &name))
     }
 
-    /// Has the user manager read the definition just written, and checks that it reads nothing
-    /// else of the unit. What it reads besides is named with its remedy, and the definition stays
-    /// written and recorded.
+    /// Has the user manager read the definition just written, and checks that it would run it as
+    /// kr wrote it. What it holds otherwise is named with the drop-ins it reads, and the definition
+    /// stays written and recorded. Drop-ins that leave the command alone are named too, as what the
+    /// manager applies besides.
     pub(super) fn take(definition: &Definition) -> Result<Vec<String>> {
         let failed = |why: String| CliError::HostUnavailable(why);
         succeeded(&["daemon-reload"]).map_err(failed)?;
         let found = unit(&definition.target()).map_err(failed)?;
         match found.difference(definition) {
-            None => Ok(Vec::new()),
+            None if found.drop_ins.is_empty() => Ok(Vec::new()),
+            None => Ok(vec![format!(
+                "the user manager runs {} as kr wrote it, and applies what else these drop-ins set \
+                 for it: {}",
+                definition.target(),
+                found
+                    .drop_ins
+                    .iter()
+                    .map(|drop_in| drop_in.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )]),
             Some(why) => Err(CliError::HostUnavailable(format!(
                 "{why}; then run kr host startup --set service again. The definition is written \
                  and recorded, and kr host startup --clear removes it"
@@ -1573,8 +1797,8 @@ mod platform {
         }
     }
 
-    /// Checks, for a start request, that the user manager reads exactly the checked definition and
-    /// nothing else of the unit, and has read it since it last changed.
+    /// Checks, for a start request, that the user manager would run the checked definition as kr
+    /// wrote it, and has read it since it last changed.
     pub(super) fn check(
         record: &Record,
         expected: &Definition,
@@ -2004,6 +2228,61 @@ mod tests {
         );
     }
 
+    /// KR-REQ-07.12: a start request loads the definition where launchd holds nothing under its
+    /// label, starts the job where launchd holds exactly the definition, and refuses anything else
+    /// with its remedy. The check and the request both decide this way, each from what launchd
+    /// holds when it asks.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_start_request_loads_starts_or_refuses_what_launchd_holds_when_it_asks() {
+        let written = definition(
+            Path::new("/Users/someone/Library/LaunchAgents/kr-controller-test.plist"),
+            "the job\n",
+        );
+        let held = |path: &str, extra: &str| {
+            platform::Job::Loaded(platform::Loaded::read(&format!(
+                "gui/501/kr-controller-test = {{\n\
+                 \tpath = {path}\n\
+                 \tprogram = /opt/kr/kr-controller\n\
+                 \targuments = {{\n\
+                 \t\t/opt/kr/kr-controller\n\
+                 \t\t--state-dir\n\
+                 \t\t/state\n\
+                 {extra}\
+                 \t}}\n\
+                 \n\
+                 \tworking directory = /state/dir\n\
+                 }}\n"
+            )))
+        };
+        let path = written.path.display().to_string();
+        assert_eq!(
+            platform::next(&platform::Job::NotLoaded, &written).ok(),
+            Some(platform::Next::Load)
+        );
+        assert_eq!(
+            platform::next(&held(&path, ""), &written).ok(),
+            Some(platform::Next::Start)
+        );
+        for (job, what) in [
+            (
+                held("/Users/someone/Library/LaunchAgents/other.plist", ""),
+                "from another definition",
+            ),
+            (held(&path, "\t\t--worker\n"), "an earlier form"),
+        ] {
+            match platform::next(&job, &written) {
+                Err(Refusal::NotSetUp(why)) => assert!(
+                    why.contains(what)
+                        && why.contains("launchctl bootout gui/501/kr-controller-test")
+                        && why.contains(SETUP_ACTION),
+                    "{what}: {why}"
+                ),
+                other => panic!("{what}: {other:?}"),
+            }
+        }
+    }
+
     /// KR-REQ-07.12: a systemd user unit runs the daemon with this installation's roots, in the
     /// environment's own directory, only when started, with every word taken exactly as it is,
     /// a dollar sign in the program's own path included.
@@ -2047,12 +2326,13 @@ mod tests {
         assert_eq!(unit.arguments, arguments);
     }
 
-    /// The user manager reads exactly the definition when it loads the unit from kr's file and reads
-    /// no drop-in for it but the ones every service reads; a drop-in anywhere else, the unit's own,
-    /// a prefix of its name or an alias, is refused whatever it holds.
+    /// The user manager runs the definition as kr wrote it when it loads the unit from kr's file
+    /// and holds exactly the file's one command, word for word, started the way the file says. A
+    /// command anywhere else, or one whose words divide differently, is a difference wherever it
+    /// came from, and a drop-in that leaves the commands alone is not.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_user_unit_differs_when_the_manager_reads_anything_but_the_definition() {
+    fn a_user_unit_differs_when_the_manager_would_run_anything_but_the_definition() {
         let written = Definition {
             manager: Manager::Systemd,
             domain: None,
@@ -2062,71 +2342,143 @@ mod tests {
                 "the unit\n",
             )
         };
-        let path = written.path.display().to_string();
-        let described = |fragment: &str, drop_ins: &str| {
-            platform::Unit::read(&format!(
-                "LoadState=loaded\nFragmentPath={fragment}\nDropInPaths={drop_ins}\n\
-                 NeedDaemonReload=no\nMainPID=0\n"
-            ))
+        let command = |program: &str, arguments: &[&str], flags: &[&str]| platform::Command {
+            program: program.to_owned(),
+            arguments: arguments.iter().map(|word| (*word).to_owned()).collect(),
+            flags: flags.iter().map(|flag| (*flag).to_owned()).collect(),
         };
-        assert_eq!(described(&path, "").difference(&written), None);
+        let exact = command(
+            "/opt/kr/kr-controller",
+            &["/opt/kr/kr-controller", "--state-dir", "/state"],
+            &["no-env-expand"],
+        );
+        let path = written.path.display().to_string();
+        let held =
+            |fragment: &str, commands: Vec<(&str, Vec<platform::Command>)>, drop_ins: &[&str]| {
+                platform::Unit {
+                    load_state: "loaded".to_owned(),
+                    fragment: Some(PathBuf::from(fragment)),
+                    drop_ins: drop_ins.iter().map(PathBuf::from).collect(),
+                    need_reload: false,
+                    start_type: "exec".to_owned(),
+                    commands: commands
+                        .into_iter()
+                        .map(|(property, listed)| (property.to_owned(), listed))
+                        .collect(),
+                    pid: None,
+                }
+            };
+        let only = |listed: platform::Command| vec![("ExecStartEx", vec![listed])];
+
         assert_eq!(
-            described(
+            held(&path, only(exact.clone()), &[]).difference(&written),
+            None
+        );
+        assert_eq!(
+            held(
                 &path,
-                "/usr/lib/systemd/user/service.d/10-timeout-abort.conf \
-                 /home/some one/.config/systemd/user/service.d/limits.conf"
+                only(exact.clone()),
+                &[
+                    "/home/some one/.config/systemd/user/kr-controller-test.service.d/limits.conf",
+                    "/usr/lib/systemd/user/service.d/10-timeout-abort.conf",
+                ],
             )
             .difference(&written),
             None,
-            "drop-ins every service reads are the host's own"
+            "drop-ins that leave the command alone are the host's and the person's"
         );
-        for (fragment, drop_ins, what) in [
+        let started = |start_type: &str| platform::Unit {
+            start_type: start_type.to_owned(),
+            ..held(&path, only(exact.clone()), &[])
+        };
+        for (unit, what) in [
             (
-                "/etc/systemd/user/kr-controller-test.service",
-                "",
-                "loads kr-controller-test.service from",
+                held(
+                    "/etc/systemd/user/kr-controller-test.service",
+                    only(exact.clone()),
+                    &[],
+                ),
+                "loads kr-controller-test.service from /etc",
             ),
             (
-                path.as_str(),
-                "/home/some one/.config/systemd/user/kr-controller-test.service.d/override.conf",
-                "kr-controller-test.service.d/override.conf",
+                held(
+                    &path,
+                    only(command("/bin/true", &["/bin/true"], &[])),
+                    &["/x/overrides/service.d/zz.conf"],
+                ),
+                "ExecStartEx /bin/true",
             ),
             (
-                path.as_str(),
-                "/home/some one/.config/systemd/user/kr-controller-.service.d/prefix.conf",
-                "kr-controller-.service.d/prefix.conf",
+                held(
+                    &path,
+                    only(command(
+                        "/opt/kr/kr-controller",
+                        &["/opt/kr/kr-controller", "--state-dir /state"],
+                        &["no-env-expand"],
+                    )),
+                    &[],
+                ),
+                "\"--state-dir /state\"",
             ),
             (
-                path.as_str(),
-                "/usr/lib/systemd/user/service.d/10-timeout-abort.conf \
-                 /run/user/1000/systemd/user/alias.service.d/alias.conf",
-                "alias.service.d/alias.conf",
+                held(
+                    &path,
+                    only(command(
+                        "/opt/kr/kr-controller",
+                        &["/opt/kr/kr-controller", "--state-dir", "/state"],
+                        &[],
+                    )),
+                    &[],
+                ),
+                "and the flags []",
             ),
+            (
+                held(
+                    &path,
+                    vec![
+                        ("ExecStartEx", vec![exact.clone()]),
+                        (
+                            "ExecStartPreEx",
+                            vec![command("/bin/sh", &["/bin/sh", "-c", "true"], &[])],
+                        ),
+                    ],
+                    &[],
+                ),
+                "ExecStartPreEx /bin/sh",
+            ),
+            (
+                held(
+                    &path,
+                    vec![("ExecStartEx", vec![exact.clone(), exact.clone()])],
+                    &[],
+                ),
+                "it holds ExecStartEx",
+            ),
+            (held(&path, Vec::new(), &[]), "ExecStartEx with no command"),
+            (started("notify"), "Type notify"),
         ] {
-            let why = described(fragment, drop_ins)
-                .difference(&written)
-                .expect("a difference");
+            let why = unit.difference(&written).expect("a difference");
             assert!(why.contains(what), "{what}: {why}");
         }
+        let why = held(
+            &path,
+            only(command("/bin/true", &["/bin/true"], &[])),
+            &["/x/overrides/service.d/zz.conf"],
+        )
+        .difference(&written)
+        .expect("a difference");
         assert!(
-            platform::Unit::read("LoadState=not-found\nFragmentPath=\n")
-                .difference(&written)
-                .expect("not read")
-                .contains("has not read the definition")
+            why.contains("the drop-ins it reads for it are /x/overrides/service.d/zz.conf"),
+            "the difference names the drop-ins to look in: {why}"
         );
-    }
-
-    /// A list of drop-ins is split after each file name, so a path with a space stays one path.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_list_of_drop_ins_keeps_each_path_whole() {
-        assert_eq!(platform::drop_ins(""), Vec::<PathBuf>::new());
-        assert_eq!(
-            platform::drop_ins("/a b/x.service.d/one.conf /c/service.d/two.conf"),
-            vec![
-                PathBuf::from("/a b/x.service.d/one.conf"),
-                PathBuf::from("/c/service.d/two.conf"),
-            ]
+        assert!(
+            platform::Unit {
+                load_state: "not-found".to_owned(),
+                ..platform::Unit::default()
+            }
+            .difference(&written)
+            .expect("not read")
+            .contains("has not read the definition")
         );
     }
 }
