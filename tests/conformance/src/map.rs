@@ -522,19 +522,36 @@ impl Scope {
         })
     }
 
-    /// What `module` offers code in `from` under `name`. First its own function, which a macro's
-    /// item or a `use` of the same name could not stand beside; then a `use` that brings an item in
-    /// by that very name; then its globs, each for what the module it names offers `module`. A
-    /// glob offers only what `from` may name through it. Exactly one function among the globs is
-    /// the answer, since a second would be an ambiguity the compiler refuses; a module whose macros
-    /// could make items, a renaming `use`, a visibility the reading cannot work out and a glob it
-    /// cannot follow all leave the answer unproved.
-    fn offered(&self, module: &[String], name: &str, from: &[String], depth: usize) -> Found {
+    /// What `module` offers `caller` under `name`, reached through `importer`: the module itself
+    /// when the caller names it directly, or the module whose `use` or glob reached it. An item or a
+    /// `use` counts only where both the importer and the caller may name it, since a re-export
+    /// never makes anything more visible than it is. First the module's own function, which a
+    /// macro's item or a `use` of the same name could not stand beside; then a `use` that brings an
+    /// item in by that very name; then its globs, each for what the module it names offers. The
+    /// answer from the globs is a function only when exactly one of them offers one and nothing
+    /// about any of them is in doubt: a glob the reading cannot follow, a renaming `use` among
+    /// them, a visibility it cannot work out, or a module whose macros could make items.
+    fn offered(
+        &self,
+        module: &[String],
+        name: &str,
+        importer: &[String],
+        caller: &[String],
+        depth: usize,
+    ) -> Found {
         if depth > DEPTH {
             return Found::Unproved;
         }
+        let reachable = |visibility: Visibility| match (
+            visible(visibility, module, importer),
+            visible(visibility, module, caller),
+        ) {
+            (Some(true), Some(true)) => Some(true),
+            (Some(false), _) | (_, Some(false)) => Some(false),
+            _ => None,
+        };
         if let Some(visibility) = self.functions.get(&(module.to_vec(), name.to_owned())) {
-            return match visible(*visibility, module, from) {
+            return match reachable(*visibility) {
                 Some(true) => Found::Function(module.to_vec()),
                 Some(false) => Found::Absent,
                 None => Found::Unproved,
@@ -550,7 +567,7 @@ impl Scope {
             if path.last().map(String::as_str) != Some(name) {
                 return Found::Unproved;
             }
-            return match visible(*visibility, module, from) {
+            return match reachable(*visibility) {
                 Some(false) => Found::Absent,
                 None => Found::Unproved,
                 Some(true) => {
@@ -560,7 +577,7 @@ impl Scope {
                     };
                     // A `use` names something; if the reading finds nothing there, it cannot say
                     // what.
-                    match self.offered(&target, name, module, depth + 1) {
+                    match self.offered(&target, name, module, caller, depth + 1) {
                         Found::Absent => Found::Unproved,
                         found => found,
                     }
@@ -576,7 +593,7 @@ impl Scope {
             let Import::Glob { path } = import else {
                 continue;
             };
-            match visible(*visibility, module, from) {
+            match reachable(*visibility) {
                 Some(false) => continue,
                 None => {
                     unknown = true;
@@ -588,7 +605,7 @@ impl Scope {
                 unknown = true;
                 continue;
             };
-            match self.offered(&target, name, module, depth + 1) {
+            match self.offered(&target, name, module, caller, depth + 1) {
                 Found::Function(defined) => {
                     found.insert(defined);
                 }
@@ -597,7 +614,7 @@ impl Scope {
             }
         }
         match (found.len(), unknown) {
-            (1, _) => Found::Function(found.into_iter().next().unwrap_or_default()),
+            (1, false) => Found::Function(found.into_iter().next().unwrap_or_default()),
             (0, false) => Found::Absent,
             _ => Found::Unproved,
         }
@@ -633,7 +650,7 @@ fn reaches(
         scope.module(from, qualifier, local, 0)
     };
     module.is_some_and(|module| {
-        scope.offered(&module, name, from, 0) == Found::Function(helper.module.clone())
+        scope.offered(&module, name, from, from, 0) == Found::Function(helper.module.clone())
     })
 }
 
