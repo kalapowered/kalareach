@@ -683,6 +683,17 @@ impl Source {
             .collect()
     }
 
+    /// The full path of a type `name` defined in `scope`. A block's definition is named by its block
+    /// too, so a type a function defines is never the module's type of the same name.
+    fn defined_path(&self, scope: usize, name: &str) -> String {
+        let mut path = self.module_of(scope);
+        if self.scopes[scope].block {
+            path.push(format!("{{block {scope}}}"));
+        }
+        path.push(name.to_owned());
+        path.join("::")
+    }
+
     /// The scopes whose names a path written in `scope` can use without a prefix: the scope itself
     /// and each block around it, up to and including the module they are in.
     fn visible(&self, scope: usize) -> Vec<usize> {
@@ -780,12 +791,8 @@ impl Source {
                         placed = Some(path.iter().chain(rest).cloned().collect::<Vec<_>>());
                     }
                     (0, true) => {
-                        placed = Some(
-                            self.module_of(visible)
-                                .into_iter()
-                                .chain(segments.iter().cloned())
-                                .collect(),
-                        );
+                        let joined = self.defined_path(visible, first);
+                        return Some(aliases.get(&joined).cloned().unwrap_or(joined));
                     }
                     _ => return None,
                 }
@@ -1290,6 +1297,8 @@ struct Known {
     /// The error types `thiserror` renders.
     thiserror: BTreeSet<String>,
     debug_as_display: BTreeSet<String>,
+    /// The places a claim, an error or a rendering names a type this reading cannot place.
+    unplaced: Vec<Finding>,
 }
 
 /// The re-exports of each crate's root, as full paths to what they name.
@@ -1306,6 +1315,33 @@ fn aliases(sources: &[Source]) -> BTreeMap<String, String> {
     aliases
 }
 
+/// The full paths of the types `tokens` name in `source`, recording a finding for each one this
+/// reading cannot place: a claim, an error or a rendering whose type is unknown is never passed over.
+fn placed(
+    source: &Source,
+    tokens: &[Located],
+    scope: usize,
+    aliases: &BTreeMap<String, String>,
+    what: &str,
+    unplaced: &mut Vec<Finding>,
+) -> Vec<String> {
+    let line = tokens.first().map_or(0, |located| located.line);
+    held(source, tokens, scope, aliases)
+        .into_iter()
+        .filter_map(|path| {
+            if path.is_none() {
+                unplaced.push(Finding {
+                    file: source.name.clone(),
+                    line,
+                    item: what.to_owned(),
+                    what: format!("{what} names a type this reading cannot place"),
+                });
+            }
+            path
+        })
+        .collect()
+}
+
 fn collect_known(sources: &[Source], aliases: &BTreeMap<String, String>) -> Known {
     let mut known = Known::default();
     for source in sources {
@@ -1317,20 +1353,24 @@ fn collect_known(sources: &[Source], aliases: &BTreeMap<String, String>) -> Know
             };
             match word.as_str() {
                 // `impl Plain for T`, claimed only in the two files that define what may be shown.
-                "Plain" if shown_file && ident(tokens.get(index + 1)) == Some("for") => {
+                // A macro's own `impl Plain for $name` is its definition, not a claim.
+                "Plain"
+                    if shown_file
+                        && ident(tokens.get(index + 1)) == Some("for")
+                        && !punct(tokens.get(index + 2), '$') =>
+                {
                     let end = (index + 2..tokens.len())
                         .find(|&end| punct(tokens.get(end), '{'))
                         .unwrap_or(tokens.len());
-                    known.plain.extend(
-                        held(
-                            source,
-                            &tokens[index + 2..end],
-                            source.scope_at(index),
-                            aliases,
-                        )
-                        .into_iter()
-                        .flatten(),
+                    let paths = placed(
+                        source,
+                        &tokens[index + 2..end],
+                        source.scope_at(index),
+                        aliases,
+                        "impl Plain",
+                        &mut known.unplaced,
                     );
+                    known.plain.extend(paths);
                 }
                 "plain" | "debug_as_display"
                     if punct(tokens.get(index + 1), '!') && punct(tokens.get(index + 2), '(') =>
@@ -1339,9 +1379,14 @@ fn collect_known(sources: &[Source], aliases: &BTreeMap<String, String>) -> Know
                         continue;
                     }
                     for argument in arguments(tokens, index + 2).unwrap_or_default() {
-                        let paths = held(source, &argument, source.scope_at(index), aliases)
-                            .into_iter()
-                            .flatten();
+                        let paths = placed(
+                            source,
+                            &argument,
+                            source.scope_at(index),
+                            aliases,
+                            &format!("{word}!"),
+                            &mut known.unplaced,
+                        );
                         if word == "plain" {
                             known.plain.extend(paths);
                         } else {
@@ -1356,15 +1401,14 @@ fn collect_known(sources: &[Source], aliases: &BTreeMap<String, String>) -> Know
                     let end = (index + 2..tokens.len())
                         .find(|&end| punct(tokens.get(end), '{') || punct(tokens.get(end), ';'))
                         .unwrap_or(tokens.len());
-                    for path in held(
+                    for path in placed(
                         source,
                         &tokens[index + 2..end],
                         source.scope_at(index),
                         aliases,
-                    )
-                    .into_iter()
-                    .flatten()
-                    {
+                        "impl Error",
+                        &mut known.unplaced,
+                    ) {
                         known
                             .errors
                             .entry(path)
@@ -1376,10 +1420,7 @@ fn collect_known(sources: &[Source], aliases: &BTreeMap<String, String>) -> Know
                     if derives.iter().any(|name| name == "thiserror::Error")
                         && let Some(name) = defined_after(tokens, index)
                     {
-                        let path = format!(
-                            "{}::{name}",
-                            source.module_of(source.scope_at(index)).join("::")
-                        );
+                        let path = source.defined_path(source.scope_at(index), &name);
                         known.errors.insert(path.clone(), source.name.clone());
                         known.thiserror.insert(path);
                     }
@@ -1458,7 +1499,7 @@ fn defined_after(tokens: &[Located], at: usize) -> Option<String> {
 fn check(sources: &[Source]) -> Vec<Finding> {
     let aliases = aliases(sources);
     let known = collect_known(sources, &aliases);
-    let mut findings = BTreeSet::new();
+    let mut findings: BTreeSet<Finding> = known.unplaced.iter().cloned().collect();
     for source in sources {
         findings.extend(source.problems.iter().cloned());
         check_source(source, &known, &aliases, &mut findings);
@@ -1537,12 +1578,18 @@ fn check_source(
                     &tokens[index + 2..end],
                     source.scope_at(index),
                     aliases,
-                )
-                .into_iter()
-                .flatten()
-                {
-                    if known.errors.contains_key(&path) {
-                        find(line, &path, "an error type with a Debug written by hand");
+                ) {
+                    match path {
+                        Some(path) if known.errors.contains_key(&path) => {
+                            find(line, &path, "an error type with a Debug written by hand");
+                        }
+                        Some(_) => {}
+                        // A `Debug` for a type this reading cannot place could be an error's.
+                        None => find(
+                            line,
+                            "impl Debug",
+                            "impl Debug names a type this reading cannot place",
+                        ),
                     }
                 }
             }
@@ -1675,10 +1722,7 @@ fn check_source(
                         );
                     }
                 }
-                let path = format!(
-                    "{}::{defined}",
-                    source.module_of(source.scope_at(index)).join("::")
-                );
+                let path = source.defined_path(source.scope_at(index), &defined);
                 if known.errors.contains_key(&path)
                     && derives.iter().any(|derive| derive == "Debug")
                 {
@@ -1697,10 +1741,7 @@ fn check_source(
             }
             "struct" | "enum" if !shown_file => {
                 if let Some(name) = ident(tokens.get(index + 1)) {
-                    let path = format!(
-                        "{}::{name}",
-                        source.module_of(source.scope_at(index)).join("::")
-                    );
+                    let path = source.defined_path(source.scope_at(index), name);
                     if known.errors.contains_key(&path) {
                         check_error_type(source, index, &path, known, aliases, &mut find);
                     }
@@ -2404,7 +2445,7 @@ fn each_break_of_the_rule_is_named_with_its_class_and_place() {
             "a name placed in another function's block",
             "fn first() {\n    use kr_protocol::scalars::Uuid;\n}\nfn second() {\n    type Uuid = String;\n    #[derive(thiserror::Error)]\n    enum Failure {\n        #[error(\"failed: {0}\")]\n        Failed(Uuid),\n    }\n    kr_client::debug_as_display!(Failure);\n}\n",
             9,
-            "error field of type kr_cli::control::Uuid",
+            "error field of type kr_cli::control::{block",
         ),
         (
             "an expect called through parentheses",
@@ -2423,6 +2464,18 @@ fn each_break_of_the_rule_is_named_with_its_class_and_place() {
             "fn f(input: &str) {\n    dbg!(input);\n}\n",
             2,
             "standard error written outside",
+        ),
+        (
+            "an error this reading cannot place",
+            "mod other {\n    pub struct Failure(pub String);\n}\n#[cfg(unix)]\nstruct Failure(String);\n#[cfg(not(unix))]\nuse other::Failure;\nimpl std::error::Error for Failure {}\nkr_client::display_as_said!(Failure);\nimpl std::fmt::Debug for Failure {\n    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(\"x\") }\n}\n",
+            8,
+            "impl Error names a type this reading cannot place",
+        ),
+        (
+            "a function's type named like a module's error",
+            "#[derive(thiserror::Error)]\npub enum Token {\n    #[error(\"refused\")]\n    Refused,\n}\nkr_client::debug_as_display!(Token);\nfn f() {\n    type Token = String;\n    #[derive(thiserror::Error)]\n    enum Local {\n        #[error(\"{0}\")]\n        Failed(Token),\n    }\n    kr_client::debug_as_display!(Local);\n}\n",
+            12,
+            "error field of type kr_cli::control::{block",
         ),
         (
             "an error whose Debug is not its Display",
