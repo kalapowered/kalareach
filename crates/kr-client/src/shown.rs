@@ -600,7 +600,10 @@ impl Shown {
                         })
                         .unwrap_or("[a name]"),
                 ),
-                other => said.push(other.as_os_str()),
+                std::path::Component::Prefix(prefix) => said.push(path_prefix(prefix.kind())),
+                std::path::Component::RootDir
+                | std::path::Component::CurDir
+                | std::path::Component::ParentDir => said.push(component.as_os_str()),
             }
         }
         Self::decided(said.display().to_string())
@@ -708,6 +711,19 @@ fn written_by_a_store(name: &str, extensions: &[&str]) -> bool {
         return false;
     };
     identifier(first) && parts.all(|part| identifier(part) || extensions.contains(&part))
+}
+
+/// What a path's prefix says outside a configured root: a drive's letter, and a placeholder for a
+/// server, a share or a device, whose names are whatever somebody gave them.
+fn path_prefix(prefix: std::path::Prefix<'_>) -> String {
+    match prefix {
+        std::path::Prefix::Disk(letter) | std::path::Prefix::VerbatimDisk(letter)
+            if letter.is_ascii_alphabetic() =>
+        {
+            format!("{}:", char::from(letter))
+        }
+        _ => "[a network or device path]".to_owned(),
+    }
 }
 
 /// The word `segment` is in one of the paths the service adapters call, if it is one.
@@ -1344,6 +1360,25 @@ mod tests {
                 .as_str()
                 .ends_with("sessions/0e1f9a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b.kr")
         );
+    }
+
+    /// A path prefix outside a configured root says a drive's letter, and never a server's, a
+    /// share's or a device's name.
+    #[test]
+    fn a_path_prefix_says_a_drive_and_never_a_servers_name() {
+        use std::ffi::OsStr;
+        use std::path::Prefix;
+
+        assert_eq!(path_prefix(Prefix::Disk(b'C')), "C:");
+        assert_eq!(path_prefix(Prefix::VerbatimDisk(b'D')), "D:");
+        for prefix in [
+            Prefix::UNC(OsStr::new(MARKER), OsStr::new("share")),
+            Prefix::VerbatimUNC(OsStr::new("server"), OsStr::new(MARKER)),
+            Prefix::Verbatim(OsStr::new(MARKER)),
+            Prefix::DeviceNS(OsStr::new(MARKER)),
+        ] {
+            assert_eq!(path_prefix(prefix), "[a network or device path]");
+        }
     }
 
     /// A terminal type is said when it is a terminfo name this build lists, and replaced otherwise,
