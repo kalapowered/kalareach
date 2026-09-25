@@ -652,7 +652,7 @@ impl UpstreamDispatch for JournalHoldingUpstream {
     }
 }
 
-/// KR-REQ-09 and KR-REQ-12.06: a dispatch marker this host could not write leaves nothing
+/// Section 9 and KR-REQ-12.06: a dispatch marker this host could not write leaves nothing
 /// executable behind it.
 ///
 /// The admission is taken before the marker, so the window this closes is the one between them.
@@ -912,7 +912,7 @@ fn approval_mutation(
     }
 }
 
-/// KR-REQ-11.33 and KR-REQ-09: a resource the native path resolved first leaves the rich answer a
+/// KR-REQ-11.33 and section 9: a resource the native path resolved first leaves the rich answer a
 /// rejection with a receipt, not an outcome nobody can establish.
 ///
 /// Here the resource is already resolved when the mutation is sent. The harder case, where it is
@@ -957,7 +957,7 @@ async fn kr_req_11_33_a_natively_resolved_resource_leaves_the_rich_answer_a_reje
     );
 }
 
-/// KR-REQ-11.17 and KR-REQ-09: evidence withdrawn before the service admits is a rejection too.
+/// KR-REQ-11.17 and section 9: evidence withdrawn before the service admits is a rejection too.
 ///
 /// The other door: the capability the answer needs is invalidated rather than the resource being
 /// resolved. Again the interval version follows below.
@@ -1030,7 +1030,7 @@ fn durable(host: &Host, action_id: ActionId) -> (Option<String>, Vec<String>) {
     (state, events)
 }
 
-/// KR-REQ-11.33, KR-REQ-11.17 and KR-REQ-09: what changes inside the interval between the durable
+/// KR-REQ-11.33, KR-REQ-11.17 and section 9: what changes inside the interval between the durable
 /// acceptance and the broker's admission is still a rejection, and still sends nothing.
 ///
 /// This is the window the admission was moved across. The service used to finish its own checks
@@ -1120,7 +1120,7 @@ async fn kr_req_11_33_what_changes_inside_the_admission_interval_is_still_a_reje
     }
 }
 
-/// KR-REQ-09 and KR-REQ-11.27: an approval whose dispatch marker the receipt journal refused
+/// Section 9 and KR-REQ-11.27: an approval whose dispatch marker the receipt journal refused
 /// leaves its reservation back where it was.
 ///
 /// The marker is the receipt's, and the reservation is the broker's. They live in one journal
@@ -1587,7 +1587,7 @@ fn socket_pair() -> (SocketStream, SocketStream) {
     (ready(here), ready(there))
 }
 
-/// KR-REQ-09 and KR-REQ-11.33: a request that went in full and was never answered leaves a receipt
+/// Section 9 and KR-REQ-11.33: a request that went in full and was never answered leaves a receipt
 /// nobody can read as applied.
 ///
 /// The transport here is the real one, over a real socket pair. The upstream reads the whole frame
@@ -1980,7 +1980,7 @@ async fn plugin_answer(
     (error.code, receipt(client, action_id).await.state)
 }
 
-/// KR-REQ-12.18 and KR-REQ-09: a plugin action that names a pending resource is checked against
+/// KR-REQ-12.18 and section 9: a plugin action that names a pending resource is checked against
 /// that resource before its dispatch marker. An unknown resource, one that belongs to another
 /// instance and one already answered are each refused for that reason, with a receipt that says
 /// so. Naming none, or one this instance can still answer, passes the check and meets the refusal
