@@ -29,11 +29,11 @@ use kr_protocol::service::{ServiceRequestSignature, installation_id};
 /* Shapes                                                                      */
 /* -------------------------------------------------------------------------- */
 
-fn installation(seed: u8) -> InstallationId {
+pub(super) fn installation(seed: u8) -> InstallationId {
     InstallationId::new(identity(seed))
 }
 
-fn shared_collection(home: InstallationId, seed: u8) -> CollectionRef {
+pub(super) fn shared_collection(home: InstallationId, seed: u8) -> CollectionRef {
     CollectionRef {
         home,
         collection_id: SyncCollectionId::new(identity(seed)),
@@ -42,7 +42,7 @@ fn shared_collection(home: InstallationId, seed: u8) -> CollectionRef {
 
 /// A real key record of `collection` at `revision` and `epoch`, issued by a fresh device that is
 /// its only member.
-fn record(collection: &CollectionRef, revision: u64, epoch: u64) -> CollectionKeyRecord {
+pub(super) fn record(collection: &CollectionRef, revision: u64, epoch: u64) -> CollectionKeyRecord {
     let issuer = DeviceKeys::generate().expect("device keys");
     let draft = CollectionRecordDraft {
         collection_id: collection.collection_id,

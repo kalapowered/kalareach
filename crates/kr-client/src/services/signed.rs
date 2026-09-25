@@ -369,10 +369,28 @@ impl Refusal {
     pub(crate) fn into_error(self) -> ClientError {
         let (code, action) = classify(&self.code, self.status);
         ClientError::Refused {
-            error: ProtocolError::new(code, self.message),
+            error: ProtocolError::new(code, plain_message(&self.code, self.message)),
             retry_after_seconds: self.retry_after_seconds,
             action,
         }
+    }
+}
+
+/// What a person is told about one refusal: the service's own message, except where the code says
+/// more about this request than the service's words do.
+///
+/// `SIGNED_BEFORE_CUTOFF` is that exception. The service words it for a write that may have run
+/// before, and an exchange reads it as an answer before it could become an error. Every other
+/// request reaches it as an error, and for those what matters is what the refusal means: nothing
+/// ran, nothing was recorded, and asking again can succeed only once the service's cutoff falls
+/// behind the clocks.
+fn plain_message(code: &str, message: String) -> String {
+    match code {
+        "SIGNED_BEFORE_CUTOFF" => "nothing ran and nothing was recorded: the service holds this \
+             request as signed before its collection's cutoff, which runs ahead of the clocks, and \
+             asking again can succeed only once the cutoff falls behind them"
+            .to_owned(),
+        _ => message,
     }
 }
 
@@ -459,6 +477,15 @@ fn answer_of(answer: &ServiceHttpAnswer) -> Result<Answer> {
 /// one answer for both, reported as the unknown object it is to this device. `KEY_EPOCH_RETIRED` is
 /// a write sealed under a key the collection no longer writes with: this device's view has fallen
 /// behind the collection's key records, which a refresh brings up to date.
+///
+/// `SIGNED_BEFORE_CUTOFF` refuses a request signed before the collection's cutoff, running nothing
+/// and recording nothing. An exchange reads it as an answer about its attempt. Every other request
+/// is signed when it is sent, or, for a key-record offer, at the instant its caller recorded, which
+/// this client sends only while it is fresh. The service checks freshness first, so a refusal of
+/// one says that the collection's record of what it swept runs ahead of the clocks. Nothing on this
+/// device can correct that, and the request as sent is not at fault, so it is `CLOCK_UNTRUSTED`,
+/// which retries nothing by itself, and the person waits: asking again can succeed only once the
+/// cutoff falls behind the clocks.
 fn classify(code: &str, status: u16) -> (ErrorCode, UserAction) {
     match code {
         "UNAUTHENTICATED" => (ErrorCode::PermissionDenied, UserAction::FixConfiguration),
@@ -475,6 +502,7 @@ fn classify(code: &str, status: u16) -> (ErrorCode, UserAction) {
         "REQUEST_FENCED" => (ErrorCode::PermissionDenied, UserAction::Nothing),
         "COLLECTION_ABSENT" => (ErrorCode::UnknownSession, UserAction::Nothing),
         "KEY_EPOCH_RETIRED" => (ErrorCode::ResyncRequired, UserAction::Resync),
+        "SIGNED_BEFORE_CUTOFF" => (ErrorCode::ClockUntrusted, UserAction::Wait),
         _ if status >= 500 => (ErrorCode::UpstreamUnavailable, UserAction::Wait),
         _ => (ErrorCode::InvalidArgument, UserAction::Update),
     }

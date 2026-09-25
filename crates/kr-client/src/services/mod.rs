@@ -88,7 +88,9 @@
 //!
 //! One thing is deliberately not covered by it. A refusal the service sent carries the service's
 //! own message, which is written to be shown to a person, and that message is in the error this
-//! client returns. What is never in it is anything else of the answer.
+//! client returns. What is never in it is anything else of the answer. The one refusal whose words
+//! are this client's is settings sync's `SIGNED_BEFORE_CUTOFF` outside an exchange, because the
+//! service words it for a write and what the person needs is what it means for their request.
 
 pub mod account;
 pub mod authority;

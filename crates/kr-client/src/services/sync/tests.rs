@@ -6,7 +6,7 @@
 //! itself.
 
 use super::*;
-use crate::retry::{Step, UserAction};
+use crate::retry::{RequestClass, Step, UserAction};
 use crate::services::ServiceHttpAnswer;
 use crate::services::rendering::{NEVER_RENDERED, renders_only};
 use kr_crypto::secret::Secret;
@@ -1256,22 +1256,49 @@ async fn the_services_own_refusals_are_errors_that_say_what_they_are() {
     );
 }
 
+/* -------------------------------------------------------------------------- */
+/* A request signed before the collection's cutoff                             */
+/* -------------------------------------------------------------------------- */
+
+/// The refusal of a request signed before the collection's cutoff, in the service's own words.
+fn cut_off() -> ServiceHttpAnswer {
+    refusal(
+        409,
+        "SIGNED_BEFORE_CUTOFF",
+        "That request is older than this collection can account for, and an earlier attempt at it \
+         may already have run, so it is not carried out.",
+    )
+}
+
+/// Holds what a request other than an exchange is told when it meets the cutoff.
+///
+/// An untrusted clock, which nothing sends or signs again by itself whatever the request is, and
+/// which the person waits out rather than updating this client; and a message that says nothing
+/// ran and nothing was recorded, in place of the service's words about a write.
+fn told_to_wait_for_the_cutoff(refused: &ClientError) {
+    assert_eq!(refused.code(), ErrorCode::ClockUntrusted, "{refused}");
+    assert_eq!(refused.user_action(), UserAction::Wait, "{refused}");
+    for class in RequestClass::ALL {
+        let decision = refused.decision(class);
+        assert!(!decision.retries_automatically(), "{refused} for {class:?}");
+        assert_eq!(decision.action, UserAction::Wait);
+    }
+    let said = refused.to_string();
+    assert!(
+        said.contains("nothing ran and nothing was recorded"),
+        "{said}"
+    );
+    assert!(!said.contains("earlier attempt"), "{said}");
+}
+
+/// KR-REQ-20.13, the control: a write signed before the cutoff is an answer that ends its attempt,
+/// in a collection only its home writes and in a shared one, because its caller must never present
+/// the identity again; and every other refusal of a write stays an error.
 #[tokio::test]
 async fn a_write_signed_before_the_cutoff_is_an_answer_that_ends_its_attempt() {
-    // The service refuses an attempt signed before the collection's cutoff without running it. To
-    // a write that is an answer about the attempt, because its caller must never present the
-    // identity again. Every other request is signed as it is sent, so to them it stays the error
-    // the service named, and every other refusal of a write stays an error too.
     let (client, recorder) = sync_client();
     let object = identity(7);
     let bytes = published(&sealed(b"theme=dark"));
-    let cut_off = || {
-        refusal(
-            409,
-            "SIGNED_BEFORE_CUTOFF",
-            "That request was signed before this collection's cutoff and was not run.",
-        )
-    };
 
     recorder.answering_with(vec![cut_off()]);
     assert_eq!(
@@ -1281,21 +1308,312 @@ async fn a_write_signed_before_the_cutoff_is_an_answer_that_ends_its_attempt() {
             .expect("an answer"),
         SyncExchanged::SignedBeforeCutoff
     );
-
-    recorder.answering_with(vec![cut_off()]);
-    assert!(
+    let collection = shared::shared_collection(shared::installation(0x41), 0x42);
+    assert_eq!(
         client
-            .request_status(&settings_of(object), identity(8))
+            .exchange_shared(
+                &collection,
+                &settings_of(object),
+                1,
+                identity(8),
+                now_ms(),
+                None,
+                &bytes,
+            )
             .await
-            .is_err(),
-        "a status query is no write"
+            .expect("an answer"),
+        Keyed::Answered {
+            answer: SyncExchanged::SignedBeforeCutoff,
+            head: None,
+        }
     );
+
     recorder.answering_with(vec![refusal(409, "ID_CONFLICT", "reused")]);
     let taken = client
         .compare_exchange(&settings_of(object), identity(8), now_ms(), None, &bytes)
         .await
         .expect_err("another refusal of a write");
     assert_eq!(taken.code(), ErrorCode::IdConflict);
+}
+
+/// KR-REQ-20.13: a comparison refused as signed before the cutoff, and a fetch, which is one, are
+/// an untrusted clock to wait out, in a collection only its home writes and in a shared one.
+#[tokio::test]
+async fn a_comparison_refused_before_the_cutoff_is_a_clock_to_wait_out() {
+    let (client, recorder) = sync_client();
+    let object = settings_of(identity(7));
+    let collection = shared::shared_collection(shared::installation(0x41), 0x42);
+    recorder.answering_with(vec![cut_off()]);
+
+    told_to_wait_for_the_cutoff(
+        &client
+            .compare(&object, true, None)
+            .await
+            .expect_err("refused"),
+    );
+    told_to_wait_for_the_cutoff(&client.fetch(&object).await.expect_err("refused"));
+    told_to_wait_for_the_cutoff(
+        &client
+            .compare_shared(&collection, &[], true, None)
+            .await
+            .expect_err("refused"),
+    );
+    told_to_wait_for_the_cutoff(
+        &client
+            .inventory(&collection, None, NonZeroUsize::MIN)
+            .await
+            .expect_err("refused"),
+    );
+    assert_eq!(recorder.requests(), 4, "one request each, none sent again");
+}
+
+/// KR-REQ-20.13: a resolution refused as signed before the cutoff is an untrusted clock to wait
+/// out, in a collection only its home writes and in a shared one.
+#[tokio::test]
+async fn a_resolution_refused_before_the_cutoff_is_a_clock_to_wait_out() {
+    let (client, recorder) = sync_client();
+    let copy = SyncConflictId::new(identity(9));
+    let collection = shared::shared_collection(shared::installation(0x41), 0x42);
+    recorder.answering_with(vec![cut_off()]);
+
+    told_to_wait_for_the_cutoff(
+        &client
+            .resolve(&settings_of(identity(7)), copy)
+            .await
+            .expect_err("refused"),
+    );
+    told_to_wait_for_the_cutoff(
+        &client
+            .resolve_shared(&collection, copy)
+            .await
+            .expect_err("refused"),
+    );
+    assert_eq!(recorder.requests(), 2, "one request each, none sent again");
+}
+
+/// KR-REQ-20.13: a status query refused as signed before the cutoff is an untrusted clock to wait
+/// out, for a write in either kind of collection and for a key-record offer.
+#[tokio::test]
+async fn a_status_query_refused_before_the_cutoff_is_a_clock_to_wait_out() {
+    let (client, recorder) = sync_client();
+    let request = identity(8);
+    let collection = shared::shared_collection(shared::installation(0x41), 0x42);
+    recorder.answering_with(vec![cut_off()]);
+
+    told_to_wait_for_the_cutoff(
+        &client
+            .request_status(&settings_of(identity(7)), request)
+            .await
+            .expect_err("refused"),
+    );
+    told_to_wait_for_the_cutoff(
+        &client
+            .status_shared(&collection, request)
+            .await
+            .expect_err("refused"),
+    );
+    told_to_wait_for_the_cutoff(
+        &client
+            .rekey_status(&collection, request)
+            .await
+            .expect_err("refused"),
+    );
+    assert_eq!(recorder.requests(), 3, "one request each, none sent again");
+}
+
+/// KR-REQ-20.13: a fence refused as signed before the cutoff is an untrusted clock to wait out, for
+/// a write in either kind of collection and for a key-record offer. Nothing is fenced, so the
+/// request stays counted until a fence is answered.
+#[tokio::test]
+async fn a_fence_refused_before_the_cutoff_is_a_clock_to_wait_out() {
+    let (client, recorder) = sync_client();
+    let request = identity(8);
+    let now = now_ms();
+    let collection = shared::shared_collection(shared::installation(0x41), 0x42);
+    recorder.answering_with(vec![cut_off()]);
+
+    told_to_wait_for_the_cutoff(
+        &client
+            .fence_request(&settings_of(identity(7)), request, now, now)
+            .await
+            .expect_err("refused"),
+    );
+    told_to_wait_for_the_cutoff(
+        &client
+            .fence_shared(&collection, request, now, now)
+            .await
+            .expect_err("refused"),
+    );
+    told_to_wait_for_the_cutoff(
+        &client
+            .rekey_fence(&collection, request, now, now)
+            .await
+            .expect_err("refused"),
+    );
+    assert_eq!(recorder.requests(), 3, "one request each, none sent again");
+}
+
+/// KR-REQ-20.13: a read of a shared collection's key records refused as signed before the cutoff is
+/// an untrusted clock to wait out, whether it follows the records after a revision or reads one.
+#[tokio::test]
+async fn a_read_of_key_records_refused_before_the_cutoff_is_a_clock_to_wait_out() {
+    let (client, recorder) = sync_client();
+    let collection = shared::shared_collection(shared::installation(0x41), 0x42);
+    recorder.answering_with(vec![cut_off()]);
+
+    told_to_wait_for_the_cutoff(
+        &client
+            .records_after(&collection, 0)
+            .await
+            .expect_err("refused"),
+    );
+    told_to_wait_for_the_cutoff(&client.record_at(&collection, 1).await.expect_err("refused"));
+    assert_eq!(recorder.requests(), 2, "one request each, none sent again");
+}
+
+/// KR-REQ-20.13: the offer of a key record refused as signed before the cutoff is an untrusted
+/// clock to wait out. It is an error rather than an answer, and what became of the offer is
+/// settled by its status and its fence, as it is for any offer whose answer did not come.
+#[tokio::test]
+async fn a_key_record_offer_refused_before_the_cutoff_is_a_clock_to_wait_out() {
+    let (client, recorder) = sync_client();
+    let collection = shared::shared_collection(shared::installation(0x41), 0x42);
+    let offered = shared::record(&collection, 1, 1);
+    recorder.answering_with(vec![cut_off()]);
+
+    told_to_wait_for_the_cutoff(
+        &client
+            .rekey(&collection, identity(8), now_ms(), &offered)
+            .await
+            .expect_err("refused"),
+    );
+    assert_eq!(recorder.requests(), 1, "sent once, and not again");
+}
+
+/// KR-REQ-20.13, the control: every refusal but the cutoff keeps the class it had, and the service's
+/// own words, whatever request meets it.
+#[tokio::test]
+async fn every_other_refusal_keeps_its_class_and_the_services_words() {
+    let (client, recorder) = sync_client();
+    for (status, code, expected, action) in [
+        (
+            401,
+            "UNAUTHENTICATED",
+            ErrorCode::PermissionDenied,
+            UserAction::FixConfiguration,
+        ),
+        (
+            401,
+            "REAUTHENTICATION_REQUIRED",
+            ErrorCode::PermissionDenied,
+            UserAction::SignIn,
+        ),
+        (
+            403,
+            "FORBIDDEN",
+            ErrorCode::PermissionDenied,
+            UserAction::FixConfiguration,
+        ),
+        (
+            429,
+            "RATE_LIMITED",
+            ErrorCode::RateLimited,
+            UserAction::Wait,
+        ),
+        (
+            429,
+            "QUOTA_EXHAUSTED",
+            ErrorCode::QuotaExceeded,
+            UserAction::Wait,
+        ),
+        (
+            503,
+            "NOT_CONFIGURED",
+            ErrorCode::HostNotConfigured,
+            UserAction::FixConfiguration,
+        ),
+        (
+            500,
+            "INTERNAL",
+            ErrorCode::UpstreamUnavailable,
+            UserAction::Wait,
+        ),
+        (
+            400,
+            "INVALID_REQUEST",
+            ErrorCode::InvalidArgument,
+            UserAction::Update,
+        ),
+        (
+            400,
+            "INVALID_ARGUMENT",
+            ErrorCode::InvalidArgument,
+            UserAction::Update,
+        ),
+        (
+            404,
+            "NOT_FOUND",
+            ErrorCode::InvalidArgument,
+            UserAction::Update,
+        ),
+        (
+            405,
+            "METHOD_NOT_ALLOWED",
+            ErrorCode::InvalidArgument,
+            UserAction::Update,
+        ),
+        (
+            409,
+            "ID_CONFLICT",
+            ErrorCode::IdConflict,
+            UserAction::Update,
+        ),
+        (
+            409,
+            "REQUEST_FENCED",
+            ErrorCode::PermissionDenied,
+            UserAction::Nothing,
+        ),
+        (
+            404,
+            "COLLECTION_ABSENT",
+            ErrorCode::UnknownSession,
+            UserAction::Nothing,
+        ),
+        (
+            409,
+            "KEY_EPOCH_RETIRED",
+            ErrorCode::ResyncRequired,
+            UserAction::Resync,
+        ),
+        (
+            503,
+            "A_CODE_THIS_CLIENT_DOES_NOT_KNOW",
+            ErrorCode::UpstreamUnavailable,
+            UserAction::Wait,
+        ),
+        (
+            409,
+            "A_CODE_THIS_CLIENT_DOES_NOT_KNOW",
+            ErrorCode::InvalidArgument,
+            UserAction::Update,
+        ),
+    ] {
+        recorder.answering_with(vec![refusal(status, code, "the service's own words")]);
+        let refused = client
+            .request_status(&settings_of(identity(7)), identity(8))
+            .await
+            .expect_err("a refusal");
+        assert_eq!(
+            (refused.code(), refused.user_action()),
+            (expected, action),
+            "{code}"
+        );
+        assert!(
+            refused.to_string().contains("the service's own words"),
+            "{code}: {refused}"
+        );
+    }
 }
 
 #[tokio::test]
