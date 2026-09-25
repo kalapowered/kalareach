@@ -9,7 +9,8 @@ Each row gives the method's effect, the ingress classes that may reach it and th
 summary. The complete authority entry of every method is in
 [`packages/protocol/schema/method-authority.json`](../../packages/protocol/schema/method-authority.json),
 and [the method and authority table](README.md#the-method-and-authority-table) explains its fields.
-The last column links to the section that describes what the method does, where one does.
+The last column names the section that describes what the method does, where one does, and
+links to its document.
 
 ## Host and environment
 
@@ -17,24 +18,24 @@ The last column links to the section that describes what the method does, where 
 | --- | --- | --- | --- | --- |
 | `host.info` | read | `local_ipc`, `paired_device` | Host build identity, protocol limits and configured services. |  |
 | `environment.list` | read | `local_ipc`, `paired_device` | The environments this actor's grant admits. |  |
-| `environment.capabilities` | read | `local_ipc`, `paired_device` | What one environment can currently do. Capability evidence, never authority. | [Platforms: What may be done on a desktop](../host/platforms.md#what-may-be-done-on-a-desktop) |
+| `environment.capabilities` | read | `local_ipc`, `paired_device` | What one environment can currently do. Capability evidence, never authority. | [Platforms: What may be done on a desktop](../host/platforms.md) |
 | `host.doctor` | read | `local_ipc`, `paired_device` | Host diagnostics with credentials redacted. |  |
 | `environment.enrol` | write | `local_ipc` | Record an enrolled WSL, container, SSH or paired environment: its platform identity, its operating-system user and the absolute path of the helper installed there. |  |
 | `environment.forget` | write | `local_ipc` | Remove one enrolled environment and its cached inventory row. |  |
 | `environment.inventory` | read | `local_ipc` | The owner-approved cached inventory of enrolled environments. It reports what was last observed and starts nothing. |  |
 | `environment.refresh` | write | `local_ipc` | Observe one enrolled environment now, and start it when the request asks for that. |  |
-| `delivery.destination.secret.set` | write | `local_ipc` | Keep the credential an external notification destination sends with in this host's secret store, under the destination's identifier. It is never answered back, and it goes when the destination does. | [Delivery: Credentials](../delivery/README.md#credentials) |
+| `delivery.destination.secret.set` | write | `local_ipc` | Keep the credential an external notification destination sends with in this host's secret store, under the destination's identifier. It is never answered back, and it goes when the destination does. | [Delivery: Credentials](../delivery/README.md) |
 
 ## Pairing
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
-| `pair.invite` | write | `local_ipc` | Issue a five-minute single-use pairing invitation in code or direct mode. | [Pairing: The exchange](../pairing/README.md#the-exchange) |
-| `pair.redeem` | write | `unpaired_peer` | Redeem an invitation from the bounded pre-authorisation surface. | [Pairing: Direct QR](../pairing/README.md#direct-qr) |
-| `pair.finish` | write | `unpaired_peer` | Bind the pairing transcript to the live iroh endpoint identities. | [Pairing: The exchange](../pairing/README.md#the-exchange) |
-| `pair.confirm` | write | `local_ipc`, `paired_device` | Commit the device record and its grant after owner approval. | [Pairing: The exchange](../pairing/README.md#the-exchange) |
-| `pair.cancel` | write | `local_ipc`, `paired_device` | Consume an invitation without issuing a grant. | [Pairing: Direct QR](../pairing/README.md#direct-qr) |
-| `pair.status` | read | `unpaired_peer`, `local_ipc`, `paired_device` | Report a pending or committed pairing result, never secret material. | [Pairing: Direct QR](../pairing/README.md#direct-qr) |
+| `pair.invite` | write | `local_ipc` | Issue a five-minute single-use pairing invitation in code or direct mode. | [Pairing: The exchange](../pairing/README.md) |
+| `pair.redeem` | write | `unpaired_peer` | Redeem an invitation from the bounded pre-authorisation surface. | [Pairing: Direct QR](../pairing/README.md) |
+| `pair.finish` | write | `unpaired_peer` | Bind the pairing transcript to the live iroh endpoint identities. | [Pairing: The exchange](../pairing/README.md) |
+| `pair.confirm` | write | `local_ipc`, `paired_device` | Commit the device record and its grant after owner approval. | [Pairing: The exchange](../pairing/README.md) |
+| `pair.cancel` | write | `local_ipc`, `paired_device` | Consume an invitation without issuing a grant. | [Pairing: Direct QR](../pairing/README.md) |
+| `pair.status` | read | `unpaired_peer`, `local_ipc`, `paired_device` | Report a pending or committed pairing result, never secret material. | [Pairing: Direct QR](../pairing/README.md) |
 
 ## Devices
 
@@ -42,7 +43,7 @@ The last column links to the section that describes what the method does, where 
 | --- | --- | --- | --- | --- |
 | `device.list` | read | `local_ipc`, `paired_device` | Paired devices, their key purposes and each host's last authority acknowledgement. |  |
 | `device.revoke` | write | `local_ipc`, `paired_device` | Revoke a device. Completion requires the per-worker dispatch barrier, not a lease timer. |  |
-| `device.preview_key.update` | write | `paired_device` | Rotate this device's own notification-preview key through its paired proof. | [Delivery: What travels, and what does not](../delivery/README.md#what-travels-and-what-does-not) |
+| `device.preview_key.update` | write | `paired_device` | Rotate this device's own notification-preview key through its paired proof. | [Delivery: What travels, and what does not](../delivery/README.md) |
 | `device.keys.complete` | write | `paired_device` | Declare this device's own four public keys once, signed by the authorisation key its pairing recorded, so the host keeps every key it binds. |  |
 
 ## Plugin catalogues
@@ -50,54 +51,54 @@ The last column links to the section that describes what the method does, where 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
 | `catalogue.list` | read | `local_ipc`, `paired_device` | Configured plugin catalogues, their roots, generations and budgets. |  |
-| `catalogue.add` | write | `local_ipc`, `paired_device` | Trust a new catalogue root. A new root always requires fresh owner confirmation. | [Plugin catalogue: Enrolment comes first](../plugins/catalogue.md#enrolment-comes-first) |
-| `catalogue.sync` | write | `local_ipc`, `paired_device` | Synchronise a catalogue generation within its verified trust ceiling. | [Plugin catalogue: What a sync does](../plugins/catalogue.md#what-a-sync-does) |
+| `catalogue.add` | write | `local_ipc`, `paired_device` | Trust a new catalogue root. A new root always requires fresh owner confirmation. | [Plugin catalogue: Enrolment comes first](../plugins/catalogue.md) |
+| `catalogue.sync` | write | `local_ipc`, `paired_device` | Synchronise a catalogue generation within its verified trust ceiling. | [Plugin catalogue: What a sync does](../plugins/catalogue.md) |
 | `catalogue.pin` | write | `local_ipc`, `paired_device` | Pin a catalogue to an exact generation. |  |
-| `catalogue.remove` | write | `local_ipc`, `paired_device` | Remove a catalogue and stop trusting its root. | [Plugin catalogue: Enrolment comes first](../plugins/catalogue.md#enrolment-comes-first) |
+| `catalogue.remove` | write | `local_ipc`, `paired_device` | Remove a catalogue and stop trusting its root. | [Plugin catalogue: Enrolment comes first](../plugins/catalogue.md) |
 
 ## Plugins
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
 | `plugin.list` | read | `local_ipc`, `paired_device` | Installed plugins, their pinned packages and their enabled state. |  |
-| `plugin.install` | write | `local_ipc`, `paired_device` | Install a verified package inside the repository's trust ceiling. | [Plugin catalogue: Two activations, each atomic on its own](../plugins/catalogue.md#two-activations-each-atomic-on-its-own) |
+| `plugin.install` | write | `local_ipc`, `paired_device` | Install a verified package inside the repository's trust ceiling. | [Plugin catalogue: Two activations, each atomic on its own](../plugins/catalogue.md) |
 | `plugin.remove` | write | `local_ipc`, `paired_device` | Remove an installed plugin from an environment. |  |
 | `plugin.pin` | write | `local_ipc`, `paired_device` | Pin a plugin to an exact package hash. |  |
-| `plugin.enable` | write | `local_ipc`, `paired_device` | Enable an installed plugin in an environment. | [Plugin catalogue: Matching, enabling and binding](../plugins/catalogue.md#matching-enabling-and-binding) |
-| `plugin.disable` | write | `local_ipc`, `paired_device` | Disable an installed plugin without removing it. | [Plugin catalogue: Matching, enabling and binding](../plugins/catalogue.md#matching-enabling-and-binding) |
-| `plugin.grant` | write | `local_ipc`, `paired_device` | Grant a plugin capability. Executable and native-bridge capabilities need confirmation. | [Plugin catalogue: Capabilities and qualification](../plugins/catalogue.md#capabilities-and-qualification) |
-| `plugin.capabilities` | read | `local_ipc`, `paired_device` | What one installed plugin can currently do under its verified package. | [Plugin catalogue: Capabilities and qualification](../plugins/catalogue.md#capabilities-and-qualification) |
+| `plugin.enable` | write | `local_ipc`, `paired_device` | Enable an installed plugin in an environment. | [Plugin catalogue: Matching, enabling and binding](../plugins/catalogue.md) |
+| `plugin.disable` | write | `local_ipc`, `paired_device` | Disable an installed plugin without removing it. | [Plugin catalogue: Matching, enabling and binding](../plugins/catalogue.md) |
+| `plugin.grant` | write | `local_ipc`, `paired_device` | Grant a plugin capability. Executable and native-bridge capabilities need confirmation. | [Plugin catalogue: Capabilities and qualification](../plugins/catalogue.md) |
+| `plugin.capabilities` | read | `local_ipc`, `paired_device` | What one installed plugin can currently do under its verified package. | [Plugin catalogue: Capabilities and qualification](../plugins/catalogue.md) |
 
 ## Plugin actions
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
-| `plugin.action.invoke` | write | `local_ipc`, `paired_device` | Invoke a registered plugin action. Its own entry adds the rights this call intersects. | [Plugin approvals: The call names the request](../plugins/sdk.md#the-call-names-the-request) |
+| `plugin.action.invoke` | write | `local_ipc`, `paired_device` | Invoke a registered plugin action. Its own entry adds the rights this call intersects. | [Plugin approvals: The call names the request](../plugins/sdk.md) |
 
 ## Question source
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
-| `question.create` | write | `local_ipc` | Create a question from a verified originating application. Source ownership never impersonates a human answer or chooses an ungranted destination. | [Agent contact: What binds a helper to a session](../contact/README.md#what-binds-a-helper-to-a-session) |
-| `question.read_own` | read | `local_ipc` | Read the questions this source created. | [Agent contact: The caller token](../contact/README.md#the-caller-token) |
-| `question.cancel_own` | write | `local_ipc` | Cancel a question this source created. | [Agent contact: Cancellation](../contact/README.md#cancellation) |
-| `alert.create` | write | `local_ipc` | Raise an alert from a verified originating application. | [Agent contact: The four tools](../contact/README.md#the-four-tools) |
+| `question.create` | write | `local_ipc` | Create a question from a verified originating application. Source ownership never impersonates a human answer or chooses an ungranted destination. | [Agent contact: What binds a helper to a session](../contact/README.md) |
+| `question.read_own` | read | `local_ipc` | Read the questions this source created. | [Agent contact: The caller token](../contact/README.md) |
+| `question.cancel_own` | write | `local_ipc` | Cancel a question this source created. | [Agent contact: Cancellation](../contact/README.md) |
+| `alert.create` | write | `local_ipc` | Raise an alert from a verified originating application. | [Agent contact: The four tools](../contact/README.md) |
 
 ## Question user interface
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
-| `question.read` | read | `local_ipc`, `paired_device` | Read questions this actor may see, at their exact current revision. | [Agent contact: Answering from the terminal](../contact/README.md#answering-from-the-terminal) |
-| `question.answer` | write | `local_ipc`, `paired_device` | Answer the exact question revision shown, resolved atomically. | [Agent contact: Questions](../contact/README.md#questions) |
-| `question.cancel` | write | `local_ipc`, `paired_device` | Cancel the exact question revision shown, resolved atomically. | [Agent contact: Cancellation](../contact/README.md#cancellation) |
+| `question.read` | read | `local_ipc`, `paired_device` | Read questions this actor may see, at their exact current revision. | [Agent contact: Answering from the terminal](../contact/README.md) |
+| `question.answer` | write | `local_ipc`, `paired_device` | Answer the exact question revision shown, resolved atomically. | [Agent contact: Questions](../contact/README.md) |
+| `question.cancel` | write | `local_ipc`, `paired_device` | Cancel the exact question revision shown, resolved atomically. | [Agent contact: Cancellation](../contact/README.md) |
 
 ## Skill setup
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
-| `agent_tools.install` | write | `local_ipc` | Install the contact skill for a target agent under an exact change manifest. | [Agent contact: Installing the skill](../contact/README.md#installing-the-skill) |
-| `agent_tools.status` | read | `local_ipc` | Report what is installed for a target agent, at which scope and version. | [Agent contact: Installing the skill](../contact/README.md#installing-the-skill) |
-| `agent_tools.remove` | write | `local_ipc` | Remove the contact skill from a target agent under an exact change manifest. | [Agent contact: Installing the skill](../contact/README.md#installing-the-skill) |
+| `agent_tools.install` | write | `local_ipc` | Install the contact skill for a target agent under an exact change manifest. | [Agent contact: Installing the skill](../contact/README.md) |
+| `agent_tools.status` | read | `local_ipc` | Report what is installed for a target agent, at which scope and version. | [Agent contact: Installing the skill](../contact/README.md) |
+| `agent_tools.remove` | write | `local_ipc` | Remove the contact skill from a target agent under an exact change manifest. | [Agent contact: Installing the skill](../contact/README.md) |
 
 ## Sessions
 
@@ -114,7 +115,7 @@ The last column links to the section that describes what the method does, where 
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
-| `session.attach` | write | `local_ipc`, `paired_device` | Attach in semantic or terminal mode. A geometry claim needs terminal.geometry as well. | [Protocol: Rights and capabilities are not the same thing](README.md#rights-and-capabilities-are-not-the-same-thing) |
+| `session.attach` | write | `local_ipc`, `paired_device` | Attach in semantic or terminal mode. A geometry claim needs terminal.geometry as well. | [Protocol: Rights and capabilities are not the same thing](README.md) |
 | `session.detach` | write | `local_ipc`, `paired_device` | Detach this actor's own attachment and run geometry succession. |  |
 | `attachment.configure` | write | `local_ipc`, `paired_device` | Withdraw or add an authorised geometry claim without displacing the current owner. |  |
 | `attachment.viewport` | write | `local_ipc`, `paired_device` | Report this attachment's physical dimensions. It never changes the pseudoterminal. |  |
@@ -135,17 +136,17 @@ The last column links to the section that describes what the method does, where 
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
-| `root.editor.enter` | write | `local_ipc` | The validated root process reports that its line editor is active. | [Protocol: The root integration](README.md#the-root-integration) |
-| `root.editor.leave` | write | `local_ipc` | The validated root process reports that its line editor is no longer active. | [Protocol: The root integration](README.md#the-root-integration) |
-| `root.editor.fence` | write | `local_ipc` | Advance the root editor fence so an intervening local edit is detected. | [Protocol: The root integration](README.md#the-root-integration) |
-| `root.eof.detach` | write | `local_ipc` | The root shell reached end of file and the session detaches instead of exiting blindly. | [Protocol: The root integration](README.md#the-root-integration) |
-| `root.command.accepted` | write | `local_ipc` | The root integration confirms that the installed command was accepted by the editor. | [Protocol: The root integration](README.md#the-root-integration) |
+| `root.editor.enter` | write | `local_ipc` | The validated root process reports that its line editor is active. | [Protocol: The root integration](README.md) |
+| `root.editor.leave` | write | `local_ipc` | The validated root process reports that its line editor is no longer active. | [Protocol: The root integration](README.md) |
+| `root.editor.fence` | write | `local_ipc` | Advance the root editor fence so an intervening local edit is detected. | [Protocol: The root integration](README.md) |
+| `root.eof.detach` | write | `local_ipc` | The root shell reached end of file and the session detaches instead of exiting blindly. | [Protocol: The root integration](README.md) |
+| `root.command.accepted` | write | `local_ipc` | The root integration confirms that the installed command was accepted by the editor. | [Protocol: The root integration](README.md) |
 
 ## Shell launch
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
-| `shell.launch` | write | `local_ipc`, `paired_device` | Install and submit an argument vector or correctly quoted command through the trusted root editor. An intervening local edit returns DRAFT_CONFLICT. | [Protocol: The root integration](README.md#the-root-integration) |
+| `shell.launch` | write | `local_ipc`, `paired_device` | Install and submit an argument vector or correctly quoted command through the trusted root editor. An intervening local edit returns DRAFT_CONFLICT. | [Protocol: The root integration](README.md) |
 
 ## Agent state
 
@@ -169,51 +170,51 @@ The last column links to the section that describes what the method does, where 
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
-| `draft.create` | write | `local_ipc`, `paired_device` | Create a device-owned draft that survives attachment replacement. | [Transfer: Attachments, drafts and insertion](../transfer/README.md#attachments-drafts-and-insertion) |
-| `draft.update` | write | `local_ipc`, `paired_device` | Update a draft at its exact revision. A draft is never submitted automatically. | [Transfer: Attachments, drafts and insertion](../transfer/README.md#attachments-drafts-and-insertion) |
-| `agent.draft.add_attachment` | write | `local_ipc`, `paired_device` | Insert a completed attachment handle into a draft through the active adapter. | [Transfer: Attachments, drafts and insertion](../transfer/README.md#attachments-drafts-and-insertion) |
-| `upload.begin` | write | `local_ipc`, `paired_device`, `workflow` | Reserve the declared size and return an upload identifier, chunk size and expiry. | [Transfer: The seven methods](../transfer/README.md#the-seven-methods) |
-| `upload.status` | read | `local_ipc`, `paired_device`, `workflow` | Report verified chunk status so an interrupted transfer resumes without republishing. | [Transfer: The seven methods](../transfer/README.md#the-seven-methods) |
-| `upload.chunk` | write | `local_ipc`, `paired_device`, `workflow` | Send one chunk with its index, exact length and digest. A matching duplicate is acknowledged; a conflicting duplicate invalidates the upload. | [Transfer: The seven methods](../transfer/README.md#the-seven-methods) |
-| `upload.finish` | write | `local_ipc`, `paired_device`, `workflow` | Verify the declared digest and size, then publish the attachment handle atomically. | [Transfer: The seven methods](../transfer/README.md#the-seven-methods) |
-| `upload.cancel` | write | `local_ipc`, `paired_device`, `workflow` | Cancel an unfinished upload and release its reservation. | [Transfer: The seven methods](../transfer/README.md#the-seven-methods) |
-| `download.begin` | read | `local_ipc`, `paired_device`, `workflow` | Open an immutable source revision or bounded staging snapshot and describe its chunks. | [Transfer: The seven methods](../transfer/README.md#the-seven-methods) |
-| `download.chunk` | read | `local_ipc`, `paired_device`, `workflow` | Read one chunk of the same snapshot. Read authority is checked on every request. | [Transfer: The seven methods](../transfer/README.md#the-seven-methods) |
+| `draft.create` | write | `local_ipc`, `paired_device` | Create a device-owned draft that survives attachment replacement. | [Transfer: Attachments, drafts and insertion](../transfer/README.md) |
+| `draft.update` | write | `local_ipc`, `paired_device` | Update a draft at its exact revision. A draft is never submitted automatically. | [Transfer: Attachments, drafts and insertion](../transfer/README.md) |
+| `agent.draft.add_attachment` | write | `local_ipc`, `paired_device` | Insert a completed attachment handle into a draft through the active adapter. | [Transfer: Attachments, drafts and insertion](../transfer/README.md) |
+| `upload.begin` | write | `local_ipc`, `paired_device`, `workflow` | Reserve the declared size and return an upload identifier, chunk size and expiry. | [Transfer: The seven methods](../transfer/README.md) |
+| `upload.status` | read | `local_ipc`, `paired_device`, `workflow` | Report verified chunk status so an interrupted transfer resumes without republishing. | [Transfer: The seven methods](../transfer/README.md) |
+| `upload.chunk` | write | `local_ipc`, `paired_device`, `workflow` | Send one chunk with its index, exact length and digest. A matching duplicate is acknowledged; a conflicting duplicate invalidates the upload. | [Transfer: The seven methods](../transfer/README.md) |
+| `upload.finish` | write | `local_ipc`, `paired_device`, `workflow` | Verify the declared digest and size, then publish the attachment handle atomically. | [Transfer: The seven methods](../transfer/README.md) |
+| `upload.cancel` | write | `local_ipc`, `paired_device`, `workflow` | Cancel an unfinished upload and release its reservation. | [Transfer: The seven methods](../transfer/README.md) |
+| `download.begin` | read | `local_ipc`, `paired_device`, `workflow` | Open an immutable source revision or bounded staging snapshot and describe its chunks. | [Transfer: The seven methods](../transfer/README.md) |
+| `download.chunk` | read | `local_ipc`, `paired_device`, `workflow` | Read one chunk of the same snapshot. Read authority is checked on every request. | [Transfer: The seven methods](../transfer/README.md) |
 
 ## Project repositories
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
-| `project.list` | read | `local_ipc`, `paired_device`, `workflow` | List environment-local repositories as scoped metadata. | [Project: The ten methods](../project/README.md#the-ten-methods) |
-| `project.read` | read | `local_ipc`, `paired_device`, `workflow` | Read one repository's scoped metadata. | [Project: The ten methods](../project/README.md#the-ten-methods) |
-| `project.init` | write | `local_ipc`, `paired_device`, `workflow` | Initialise a repository at an authorised destination handle. | [Project: The ten methods](../project/README.md#the-ten-methods) |
-| `project.clone` | write | `local_ipc`, `paired_device`, `workflow` | Clone into an authorised destination through the approved credential broker. | [Project: The ten methods](../project/README.md#the-ten-methods) |
-| `project.adopt` | write | `local_ipc`, `paired_device`, `workflow` | Adopt an existing checkout through the explicit adoption flow. | [Project: The ten methods](../project/README.md#the-ten-methods) |
-| `project.location.list` | read | `local_ipc` | List the directories the owner authorised for repository work. | [Project: Authorised locations](../project/README.md#authorised-locations) |
-| `project.location.authorise` | write | `local_ipc` | Authorise one opened directory for one grant and purpose. | [Project: Authorised locations](../project/README.md#authorised-locations) |
-| `project.location.withdraw` | write | `local_ipc` | Withdraw one authorised location, finally. | [Project: Authorised locations](../project/README.md#authorised-locations) |
-| `project.location.attach` | write | `local_ipc` | Bind one repository to the source location it is read through. | [Project: Authorised locations](../project/README.md#authorised-locations) |
-| `project.operation.cancel` | write | `local_ipc`, `paired_device`, `workflow` | Cancel owned repository work and report retained or removed staging paths. | [Project: The ten methods](../project/README.md#the-ten-methods) |
+| `project.list` | read | `local_ipc`, `paired_device`, `workflow` | List environment-local repositories as scoped metadata. | [Project: The ten methods](../project/README.md) |
+| `project.read` | read | `local_ipc`, `paired_device`, `workflow` | Read one repository's scoped metadata. | [Project: The ten methods](../project/README.md) |
+| `project.init` | write | `local_ipc`, `paired_device`, `workflow` | Initialise a repository at an authorised destination handle. | [Project: The ten methods](../project/README.md) |
+| `project.clone` | write | `local_ipc`, `paired_device`, `workflow` | Clone into an authorised destination through the approved credential broker. | [Project: The ten methods](../project/README.md) |
+| `project.adopt` | write | `local_ipc`, `paired_device`, `workflow` | Adopt an existing checkout through the explicit adoption flow. | [Project: The ten methods](../project/README.md) |
+| `project.location.list` | read | `local_ipc` | List the directories the owner authorised for repository work. | [Project: Authorised locations](../project/README.md) |
+| `project.location.authorise` | write | `local_ipc` | Authorise one opened directory for one grant and purpose. | [Project: Authorised locations](../project/README.md) |
+| `project.location.withdraw` | write | `local_ipc` | Withdraw one authorised location, finally. | [Project: Authorised locations](../project/README.md) |
+| `project.location.attach` | write | `local_ipc` | Bind one repository to the source location it is read through. | [Project: Authorised locations](../project/README.md) |
+| `project.operation.cancel` | write | `local_ipc`, `paired_device`, `workflow` | Cancel owned repository work and report retained or removed staging paths. | [Project: The ten methods](../project/README.md) |
 
 ## Workspaces
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
-| `workspace.list` | read | `local_ipc`, `paired_device`, `workflow` | List workspaces. A view never implies deletion. | [Project: The ten methods](../project/README.md#the-ten-methods) |
-| `workspace.create` | write | `local_ipc`, `paired_device`, `workflow` | Create a shared or isolated workspace with explicit inclusion rules. | [Project: The ten methods](../project/README.md#the-ten-methods) |
-| `workspace.read` | read | `local_ipc`, `paired_device`, `workflow` | Read one workspace's policy and bound sessions. | [Project: The ten methods](../project/README.md#the-ten-methods) |
-| `workspace.remove` | write | `local_ipc`, `paired_device`, `workflow` | Remove a workspace once its retention rules and pins permit it. | [Project: The ten methods](../project/README.md#the-ten-methods) |
+| `workspace.list` | read | `local_ipc`, `paired_device`, `workflow` | List workspaces. A view never implies deletion. | [Project: The ten methods](../project/README.md) |
+| `workspace.create` | write | `local_ipc`, `paired_device`, `workflow` | Create a shared or isolated workspace with explicit inclusion rules. | [Project: The ten methods](../project/README.md) |
+| `workspace.read` | read | `local_ipc`, `paired_device`, `workflow` | Read one workspace's policy and bound sessions. | [Project: The ten methods](../project/README.md) |
+| `workspace.remove` | write | `local_ipc`, `paired_device`, `workflow` | Remove a workspace once its retention rules and pins permit it. | [Project: The ten methods](../project/README.md) |
 
 ## Changes and diffs
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
-| `diff.read` | read | `local_ipc`, `paired_device`, `workflow` | Read a diff with repository identity, base, head and content revisions. | [Project: Change sets](../project/README.md#change-sets) |
-| `diff.apply` | write | `local_ipc`, `paired_device`, `workflow` | Apply a diff under the destination's concurrency contract. A preflight conflict returns DRAFT_CONFLICT without any write. | [Project: Change sets](../project/README.md#change-sets) |
-| `diff.revert` | write | `local_ipc`, `paired_device`, `workflow` | Revert a previously applied change under the same destination contract. | [Project: Change sets](../project/README.md#change-sets) |
-| `changeset.capture` | write | `local_ipc`, `paired_device`, `workflow` | Capture an immutable change-set version with its policy and provenance. | [Project: Change sets](../project/README.md#change-sets) |
-| `changeset.read` | read | `local_ipc`, `paired_device`, `workflow` | Read one exact change-set version. | [Project: Change sets](../project/README.md#change-sets) |
-| `changeset.materialize` | write | `local_ipc`, `paired_device`, `workflow` | Materialise an exact change-set version into an independent workspace. | [Project: Change sets](../project/README.md#change-sets) |
+| `diff.read` | read | `local_ipc`, `paired_device`, `workflow` | Read a diff with repository identity, base, head and content revisions. | [Project: Change sets](../project/README.md) |
+| `diff.apply` | write | `local_ipc`, `paired_device`, `workflow` | Apply a diff under the destination's concurrency contract. A preflight conflict returns DRAFT_CONFLICT without any write. | [Project: Change sets](../project/README.md) |
+| `diff.revert` | write | `local_ipc`, `paired_device`, `workflow` | Revert a previously applied change under the same destination contract. | [Project: Change sets](../project/README.md) |
+| `changeset.capture` | write | `local_ipc`, `paired_device`, `workflow` | Capture an immutable change-set version with its policy and provenance. | [Project: Change sets](../project/README.md) |
+| `changeset.read` | read | `local_ipc`, `paired_device`, `workflow` | Read one exact change-set version. | [Project: Change sets](../project/README.md) |
+| `changeset.materialize` | write | `local_ipc`, `paired_device`, `workflow` | Materialise an exact change-set version into an independent workspace. | [Project: Change sets](../project/README.md) |
 
 ## Review and attention
 
@@ -237,9 +238,9 @@ The last column links to the section that describes what the method does, where 
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
-| `owner.confirmation.request` | write | `local_ipc`, `paired_device` | Start a confirmation ceremony bound to one single-use action digest. | [Pairing: Owner confirmation](../pairing/README.md#owner-confirmation) |
-| `owner.confirmation.pending` | read | `local_ipc`, `paired_device` | The confirmation challenges an owner can still answer, each with the exact action it approves, so a separately paired owner device can approve what the local owner asked. | [Pairing: Owner confirmation](../pairing/README.md#owner-confirmation) |
-| `owner.confirmation.complete` | write | `local_ipc`, `paired_device` | Complete the ceremony with a protected user-verification context. A click that desktop automation can synthesise is not that proof. | [Pairing: Owner confirmation](../pairing/README.md#owner-confirmation) |
+| `owner.confirmation.request` | write | `local_ipc`, `paired_device` | Start a confirmation ceremony bound to one single-use action digest. | [Pairing: Owner confirmation](../pairing/README.md) |
+| `owner.confirmation.pending` | read | `local_ipc`, `paired_device` | The confirmation challenges an owner can still answer, each with the exact action it approves, so a separately paired owner device can approve what the local owner asked. | [Pairing: Owner confirmation](../pairing/README.md) |
+| `owner.confirmation.complete` | write | `local_ipc`, `paired_device` | Complete the ceremony with a protected user-verification context. A click that desktop automation can synthesise is not that proof. | [Pairing: Owner confirmation](../pairing/README.md) |
 
 ## State recovery
 
@@ -254,7 +255,7 @@ The last column links to the section that describes what the method does, where 
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
-| `grant.create` | write | `local_ipc`, `paired_device` | Delegate a narrower grant. Persistent enlargement requires owner confirmation. | [Pairing: Grants](../pairing/README.md#grants) |
+| `grant.create` | write | `local_ipc`, `paired_device` | Delegate a narrower grant. Persistent enlargement requires owner confirmation. | [Pairing: Grants](../pairing/README.md) |
 | `grant.revoke` | write | `local_ipc`, `paired_device` | Revoke a grant and its descendants. Completion uses the per-worker dispatch barrier. |  |
 | `grant.list` | read | `local_ipc`, `paired_device` | List grants this issuer may see, with their revisions and expiry. |  |
 
@@ -262,10 +263,10 @@ The last column links to the section that describes what the method does, where 
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
-| `push.installation.register` | write | `service_client` | Bind a push token to an installation identity after the token-receipt challenge. | [Protocol: Push objects](README.md#push-objects) |
-| `push.sender.issue` | write | `service_client` | Issue a host-scoped delivery credential for one installation. | [Protocol: Push objects](README.md#push-objects) |
-| `push.sender.renew` | write | `service_client` | Renew a delivery credential without changing destination, host key or rate policy. | [Protocol: Push objects](README.md#push-objects) |
-| `push.sender.revoke` | write | `service_client` | Revoke a sender authorisation. A revoked record cannot renew. | [Protocol: Push objects](README.md#push-objects) |
+| `push.installation.register` | write | `service_client` | Bind a push token to an installation identity after the token-receipt challenge. | [Protocol: Push objects](README.md) |
+| `push.sender.issue` | write | `service_client` | Issue a host-scoped delivery credential for one installation. | [Protocol: Push objects](README.md) |
+| `push.sender.renew` | write | `service_client` | Renew a delivery credential without changing destination, host key or rate policy. | [Protocol: Push objects](README.md) |
+| `push.sender.revoke` | write | `service_client` | Revoke a sender authorisation. A revoked record cannot renew. | [Protocol: Push objects](README.md) |
 | `mailbox.read` | read | `service_client` | Read encrypted mailbox envelopes. The service never sees their plaintext. |  |
 | `mailbox.deliver` | write | `service_client` | Place one sealed envelope in a recipient's mailbox. The service stores the routing record and the ciphertext and never a plaintext field. |  |
 | `mailbox.acknowledge` | write | `service_client` | Acknowledge mailbox items the recipient has stored durably, so the service may remove them. The replay identifiers outlive the items. |  |
@@ -285,19 +286,19 @@ The last column links to the section that describes what the method does, where 
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
-| `voice.prepare` | read | `paired_device` | Read what a voice session started now would reach, what would be sent with it and who would be able to read that. It creates nothing: no provider session, no reservation, no grant, and no context leaves the host for it. | [Voice: The rate a call runs under](../voice/README.md#the-rate-a-call-runs-under) |
-| `voice.start` | write | `paired_device` | Start a voice session. Budget and account checks happen at the managed broker. | [Voice: The rate a call runs under](../voice/README.md#the-rate-a-call-runs-under) |
-| `voice.stop` | write | `paired_device` | Stop a voice session. Ending it revokes its voice grant immediately. | [Voice: A voice session is not a terminal session](../voice/README.md#a-voice-session-is-not-a-terminal-session) |
-| `voice.grant` | write | `local_ipc`, `paired_device` | Create or change a voice grant, stating exactly which actions it permits. A device may broaden its own; changing another device's needs host-management authority. | [Voice: The voice grant](../voice/README.md#the-voice-grant) |
-| `voice.delegate` | write | `paired_device` | Submit a delegation from the paired device. A provider delegation identifier is correlation data, never authority. | [Voice: What is never authority](../voice/README.md#what-is-never-authority) |
-| `voice.context` | read | `paired_device` | Read the selected voice context. Selection intersects this device's scope and never uses the host owner's broader history. | [Voice: What the coordinator may send back](../voice/README.md#what-the-coordinator-may-send-back) |
+| `voice.prepare` | read | `paired_device` | Read what a voice session started now would reach, what would be sent with it and who would be able to read that. It creates nothing: no provider session, no reservation, no grant, and no context leaves the host for it. | [Voice: The rate a call runs under](../voice/README.md) |
+| `voice.start` | write | `paired_device` | Start a voice session. Budget and account checks happen at the managed broker. | [Voice: The rate a call runs under](../voice/README.md) |
+| `voice.stop` | write | `paired_device` | Stop a voice session. Ending it revokes its voice grant immediately. | [Voice: A voice session is not a terminal session](../voice/README.md) |
+| `voice.grant` | write | `local_ipc`, `paired_device` | Create or change a voice grant, stating exactly which actions it permits. A device may broaden its own; changing another device's needs host-management authority. | [Voice: The voice grant](../voice/README.md) |
+| `voice.delegate` | write | `paired_device` | Submit a delegation from the paired device. A provider delegation identifier is correlation data, never authority. | [Voice: What is never authority](../voice/README.md) |
+| `voice.context` | read | `paired_device` | Read the selected voice context. Selection intersects this device's scope and never uses the host owner's broader history. | [Voice: What the coordinator may send back](../voice/README.md) |
 
 ## Automation
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
-| `workflow.install` | write | `local_ipc`, `paired_device` | Install a versioned automation definition under an explicit workflow grant. | [Automation: The five methods](../automation/README.md#the-five-methods) |
-| `workflow.enable` | write | `local_ipc`, `paired_device` | Enable an installed definition at an exact revision. | [Automation: The five methods](../automation/README.md#the-five-methods) |
-| `workflow.pause` | write | `local_ipc`, `paired_device` | Pause a definition. Exceeding a concurrency or budget limit pauses it automatically. | [Automation: The five methods](../automation/README.md#the-five-methods) |
-| `workflow.run` | write | `local_ipc`, `paired_device` | Start a run, recording the trigger event, definition version and causal parent. | [Automation: The five methods](../automation/README.md#the-five-methods) |
-| `workflow.read` | read | `local_ipc`, `paired_device` | Read definitions, runs, node receipts and remaining causal budget. | [Automation: The five methods](../automation/README.md#the-five-methods) |
+| `workflow.install` | write | `local_ipc`, `paired_device` | Install a versioned automation definition under an explicit workflow grant. | [Automation: The five methods](../automation/README.md) |
+| `workflow.enable` | write | `local_ipc`, `paired_device` | Enable an installed definition at an exact revision. | [Automation: The five methods](../automation/README.md) |
+| `workflow.pause` | write | `local_ipc`, `paired_device` | Pause a definition. Exceeding a concurrency or budget limit pauses it automatically. | [Automation: The five methods](../automation/README.md) |
+| `workflow.run` | write | `local_ipc`, `paired_device` | Start a run, recording the trigger event, definition version and causal parent. | [Automation: The five methods](../automation/README.md) |
+| `workflow.read` | read | `local_ipc`, `paired_device` | Read definitions, runs, node receipts and remaining causal budget. | [Automation: The five methods](../automation/README.md) |
