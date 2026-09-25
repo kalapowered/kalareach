@@ -499,6 +499,9 @@ struct WatchedLink {
     paired_gate: Option<Arc<Gate>>,
     /// Every connection as a paired device fails.
     sever_paired: bool,
+    /// While set, every dial after the first fails at once, as a network that drops new
+    /// connections would.
+    fresh_dials_fail: Arc<AtomicBool>,
     severed: Arc<AtomicBool>,
     statuses: Arc<AtomicUsize>,
     dials: AtomicUsize,
@@ -520,6 +523,7 @@ impl WatchedLink {
             status_gate: None,
             paired_gate: None,
             sever_paired: false,
+            fresh_dials_fail: Arc::new(AtomicBool::new(false)),
             severed: Arc::new(AtomicBool::new(false)),
             statuses: Arc::new(AtomicUsize::new(0)),
             dials: AtomicUsize::new(0),
@@ -557,7 +561,9 @@ impl HostLink for WatchedLink {
         endpoint: &'a EndpointKey,
     ) -> BoxFuture<'a, Result<Connection, LinkError>> {
         let earlier = self.dials.fetch_add(1, Ordering::SeqCst);
-        if self.severed.load(Ordering::SeqCst) {
+        if self.severed.load(Ordering::SeqCst)
+            || (earlier > 0 && self.fresh_dials_fail.load(Ordering::SeqCst))
+        {
             return Box::pin(async { Err(severed()) });
         }
         let gate = self.reconnect_gate.as_ref().filter(|_| earlier > 0);
@@ -1587,6 +1593,51 @@ async fn a_device_waits_inside_the_hosts_request_budget_for_an_owner_who_takes_t
         made(&link).opened.load(Ordering::SeqCst) >= 2,
         "the device moved to a fresh connection before the first had no questions left"
     );
+}
+
+/// KR-REQ-10.36, KR-REQ-10.23: fresh connections fail for a while just as the device nears the end
+/// of the questions its connection has, and the owner approves after the first of them failed. A
+/// device that then asked its last question at once would hear that the owner had not decided yet,
+/// and have nothing left to hear the approval on: the host serves a committed device no new unpaired
+/// connection. This device keeps the last question while it tries fresh connections, and asks it
+/// only once several in a row have failed, which is how it learns that the host committed it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_last_question_waits_while_fresh_connections_fail() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let invited = issue_direct(environment, &mut client, &owner).await;
+
+    let (link, making) = watching(|link| {
+        link.fresh_dials_fail.store(true, Ordering::SeqCst);
+    });
+    let device = ProductDevice::new(Arc::new(host.room.clone()), making);
+    let (attempt, mut shown) = device.redeem(&direct_text(&invited));
+    awaiting_value(&mut shown).await;
+    // Thirteen status questions after the challenge and the proof leave one on the connection.
+    tokio::time::timeout(Duration::from_secs(90), async {
+        while made(&link).statuses.load(Ordering::SeqCst) < 13 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the device nears the end of its connection's questions");
+    let dials = made(&link).dials.load(Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while made(&link).dials.load(Ordering::SeqCst) == dials {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the device tries a fresh connection, which fails");
+    calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
+        .await
+        .expect("the owner approves");
+    made(&link).fresh_dials_fail.store(false, Ordering::SeqCst);
+    let paired = outcome(attempt).await.expect("paired");
+    assert_eq!(paired.host_endpoint_id, host.network().endpoint_id());
 }
 
 /// KR-REQ-10.23: a host may serve an unpaired connection by other limits than the ones a device

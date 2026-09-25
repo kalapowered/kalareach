@@ -88,9 +88,13 @@ pub const STATUS_INTERVAL: Duration = Duration::from_secs(3);
 /// however long the network took, and that is never the same twice.
 const WINDOW_MARGIN: Duration = Duration::from_secs(1);
 
-/// How many times a device doubles its wait after refusals in a row, as a host that counts the
-/// questions it refuses turns away one asked again before its own window has passed.
-const MOST_DOUBLINGS: u32 = 3;
+/// How many questions a connection has left when a waiting device starts to look for a fresh
+/// one: enough that several fresh connections can be tried before its last question is needed.
+const CHANGE_WITH_LEFT: usize = 4;
+
+/// How many fresh connections in a row a waiting device tries while it keeps the last question on
+/// its old connection, before it asks that question.
+const FRESH_TRIES_ON_THE_LAST: usize = 3;
 
 /// How long a device waits before dialling a host again, in turn, and then every time after the
 /// last.
@@ -742,6 +746,7 @@ impl Pairing {
         let limits = PreAuthLimits::default();
         let mut reconnects = 0_usize;
         let mut refused = 0_u32;
+        let mut fresh_failed = 0_usize;
         loop {
             // The attempt's own deadline holds on every pass, whatever the host last said: a host
             // that keeps answering that the owner has not decided does not hold the device past
@@ -767,27 +772,47 @@ impl Pairing {
                     }
                     Turn::Spent => {
                         drop(held.take());
+                        fresh_failed = 0;
                         held = self.reconnect(&pending).await;
                         continue;
                     }
                 }
             }
-            // The old connection keeps its last question until a fresh one has answered: a host
-            // that commits the device meanwhile serves it no unpaired surface on a new connection,
-            // and the old one is then the only place left to learn what the device became.
-            let changed = if held
-                .as_ref()
-                .is_some_and(|unpaired| unpaired.asked.nearly_spent(&limits))
-            {
-                self.fresh_answer(&pending, &params).await
-            } else {
-                None
-            };
-            let asked = match changed {
-                Some((fresh, answer)) => {
-                    held = Some(fresh);
-                    Ok(answer)
+            // A host that commits the device serves it no unpaired surface on a new connection, so
+            // the connection the device already has is then the only place to learn what it
+            // became. Near the end of that connection's questions the device looks for a fresh
+            // connection before each question, and changes to one only once it has answered. The
+            // last question is kept while fresh connections fail: fresh connections that keep
+            // failing while the old one stays open are what a host that committed the device
+            // shows, so after a few in a row the device asks the last question there.
+            let left = held.as_ref().map(|unpaired| unpaired.asked.left(&limits));
+            let mut answered = None;
+            if left.is_some_and(|left| left <= CHANGE_WITH_LEFT) {
+                match self.fresh_answer(&pending, &params).await {
+                    Ok((fresh, answer)) => {
+                        held = Some(fresh);
+                        fresh_failed = 0;
+                        answered = Some(Ok(answer));
+                    }
+                    // The host's own word on a fresh connection is its word about the attempt.
+                    Err(LinkError::Refused(refusal)) => {
+                        answered = Some(Err(LinkError::Refused(refusal)));
+                    }
+                    Err(LinkError::Lost(_) | LinkError::Configuration(_)) if left == Some(1) => {
+                        fresh_failed += 1;
+                        if fresh_failed < FRESH_TRIES_ON_THE_LAST {
+                            let delay = RECONNECT_DELAYS
+                                [(fresh_failed - 1).min(RECONNECT_DELAYS.len() - 1)]
+                            .min(self.left(&pending));
+                            tokio::time::sleep(delay).await;
+                            continue;
+                        }
+                    }
+                    Err(LinkError::Lost(_) | LinkError::Configuration(_)) => {}
                 }
+            }
+            let asked = match answered {
+                Some(answered) => answered,
                 None => match held.as_mut() {
                     Some(unpaired) => {
                         unpaired.asked.asked(tokio::time::Instant::now());
@@ -817,8 +842,7 @@ impl Pairing {
                 // host that ended the connection with it is found out by the next question, as a
                 // connection lost.
                 Err(LinkError::Refused(refusal)) if refusal.code == ErrorCode::RateLimited => {
-                    let wait = (limits.window + WINDOW_MARGIN)
-                        .saturating_mul(1 << refused.min(MOST_DOUBLINGS));
+                    let wait = pause_after_refusals(refused, &limits);
                     refused += 1;
                     tokio::time::sleep(wait.min(self.left(&pending))).await;
                 }
@@ -832,6 +856,7 @@ impl Pairing {
                 Err(LinkError::Lost(_) | LinkError::Configuration(_)) => {
                     // The connection is gone; it is let go of before the wait, not after.
                     drop(held.take());
+                    fresh_failed = 0;
                     progress.send_replace(reconnecting(&pending));
                     let delay = RECONNECT_DELAYS[reconnects.min(RECONNECT_DELAYS.len() - 1)]
                         .min(self.left(&pending));
@@ -941,18 +966,20 @@ impl Pairing {
     }
 
     /// A fresh unpaired connection to the host of `pending`, and its answer to the first question
-    /// asked on it; `None` when no connection opens or it does not answer.
+    /// asked on it, or why there is none: a connection that does not open or does not answer is
+    /// lost, and a refusal is the host's own word.
     async fn fresh_answer(
         &self,
         pending: &PendingAttempt,
         params: &PairStatusParams,
-    ) -> Option<(Unpaired, PairStatusResult)> {
-        let mut fresh = self.reconnect(pending).await?;
-        fresh.asked.asked(tokio::time::Instant::now());
-        let answer = within(self.step(pending), fresh.preauth.status(params))
+    ) -> Result<(Unpaired, PairStatusResult), LinkError> {
+        let mut fresh = self
+            .reconnect(pending)
             .await
-            .ok()?;
-        Some((fresh, answer))
+            .ok_or_else(|| LinkError::Lost("no fresh connection opened".to_owned()))?;
+        fresh.asked.asked(tokio::time::Instant::now());
+        let answer = within(self.step(pending), fresh.preauth.status(params)).await?;
+        Ok((fresh, answer))
     }
 
     /// Dials the host again, unpaired, and opens its pre-authorisation surface.
@@ -1200,9 +1227,9 @@ impl Asked {
         }
     }
 
-    /// True when the connection has one question left, or none.
-    fn nearly_spent(&self, limits: &PreAuthLimits) -> bool {
-        self.total + 1 >= limits.max_requests
+    /// How many questions the connection has left.
+    const fn left(&self, limits: &PreAuthLimits) -> usize {
+        limits.max_requests.saturating_sub(self.total)
     }
 
     /// Counts one question, sent at `now`.
@@ -1210,6 +1237,15 @@ impl Asked {
         self.total += 1;
         self.recent.push_back(now);
     }
+}
+
+/// How long a waiting device pauses after `refused` refusals in a row, as too soon, before its next
+/// question. A host counts the questions it refuses as well, so a question asked again before the
+/// host's own window has passed is refused again: the pause starts at the window this device paces
+/// by and doubles with each refusal in a row, so it outgrows any window a host keeps. The attempt's
+/// own deadline bounds it.
+fn pause_after_refusals(refused: u32, limits: &PreAuthLimits) -> Duration {
+    (limits.window + WINDOW_MARGIN).saturating_mul(2_u32.saturating_pow(refused))
 }
 
 /// A method that takes no parameters, as the empty map the protocol expects.
@@ -1771,12 +1807,7 @@ mod tests {
         let mut asked = Asked::after(1, start);
         let mut now = start;
         while asked.total < limits.max_requests {
-            assert_eq!(
-                asked.nearly_spent(&limits),
-                asked.total + 1 == limits.max_requests,
-                "{}",
-                asked.total
-            );
+            assert_eq!(asked.left(&limits), limits.max_requests - asked.total);
             match asked.turn(now, &limits) {
                 Turn::Now => asked.asked(now),
                 Turn::After(wait) => now += wait,
@@ -1794,5 +1825,45 @@ mod tests {
             asked.asked(now);
             now += STATUS_INTERVAL;
         }
+    }
+
+    /// KR-REQ-10.23: a host that counts the questions it refuses, and keeps a window longer than
+    /// any fixed pause, still answers in the end: the pauses double past its window within an
+    /// attempt's lifetime. Pauses that stopped growing at eight windows would keep a two-minute
+    /// window full for good.
+    #[test]
+    fn pauses_after_refusals_outgrow_any_window_a_host_keeps() {
+        let limits = PreAuthLimits::default();
+        let lifetime = Duration::from_millis(INVITATION_LIFETIME_MS + RECOVERY_MARGIN_MS);
+        // A host that answers one question in any `window` and counts the ones it refuses, asked
+        // right after the finish and then after each pause: when it first answers, if it does.
+        let first_answer = |window: Duration, pause: &dyn Fn(u32) -> Duration| {
+            let mut charged = vec![Duration::ZERO];
+            let mut now = Duration::ZERO;
+            let mut refused = 0;
+            while now < lifetime {
+                let in_window = charged.iter().filter(|at| now - **at < window).count();
+                charged.push(now);
+                if in_window == 0 {
+                    return Some(now);
+                }
+                now += pause(refused);
+                refused += 1;
+            }
+            None
+        };
+        for window in [Duration::from_secs(20), Duration::from_secs(120)] {
+            assert!(
+                first_answer(window, &|refused| pause_after_refusals(refused, &limits)).is_some(),
+                "{window:?}"
+            );
+        }
+        assert_eq!(
+            first_answer(Duration::from_secs(120), &|refused| {
+                pause_after_refusals(refused.min(3), &limits)
+            }),
+            None,
+            "pauses that stop growing never outlast the window"
+        );
     }
 }
