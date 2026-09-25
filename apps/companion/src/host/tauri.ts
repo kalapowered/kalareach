@@ -13,6 +13,8 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 
+import type { EventsSnapshotResult } from '@kalareach/protocol'
+
 import type { AccountView, UsageView } from '../model/account'
 
 import type {
@@ -27,7 +29,6 @@ import type {
   PairingOrigin,
   PairingView,
   PasteView,
-  ProjectedScreen,
   ReviewOutcome,
   SessionSubject,
   Settled,
@@ -164,7 +165,10 @@ export function tauriPort(): HostPort {
     storageStatus: () => noAgreedShape('what this host retains'),
     storageObjectDelete: () => noAgreedShape('deleting a retained artefact'),
 
-    terminalProjection: (params) => read<ProjectedScreen>('events_snapshot', params),
+    eventsSnapshot: (params) => read<EventsSnapshotResult>('events_snapshot', params),
+    // No command answers a projected screen: `events_snapshot` answers the session's state, which
+    // has no rows, so the screen is refused rather than read from a shape it is not.
+    terminalProjection: () => noAgreedShape('the projected screen'),
     terminalInput: (params) => read('input_write', params),
     attachmentViewport: (params, subject) =>
       mutate<Settled>('attachment_viewport', params, subject),

@@ -77,6 +77,17 @@ export interface GeometryClaim {
   readonly rows: number
 }
 
+/**
+ * The attachment a raw terminal view is, named from its session.
+ *
+ * The desktop's raw view and the phone's name their own attachment the same way, and each reads
+ * the summary with this name from the session's snapshot, never another attachment's. A host that
+ * reports no attachment of this name reports no presentation for the view.
+ */
+export function terminalAttachment(sessionId: string): string {
+  return `att-${sessionId}`
+}
+
 /** The request that releases one view's geometry claim. */
 export function releaseGeometry(claim: GeometryClaim): {
   readonly attachment_id: string

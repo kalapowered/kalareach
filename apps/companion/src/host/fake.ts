@@ -15,11 +15,14 @@
 
 import type { DocumentNode } from '@kalareach/plugin-sdk'
 import type {
+  AttachmentSummary,
   CapabilityRecord,
   ClosureRecord,
   EnvironmentCapabilitiesResult,
   EnvironmentListResult,
+  EventsSnapshotResult,
   HostInfoResult,
+  PresentationReason,
   Receipt,
   SessionListResult,
   SessionReadResult,
@@ -28,6 +31,7 @@ import type {
   VoiceManagedTerms,
   VoicePrepareResult,
   VoiceRate,
+  TerminalPresentationMode,
   VoiceSessionDescriptor
 } from '@kalareach/protocol'
 
@@ -59,6 +63,7 @@ import type {
   Written
 } from './port'
 import { codeComplete } from '../pairing/words'
+import { terminalAttachment } from '../terminal/modes'
 
 const ENVIRONMENT = '3f1a2c40-11aa-4b2c-9d3e-000000000001'
 const VOICE_SESSION = '6c5d4e30-33cc-4d4e-9f5a-000000000201'
@@ -280,6 +285,18 @@ export interface FakeHostControls {
    * the registrations.
    */
   holdRegistrations(): () => void
+  /**
+   * Sets how the host presents one attachment while its window is on the live screen: directly, as
+   * a viewport for `reason`, as a viewport with no reason (which is how a worker built before
+   * reasons reports every viewport), or with null, not as a terminal at all.
+   */
+  presentAttachment(
+    attachmentId: string,
+    presentation: TerminalPresentationMode | null,
+    reason?: PresentationReason
+  ): void
+  /** Takes one attachment out of what the host reports, as a detach does. */
+  detachAttachment(attachmentId: string): void
 }
 
 /**
@@ -301,6 +318,7 @@ export type HeldRead =
   | 'pluginList'
   | 'terminalProjection'
   | 'attachmentViewport'
+  | 'eventsSnapshot'
 
 /** The reads of one kind a test is holding. */
 export interface HeldReads {
@@ -368,6 +386,15 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
   const nodes: DocumentNode[] = startingConversation()
   /** How far above its live screen each session's view is looking, in rows. */
   const rowsAbove = new Map<string, number>()
+  /** Each session's attachments, in join order. */
+  const attached = new Map<string, FakeAttachment[]>(
+    [SESSION_MAIN, SESSION_BUILD, SESSION_OFFLINE].map((sessionId) => [
+      sessionId,
+      startingAttachments(sessionId)
+    ])
+  )
+  const attachmentNamed = (attachmentId: string): FakeAttachment | undefined =>
+    [...attached.values()].flat().find((each) => each.attachmentId === attachmentId)
   const acknowledged = new Set<string>()
   const deletedArtefacts = new Set<string>()
   const openedPanes: string[] = []
@@ -735,6 +762,20 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       return Promise.resolve(settledAs('storage.object.delete', 'applied'))
     },
 
+    eventsSnapshot: (params) =>
+      reading('eventsSnapshot', () => {
+        requireConnection()
+        const found = sessions().sessions.find((each) => each.session_id === params.session_id)
+        if (!found) refuse('UNKNOWN_SESSION', 'That session is not on this host.')
+        const view = terminalAttachment(found.session_id)
+        const above = (rowsAbove.get(found.session_id) ?? 0) > 0
+        return sessionSnapshot(
+          found,
+          (attached.get(found.session_id) ?? []).map((each) =>
+            summaryOf(each, above && each.attachmentId === view)
+          )
+        )
+      }),
     terminalProjection: (params) =>
       reading('terminalProjection', () => {
         requireConnection()
@@ -1213,6 +1254,20 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       return () => {
         complete()
         registering = Promise.resolve()
+      }
+    },
+    presentAttachment(attachmentId, presentation, reason) {
+      const found = attachmentNamed(attachmentId)
+      if (!found) return
+      found.presentation = presentation
+      found.reason = presentation === 'viewport' ? reason : undefined
+    },
+    detachAttachment(attachmentId) {
+      for (const [sessionId, held] of attached) {
+        attached.set(
+          sessionId,
+          held.filter((each) => each.attachmentId !== attachmentId)
+        )
       }
     }
   }
@@ -1889,6 +1944,116 @@ function projection(sessionId: string, rowsAbove: number): ProjectedScreen {
       '#585c60', '#faa49c', '#aad2bb', '#e7bf7a', '#8fb8f5', '#c0a6dc', '#8fb4a8', '#ffffff'
     ]
   }
+}
+
+/** One attachment of a session, as this host holds it. */
+interface FakeAttachment {
+  readonly attachmentId: string
+  readonly ordinal: number
+  readonly mode: 'semantic' | 'terminal'
+  /** How it is presented while its window is on the live screen; null when it is no terminal. */
+  presentation: TerminalPresentationMode | null
+  /** The reason a viewport is given, or none, as a worker built before reasons reports it. */
+  reason: PresentationReason | undefined
+}
+
+/**
+ * A session's attachments when this host starts: `kr` attached from a terminal of another size,
+ * a semantic view, and the raw view this application names as its own, shown directly.
+ */
+function startingAttachments(sessionId: string): FakeAttachment[] {
+  const tail = sessionId.slice(-12)
+  return [
+    {
+      attachmentId: `c1a0c1a0-0000-4000-8000-${tail}`,
+      ordinal: 1,
+      mode: 'terminal',
+      presentation: 'viewport',
+      reason: 'size_mismatch'
+    },
+    {
+      attachmentId: `5e5a5e5a-0000-4000-8000-${tail}`,
+      ordinal: 2,
+      mode: 'semantic',
+      presentation: null,
+      reason: undefined
+    },
+    {
+      attachmentId: terminalAttachment(sessionId),
+      ordinal: 3,
+      mode: 'terminal',
+      presentation: 'direct',
+      reason: undefined
+    }
+  ]
+}
+
+/** Every presentation reason, in the order the first that holds is the one reported. */
+const PRESENTATION_ORDER: readonly PresentationReason[] = [
+  'no_terminal_profile',
+  'unqualified_terminal_profile',
+  'size_mismatch',
+  'history_window',
+  'stream_not_carryable',
+  'restoration_incomplete',
+  'awaiting_parser_boundary'
+]
+
+/**
+ * What the host reports for one attachment, given how it stands and whether its window is above
+ * the live screen: the first reason in the order that holds, a viewport with no reason from a
+ * worker that gives none, or direct when nothing holds.
+ */
+function summaryOf(attachment: FakeAttachment, windowAbove: boolean): AttachmentSummary {
+  const terminal = attachment.mode === 'terminal'
+  let presentation: TerminalPresentationMode | null = attachment.presentation
+  let reason: PresentationReason | undefined
+  if (presentation === 'viewport' && attachment.reason === undefined) {
+    reason = undefined
+  } else if (presentation !== null) {
+    const holding = [
+      ...(attachment.reason === undefined ? [] : [attachment.reason]),
+      ...(windowAbove ? (['history_window'] as const) : [])
+    ]
+    reason = PRESENTATION_ORDER.find((each) => holding.includes(each))
+    presentation = reason === undefined ? 'direct' : 'viewport'
+  }
+  return {
+    attached_at_ms: String(FAKE_NOW_MS - 60_000 * attachment.ordinal),
+    attachment_id: attachment.attachmentId,
+    claim_geometry: false,
+    dimensions: terminal ? { columns: '120', rows: '40' } : null,
+    granted: terminal ? ['observe_terminal', 'input'] : ['observe_semantic'],
+    mode: attachment.mode,
+    ordinal: String(attachment.ordinal),
+    presentation,
+    // Left out when there is none, as the host writes it.
+    ...(reason === undefined ? {} : { presentation_reason: reason }),
+    terminal_profile_id: terminal ? 'xterm-256color' : null
+  }
+}
+
+/** One session's snapshot: its state now, with every attachment's summary. */
+function sessionSnapshot(
+  session: SessionListResult['sessions'][number],
+  attachments: readonly AttachmentSummary[]
+): EventsSnapshotResult {
+  const state = {
+    agent_resources: {
+      continue_after: null,
+      cursor: '40',
+      resources: [],
+      snapshot_id: '1',
+      stream_generation: '1'
+    },
+    cursor: '40',
+    geometry: { dimensions: { columns: '120', rows: '40' }, epoch: '1', owner: null },
+    lease: { connection_id: null, epoch: '1', holder: null },
+    oldest_retained_cursor: '1',
+    session,
+    taken_at_ms: String(FAKE_NOW_MS)
+  } as unknown as Omit<EventsSnapshotResult, 'attachments'>
+  return { ...state, attachments: [...attachments] }
 }
 
 /* ---- First-start setup --------------------------------------------------------------------- */

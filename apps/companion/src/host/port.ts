@@ -15,6 +15,8 @@ import type {
   Dimensions4,
   EnvironmentCapabilitiesResult,
   EnvironmentListResult,
+  EventsSnapshotParams,
+  EventsSnapshotResult,
   HostInfoResult,
   Receipt,
   SessionListResult,
@@ -539,6 +541,12 @@ export interface HostPort {
   storageStatus(params: unknown): Promise<unknown>
   storageObjectDelete(params: unknown, subject: SessionSubject): Promise<Settled>
 
+  /**
+   * One session as the host installs it: every attachment with how it is presented and why, who
+   * owns the size and who holds input. It carries no screen.
+   */
+  eventsSnapshot(params: EventsSnapshotParams): Promise<EventsSnapshotResult>
+  /** The projected screen a raw terminal view draws: rows of resolved cells, the cursor, the window. */
   terminalProjection(params: unknown): Promise<ProjectedScreen>
   terminalInput(params: unknown): Promise<unknown>
   attachmentViewport(params: unknown, subject: SessionSubject): Promise<Settled>
