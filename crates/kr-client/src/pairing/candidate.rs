@@ -368,6 +368,16 @@ impl Pairing {
             Err(failure) => return Some(ended(progress, Err(failure))),
         };
         progress.send_replace(reconnecting(&pending));
+        // Nothing this device does for another host may close the endpoint the attempt uses.
+        let _held = match within(WAIT_STEP, self.link.hold(&pending.network_config)).await {
+            Ok(held) => held,
+            Err(error) => {
+                return Some(ended(
+                    progress,
+                    Err(link_failed(&error, pending.tries_left)),
+                ));
+            }
+        };
         // The host may have committed this device already, and this device recorded it and
         // stopped before it let the waiting attempt go. The host now answers that endpoint as the
         // paired device, so the record is what reaches it.
@@ -540,10 +550,14 @@ impl Pairing {
         }
         drop(room);
 
-        // The host, at the endpoint its authenticated bundle pinned.
+        // The host, at the endpoint its authenticated bundle pinned, which nothing this device does
+        // for another host may close while the attempt runs.
         progress.send_replace(AttemptState::Working {
             stage: Stage::ReachingHost,
         });
+        let _held = within(WAIT_STEP, self.link.hold(&bundle.network_config))
+            .await
+            .map_err(|error| link_failed(&error, tries))?;
         let connection = within(
             WAIT_STEP,
             self.link.dial(&bundle.network_config, &bundle.endpoint_id),

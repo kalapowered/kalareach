@@ -346,6 +346,120 @@ async fn the_page_is_sent_no_secret_while_this_computer_pairs_and_confirms() {
     );
 }
 
+/// A host's endpoint on the loopback network whose configuration names `relay` and resolves
+/// through `resolver`. Nothing answers at either, so a device reaches the host at its direct
+/// address; what the two services decide is which of this device's endpoints may be open at once.
+fn on_relay(relay: &str, resolver: &str) -> kr_transport::config::EndpointConfig {
+    kr_transport::config::EndpointConfig {
+        bind_addr: Some(support::loopback()),
+        relay_urls: vec![relay.parse().expect("a relay URL")],
+        discovery: kr_transport::config::DiscoveryConfig {
+            pkarr_resolver_url: Some(resolver.parse().expect("a resolver URL")),
+            ..kr_transport::config::DiscoveryConfig::default()
+        },
+        ..kr_transport::config::EndpointConfig::default()
+    }
+}
+
+/// KR-REQ-10.27, KR-REQ-10.06: this computer watches a host it owns while it pairs with another
+/// host whose configuration shares the first one's relay and selects another resolver. One key
+/// holds one endpoint on a relay, so reaching the owned host would close the endpoint the attempt
+/// uses. The attempt waits for its owner through several of the watcher's cycles and never loses
+/// its connection, the owned host is out of contact meanwhile, and once the attempt has ended the
+/// watcher reaches the owned host again and lists what it asks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_watcher_never_cuts_off_an_attempt_that_shares_its_relay() {
+    const RELAY: &str = "https://relay.pairing.test";
+    let owner_keys = DeviceKeys::generate().expect("keys");
+    let owned =
+        Host::start_with_endpoint(&owner_keys, on_relay(RELAY, "http://127.0.0.1:9/pkarr")).await;
+    let other_owner = DeviceKeys::generate().expect("keys");
+    let joining =
+        Host::start_with_endpoint(&other_owner, on_relay(RELAY, "http://127.0.0.1:10/pkarr")).await;
+    let capture = Arc::new(Capture::default());
+    let data = tempfile::tempdir().expect("a directory");
+    let device = support::owner_device_with(&owned, &owner_keys, data.path(), &capture);
+    let watcher = Owner::new(
+        Arc::clone(&device),
+        Arc::new(StubCeremony {
+            answer: CeremonyOutcome::Confirmed,
+            asked: AtomicUsize::new(0),
+        }),
+        || {},
+    );
+    watcher.start();
+    support::owned_host_shown(&device, true).await;
+
+    let mut client = joining.client().await;
+    let joining_owner = Signer::OwnerDevice(&other_owner);
+    let direct = calls::invite_direct(
+        joining.environment_id,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &viewer(),
+        &joining_owner,
+    )
+    .await
+    .expect("a direct invitation");
+    let InviteEntry::Direct { qr_text } = &direct.entry else {
+        panic!("a direct invitation");
+    };
+    let invitation = device.read(qr_text.as_str()).expect("an invitation");
+    let _ = device.hold(invitation);
+    device.start_held().expect("started");
+    let state = reached(&device, awaiting).await;
+    assert!(awaiting(&state), "{state:?}");
+
+    // The owner takes long enough for the watcher to cycle several times, and for the attempt to
+    // ask again once the host's window has made room for its question.
+    tokio::time::sleep(Duration::from_secs(15)).await;
+    let lost: Vec<String> = capture
+        .texts()
+        .into_iter()
+        .filter(|text| {
+            text.contains(r#""state":"reconnecting""#) || text.contains(r#""state":"ended""#)
+        })
+        .collect();
+    assert_eq!(
+        lost,
+        Vec::<String>::new(),
+        "the attempt kept its connection"
+    );
+    assert_eq!(
+        support::owned_host_in_contact(&device),
+        Some(false),
+        "the owned host waits while the attempt holds the relay"
+    );
+
+    calls::confirm_candidate(
+        joining.environment_id,
+        &mut client,
+        direct.invitation_id,
+        &joining_owner,
+    )
+    .await
+    .expect("the owner approves");
+    let state = reached(&device, paired).await;
+    assert!(paired(&state), "{state:?}");
+
+    // The attempt has ended, and the owned host is reached again.
+    let mut owned_client = owned.client().await;
+    calls::request(
+        owned.environment_id,
+        &mut owned_client,
+        ConfirmationSubject::IssueInvitation {
+            mode: InviteModeKind::Direct,
+            rendezvous_origin: Nullable::null(),
+            grant_kind: InviteGrantKind::SessionInvitation,
+            proposed_grant: viewer(),
+        },
+    )
+    .await
+    .expect("the owned host asks its owner");
+    support::listed(&watcher, |request| request.checkable).await;
+    support::owned_host_shown(&device, true).await;
+}
+
 /// A room that counts the sockets it is asked to open, and ends each before any host speaks.
 #[derive(Default)]
 struct CountingRoom {
