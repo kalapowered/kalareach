@@ -609,7 +609,11 @@ async fn an_applied_answer_that_names_a_copy_is_not_one_this_client_reads() {
     let collection = shared::shared_collection(shared::installation(0x41), 0x42);
 
     for (state, record, current) in [
-        ("written", summary(object, revision(9), "4"), Some(revision(9))),
+        (
+            "written",
+            summary(object, revision(9), "4"),
+            Some(revision(9)),
+        ),
         ("removed", serde_json::Value::Null, None),
     ] {
         recorder.answering(vec![exchanged(state, record, current, "4", copy.clone())]);
