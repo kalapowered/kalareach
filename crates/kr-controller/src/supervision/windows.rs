@@ -1751,7 +1751,10 @@ mod tests {
                 environment_id: EnvironmentId::new(kr_ipc::new_uuid()),
                 ..ours.clone()
             };
-            let _registered = Registered(theirs.clone());
+            let _theirs = Registered(theirs.clone());
+            // Removes the task a registration that wrongly took the name would leave, which is
+            // this environment's, so a broken copy of the refusal leaves nothing behind either.
+            let _ours = Registered(ours.clone());
             register(&theirs).expect("the other environment's task");
             assert!(matches!(
                 standing(&ours).expect("asked"),
@@ -1777,7 +1780,10 @@ mod tests {
                 environment_id: EnvironmentId::new(kr_ipc::new_uuid()),
                 ..ours.clone()
             };
-            let _registered = Registered(theirs.clone());
+            let _theirs = Registered(theirs.clone());
+            // Removes the task a creation that wrongly took the name would leave, which is this
+            // environment's, so a broken copy of the refusal leaves nothing behind either.
+            let _ours = Registered(ours.clone());
             register(&theirs).expect("the task that took the name meanwhile");
             let created = super::super::platform::create_task(&ours, false);
             assert_eq!(
