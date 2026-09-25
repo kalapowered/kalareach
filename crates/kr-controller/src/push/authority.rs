@@ -35,6 +35,8 @@ pub struct GrantedRecipients {
     policy: Arc<Mutex<HostPolicy>>,
     environment_id: EnvironmentId,
     clock: crate::service::WallClock,
+    /// The continuous clock a membership lease's continuous deadline is compared with.
+    continuous: Arc<dyn kr_transport::clock::ContinuousClock>,
 }
 
 impl std::fmt::Debug for GrantedRecipients {
@@ -48,19 +50,22 @@ impl std::fmt::Debug for GrantedRecipients {
 
 impl GrantedRecipients {
     /// Answers from `sharing`'s grants under `policy`, for the sessions of one environment, with
-    /// UTC read on `clock`, the daemon's wall clock.
+    /// UTC read on `clock`, the daemon's wall clock, and a lease's continuous deadline compared
+    /// with `continuous`, the daemon's continuous clock.
     #[must_use]
     pub fn new(
         sharing: Arc<SharingService>,
         policy: Arc<Mutex<HostPolicy>>,
         environment_id: EnvironmentId,
         clock: crate::service::WallClock,
+        continuous: Arc<dyn kr_transport::clock::ContinuousClock>,
     ) -> Self {
         Self {
             sharing,
             policy,
             environment_id,
             clock,
+            continuous,
         }
     }
 
@@ -78,6 +83,7 @@ impl GrantedRecipients {
             policy,
             environment_id,
             crate::service::WallClock::from_fn(clock),
+            Arc::new(kr_transport::clock::SystemContinuousClock::new()),
         )
     }
 }
@@ -102,9 +108,9 @@ impl RecipientAuthority for GrantedRecipients {
             return None;
         }
         // Content leaving this host for a recipient elsewhere is remote use of the grant, so it is
-        // intersected the way a paired device's request is. This host attributes no account to
-        // the recipient of an external message, so an organisation grant, whose lease is per
-        // member, admits nothing rather than being answered by somebody else's lease.
+        // intersected the way a paired device's request is. An organisation grant answers to the
+        // lease of the member its recipient device is bound to, on both clocks; a message carries
+        // no account of its own that could name another.
         let effective = policy
             .intersect(
                 grant,
@@ -114,9 +120,9 @@ impl RecipientAuthority for GrantedRecipients {
                     environment_id: self.environment_id,
                     session_id: None,
                     claims_geometry: false,
-                    recipient_account: None,
                     own_subject: None,
                     now_ms,
+                    continuous_now: self.continuous.now(),
                 },
                 now_ms,
             )

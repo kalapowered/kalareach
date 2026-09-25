@@ -61,6 +61,24 @@ pub struct StoredEnrolment {
     /// The host authority revision in force when this host enrolled. An organisation grant's
     /// requirement names it.
     pub enrolment_revision: AuthorityRevision,
+    /// The devices bound to member accounts in this organisation, each by its first verified
+    /// lease.
+    pub members: Vec<StoredBinding>,
+}
+
+/// One device bound to a member account, as it is written down.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredBinding {
+    /// The device.
+    pub device_id: DeviceId,
+    /// The member account its first verified lease named.
+    pub account_id: AccountId,
+    /// The authorisation key that lease named and the presenting connection proved.
+    pub device_key: AuthorisationKey,
+    /// When this host bound it, in UTC milliseconds.
+    pub bound_at_ms: TimestampMs,
+    /// The SHA-256 digest of the lease that bound it.
+    pub lease_digest: Digest256,
 }
 
 /// The newest lease this host installed for one member's device, as it is written down.

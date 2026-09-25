@@ -196,12 +196,13 @@ pub fn decide_with_ceiling(
     let Some(ceiling) = ceiling else {
         let permitted =
             decide(grant, record, policy, request.clone()).map_err(CeilingRefusal::Refused)?;
+        let lapses_at_ms = lapses_at_ms(grant, policy, &request, permitted.lease);
         return Ok(Decided {
             permitted,
             removed: CanonicalSet::new(),
             refused_rights: CanonicalSet::new(),
             decided_at_ms: policy.settled_now(request.now_ms),
-            lapses_at_ms: lapses_at_ms(grant, policy, &request),
+            lapses_at_ms,
         });
     };
     // The ceiling is applied to the grant *before* the decision, never to its result. A method
@@ -248,23 +249,30 @@ pub fn decide_with_ceiling(
         .copied()
         .filter(|right| !policy_rights.contains(right))
         .collect();
+    let lapses_at_ms = lapses_at_ms(grant, policy, &request, permitted.lease);
     Ok(Decided {
         permitted,
         removed,
         refused_rights,
         decided_at_ms: now_ms,
-        lapses_at_ms: lapses_at_ms(grant, policy, &request),
+        lapses_at_ms,
     })
 }
 
 /// The first UTC moment a permitted request stops being permitted by the passage of time alone.
 ///
-/// Two bounds can end a paired device's authority on a clock: the grant's own expiry, and, for a
+/// Three bounds can end a paired device's authority on a clock: the grant's own expiry; for a
 /// caller that is not at this machine under a personal grant, the bounded offline validity an
-/// owner chose, which holds up to the last moment inside it. A membership lease is not among them,
-/// because a request that carries no account is never admitted under one. Everything else that
-/// ends a decision is an event, and moves [`crate::service::Controller`]'s authority epoch.
-fn lapses_at_ms(grant: &Grant, policy: &HostPolicy, request: &AccessRequest) -> Option<u64> {
+/// owner chose, which holds up to the last moment inside it; and the signed expiry of the
+/// membership lease the decision was taken under, whose continuous deadline the decision carries
+/// beside it ([`Permitted::lease`]). Everything else that ends a decision is an event, and moves
+/// [`crate::service::Controller`]'s authority epoch.
+fn lapses_at_ms(
+    grant: &Grant,
+    policy: &HostPolicy,
+    request: &AccessRequest,
+    lease: Option<crate::grants::organisation::LeaseBound>,
+) -> Option<u64> {
     let expiry = match grant.expiry {
         kr_protocol::grant::GrantExpiry::Never => None,
         kr_protocol::grant::GrantExpiry::At { expires_at_ms } => Some(expires_at_ms.get()),
@@ -282,10 +290,10 @@ fn lapses_at_ms(grant: &Grant, policy: &HostPolicy, request: &AccessRequest) -> 
                 .checked_add(1)
         })
     });
-    match (expiry, offline) {
-        (Some(expiry), Some(offline)) => Some(expiry.min(offline)),
-        (expiry, offline) => expiry.or(offline),
-    }
+    [expiry, offline, lease.map(|lease| lease.expires_at_ms)]
+        .into_iter()
+        .flatten()
+        .min()
 }
 
 /// Why a request was refused once every intersection had been applied.

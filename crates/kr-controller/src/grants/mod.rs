@@ -72,12 +72,6 @@ pub struct AccessRequest {
     pub session_id: Option<SessionId>,
     /// Whether the request claims or adds a geometry claim.
     pub claims_geometry: bool,
-    /// The account the grant's recipient is bound to, when the host has resolved one.
-    ///
-    /// Needed only for a grant that requires organisation membership: it decides whose lease
-    /// answers for the request. Absent, such a grant is refused rather than answered by somebody
-    /// else's lease.
-    pub recipient_account: Option<kr_protocol::ids::AccountId>,
     /// Whether the subject belongs to the verified actor itself, when the host has resolved it.
     ///
     /// `None` means the host has not resolved the subject here, which is the ordinary case at the
@@ -90,6 +84,9 @@ pub struct AccessRequest {
     /// has already observed, so winding the clock back does not revive an expiry this host has
     /// already decided against.
     pub now_ms: u64,
+    /// The host's continuous clock when the request is decided, which a membership lease's
+    /// continuous deadline is compared with.
+    pub continuous_now: kr_transport::clock::ContinuousInstant,
 }
 
 /// Why a request was refused.
@@ -138,8 +135,8 @@ pub enum Refusal {
         /// The highest revision this host has issued.
         current_revision: AuthorityRevision,
     },
-    /// The grant requires an organisation membership and this host cannot name the account its
-    /// recipient is bound to, so it cannot tell whose lease would answer for it.
+    /// The grant requires an organisation membership and its recipient device is bound to no
+    /// member of that organisation on this host, so no lease answers for it.
     MembershipUnattributed,
     /// The grant does not cover this environment.
     EnvironmentOutsideGrant,
@@ -267,6 +264,9 @@ pub struct Permitted {
     pub rights: CanonicalSet<ActionRight>,
     /// The revision the decision was taken under.
     pub authority_revision: AuthorityRevision,
+    /// The deadlines of the membership lease the decision was taken under, when one answered for
+    /// it: the decision holds only while both are ahead.
+    pub lease: Option<organisation::LeaseBound>,
     /// The requirements this decision could not answer, for the subject to answer.
     ///
     /// Resource ownership, a pairing transcript, a service credential, a local caller's token and
@@ -429,6 +429,7 @@ pub fn decide(
     Ok(Permitted {
         rights: intersection.rights,
         authority_revision: policy.authority_revision(),
+        lease: intersection.lease,
         unresolved,
     })
 }
@@ -449,8 +450,9 @@ pub fn decide(
 /// expiry this host had already refused. The caller writes the policy down afterwards, as every
 /// other raise of the floor is written down.
 ///
-/// This host resolves no account for a grant's recipient here, so a grant that requires an
-/// organisation membership is refused rather than answered by somebody else's lease.
+/// A grant that requires an organisation membership is answered by the lease of the member its
+/// recipient device is bound to, on both clocks, as a request's is; nothing here presents a
+/// connection or names an account. What comes back carries that lease's deadlines with the rights.
 ///
 /// # Errors
 ///
@@ -461,7 +463,8 @@ pub fn standing_at_dispatch(
     environment_id: EnvironmentId,
     ingress: kr_protocol::actor::ActorIngress,
     now_ms: u64,
-) -> std::result::Result<CanonicalSet<ActionRight>, Refusal> {
+    continuous_now: kr_transport::clock::ContinuousInstant,
+) -> std::result::Result<PolicyIntersection, Refusal> {
     let grant = &record.grant;
     if record.revoked_at_ms.is_some() {
         return Err(match record.revoked_by_parent {
@@ -501,11 +504,11 @@ pub fn standing_at_dispatch(
         environment_id,
         session_id: None,
         claims_geometry: false,
-        recipient_account: None,
         own_subject: None,
         now_ms,
+        continuous_now,
     };
-    Ok(policy.intersect(grant, &request, now_ms)?.rights)
+    policy.intersect(grant, &request, now_ms)
 }
 
 /// Whether a conditional requirement applies to this request.

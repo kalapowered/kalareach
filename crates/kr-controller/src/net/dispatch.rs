@@ -2587,9 +2587,9 @@ impl RemoteConnection {
             environment_id: self.controller.paths().environment_id(),
             session_id,
             claims_geometry,
-            recipient_account: None,
             own_subject: None,
             now_ms: self.controller.wall_now_ms(),
+            continuous_now: self.controller.clock.now(),
         };
         let decided = self
             .controller

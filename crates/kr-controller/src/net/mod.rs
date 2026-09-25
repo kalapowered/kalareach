@@ -609,6 +609,7 @@ impl NetworkHost {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .advance_authority_revision(revision);
+        controller.unbind_device(device_id);
         controller.announce_authority_revision().await
     }
 
@@ -1020,19 +1021,9 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
         controller.paths().registry_database(),
     )?);
     invitations::prepare(&devices)?;
-    // The daemon's own clock, not a second one. Deadlines from the transport's action windows are
-    // compared with deadlines the daemon decided, and a continuous instant is anchored privately:
-    // two clocks would make those comparisons meaningless rather than merely imprecise.
-    let clock: Arc<dyn kr_transport::clock::ContinuousClock> = Arc::clone(&controller.clock);
-    // One record of every grant's lifetime, read by the connections this host admits and by the
-    // owner confirmations it spends.
-    let lifetimes = Arc::new(lifetimes::GrantLifetimes::new(
-        Arc::clone(&devices),
-        Arc::clone(&clock),
-        Arc::clone(&controller.shared_clock),
-        controller.boot_identity.clone(),
-        controller.wall_clock(),
-    ));
+    // The daemon's one record of every grant's lifetime, read by the connections this host admits
+    // and by the owner confirmations it spends, on the daemon's own clocks.
+    let lifetimes = Arc::clone(controller.lifetimes());
     let rows = invitations::InvitationRows::new(Arc::clone(&devices), Arc::clone(&lifetimes));
     // Section 10: a host restart cancels every invitation it left unfinished, because a
     // candidate's attempt lived only in memory and nothing can resume it. What an invitation
@@ -1130,7 +1121,10 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
         identity,
         &keys.transport,
         Arc::clone(&host),
-        clock,
+        // The daemon's own clock, not a second one. Deadlines from the transport's action windows
+        // are compared with deadlines the daemon decided: two clocks would make those comparisons
+        // meaningless rather than merely imprecise.
+        Arc::clone(&controller.clock),
     )
     .await
     .map_err(|error| match error {
@@ -1877,9 +1871,11 @@ mod tests {
             environment_id: temp.environment_id(),
             session_id: None,
             claims_geometry: false,
-            recipient_account: None,
             own_subject: None,
             now_ms,
+            continuous_now: kr_transport::clock::ContinuousClock::now(
+                &kr_transport::clock::SystemContinuousClock::new(),
+            ),
         }
     }
 

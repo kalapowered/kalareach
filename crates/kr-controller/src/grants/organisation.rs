@@ -19,9 +19,15 @@
 //! 5. it is inside its own rules: at most fifteen minutes long, and inside its role's ceiling;
 //! 6. it is inside its window on this host's clock, which must be trusted, and not issued more than
 //!    five seconds in this host's future;
-//! 7. it is newer than every lease this host has installed for that member and device: a lease
+//! 7. it names the account and key the presenting device is bound to, or, when the device is bound
+//!    to nobody in that organisation, it binds the device to its account and key;
+//! 8. it is newer than every lease this host has installed for that member and device: a lease
 //!    digest is installed at most once on a host, whatever either clock says, so an expired lease
 //!    presented again never revives, not after a restart and not after a new enrolment.
+//!
+//! The binding is what a grant's recipient is resolved through at every ingress: a grant that
+//! requires an organisation answers to the lease of the account and key its recipient device is
+//! bound to, and to no other.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -33,12 +39,12 @@ use kr_protocol::account::{
     PolicyAuthorityLink,
 };
 use kr_protocol::ids::{
-    AccountId, AuthorityRevision, ControllerGeneration, OrganisationId, PolicyKeyRevision,
+    AccountId, AuthorityRevision, ControllerGeneration, DeviceId, OrganisationId, PolicyKeyRevision,
 };
 use kr_protocol::scalars::{AuthorisationKey, Digest256, Signature64};
 use kr_transport::clock::ContinuousInstant;
 
-use super::durable::{StoredEnrolment, StoredLeaseRecord};
+use super::durable::{StoredBinding, StoredEnrolment, StoredLeaseRecord};
 use crate::service::net::devices::ObservedUtc;
 
 /// How far this host's clock may be behind a lease's issue time, and how much earlier than its
@@ -112,6 +118,8 @@ impl core::fmt::Display for ChainRefused {
 pub enum LeaseRefused {
     /// This host is not enrolled in the lease's organisation.
     NotEnrolled,
+    /// The presenting device holds no live grant on this host that requires that organisation.
+    NoOrganisationGrant,
     /// The lease names a revision this host has not authenticated from its anchor.
     UnauthenticatedRevision,
     /// The signature is not the named revision's over the lease's signing input.
@@ -144,6 +152,8 @@ pub enum LeaseRefused {
     AmbiguousIssue,
     /// A newer lease for that member and device is already recorded.
     Superseded,
+    /// The presenting device is bound to another member account in that organisation.
+    AccountMismatch,
 }
 
 impl LeaseRefused {
@@ -152,6 +162,9 @@ impl LeaseRefused {
     pub const fn detail(self) -> &'static str {
         match self {
             Self::NotEnrolled => "this host is not enrolled in that organisation",
+            Self::NoOrganisationGrant => {
+                "this device holds no grant on this host that requires that organisation"
+            }
             Self::UnauthenticatedRevision => {
                 "the lease names a policy-signing revision this host has not authenticated"
             }
@@ -176,6 +189,7 @@ impl LeaseRefused {
             }
             Self::AmbiguousIssue => "another lease with the same issue time is already recorded",
             Self::Superseded => "a newer lease for this device is already recorded",
+            Self::AccountMismatch => "this device is bound to another member of that organisation",
         }
     }
 }
@@ -223,6 +237,49 @@ impl InstalledLease {
     pub fn unexpired_at(&self, utc_ms: u64) -> bool {
         utc_ms < self.lease.payload.expires_at_ms.get()
     }
+
+    /// Its two deadlines, as a decision under it carries them.
+    #[must_use]
+    pub fn bound(&self) -> LeaseBound {
+        LeaseBound {
+            continuous_deadline: self.continuous_deadline,
+            expires_at_ms: self.lease.payload.expires_at_ms.get(),
+        }
+    }
+}
+
+/// The two deadlines of the lease a decision was taken under: when it ends on the continuous
+/// clock, and its signed expiry on UTC. A decision holds only while both are ahead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LeaseBound {
+    /// When the lease ends on the continuous clock.
+    pub continuous_deadline: ContinuousInstant,
+    /// Its signed expiry, in UTC milliseconds.
+    pub expires_at_ms: u64,
+}
+
+/// One device bound to a member account, by the first verified lease it presented.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Binding {
+    /// The member account.
+    pub account_id: AccountId,
+    /// The authorisation key the binding lease named and the presenting connection proved.
+    pub device_key: AuthorisationKey,
+    /// When this host bound it, in UTC milliseconds.
+    pub bound_at_ms: u64,
+    /// The SHA-256 digest of the lease that bound it.
+    pub lease_digest: Digest256,
+}
+
+/// Why a device's lease does not answer for a grant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemberLease {
+    /// The device is bound to no member account in that organisation.
+    Unbound,
+    /// It is bound, and this host holds no lease for its account and key.
+    NoLease,
+    /// Its lease has ended on either clock.
+    Expired,
 }
 
 /// The newest lease this host installed for one member's device, and the run that installed it.
@@ -397,8 +454,10 @@ pub struct Enrolment {
     links: Vec<PolicyAuthorityLink>,
     accepted_head: PolicyKeyRevision,
     enrolment_revision: AuthorityRevision,
+    /// The devices bound to member accounts, each by the first verified lease it presented.
+    members: BTreeMap<DeviceId, Binding>,
     /// The leases installed now, one per member account and device key. Private: only
-    /// [`Self::install`] adds one.
+    /// [`install`] adds one.
     installed: BTreeMap<(AccountId, AuthorisationKey), InstalledLease>,
 }
 
@@ -410,6 +469,7 @@ impl Enrolment {
             links: vec![verified.anchor],
             root: verified.root,
             enrolment_revision,
+            members: BTreeMap::new(),
             installed: BTreeMap::new(),
         }
     }
@@ -421,6 +481,21 @@ impl Enrolment {
             links: stored.links.clone(),
             accepted_head: stored.accepted_head,
             enrolment_revision: stored.enrolment_revision,
+            members: stored
+                .members
+                .iter()
+                .map(|binding| {
+                    (
+                        binding.device_id,
+                        Binding {
+                            account_id: binding.account_id.clone(),
+                            device_key: binding.device_key,
+                            bound_at_ms: binding.bound_at_ms.get(),
+                            lease_digest: binding.lease_digest,
+                        },
+                    )
+                })
+                .collect(),
             installed: BTreeMap::new(),
         }
     }
@@ -433,7 +508,52 @@ impl Enrolment {
             links: self.links.clone(),
             accepted_head: self.accepted_head,
             enrolment_revision: self.enrolment_revision,
+            members: self
+                .members
+                .iter()
+                .map(|(device_id, binding)| StoredBinding {
+                    device_id: *device_id,
+                    account_id: binding.account_id.clone(),
+                    device_key: binding.device_key,
+                    bound_at_ms: kr_protocol::scalars::TimestampMs::new(binding.bound_at_ms),
+                    lease_digest: binding.lease_digest,
+                })
+                .collect(),
         }
+    }
+
+    /// The member account and key `device_id` is bound to in this organisation.
+    #[must_use]
+    pub fn binding(&self, device_id: DeviceId) -> Option<&Binding> {
+        self.members.get(&device_id)
+    }
+
+    /// The lease in force for the member `device_id` is bound to, at both readings.
+    ///
+    /// # Errors
+    ///
+    /// Why there is none: the device is bound to nobody here, it holds no lease, or its lease has
+    /// ended on either clock.
+    pub fn lease_for_device(
+        &self,
+        device_id: DeviceId,
+        now: ContinuousInstant,
+        utc_ms: u64,
+    ) -> Result<&InstalledLease, MemberLease> {
+        let binding = self.members.get(&device_id).ok_or(MemberLease::Unbound)?;
+        let installed = self
+            .installed(&binding.account_id, &binding.device_key)
+            .ok_or(MemberLease::NoLease)?;
+        if installed.in_force(now, utc_ms) {
+            Ok(installed)
+        } else {
+            Err(MemberLease::Expired)
+        }
+    }
+
+    /// Removes `device_id`'s binding: the device was revoked. Returns whether it was bound.
+    pub(crate) fn unbind(&mut self, device_id: DeviceId) -> bool {
+        self.members.remove(&device_id).is_some()
     }
 
     /// The first revision's link: the organisation's identity.
@@ -622,6 +742,9 @@ impl Enrolment {
 pub struct LeasePresentation<'a> {
     /// The lease, typed as it arrived.
     pub lease: &'a MembershipLease,
+    /// The device presenting it: the paired device of the connection, or this host's own device
+    /// for its local owner.
+    pub device_id: DeviceId,
     /// The authorisation key the presenting connection proved.
     pub proven_key: &'a AuthorisationKey,
     /// This host's reading of UTC, which exists only while its clock is trusted.
@@ -647,13 +770,16 @@ pub struct LeaseInstalled {
     pub continuous_deadline: ContinuousInstant,
     /// What the presentation changed.
     pub change: LeaseChange,
+    /// Whether it bound the presenting device to the lease's account and key, which the caller
+    /// writes down with a retained event.
+    pub bound: bool,
 }
 
 /// What presenting a lease changed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LeaseChange {
-    /// The lease already installed in this run, presented again: nothing is written and its
-    /// deadline does not move.
+    /// The lease already installed in this run, presented again: its deadline does not move, and
+    /// nothing is written unless it binds the presenting device.
     Repeat,
     /// A lease newer than any this host installed for that member and device. Its record is new
     /// and is written before the lease is installed.
@@ -722,6 +848,18 @@ pub(crate) fn install(
     if expired {
         return Err(LeaseRefused::Expired);
     }
+    // The binding: a device bound in this organisation presents only for the account and key it
+    // is bound to; one bound to nobody binds on this lease, once the lease is installed.
+    let binds = match enrolment.members.get(&presentation.device_id) {
+        Some(binding) if binding.account_id != payload.account_id => {
+            return Err(LeaseRefused::AccountMismatch);
+        }
+        Some(binding) if binding.device_key != payload.device_key => {
+            return Err(LeaseRefused::DeviceMismatch);
+        }
+        Some(_) => false,
+        None => true,
+    };
 
     let holder: LeaseHolder = (
         payload.organisation_id,
@@ -748,13 +886,18 @@ pub(crate) fn install(
                         if installed.digest == digest
                             && installed.in_force(presentation.now, settled_ms) =>
                     {
+                        let continuous_deadline = installed.continuous_deadline;
+                        if binds {
+                            bind(enrolment, &presentation, settled_ms, digest);
+                        }
                         Ok(LeaseInstalled {
                             organisation_id: payload.organisation_id,
                             account_id: payload.account_id.clone(),
                             key_revision: payload.key_revision,
                             expires_at_ms: payload.expires_at_ms.get(),
-                            continuous_deadline: installed.continuous_deadline,
+                            continuous_deadline,
                             change: LeaseChange::Repeat,
+                            bound: binds,
                         })
                     }
                     _ => Err(LeaseRefused::Expired),
@@ -812,6 +955,9 @@ pub(crate) fn install(
             continuous_deadline,
         },
     );
+    if binds {
+        bind(enrolment, &presentation, settled_ms, digest);
+    }
     Ok(LeaseInstalled {
         organisation_id: payload.organisation_id,
         account_id: payload.account_id.clone(),
@@ -819,7 +965,27 @@ pub(crate) fn install(
         expires_at_ms: payload.expires_at_ms.get(),
         continuous_deadline,
         change: LeaseChange::Installed { narrowed },
+        bound: binds,
     })
+}
+
+/// Binds the presenting device to the account and key its verified lease names.
+fn bind(
+    enrolment: &mut Enrolment,
+    presentation: &LeasePresentation<'_>,
+    bound_at_ms: u64,
+    lease_digest: Digest256,
+) {
+    let payload = &presentation.lease.payload;
+    enrolment.members.insert(
+        presentation.device_id,
+        Binding {
+            account_id: payload.account_id.clone(),
+            device_key: payload.device_key,
+            bound_at_ms,
+            lease_digest,
+        },
+    );
 }
 
 /// The lease records as they are written down, keeping only those a lease could still need: a

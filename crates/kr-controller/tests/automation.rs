@@ -1187,6 +1187,7 @@ fn a_clock_wound_back_does_not_revive_a_grant_a_dispatch_refused() {
         environment_id,
         ActorIngress::LocalIpc,
         150,
+        kr_transport::clock::ContinuousClock::now(&kr_transport::clock::ManualClock::new()),
     )
     .expect("the grant stands before it expires");
     standing_at_dispatch(
@@ -1195,6 +1196,7 @@ fn a_clock_wound_back_does_not_revive_a_grant_a_dispatch_refused() {
         environment_id,
         ActorIngress::LocalIpc,
         201,
+        kr_transport::clock::ContinuousClock::now(&kr_transport::clock::ManualClock::new()),
     )
     .expect_err("the grant has expired");
     assert_eq!(policy.utc_floor_ms(), 201, "the refusal raised the floor");
@@ -1204,6 +1206,7 @@ fn a_clock_wound_back_does_not_revive_a_grant_a_dispatch_refused() {
         environment_id,
         ActorIngress::LocalIpc,
         199,
+        kr_transport::clock::ContinuousClock::now(&kr_transport::clock::ManualClock::new()),
     )
     .expect_err("a clock wound back does not revive it");
 }

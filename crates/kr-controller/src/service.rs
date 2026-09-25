@@ -454,6 +454,8 @@ pub struct Controller {
     /// device records in, so the two see one set of devices whether or not this host is on a
     /// network.
     devices: Arc<net::devices::DeviceDirectory>,
+    /// Every grant's lifetime on this host, measured on this daemon's clocks.
+    lifetimes: Arc<net::lifetimes::GrantLifetimes>,
     /// What is true of this host rather than of one grant: the revision in force, the organisation
     /// leases it holds and the optional bounded offline-validity policy its owner chose.
     ///
@@ -832,6 +834,16 @@ impl Controller {
         // clock, and never less than this host's reading of UTC says.
         let shared_clock: Arc<dyn kr_ipc::clock::SharedClock> =
             Arc::new(kr_ipc::clock::SystemSharedClock);
+        // One record of every grant's lifetime, on this daemon's clocks. The network's connections
+        // and the owner confirmations they spend ask it, and so does everything else here that
+        // decides a grant's time, so no two parts of the host can disagree about one grant.
+        let lifetimes = Arc::new(net::lifetimes::GrantLifetimes::new(
+            Arc::clone(&devices),
+            Arc::clone(&clock),
+            Arc::clone(&shared_clock),
+            setup.boot_identity.clone(),
+            wall.clone(),
+        ));
         let offline_anchor = net::offline_anchor(
             policy
                 .lock()
@@ -894,6 +906,7 @@ impl Controller {
                 Arc::clone(&policy),
                 setup.environment_id,
                 wall.clone(),
+                Arc::clone(&clock),
             )),
             Arc::new(crate::push::sender::HostSigner::new(
                 device_keys.authorisation,
@@ -939,6 +952,7 @@ impl Controller {
             delivery,
             delivery_runtime,
             devices,
+            lifetimes,
             policy,
             authority_epoch: std::sync::atomic::AtomicU64::new(0),
             utc_floor,
@@ -1895,6 +1909,7 @@ impl Controller {
             };
             if lapsed.is_none() {
                 self.devices.revoke(device_id, TimestampMs::new(now_ms))?;
+                self.unbind_device(device_id);
             }
             (revocation, lapsed, record_is_live)
         };
@@ -2066,6 +2081,169 @@ impl Controller {
         Ok(value)
     }
 
+    /// Decides a membership lease a device presents to this host, and installs it when it is new.
+    ///
+    /// The device has to hold a live grant on this host that requires the lease's organisation:
+    /// its pairing grant while it is paired, or a redeemed grant naming it as recipient that is
+    /// neither revoked nor expired. Everything the lease itself states is then
+    /// [`crate::grants::HostPolicy::install_lease`]'s, at this host's reading of UTC while its
+    /// clock is trusted and on the continuous clock every deadline here is measured on. The first
+    /// lease a device presents in an organisation binds it to that lease's account and key; a lease
+    /// for another member on a bound device is refused, and the attempt is logged.
+    ///
+    /// The lease is decided on a copy of the policy, and the copy is written down before it is
+    /// published, so a lease's record and a new binding are on disk before anything decides from
+    /// them; a binding is written in the same transaction as its retained event. A repeat that
+    /// binds nothing writes nothing and publishes nothing. An expired lease is answered as expired
+    /// only once the floor it was found expired on is written down.
+    ///
+    /// `proven_key` is the authorisation key the presenting connection proved.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the device's grants, the clock's record or the policy cannot be
+    /// read or written; nothing is installed or bound then. A lease a rule refuses is the inner
+    /// error.
+    pub fn present_membership_lease(
+        &self,
+        device_id: kr_protocol::ids::DeviceId,
+        proven_key: &kr_protocol::scalars::AuthorisationKey,
+        lease: &kr_protocol::account::MembershipLease,
+    ) -> Result<
+        std::result::Result<
+            crate::grants::organisation::LeaseInstalled,
+            crate::grants::LeaseRefused,
+        >,
+    > {
+        use crate::grants::LeaseRefused;
+        use crate::grants::organisation::{LeaseChange, LeasePresentation};
+
+        let organisation_id = lease.payload.organisation_id;
+        if !self.holds_organisation_grant(device_id, organisation_id)? {
+            return Ok(Err(LeaseRefused::NoOrganisationGrant));
+        }
+        let reading = self.lifetimes.clock_trust().sample(&self.devices)?;
+        let mut held = self
+            .policy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut candidate = held.clone();
+        let installed = match candidate.install_lease(LeasePresentation {
+            lease,
+            device_id,
+            proven_key,
+            reading,
+            now: self.clock.now(),
+            generation: self.generation,
+        }) {
+            Ok(installed) => installed,
+            Err(LeaseRefused::Expired) => {
+                // The clock decided it, so it is answered only once the floor it stood on is on
+                // disk: a clock wound back before the next start would otherwise decide the other
+                // way.
+                let floor = held.utc_floor_ms();
+                self.owe_floor(&held);
+                return Ok(Err(if self.utc_floor.written() < floor {
+                    LeaseRefused::FloorUnrecorded
+                } else {
+                    LeaseRefused::Expired
+                }));
+            }
+            Err(refused) => {
+                if refused == LeaseRefused::AccountMismatch {
+                    eprintln!(
+                        "kr-controller: device {device_id} presented a lease for another member of \
+                         an organisation than the one it is bound to"
+                    );
+                }
+                return Ok(Err(refused));
+            }
+        };
+        if !installed.bound && installed.change == LeaseChange::Repeat {
+            return Ok(Ok(installed));
+        }
+        let snapshot = candidate.snapshot();
+        let binding = installed
+            .bound
+            .then(|| {
+                candidate
+                    .enrolment(organisation_id)
+                    .and_then(|enrolment| enrolment.binding(device_id))
+            })
+            .flatten();
+        match binding {
+            Some(binding) => self.sharing.grants().store_policy_with_event(
+                &snapshot,
+                &crate::grants::store::BindingEvent {
+                    organisation_id,
+                    device_id,
+                    account_id: binding.account_id.clone(),
+                    device_key: binding.device_key,
+                    lease_digest: binding.lease_digest,
+                    bound_at_ms: binding.bound_at_ms,
+                },
+            )?,
+            None => self.sharing.grants().store_policy(&snapshot)?,
+        }
+        self.utc_floor.wrote(snapshot.utc_floor_ms.get());
+        *held = candidate;
+        // Published with the policy, under its lock, as every change of the policy is.
+        self.advance_authority_epoch();
+        Ok(Ok(installed))
+    }
+
+    /// Whether `device_id` holds a live grant on this host that requires membership of
+    /// `organisation_id`: its pairing grant while it is paired, or a redeemed grant naming it as
+    /// recipient that is neither revoked nor expired.
+    fn holds_organisation_grant(
+        &self,
+        device_id: kr_protocol::ids::DeviceId,
+        organisation_id: kr_protocol::ids::OrganisationId,
+    ) -> Result<bool> {
+        let requires = |grant: &kr_protocol::grant::Grant| {
+            grant
+                .organisation
+                .as_ref()
+                .is_some_and(|requirement| requirement.organisation_id == organisation_id)
+        };
+        if let Some(record) = self.devices.record_for_device(device_id)? {
+            if !record.is_paired() {
+                return Ok(false);
+            }
+            if requires(&record.grant) {
+                return Ok(true);
+            }
+        }
+        let now_ms = self.settled_utc_now();
+        Ok(self
+            .sharing
+            .grants()
+            .records_for_device(device_id)?
+            .iter()
+            .any(|record| {
+                record.state(now_ms) == kr_protocol::sharing::GrantState::Active
+                    && requires(&record.grant)
+            }))
+    }
+
+    /// Removes a revoked device's bindings from every organisation this host is enrolled in, so
+    /// no lease answers for it again.
+    ///
+    /// A write that fails is logged and leaves the binding on disk. The device is revoked by
+    /// then, with every grant it held, so nothing is decided under that binding meanwhile.
+    pub(crate) fn unbind_device(&self, device_id: kr_protocol::ids::DeviceId) {
+        let bound = self
+            .policy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_bound(device_id);
+        if bound && let Err(error) = self.update_policy(|policy| policy.unbind_device(device_id)) {
+            eprintln!(
+                "kr-controller: could not remove a revoked device's organisation bindings: {error}"
+            );
+        }
+    }
+
     /// The reading this daemon's own requests start from, written down before it is used.
     ///
     /// The later of this machine's clock and the highest reading this host has already decided
@@ -2157,9 +2335,9 @@ impl Controller {
         self.wall.now_ms()
     }
 
-    /// The wall clock itself, for a part of the daemon that reads it on its own.
-    pub(crate) fn wall_clock(&self) -> WallClock {
-        self.wall.clone()
+    /// Every grant's lifetime on this host.
+    pub(crate) const fn lifetimes(&self) -> &Arc<net::lifetimes::GrantLifetimes> {
+        &self.lifetimes
     }
 
     /// Records a lapse found at `at_ms`: this host's reading of UTC is at least that from here
@@ -2285,7 +2463,9 @@ impl Controller {
             self.paths.environment_id(),
             ingress,
             now_ms,
-        );
+            self.clock.now(),
+        )
+        .map(|intersection| intersection.rights);
         let decided = match (decided, offline) {
             (Ok(rights), Some(offline)) => {
                 let lapsed = crate::grants::Refusal::OfflineValidityLapsed {

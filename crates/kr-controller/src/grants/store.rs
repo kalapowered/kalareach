@@ -304,6 +304,15 @@ impl GrantDirectory {
                  CREATE TABLE IF NOT EXISTS fence_debt (
                      grant_id      BLOB PRIMARY KEY NOT NULL,
                      recorded_at_ms INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS organisation_events (
+                     sequence        INTEGER PRIMARY KEY NOT NULL,
+                     organisation_id BLOB NOT NULL,
+                     device_id       BLOB NOT NULL,
+                     account_id      TEXT NOT NULL,
+                     device_key      BLOB NOT NULL,
+                     lease_digest    BLOB NOT NULL,
+                     bound_at_ms     INTEGER NOT NULL
                  );",
             )
             .map_err(ControllerError::registry)?;
@@ -1345,6 +1354,109 @@ impl GrantDirectory {
         self.store("policy", policy)
     }
 
+    /// Writes this host's policy together with the retained event of the binding it made, in one
+    /// transaction, so neither is on disk without the other.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when either row cannot be written; then neither is.
+    pub fn store_policy_with_event(
+        &self,
+        policy: &StoredPolicy,
+        event: &BindingEvent,
+    ) -> Result<()> {
+        let encoded = kr_cbor::to_canonical_vec(policy)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        self.in_transaction(|connection| {
+            connection
+                .execute(
+                    "INSERT OR REPLACE INTO host_authority (key, value) VALUES ('policy', ?1)",
+                    params![encoded],
+                )
+                .map_err(ControllerError::registry)?;
+            connection
+                .execute(
+                    "INSERT INTO organisation_events
+                         (organisation_id, device_id, account_id, device_key, lease_digest,
+                          bound_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        event.organisation_id.get().as_bytes().as_slice(),
+                        event.device_id.get().as_bytes().as_slice(),
+                        event.account_id.as_str(),
+                        event.device_key.as_bytes().as_slice(),
+                        event.lease_digest.as_bytes().as_slice(),
+                        i64::try_from(event.bound_at_ms).unwrap_or(i64::MAX),
+                    ],
+                )
+                .map_err(ControllerError::registry)?;
+            Ok(())
+        })
+    }
+
+    /// Every retained organisation event, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the rows cannot be read or one does not decode.
+    pub fn organisation_events(&self) -> Result<Vec<BindingEvent>> {
+        type Columns = (Vec<u8>, Vec<u8>, String, Vec<u8>, Vec<u8>, i64);
+        let rows: Vec<Columns> = self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT organisation_id, device_id, account_id, device_key, lease_digest,
+                        bound_at_ms
+                 FROM organisation_events ORDER BY sequence",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<Columns>>>()?;
+            Ok(rows)
+        })?;
+        let malformed =
+            || ControllerError::InvalidArgument("an organisation event does not decode".to_owned());
+        rows.into_iter()
+            .map(
+                |(
+                    organisation_id,
+                    device_id,
+                    account_id,
+                    device_key,
+                    lease_digest,
+                    bound_at_ms,
+                )| {
+                    Ok(BindingEvent {
+                        organisation_id: kr_protocol::ids::OrganisationId::new(
+                            kr_protocol::scalars::Uuid::from_bytes(
+                                organisation_id.try_into().map_err(|_| malformed())?,
+                            ),
+                        ),
+                        device_id: DeviceId::new(kr_protocol::scalars::Uuid::from_bytes(
+                            device_id.try_into().map_err(|_| malformed())?,
+                        )),
+                        account_id: kr_protocol::ids::AccountId::new(&account_id)
+                            .map_err(|_| malformed())?,
+                        device_key: kr_protocol::scalars::AuthorisationKey::from_bytes(
+                            device_key.try_into().map_err(|_| malformed())?,
+                        ),
+                        lease_digest: Digest256::from_bytes(
+                            lease_digest.try_into().map_err(|_| malformed())?,
+                        ),
+                        bound_at_ms: u64::try_from(bound_at_ms).map_err(|_| malformed())?,
+                    })
+                },
+            )
+            .collect()
+    }
+
     /// Reads this host's stored authority-feed state, if it has one.
     ///
     /// # Errors
@@ -1398,6 +1510,24 @@ impl GrantDirectory {
 }
 
 type Row = Result<GrantRecord>;
+
+/// The retained record that a device was bound to a member account in an organisation, by the
+/// first verified lease it presented there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BindingEvent {
+    /// The organisation.
+    pub organisation_id: kr_protocol::ids::OrganisationId,
+    /// The device that presented the lease.
+    pub device_id: DeviceId,
+    /// The member account it is bound to.
+    pub account_id: kr_protocol::ids::AccountId,
+    /// The authorisation key the lease named and the device proved.
+    pub device_key: kr_protocol::scalars::AuthorisationKey,
+    /// The SHA-256 digest of the lease that bound it.
+    pub lease_digest: Digest256,
+    /// When this host bound it, in UTC milliseconds.
+    pub bound_at_ms: u64,
+}
 
 /// Checks a grant's parent inside a transaction the caller is already holding.
 ///

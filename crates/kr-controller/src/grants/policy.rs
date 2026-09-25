@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kr_protocol::account::{MEMBERSHIP_LEASE_MAX_LIFETIME_MS, MembershipLease, PolicyAuthority};
 use kr_protocol::actor::ActorIngress;
 use kr_protocol::grant::{Grant, GrantExpiry};
-use kr_protocol::ids::{AccountId, AuthorityRevision, OrganisationId};
+use kr_protocol::ids::{AccountId, AuthorityRevision, DeviceId, OrganisationId};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{AuthorisationKey, CanonicalSet};
 use kr_protocol::sharing::{MembershipRefusal, OfflineValidityPolicy};
@@ -39,8 +39,8 @@ use kr_transport::clock::ContinuousInstant;
 
 use super::durable::StoredPolicy;
 use super::organisation::{
-    self, ChainOutcome, ChainRefused, Enrolment, LeaseHolder, LeaseInstalled, LeasePresentation,
-    LeaseRecord, LeaseRefused, LeaseTime, VerifiedEnrolment,
+    self, ChainOutcome, ChainRefused, Enrolment, LeaseBound, LeaseHolder, LeaseInstalled,
+    LeasePresentation, LeaseRecord, LeaseRefused, LeaseTime, MemberLease, VerifiedEnrolment,
 };
 use super::{AccessRequest, Refusal};
 use crate::service::net::devices::ObservedUtc;
@@ -52,6 +52,9 @@ pub struct PolicyIntersection {
     pub rights: CanonicalSet<ActionRight>,
     /// The organisation whose lease narrowed them, when one did.
     pub organisation_id: Option<OrganisationId>,
+    /// The deadlines of the membership lease the intersection was taken under, when a lease
+    /// answered for it: it holds only while both are ahead.
+    pub lease: Option<LeaseBound>,
 }
 
 /// The highest UTC reading this host has decided anything from, and whether that reading is on
@@ -398,6 +401,26 @@ impl HostPolicy {
         self.enrolments.get(&organisation_id)
     }
 
+    /// Whether `device_id` is bound to a member account in any organisation this host is enrolled
+    /// in.
+    #[must_use]
+    pub fn is_bound(&self, device_id: DeviceId) -> bool {
+        self.enrolments
+            .values()
+            .any(|enrolment| enrolment.binding(device_id).is_some())
+    }
+
+    /// Removes `device_id`'s bindings from every enrolment: the device was revoked, so no lease
+    /// answers for it again. Returns whether it was bound anywhere.
+    pub fn unbind_device(&mut self, device_id: DeviceId) -> bool {
+        // Every enrolment, not only the first that held one: each keeps its own binding.
+        let mut unbound = false;
+        for enrolment in self.enrolments.values_mut() {
+            unbound |= enrolment.unbind(device_id);
+        }
+        unbound
+    }
+
     /// Follows a published chain forward for an organisation this host is enrolled in.
     ///
     /// A head this host already accepted does no signature work and reads no clock, and an older
@@ -661,27 +684,25 @@ impl HostPolicy {
                         refusal: MembershipRefusal::WrongAuthority,
                     });
                 }
-                // Whose lease answers for this grant. Without the account, one valid member's
-                // lease would sustain a disabled member's access, which is the whole of what
-                // section 17's per-member disablement is for.
-                let Some(account_id) = request.recipient_account.as_ref() else {
-                    return Err(Refusal::MembershipUnattributed);
-                };
-                // The clock decides, and nothing else does. An open transport is not a lease.
-                let mut installed = enrolment.installed_for(account_id).peekable();
-                if installed.peek().is_none() {
-                    return Err(Refusal::MembershipUnusable {
-                        refusal: MembershipRefusal::NoLease,
-                    });
-                }
-                let Some(lease) = installed
-                    .find(|installed| installed.unexpired_at(now_ms))
-                    .map(super::organisation::InstalledLease::lease)
-                else {
-                    return Err(Refusal::MembershipUnusable {
-                        refusal: MembershipRefusal::LeaseExpired,
-                    });
-                };
+                // Whose lease answers for this grant: the lease of the account and key its
+                // recipient device is bound to, and no other. Any other member's lease would
+                // sustain a disabled member's access, which is the whole of what section 17's
+                // per-member disablement is for. The binding holds everything the lookup needs, so
+                // a decision with no presenting connection resolves it alike, and no caller can
+                // supply an account or a key of its own. Both clocks decide, and nothing else
+                // does: an open transport is not a lease.
+                let installed = enrolment
+                    .lease_for_device(grant.recipient_device_id, request.continuous_now, now_ms)
+                    .map_err(|missing| match missing {
+                        MemberLease::Unbound => Refusal::MembershipUnattributed,
+                        MemberLease::NoLease => Refusal::MembershipUnusable {
+                            refusal: MembershipRefusal::NoLease,
+                        },
+                        MemberLease::Expired => Refusal::MembershipUnusable {
+                            refusal: MembershipRefusal::LeaseExpired,
+                        },
+                    })?;
+                let lease = installed.lease();
                 let rights = grant
                     .actions
                     .iter()
@@ -691,18 +712,22 @@ impl HostPolicy {
                 Ok(PolicyIntersection {
                     rights,
                     organisation_id: Some(requirement.organisation_id),
+                    lease: Some(installed.bound()),
                 })
             }
             None => {
                 // Personal authority. It continues through an organisation outage, unless this
                 // host is exclusively organisation-managed, in which case there is no personal
                 // path left to continue on.
-                if self.exclusively_managed
-                    && let Some(refusal) =
-                        self.unusable_for(request.recipient_account.as_ref(), now_ms)
-                {
-                    return Err(Refusal::MembershipUnusable { refusal });
-                }
+                let lease = if self.exclusively_managed {
+                    Some(self.managed_lease(
+                        grant.recipient_device_id,
+                        request.continuous_now,
+                        now_ms,
+                    )?)
+                } else {
+                    None
+                };
                 // The bounded offline policy is for *remote* personal access. Section 10 puts it
                 // there in so many words, and a person at the keyboard of their own machine is not
                 // the case it is about: refusing them because a cloud feed is unreachable would be
@@ -721,45 +746,46 @@ impl HostPolicy {
                 Ok(PolicyIntersection {
                     rights: grant.actions.clone(),
                     organisation_id: None,
+                    lease,
                 })
             }
         }
     }
 
-    /// Why this host, being exclusively organisation-managed, cannot answer for one account.
+    /// The lease that answers for a personal grant on a host enrolled as exclusively
+    /// organisation-managed: the one of the account and key the grant's recipient device is bound
+    /// to, in any organisation this host is enrolled in.
     ///
-    /// The question is about **this** actor, not about every member. One member's lease lapsing
-    /// must not stop another member working, and a host with no enrolment at all that is
+    /// The question is about **this** device's member, not about every member. One member's lease
+    /// lapsing must not stop another member working, and a host with no enrolment at all that is
     /// nevertheless marked exclusively managed has no organisation to answer for it, which is its
-    /// own refusal rather than a pass.
-    fn unusable_for(
+    /// own refusal rather than a pass. A device bound to nobody is unattributed, as it is for an
+    /// organisation's own grant.
+    fn managed_lease(
         &self,
-        account_id: Option<&AccountId>,
+        device_id: DeviceId,
+        now: ContinuousInstant,
         now_ms: u64,
-    ) -> Option<MembershipRefusal> {
-        let Some(account_id) = account_id else {
-            // The host answers only under an organisation, and cannot tell whose lease would
-            // answer. Refusing is the only honest outcome.
-            return Some(MembershipRefusal::NoLease);
-        };
-        if self.enrolments.is_empty() {
-            return Some(MembershipRefusal::NoLease);
-        }
+    ) -> std::result::Result<LeaseBound, Refusal> {
         let mut seen = None;
         for enrolment in self.enrolments.values() {
-            let mut installed = enrolment.installed_for(account_id).peekable();
-            if installed.peek().is_none() {
-                seen = Some(MembershipRefusal::NoLease);
-                continue;
+            match enrolment.lease_for_device(device_id, now, now_ms) {
+                // One usable lease is enough: this device's member is in good standing somewhere
+                // this host answers to.
+                Ok(installed) => return Ok(installed.bound()),
+                Err(MemberLease::Unbound) => {}
+                Err(MemberLease::NoLease) => {
+                    seen.get_or_insert(MembershipRefusal::NoLease);
+                }
+                Err(MemberLease::Expired) => seen = Some(MembershipRefusal::LeaseExpired),
             }
-            if !installed.any(|installed| installed.unexpired_at(now_ms)) {
-                seen = Some(MembershipRefusal::LeaseExpired);
-                continue;
-            }
-            // One usable lease is enough: this actor is a member in good standing somewhere this
-            // host answers to.
-            return None;
         }
-        seen.or(Some(MembershipRefusal::NoLease))
+        Err(match seen {
+            Some(refusal) => Refusal::MembershipUnusable { refusal },
+            None if self.enrolments.is_empty() => Refusal::MembershipUnusable {
+                refusal: MembershipRefusal::NoLease,
+            },
+            None => Refusal::MembershipUnattributed,
+        })
     }
 }

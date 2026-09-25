@@ -16,7 +16,9 @@ use kr_protocol::account::{
     POLICY_AUTHORITY_HEAD_MAX_LIFETIME_MS, PolicyAuthority, PolicyAuthorityHead,
     PolicyAuthorityHeadPayload, PolicyAuthorityLink, PolicyAuthorityLinkPayload, TeamRole,
 };
-use kr_protocol::ids::{AccountId, ControllerGeneration, OrganisationId, PolicyKeyRevision};
+use kr_protocol::ids::{
+    AccountId, ControllerGeneration, DeviceId, OrganisationId, PolicyKeyRevision,
+};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{AuthorisationKey, Nullable, Signature64, TimestampMs, Uuid};
 use kr_transport::clock::ContinuousInstant;
@@ -232,6 +234,14 @@ pub const fn reading(ms: u64) -> ObservedUtc {
     }
 }
 
+/// The identity of the device holding `key`: one device for each key, as pairing gives it.
+#[must_use]
+pub fn device_of(key: &AuthorisationKey) -> DeviceId {
+    let mut identity = [0_u8; 16];
+    identity.copy_from_slice(&key.as_bytes()[..16]);
+    DeviceId::new(Uuid::from_bytes(identity))
+}
+
 /// A member account.
 #[must_use]
 pub fn member(name: &str) -> AccountId {
@@ -256,6 +266,7 @@ pub fn presented<'a>(
 ) -> LeasePresentation<'a> {
     LeasePresentation {
         lease,
+        device_id: device_of(proven_key),
         proven_key,
         reading: Some(reading(utc_ms)),
         now,

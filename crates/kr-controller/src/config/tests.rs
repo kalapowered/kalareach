@@ -660,9 +660,11 @@ fn the_ceiling_narrows_the_grant_the_decision_is_taken_against() {
         environment_id,
         session_id: Some(session_id),
         claims_geometry: false,
-        recipient_account: None,
         own_subject: None,
         now_ms: 1_000,
+        continuous_now: kr_transport::clock::ContinuousClock::now(
+            &kr_transport::clock::ManualClock::new(),
+        ),
     };
 
     // No ceiling: the grant decides on its own, and the input right is in the decision.
@@ -834,9 +836,11 @@ fn a_decision_lapses_at_its_grants_expiry_or_the_end_of_the_offline_bound() {
                 environment_id,
                 session_id: None,
                 claims_geometry: false,
-                recipient_account: None,
                 own_subject: None,
                 now_ms: 1_000,
+                continuous_now: kr_transport::clock::ContinuousClock::now(
+                    &kr_transport::clock::ManualClock::new(),
+                ),
             },
         )
         .expect("the grant decides")

@@ -10,19 +10,33 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kr_controller::grants::organisation::{ChainOutcome, ChainRefused, LeaseChange};
-use kr_controller::grants::{GrantDirectory, GrantRecord, HostPolicy, LeaseRefused};
+use kr_controller::grants::organisation::{
+    ChainOutcome, ChainRefused, LeaseChange, LeasePresentation,
+};
+use kr_controller::grants::store::BindingEvent;
+use kr_controller::grants::{
+    AccessRequest, GrantDirectory, GrantRecord, HostPolicy, LeaseRefused, Refusal, decide,
+};
+use kr_controller::service::net::devices::{DeviceDirectory, DeviceRecord};
 use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
 use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::account::{ChainError, POLICY_AUTHORITY_DOMAIN, POLICY_AUTHORITY_HEAD_DOMAIN};
-use kr_protocol::grant::{EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector};
-use kr_protocol::ids::{
-    AuthorityRevision, BuildId, DeviceId, EnvironmentId, GrantId, OrganisationId, PolicyKeyRevision,
+use kr_protocol::actor::ActorIngress;
+use kr_protocol::grant::{
+    EnvironmentSelector, Grant, GrantExpiry, HistoryScope, OrganisationRequirement, SessionSelector,
 };
+use kr_protocol::ids::{
+    AuthorityRevision, BuildId, DeviceId, DeviceKeyRevision, EnvironmentId, GrantId,
+    OrganisationId, PolicyKeyRevision,
+};
+use kr_protocol::method::Method;
+use kr_protocol::pairing::{DeviceName, DevicePlatform};
 use kr_protocol::rights::ActionRight;
-use kr_protocol::scalars::{CanonicalSet, Nullable, Signature64, TimestampMs, Uuid};
+use kr_protocol::scalars::{
+    AuthorisationKey, CanonicalSet, EndpointKey, Nullable, Signature64, TimestampMs, Uuid,
+};
 use kr_protocol::sharing::{MembershipRefusal, OfflineValidityPolicy};
 use kr_transport::clock::{ContinuousClock as _, ManualClock};
 
@@ -1088,4 +1102,351 @@ async fn an_existing_policy_row_is_upgraded_once_and_keeps_its_floors() {
     grants
         .grant(after.grant.grant_id, kr_ipc::now_ms().get())
         .expect("the control: a grant expiring after the floor is permitted");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The member behind a grant: bindings (section 5)
+// ---------------------------------------------------------------------------------------------
+
+/// A pairing record for the device holding `key`, whose grant requires `requirement`'s
+/// organisation at its enrolment revision when there is one.
+fn member_device(
+    byte: u8,
+    key: AuthorisationKey,
+    requirement: Option<(OrganisationId, AuthorityRevision)>,
+) -> DeviceRecord {
+    let device_id = DeviceId::new(Uuid::from_bytes([byte; 16]));
+    DeviceRecord {
+        device_id,
+        endpoint_id: EndpointKey::from_bytes([byte; 32]),
+        device_key_revision: DeviceKeyRevision::new(1),
+        authorisation: key,
+        stored_envelope: None,
+        notification_preview: None,
+        device_name: DeviceName::new("A phone").expect("a name"),
+        platform: DevicePlatform::Ios,
+        grant: Grant {
+            grant_id: GrantId::new(Uuid::from_bytes([byte; 16])),
+            parent_grant_id: Nullable::null(),
+            issuer_device_id: DeviceId::new(Uuid::from_bytes([0xf0; 16])),
+            recipient_device_id: device_id,
+            authority_revision: AuthorityRevision::new(1),
+            environment_selector: EnvironmentSelector::Any,
+            session_selector: SessionSelector::Any,
+            actions: VIEW.iter().copied().collect(),
+            history: HistoryScope {
+                lower_bound_ms: Nullable::null(),
+                include_live_screen: false,
+                named_questions: CanonicalSet::new(),
+                named_approvals: CanonicalSet::new(),
+            },
+            expiry: GrantExpiry::Never,
+            organisation: Nullable(requirement.map(|(organisation_id, policy_revision)| {
+                OrganisationRequirement {
+                    organisation_id,
+                    policy_revision,
+                }
+            })),
+        },
+        paired_at_ms: TimestampMs::new(1_000),
+        revoked_at_ms: None,
+        expired_at_ms: None,
+        committed_invitation_id: None,
+    }
+}
+
+/// A daemon enrolled, at the wall clock now, in an organisation named by `byte`. Returns the
+/// organisation, the enrolment revision and the moment it enrolled.
+async fn enrolled_daemon(
+    temp: &kr_ipc::testing::TempHost,
+    byte: u8,
+) -> (Arc<Controller>, Organisation, AuthorityRevision, u64) {
+    let controller = start_daemon(&temp.environment(), temp.environment_id()).await;
+    let now = kr_ipc::now_ms().get();
+    let mut organisation = Organisation::new(byte, now - 2 * DAY_MS);
+    organisation.rotate(now - DAY_MS);
+    let revision = controller.policy().authority_revision();
+    controller
+        .update_policy(|policy| organisation.enrol(policy, now))
+        .expect("the enrolment is written down");
+    (controller, organisation, revision, now)
+}
+
+/// The binding `device_id` holds in `organisation_id`, as the daemon's policy stands.
+fn binding_of(
+    controller: &Controller,
+    organisation_id: OrganisationId,
+    device_id: DeviceId,
+) -> Option<kr_controller::grants::organisation::Binding> {
+    controller
+        .policy()
+        .enrolment(organisation_id)
+        .and_then(|enrolment| enrolment.binding(device_id).cloned())
+}
+
+/// KR-REQ-17.53 (the member behind a grant): the first verified lease a device presents binds it
+/// to that lease's account and key, durably and with a retained event; a later lease for another
+/// account on that device is refused. The control: the same member's next lease installs and binds
+/// nothing new.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_device_is_bound_to_the_account_and_key_of_its_first_verified_lease_and_no_other() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let (controller, organisation, revision, now) = enrolled_daemon(&temp, 0x31).await;
+    let organisation_id = organisation.organisation_id;
+    let phone = device();
+    let paired = member_device(0x41, *phone.public(), Some((organisation_id, revision)));
+    controller.devices().commit(&paired).expect("paired");
+    let (ada, bea) = (member("ada"), member("bea"));
+
+    let first = organisation.lease(2, &ada, *phone.public(), now, VIEW);
+    let installed = controller
+        .present_membership_lease(paired.device_id, phone.public(), &first)
+        .expect("storage")
+        .expect("the first verified lease installs");
+    assert!(installed.bound, "and binds the device");
+    let binding = binding_of(&controller, organisation_id, paired.device_id).expect("bound");
+    assert_eq!(
+        (&binding.account_id, &binding.device_key),
+        (&ada, phone.public())
+    );
+    let stored = controller
+        .sharing()
+        .grants()
+        .stored_policy()
+        .expect("readable")
+        .expect("written");
+    assert_eq!(
+        stored.enrolments[0].members.len(),
+        1,
+        "the binding is in the stored enrolment"
+    );
+    assert_eq!(
+        controller
+            .sharing()
+            .grants()
+            .organisation_events()
+            .expect("readable"),
+        vec![BindingEvent {
+            organisation_id,
+            device_id: paired.device_id,
+            account_id: ada.clone(),
+            device_key: *phone.public(),
+            lease_digest: binding.lease_digest,
+            bound_at_ms: binding.bound_at_ms,
+        }],
+        "and its event is retained"
+    );
+
+    let another = organisation.lease(2, &bea, *phone.public(), now + 1_000, VIEW);
+    assert_eq!(
+        controller
+            .present_membership_lease(paired.device_id, phone.public(), &another)
+            .expect("storage"),
+        Err(LeaseRefused::AccountMismatch),
+        "a lease for another member on a bound device is refused"
+    );
+    assert_eq!(
+        binding_of(&controller, organisation_id, paired.device_id).as_ref(),
+        Some(&binding)
+    );
+
+    // The control: the same member's next lease installs, and binds nothing new.
+    let next = organisation.lease(2, &ada, *phone.public(), now + 2_000, VIEW);
+    let renewed = controller
+        .present_membership_lease(paired.device_id, phone.public(), &next)
+        .expect("storage")
+        .expect("the same member's next lease installs");
+    assert!(!renewed.bound);
+    assert_eq!(
+        controller
+            .sharing()
+            .grants()
+            .organisation_events()
+            .expect("readable")
+            .len(),
+        1
+    );
+}
+
+/// A device that holds no grant requiring the organisation cannot bind, whatever lease it holds.
+/// The control: a device whose grant requires the organisation binds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_device_without_an_organisation_grant_cannot_bind() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let (controller, organisation, revision, now) = enrolled_daemon(&temp, 0x32).await;
+    let organisation_id = organisation.organisation_id;
+    let (laptop, phone) = (device(), device());
+    let personal = member_device(0x42, *laptop.public(), None);
+    let paired = member_device(0x43, *phone.public(), Some((organisation_id, revision)));
+    controller.devices().commit(&personal).expect("paired");
+    controller.devices().commit(&paired).expect("paired");
+
+    let lease = organisation.lease(2, &member("ada"), *laptop.public(), now, VIEW);
+    assert_eq!(
+        controller
+            .present_membership_lease(personal.device_id, laptop.public(), &lease)
+            .expect("storage"),
+        Err(LeaseRefused::NoOrganisationGrant)
+    );
+    assert!(binding_of(&controller, organisation_id, personal.device_id).is_none());
+    assert!(
+        controller
+            .sharing()
+            .grants()
+            .organisation_events()
+            .expect("readable")
+            .is_empty()
+    );
+
+    let lease = organisation.lease(2, &member("ada"), *phone.public(), now, VIEW);
+    let installed = controller
+        .present_membership_lease(paired.device_id, phone.public(), &lease)
+        .expect("storage")
+        .expect("the control: the device with one binds");
+    assert!(installed.bound);
+}
+
+/// One device presenting two members' leases at once is bound to exactly one of them. The
+/// control: one member's leases presented one after the other both install.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_device_racing_two_accounts_binds_exactly_one() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let (controller, organisation, revision, now) = enrolled_daemon(&temp, 0x33).await;
+    let organisation_id = organisation.organisation_id;
+    let phone = device();
+    let key = *phone.public();
+    let paired = member_device(0x44, key, Some((organisation_id, revision)));
+    controller.devices().commit(&paired).expect("paired");
+    let device_id = paired.device_id;
+
+    let present = |name: &str| {
+        let controller = Arc::clone(&controller);
+        let lease = organisation.lease(2, &member(name), key, now, VIEW);
+        tokio::task::spawn_blocking(move || {
+            controller
+                .present_membership_lease(device_id, &key, &lease)
+                .expect("storage")
+        })
+    };
+    let (ada, bea) = tokio::join!(present("ada"), present("bea"));
+    let outcomes = [ada.expect("presented"), bea.expect("presented")];
+    let bound: Vec<_> = outcomes
+        .iter()
+        .filter_map(|outcome| outcome.as_ref().ok())
+        .collect();
+    assert_eq!(bound.len(), 1, "exactly one binds: {outcomes:?}");
+    assert!(bound[0].bound);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == Err(LeaseRefused::AccountMismatch))
+            .count(),
+        1,
+        "the other is refused: {outcomes:?}"
+    );
+    assert_eq!(
+        binding_of(&controller, organisation_id, device_id).map(|binding| binding.account_id),
+        Some(bound[0].account_id.clone())
+    );
+    assert_eq!(
+        controller
+            .sharing()
+            .grants()
+            .organisation_events()
+            .expect("readable")
+            .len(),
+        1
+    );
+
+    // The control: one member's two leases, one after the other, both install.
+    let laptop = device();
+    let second = member_device(0x45, *laptop.public(), Some((organisation_id, revision)));
+    controller.devices().commit(&second).expect("paired");
+    let first = organisation.lease(2, &member("cai"), *laptop.public(), now, VIEW);
+    let next = organisation.lease(2, &member("cai"), *laptop.public(), now + 1_000, VIEW);
+    assert!(
+        controller
+            .present_membership_lease(second.device_id, laptop.public(), &first)
+            .expect("storage")
+            .expect("the first installs")
+            .bound
+    );
+    assert!(
+        !controller
+            .present_membership_lease(second.device_id, laptop.public(), &next)
+            .expect("storage")
+            .expect("the next installs too")
+            .bound
+    );
+}
+
+/// A pairing record written with an organisation requirement before this host enrolled still
+/// reads, and its grant answers only once an enrolment records exactly its revision and the device
+/// is bound on its own lease.
+#[test]
+fn a_stored_grant_with_an_earlier_organisation_requirement_still_reads() {
+    let directory = DeviceDirectory::in_memory().expect("a directory");
+    let mut organisation = Organisation::new(0x21, T - 2 * DAY_MS);
+    organisation.rotate(T - DAY_MS);
+    let phone = device();
+    let paired = member_device(
+        0x46,
+        *phone.public(),
+        Some((organisation.organisation_id, AuthorityRevision::new(1))),
+    );
+    directory
+        .commit(&paired)
+        .expect("the row is written before any enrolment");
+    let read = directory
+        .record_for_device(paired.device_id)
+        .expect("readable")
+        .expect("the row still reads");
+    assert_eq!(read.grant, paired.grant);
+    let record = GrantRecord {
+        grant: read.grant.clone(),
+        session_id: None,
+        issued_at_ms: 1_000,
+        activated_at_ms: Some(1_000),
+        revoked_at_ms: None,
+        revoked_by_parent: None,
+    };
+    let request = || AccessRequest {
+        method: Method::SessionRead,
+        ingress: ActorIngress::PairedDevice,
+        environment_id: EnvironmentId::new(Uuid::from_bytes([0xe0; 16])),
+        session_id: None,
+        claims_geometry: false,
+        own_subject: None,
+        now_ms: T + MINUTE_MS,
+        continuous_now: ManualClock::new().now(),
+    };
+
+    let mut host = policy();
+    assert_eq!(
+        decide(&read.grant, &record, &mut host, request()),
+        Err(Refusal::MembershipUnusable {
+            refusal: MembershipRefusal::NoLease
+        }),
+        "no enrolment records its revision yet"
+    );
+    let mut elsewhere = HostPolicy::personal(AuthorityRevision::new(2));
+    organisation.enrol(&mut elsewhere, T);
+    assert_eq!(
+        decide(&read.grant, &record, &mut elsewhere, request()),
+        Err(Refusal::MembershipUnusable {
+            refusal: MembershipRefusal::WrongAuthority
+        }),
+        "an enrolment at another revision does not answer for it"
+    );
+
+    // The control: enrolled at exactly its revision, with the device bound on its own lease.
+    organisation.enrol(&mut host, T);
+    let lease = organisation.lease(2, &member("ada"), *phone.public(), T, VIEW);
+    host.install_lease(LeasePresentation {
+        device_id: paired.device_id,
+        ..presented(&lease, phone.public(), T, ManualClock::new().now(), 1)
+    })
+    .expect("installed");
+    decide(&read.grant, &record, &mut host, request())
+        .expect("it answers once an enrolment records its revision");
 }

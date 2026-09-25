@@ -28,6 +28,7 @@ use std::time::Duration;
 mod net_support;
 mod organisation_support;
 
+use kr_controller::grants::organisation::LeasePresentation;
 use kr_controller::grants::{
     AccessRequest, AuthorityFeed, FeedRefusal, GrantDirectory, GrantRecord, HostPolicy, Refusal,
     decide, rights_for, unconditional_rights_for,
@@ -599,8 +600,8 @@ fn request(method: Method, now_ms: u64) -> AccessRequest {
         session_id: Some(session_id(0xa0)),
         claims_geometry: false,
         own_subject: None,
-        recipient_account: Some(account()),
         now_ms,
+        continuous_now: ManualClock::new().now(),
     }
 }
 
@@ -628,25 +629,29 @@ fn organisation_grant(
     }
 }
 
-/// Installs a fifteen-minute lease, issued at `issued_ms` by revision 2, for `account` on a device
-/// of its own.
+/// Installs a fifteen-minute lease, issued at `issued_ms` by revision 2, for `account` on a key of
+/// its own, presented by `device`, which it binds to that account and key.
 fn install_lease_for(
     policy: &mut HostPolicy,
     organisation: &Organisation,
+    device: DeviceId,
     account: &AccountId,
     issued_ms: u64,
     rights: &[ActionRight],
 ) -> MembershipLease {
-    let device = organisation_support::device();
-    let lease = organisation.lease(2, account, *device.public(), issued_ms, rights);
+    let key = organisation_support::device();
+    let lease = organisation.lease(2, account, *key.public(), issued_ms, rights);
     policy
-        .install_lease(presented(
-            &lease,
-            device.public(),
-            issued_ms.max(T),
-            ManualClock::new().now(),
-            1,
-        ))
+        .install_lease(LeasePresentation {
+            device_id: device,
+            ..presented(
+                &lease,
+                key.public(),
+                issued_ms.max(T),
+                ManualClock::new().now(),
+                1,
+            )
+        })
         .expect("the lease is inside every rule section 17 states");
     lease
 }
@@ -714,6 +719,7 @@ fn the_host_intersects_the_grant_with_policy_on_every_request() {
     install_lease_for(
         &mut policy,
         &organisation,
+        device_id(0xf1),
         &account(),
         T,
         &[ActionRight::SessionView],
@@ -1390,6 +1396,7 @@ fn an_expired_membership_blocks_organisation_mediated_work_on_a_live_transport()
     install_lease_for(
         &mut policy,
         &organisation,
+        device_id(0xf1),
         &account(),
         T,
         &[ActionRight::SessionView, ActionRight::TerminalInput],
@@ -1446,8 +1453,9 @@ fn an_expired_membership_blocks_organisation_mediated_work_on_a_live_transport()
         Err(kr_controller::grants::LeaseRefused::UnauthenticatedRevision),
         "a lease by a revision this host has not authenticated is not installed at all"
     );
-    // Because it was never installed, the decision finds no lease at all. That is the stronger
-    // outcome: a host does not hold a lease it could not have accepted.
+    // Because it was never installed, it bound nothing, and no lease answers for the grant's
+    // device. That is the stronger outcome: a host does not hold a lease it could not have
+    // accepted.
     let held = organisation_grant(second.organisation_id, 1, VIEW);
     assert_eq!(
         decide(
@@ -1456,9 +1464,7 @@ fn an_expired_membership_blocks_organisation_mediated_work_on_a_live_transport()
             &mut other,
             request(Method::SessionRead, T + 1_000)
         ),
-        Err(Refusal::MembershipUnusable {
-            refusal: MembershipRefusal::NoLease
-        })
+        Err(Refusal::MembershipUnattributed)
     );
 }
 
@@ -1475,7 +1481,14 @@ fn personal_access_survives_an_organisation_outage_unless_the_host_is_exclusivel
 
     let mut ordinary = HostPolicy::personal(AuthorityRevision::new(1));
     let organisation = enrolled_organisation(&mut ordinary, 0x21);
-    install_lease_for(&mut ordinary, &organisation, &account(), T, VIEW);
+    install_lease_for(
+        &mut ordinary,
+        &organisation,
+        device_id(0xf1),
+        &account(),
+        T,
+        VIEW,
+    );
     decide(
         &personal,
         &stored,
@@ -1487,7 +1500,14 @@ fn personal_access_survives_an_organisation_outage_unless_the_host_is_exclusivel
     let mut exclusive = HostPolicy::personal(AuthorityRevision::new(1));
     let organisation = enrolled_organisation(&mut exclusive, 0x21);
     exclusive.set_exclusively_managed(true);
-    install_lease_for(&mut exclusive, &organisation, &account(), T, VIEW);
+    install_lease_for(
+        &mut exclusive,
+        &organisation,
+        device_id(0xf1),
+        &account(),
+        T,
+        VIEW,
+    );
     assert!(exclusive.is_exclusively_managed());
     assert_eq!(
         decide(
@@ -1855,7 +1875,14 @@ fn a_stored_policy_is_read_back_with_its_restrictions_and_its_floors() {
     policy.set_exclusively_managed(true);
     let organisation = enrolled_organisation(&mut policy, 0x21);
     let organisation_id = organisation.organisation_id;
-    install_lease_for(&mut policy, &organisation, &account(), T, VIEW);
+    install_lease_for(
+        &mut policy,
+        &organisation,
+        device_id(0xf1),
+        &account(),
+        T,
+        VIEW,
+    );
     policy.set_offline_validity(Some(OfflineValidityPolicy {
         maximum_offline_ms: kr_protocol::scalars::DurationMs::new(60_000),
         last_synchronised_at_ms: Nullable::some(TimestampMs::new(100_000)),
@@ -1905,14 +1932,9 @@ fn one_members_lease_does_not_sustain_another_members_access() {
     let organisation = enrolled_organisation(&mut policy, 0x21);
     let held = organisation_grant(organisation.organisation_id, 1, VIEW);
     let stored = record(held.clone());
-    // A lease for somebody else entirely.
-    install_lease_for(
-        &mut policy,
-        &organisation,
-        &AccountId::new("8f14e45f-ea1e-4b9e-9f3a-0a3a9b0d2f61").expect("an account"),
-        T,
-        VIEW,
-    );
+    // A lease for somebody else entirely, on that member's own device.
+    let other = AccountId::new("8f14e45f-ea1e-4b9e-9f3a-0a3a9b0d2f61").expect("an account");
+    install_lease_for(&mut policy, &organisation, device_id(0xf2), &other, T, VIEW);
 
     assert_eq!(
         decide(
@@ -1921,10 +1943,8 @@ fn one_members_lease_does_not_sustain_another_members_access() {
             &mut policy,
             request(Method::SessionRead, T + 1_000)
         ),
-        Err(Refusal::MembershipUnusable {
-            refusal: MembershipRefusal::NoLease
-        }),
-        "a valid member's lease does not answer for a disabled one"
+        Err(Refusal::MembershipUnattributed),
+        "a valid member's lease does not answer for a device bound to nobody"
     );
 
     // With this recipient's own lease it decides. Once that lease has run out it stops again,
@@ -1932,6 +1952,7 @@ fn one_members_lease_does_not_sustain_another_members_access() {
     install_lease_for(
         &mut policy,
         &organisation,
+        device_id(0xf1),
         &account(),
         T - 5 * 60 * 1000,
         VIEW,
@@ -1955,15 +1976,179 @@ fn one_members_lease_does_not_sustain_another_members_access() {
         })
     );
 
-    // And a host that cannot name the account refuses rather than picking a lease.
-    let unattributed = AccessRequest {
-        recipient_account: None,
-        ..request(Method::SessionRead, T + 1_000)
+    // And a grant whose device is bound to nobody is refused rather than answered by a lease
+    // this host happens to hold.
+    let unbound = Grant {
+        recipient_device_id: device_id(0xf3),
+        ..held.clone()
     };
     assert_eq!(
-        decide(&held, &stored, &mut policy, unattributed),
+        decide(
+            &unbound,
+            &record(unbound.clone()),
+            &mut policy,
+            request(Method::SessionRead, T + 1_000)
+        ),
         Err(Refusal::MembershipUnattributed)
     );
+}
+
+/// A delegated organisation grant answers to its own recipient's binding and lease, never to its
+/// parent recipient's. The control: once the child's recipient binds on its own lease, the child
+/// answers.
+#[test]
+fn a_delegated_organisation_grant_needs_its_own_recipients_lease() {
+    let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
+    let organisation = enrolled_organisation(&mut policy, 0x21);
+    let parent = organisation_grant(organisation.organisation_id, 1, VIEW);
+    let child = Grant {
+        grant_id: grant_id(2),
+        parent_grant_id: Nullable::some(parent.grant_id),
+        issuer_device_id: parent.recipient_device_id,
+        recipient_device_id: device_id(0xf4),
+        ..parent.clone()
+    };
+    assert!(
+        child.narrows(&parent),
+        "it inherits its parent's requirement"
+    );
+    install_lease_for(
+        &mut policy,
+        &organisation,
+        device_id(0xf1),
+        &account(),
+        T,
+        VIEW,
+    );
+    decide(
+        &parent,
+        &record(parent.clone()),
+        &mut policy,
+        request(Method::SessionRead, T + 1_000),
+    )
+    .expect("the parent's recipient holds a live lease");
+    assert_eq!(
+        decide(
+            &child,
+            &record(child.clone()),
+            &mut policy,
+            request(Method::SessionRead, T + 1_000)
+        ),
+        Err(Refusal::MembershipUnattributed),
+        "the parent recipient's lease does not answer for the child's recipient"
+    );
+
+    let delegate = AccountId::new("5b0e1c7d-2f4a-4c1e-8d3b-6a9f0e2c4b71").expect("an account");
+    install_lease_for(
+        &mut policy,
+        &organisation,
+        device_id(0xf4),
+        &delegate,
+        T,
+        VIEW,
+    );
+    decide(
+        &child,
+        &record(child.clone()),
+        &mut policy,
+        request(Method::SessionRead, T + 1_000),
+    )
+    .expect("the child's recipient's own lease answers");
+}
+
+/// The lease that answers for an organisation grant is found through its recipient device's
+/// binding, by a workflow's dispatch and by a push rule alike, neither of which has a presenting
+/// connection. A live lease of the same member for another device's key answers nothing for this
+/// device. The control: this device's own lease answers both.
+#[test]
+fn the_intersection_finds_the_lease_through_the_bindings_key() {
+    use kr_delivery::producer::RecipientAuthority as _;
+
+    const AT_MS: u64 = T + 6 * 60 * 1000;
+    let clock = kr_transport::clock::SystemContinuousClock::new();
+    let sharing = Arc::new(
+        kr_controller::sharing::SharingService::in_memory(device_id(0xf0)).expect("a grant store"),
+    );
+    let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
+    let organisation = enrolled_organisation(&mut policy, 0x21);
+    let held = organisation_grant(organisation.organisation_id, 1, VIEW);
+    let stored = record(held.clone());
+    sharing
+        .grants()
+        .issue(&stored, || Ok(()))
+        .expect("the grant is written");
+
+    // This device binds on a lease that ends five minutes after `T`; the same member's other
+    // device holds a lease for its own key that runs to fifteen.
+    let (phone, laptop) = (
+        organisation_support::device(),
+        organisation_support::device(),
+    );
+    let ending = organisation.lease(2, &account(), *phone.public(), T - 10 * 60 * 1000, VIEW);
+    policy
+        .install_lease(LeasePresentation {
+            device_id: device_id(0xf1),
+            ..presented(&ending, phone.public(), T, clock.now(), 1)
+        })
+        .expect("this device's lease installs");
+    let other = organisation.lease(2, &account(), *laptop.public(), T, VIEW);
+    policy
+        .install_lease(LeasePresentation {
+            device_id: device_id(0xf5),
+            ..presented(&other, laptop.public(), T, clock.now(), 1)
+        })
+        .expect("the other device's lease installs");
+
+    let standing = |policy: &mut HostPolicy| {
+        kr_controller::grants::standing_at_dispatch(
+            &stored,
+            policy,
+            environment_id(0xe0),
+            ActorIngress::PairedDevice,
+            AT_MS,
+            clock.now(),
+        )
+    };
+    assert_eq!(
+        standing(&mut policy).map(|intersection| intersection.rights),
+        Err(Refusal::MembershipUnusable {
+            refusal: MembershipRefusal::LeaseExpired
+        }),
+        "the member's other device's live lease answers nothing for this device"
+    );
+    let shared = Arc::new(std::sync::Mutex::new(policy.clone()));
+    let recipients = kr_controller::push::authority::GrantedRecipients::at(
+        Arc::clone(&sharing),
+        Arc::clone(&shared),
+        environment_id(0xe0),
+        || AT_MS,
+    );
+    let rule = kr_delivery::destination::DeliveryRule {
+        name: "on a question".to_owned(),
+        grant_id: Some(held.grant_id),
+    };
+    assert!(
+        recipients.scope_for(&rule).is_none(),
+        "nor for a push rule naming its grant"
+    );
+
+    // The control: this device's own renewal answers both.
+    let renewed = organisation.lease(2, &account(), *phone.public(), AT_MS, VIEW);
+    policy
+        .install_lease(LeasePresentation {
+            device_id: device_id(0xf1),
+            ..presented(&renewed, phone.public(), AT_MS, clock.now(), 1)
+        })
+        .expect("the renewal installs");
+    let answered = standing(&mut policy).expect("this device's own lease answers");
+    assert_eq!(answered.rights, VIEW.iter().copied().collect());
+    assert_eq!(
+        answered.lease.map(|lease| lease.expires_at_ms),
+        Some(AT_MS + organisation_support::LEASE_MS),
+        "and the decision carries that lease's deadlines"
+    );
+    *shared.lock().expect("the policy") = policy.clone();
+    assert!(recipients.scope_for(&rule).is_some(), "and a push rule's");
 }
 
 /// A grant answering to an enrolment revision this host did not record is refused.
@@ -1972,7 +2157,14 @@ fn a_grant_naming_another_policy_revision_is_refused() {
     let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
     let organisation = enrolled_organisation(&mut policy, 0x21);
     let held = organisation_grant(organisation.organisation_id, 3, VIEW);
-    install_lease_for(&mut policy, &organisation, &account(), T, VIEW);
+    install_lease_for(
+        &mut policy,
+        &organisation,
+        device_id(0xf1),
+        &account(),
+        T,
+        VIEW,
+    );
     assert_eq!(
         decide(
             &held,

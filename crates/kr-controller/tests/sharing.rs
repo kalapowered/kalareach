@@ -93,8 +93,10 @@ fn request(method: Method, now_ms: u64) -> AccessRequest {
         session_id: Some(session_id(0xa0)),
         claims_geometry: false,
         own_subject: None,
-        recipient_account: None,
         now_ms,
+        continuous_now: kr_transport::clock::ContinuousClock::now(
+            &kr_transport::clock::ManualClock::new(),
+        ),
     }
 }
 

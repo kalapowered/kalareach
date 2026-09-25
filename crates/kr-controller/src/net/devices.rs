@@ -507,6 +507,12 @@ impl DeviceDirectory {
                  );
                  CREATE INDEX IF NOT EXISTS network_devices_endpoint
                      ON network_devices (endpoint_id);
+                 CREATE TRIGGER IF NOT EXISTS network_devices_authorisation_key_fixed
+                     BEFORE UPDATE OF authorisation_key ON network_devices
+                     WHEN NEW.authorisation_key IS NOT OLD.authorisation_key
+                 BEGIN
+                     SELECT RAISE(ABORT, 'a device''s authorisation key is fixed for its identity');
+                 END;
                  CREATE TABLE IF NOT EXISTS network_actions (
                      actor_id TEXT NOT NULL,
                      action_id BLOB NOT NULL,
@@ -1676,6 +1682,44 @@ mod tests {
             .expect("read")
             .expect("present")
             .public_keys()
+    }
+
+    /// A device's authorisation key is fixed for its identity: the directory refuses an update
+    /// that would replace it, so an organisation binding made for that key is never answered by
+    /// another. The control: the same row's preview key is still updated.
+    #[test]
+    fn a_devices_authorisation_key_cannot_be_replaced_under_its_identity() {
+        let directory = DeviceDirectory::in_memory().expect("a directory");
+        let device = record(1);
+        directory.commit(&device).expect("the row is written");
+
+        let replaced = directory.with(|connection| {
+            connection.execute(
+                "UPDATE network_devices SET authorisation_key = ?2 WHERE device_id = ?1",
+                params![
+                    device.device_id.get().as_bytes().as_slice(),
+                    [9_u8; 32].as_slice()
+                ],
+            )
+        });
+        assert!(replaced.is_err(), "the key is not replaced: {replaced:?}");
+        let stored = directory
+            .record_for_device(device.device_id)
+            .expect("read")
+            .expect("found");
+        assert_eq!(stored.authorisation, device.authorisation);
+
+        assert_eq!(
+            directory
+                .update_preview_key(
+                    device.device_id,
+                    NotificationPreviewKey::from_bytes([42; 32]),
+                    DeviceKeyRevision::new(2),
+                )
+                .expect("update succeeds"),
+            PreviewKeyOutcome::Recorded,
+            "the control: another column of the same row is updated"
+        );
     }
 
     #[test]
