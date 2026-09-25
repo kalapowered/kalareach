@@ -24,6 +24,11 @@ fn tree(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// The program Cargo runs each test binary through while a step's tests are listed.
+fn lister() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_kr-conformance"))
+}
+
 fn identifier(text: &str) -> Identifier {
     text.parse().expect("an identifier")
 }
@@ -86,6 +91,7 @@ fn run(name: &str) -> Result<(Document, tempfile::TempDir), Stopped> {
             "the tree's tests",
             &["test", "--locked", "--workspace", "--no-fail-fast"],
         )]),
+        lister: lister(),
         environment: vec![(
             "CARGO_TARGET_DIR".to_owned(),
             target.to_string_lossy().into_owned(),
@@ -361,6 +367,7 @@ fn an_evidence_directory_that_holds_an_earlier_report_is_refused() {
             "the tree's tests",
             &["test", "--locked", "--workspace", "--no-fail-fast"],
         )]),
+        lister: lister(),
         environment: vec![(
             "CARGO_TARGET_DIR".to_owned(),
             target.to_string_lossy().into_owned(),
@@ -392,6 +399,7 @@ fn a_target_no_step_runs_is_not_run_with_the_reason() {
             "the library's tests",
             &["test", "--locked", "--lib"],
         )]),
+        lister: lister(),
         environment: vec![(
             "CARGO_TARGET_DIR".to_owned(),
             target.to_string_lossy().into_owned(),
@@ -437,6 +445,7 @@ fn a_run_asked_for_every_terminal_names_each_one_as_not_run_and_fails_until_its_
             "the library's tests",
             &["test", "--locked", "--lib"],
         )]),
+        lister: lister(),
         environment: vec![(
             "CARGO_TARGET_DIR".to_owned(),
             target.to_string_lossy().into_owned(),
@@ -492,6 +501,7 @@ fn a_test_a_steps_own_flags_leave_out_is_not_run_rather_than_not_built() {
             "the ignored tests alone",
             &["test", "--locked", "--lib", "--", "--ignored"],
         )]),
+        lister: lister(),
         environment: vec![(
             "CARGO_TARGET_DIR".to_owned(),
             target.to_string_lossy().into_owned(),
