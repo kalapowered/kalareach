@@ -550,8 +550,8 @@ and exits with 1, and the next `kr question drafts` retires any copy still kept.
 
 `kr question drafts` reads each kept answer's question again. An answer whose question is still
 pending at the revision it answered is offered, and stays kept. Any other is retired: its question
-was answered, cancelled or expired, moved to another revision, or its session is gone, and the
-answer is not sent and no longer kept. The command sends nothing, however often it runs. `kr
+was answered, cancelled or expired, moved to another revision, or its session is gone; the command
+does not send it, and it is no longer kept. The command sends nothing, however often it runs. `kr
 question send` is the one way a kept answer is sent: it reads the question once more and sends the
 answer only while that question is still what the person answered. An answer whose outcome was not
 known is retired by the next `kr question drafts` if it did arrive, so it is never sent twice. When

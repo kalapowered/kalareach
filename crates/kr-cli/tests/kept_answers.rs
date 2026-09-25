@@ -4,7 +4,7 @@
 //! Section 11: offline answers remain drafts, and a reconnect never submits them. `kr question
 //! answer` keeps an answer the session's worker could not take, or whose outcome is not known, and
 //! says so. `kr question drafts` reads the questions again and says of each kept answer whether it
-//! can still be sent or has been retired unsent, and why; it sends nothing. `kr question send` is
+//! can still be sent or has been retired, and why; it sends nothing. `kr question send` is
 //! the one step that sends a kept answer.
 //!
 //! The worker here is scripted, because what is under test is what the command does when a worker
@@ -783,7 +783,7 @@ async fn a_kept_answer_whose_question_moved_is_retired_unsent() {
     let shown = String::from_utf8_lossy(&shown.stdout);
     assert!(shown.contains("retired"), "{shown}");
     assert!(shown.contains("moved to revision 2"), "{shown}");
-    assert!(shown.contains("not sent"), "{shown}");
+    assert!(shown.contains("this command did not send it"), "{shown}");
     assert_eq!(host.answers_received(), 0, "nothing was sent");
     assert!(!host.kept().exists(), "a retired answer is no longer kept");
 
@@ -794,6 +794,23 @@ async fn a_kept_answer_whose_question_moved_is_retired_unsent() {
     assert_ne!(status, Some(0), "{document}");
     assert_eq!(host.answers_received(), 0, "and nothing sends it");
     assert_eq!(host.state().question.state, QuestionState::Pending);
+
+    // `kr question send` meeting the moved question retires the answer too, and says it did not
+    // send it.
+    let host = kept_answer().await;
+    let question = host.question();
+    host.state().question.revision = QuestionRevision::new(2);
+    let (status, document) = host.json(&["question", "send", &question]);
+    assert_eq!(status, Some(8), "{document}");
+    assert_eq!(document["code"], "STALE_SESSION", "{document}");
+    let message = document["message"].as_str().expect("a message");
+    assert!(message.contains("moved to revision 2"), "{message}");
+    assert!(
+        message.contains("this command did not send the kept answer"),
+        "{message}"
+    );
+    assert!(!host.kept().exists(), "a retired answer is no longer kept");
+    assert_eq!(host.answers_received(), 0, "nothing was sent");
 }
 
 /// KR-REQ-11.63: an answer the worker took and whose reply was lost is kept as an answer whose
@@ -820,6 +837,42 @@ async fn an_answer_whose_reply_was_lost_is_kept_as_unknown_and_never_sent_twice(
     assert_eq!(document["drafts"][0]["reason_code"], "QUESTION_RESOLVED");
     assert!(!host.kept().exists(), "a retired answer is no longer kept");
     assert_eq!(host.answers_received(), 1, "and it was not sent again");
+
+    // Retired by `kr question drafts` for a person, or by `kr question send`, an answer that may
+    // well have arrived is never called unsent: what is said is that this command did not send it.
+    for sends in [false, true] {
+        let host = Host::start(Behaviour::TakesAnswersAndDropsTheReply).await;
+        let question = host.question();
+        let (status, _) = host.json(&["question", "answer", &question, "--choice", "left"]);
+        assert_eq!(status, Some(3));
+        host.behave(Behaviour::Serves);
+        let line = if sends {
+            vec!["question", "send", question.as_str()]
+        } else {
+            vec!["question", "drafts"]
+        };
+        let output = host.kr(&line);
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(said.contains("was answered"), "{line:?}: {said}");
+        assert!(
+            said.contains("this command did not send"),
+            "{line:?}: {said}"
+        );
+        assert!(!said.contains("was not sent"), "{line:?}: {said}");
+        assert!(
+            !host.kept().exists(),
+            "{line:?}: a retired answer is no longer kept"
+        );
+        assert_eq!(
+            host.answers_received(),
+            1,
+            "{line:?}: and it was not sent again"
+        );
+    }
 }
 
 /// KR-REQ-11.63: a descriptor that cannot be read, or is not the owner's alone, says nothing about

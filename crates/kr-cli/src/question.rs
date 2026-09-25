@@ -22,7 +22,7 @@
 //! sent and before the worker says what became of it, the answer is written to this user's state
 //! directory with the question and the revision the person was shown, and the person is told.
 //! `kr question drafts` reads the questions again and says of each kept answer whether it can
-//! still be sent, or was retired unsent because its question ended or moved; it sends nothing.
+//! still be sent, or was retired because its question ended or moved; it sends nothing.
 //! `kr question send` sends one kept answer, after reading its question once more, and nothing else
 //! sends a kept answer. The rules are the client library's own ([`kr_client::answers`]); what this
 //! adds is the connection they are sent over: each session's worker, found by its descriptor and
@@ -168,7 +168,7 @@ pub async fn answer(
 /// Reads the questions of every kept answer again, and says of each whether it can still be sent.
 ///
 /// A kept answer whose question is still pending at the revision it answers is offered and stays
-/// kept. Any other is retired: it is not sent and no longer kept. Nothing is sent, however often
+/// kept. Any other is retired: this sends nothing, and it is no longer kept. Nothing is sent, however often
 /// this runs.
 ///
 /// # Errors
@@ -408,7 +408,7 @@ fn answer_failure(error: AnswerError) -> CliError {
         AnswerError::Retired(reason) => CliError::Refused(ProtocolError::new(
             code,
             format!(
-                "{}, so the kept answer was not sent",
+                "{}, so this command did not send the kept answer, which is no longer kept",
                 retired_because(reason)
             ),
         )),
@@ -467,7 +467,7 @@ pub fn kept_line(reconciled: &Reconciled) -> String {
             draft.question_id
         ),
         Reconciled::Retired { draft, reason } => format!(
-            "{}  retired  {}; it was not sent and is no longer kept",
+            "{}  retired  {}; this command did not send it, and it is no longer kept",
             draft.question_id,
             retired_because(*reason)
         ),
@@ -1262,13 +1262,20 @@ mod tests {
             let line = kept_line(&retired);
             assert!(line.contains("retired"), "{line}");
             assert!(line.contains(words), "{line}");
-            assert!(line.contains("not sent"), "{line}");
+            assert!(line.contains("this command did not send it"), "{line}");
+            assert!(!line.contains("was not sent"), "{line}");
             let document = kept_rendered(&retired);
             assert_eq!(document["state"], "retired");
             assert_eq!(document["reason_code"], code, "{document}");
             let refused = answer_failure(AnswerError::Retired(reason));
             assert_eq!(refused.code(), code);
-            assert!(refused.to_string().contains("was not sent"), "{refused}");
+            assert!(
+                refused
+                    .to_string()
+                    .contains("this command did not send the kept answer"),
+                "{refused}"
+            );
+            assert!(!refused.to_string().contains("was not sent"), "{refused}");
         }
     }
 
