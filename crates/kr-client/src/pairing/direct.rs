@@ -14,7 +14,7 @@ use kr_protocol::preauth::{PairRedeemParams, PairRedeemResult};
 use tokio::sync::watch;
 
 use super::candidate::{
-    AttemptState, Pairing, RECOVERY_MARGIN_MS, Stage, WAIT_STEP, awaiting, within,
+    AttemptState, Pairing, RECOVERY_MARGIN_MS, Stage, Unpaired, WAIT_STEP, awaiting, within,
 };
 use super::failure::{FailureKind, PairingFailure, refused_by_host};
 use super::link::{ConnectionPeer, LinkError};
@@ -185,8 +185,13 @@ impl Pairing {
             }
         };
         progress.send_replace(awaiting(&pending));
-        self.await_approval(pending, Some((connection, preauth)), progress)
-            .await
+        // Two questions were asked on the connection: the challenge and the proof.
+        self.await_approval(
+            pending,
+            Some(Unpaired::new(connection, preauth, 2)),
+            progress,
+        )
+        .await
     }
 }
 

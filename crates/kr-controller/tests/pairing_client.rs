@@ -1538,6 +1538,46 @@ async fn a_device_pairs_directly_through_the_product_client() {
     assert_eq!(paired.host_endpoint_id, host.network().endpoint_id());
 }
 
+/// KR-REQ-10.36, KR-REQ-10.23: a person takes their time to approve. A host answers an unpaired
+/// connection at most four times in any ten seconds and sixteen times in all, which a device that
+/// asked once a second would pass within three seconds. The device keeps inside that budget while
+/// it waits, moves to a fresh connection before one has no questions left, and pairs once the
+/// owner approves, nearly a minute later: it is never refused, never ends and never shows that it
+/// lost its connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_waits_inside_the_hosts_request_budget_for_an_owner_who_takes_their_time() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let invited = issue_direct(environment, &mut client, &owner).await;
+
+    let (link, making) = watching(|_| {});
+    let device = ProductDevice::new(Arc::new(host.room.clone()), making);
+    let (attempt, mut shown) = device.redeem(&direct_text(&invited));
+    let seen = record(shown.clone());
+    awaiting_value(&mut shown).await;
+    tokio::time::sleep(Duration::from_secs(55)).await;
+    calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
+        .await
+        .expect("the owner approves");
+    let paired = outcome(attempt).await.expect("paired");
+    assert_eq!(paired.host_endpoint_id, host.network().endpoint_id());
+    let shown: Vec<AttemptState> = seen.lock().expect("the record").clone();
+    assert!(
+        !shown.iter().any(|state| matches!(
+            state,
+            AttemptState::Reconnecting { .. } | AttemptState::Ended { .. }
+        )),
+        "the device waited without losing its connection: {shown:?}"
+    );
+    assert!(
+        made(&link).opened.load(Ordering::SeqCst) >= 2,
+        "the device moved to a fresh connection before the first had no questions left"
+    );
+}
+
 /// KR-REQ-10.36: a direct invitation whose secret is wrong locks nothing; one redeemed at another
 /// host sends no proof; and a lock answered with another value shows no value.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

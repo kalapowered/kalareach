@@ -28,6 +28,7 @@
 //! room; the room holding the socket before the host has spoken; the host having spoken before its
 //! confirmation tag verifies; and afterwards, when the host's word is authenticated.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -40,6 +41,7 @@ use kr_pairing::code::EnteredCode;
 use kr_pairing::direct::{CandidateIdentity, verification_values_match};
 use kr_pairing::host::HANDSHAKE_DEADLINE_MS;
 use kr_pairing::platform::{ClientBudgetStore, LocatorRecord, PairingClock, RendezvousClient};
+use kr_protocol::error::ErrorCode;
 use kr_protocol::grant::GrantExpiry;
 use kr_protocol::hostinfo::EnvironmentListResult;
 use kr_protocol::ids::{AttemptId, BuildId, DeviceId, DeviceKeyRevision};
@@ -57,6 +59,7 @@ use kr_protocol::rendezvous::{
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Bytes, EndpointKey};
 use kr_transport::handshake::LocalIdentity;
+use kr_transport::preauth::PreAuthLimits;
 use serde::Serialize;
 use tokio::sync::{oneshot, watch};
 
@@ -73,7 +76,16 @@ use super::room::{RoomConnector, RoomError, RoomRole, RoomSocket};
 pub const RECORD_WAIT: Duration = Duration::from_secs(15);
 
 /// How often a waiting device asks the host where its attempt has reached.
-pub const STATUS_INTERVAL: Duration = Duration::from_secs(1);
+///
+/// A host answers an unpaired connection at most four times in any ten seconds
+/// ([`PreAuthLimits`]), so a device that asked more often would be refused. Every three seconds
+/// keeps inside that with room for the questions that came before the wait.
+pub const STATUS_INTERVAL: Duration = Duration::from_secs(3);
+
+/// How much longer than the host's window a device lets a question age before it no longer counts
+/// it. The host counts a question from when it arrived, which is later than when it was sent by
+/// however long the network took, and that is never the same twice.
+const WINDOW_MARGIN: Duration = Duration::from_secs(1);
 
 /// How long a device waits before dialling a host again, in turn, and then every time after the
 /// last.
@@ -613,8 +625,13 @@ impl Pairing {
             }
         };
         progress.send_replace(awaiting(&pending));
-        self.await_approval(pending, Some((connection, preauth)), progress)
-            .await
+        // One question was asked on the connection: the finish.
+        self.await_approval(
+            pending,
+            Some(Unpaired::new(connection, preauth, 1)),
+            progress,
+        )
+        .await
     }
 
     /// Records that the host answered with the value this device computed, so a restart shows
@@ -671,7 +688,7 @@ impl Pairing {
     pub(crate) async fn await_approval(
         &self,
         pending: PendingAttempt,
-        held: Option<(Connection, Box<dyn Preauth>)>,
+        held: Option<Unpaired>,
         progress: &watch::Sender<AttemptState>,
     ) -> Result<PairedHost, PairingFailure> {
         let tries = pending.tries_left;
@@ -683,12 +700,14 @@ impl Pairing {
     async fn waiting(
         &self,
         mut pending: PendingAttempt,
-        mut held: Option<(Connection, Box<dyn Preauth>)>,
+        mut held: Option<Unpaired>,
         progress: &watch::Sender<AttemptState>,
     ) -> Result<PairedHost, PairingFailure> {
         let params = PairStatusParams {
             invitation_id: pending.invitation_id,
         };
+        // The budget every host serves an unpaired connection by, unless it was built otherwise.
+        let limits = PreAuthLimits::default();
         let mut reconnects = 0_usize;
         loop {
             // The attempt's own deadline holds on every pass, whatever the host last said: a host
@@ -702,8 +721,28 @@ impl Pairing {
                      ended the invitation",
                 ));
             }
+            // Each question stays inside the host's budget for the connection: it waits for the
+            // window to make room, and a connection with no questions left is let go for a fresh
+            // one, which is no loss of contact and is not shown as one.
+            if let Some(unpaired) = held.as_mut() {
+                match unpaired.asked.turn(tokio::time::Instant::now(), &limits) {
+                    Turn::Now => {}
+                    Turn::After(wait) => {
+                        tokio::time::sleep(wait.min(self.left(&pending))).await;
+                        continue;
+                    }
+                    Turn::Spent => {
+                        drop(held.take());
+                        held = self.reconnect(&pending).await;
+                        continue;
+                    }
+                }
+            }
             let asked = match held.as_mut() {
-                Some((_, preauth)) => within(self.step(&pending), preauth.status(&params)).await,
+                Some(unpaired) => {
+                    unpaired.asked.asked(tokio::time::Instant::now());
+                    within(self.step(&pending), unpaired.preauth.status(&params)).await
+                }
                 None => Err(LinkError::Lost("no connection".to_owned())),
             };
             match asked {
@@ -718,6 +757,13 @@ impl Pairing {
                         }
                         None => tokio::time::sleep(STATUS_INTERVAL.min(self.left(&pending))).await,
                     }
+                }
+                // A host whose window is fuller than this device counted says so and keeps the
+                // connection: that is no answer about the attempt, so the device waits the window
+                // out and asks again. A host that ended the connection with it is found out by the
+                // next question, as a connection lost.
+                Err(LinkError::Refused(refusal)) if refusal.code == ErrorCode::RateLimited => {
+                    tokio::time::sleep(limits.window.min(self.left(&pending))).await;
                 }
                 Err(LinkError::Refused(refusal)) => {
                     let _ = self.hosts.clear_attempt();
@@ -838,7 +884,7 @@ impl Pairing {
     }
 
     /// Dials the host again, unpaired, and opens its pre-authorisation surface.
-    async fn reconnect(&self, pending: &PendingAttempt) -> Option<(Connection, Box<dyn Preauth>)> {
+    async fn reconnect(&self, pending: &PendingAttempt) -> Option<Unpaired> {
         let connection = within(
             self.step(pending),
             self.link
@@ -856,7 +902,7 @@ impl Pairing {
         )
         .await
         .ok()?;
-        Some((connection, preauth))
+        Some(Unpaired::new(connection, preauth, 0))
     }
 
     /// Records the host that committed this device, and connects to it as what it became.
@@ -1004,6 +1050,89 @@ pub(crate) async fn within<T>(
             "the host answered nothing in time".to_owned(),
         ))
     })
+}
+
+/// An unpaired connection to the host a device is waiting on, and the questions asked on it.
+pub(crate) struct Unpaired {
+    /// Held so the connection stays open while its surface is used, and closed with it.
+    _connection: Connection,
+    preauth: Box<dyn Preauth>,
+    asked: Asked,
+}
+
+impl Unpaired {
+    /// `connection` and its pre-authorisation surface, on which `already` questions were asked
+    /// just now: the finish, or a direct invitation's challenge and proof.
+    pub(crate) fn new(connection: Connection, preauth: Box<dyn Preauth>, already: usize) -> Self {
+        Self {
+            _connection: connection,
+            preauth,
+            asked: Asked::after(already, tokio::time::Instant::now()),
+        }
+    }
+}
+
+/// The questions a device has asked on one unpaired connection, counted as the host counts them.
+///
+/// A host answers an unpaired connection [`PreAuthLimits::max_requests`] times in all, and
+/// [`PreAuthLimits::max_requests_per_window`] times in any [`PreAuthLimits::window`]. Past the
+/// second it refuses the question and keeps the connection; past the first it answers once more
+/// and ends the connection. So a device that waits spaces its questions to keep the window from
+/// filling, and moves to a fresh connection once this one has no questions left.
+#[derive(Debug)]
+struct Asked {
+    /// When each question still inside the window was sent, oldest first.
+    recent: VecDeque<tokio::time::Instant>,
+    /// Every question asked on the connection.
+    total: usize,
+}
+
+/// When the next question on a connection may go.
+#[derive(Debug, PartialEq, Eq)]
+enum Turn {
+    /// Now.
+    Now,
+    /// Once this much time has passed, when an older question leaves the window.
+    After(Duration),
+    /// Never on this connection: it has no questions left.
+    Spent,
+}
+
+impl Asked {
+    /// A connection on which `already` questions were asked at `now`.
+    fn after(already: usize, now: tokio::time::Instant) -> Self {
+        Self {
+            recent: std::iter::repeat_n(now, already).collect(),
+            total: already,
+        }
+    }
+
+    /// When the next question may go, at `now`, inside `limits`.
+    fn turn(&mut self, now: tokio::time::Instant, limits: &PreAuthLimits) -> Turn {
+        if self.total >= limits.max_requests {
+            return Turn::Spent;
+        }
+        let window = limits.window + WINDOW_MARGIN;
+        while self
+            .recent
+            .front()
+            .is_some_and(|sent| now.saturating_duration_since(*sent) >= window)
+        {
+            self.recent.pop_front();
+        }
+        match self.recent.front() {
+            Some(oldest) if self.recent.len() >= limits.max_requests_per_window => {
+                Turn::After(window.saturating_sub(now.saturating_duration_since(*oldest)))
+            }
+            _ => Turn::Now,
+        }
+    }
+
+    /// Counts one question, sent at `now`.
+    fn asked(&mut self, now: tokio::time::Instant) {
+        self.total += 1;
+        self.recent.push_back(now);
+    }
 }
 
 /// A method that takes no parameters, as the empty map the protocol expects.
@@ -1527,6 +1656,55 @@ mod tests {
                 FailureKind::ServiceUnreachable,
                 "{status}"
             );
+        }
+    }
+
+    /// KR-REQ-10.23: a waiting device's questions keep inside the budget a host serves an unpaired
+    /// connection by. After the questions that proved it, it asks while the window has room,
+    /// waits for the oldest question to age out of the window, with a margin, once the window is
+    /// full, and calls the connection spent once every question the host answers has been asked,
+    /// so the next goes on a fresh one. A device that asked on the old rate, once a second, would
+    /// have filled the window with its third status question.
+    #[test]
+    fn a_waiting_device_asks_inside_the_hosts_budget() {
+        let limits = PreAuthLimits::default();
+        let start = tokio::time::Instant::now();
+        let at = |seconds: u64| start + Duration::from_secs(seconds);
+        let window = limits.window + WINDOW_MARGIN;
+
+        // A direct invitation's challenge and proof, then two status questions a second apart.
+        let mut asked = Asked::after(2, start);
+        assert_eq!(asked.turn(start, &limits), Turn::Now);
+        asked.asked(start);
+        assert_eq!(asked.turn(at(1), &limits), Turn::Now);
+        asked.asked(at(1));
+        // The window is full: the third waits until the challenge and proof have aged out.
+        assert_eq!(
+            asked.turn(at(2), &limits),
+            Turn::After(window - Duration::from_secs(2))
+        );
+        assert_eq!(asked.turn(start + window, &limits), Turn::Now);
+
+        // Every question the host answers on one connection, then none.
+        let mut asked = Asked::after(1, start);
+        let mut now = start;
+        while asked.total < limits.max_requests {
+            match asked.turn(now, &limits) {
+                Turn::Now => asked.asked(now),
+                Turn::After(wait) => now += wait,
+                Turn::Spent => panic!("spent after {} questions", asked.total),
+            }
+            now += STATUS_INTERVAL;
+        }
+        assert_eq!(asked.turn(now, &limits), Turn::Spent);
+
+        // At the steady rate the window never fills.
+        let mut asked = Asked::after(0, start);
+        let mut now = start;
+        for _ in 0..limits.max_requests {
+            assert_eq!(asked.turn(now, &limits), Turn::Now, "{:?}", now - start);
+            asked.asked(now);
+            now += STATUS_INTERVAL;
         }
     }
 }
