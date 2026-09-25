@@ -1650,6 +1650,7 @@ fn levels(tokens: &[Token]) -> Levels {
         Enum,
         Other,
     }
+    let enums = enum_bodies(tokens);
     let mut groups: Vec<Group> = Vec::new();
     let mut module = Vec::with_capacity(tokens.len());
     let mut enum_body = Vec::with_capacity(tokens.len());
@@ -1664,7 +1665,7 @@ fn levels(tokens: &[Token]) -> Levels {
                     && tokens[index - 2].ident() == Some("mod")
                 {
                     Group::Module
-                } else if opens_an_enum(tokens, index) {
+                } else if enums.contains(&index) {
                     Group::Enum
                 } else {
                     Group::Other
@@ -1679,16 +1680,39 @@ fn levels(tokens: &[Token]) -> Levels {
     Levels { module, enum_body }
 }
 
-/// Whether the brace at `open` opens an `enum`'s body: what comes before it, back to the end of the
-/// statement or item before, names an `enum`.
-fn opens_an_enum(tokens: &[Token], open: usize) -> bool {
-    let start = tokens[..open]
-        .iter()
-        .rposition(|token| token.is_punct(';') || token.is_punct('{') || token.is_punct('}'))
-        .map_or(0, |at| at + 1);
-    tokens[start..open]
-        .windows(2)
-        .any(|pair| pair[0].ident() == Some("enum") && pair[1].ident().is_some())
+/// Where each `enum`'s body opens: after `enum` and its name, the first `{` outside every group and
+/// every angle bracket of its generics and `where` clause (a `>` after `-` is an arrow's).
+fn enum_bodies(tokens: &[Token]) -> BTreeSet<usize> {
+    let mut found = BTreeSet::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if token.ident() != Some("enum") || tokens.get(index + 1).and_then(Token::ident).is_none() {
+            continue;
+        }
+        let mut groups = 0_usize;
+        let mut angles = 0_usize;
+        for at in index + 2..tokens.len() {
+            match tokens[at].tok {
+                Tok::Punct('{') if groups == 0 && angles == 0 => {
+                    found.insert(at);
+                    break;
+                }
+                Tok::Punct('(' | '[' | '{') => groups += 1,
+                Tok::Punct(')' | ']' | '}') => {
+                    if groups == 0 {
+                        break;
+                    }
+                    groups -= 1;
+                }
+                Tok::Punct('<') if groups == 0 => angles += 1,
+                Tok::Punct('>') if groups == 0 && !tokens[at - 1].is_punct('-') => {
+                    angles = angles.saturating_sub(1);
+                }
+                Tok::Punct(';') if groups == 0 && angles == 0 => break,
+                _ => {}
+            }
+        }
+    }
+    found
 }
 
 /// A `use` declaration: the tokens of its tree, what it brings in, and whether it stands among a
@@ -2337,6 +2361,9 @@ mod tests {
             "enum E { shared() }",
             "pub enum E<T> where T: Copy { Other(T), shared(u8) }",
             "enum E { A = shared() }",
+            "fn t() { enum E<T = [u8; 1]> { shared(), Other(T) } }",
+            "enum E<const N: usize = { 1 }> { shared() }",
+            "enum E<F> where F: Fn() -> u8 { shared(F) }",
         ] {
             let found = breached(text);
             assert!(!found.is_empty(), "{text}");
@@ -2358,6 +2385,8 @@ mod tests {
             "fn t() { assert_eq!(shared(), 3); }",
             "fn t() { let _ = <T>::shared(); }",
             "fn t() { let _ = E::A(shared()); }",
+            "enum A { X }\nfn t() { shared(); }",
+            "fn t() { let v = [0u8; 1]; shared(); }",
             "use a::shared;",
             "pub use a::{b, shared};",
             "mod m { use super::shared; }",
