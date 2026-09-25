@@ -5002,7 +5002,8 @@ impl BrokerState {
             let entry = self.ledger.decoding(resource_id)?.ok_or_else(|| {
                 BrokerError::PreconditionFailed {
                     detail: format!(
-                        "{resource_id} has no recorded interpretation, so there is nothing to answer"
+                        "{resource_id} has no recorded interpretation, so there is nothing to \
+                         answer"
                     ),
                 }
             })?;
