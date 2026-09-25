@@ -278,6 +278,39 @@ impl BridgeStream {
             })
     }
 
+    /// Writes one whole frame now, if the connection takes all of it without waiting, and says
+    /// whether it did.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::InvalidArgument`] for a frame past the bound, and
+    /// [`BrokerError::UpstreamUnavailable`] when the write fails or takes only part of the frame,
+    /// which leaves the connection unusable.
+    pub fn try_write_frame(&mut self, body: &[u8]) -> Result<bool> {
+        if body.len() > crate::broker::gateway::MAX_NATIVE_FRAME_BYTES {
+            return Err(BrokerError::invalid(format!(
+                "a frame for a bridge is at most {} bytes and this one is {}",
+                crate::broker::gateway::MAX_NATIVE_FRAME_BYTES,
+                body.len()
+            )));
+        }
+        let framed = self.framing.encode(body);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        match std::pin::Pin::new(&mut self.writer).poll_write(&mut context, &framed) {
+            std::task::Poll::Ready(Ok(written)) if written == framed.len() => {
+                let _ = std::pin::Pin::new(&mut self.writer).poll_flush(&mut context);
+                Ok(true)
+            }
+            std::task::Poll::Ready(Ok(_)) => Err(BrokerError::UpstreamUnavailable {
+                detail: "the bridge's connection took only part of a frame".to_owned(),
+            }),
+            std::task::Poll::Ready(Err(error)) => Err(BrokerError::UpstreamUnavailable {
+                detail: format!("the bridge's connection could not be written: {error}"),
+            }),
+            std::task::Poll::Pending => Ok(false),
+        }
+    }
+
     /// Closes the host's direction, so the bridge reads the end of what this host sends.
     pub async fn close(&mut self) {
         let _ = self.writer.shutdown().await;

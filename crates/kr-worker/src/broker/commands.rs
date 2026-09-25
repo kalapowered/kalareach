@@ -98,6 +98,63 @@ pub enum BackendState {
     Retired,
 }
 
+/// A backend's state and the lock that orders its commit, its confirmation and its retirement.
+///
+/// The commit (the state, the guard, the supervision) and the confirmation (still committed, then
+/// the one line the launcher execs on) each run under the lock, and so does retirement. So a
+/// retirement is either before the commit, which then fails; between the two, which withholds the
+/// confirmation; or after the confirmation, when the program has been told and started, like a
+/// session that closes while its program runs.
+struct Lifecycle {
+    state: tokio::sync::watch::Sender<BackendState>,
+    lock: Mutex<()>,
+}
+
+impl Lifecycle {
+    fn new(state: BackendState) -> Self {
+        Self {
+            state: tokio::sync::watch::channel(state).0,
+            lock: Mutex::new(()),
+        }
+    }
+
+    fn held(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Moves a launch in progress to committed and runs `then` under the lock; a backend retired
+    /// meanwhile stays retired, and `then` is not run.
+    fn commit(&self, registration: Arc<Registration>, then: impl FnOnce()) -> bool {
+        let _held = self.held();
+        let moved = self.state.send_if_modified(|state| {
+            if matches!(state, BackendState::Launching) {
+                *state = BackendState::Committed(registration);
+                true
+            } else {
+                false
+            }
+        });
+        if moved {
+            then();
+        }
+        moved
+    }
+
+    /// Runs `confirm` under the lock while the backend is still committed, and nothing otherwise.
+    fn confirm<T>(&self, confirm: impl FnOnce() -> T) -> Option<T> {
+        let _held = self.held();
+        matches!(*self.state.borrow(), BackendState::Committed(_)).then(confirm)
+    }
+
+    /// Marks the backend retired, under the lock.
+    fn retire(&self) {
+        let _held = self.held();
+        self.state.send_replace(BackendState::Retired);
+    }
+}
+
 /// The invocation one backend was established for, exactly.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Invocation {
@@ -124,9 +181,11 @@ struct Backend {
     root_shell: ProcessStartIdentity,
     established_at: Option<u64>,
     connector: Arc<InstalledConnector>,
-    state: tokio::sync::watch::Sender<BackendState>,
+    lifecycle: Lifecycle,
     identity: tokio::sync::watch::Receiver<Option<std::result::Result<ExecutableIdentity, String>>>,
-    image: Mutex<Option<std::result::Result<(), String>>>,
+    /// Why a bridge of this instance was refused for the image its process runs, once one was:
+    /// every later bridge is refused too.
+    image_refused: Mutex<Option<String>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     #[cfg(feature = "testing")]
     confirm_pause: Arc<Mutex<Option<ConfirmPause>>>,
@@ -428,7 +487,7 @@ impl CommandBackends {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .find(|backend| backend.application_instance_id == application_instance_id)
-            .map(|backend| backend.state.borrow().clone())
+            .map(|backend| backend.lifecycle.state.borrow().clone())
     }
 
     fn launcher(&self) -> std::result::Result<PathBuf, String> {
@@ -522,7 +581,6 @@ impl CommandBackends {
             BrokerError::ledger(format!("could not write the launch record: {error}"))
         })?;
         let (identity_sender, identity) = tokio::sync::watch::channel(None);
-        let (state, _) = tokio::sync::watch::channel(BackendState::Unbound);
         let backend = Arc::new(Backend {
             application_instance_id,
             prompt_generation: request.prompt_generation,
@@ -536,9 +594,9 @@ impl CommandBackends {
             root_shell: request.root_shell.clone(),
             established_at,
             connector,
-            state,
+            lifecycle: Lifecycle::new(BackendState::Unbound),
             identity,
-            image: Mutex::new(None),
+            image_refused: Mutex::new(None),
             tasks: Mutex::new(Vec::new()),
             #[cfg(feature = "testing")]
             confirm_pause: Arc::clone(&self.confirm_pause),
@@ -574,11 +632,11 @@ impl CommandBackends {
 
 impl Backend {
     fn is_unbound(&self) -> bool {
-        matches!(*self.state.borrow(), BackendState::Unbound)
+        matches!(*self.lifecycle.state.borrow(), BackendState::Unbound)
     }
 
     fn is_retired(&self) -> bool {
-        matches!(*self.state.borrow(), BackendState::Retired)
+        matches!(*self.lifecycle.state.borrow(), BackendState::Retired)
     }
 
     /// Ends this backend: no more connections, no running admission, no endpoint, no credential, no
@@ -588,7 +646,7 @@ impl Backend {
     /// any guard it holds. A launcher that looks later finds nothing and runs what was typed, which
     /// its variable's file name tells it.
     fn retire(&self) {
-        self.state.send_replace(BackendState::Retired);
+        self.lifecycle.retire();
         for task in self
             .tasks
             .lock()
@@ -624,7 +682,7 @@ impl Backend {
     fn roll_back(&self) {
         let _ = std::fs::remove_file(&self.registration);
         let mut retired = false;
-        self.state.send_if_modified(|state| {
+        self.lifecycle.state.send_if_modified(|state| {
             if matches!(state, BackendState::Launching) {
                 if self.line_over.load(Ordering::SeqCst) {
                     *state = BackendState::Retired;
@@ -640,19 +698,6 @@ impl Backend {
         if retired {
             self.retire();
         }
-    }
-
-    /// Moves this backend out of a launch in progress, and nowhere else: a backend retired while
-    /// a launch was being admitted stays retired.
-    fn settle_launch(&self, next: BackendState) -> bool {
-        self.state.send_if_modified(|state| {
-            if matches!(state, BackendState::Launching) {
-                *state = next;
-                true
-            } else {
-                false
-            }
-        })
     }
 
     /// Waits for the executable's identity, within `wait`.
@@ -677,7 +722,7 @@ async fn serve(backend: Arc<Backend>, broker: Arc<Broker>, environment_id: Envir
         let accepted = match backend.gateway.accept_next().await {
             Ok(accepted) => accepted,
             Err(_) => {
-                if matches!(*backend.state.borrow(), BackendState::Retired) {
+                if matches!(*backend.lifecycle.state.borrow(), BackendState::Retired) {
                     return;
                 }
                 // An accept the kernel refused, for a descriptor limit or a connection reset
@@ -697,10 +742,11 @@ async fn serve(backend: Arc<Backend>, broker: Arc<Broker>, environment_id: Envir
             let _permit = permit;
             // Retiring the backend ends the admission wherever it is: its connection closes, and a
             // guard it holds gives back.
-            let mut state = backend.state.subscribe();
+            let mut state = backend.lifecycle.state.subscribe();
             tokio::select! {
-                () = admit(Arc::clone(&backend), broker, environment_id, accepted) => {}
+                biased;
                 _ = state.wait_for(|state| matches!(state, BackendState::Retired)) => {}
+                () = admit(Arc::clone(&backend), broker, environment_id, accepted) => {}
             }
         });
     }
@@ -722,8 +768,11 @@ async fn admit(
             let _ = admit_launch(&backend, &broker, environment_id, presented).await;
         }
         Opening::Bridge(pending) => {
-            let Some(registration) =
-                committed(&backend.state, crate::broker::attach::HELLO_DEADLINE).await
+            let Some(registration) = committed(
+                &backend.lifecycle.state,
+                crate::broker::attach::HELLO_DEADLINE,
+            )
+            .await
             else {
                 return;
             };
@@ -732,7 +781,7 @@ async fn admit(
             else {
                 return;
             };
-            if let Err(_refused) = verify_once(&backend, &registration) {
+            if let Err(_refused) = verify(&backend, &registration) {
                 return;
             }
             let Ok(admitted) = authenticated.admit().await else {
@@ -778,17 +827,18 @@ async fn committed(
     }
 }
 
-/// Checks, once for the instance, that the committed process executes what this backend hashed.
+/// Checks, for each bridge, that the committed process executes what this backend hashed.
 ///
 /// Only an authenticated bridge asks: it descends from the registered process, which starts no child
-/// before its exec, so the verdict kept is taken after the exec.
-fn verify_once(backend: &Backend, registration: &Registration) -> std::result::Result<(), String> {
-    let mut image = backend
-        .image
+/// before its exec, so the check is never taken before the exec. It is taken again for every bridge,
+/// because the program can exec another in its place; one refusal refuses every later bridge.
+fn verify(backend: &Backend, registration: &Registration) -> std::result::Result<(), String> {
+    let mut refused = backend
+        .image_refused
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(verified) = image.as_ref() {
-        return verified.clone();
+    if let Some(why) = refused.as_ref() {
+        return Err(why.clone());
     }
     let identity = backend
         .identity
@@ -798,7 +848,9 @@ fn verify_once(backend: &Backend, registration: &Registration) -> std::result::R
     let verified = identity.and_then(|identity| {
         crate::broker::image::verify_image(&registration.expected_process, &identity)
     });
-    *image = Some(verified.clone());
+    if let Err(why) = &verified {
+        *refused = Some(why.clone());
+    }
     verified
 }
 
@@ -872,7 +924,7 @@ async fn admit_launch(
         ));
     }
     // Unbound to launching, or refused: one launch per backend.
-    let claimed = backend.state.send_if_modified(|state| {
+    let claimed = backend.lifecycle.state.send_if_modified(|state| {
         if matches!(state, BackendState::Unbound) {
             *state = BackendState::Launching;
             true
@@ -915,19 +967,24 @@ async fn admit_launch(
             "the admitted launch did not say it is going",
         ));
     }
-    if !backend.settle_launch(BackendState::Committed(Arc::new(registration))) {
-        // Retired while the launch was admitted: nothing is kept, and the launcher, which is not
-        // told it is committed, runs what was typed.
+    // The commit, under the lifecycle lock: the state, the guard and the supervision together, or,
+    // for a backend retired meanwhile, none of them, and the guard gives back.
+    let mut guard = Some(guard);
+    let committed = backend.lifecycle.commit(Arc::new(registration), || {
+        if let Some(guard) = guard.take() {
+            guard.commit();
+        }
+        let supervising = tokio::spawn(supervise(Arc::clone(backend), Arc::clone(broker), process));
+        backend
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(supervising);
+    });
+    if !committed {
         drop(guard);
         return Err(BrokerError::denied("this backend was retired"));
     }
-    guard.commit();
-    let supervising = tokio::spawn(supervise(Arc::clone(backend), Arc::clone(broker), process));
-    backend
-        .tasks
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push(supervising);
     #[cfg(feature = "testing")]
     {
         let armed = backend
@@ -940,11 +997,24 @@ async fn admit_launch(
             let _ = go.await;
         }
     }
-    // The launcher execs with the integration's flags only on this. Should it not arrive, the
-    // launcher runs what was typed without the variable, and the instance, which names that process,
-    // has no bridge and ends with it.
-    stream.write_frame(&confirmation()).await?;
-    Ok(())
+    // The launcher execs with the integration's flags only on this, written under the lifecycle
+    // lock while the backend is still committed, and without waiting: the connection's buffer is
+    // empty, and a write that would wait is a confirmation withheld. Should it not arrive, the
+    // launcher runs what was typed without the variable, and the instance, which names that
+    // process, has no bridge and ends with it.
+    match backend
+        .lifecycle
+        .confirm(|| stream.try_write_frame(&confirmation()))
+    {
+        Some(Ok(true)) => Ok(()),
+        Some(Ok(false)) => Err(BrokerError::UpstreamUnavailable {
+            detail: "the launch's confirmation could not be written without waiting".to_owned(),
+        }),
+        Some(Err(error)) => Err(error),
+        None => Err(BrokerError::denied(
+            "this backend was retired before its launch was confirmed",
+        )),
+    }
 }
 
 /// Records the launch, registers its instance by its reservation, publishes the registration and
@@ -1343,6 +1413,50 @@ mod tests {
             "not the typed vector around it"
         );
         assert_eq!(registration_name(3, 2), "registration.3.2");
+    }
+
+    /// A retirement waits for a confirmation being written, and withholds one not yet begun; a
+    /// retired backend is not committed.
+    #[test]
+    fn retirement_and_the_confirmation_exclude_each_other() {
+        let lifecycle = Arc::new(Lifecycle::new(BackendState::Launching));
+        assert!(lifecycle.commit(registration(), || {}));
+        let (writing, written) = std::sync::mpsc::channel();
+        let (finish, finished) = std::sync::mpsc::channel::<()>();
+        let confirming = {
+            let lifecycle = Arc::clone(&lifecycle);
+            std::thread::spawn(move || {
+                lifecycle.confirm(|| {
+                    let _ = writing.send(());
+                    let _ = finished.recv();
+                    "written"
+                })
+            })
+        };
+        written.recv().expect("the confirmation is being written");
+        let retiring = {
+            let lifecycle = Arc::clone(&lifecycle);
+            std::thread::spawn(move || lifecycle.retire())
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            !retiring.is_finished(),
+            "the retirement waits for the confirmation being written"
+        );
+        let _ = finish.send(());
+        assert_eq!(confirming.join().expect("joins"), Some("written"));
+        retiring.join().expect("joins");
+        assert_eq!(
+            lifecycle.confirm(|| "written"),
+            None,
+            "a retired backend confirms nothing"
+        );
+        assert!(
+            !lifecycle.commit(registration(), || panic!(
+                "nothing is run for a retired backend"
+            )),
+            "and commits nothing"
+        );
     }
 
     #[test]
