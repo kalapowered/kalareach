@@ -110,9 +110,11 @@ record_patterns=(
 )
 
 # The variables a step may inherit from the environment this script was started in. Everything
-# else is left behind.
-inherited=(PATH USER LOGNAME SHELL TERM LANG LC_ALL LC_CTYPE TZ XDG_RUNTIME_DIR CARGO_BUILD_JOBS
-  CARGO_NET_GIT_FETCH_WITH_CLI DEVELOPER_DIR SDKROOT)
+# else is left behind. The Cargo ones change how much a build keeps and how many jobs it runs,
+# never what it builds.
+inherited=(PATH USER LOGNAME SHELL TERM LANG LC_ALL LC_CTYPE TZ XDG_RUNTIME_DIR DEVELOPER_DIR SDKROOT
+  CARGO_BUILD_JOBS CARGO_INCREMENTAL CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG
+  CARGO_NET_GIT_FETCH_WITH_CLI)
 
 rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
 
