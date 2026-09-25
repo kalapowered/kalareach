@@ -3382,8 +3382,9 @@ mod tests {
             ),
         ] {
             let unit = platform::Unit::read(&printed);
-            // The negative control: what kr read holds the marker.
-            assert!(format!("{unit:?}").contains(MARKER), "{place}");
+            // The negative control: what the user manager printed holds the marker. A list kr
+            // cannot read back is dropped as it is read, so the unit kr read may not hold it.
+            assert!(printed.contains(MARKER), "{place}");
             let why = unit.difference(&written).expect("a difference");
             assert_unmarked(place, &failure_renderings(CliError::HostUnavailable(why)));
         }
