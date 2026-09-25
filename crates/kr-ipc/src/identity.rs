@@ -113,6 +113,30 @@ pub fn process_start_identity(pid: u32) -> Result<ProcessStartIdentity> {
     }
 }
 
+/// Runs `work` and returns what it returned, with every process this thread read a `/proc` entry
+/// of meanwhile, in the order read, for the host crates' own tests: what a test counts to know
+/// that a question about one session read nothing about any other process.
+#[cfg(all(feature = "testing", any(target_os = "linux", target_os = "android")))]
+pub fn processes_read_during<T>(work: impl FnOnce() -> T) -> (T, Vec<u32>) {
+    platform::processes_read_during(work)
+}
+
+/// Returns the processes one process is the parent of now: those it started that have not been
+/// collected, and each one it adopted as the child subreaper when that one's own parent exited.
+///
+/// What it costs follows the one process, not the host: the kernel keeps the list with each of the
+/// process's threads, and nothing else is read. A kernel that is built without those lists is an
+/// error here rather than an empty answer, so a caller never reads "no children" into it.
+///
+/// # Errors
+///
+/// Returns [`IpcError::IdentityUnavailable`] when the process cannot be read, or when the kernel
+/// keeps no list of children.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn children_of(pid: u32) -> Result<Vec<u32>> {
+    platform::children_of(pid)
+}
+
 /// Returns the process identifiers currently in one process group.
 ///
 /// A terminal session's processes normally stay in the group the shell leads, which is what makes
@@ -355,6 +379,38 @@ mod platform {
 
     const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
 
+    /// Reads one of a process's own `/proc` files, `/proc/<pid>/<file>`.
+    ///
+    /// Every question this module asks about one process reads through here, so a test can see
+    /// which processes a question read about.
+    fn read_process_file(pid: u32, file: &str) -> std::io::Result<String> {
+        #[cfg(feature = "testing")]
+        PROCESS_READS.with(|reads| {
+            if let Some(reads) = reads.borrow_mut().as_mut() {
+                reads.push(pid);
+            }
+        });
+        std::fs::read_to_string(format!("/proc/{pid}/{file}"))
+    }
+
+    #[cfg(feature = "testing")]
+    thread_local! {
+        /// The processes this thread has read about since a test began counting, or none when
+        /// no test is.
+        static PROCESS_READS: std::cell::RefCell<Option<Vec<u32>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Runs `work` and returns what it returned, with every process this thread read a `/proc`
+    /// entry of meanwhile, in the order read.
+    #[cfg(feature = "testing")]
+    pub fn processes_read_during<T>(work: impl FnOnce() -> T) -> (T, Vec<u32>) {
+        PROCESS_READS.with(|reads| *reads.borrow_mut() = Some(Vec::new()));
+        let done = work();
+        let read = PROCESS_READS.with(|reads| reads.borrow_mut().take().unwrap_or_default());
+        (done, read)
+    }
+
     /// Where each field of `/proc/<pid>/stat` sits *after* the command name.
     ///
     /// The line begins `pid (comm) state ...` and the command name can contain spaces and brackets,
@@ -389,7 +445,7 @@ mod platform {
     /// something else is not an answer about this process.
     pub(super) fn liveness(pid: u32, start_value: u64) -> super::ProcessState {
         let path = format!("/proc/{pid}/stat");
-        match std::fs::read_to_string(&path) {
+        match read_process_file(pid, "stat") {
             Ok(text) => decide(&text, start_value),
             // A missing entry is a process that has gone. Every other failure - a descriptor limit,
             // a permission, a kernel that would not answer - proves nothing, and answering "ended"
@@ -459,8 +515,39 @@ mod platform {
         stat_field_matches(STAT_TERMINAL, terminal, "controlling terminal")
     }
 
+    pub(super) fn children_of(pid: u32) -> Result<Vec<u32>> {
+        let task = format!("/proc/{pid}/task");
+        let threads = std::fs::read_dir(&task)
+            .map_err(|error| unavailable("children of a process", format!("{task}: {error}")))?;
+        let mut children = Vec::new();
+        for thread in threads.flatten() {
+            let Some(tid) = thread.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            match read_process_file(pid, &format!("task/{tid}/children")) {
+                Ok(list) => children.extend(
+                    list.split_whitespace()
+                        .filter_map(|child| child.parse::<u32>().ok()),
+                ),
+                // A thread that ended between the listing and the read had nothing more to say.
+                // One that is still there without a list is a kernel that keeps none.
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound && !thread.path().exists() => {}
+                Err(error) => {
+                    return Err(unavailable(
+                        "children of a process",
+                        format!("{task}/{tid}/children: {error}"),
+                    ));
+                }
+            }
+        }
+        children.sort_unstable();
+        children.dedup();
+        Ok(children)
+    }
+
     pub(super) fn controlling_terminal(pid: u32) -> Result<Option<u32>> {
-        let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|error| {
+        let text = read_process_file(pid, "stat").map_err(|error| {
             unavailable("controlling terminal", format!("/proc/{pid}/stat: {error}"))
         })?;
         // Zero is no controlling terminal at all, which is not a terminal to enumerate by.
@@ -493,7 +580,7 @@ mod platform {
             else {
                 continue;
             };
-            let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            let Ok(text) = read_process_file(pid, "stat") else {
                 continue;
             };
             if stat_field(&text, index) == Some(wanted) {
@@ -515,7 +602,7 @@ mod platform {
             else {
                 continue;
             };
-            let Ok(line) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            let Ok(line) = read_process_file(pid, "stat") else {
                 continue;
             };
             if stat_field(&line, STAT_PROCESS_GROUP) == Some(group) {
@@ -537,7 +624,7 @@ mod platform {
 
     pub(super) fn query_process(pid: u32) -> super::ProcessQuery {
         let path = format!("/proc/{pid}/stat");
-        let text = match std::fs::read_to_string(&path) {
+        let text = match read_process_file(pid, "stat") {
             Ok(text) => text,
             // The only failure that proves absence on Linux is a missing /proc entry. A permission,
             // a descriptor limit or an entry that vanished part way through a read proves nothing.
@@ -1207,6 +1294,31 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.pid.get(), u64::from(std::process::id()));
         assert_eq!(process_state(&first), ProcessState::Running);
+    }
+
+    /// A process's children are read from that process alone: what it costs follows the one
+    /// process, however many others the host is running.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_process_s_children_are_read_from_that_process_alone() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("a child");
+        let me = std::process::id();
+        let (children, read) = super::processes_read_during(|| super::children_of(me));
+        let _ = child.kill();
+        let _ = child.wait();
+        let children = children.expect("the kernel lists this process's children");
+        assert!(
+            children.contains(&child.id()),
+            "the child is listed: {children:?}"
+        );
+        assert!(!read.is_empty(), "the reading is counted");
+        assert!(
+            read.iter().all(|pid| *pid == me),
+            "nothing but this process was read: {read:?}"
+        );
     }
 
     #[test]

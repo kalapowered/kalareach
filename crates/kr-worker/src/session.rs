@@ -593,6 +593,8 @@ impl Session {
             ));
         }
         let command = self.config.shell.clone();
+        // Before the shell exists, so that whatever it leaves behind stays this worker's.
+        crate::ownership::adopt_orphans();
         match self.pty.launch(&command) {
             Ok(shell) => {
                 // Ownership is established with the shell, not at closure: a process that started
