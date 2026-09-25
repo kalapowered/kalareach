@@ -225,6 +225,16 @@ impl Standalone {
         ])
     }
 
+    /// Closes a session this test created, through the daemon that holds it.
+    fn close(&self, created: &Value) {
+        let session = created["session_id"]
+            .as_str()
+            .expect("a session identifier");
+        let output = start(self.kr(&["--json", "close", session])).finish("kr close");
+        let closed = document(&output, "kr close");
+        assert!(output.status.success(), "{closed}");
+    }
+
     /// The daemons `kr` started in this tree, by process number, in the order they started.
     fn launched(&self) -> Vec<u32> {
         std::fs::read_to_string(self.tree.root().join(LAUNCHED))
@@ -500,6 +510,7 @@ fn three_first_invocations_at_once_converge_on_one_daemon() {
 
     let started: Vec<Running> = (0..3).map(|_| start(host.new_session())).collect();
     let mut sessions = Vec::new();
+    let mut documents = Vec::new();
     for (index, running) in started.into_iter().enumerate() {
         let what = format!("kr new {index}");
         let output = running.finish(&what);
@@ -516,6 +527,7 @@ fn three_first_invocations_at_once_converge_on_one_daemon() {
             .parse()
             .expect("parses");
         sessions.push(session_id);
+        documents.push(created);
     }
 
     let launched = host.launched();
@@ -549,6 +561,9 @@ fn three_first_invocations_at_once_converge_on_one_daemon() {
         );
     }
     host.assert_detached(daemon);
+    for created in &documents {
+        host.close(created);
+    }
 }
 
 /// KR-REQ-07.12: a daemon that does not come up in time ends the command with a failure of its own
@@ -684,6 +699,7 @@ fn selecting_and_using_the_standalone_start_installs_nothing_and_seeks_no_privil
     );
     assert_eq!(created["state"], "live", "{created}");
     host.assert_detached(host.one_daemon());
+    host.close(&created);
 
     assert!(
         !calls.exists(),
@@ -781,4 +797,5 @@ fn the_start_is_selected_with_no_daemon_and_the_doctor_names_its_source() {
     let row = reported("kr doctor after the clear");
     assert_eq!(row["value"], "none", "{row}");
     assert_eq!(row["source"], "default", "{row}");
+    host.close(&created);
 }
