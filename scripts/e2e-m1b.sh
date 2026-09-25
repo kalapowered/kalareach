@@ -82,12 +82,26 @@ case "$authority" in
     exit 2
     ;;
 esac
-# What is left once every character a host and a port may hold is taken out. Anything that
-# survives is a value that is not an origin.
-if [ -n "${authority//[]a-z0-9.:[-]/}" ]; then
-  echo "an origin is a lower-case host and an optional port in printable ASCII, and nothing else" >&2
+# The whole origin, in the one canonical form a rendezvous origin has: a lower-case host name or a
+# bracketed IPv6 literal, then an optional port from 1 to 65535 with no leading zero, in at most 128
+# bytes. Anything else is refused here, before it reaches a build, a log line or a request.
+host_name='[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*'
+canonical="^https://(${host_name}|\\[[0-9a-f:]+\\])(:[1-9][0-9]{0,4})?\$"
+if [ "${#origin}" -gt 128 ] || ! [[ "$origin" =~ $canonical ]]; then
+  echo "an origin is a lower-case host and an optional port from 1 to 65535, and nothing else" >&2
   exit 2
 fi
+# The port, when there is one, is what follows the last colon after the host, which for an IPv6
+# literal is after its closing bracket. The pattern has already made it digits with no leading zero.
+after_host="${authority##*]}"
+case "$after_host" in
+  *:*)
+    if [ "${after_host##*:}" -gt 65535 ]; then
+      echo "an origin's port is at most 65535" >&2
+      exit 2
+    fi
+    ;;
+esac
 
 # Section 27 puts every test artefact in one directory. This run takes a new directory of its own
 # under it and writes one log per leg there, so a leg that failed leaves its whole output behind.
@@ -132,7 +146,7 @@ while IFS= read -r name; do
     *":$name "*) ;;
     *)
       echo "$name is a leg this report does not name, so it would not be run" >&2
-      exit 2
+      exit 1
       ;;
   esac
 done <<<"$names"
@@ -161,6 +175,9 @@ run_leg() {
     --exact "$name" --nocapture --test-threads=1 >"$log" 2>&1 || rc=$?
 
   while IFS= read -r line; do
+    # The test harness writes its own "test <name> ... " in front of the first thing a leg prints
+    # when output is not captured, so that is taken off before a line is read.
+    line="${line#"test $name ... "}"
     if [ "$after_panic" -eq 1 ]; then
       # The first line of the message is the reason the report gives.
       [ -n "$reason" ] || reason="$line"
