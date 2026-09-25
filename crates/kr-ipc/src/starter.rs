@@ -42,7 +42,7 @@
 //! The claim and the session record are plain owner-only files and work on every platform; only
 //! Windows has a starter to use them.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use kr_protocol::identity::BootIdentity;
 use kr_protocol::scalars::Uuid;
@@ -93,7 +93,8 @@ pub const fn job_plan(limit_flags: Option<u32>) -> JobPlan {
 /// waiting launch says nothing about why the starter was run. The deadline is on the machine's own
 /// continuous clock ([`crate::clock`]), counted in the boot the claim names, so a clock step cannot
 /// extend it and a claim from an earlier boot has lapsed. A retry of the same request leaves the
-/// claim it left before, deadline and all, rather than a later one.
+/// claim it left before, deadline and all, rather than a later one, and a claim once taken stays
+/// taken for the rest of its boot: a retry cannot publish it again.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartClaim {
@@ -117,7 +118,6 @@ impl StartClaim {
 #[derive(Debug)]
 pub struct TakenClaim {
     claim: StartClaim,
-    path: PathBuf,
 }
 
 impl TakenClaim {
@@ -135,34 +135,22 @@ impl TakenClaim {
     pub fn admits(&self, boot: &BootIdentity, now_boot_ms: u64) -> bool {
         self.claim.admits(boot, now_boot_ms)
     }
-
-    /// Removes the taken claim, once the starter has acted on it or decided not to.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the file cannot be removed.
-    pub fn discard(self) -> Result<()> {
-        match std::fs::remove_file(&self.path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(IpcError::io("remove", &self.path, error)),
-        }
-    }
 }
 
 /// The largest claim or session record this host reads.
 const MAX_RECORD_LEN: u64 = 4096;
 
-/// The suffix of a claim waiting to be taken.
-const WAITING: &str = "claim";
+/// The suffix of a claim: the request, as it was left.
+const CLAIM: &str = "claim";
 
-/// The suffix of a claim a starter has taken.
+/// The suffix of the marker that says a claim was taken.
 const TAKEN: &str = "taken";
 
 /// Leaves `claim` for this environment's starter.
 ///
-/// Leaving the same request twice leaves it once: the file is named for the request and is never
-/// replaced, so a retry cannot move the deadline the first attempt set.
+/// Leaving the same request twice leaves it once: the file is named for the request, is never
+/// replaced, and stays until a later boot, so a retry can neither move the deadline the first
+/// attempt set nor make a claim that was taken takeable again.
 ///
 /// # Errors
 ///
@@ -170,7 +158,7 @@ const TAKEN: &str = "taken";
 pub fn leave_claim(environment: &EnvironmentPaths, claim: &StartClaim) -> Result<()> {
     let directory = environment.start_claims_dir();
     crate::paths::create_private_tree(environment.runtime_root(), &directory)?;
-    let path = directory.join(format!("{}.{WAITING}", claim.request));
+    let path = directory.join(format!("{}.{CLAIM}", claim.request));
     let bytes = kr_cbor::to_canonical_vec(claim).map_err(|error| {
         IpcError::io(
             "encode",
@@ -189,14 +177,15 @@ pub fn leave_claim(environment: &EnvironmentPaths, claim: &StartClaim) -> Result
 
 /// Takes one claim this starter may act on, if there is one.
 ///
-/// Taking is one exclusive link of the claim's file to a taken name, so of any number of starters
-/// looking at once, one takes each claim and every other finds it taken or gone. A claim that has lapsed, or that names another
-/// boot, is taken and removed rather than returned, so nothing acts on it and it does not wait
-/// forever. A name in the directory that is not a waiting claim is left alone.
+/// Taking a claim creates its taken marker, which only one creation can do: of any number of
+/// starters looking at once, one takes each claim and every other finds it taken. A claim that has
+/// lapsed is taken like any other and not returned, so nothing acts on it; the claim and its marker
+/// stay for the rest of the boot, so the request cannot be taken again. A claim, and its marker,
+/// from an earlier boot are removed. A name in the directory that is not a claim is left alone.
 ///
 /// # Errors
 ///
-/// Returns an error when the directory cannot be read, or a claim cannot be taken or read for a
+/// Returns an error when the directory cannot be read, or a claim cannot be read or taken for a
 /// reason other than another starter taking it first.
 pub fn take_claim(
     environment: &EnvironmentPaths,
@@ -209,52 +198,52 @@ pub fn take_claim(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(IpcError::io("read", &directory, error)),
     };
-    let mut waiting: Vec<Uuid> = entries
+    let mut requests: Vec<Uuid> = entries
         .flatten()
         .filter_map(|entry| {
             let name = entry.file_name();
             let request: Uuid = name
                 .to_str()?
-                .strip_suffix(&format!(".{WAITING}"))?
+                .strip_suffix(&format!(".{CLAIM}"))?
                 .parse()
                 .ok()?;
-            (format!("{request}.{WAITING}") == name.to_str()?).then_some(request)
+            (format!("{request}.{CLAIM}") == name.to_str()?).then_some(request)
         })
         .collect();
-    waiting.sort();
-    for request in waiting {
-        let from = directory.join(format!("{request}.{WAITING}"));
-        let to = directory.join(format!("{request}.{TAKEN}"));
-        // A link refuses a name that exists, so exactly one of the starters that link at once
-        // succeeds. A rename would not do: on Windows it works through a handle opened first, and
-        // two starters that had both opened the waiting claim would both succeed.
-        match std::fs::hard_link(&from, &to) {
+    requests.sort();
+    for request in requests {
+        let path = directory.join(format!("{request}.{CLAIM}"));
+        let marker = directory.join(format!("{request}.{TAKEN}"));
+        let claim = read_claim(&path)?;
+        if claim.boot != *boot {
+            // An earlier boot's request: its deadline is on a clock that has restarted, and
+            // nothing can act on it now.
+            for stale in [&marker, &path] {
+                match std::fs::remove_file(stale) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(IpcError::io("remove", stale, error)),
+                }
+            }
+            continue;
+        }
+        // Creating the marker refuses a name that exists, so exactly one of the starters that
+        // create it at once succeeds. A rename of the claim would not do: on Windows it works
+        // through a handle opened first, and two starters that had both opened the claim would
+        // both succeed.
+        match crate::paths::create_new_owner_only_file(&marker, &[]) {
             Ok(()) => {}
-            // Another starter took it first.
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::NotFound
-                ) =>
+            Err(IpcError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::AlreadyExists =>
             {
                 continue;
             }
-            Err(error) => return Err(IpcError::io("take", &from, error)),
+            Err(error) => return Err(error),
         }
-        // Taken: the waiting name goes, so no later starter looks at it again.
-        match std::fs::remove_file(&from) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(IpcError::io("remove", &from, error)),
-        }
-        let taken = TakenClaim {
-            claim: read_claim(&to)?,
-            path: to,
-        };
+        let taken = TakenClaim { claim };
         if taken.admits(boot, now_boot_ms) {
             return Ok(Some(taken));
         }
-        taken.discard()?;
     }
     Ok(None)
 }
@@ -468,9 +457,11 @@ mod windows {
                     &raw const attributes,
                 )
             };
+            // Read before the descriptor is freed, whose release can replace it.
+            let failure = (handle == INVALID_HANDLE_VALUE).then(io::Error::last_os_error);
             drop(descriptor);
-            if handle == INVALID_HANDLE_VALUE {
-                return Err(io::Error::last_os_error());
+            if let Some(error) = failure {
+                return Err(error);
             }
             // SAFETY: the call above returned a new handle that nothing else owns.
             let pipe = unsafe { OwnedHandle::from_raw_handle(handle) };
@@ -490,7 +481,9 @@ mod windows {
         ///
         /// `None` is an instance nobody reached in time, or one a process reached and left before
         /// anything was said: either way nothing was handed over. It is removed as this returns,
-        /// so no later starter can reach it.
+        /// so no later starter can reach it. A deadline that has passed when this is called, or
+        /// that passes while a reach is being withdrawn, is `None` too, even for a starter that
+        /// reached the instance already: that starter finds the pipe closed and starts nothing.
         ///
         /// # Errors
         ///
@@ -554,11 +547,15 @@ mod windows {
     ///
     /// # Errors
     ///
-    /// Returns a permission error when the server runs as another account, and the operating
-    /// system's error when the pipe cannot be opened for any other reason.
+    /// Returns a timeout when `deadline` has passed, a permission error when the server runs as
+    /// another account, and the operating system's error when the pipe cannot be opened for any
+    /// other reason.
     pub fn connect(endpoint: &Endpoint, deadline: Instant) -> io::Result<Reached> {
         let name = pipe_name(endpoint);
         loop {
+            if Instant::now() >= deadline {
+                return Err(timed_out());
+            }
             // SAFETY: `name` is a terminated wide string, no attributes or template are given, and
             // the call returns a new handle or the invalid value.
             let handle = unsafe {
@@ -1130,11 +1127,13 @@ mod windows {
         /// Ends the child before it has run, and says so.
         fn end(self, detail: String) -> ChildRefusal {
             let process = self.process.as_raw_handle();
-            // SAFETY: the process handle is open with the right to terminate, which a creator's
-            // handle carries; the wait takes the same handle and a bound.
+            // What decides is the wait, not the termination's own answer: a child that has already
+            // ended cannot be terminated again, and is gone all the same.
+            // SAFETY: the process handle is open with the rights to terminate and to wait, which a
+            // creator's handle carries.
             let ended = unsafe {
-                TerminateProcess(process, 1) != 0
-                    && WaitForSingleObject(process, END_BOUND_MS) == WAIT_OBJECT_0
+                TerminateProcess(process, 1);
+                WaitForSingleObject(process, END_BOUND_MS) == WAIT_OBJECT_0
             };
             ChildRefusal {
                 detail,
@@ -1435,16 +1434,24 @@ mod windows {
     /// `begin` starts the operation with the structure it is given and returns what the call
     /// returned. The structure lives on this frame, and this does not return until the operation
     /// has finished or has been cancelled and has said so, so nothing the operation writes
-    /// outlives what it writes into. A cancelled operation is reported as a timeout.
+    /// outlives what it writes into.
+    ///
+    /// The deadline is kept exactly. An operation is not begun once it has passed, even one that
+    /// could finish at once, and an operation the wait gave up on is a timeout even if it finished
+    /// while it was being cancelled: what missed the deadline is never reported as done.
     fn complete(
         handle: HANDLE,
         deadline: Instant,
         begin: impl FnOnce(*mut OVERLAPPED) -> windows_sys::core::BOOL,
     ) -> io::Result<u32> {
+        if Instant::now() >= deadline {
+            return Err(timed_out());
+        }
         let event = Event::new()?;
         // SAFETY: all-zero is the structure's documented initial state; its event is set next.
         let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
         overlapped.hEvent = event.0.as_raw_handle();
+        let mut gave_up = false;
         if begin(&raw mut overlapped) == 0 {
             let error = io::Error::last_os_error();
             if code(&error) != Some(ERROR_IO_PENDING) {
@@ -1454,6 +1461,7 @@ mod windows {
             let waited =
                 unsafe { WaitForSingleObject(event.0.as_raw_handle(), millis_until(deadline)) };
             if waited != WAIT_OBJECT_0 {
+                gave_up = true;
                 // SAFETY: cancels only this operation, whose structure is still live.
                 unsafe {
                     CancelIoEx(handle, &raw const overlapped);
@@ -1465,17 +1473,23 @@ mod windows {
         // structure it wrote into goes.
         let finished =
             unsafe { GetOverlappedResult(handle, &raw const overlapped, &raw mut transferred, 1) };
-        if finished != 0 {
-            return Ok(transferred);
+        let error = (finished == 0).then(io::Error::last_os_error);
+        if gave_up {
+            return Err(timed_out());
         }
-        let error = io::Error::last_os_error();
-        if code(&error) == Some(ERROR_OPERATION_ABORTED) {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "the other end of the launch pipe did not answer in time",
-            ));
+        match error {
+            None => Ok(transferred),
+            Some(error) if code(&error) == Some(ERROR_OPERATION_ABORTED) => Err(timed_out()),
+            Some(error) => Err(error),
         }
-        Err(error)
+    }
+
+    /// The error a missed deadline is reported as.
+    fn timed_out() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "the other end of the launch pipe did not answer in time",
+        )
     }
 
     /// The milliseconds left until `deadline`, for a wait: zero once it has passed, and never the
@@ -1581,14 +1595,6 @@ mod tests {
                 .is_none(),
             "a taken claim is not taken again"
         );
-        taken.discard().expect("the taken claim is removed");
-        assert_eq!(
-            std::fs::read_dir(environment.start_claims_dir())
-                .expect("the directory")
-                .count(),
-            0,
-            "nothing of the claim is left"
-        );
     }
 
     /// Leaving the same request again keeps the claim, and the deadline, it left the first time.
@@ -1615,13 +1621,44 @@ mod tests {
         );
     }
 
-    /// A lapsed claim, or one from another boot, is removed and never handed to a starter; what is
-    /// not a claim is left where it is.
+    /// A request left again after its claim was taken is not taken again, whatever deadline the
+    /// retry carries: the claim stays taken for the rest of its boot.
+    #[test]
+    fn a_request_left_again_after_it_was_taken_is_not_taken_again() {
+        let host = TempHost::create();
+        let environment = host.environment();
+        let first = claim(10_000);
+        leave_claim(&environment, &first).expect("the claim is left");
+        take_claim(&environment, &boot(1), 5_000)
+            .expect("the directory is read")
+            .expect("the claim is taken");
+        let retried = StartClaim {
+            deadline_boot_ms: 60_000,
+            ..first.clone()
+        };
+        leave_claim(&environment, &retried).expect("a retry succeeds");
+        assert!(
+            take_claim(&environment, &boot(1), 5_000)
+                .expect("the directory is read")
+                .is_none(),
+            "the request was taken once, and is not taken again"
+        );
+        assert!(
+            take_claim(&environment, &boot(1), 30_000)
+                .expect("the directory is read")
+                .is_none(),
+            "nor once the first deadline has passed, whatever the retry carried"
+        );
+    }
+
+    /// A lapsed claim is never handed to a starter and stays taken; one from another boot is
+    /// removed; what is not a claim is left where it is.
     #[test]
     fn a_lapsed_claim_or_another_boots_is_removed_and_not_taken() {
         let host = TempHost::create();
         let environment = host.environment();
-        leave_claim(&environment, &claim(1_000)).expect("a claim that lapses");
+        let lapsing = claim(1_000);
+        leave_claim(&environment, &lapsing).expect("a claim that lapses");
         let elsewhere = StartClaim {
             boot: boot(9),
             ..claim(60_000)
@@ -1636,12 +1673,22 @@ mod tests {
                 .is_none(),
             "nothing here may be acted on"
         );
-        let left: Vec<String> = std::fs::read_dir(environment.start_claims_dir())
+        let mut left: Vec<String> = std::fs::read_dir(environment.start_claims_dir())
             .expect("the directory")
             .flatten()
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(left, vec!["notes.txt".to_owned()]);
+        left.sort();
+        let mut expected = vec![
+            format!("{}.claim", lapsing.request),
+            format!("{}.taken", lapsing.request),
+            "notes.txt".to_owned(),
+        ];
+        expected.sort();
+        assert_eq!(
+            left, expected,
+            "the lapsed claim stays taken, the other boot's is gone, the stranger is untouched"
+        );
     }
 
     /// Of many starters looking at once, one takes a claim.
@@ -1797,6 +1844,65 @@ mod tests {
                     Reached::NoInstance
                 ),
                 "a late starter finds nothing waiting"
+            );
+        }
+
+        /// A deadline that has passed hands nothing over, even to a starter that reached the
+        /// instance already: the instance is withdrawn and that starter finds the pipe closed.
+        #[test]
+        fn a_starter_already_there_is_handed_nothing_once_the_deadline_has_passed() {
+            let endpoint = endpoint();
+            let listener = LaunchListener::create(&endpoint).expect("an instance");
+            let Reached::Connected(mut starter) =
+                connect(&endpoint, soon()).expect("the pipe is reached")
+            else {
+                panic!("a waiting instance is reached");
+            };
+            assert!(
+                listener.accept(Instant::now()).expect("the wait").is_none(),
+                "nothing is handed over after the deadline"
+            );
+            let closed = starter
+                .receive(soon())
+                .expect_err("the pipe was closed under it");
+            assert_eq!(closed.kind(), std::io::ErrorKind::UnexpectedEof);
+        }
+
+        /// A read or a write whose deadline has passed is a timeout, even when it could finish at
+        /// once; and reaching the pipe after the deadline is a timeout too.
+        #[test]
+        fn an_operation_after_its_deadline_is_a_timeout_even_when_it_could_finish_at_once() {
+            let endpoint = endpoint();
+            let listener = LaunchListener::create(&endpoint).expect("an instance");
+            assert_eq!(
+                connect(&endpoint, Instant::now())
+                    .expect_err("too late to reach it")
+                    .kind(),
+                std::io::ErrorKind::TimedOut
+            );
+            let Reached::Connected(mut starter) =
+                connect(&endpoint, soon()).expect("the pipe is reached")
+            else {
+                panic!("a waiting instance is reached");
+            };
+            let mut daemon = listener
+                .accept(soon())
+                .expect("the wait")
+                .expect("the starter reached it");
+            starter.send(b"waiting", soon()).expect("sent");
+            assert_eq!(
+                daemon
+                    .receive(Instant::now())
+                    .expect_err("the read is too late")
+                    .kind(),
+                std::io::ErrorKind::TimedOut
+            );
+            assert_eq!(
+                daemon
+                    .send(b"late", Instant::now())
+                    .expect_err("the write is too late")
+                    .kind(),
+                std::io::ErrorKind::TimedOut
             );
         }
 
