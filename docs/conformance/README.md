@@ -171,9 +171,11 @@ compiles:
   and every declared module has its file.
 - The target is of the 2018 edition or later.
 
-The report checks these on tokens and nothing else, so it errs towards a problem: text inside
-`stringify!` counts, as does a macro's definition. Each problem names the file and the line. A
-target with one keys no test through a helper, and the report stops before it runs anything.
+The report checks the names on tokens, with no regard to what the compiler would make of them, so
+it errs towards a problem: text inside `stringify!` counts, as does a macro's definition; only a
+plain `use` of a helper's name is followed further, through the report's reading of the modules.
+Each problem names the file and the line. A target with one keys no test through a helper, and the
+report stops before it runs anything.
 
 The report does not model build scripts, `include!`, procedural macros other than the trusted
 derives and `tokio::test`, the expansion of any macro, or `cfg`. None of them earns a key: the
@@ -218,8 +220,9 @@ declaration among a module's items as the compiler does, so a test is named exac
 harness names it. A `path` attribute is read from the directory of the file it is in at the file's
 top level, and from the inline module's directory inside one; on an inline module, written before
 it or at the start of its body, it names the directory of the modules inside; and the file it names
-keeps its own modules beside it, as a `mod.rs` does. A module whose file is not there, or whose files a `cfg_attr` chooses, is a warning,
-and in a target with a helper a problem.
+keeps its own modules beside it, as a `mod.rs` does. A module whose file is not there, whose files a
+`cfg_attr` may choose, or whose own file carries a `path` attribute among its inner attributes is a
+warning, and in a target with a helper a problem.
 
 ### Case tables kept as data
 
