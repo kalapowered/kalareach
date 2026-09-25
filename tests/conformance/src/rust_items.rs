@@ -1721,32 +1721,37 @@ fn conventions(tokens: &[Token], helpers: &BTreeSet<String>) -> Vec<(usize, Stri
 /// wherever they hold a `$`. What a metavariable (`$name`) or a repetition (`$( ... )*`) stands for
 /// is known only where the macro is invoked, so these tokens do not show the code they write.
 fn macro_text(tokens: &[Token]) -> Vec<bool> {
-    let mut groups = Vec::new();
+    let opens = |at: usize| {
+        tokens
+            .get(at)
+            .is_some_and(|token| ['(', '[', '{'].iter().any(|c| token.is_punct(*c)))
+    };
+    let close = |open: usize| matching(tokens, open).unwrap_or(tokens.len() - 1);
+    // Each macro's span, from the group that opens it to the group that ends it.
+    let mut spans = Vec::new();
     for (index, token) in tokens.iter().enumerate() {
         let word = token.ident();
         if word.is_some() && tokens.get(index + 1).is_some_and(|next| next.is_punct('!')) {
             let named = word == Some("macro_rules")
                 && tokens.get(index + 2).and_then(Token::ident).is_some();
-            groups.push(index + if named { 3 } else { 2 });
-        } else if word == Some("macro") && tokens.get(index + 1).and_then(Token::ident).is_some() {
-            // `macro name(...) { ... }` takes its arguments and its body in two groups.
-            groups.push(index + 2);
-            if tokens.get(index + 2).is_some_and(|open| open.is_punct('('))
-                && let Some(close) = matching(tokens, index + 2)
-            {
-                groups.push(close + 1);
+            let open = index + if named { 3 } else { 2 };
+            if opens(open) {
+                spans.push((open, close(open)));
             }
+        } else if word == Some("macro")
+            && tokens.get(index + 1).and_then(Token::ident).is_some()
+            && opens(index + 2)
+        {
+            // `macro name(...) { ... }` takes its arguments and its body in two groups.
+            let mut last = close(index + 2);
+            if tokens[index + 2].is_punct('(') && opens(last + 1) {
+                last = close(last + 1);
+            }
+            spans.push((index + 2, last));
         }
     }
     let mut text = vec![false; tokens.len()];
-    for open in groups {
-        if !tokens
-            .get(open)
-            .is_some_and(|token| ['(', '[', '{'].iter().any(|c| token.is_punct(*c)))
-        {
-            continue;
-        }
-        let close = matching(tokens, open).unwrap_or(tokens.len() - 1);
+    for (open, close) in spans {
         if tokens[open..=close].iter().any(|token| token.is_punct('$')) {
             text[open..=close].fill(true);
         }
@@ -1784,8 +1789,9 @@ const ITEM_KEYWORDS: &[&str] = &[
 /// opens or ends: there the reading cannot tell where the item's name, generic parameters or body
 /// are. A header runs from its keyword (`fn` but for a function's type, `fn(...)`; `impl` in a type
 /// as well as an item's) to its body, its `;` or the end of the group it stands in, and the groups
-/// it holds, a macro's braces (`ty!{}`) among them, are no part of it; angle brackets are no group.
-/// A repetition that holds whole items splits no header.
+/// it holds, a macro's braces (`ty!{}`) among them, are no part of it; angle brackets are no group,
+/// and a `{` inside them opens none of the item's body. A repetition that holds whole items splits
+/// no header.
 fn split_headers(tokens: &[Token]) -> BTreeSet<usize> {
     // Where each repetition's group ends: the `)` of a `$(`.
     let mut ends = BTreeSet::new();
@@ -1832,7 +1838,7 @@ fn split_headers(tokens: &[Token]) -> BTreeSet<usize> {
                 && !(tokens[at - 1].is_punct('!') && at >= 2 && tokens[at - 2].ident().is_some());
             match tokens[at].tok {
                 Tok::Punct('{') if body && groups == 0 && angles == 0 => break,
-                Tok::Punct(';') if groups == 0 && angles == 0 => break,
+                Tok::Punct(';') if groups == 0 => break,
                 Tok::Punct('(' | '[' | '{') => groups += 1,
                 Tok::Punct(')' | ']' | '}') => {
                     if groups == 0 {
@@ -2039,15 +2045,18 @@ impl Around<'_> {
     }
 
     /// Whether the macro around this name cannot make a declaration of it where it is written: it
-    /// is invoked (`name!`), a path goes on through it (`name::item`), it follows a `.` (a field, a
-    /// method or the end of a range), or it is inside an attribute. A macro it is handed to may make
-    /// anything of it, which the rules on where that macro is invoked cover.
+    /// is invoked (`name!`), a path goes on through it to an item (`name::item`, where
+    /// `name::self` in a use tree's braces would bring the name itself in), it follows a `.` (a
+    /// field, a method or the end of a range), or it is inside an attribute. A macro it is handed
+    /// to may make anything of it, which the rules on where that macro is invoked cover.
     fn declares_nothing_where_written(&self, in_attribute: bool) -> bool {
         in_attribute
             || self.punct_after(1, '!')
             || (self.punct_after(1, ':')
                 && self.punct_after(2, ':')
-                && self.word_after(3).is_some())
+                && self
+                    .word_after(3)
+                    .is_some_and(|next| !matches!(next, "self" | "super" | "crate" | "Self")))
             || self.punct_before(1, '.')
     }
 
@@ -2959,6 +2968,7 @@ mod tests {
             "macro_rules! m { ($($v:ident),*) => { enum E { $($v),* } }; }",
             "macro_rules! m { ($($v:vis)?) => { $($v)? fn other() {} }; }",
             "macro_rules! m { ($($e:tt)*) => { fn other() -> ! { $($e)* loop {} } }; }",
+            "macro_rules! m { ($($x:tt)*) => { stringify!(fn < ; $($x)*) }; }",
             // A function's type, and `union` where it names no item.
             "macro_rules! m { ($($t:ty),*) => { let f: fn($($t),*) = g; let u = a.union($($t),*); }; }",
             "fn union() {}\nfn t() { let union = 1; }",
@@ -2986,6 +2996,8 @@ mod tests {
                 "shared",
             ),
             ("macro_rules! m { ($x:expr) => { shared($x) }; }", "shared"),
+            // A macro's definition in two groups is one macro.
+            ("macro m($x:ident) { shared() }", "shared"),
             ("define!(($x:expr) => { shared($x) });", "shared"),
             (
                 "macro_rules! m { ($kw:tt) => { $kw other<core>() {} }; }",
@@ -3004,6 +3016,11 @@ mod tests {
                 "assert",
             ),
             ("macro_rules! m { ($kw:tt) => { $kw std {} }; }", "std"),
+            // In a use tree's braces, `name::self` brings the name in.
+            (
+                "macro_rules! m { ($kw:tt) => { $kw holder::{core::self}; }; }",
+                "core",
+            ),
             (
                 "macro_rules! m { ($x:expr) => { use a::println; }; }",
                 "println",
