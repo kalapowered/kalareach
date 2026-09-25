@@ -1750,7 +1750,7 @@ impl Controller {
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use kr_protocol::actor::ActorIngress;
@@ -1784,7 +1784,7 @@ pub(super) mod tests {
     }
 
     /// Starts a daemon on an environment that may already hold an earlier daemon's records.
-    pub(super) async fn daemon(temp: &kr_ipc::testing::TempHost) -> Arc<Controller> {
+    pub(crate) async fn daemon(temp: &kr_ipc::testing::TempHost) -> Arc<Controller> {
         daemon_in(
             temp,
             kr_ipc::identity::boot_identity().expect("a boot identity"),
@@ -1828,7 +1828,7 @@ pub(super) mod tests {
 
     /// Starts a daemon with `start`, and again while a daemon this test let go still holds the
     /// environment, until [`ENVIRONMENT_HANDOVER_DEADLINE`]. Any other failure fails the test.
-    async fn started<F, S>(start: F) -> Arc<Controller>
+    pub(crate) async fn started<F, S>(start: F) -> Arc<Controller>
     where
         F: Fn() -> S,
         S: std::future::Future<Output = crate::error::Result<Arc<Controller>>>,
@@ -1868,7 +1868,7 @@ pub(super) mod tests {
     }
 
     /// What a test daemon is started with, in the boot `boot_identity` names.
-    fn setup(
+    pub(crate) fn setup(
         temp: &kr_ipc::testing::TempHost,
         boot_identity: kr_protocol::identity::BootIdentity,
     ) -> ControllerSetup {
