@@ -47,6 +47,7 @@ pub mod desktop;
 pub mod directory;
 pub mod error;
 pub mod grants;
+pub mod machine;
 pub mod project;
 pub mod push;
 pub mod registry;
