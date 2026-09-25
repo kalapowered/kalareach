@@ -2497,6 +2497,10 @@ mod tests {
                 shown(&path, "\"/a b\\q.conf\"", &only, ""),
                 "cannot read back which drop-ins",
             ),
+            (
+                shown(&path, "\"/a b\\q.conf\"", &only, "NeedDaemonReload=yes\n"),
+                "escapes a character kr does not read back",
+            ),
         ] {
             let why = unit.difference(&written).expect("a difference");
             assert!(why.contains(what), "{what}: {why}");
@@ -2547,6 +2551,22 @@ mod tests {
                 "[Service]\nEnvironment=A=1 \\\nExecStart=x\n",
                 Some("ExecStart"),
             ),
+            (
+                "[Service]\nExecStart\\\n=\nExecStart\\\n=/opt/kr/kr-controller\n",
+                Some("ExecStart"),
+            ),
+            (
+                "[Service]\r\nExecStart\\\r\n=/bin/true\r\n",
+                Some("ExecStart"),
+            ),
+            ("[Service]\rExecStart=/bin/true\r", Some("ExecStart")),
+            ("[Service]\0ExecStart=/bin/true\0", Some("ExecStart")),
+            ("\u{feff}ExecStart=/bin/true\n", Some("ExecStart")),
+            (
+                "[Service]\nEnvironment=A=1 \\\n# a note\nExecStart=/bin/true\n",
+                Some("ExecStart"),
+            ),
+            ("[Service]\nExec\\\nStart=/bin/true\n", Some("Exec Start")),
             ("[Service]\nEnvironment=ExecStart=x\nTimeoutSec=5\n", None),
             ("[Service]\n# ExecStart=x\n; Type=notify\n", None),
             ("[Service]\nTimeoutStopFailureMode=abort\n", None),

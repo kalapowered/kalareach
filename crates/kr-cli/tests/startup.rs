@@ -1931,8 +1931,11 @@ struct UserManager {
 
 #[cfg(target_os = "linux")]
 impl UserManager {
-    /// Starts a manager whose home is `home`, or says why none can be started here.
-    fn start(home: &Path, holder: teardown::Holder) -> Result<Self, String> {
+    /// Starts a manager whose home is `home`, or says why none can be started here. With `bus`,
+    /// a message bus of the manager's own runs in its scope first, at `bus` in its runtime
+    /// directory, where a user manager looks for one, so `systemctl` told to use a bus there
+    /// reaches this manager.
+    fn start(home: &Path, holder: teardown::Holder, bus: bool) -> Result<Self, String> {
         use std::os::unix::fs::PermissionsExt as _;
 
         let program = ["/usr/lib/systemd/systemd", "/lib/systemd/systemd"]
@@ -1967,13 +1970,23 @@ impl UserManager {
             .map_err(|error| error.to_string())?;
         let scope = format!("kr-test-manager-{}.scope", kr_ipc::new_uuid());
         let process = spawning(|| {
-            Command::new("systemd-run")
+            let mut command = Command::new("systemd-run");
+            command
                 .args(["--user", "--scope", "--quiet", "--property=Delegate=yes"])
                 .arg(format!("--unit={scope}"))
                 .args(["--", "env", "-i"])
                 .arg(format!("HOME={}", home.display()))
                 .arg(format!("XDG_RUNTIME_DIR={}", runtime.display()))
-                .arg("PATH=/usr/bin:/bin")
+                .arg("PATH=/usr/bin:/bin");
+            if bus {
+                command.args([
+                    "/bin/sh",
+                    "-c",
+                    "dbus-daemon --session --address=\"unix:path=$XDG_RUNTIME_DIR/bus\" --fork \
+                     --nopidfile >/dev/null && exec \"$0\" \"$@\"",
+                ]);
+            }
+            command
                 .arg(&program)
                 .args([
                     "--user",
@@ -2162,7 +2175,7 @@ impl ServiceHost {
         }
         #[cfg(target_os = "linux")]
         {
-            match UserManager::start(&home, tree.holder()) {
+            match UserManager::start(&home, tree.holder(), false) {
                 Ok(manager) => Some(Self {
                     manager,
                     tree,
@@ -2967,12 +2980,15 @@ fn no_drop_in_anywhere_changes_the_command_the_user_manager_runs() {
 }
 
 /// KR-REQ-07.12: on Linux every question kr puts to the user manager and every request it makes
-/// go the same way, through `systemctl --user` with the runtime directory set, so the manager whose
-/// definition kr checked is the manager it asks to start the daemon.
+/// go through `systemctl --user` from the same environment, so the manager whose definition kr
+/// checked is the manager it asks to start the daemon.
 ///
-/// With `SYSTEMCTL_FORCE_BUS=1` and a session bus address where no bus is, `systemctl` finds no
-/// manager; so `kr new` reaches none either, says so, and nothing is started anywhere. Without
-/// them, the same `kr new` has the test's own manager start the daemon.
+/// Two managers are reachable. The test's own, named by the runtime directory, holds the
+/// definition kr wrote. A second one, reachable only over a message bus of its own, holds another
+/// unit under the same name whose command leaves a mark. With `SYSTEMCTL_FORCE_BUS=1` and that
+/// bus named, `systemctl` reaches the second manager for every call: kr checks what that manager
+/// holds, refuses it, and asks nothing to start, so the mark never appears. Without them, the test's
+/// own manager starts the daemon.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_user_manager_kr_checks_is_the_one_it_asks() {
@@ -2980,20 +2996,67 @@ fn the_user_manager_kr_checks_is_the_one_it_asks() {
         return;
     };
     host.select_service();
-    let nowhere = format!(
-        "unix:path={}",
-        host.tree.root().join("no-bus-here").display()
-    );
-    let mut elsewhere = host.new_session();
-    elsewhere
-        .env("SYSTEMCTL_FORCE_BUS", "1")
-        .env("DBUS_SESSION_BUS_ADDRESS", &nowhere);
+    let other_home = host.tree.root().join("other-home");
+    let other_units = other_home.join(".config/systemd/user");
+    std::fs::create_dir_all(&other_units).expect("the other manager's unit directory");
+    let mark = host.tree.root().join("the-other-manager-ran-its-unit");
+    let other_unit = other_units.join(format!("{}.service", host.label()));
+    std::fs::write(
+        &other_unit,
+        format!(
+            "[Service]\nType=exec\nExecStart=/usr/bin/touch {}\n",
+            mark.display()
+        ),
+    )
+    .expect("another unit under the same name");
+    let other = match UserManager::start(&other_home, host.tree.holder(), true) {
+        Ok(other) => other,
+        Err(why) => {
+            assert!(
+                std::env::var_os(REQUIRE_SERVICE_MANAGER).is_none(),
+                "a second manager with a bus of its own could not be started: {why}"
+            );
+            eprintln!("the manager choice is not tested here: {why}");
+            return;
+        }
+    };
+    let bus = format!("unix:path={}", other.runtime.join("bus").display());
+    let over_the_bus = |command: &mut Command| {
+        command
+            .env("SYSTEMCTL_FORCE_BUS", "1")
+            .env("DBUS_SESSION_BUS_ADDRESS", &bus);
+    };
+    // The second manager answers on its bus before kr is pointed there.
+    let begun = Instant::now();
+    loop {
+        let mut asked = Command::new("systemctl");
+        asked.args(["--user", "show", "--property=Version", "--value"]);
+        over_the_bus(&mut asked);
+        if bounded(asked, STREAMS_DEADLINE).is_ok_and(|answer| answer.status.success()) {
+            break;
+        }
+        assert!(
+            begun.elapsed() < LIVENESS_DEADLINE,
+            "the second manager did not answer on its bus"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 
-    let output = start(elsewhere).finish("kr new pointed at no bus");
+    let mut elsewhere = host.new_session();
+    over_the_bus(&mut elsewhere);
+    let output = start(elsewhere).finish("kr new pointed at the other manager");
     let failure = document(&output, "kr new");
-    assert_ne!(output.status.code(), Some(0), "{failure}");
-    assert_eq!(failure["code"], "ENVIRONMENT_UNAVAILABLE", "{failure}");
-    assert_eq!(host.daemon(), None, "nothing was started");
+    assert_eq!(failure["code"], "HOST_NOT_CONFIGURED", "{failure}");
+    let message = failure["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(&other_unit.display().to_string()),
+        "the failure names what the other manager holds: {message}"
+    );
+    assert!(
+        !mark.exists(),
+        "the other manager was asked to start nothing"
+    );
+    assert_eq!(host.daemon(), None, "and the test's own started nothing");
     assert!(!host.answers(), "nothing answers");
 
     let output = start(host.new_session()).finish("kr new");
@@ -3007,7 +3070,9 @@ fn the_user_manager_kr_checks_is_the_one_it_asks() {
         host.daemon()
             .expect("the test's own manager reports the daemon it started"),
     );
+    assert!(!mark.exists(), "and the other manager still ran nothing");
     host.close(&created);
+    drop(other);
 }
 
 /// KR-REQ-07.12: on Linux a drop-in that sets the daemon's command is refused even when the
@@ -3036,19 +3101,30 @@ fn a_drop_in_that_resplits_the_command_is_refused_though_it_prints_the_same() {
         .with_file_name(format!("{}.service.d", host.label()));
     std::fs::create_dir_all(&own).expect("the unit's own drop-in directory");
     let drop_in = own.join("20-resplit.conf");
-    std::fs::write(&drop_in, format!("[Service]\nExecStart=\n{resplit}\n")).expect("a drop-in");
-    host.reload();
+    // Once as plain lines, and once as systemd also reads it: keys continued onto the next line
+    // with a backslash, and lines ended by carriage returns alone.
+    let continued = resplit.replacen("ExecStart=", "ExecStart\\\r=", 1);
+    for contents in [
+        format!("[Service]\nExecStart=\n{resplit}\n"),
+        format!("[Service]\rExecStart\\\r=\r{continued}\r"),
+    ] {
+        std::fs::write(&drop_in, &contents).expect("a drop-in");
+        host.reload();
 
-    let output = start(host.new_session()).finish("kr new");
-    let failure = document(&output, "kr new");
-    assert_eq!(failure["code"], "HOST_NOT_CONFIGURED", "{failure}");
-    let message = failure["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains(&drop_in.display().to_string()) && message.contains("ExecStart"),
-        "the failure names the drop-in and the key it sets: {message}"
-    );
-    assert_eq!(host.daemon(), None, "nothing was started");
-    assert!(!host.answers(), "nothing answers");
+        let output = start(host.new_session()).finish("kr new");
+        let failure = document(&output, "kr new");
+        assert_eq!(
+            failure["code"], "HOST_NOT_CONFIGURED",
+            "{contents:?}: {failure}"
+        );
+        let message = failure["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(&drop_in.display().to_string()) && message.contains("ExecStart"),
+            "{contents:?}: the failure names the drop-in and the key it sets: {message}"
+        );
+        assert_eq!(host.daemon(), None, "{contents:?}: nothing was started");
+        assert!(!host.answers(), "{contents:?}: nothing answers");
+    }
 }
 
 /// KR-REQ-07.12: on Linux a drop-in every service reads that leaves commands alone, such as the
