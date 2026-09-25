@@ -34,6 +34,7 @@
 //! password reset therefore returns an account and nothing else: [`SeedSource`] is the complete
 //! list of places a seed comes from, and a service is not one of them.
 
+mod archive;
 mod bundle;
 mod kit;
 mod record;
@@ -46,6 +47,7 @@ use kr_protocol::scalars::Digest256;
 use crate::services::SyncPosition;
 use crate::shown::{IoFault, Said, Shown};
 
+pub use crate::recovery::archive::{SettingsArchive, SettingsBackedUp, SettingsCollection};
 pub use crate::recovery::bundle::{
     BundleStore, LostWrite, Migrated, MigrationRecord, OfflineExport, WriterEnabled,
     bundle_collection, fresh_locator,
