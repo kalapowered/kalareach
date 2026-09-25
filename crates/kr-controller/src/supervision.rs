@@ -1163,11 +1163,13 @@ fn detached_command(
 /// A worker outlives the daemon, so it must not be a member of a job that kills its members when the
 /// daemon closes. `job_flags` is the daemon's own job's limit flags, or `None` when it runs in no
 /// job. Breakaway is asked for when the job kills on close, and also when the job permits breakaway
-/// even without kill-on-close: breaking away out of a permitting job is free and takes the worker
-/// out of the whole job hierarchy the daemon sits in, which is what protects it when an outer job
-/// kills on close while the immediate one does not. With no job, or a job that neither kills on
-/// close nor permits breakaway (a runner's plain job), no breakaway is asked for: the worker either
-/// already outlives the daemon or could not break away in any case, and asking would be refused.
+/// even without kill-on-close: breaking away out of a permitting job is free and takes the worker out
+/// of the jobs it can leave, which protects it when an outer job kills on close while an inner one
+/// permits breakaway. It does not leave the whole hierarchy in every case: breakaway stops at the
+/// first ancestor that forbids it, the limit stated below. With no job, or a job that neither kills
+/// on close nor permits breakaway (a runner's plain job), no breakaway is asked for: the worker
+/// either already outlives the daemon or could not break away in any case, and asking would be
+/// refused.
 ///
 /// The reading is of the immediate job only; the operating system does not report an ancestor job's
 /// flags through this query, and breakaway stops at the first ancestor that forbids it rather than

@@ -706,14 +706,6 @@ mod tests {
                     CheckedWrite::Complete,
                     "a peer that never reads took the whole frame"
                 );
-                // The bytes sent stop advancing once a transport write is outstanding and the peer
-                // does not read; five polls without progress is the backpressure holding.
-                if writer.sent == last {
-                    stalls += 1;
-                } else {
-                    stalls = 0;
-                    last = writer.sent;
-                }
                 if stalls >= 5 && writer.has_sent_any() {
                     break;
                 }
@@ -735,6 +727,15 @@ mod tests {
                 outcome = writer
                     .resume_frame_checked(|| true)
                     .expect("the peer is there");
+                // Counted after the attempt: the bytes sent stop advancing once a transport write is
+                // outstanding and the peer does not read, and five attempts without progress is the
+                // backpressure holding.
+                if writer.sent == last {
+                    stalls += 1;
+                } else {
+                    stalls = 0;
+                    last = writer.sent;
+                }
             }
             assert!(
                 writer.sent < frame.len(),
