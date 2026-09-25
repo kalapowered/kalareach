@@ -552,12 +552,6 @@ const QUIET_AFTER: Duration = Duration::from_secs(4);
 /// How many intervals a quiet session is watched for.
 const QUIET_INTERVALS: u32 = 16;
 
-/// The most foreground reads a quiet session may make in [`QUIET_INTERVALS`]: one read in four
-/// intervals. From [`QUIET_AFTER`] on, the watch waits a second and more between looks, a quarter of
-/// the time since the traffic, so it reads at most four times in these four seconds; a watch on a
-/// clock reads on every interval.
-const QUIET_READS: usize = 4;
-
 /// A session whose one view holds the input lease, and the view's own delivery stream.
 struct Typing {
     runtime: Arc<kr_worker::runtime::SessionRuntime>,
@@ -619,15 +613,24 @@ impl Typing {
     }
 
     /// Asserts that the session reads its foreground on no more than one interval in four, over
-    /// [`QUIET_INTERVALS`] intervals.
+    /// [`QUIET_INTERVALS`] intervals or however much longer this task was kept from looking.
+    ///
+    /// From [`QUIET_AFTER`] on, the watch waits a second and more between looks, a quarter of the
+    /// time since the traffic, so it reads at most once in any four intervals; a watch on a clock
+    /// reads on every interval. The limit is taken from the time actually watched, because a late
+    /// wake here lengthens the window without making the watch any busier.
     async fn quiet(&self, what: &str) {
         let before = self.reads();
+        let started = tokio::time::Instant::now();
         tokio::time::sleep(kr_worker::broker::adoption::WATCH_INTERVAL * QUIET_INTERVALS).await;
         let read = self.reads() - before;
+        let watched = started.elapsed();
+        let fours = (kr_worker::broker::adoption::WATCH_INTERVAL * 4).as_nanos();
+        let allowed = usize::try_from(watched.as_nanos().div_ceil(fours)).unwrap_or(usize::MAX);
         assert!(
-            read <= QUIET_READS,
+            read <= allowed,
             "{what} reads its foreground on no more than one interval in four: {read} reads in \
-             {QUIET_INTERVALS} intervals"
+             {watched:?}"
         );
     }
 
