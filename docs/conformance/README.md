@@ -135,6 +135,8 @@ text is never taken for a comment.
 
 A test declared once for a table of cases (`it.each`, `test.each`) is as many tests as the table
 has rows. Each is recorded under the title the run gave it, with a command that runs that one row.
+Rows that share a title are told apart by their place among the rows with that title, and the
+command that selects the title runs them all.
 
 ### Tests another toolchain builds
 
