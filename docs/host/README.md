@@ -222,7 +222,13 @@ set up for that. The document's `startup` section records the setup:
 
 | Field | What it selects | What it accepts |
 | --- | --- | --- |
-| `startup.controller` | how `kr new` starts this environment's control daemon when none is running; absent starts none, and `kr new` answers `HOST_NOT_CONFIGURED` with the setup action | `standalone` |
+| `startup.controller` | how `kr new` starts this environment's control daemon when none is running; absent starts none, and `kr new` answers `HOST_NOT_CONFIGURED` with the setup action | `service`, `standalone` |
+
+`service` has this user's own service manager start the daemon, from a definition that
+`kr host startup --set service` writes and records: a launchd job on macOS, a systemd user unit on
+Linux. `kr new` then asks the manager to start it, and the manager is the daemon's parent.
+[docs/cli/README.md](../cli/README.md#kr-host-startup) says what is written, where, and what
+`--clear` removes.
 
 `standalone` is the standalone headless profile, for a host with no service manager set up to start
 the daemon. `kr new` then runs the `kr-controller` installed beside it, detached: in a session and a
@@ -236,11 +242,13 @@ seconds for it to answer, and
 [docs/cli/README.md](../cli/README.md#when-no-control-daemon-is-running) says what a person sees.
 
 `kr host startup` writes the section as one validated edit with no daemon running, and `kr doctor`
-reports it with its source and as applying at the next start. Like the network and the voice
-broker, no request, profile or environment variable reaches it, so a variable exported in one
-terminal cannot make a command start a daemon on a host that was never set up to have one started.
-Neither writing the choice nor starting the daemon installs a service, enables lingering or obtains
-a privilege. A value this build does not know makes the document invalid, and the host starts
+reports it with its source and as applying at the next start, and, for `service`, whether the
+definition matches what kr wrote. Like the network and the voice broker, no request, profile or
+environment variable reaches it, so a variable exported in one terminal cannot make a command start
+a daemon on a host that was never set up to have one started. Starting the daemon installs nothing,
+enables no lingering and obtains no privilege, under either start. The one thing a choice installs
+is the service definition `kr host startup --set service` writes and records, and choosing anything
+else removes it. A value this build does not know makes the document invalid, and the host starts
 nothing.
 
 ### What leaves this host

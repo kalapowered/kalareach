@@ -71,6 +71,22 @@ fallback, and a worker there is a child of the control daemon and runs in the lo
 daemon runs in, so a headless session there is a session with no desktop handles and no promise
 about the desktop rather than one that cannot reach it; its capability records say so.
 
+### The control daemon under the service start
+
+When `kr host startup --set service` has chosen the service start, the control daemon is itself a
+per-user job, and a logout does to it what it does to a session of the matching profile. On macOS
+its job is loaded into your graphical domain on a host whose sessions are desktop-bound by default,
+so it runs in that login, reaches what the login reaches, the login keychain among it, and ends with
+it. On a host whose sessions are headless it is loaded into your background domain instead, which
+outlives the graphical login, and how long after the last session is launchd's own behaviour, as
+for a headless session. On Linux the user manager that started it runs while you have any session
+and, with lingering enabled, from boot, and the daemon runs with it.
+
+Either way the job starts only when a command asks for it, never at login, so after a reboot or a
+logout that ended it, nothing runs until the next `kr new`. A daemon that ends takes no session with
+it: every worker is a job of its own. A daemon the standalone start ran is in whatever login context
+the command that started it was in.
+
 ### Enabling persistence on Linux
 
 Lingering is the user's own setting and KalaReach never enables it. Installing the host does not
