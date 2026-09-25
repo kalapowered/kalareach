@@ -132,7 +132,7 @@ pub async fn answer(
 ) -> Result<Question> {
     let (descriptor, question, client) = locate(paths, question_id, build_id.clone()).await?;
     let drafts = kept_answers(paths)?;
-    let workers = Workers::new(paths, build_id).holding(descriptor.session_id, client);
+    let workers = Workers::new(paths, build_id).holding(&descriptor, client);
     let answered = answers::answer(
         Some(&workers),
         &drafts,
@@ -437,7 +437,8 @@ pub struct Workers {
     build_id: BuildId,
     connections: tokio::sync::Mutex<BTreeMap<SessionId, LocalClient>>,
     failure: std::sync::Mutex<Option<Failure>>,
-    /// The environment each kept answer's session ran in, whose daemon says whether it ended.
+    /// The environment each session ran in: where its descriptor is published, and whose daemon
+    /// says whether it ended.
     environments: BTreeMap<SessionId, EnvironmentId>,
 }
 
@@ -465,10 +466,14 @@ impl Workers {
         self
     }
 
-    /// Starts from a connection already open to one session's worker, and proved.
+    /// Starts from a connection already open to the worker `descriptor` names, and proved.
     #[must_use]
-    pub fn holding(mut self, session_id: SessionId, client: LocalClient) -> Self {
-        self.connections.get_mut().insert(session_id, client);
+    pub fn holding(mut self, descriptor: &WorkerDescriptor, client: LocalClient) -> Self {
+        self.environments
+            .insert(descriptor.session_id, descriptor.environment_id);
+        self.connections
+            .get_mut()
+            .insert(descriptor.session_id, client);
         self
     }
 
@@ -508,10 +513,11 @@ impl Workers {
     /// Opens and proves a connection to the worker of `session_id`.
     ///
     /// A session ends only when its environment's daemon says so: a closure its registry keeps, or
-    /// a session it never held. That, and nothing else, is the host's own `UNKNOWN_SESSION`, which
-    /// retires a kept answer as gone. A descriptor that is missing, unreadable or untrusted, and a
-    /// worker that cannot be reached, say nothing about whether the session ended; each is a
-    /// failure that retires nothing.
+    /// no record at all of a session whose descriptor is proved absent. That, and nothing else, is
+    /// the host's own `UNKNOWN_SESSION`, which retires a kept answer as gone. A descriptor that is
+    /// missing, a descriptor or directory that cannot be read or trusted, and a worker that cannot
+    /// be reached, say nothing about whether the session ended; each is a failure that retires
+    /// nothing.
     async fn open(&self, session_id: SessionId) -> std::result::Result<LocalClient, ClientError> {
         let Some(descriptor) = self.descriptor(session_id)? else {
             return Err(match self.ended(session_id, true).await {
@@ -543,13 +549,18 @@ impl Workers {
         }
     }
 
-    /// The descriptor `session_id` was published under, in whichever environment holds it, or
-    /// none when no environment this host can read holds one.
+    /// The descriptor `session_id` published in the environment it ran in, or none when that
+    /// environment's descriptor directory, read and trusted, holds none for it.
+    ///
+    /// Only that one environment is read, and by the session's own name, so an answer of none is
+    /// the directory's own word that nothing is published there, never a directory that could not
+    /// be read.
     ///
     /// # Errors
     ///
-    /// A file at the session's own descriptor path that cannot be read or trusted is a failure:
-    /// it is no evidence the session is gone, and it is not a worker to reach.
+    /// An environment this host cannot identify, and a descriptor directory or file that cannot be
+    /// read or trusted, are failures: they are no evidence the session is gone, and they are not a
+    /// worker to reach.
     fn descriptor(
         &self,
         session_id: SessionId,
@@ -557,29 +568,25 @@ impl Workers {
         let unreadable = |detail: String| {
             ClientError::Host(ProtocolError::new(ErrorCode::ResourceUnavailable, detail))
         };
-        let known = environments(&self.paths).map_err(|error| unreadable(error.to_string()))?;
-        for environment in known {
-            let Ok(entries) = kr_ipc::descriptor::read_all(&environment.paths) else {
-                continue;
-            };
-            let published = environment.paths.descriptor_file(session_id);
-            for entry in entries {
-                match entry.descriptor {
-                    Ok(descriptor) if descriptor.session_id == session_id => {
-                        return Ok(Some(descriptor));
-                    }
-                    Ok(_) => {}
-                    Err(why) if entry.path == published => {
-                        return Err(unreadable(format!(
-                            "session {session_id}'s descriptor at {} cannot be used: {why}",
-                            entry.path.display()
-                        )));
-                    }
-                    Err(_) => {}
-                }
-            }
-        }
-        Ok(None)
+        let environment = self.environment(session_id).map_err(|why| {
+            unreadable(format!(
+                "session {session_id}'s descriptor cannot be looked for: {why}"
+            ))
+        })?;
+        kr_ipc::descriptor::read(&environment.paths, session_id).map_err(|error| {
+            unreadable(format!(
+                "whether session {session_id} has published a descriptor cannot be read: {error}"
+            ))
+        })
+    }
+
+    /// The environment `session_id` ran in, as this host knows it.
+    fn environment(&self, session_id: SessionId) -> std::result::Result<KnownEnvironment, String> {
+        let Some(environment_id) = self.environments.get(&session_id) else {
+            return Err("which environment it ran in is not known".to_owned());
+        };
+        crate::resolve::select(&self.paths, Some(&environment_id.to_string()))
+            .map_err(|error| error.to_string())
     }
 
     /// Whether the daemon of the environment `session_id` ran in establishes that it ended.

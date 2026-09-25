@@ -554,12 +554,14 @@ known is retired by the next `kr question drafts` if it did arrive, so it is nev
 
 A kept answer is retired as gone only on the word of the daemon of the environment its session ran
 in: a closure its registry keeps, or, for a session with no descriptor, no record of the session at
-all. Nothing on disk, or missing from it, retires one. When the descriptor is missing and there is
-no daemon to ask, when the daemon reports the session still live, and when a descriptor is there
-and cannot be read or is readable by anyone but its owner, `kr question drafts` fails and retires
-nothing. A worker that cannot be reached retires its answer only on a closure its daemon keeps; the
-descriptor it left behind says nothing either way. Otherwise `kr question drafts` exits with 3,
-names the worker it could not reach and what its daemon said of the session, and retires nothing.
+all. Nothing on disk, or missing from it, retires one. The descriptor is looked for only in that
+environment, under the session's own name. When the descriptor is missing and there is no daemon to
+ask, when the daemon reports the session still live, when the descriptor or its directory cannot be
+read or is readable by anyone but its owner, and when the environment cannot be identified, `kr
+question drafts` fails and retires nothing. A worker that cannot be reached retires its answer only
+on a closure its daemon keeps; the descriptor it left behind says nothing either way. Otherwise `kr
+question drafts` exits with 3, names the worker it could not reach and what its daemon said of the
+session, and retires nothing.
 
 ## `kr skill`
 

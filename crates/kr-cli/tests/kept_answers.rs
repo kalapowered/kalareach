@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use kr_ipc::endpoint::Listener;
+use kr_ipc::paths::EnvironmentPaths;
 use kr_ipc::verify::WorkerIdentity;
 use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Response};
 use kr_protocol::error::{ErrorCode, ProtocolError};
@@ -27,8 +28,8 @@ use kr_protocol::frame::StreamKind;
 use kr_protocol::hello::PROTOCOL_VERSION;
 use kr_protocol::identity::WorkerProfile;
 use kr_protocol::ids::{
-    ActorId, ApplicationInstanceId, ConnectionId, QuestionId, QuestionRevision, SessionEpoch,
-    SessionId,
+    ActorId, ApplicationInstanceId, ConnectionId, EnvironmentId, QuestionId, QuestionRevision,
+    SessionEpoch, SessionId,
 };
 use kr_protocol::question::{
     AnswerRecord, Question, QuestionAnswerParams, QuestionChoice, QuestionKind, QuestionReadParams,
@@ -59,6 +60,15 @@ enum Behaviour {
     CannotSayWhatBecameOfAnswers,
 }
 
+/// Which environment the scripted session runs in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Place {
+    /// This installation's own.
+    Installation,
+    /// A second environment on the same host.
+    SecondEnvironment,
+}
+
 /// What a scripted control daemon says of the session when it is asked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Registry {
@@ -85,6 +95,8 @@ struct Host {
     state: Arc<Mutex<State>>,
     serving: tokio::task::JoinHandle<()>,
     question_id: QuestionId,
+    /// The environment the session runs in.
+    environment: EnvironmentPaths,
     /// Where the session's descriptor is published.
     descriptor: PathBuf,
 }
@@ -97,10 +109,23 @@ impl Drop for Host {
 
 impl Host {
     async fn start(behaviour: Behaviour) -> Self {
+        Self::start_in(behaviour, Place::Installation).await
+    }
+
+    async fn start_in(behaviour: Behaviour, place: Place) -> Self {
         let temp = kr_ipc::testing::TempHost::create();
         let home = temp.root().join("h");
         std::fs::create_dir(&home).expect("a home directory on the internal disk");
-        let environment = temp.environment();
+        let environment = match place {
+            Place::Installation => temp.environment(),
+            Place::SecondEnvironment => {
+                let environment = temp
+                    .paths()
+                    .environment(EnvironmentId::new(kr_ipc::new_uuid()));
+                environment.create().expect("a second environment");
+                environment
+            }
+        };
         let session_id = SessionId::new(kr_ipc::new_uuid());
         let display = DisplayNumber::new(1);
         let endpoint = environment.worker_endpoint(display).expect("an endpoint");
@@ -120,7 +145,7 @@ impl Host {
         let descriptor = WorkerDescriptor {
             session_id,
             session_epoch: SessionEpoch::V1,
-            environment_id: temp.environment_id(),
+            environment_id: environment.environment_id(),
             display_number: display,
             boot_identity: boot,
             process_start_identity: process,
@@ -147,6 +172,7 @@ impl Host {
         ));
         Self {
             descriptor: environment.descriptor_file(session_id),
+            environment,
             temp,
             home,
             state,
@@ -219,13 +245,22 @@ impl Host {
 }
 
 impl Host {
-    /// Starts a control daemon for this host's environment that answers `session.read` for the
+    /// Starts a control daemon for the session's environment that answers `session.read` for the
     /// scripted session as `registry` says, until the returned task is ended.
     fn daemon(&self, registry: Registry) -> tokio::task::JoinHandle<()> {
-        let environment = self.temp.environment();
+        self.daemon_in(&self.environment, registry)
+    }
+
+    /// Starts a control daemon for `environment` that answers `session.read` for the scripted
+    /// session as `registry` says, until the returned task is ended.
+    fn daemon_in(
+        &self,
+        environment: &EnvironmentPaths,
+        registry: Registry,
+    ) -> tokio::task::JoinHandle<()> {
         let endpoint = environment.controller_endpoint().expect("an endpoint");
         let listener = Listener::bind(&endpoint).expect("binds the control endpoint");
-        let environment_id = self.temp.environment_id();
+        let environment_id = environment.environment_id();
         let session_id = self.state().question.session_id;
         tokio::spawn(async move {
             while let Ok((connection, peer)) = listener.accept().await {
@@ -893,6 +928,102 @@ async fn an_unreachable_worker_retires_a_kept_answer_only_on_a_recorded_closure(
             daemon.abort();
         }
     }
+}
+
+/// KR-REQ-11.63: a descriptor directory that cannot be trusted says nothing about whether a
+/// session published a descriptor, so while it cannot be read nothing is retired, even by a daemon
+/// with no record of the session. The control: the same directory put right, with no descriptor in
+/// it, proves the descriptor absent, and that daemon's word retires the answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_descriptor_directory_that_cannot_be_trusted_retires_nothing() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let host = kept_answer().await;
+    let daemon = host.daemon(Registry::NeverHeld);
+    let directory = host.environment.descriptors_dir();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).expect("widened");
+    for published in [true, false] {
+        if !published {
+            std::fs::remove_file(&host.descriptor).expect("the descriptor goes");
+        }
+        let (status, document) = host.json(&["question", "drafts"]);
+        assert_ne!(status, Some(0), "published {published}: {document}");
+        let message = document["message"].as_str().expect("a message");
+        assert!(
+            message.contains("has published a descriptor cannot be read"),
+            "{message}"
+        );
+        assert!(
+            host.kept().is_file(),
+            "published {published}: nothing is retired"
+        );
+    }
+
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).expect("narrowed");
+    let (status, document) = host.json(&["question", "drafts"]);
+    assert_eq!(status, Some(0), "{document}");
+    assert_eq!(document["drafts"][0]["state"], "retired", "{document}");
+    assert_eq!(document["drafts"][0]["reason_code"], "UNKNOWN_SESSION");
+    assert!(!host.kept().exists(), "a retired answer is not kept");
+    assert_eq!(host.answers_received(), 0, "and it was never sent");
+    daemon.abort();
+}
+
+/// KR-REQ-11.63: a kept answer's session is looked for, and asked after, only in the environment
+/// it ran in. A session in a second environment is found and offered there; while that environment
+/// cannot be identified nothing is retired; with its descriptor gone, this installation's own
+/// daemon recording a closure retires nothing, and the session's own environment's daemon does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kept_answer_is_asked_after_only_in_its_own_environment() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let host = Host::start_in(Behaviour::EndsAfterTheRead, Place::SecondEnvironment).await;
+    assert_ne!(
+        host.environment.environment_id(),
+        host.temp.environment_id(),
+        "the session is not in this installation's own environment"
+    );
+    let question = host.question();
+    let (status, document) = host.json(&["question", "answer", &question, "--choice", "left"]);
+    assert_eq!(status, Some(3), "{document}");
+    host.behave(Behaviour::Serves);
+    let (status, document) = host.json(&["question", "drafts"]);
+    assert_eq!(status, Some(0), "{document}");
+    assert_eq!(document["drafts"][0]["state"], "offered", "{document}");
+
+    // Its environment's identity cannot be read.
+    let marker = host
+        .environment
+        .state_dir()
+        .join(kr_ipc::paths::ENVIRONMENT_MARKER);
+    std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o644)).expect("widened");
+    let (status, document) = host.json(&["question", "drafts"]);
+    assert_ne!(status, Some(0), "{document}");
+    let message = document["message"].as_str().expect("a message");
+    assert!(message.contains("cannot be looked for"), "{message}");
+    assert!(host.kept().is_file(), "nothing is retired");
+    std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).expect("narrowed");
+
+    // Its descriptor gone, another environment's daemon is not asked.
+    std::fs::remove_file(&host.descriptor).expect("the descriptor goes");
+    let installation = host.daemon_in(&host.temp.environment(), Registry::Closed);
+    let (status, document) = host.json(&["question", "drafts"]);
+    assert_ne!(status, Some(0), "{document}");
+    assert!(
+        host.kept().is_file(),
+        "another environment's daemon retires nothing"
+    );
+    installation.abort();
+
+    // Its own environment's daemon is.
+    let own = host.daemon(Registry::Closed);
+    let (status, document) = host.json(&["question", "drafts"]);
+    assert_eq!(status, Some(0), "{document}");
+    assert_eq!(document["drafts"][0]["state"], "retired", "{document}");
+    assert_eq!(document["drafts"][0]["reason_code"], "UNKNOWN_SESSION");
+    assert!(!host.kept().exists(), "a retired answer is not kept");
+    assert_eq!(host.answers_received(), 0, "and it was never sent");
+    own.abort();
 }
 
 /// KR-REQ-11.63: a worker that cannot say what became of an answer leaves its fate unknown, so the
