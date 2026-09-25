@@ -33,8 +33,7 @@ use serde_json::{Map, Value, json};
 
 use crate::catalogue::files::{
     PRIVATE, READABLE, create_directory_durably, digest_of, display, guard_access_controls, hex,
-    home_directory, missing_ancestors, read_digest, storage, supported_platform, sync_directory,
-    write_atomically,
+    home_directory, missing_ancestors, read_digest, storage, sync_directory, write_atomically,
 };
 use crate::error::{ControllerError, Result};
 
@@ -60,9 +59,6 @@ pub const ENTRY_ARGS: &[&str] = &["agent-tools", "--stdio"];
 /// writes the deadline into the agent's configuration, so it writes the same number into the
 /// environment the agent launches the server with.
 pub const DEADLINE_VARIABLE: &str = "KR_TOOL_DEADLINE_MS";
-
-/// What a person does where this host will not change an agent's installation itself.
-const SERVER_BY_HAND: &str = "add the server with the agent's own command instead";
 
 /// What a person does where this host will not rewrite an agent's configuration document.
 const CONFIGURATION_BY_HAND: &str = "add or remove the server with the agent's own command instead";
@@ -794,9 +790,9 @@ impl Installer {
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::PermissionDenied`] on a platform this host cannot change an
-    /// installation on, or where a document it would rewrite is protected by an access-control
-    /// list, and [`ControllerError::InvalidArgument`] when the scope needs a project directory
+    /// Returns [`ControllerError::PermissionDenied`] where a document it would rewrite has access
+    /// controls a replacement could not carry, [`ControllerError::Storage`] where they cannot be
+    /// read, and [`ControllerError::InvalidArgument`] when the scope needs a project directory
     /// that was not given, or the record cannot be read.
     pub fn check_removal(&self, params: &AgentToolsParams) -> Result<()> {
         self.removable(params).map(|_| ())
@@ -804,7 +800,6 @@ impl Installer {
 
     /// Reads what a removal would work from, refusing everything it cannot do.
     fn removable(&self, params: &AgentToolsParams) -> Result<Option<InstallationRecord>> {
-        supported_platform(&format!("install or remove {SKILL_NAME}"), SERVER_BY_HAND)?;
         // A removal of something never installed still has to know where it would have been, or it
         // is not the removal of anything in particular.
         self.layout(params)?;
@@ -834,7 +829,6 @@ impl Installer {
     /// there and this host did not write it, and [`ControllerError::InvalidArgument`] when the
     /// scope needs a project directory that was not given.
     pub fn check(&self, params: &AgentToolsParams) -> Result<()> {
-        supported_platform(&format!("install or remove {SKILL_NAME}"), SERVER_BY_HAND)?;
         let layout = self.layout(params)?;
         let root = layout.skills.clone();
         self.check_before_writing(params, &layout, &root)
@@ -2904,6 +2898,180 @@ mod tests {
             "the tree the restricted document was in is removed: {}",
             root.display()
         );
+    }
+
+    /// Runs one of this platform's own tools on a file this test made, and fails the test when it
+    /// fails.
+    #[cfg(windows)]
+    fn run(program: &str, arguments: &[&std::ffi::OsStr]) {
+        let output = std::process::Command::new(program)
+            .args(arguments)
+            .output()
+            .unwrap_or_else(|error| panic!("{program} starts: {error}"));
+        assert!(
+            output.status.success(),
+            "{program} failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Who can reach a file, as the installer reads it.
+    #[cfg(windows)]
+    fn access_of(path: &Path) -> kr_ipc::paths::FileAccess {
+        kr_ipc::paths::FileAccess::of(path)
+            .unwrap_or_else(|refusal| panic!("{} is read: {refusal:?}", path.display()))
+    }
+
+    /// KR-REQ-11.50: on Windows a configuration with an entry set on it is not replaced: an
+    /// installation and a removal both refuse before anything is written, and the document keeps
+    /// its bytes and who can read it.
+    #[cfg(windows)]
+    #[test]
+    fn a_configuration_with_an_entry_set_on_it_is_refused_before_anything_is_written() {
+        let tree = Tree::create();
+        let installer = tree.installer();
+        let params = params(AgentTarget::Codex, InstallScope::User);
+        installer.install(&params).expect("installs");
+        let document = tree.home().join(".codex/config.toml");
+        run(
+            "icacls.exe",
+            &[
+                document.as_os_str(),
+                "/grant".as_ref(),
+                "*S-1-1-0:(R)".as_ref(),
+            ],
+        );
+        let bytes = std::fs::read(&document).expect("the document");
+        let access = access_of(&document);
+        let before = files_under(&tree.root);
+
+        let refused = installer
+            .install(&params)
+            .expect_err("refuses to replace it");
+        assert!(
+            matches!(refused, ControllerError::PermissionDenied { ref detail }
+                if detail.contains("access-control list")),
+            "{refused:?}"
+        );
+        let refused = installer
+            .remove(&params)
+            .expect_err("refuses to rewrite it");
+        assert!(
+            matches!(refused, ControllerError::PermissionDenied { ref detail }
+                if detail.contains("access-control list")),
+            "{refused:?}"
+        );
+        assert_eq!(
+            files_under(&tree.root),
+            before,
+            "nothing was written or taken"
+        );
+        assert_eq!(std::fs::read(&document).expect("the document"), bytes);
+        assert_eq!(access_of(&document), access);
+    }
+
+    /// KR-REQ-11.50: on Windows a configuration its directory made is replaced by one that reads
+    /// back the same owner and lists, by an installation and again by a removal.
+    #[cfg(windows)]
+    #[test]
+    fn a_configuration_its_directory_made_is_replaced_with_the_same_access() {
+        let tree = Tree::create();
+        let document = tree.home().join(".claude.json");
+        std::fs::write(&document, r#"{"theme":"dark"}"#).expect("writes the configuration");
+        let before = access_of(&document);
+        let installer = tree.installer();
+        let params = params(AgentTarget::ClaudeCode, InstallScope::User);
+
+        installer.install(&params).expect("installs");
+        let written = std::fs::read_to_string(&document).expect("the document");
+        assert!(written.contains(SERVER_NAME), "{written}");
+        assert_eq!(
+            access_of(&document),
+            before,
+            "the installation kept who can read it"
+        );
+
+        installer.remove(&params).expect("removes");
+        let written = std::fs::read_to_string(&document).expect("the document");
+        assert!(!written.contains(SERVER_NAME), "{written}");
+        assert_eq!(access_of(&document), before, "and so did the removal");
+    }
+
+    /// On Windows a configuration moved in from a directory that gives its files more than this
+    /// one does records nothing set on it, so it passes the check before the change; the write
+    /// compares the copy it made with it, refuses, and leaves the document's bytes and access as
+    /// they were. The installation that stopped there is reported as unfinished.
+    #[cfg(windows)]
+    #[test]
+    fn a_configuration_moved_in_from_elsewhere_is_refused_where_it_would_be_replaced() {
+        let tree = Tree::create();
+        let elsewhere = tree.root.join("elsewhere");
+        std::fs::create_dir(&elsewhere).expect("another directory");
+        run(
+            "icacls.exe",
+            &[
+                elsewhere.as_os_str(),
+                "/grant".as_ref(),
+                "*S-1-1-0:(OI)(R)".as_ref(),
+            ],
+        );
+        let made = elsewhere.join("settings.json");
+        std::fs::write(&made, r#"{"theme":"dark"}"#).expect("writes the configuration");
+        let document = tree.home().join(".claude.json");
+        std::fs::rename(&made, &document).expect("moves it in, with what it was given there");
+        let bytes = std::fs::read(&document).expect("the document");
+        let access = access_of(&document);
+        let installer = tree.installer();
+        let params = params(AgentTarget::ClaudeCode, InstallScope::User);
+
+        installer
+            .check(&params)
+            .expect("nothing it records is set on it");
+        let refused = installer
+            .install(&params)
+            .expect_err("refused where the copy would replace it");
+        assert!(
+            matches!(refused, ControllerError::PermissionDenied { ref detail }
+                if detail.contains("another owner or access-control list")),
+            "{refused:?}"
+        );
+        let refused = write_atomically(&document, b"anything", PRIVATE).expect_err("refuses");
+        assert!(
+            matches!(refused, ControllerError::PermissionDenied { .. }),
+            "{refused:?}"
+        );
+        assert_eq!(std::fs::read(&document).expect("the document"), bytes);
+        assert_eq!(access_of(&document), access);
+        assert!(
+            !installer.status(&params).expect("reads").installed,
+            "the installation did not finish"
+        );
+    }
+
+    /// On Windows an encrypted configuration is refused before anything is written: who can read
+    /// it depends on keys, which a copy written beside it would not carry.
+    #[cfg(windows)]
+    #[test]
+    fn an_encrypted_configuration_is_refused_before_anything_is_written() {
+        let tree = Tree::create();
+        let document = tree.home().join(".claude.json");
+        std::fs::write(&document, "{}").expect("writes the configuration");
+        run(
+            "cipher.exe",
+            &["/e".as_ref(), "/a".as_ref(), document.as_os_str()],
+        );
+        let before = files_under(&tree.root);
+        let refused = tree
+            .installer()
+            .install(&params(AgentTarget::ClaudeCode, InstallScope::User))
+            .expect_err("refuses");
+        assert!(
+            matches!(refused, ControllerError::PermissionDenied { ref detail }
+                if detail.contains("encrypted") && detail.ends_with(CONFIGURATION_BY_HAND)),
+            "{refused:?}"
+        );
+        assert_eq!(files_under(&tree.root), before, "nothing was written");
     }
 
     /// The access-control list a test put on a document, taken off again when this is dropped.
