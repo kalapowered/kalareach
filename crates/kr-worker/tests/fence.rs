@@ -2019,8 +2019,14 @@ async fn asks_the_real_worker_before_each_command(
             }
         })
         .await
-        .expect("the held command started");
-        let token = token.expect("the command was started with its line's capability");
+        .unwrap_or_else(|_| panic!("the held command started: {}", probes.trace()));
+        let token = token.unwrap_or_else(|| {
+            panic!(
+                "the {:?} package started the command with its line's capability ({bypass}): {}",
+                package.kind(),
+                probes.trace()
+            )
+        });
         assert_eq!(
             shell
                 .runtime
