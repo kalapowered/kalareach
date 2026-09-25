@@ -192,7 +192,7 @@ test.describe('reading once it is listening', () => {
   const shotFor = (name: string): string => shot(`${name}-${test.info().project.name}`)
 
   // KR-REQ-13.11: the surface is read at one prompt generation and answers after the prompt has
-  // moved on, so the buttons it draws are disabled from the first frame they are shown in.
+  // moved on, so the buttons it draws are disabled.
   test('draws the launch buttons disabled when the prompt moved before the surface answered', async ({
     page
   }) => {
