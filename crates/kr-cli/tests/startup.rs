@@ -231,22 +231,16 @@ fn supervise(daemon: &Path) {
         .parent()
         .expect("the state tree is inside the test's own tree")
         .to_path_buf();
-    // Each process with its start identity, so the test can tell it from whatever holds its
-    // number later. One write of the whole line: supervisors append to the same record at once,
-    // and a line written in two pieces could be split by another's.
+    // One write of the whole line: supervisors append to the same record at once, and a line
+    // written in two pieces could be split by another's.
     let record = |name: &str, pid: u32| {
-        let identity =
-            kr_ipc::identity::process_start_identity(pid).expect("the process's start identity");
-        let line = format!(
-            "{pid}\t{}\n",
-            serde_json::to_string(&identity).expect("encodes the identity")
-        );
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(tree.join(name))
             .expect("opens a record");
-        file.write_all(line.as_bytes()).expect("records a process");
+        file.write_all(record_line(pid).as_bytes())
+            .expect("records a process");
     };
     // Read without waiting, so a closed lifeline is seen as its end rather than waited on.
     let lifeline = std::fs::OpenOptions::new()
@@ -297,6 +291,20 @@ fn supervise(daemon: &Path) {
     drop(daemon);
 }
 
+/// The line a record names one process with: its number, and its start identity, so the test can
+/// tell it from whatever holds the number later.
+///
+/// A daemon can end before it is recorded, as one that cannot take the environment does, and on
+/// macOS the kernel stops describing a process once it has ended, collected or not. Such a process
+/// is named as one that has ended rather than failing the record.
+fn record_line(pid: u32) -> String {
+    let identity = kr_ipc::identity::started_process_identity(pid).expect("the start identity");
+    format!(
+        "{pid}\t{}\n",
+        serde_json::to_string(&identity).expect("encodes the identity")
+    )
+}
+
 /// A daemon a supervisor started.
 struct Supervised(Child);
 
@@ -335,29 +343,36 @@ struct Standalone {
 
 impl Drop for Standalone {
     fn drop(&mut self) {
-        self.end_what_was_started();
+        for why in self.end_what_was_started() {
+            self.tree.hold(why);
+        }
     }
 }
 
 impl Standalone {
-    /// Ends every supervisor this test's commands started, and with it every daemon, and waits for
-    /// them; what cannot be established as ended keeps the tree.
+    /// Ends every supervisor this test's commands started, and with it every daemon, waits for them,
+    /// and returns whatever could not be established as ended, which keeps the tree.
     ///
     /// The lifeline closes first, which is what closes admission: a supervisor that has not started
     /// its daemon by then starts none, and one that has ends it. Every supervisor records itself,
     /// with its start identity, before it can start anything, and ends only after its daemon has
     /// been ended and collected, so waiting for the recorded supervisors waits for every daemon too;
-    /// the daemons' own records are waited for as well. A supervisor that has not recorded itself
-    /// when the records are read finds the lifeline closed and starts nothing. Each process is
-    /// named by its start identity, so a number given to something else is not mistaken for it.
-    fn end_what_was_started(&mut self) {
+    /// the daemons' own records are waited for as well. Each process is named by its start
+    /// identity, so a number given to something else is not mistaken for it.
+    ///
+    /// Two things are not waited for. A supervisor that records itself after the records are read
+    /// finds the lifeline closed, starts nothing and ends by itself. A record that cannot be read,
+    /// such as one cut off part way by a full disk, is returned as what it is, and every record that
+    /// can be read is still waited for. Nothing here panics: this runs while a failing test unwinds,
+    /// and a second panic there would end the whole suite.
+    fn end_what_was_started(&mut self) -> Vec<String> {
         drop(self.lifeline.take());
+        let (mut identities, mut unresolved) = self.identities(STARTS);
+        let (launched, unreadable) = self.identities(LAUNCHED);
+        identities.extend(launched);
+        unresolved.extend(unreadable);
         let begun = Instant::now();
-        for identity in self
-            .identities(STARTS)
-            .into_iter()
-            .chain(self.identities(LAUNCHED))
-        {
+        for identity in identities {
             loop {
                 match kr_ipc::identity::process_state(&identity) {
                     ProcessState::Ended => break,
@@ -365,7 +380,7 @@ impl Standalone {
                         std::thread::sleep(Duration::from_millis(50));
                     }
                     ProcessState::Running => {
-                        self.tree.hold(format!(
+                        unresolved.push(format!(
                             "the process {} this test started did not end once its lifeline \
                              closed",
                             identity.pid.get()
@@ -373,7 +388,7 @@ impl Standalone {
                         break;
                     }
                     ProcessState::Unknown { detail } => {
-                        self.tree.hold(format!(
+                        unresolved.push(format!(
                             "whether the process {} this test started has ended cannot be \
                              established: {detail}",
                             identity.pid.get()
@@ -383,16 +398,35 @@ impl Standalone {
                 }
             }
         }
+        unresolved
     }
 
-    /// The start identities one record in this tree names, in the order they were recorded.
-    fn identities(&self, name: &str) -> Vec<kr_protocol::identity::ProcessStartIdentity> {
-        std::fs::read_to_string(self.tree.root().join(name))
+    /// The start identities one record in this tree names, in the order they were recorded, and a
+    /// sentence for each line that does not name one.
+    fn identities(
+        &self,
+        name: &str,
+    ) -> (
+        Vec<kr_protocol::identity::ProcessStartIdentity>,
+        Vec<String>,
+    ) {
+        let mut identities = Vec::new();
+        let mut unreadable = Vec::new();
+        for line in std::fs::read_to_string(self.tree.root().join(name))
             .unwrap_or_default()
             .lines()
-            .filter_map(|line| line.split_once('\t'))
-            .map(|(_, identity)| serde_json::from_str(identity).expect("a recorded identity"))
-            .collect()
+        {
+            match line
+                .split_once('\t')
+                .map(|(_, identity)| serde_json::from_str(identity))
+            {
+                Some(Ok(identity)) => identities.push(identity),
+                Some(Err(_)) | None => unreadable.push(format!(
+                    "the record {name} holds a line that names no process: {line:?}"
+                )),
+            }
+        }
+        (identities, unreadable)
     }
 
     fn create() -> Self {
@@ -1638,16 +1672,16 @@ fn a_supervisor_still_waiting_when_its_test_ends_starts_nothing() {
     host.ask_the_scripts(DELAY, "40");
     let running = start(host.new_session());
     let begun = Instant::now();
-    while host.identities(STARTS).is_empty() {
+    while host.identities(STARTS).0.is_empty() {
         assert!(
             begun.elapsed() < LIVENESS_DEADLINE,
             "the supervisor recorded itself"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    let supervisor = host.identities(STARTS).remove(0);
+    let supervisor = host.identities(STARTS).0.remove(0);
 
-    host.end_what_was_started();
+    assert_eq!(host.end_what_was_started(), Vec::<String>::new());
     assert_eq!(
         kr_ipc::identity::process_state(&supervisor),
         ProcessState::Ended,
@@ -1658,4 +1692,82 @@ fn a_supervisor_still_waiting_when_its_test_ends_starts_nothing() {
     let output = running.finish("kr new");
     let failure = document(&output, "kr new");
     assert_eq!(failure["code"], "ENVIRONMENT_UNAVAILABLE", "{failure}");
+}
+
+/// A record names a process that ended before it was recorded as one that has ended, rather than
+/// failing: on macOS the kernel stops describing a process once it has ended, collected or not,
+/// which is what a daemon that could not take the environment does.
+#[test]
+fn a_process_that_ended_before_it_was_recorded_is_recorded_as_ended() {
+    let mut child = spawning(|| Command::new("/usr/bin/true").spawn()).expect("starts a process");
+    let pid = child.id();
+    let begun = Instant::now();
+    // Ended, and not collected: this test has not waited for it yet.
+    while match kr_ipc::identity::query_process(pid) {
+        ProcessQuery::Gone => false,
+        ProcessQuery::Present(identity) => {
+            kr_ipc::identity::process_state(&identity) != ProcessState::Ended
+        }
+        ProcessQuery::CannotEstablish(error) => panic!("{error}"),
+    } {
+        assert!(begun.elapsed() < LIVENESS_DEADLINE, "the process ended");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let line = record_line(pid);
+    let (number, identity) = line
+        .trim_end()
+        .split_once('\t')
+        .expect("a number and an identity");
+    assert_eq!(number, pid.to_string());
+    let identity: kr_protocol::identity::ProcessStartIdentity =
+        serde_json::from_str(identity).expect("an identity");
+    assert_eq!(
+        kr_ipc::identity::process_state(&identity),
+        ProcessState::Ended,
+        "{line}"
+    );
+    let _ = child.wait();
+}
+
+/// A record cut off part way is reported, and every record that can be read is still waited for.
+#[test]
+fn a_partial_record_is_reported_and_the_others_are_still_waited_for() {
+    let mut host = Standalone::create();
+    let ended = serde_json::to_string(&kr_ipc::identity::ended_process_identity(4242))
+        .expect("encodes an identity");
+    let starts = host.tree.root().join(STARTS);
+    std::fs::write(&starts, format!("4242\t{ended}\n4243\t{{\"pid\":\"42\n"))
+        .expect("writes the records");
+
+    let unresolved = host.end_what_was_started();
+    assert_eq!(unresolved.len(), 1, "{unresolved:?}");
+    assert!(unresolved[0].contains("names no process"), "{unresolved:?}");
+    // Put right, so this test's own teardown finds nothing to keep the tree for.
+    std::fs::write(&starts, format!("4242\t{ended}\n")).expect("writes the records");
+}
+
+/// A test that fails with a partial record keeps its tree and does not end the suite: the teardown
+/// that runs while it unwinds reports the record rather than panicking a second time.
+#[test]
+fn a_failing_test_with_a_partial_record_keeps_its_tree_and_does_not_end_the_suite() {
+    let root = std::sync::Mutex::new(None);
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let host = Standalone::create();
+        *root.lock().expect("the root") = Some(host.tree.root().to_path_buf());
+        std::fs::write(host.tree.root().join(LAUNCHED), "4243\t{\"pid\":\"42\n")
+            .expect("writes a partial record");
+        panic!("a test that fails with a partial record");
+    }));
+    assert!(
+        failed.is_err(),
+        "the test failed, and this process is still here"
+    );
+    let root = root
+        .lock()
+        .expect("the root")
+        .take()
+        .expect("the tree was made");
+    assert!(root.is_dir(), "the tree was kept for somebody to look at");
+    // Nothing runs in it: the only record names no process. This test made it, so it removes it.
+    std::fs::remove_dir_all(&root).expect("removes the kept tree");
 }
