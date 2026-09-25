@@ -1,0 +1,47 @@
+//! KR-REQ-03.01: every test of this file.
+
+/// KR-REQ-03.02: a documentation comment above a test.
+#[test]
+fn documented() {}
+
+// KR-REQ-03.03: a plain comment directly above a test.
+#[test]
+fn commented() {}
+
+#[test]
+fn commented_inside() {
+    // KR-REQ-03.04, 03.05: a comment inside the body, its second row written short.
+    assert_eq!(1 + 1, 2);
+}
+
+// ------------------------------------------------------------------------------------------------
+// KR-REQ-03.06: a section.
+// ------------------------------------------------------------------------------------------------
+
+#[test]
+fn first_in_the_section() {}
+
+#[test]
+fn second_in_the_section() {}
+
+// ------------------------------------------------------------------------------------------------
+// A section that names nothing ends the one before it.
+// ------------------------------------------------------------------------------------------------
+
+#[test]
+fn kr_req_03_07_named_by_its_name() {}
+
+/// KR-REQ-03.08: a case several tests share.
+fn shared() -> u8 {
+    3
+}
+
+#[test]
+fn calls_the_shared_case() {
+    assert_eq!(shared(), 3);
+}
+
+#[test]
+fn reads_the_table() {
+    assert!(!forms::CASES.is_empty());
+}
