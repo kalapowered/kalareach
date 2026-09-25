@@ -13,7 +13,9 @@
 
 #![cfg(windows)]
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use kr_ipc::client::LocalClient;
@@ -21,6 +23,7 @@ use kr_protocol::hostinfo::configuration::ConfigurationDocument;
 use kr_protocol::ids::BuildId;
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::scalars::Nullable;
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 mod support;
 
@@ -150,17 +153,67 @@ impl Host {
         environment
     }
 
-    /// Runs `kr` on plain pipes, with `extra` set on top of the host environment.
-    fn kr(&self, arguments: &[&str], extra: &[(&str, &str)]) -> std::process::Output {
-        // The root of the system drive, which exists, is readable, and is not the build tree.
-        let cwd = std::env::var_os("SystemDrive").map_or_else(
+    /// The root of the system drive, which exists, is readable, and is not the build tree.
+    fn system_drive_root(&self) -> std::ffi::OsString {
+        std::env::var_os("SystemDrive").map_or_else(
             || std::ffi::OsString::from(r"C:\"),
             |drive| {
                 let mut root = drive;
                 root.push(r"\");
                 root
             },
-        );
+        )
+    }
+
+    /// Runs `kr` on a pseudo-console of its own, which is its controlling terminal, with `extra` set
+    /// on top of the host environment.
+    fn on_console(&self, arguments: &[&str], extra: &[(&str, &str)]) -> OnConsole {
+        let pty = native_pty_system()
+            .openpty(PtySize {
+                rows: 40,
+                cols: 200,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("opens a console");
+        let mut command = CommandBuilder::new(kr());
+        command.args(arguments);
+        command.env_clear();
+        for (name, value) in self.environment() {
+            command.env(name, value);
+        }
+        command.env("TERM", "xterm-256color");
+        for (name, value) in extra {
+            command.env(name, value);
+        }
+        command.cwd(self.system_drive_root());
+        let child = pty.slave.spawn_command(command).expect("starts kr");
+        drop(pty.slave);
+        let output = ConsoleOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+        let writer = pty.master.take_writer().expect("a writer");
+        OnConsole {
+            child,
+            output,
+            writer,
+            _master: pty.master,
+        }
+    }
+
+    /// Writes an unreadable file where a session descriptor would be, so a guard that reads the
+    /// sessions cannot establish whether this process is inside one.
+    fn unreadable_descriptor(&self) {
+        let directory = self.temp.environment().descriptors_dir();
+        std::fs::create_dir_all(&directory).expect("the descriptors directory");
+        std::fs::write(
+            directory.join("00000000-0000-4000-8000-000000000002.kr"),
+            b"not a descriptor",
+        )
+        .expect("an unreadable descriptor");
+    }
+
+    /// Runs `kr` on plain pipes, with `extra` set on top of the host environment.
+    fn kr(&self, arguments: &[&str], extra: &[(&str, &str)]) -> std::process::Output {
+        let cwd = self.system_drive_root();
         let mut command = std::process::Command::new(kr());
         command.args(arguments).env_clear().envs(self.environment());
         for (name, value) in extra {
@@ -193,5 +246,142 @@ async fn the_first_owner_is_not_confirmed_without_a_terminal() {
         String::from_utf8_lossy(&output.stderr).contains("needs a terminal"),
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `kr` running on a pseudo-console of its own.
+struct OnConsole {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    output: ConsoleOutput,
+    writer: Box<dyn Write + Send>,
+    _master: Box<dyn portable_pty::MasterPty + Send>,
+}
+
+impl OnConsole {
+    /// Types some bytes at the console.
+    fn type_in(&mut self, bytes: &[u8]) {
+        self.writer.write_all(bytes).expect("typed");
+        self.writer.flush().expect("flushed");
+    }
+
+    /// Waits for the command to end, and returns whether it succeeded and what it printed.
+    fn finish(mut self) -> (bool, String) {
+        let started = Instant::now();
+        let status = loop {
+            if let Some(status) = self.child.try_wait().expect("the command's state") {
+                break status;
+            }
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "kr did not finish; it printed: {}",
+                self.output.text()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        (status.success(), self.output.text())
+    }
+}
+
+/// Everything a console has printed so far, read on a thread of its own.
+struct ConsoleOutput {
+    seen: Arc<Mutex<Vec<u8>>>,
+}
+
+impl ConsoleOutput {
+    fn collect(mut reader: Box<dyn Read + Send>) -> Self {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let collected = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            let mut buffer = [0_u8; 4096];
+            while let Ok(read) = reader.read(&mut buffer) {
+                if read == 0 {
+                    break;
+                }
+                if let Ok(mut seen) = collected.lock() {
+                    seen.extend_from_slice(&buffer[..read]);
+                }
+            }
+        });
+        Self { seen }
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(
+            &self
+                .seen
+                .lock()
+                .expect("the console output is not poisoned"),
+        )
+        .into_owned()
+    }
+
+    /// Waits until the console shows `marker`, failing when it never does.
+    fn expect(&self, marker: &str, what: &str) {
+        let started = Instant::now();
+        while !self.text().contains(marker) {
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "{what}: waited {:?} for {marker:?}; the console shows: {}",
+                started.elapsed(),
+                self.text()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// KR-REQ-10.53: a host with no owner has its first owner's invitation confirmed at a console
+/// outside every session. `kr` asks the person to type `pair`, and on that it issues the invitation
+/// a new device confirms.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_first_owner_invitation_is_confirmed_at_a_console() {
+    let host = Host::start().await;
+    let mut console = host.on_console(&["pair", "invite", "--owner", "--direct"], &[]);
+    console
+        .output
+        .expect("Type pair to issue the invitation", "kr asks the person");
+    console.type_in(b"pair\r");
+    let (succeeded, printed) = console.finish();
+    assert!(succeeded, "kr pair invite: {printed}\n{}", host.log());
+    assert!(
+        printed.contains("kr pair confirm "),
+        "kr issues the invitation: {printed}"
+    );
+}
+
+/// KR-REQ-10.53: a console inside a KalaReach session is not where the first owner is confirmed.
+/// With `KR_SESSION` or `KR_ATTACHMENT` set, `kr` refuses on a real console and asks nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_first_owner_is_not_confirmed_inside_a_session() {
+    let host = Host::start().await;
+    for variable in ["KR_SESSION", "KR_ATTACHMENT"] {
+        let console = host.on_console(
+            &["pair", "invite", "--owner", "--direct"],
+            &[(variable, "00000000-0000-4000-8000-000000000001")],
+        );
+        let (succeeded, printed) = console.finish();
+        assert!(!succeeded, "{printed}");
+        assert!(printed.contains(&format!("{variable} is set")), "{printed}");
+        assert!(
+            !printed.contains("Type pair"),
+            "nothing was asked: {printed}"
+        );
+    }
+}
+
+/// KR-REQ-10.53: where it cannot be established whether this process is inside a session, because a
+/// session descriptor cannot be read, the first owner is not confirmed even at a console.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_first_owner_is_not_confirmed_where_membership_is_unknown() {
+    let host = Host::start().await;
+    host.unreadable_descriptor();
+    let console = host.on_console(&["pair", "invite", "--owner", "--direct"], &[]);
+    let (succeeded, printed) = console.finish();
+    assert!(!succeeded, "{printed}");
+    assert!(printed.contains("cannot be established"), "{printed}");
+    assert!(
+        !printed.contains("Type pair"),
+        "nothing was asked: {printed}"
     );
 }
