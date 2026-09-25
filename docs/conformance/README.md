@@ -115,12 +115,43 @@ row that does not exist.
 | A test function whose name spells an identifier in snake case: `kr_req_11_07_...`, `kr_acc_004_...` | That test. A name that spells no accepted form is only a name |
 | A module comment (`//!`) of test code | Every test in that module and the modules inside it |
 | In test code, a comment block with a blank line after it | Every test from there to the next such block, or the end of the module |
-| In test code, a comment on a function | Every test of the same target whose body calls that function, where the report proves from the target's own source that the compiler resolves the call to it: through module definitions, `crate`, `self` and `super`, a `use` that keeps the item's own name, and globs, each judged by who may name what it brings in. A renaming `use`, a name or glob the calling body brings in for itself, a first name the calling body may bind for itself (a local, a nested item, or a module it declares, whose calls are its own), a `cfg` in the body, a macro or attribute in or on the test, on a module around it or on the function whose expansion may rewrite them (any but the standard library's, the `rustfmt` and `clippy` tools', serde's derives and their helpers, and `tokio::test`, and those only while the target neither defines, anywhere in its files, nor imports their names, nor brings in names through `#[macro_use]`, `extern crate`, a macro among its items, an item under any other attribute or derive, or a glob from outside the crate, while no dependency takes a tool's name, and while `serde` and `tokio` are the crates.io crates the package depends on under those names and the lockfile resolves), a function under a `cfg` of its own, whose module takes its name twice or is declared twice (one for each platform), a name a module on the way takes twice or for something other than a function, a trait written like a call in a type (`dyn name()`), a module whose macros make items, a glob it cannot follow and a visibility it cannot work out all stop it, and a call it cannot prove keys nothing, so the function's identifiers stay references rather than become a key the compiler would not make |
+| In test code, a comment on a function | Every test of the same target whose body calls that function, where the report proves from the target's own source that the compiler resolves the call to it (below) |
 | A `covers` field of a `const` or `static` case table | Every test of the same package whose body names the table |
 
 Test code is a test or bench target, or a module compiled under `cfg(test)`. A comment on product
 code (a module's documentation, a function, a constant) is a reference: it is listed with the
 identifier and it is never a test.
+
+A call keys a function only where the report proves, from the target's own source, that the
+compiler resolves it to that function in every build. It follows module definitions, `crate`,
+`self` and `super`, a `use` that keeps the item's own name, and globs, each judged by who may name
+what it brings in. Where it cannot prove the call, the call keys nothing, and the function's
+identifiers stay references that the result lists with the reason. That happens when:
+
+- the calling body may bind the call's first name itself: the name shows in the body other than in
+  calls, methods and paths (a local of any kind, a closure's parameter, a nested item, a module the
+  body declares), or a `use` or glob in the body brings it in;
+- a macro or attribute may rewrite or re-scope the call. That is any macro in the test's body, any
+  attribute on the test or in its body, and any attribute on a module around it, except the
+  standard library's macros by their bare names, the built-in attributes, `#[test]`, the standard
+  library's and serde's derives with serde's helper attributes, the `rustfmt` and `clippy` tool
+  attributes and `tokio::test`. A `cfg` in the body counts as well, since it may compile the call
+  out;
+- one of those trusted names may mean something else in the target: the target defines it (a
+  `macro_rules!` anywhere in its files) or imports it; it brings in names its source does not list,
+  through `#[macro_use]`, `extern crate`, a macro among a module's items, an item under any other
+  attribute or derive, or a glob from outside the crate; a dependency takes a tool's name; or
+  `serde` or `tokio` is not the crates.io crate the package depends on under that name, as the
+  lockfile resolves it. `std`, `core` and `alloc` count as the standard library only where nothing
+  in the target or its dependencies takes those names;
+- the function is under a `cfg` of its own or of a module around it, or its module takes its name
+  twice;
+- a module on the way takes a name the path follows twice or under a `cfg`, or takes the called
+  name for something other than a function or a named `use`;
+- the call goes through a renaming `use`, a glob the report cannot follow or a visibility it cannot
+  work out, starts at the root (`::name`), comes after a qualifier (`<T>::name`), or is a keyword;
+- the name follows `dyn`, `impl` or `?`, or is a prelude trait written like a call
+  (`dyn Send + Fn()`): in a type, that is a trait, not a call.
 
 The report reads each target's crate root as Cargo describes it and follows every `mod`
 declaration, `#[path]` included, so a test is named exactly as the test harness names it.

@@ -284,6 +284,8 @@ fn rust_package(map: &mut Map, sources: &mut Sources, root: &Path, package: &Pac
             imports: BTreeMap::new(),
             expanded: BTreeSet::new(),
             names: BTreeMap::new(),
+            conditional: BTreeSet::new(),
+            conditional_globs: BTreeSet::new(),
         };
         let first_use = uses.len();
         let test_target = matches!(target.id.kind, TargetKind::Test | TargetKind::Bench);
@@ -310,6 +312,9 @@ fn rust_package(map: &mut Map, sources: &mut Sources, root: &Path, package: &Pac
                     .names
                     .entry((parent.to_vec(), name.clone()))
                     .or_default() += 1;
+                if module.conditional {
+                    scope.conditional.insert((parent.to_vec(), name.clone()));
+                }
             }
             for entry in &module.entries {
                 let mut take = |name: &str| {
@@ -320,6 +325,7 @@ fn rust_package(map: &mut Map, sources: &mut Sources, root: &Path, package: &Pac
                 };
                 match entry {
                     Entry::Item(item) => {
+                        let absent = item.conditional || module.conditional;
                         if matches!(
                             item.kind.as_str(),
                             "fn" | "const"
@@ -332,10 +338,26 @@ fn rust_package(map: &mut Map, sources: &mut Sources, root: &Path, package: &Pac
                         ) && let Some(name) = &item.name
                         {
                             take(name);
+                            if absent {
+                                scope
+                                    .conditional
+                                    .insert((module.path.clone(), name.clone()));
+                            }
                         }
                         for import in &item.imports {
-                            if let Import::Name { name, .. } = import {
-                                take(name);
+                            match import {
+                                Import::Name { name, .. } => {
+                                    take(name);
+                                    if absent {
+                                        scope
+                                            .conditional
+                                            .insert((module.path.clone(), name.clone()));
+                                    }
+                                }
+                                Import::Glob { .. } if absent => {
+                                    scope.conditional_globs.insert(module.path.clone());
+                                }
+                                Import::Glob { .. } => {}
                             }
                         }
                         scope
@@ -410,7 +432,7 @@ fn rust_package(map: &mut Map, sources: &mut Sources, root: &Path, package: &Pac
         let helpers = kept;
         // A test's calls prove nothing where the target may give a macro or attribute its reading
         // took on trust another meaning.
-        let (claimed, unlisted) = claimed_names(&modules, &scope);
+        let (claimed, unlisted) = claimed_names(&modules, &scope, package);
         for helper in helpers {
             let callers: Vec<String> = uses[first_use..]
                 .iter()
@@ -507,6 +529,11 @@ struct Scope {
     /// or a named `use`. A name taken twice (in two namespaces, or under two `cfg`s) cannot be
     /// said to mean the function.
     names: BTreeMap<(Vec<String>, String), usize>,
+    /// The names each module takes under a `cfg` that may leave them out of a build, an item, a
+    /// named `use` or a child module; where one is absent, a glob's name may stand in its place.
+    conditional: BTreeSet<(Vec<String>, String)>,
+    /// The modules with a glob under such a `cfg`.
+    conditional_globs: BTreeSet<Vec<String>>,
 }
 
 /// What a name comes to, as far as the target's own source proves it.
@@ -582,6 +609,9 @@ impl Scope {
                     at.pop()?;
                 }
                 name => {
+                    if !self.sole(&at, name) {
+                        return None;
+                    }
                     at.push(name.to_owned());
                     if !self.modules.contains(&at) {
                         return None;
@@ -592,9 +622,19 @@ impl Scope {
         Some(at)
     }
 
+    /// Whether `module` takes `name` once, in every build: a child module or `use` of that name
+    /// beside another, or under a `cfg`, may not be the one a path means.
+    fn sole(&self, module: &[String], name: &str) -> bool {
+        let key = (module.to_vec(), name.to_owned());
+        self.names.get(&key).is_none_or(|count| *count <= 1) && !self.conditional.contains(&key)
+    }
+
     /// The module one name refers to in `from`: a child module, or the module a `use` there brings
     /// in by its own name. A name a glob brings in is not followed.
     fn named_module(&self, from: &[String], name: &str, depth: usize) -> Option<Vec<String>> {
+        if !self.sole(from, name) {
+            return None;
+        }
         let child: Vec<String> = from.iter().cloned().chain([name.to_owned()]).collect();
         if self.modules.contains(&child) {
             return Some(child);
@@ -636,7 +676,11 @@ impl Scope {
             .get(&(module.to_vec(), name.to_owned()))
             .copied()
             .unwrap_or(0);
-        if taken > 1 {
+        if taken > 1
+            || self
+                .conditional
+                .contains(&(module.to_vec(), name.to_owned()))
+        {
             return Found::Unproved;
         }
         let reachable = |visibility: Visibility| match (
@@ -681,7 +725,7 @@ impl Scope {
                 }
             };
         }
-        if taken == 1 || self.expanded.contains(module) {
+        if taken == 1 || self.expanded.contains(module) || self.conditional_globs.contains(module) {
             return Found::Unproved;
         }
         let mut found = BTreeSet::new();
@@ -725,8 +769,30 @@ impl Scope {
 /// crate and the standard library. Macros are looked up by name through a crate's own definitions
 /// and imports before the standard library's prelude, so while none of these can give a trusted
 /// name another meaning, each such name is the one the reading took it for.
-fn claimed_names(modules: &[Module], scope: &Scope) -> (BTreeSet<String>, bool) {
-    let standard = |root: &str| matches!(root, "std" | "core" | "alloc");
+fn claimed_names(modules: &[Module], scope: &Scope, package: &Package) -> (BTreeSet<String>, bool) {
+    // `std`, `core` and `alloc` are the standard library's only where no module, `use` or
+    // dependency of the target takes their names.
+    let shadowed = |root: &str| {
+        package.dependency_names.contains(root)
+            || modules.iter().any(|module| {
+                module.path.last().is_some_and(|name| name == root)
+                    || module.entries.iter().any(|entry| {
+                        let imports = match entry {
+                            Entry::Item(item) => item.imports.as_slice(),
+                            Entry::Test(test) => test.imports.as_slice(),
+                            Entry::Section(_) => &[],
+                        };
+                        imports.iter().any(
+                            |import| matches!(import, Import::Name { name, .. } if name == root),
+                        )
+                    })
+            })
+    };
+    let roots: BTreeSet<&str> = ["std", "core", "alloc"]
+        .into_iter()
+        .filter(|root| !shadowed(root))
+        .collect();
+    let standard = |root: &str| roots.contains(root);
     let mut claimed = BTreeSet::new();
     let mut unlisted = false;
     for module in modules {
@@ -1005,7 +1071,7 @@ fn rust_module(
                             file: module.file.clone(),
                             module: module.path.clone(),
                             mentions: found,
-                            conditional: item.conditional,
+                            conditional: item.conditional || module.conditional,
                         });
                     }
                 } else {
