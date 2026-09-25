@@ -164,10 +164,10 @@ Each keyed test has one outcome on this platform:
 | `known_difference` | It ran and held what the profile defines, and it recorded that the application it is about reads the same thing differently |
 
 A test that returns early, because what it needs is absent, passes as far as the harness is
-concerned. The suites say so on a line that starts `skipped:`, `skipping:` or `not exercised`, and
-the report finds that line in what the test wrote and reports the test as not run, with the line as
-its reason. A line of that kind the report cannot give to one test makes its binary's output
-unreadable, which fails the step.
+concerned. The suites say so on a line that starts `skipped:`, `skipping:` or `not exercised`, or
+that names the suite and then says `: skipped, because`, and the report finds that line in what the
+test wrote and reports the test as not run, with the line as its reason. A line of that kind the
+report cannot give to one test makes its binary's output unreadable, which fails the step.
 
 A test that several steps list takes the strongest outcome among them: failed, then passed, then
 ignored, then not run, then not built. A test keyed to one identifier twice, by its own comment and
@@ -294,7 +294,7 @@ event it could not decode, a refused subscription or a detach, fails the case.
 script fetches each release once into a cache outside the repository (`KR_CONFORMANCE_APPLICATIONS`,
 or the platform's cache directory), checks its digest, and writes the cache's `index.json`. The cache
 is named by an absolute path without `..`, resolved through its links before anything is made in it,
-and refused inside the repository; a program's place in it that is a link is never used or replaced. A
+and refused inside the repository; nothing in it is read, written or replaced through a link. A
 program whose project publishes source only is built there from that release's source, with the
 flags the lock records, against the system's own curses library; tmux is built against a pinned
 libevent built the same way. A release that cannot be fetched or built is recorded as not installed,
