@@ -232,9 +232,7 @@ impl Session {
 
 /// KR-REQ-07.34, KR-REQ-07.35, KR-REQ-07.85, and `handshake-accept`.
 pub fn the_handshake_declares_the_packaged_reader(kind: ShellKind) {
-    let Some(package) = Package::found(kind) else {
-        return;
-    };
+    let package = Package::built(kind);
     let mut session = Session::start(&package);
     let hello = session.hello.clone();
 
@@ -351,9 +349,7 @@ pub fn the_handshake_declares_the_packaged_reader(kind: ShellKind) {
 
 /// `handshake-reject`: a child shell has nothing to activate from.
 pub fn a_child_shell_has_nothing_to_activate_from(kind: ShellKind) {
-    let Some(package) = Package::found(kind) else {
-        return;
-    };
+    let package = Package::built(kind);
     let mut session = Session::start(&package);
     session.first_prompt();
     session.forget_events();
@@ -374,9 +370,7 @@ pub fn a_child_shell_has_nothing_to_activate_from(kind: ShellKind) {
 
 /// KR-REQ-07.34, KR-REQ-07.35: the reader's own boundaries, and the fence its state proves.
 pub fn the_reader_reports_its_boundaries_and_proves_its_own_state(kind: ShellKind) {
-    let Some(package) = Package::found(kind) else {
-        return;
-    };
+    let package = Package::built(kind);
     let mut session = Session::start(&package);
     let first = session.first_prompt();
     assert_eq!(
@@ -504,9 +498,7 @@ pub fn the_reader_reports_its_boundaries_and_proves_its_own_state(kind: ShellKin
 
 /// KR-REQ-07.71, KR-REQ-07.72, and `enter-fence-acknowledge-detach`.
 pub fn an_eligible_gesture_under_a_fence_is_an_attributable_detach(kind: ShellKind) {
-    let Some(package) = Package::found(kind) else {
-        return;
-    };
+    let package = Package::built(kind);
     let mut session = Session::start(&package);
     session.first_prompt();
     session.forget_events();
@@ -553,9 +545,7 @@ pub fn an_eligible_gesture_under_a_fence_is_an_attributable_detach(kind: ShellKi
 
 /// KR-REQ-07.71, KR-REQ-07.72, and `eof-missing-fence`, `eof-stale-fence`, `eof-repeated-after-detach`.
 pub fn an_unattributable_gesture_is_consumed_with_one_hint_per_prompt(kind: ShellKind) {
-    let Some(package) = Package::found(kind) else {
-        return;
-    };
+    let package = Package::built(kind);
     let mut session = Session::start(&package);
     session.first_prompt();
     session.forget_events();
@@ -633,9 +623,7 @@ pub fn an_unattributable_gesture_is_consumed_with_one_hint_per_prompt(kind: Shel
 
 /// `eof-repeated-after-detach`: a detach the worker refuses is consumed with the hint.
 pub fn a_refused_detach_is_consumed_with_the_hint(kind: ShellKind) {
-    let Some(package) = Package::found(kind) else {
-        return;
-    };
+    let package = Package::built(kind);
     let mut session = Session::start(&package);
     session.first_prompt();
     session.forget_events();
@@ -673,9 +661,7 @@ pub fn a_refused_detach_is_consumed_with_the_hint(kind: ShellKind) {
 
 /// `detach-condition-exclusions`: outside the condition the editor keeps the key.
 pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
-    let Some(package) = Package::found(kind) else {
-        return;
-    };
+    let package = Package::built(kind);
     let named = excluded_states();
     let speech = dialect(kind);
 
@@ -1050,9 +1036,7 @@ pub fn the_gesture_follows_the_line_discipline(kind: ShellKind) {
             kind.as_str()
         );
     };
-    let Some(package) = Package::found(kind) else {
-        return;
-    };
+    let package = Package::built(kind);
     let mut session = Session::start(&package);
     session.first_prompt();
     session.forget_events();
@@ -1132,9 +1116,7 @@ pub fn the_gesture_follows_the_line_discipline(kind: ShellKind) {
 
 /// KR-REQ-07.34, KR-REQ-07.35, and `launch-installed`.
 pub fn a_launch_is_installed_and_accepted_on_the_reader_thread(kind: ShellKind) {
-    let Some(package) = Package::found(kind) else {
-        return;
-    };
+    let package = Package::built(kind);
     let mut session = Session::start(&package);
     session.first_prompt();
     session.forget_events();
@@ -1239,9 +1221,7 @@ pub fn a_launch_is_installed_and_accepted_on_the_reader_thread(kind: ShellKind) 
 
 /// `launch-reader-decisions`: the reader's own check, one case per reason it can produce here.
 pub fn the_reader_refuses_a_launch_its_own_state_does_not_match(kind: ShellKind) {
-    let Some(package) = Package::found(kind) else {
-        return;
-    };
+    let package = Package::built(kind);
     let wait = pending_wait(kind);
     let mut session = Session::start(&package);
     session.first_prompt();
@@ -1453,9 +1433,7 @@ fn launch_rejection_reasons() -> Vec<LaunchRejectionReason> {
 
 /// A-17 and `timeout-launch`: a revoked launch installs nothing and says so.
 pub fn a_revoked_launch_installs_nothing(kind: ShellKind) {
-    let Some(package) = Package::found(kind) else {
-        return;
-    };
+    let package = Package::built(kind);
     let mut session = Session::start(&package);
     session.first_prompt();
     session.forget_events();
@@ -1510,9 +1488,7 @@ pub fn a_revoked_launch_installs_nothing(kind: ShellKind) {
 /// `ReaderLaunchState::revoked` is "a revocation for this transaction was in the frames this step
 /// read", so a worker that dispatched a launch and revoked it in the same breath has revoked it.
 pub fn a_revocation_in_the_same_read_binds_the_launch(kind: ShellKind) {
-    let Some(package) = Package::found(kind) else {
-        return;
-    };
+    let package = Package::built(kind);
     let mut session = Session::start(&package);
     session.first_prompt();
     session.forget_events();
@@ -1603,9 +1579,7 @@ pub fn a_revocation_in_the_same_read_binds_the_launch(kind: ShellKind) {
 
 /// The reader reports itself idle, which is one of the three points a withheld fence is retried at.
 pub fn the_reader_reports_itself_idle(kind: ShellKind) {
-    let Some(package) = Package::found(kind) else {
-        return;
-    };
+    let package = Package::built(kind);
     let mut session = Session::start(&package);
     session.first_prompt();
     let (_, event) = session.expect_event("reader_idle", |event| {
@@ -1631,9 +1605,7 @@ pub fn the_reader_reports_itself_idle(kind: ShellKind) {
 
 /// A session that loses its bridge keeps the fail-safe answer to an eligible gesture.
 pub fn a_lost_bridge_does_not_restore_a_native_empty_prompt_end_of_file(kind: ShellKind) {
-    let Some(package) = Package::found(kind) else {
-        return;
-    };
+    let package = Package::built(kind);
     let mut session = Session::start(&package);
     session.first_prompt();
     session.forget_events();
@@ -1674,9 +1646,7 @@ pub fn a_takeover_ends_a_pending_key_wait_and_keeps_the_buffer(kind: ShellKind) 
             kind.as_str()
         )
     });
-    let Some(package) = Package::found(kind) else {
-        return;
-    };
+    let package = Package::built(kind);
     let mut session = Session::start(&package);
     session.first_prompt();
     session.forget_events();
@@ -1826,9 +1796,7 @@ pub fn a_takeover_ends_a_pending_key_wait_and_keeps_the_buffer(kind: ShellKind) 
 
 /// KR-REQ-07.34 and KR-REQ-07.35: a cancellation ends what it found, and nothing else.
 pub fn a_cancellation_that_ends_nothing_leaves_the_next_sequence_alone(kind: ShellKind) {
-    let Some(package) = Package::found(kind) else {
-        return;
-    };
+    let package = Package::built(kind);
     let wait = pending_wait(kind);
     let mut session = Session::start(&package);
     session.first_prompt();
@@ -1949,9 +1917,7 @@ pub fn the_ignore_eof_setting_is_left_as_the_person_set_it(kind: ShellKind) {
             kind.as_str()
         ),
     };
-    let Some(package) = Package::found(kind) else {
-        return;
-    };
+    let package = Package::built(kind);
     let mut session = Session::start(&package);
     session.first_prompt();
     session.forget_events();
@@ -1985,9 +1951,7 @@ pub fn the_ignore_eof_setting_is_left_as_the_person_set_it(kind: ShellKind) {
 
 /// KR-REQ-07.85: the package declares the baseline the specification names.
 pub fn the_package_declares_the_baseline_the_specification_names(kind: ShellKind) {
-    let Some(package) = Package::found(kind) else {
-        return;
-    };
+    let package = Package::built(kind);
     let record = &package.record;
     let version = record["shell"]["upstream_version"]
         .as_str()
