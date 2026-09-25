@@ -586,7 +586,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                     if let Some(Err(why)) = attachments.as_ref() {
                         object.insert(
                             "terminal_attachments_unread".to_owned(),
-                            serde_json::json!(why),
+                            serde_json::json!(why.as_str()),
                         );
                     }
                 }
@@ -1203,8 +1203,8 @@ async fn read_from_controller(
 }
 
 /// What `kr status` read of each attachment: the summaries its worker gave, or why they could not
-/// be read.
-type AttachmentsRead = std::result::Result<Vec<kr_protocol::attachment::AttachmentSummary>, String>;
+/// be read, which says nothing the worker sent but a refusal's own message.
+type AttachmentsRead = std::result::Result<Vec<kr_protocol::attachment::AttachmentSummary>, Shown>;
 
 /// How long `kr status` waits for a worker to answer the question about its attachments, after it
 /// has already answered the session read.
@@ -1241,19 +1241,34 @@ async fn read_session(
         ),
     )
     .await;
-    let attachments = match asked {
-        Ok(Ok(Ok(value))) => value
+    let attachments = attachments_read(asked.ok());
+    Ok((read, attachments))
+}
+
+/// What `kr status` makes of the answer to its question about a session's attachments, or of no
+/// answer within [`ATTACHMENTS_BOUND`]: the summaries the worker gave, or why they were not read.
+fn attachments_read(
+    asked: Option<
+        kr_ipc::Result<
+            std::result::Result<
+                kr_protocol::envelope::ParamsValue,
+                kr_protocol::error::ProtocolError,
+            >,
+        >,
+    >,
+) -> AttachmentsRead {
+    match asked {
+        Some(Ok(Ok(value))) => value
             .to_typed::<kr_protocol::recovery::EventsSnapshotResult>()
             .map(|snapshot| snapshot.attachments)
-            .map_err(|error| error.to_string()),
-        Ok(Ok(Err(refusal))) => Err(refusal.to_string()),
-        Ok(Err(error)) => Err(error.to_string()),
-        Err(_) => Err(format!(
+            .map_err(|error| Shown::cbor(&error)),
+        Some(Ok(Err(refusal))) => Err(shown!("{}: {}", refusal.code, Shown::protocol(&refusal))),
+        Some(Err(error)) => Err(Shown::ipc(&error)),
+        None => Err(shown!(
             "the session's worker did not answer within {} seconds",
             ATTACHMENTS_BOUND.as_secs()
         )),
-    };
-    Ok((read, attachments))
+    }
 }
 
 /// Reads a session read, from a worker of this build or of the one before it.
@@ -1619,4 +1634,49 @@ fn print_json(value: &serde_json::Value) {
         "{}",
         serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_owned())
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A snapshot that cannot be read says the rule it broke and where, never a member it named;
+    /// a worker's refusal says its code and its message.
+    #[test]
+    fn an_attachment_read_that_fails_says_nothing_the_worker_sent() {
+        const MARKER: &str = "kr-marker-7c1e";
+
+        let named = kr_cbor::CanonicalValue::Map(
+            kr_cbor::CanonicalMap::from_entries([(
+                MARKER.to_owned(),
+                kr_cbor::CanonicalValue::text(MARKER),
+            )])
+            .expect("one member"),
+        );
+        let answer = kr_protocol::envelope::ParamsValue::from(named);
+        // The negative control: the decoder's own failure names the member.
+        let refused = answer
+            .to_typed::<kr_protocol::recovery::EventsSnapshotResult>()
+            .map(|_| ())
+            .expect_err("not a snapshot");
+        assert!(refused.to_string().contains(MARKER), "{refused}");
+        let said = attachments_read(Some(Ok(Ok(answer)))).expect_err("not read");
+        assert!(!said.as_str().contains(MARKER), "{said}");
+        assert!(!format!("{said:?}").contains(MARKER), "{said:?}");
+
+        let refusal = kr_client::error::refusal(
+            kr_protocol::error::ErrorCode::UnknownSession,
+            Shown::said("no such session"),
+        );
+        assert_eq!(
+            attachments_read(Some(Ok(Err(refusal))))
+                .expect_err("refused")
+                .as_str(),
+            "UNKNOWN_SESSION: no such session"
+        );
+        assert_eq!(
+            attachments_read(None).expect_err("no answer").as_str(),
+            "the session's worker did not answer within 10 seconds"
+        );
+    }
 }
