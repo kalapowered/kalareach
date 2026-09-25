@@ -4423,6 +4423,7 @@ dependencies = [
 name = "kr-controller"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "base64 0.23.1",
  "clap",
  "exacl",

@@ -39,8 +39,8 @@ use kr_transport::clock::ContinuousInstant;
 
 use super::durable::StoredPolicy;
 use super::organisation::{
-    self, ChainOutcome, ChainRefused, Enrolment, LeaseBound, LeaseHolder, LeaseInstalled,
-    LeasePresentation, LeaseRecord, LeaseRefused, LeaseTime, MemberLease, VerifiedEnrolment,
+    self, ChainOutcome, ChainRefused, Enrolment, LeaseHolder, LeaseInstalled, LeasePresentation,
+    LeaseRecord, LeaseRefused, LeaseTime, MemberLease, VerifiedEnrolment,
 };
 use super::{AccessRequest, Refusal};
 use crate::service::net::devices::ObservedUtc;
@@ -52,9 +52,278 @@ pub struct PolicyIntersection {
     pub rights: CanonicalSet<ActionRight>,
     /// The organisation whose lease narrowed them, when one did.
     pub organisation_id: Option<OrganisationId>,
-    /// The deadlines of the membership lease the intersection was taken under, when a lease
-    /// answered for it: it holds only while both are ahead.
-    pub lease: Option<LeaseBound>,
+    /// The membership lease the intersection was taken under, when a lease answered for it: it
+    /// holds only while both of its deadlines are ahead.
+    pub lease: Option<HeldBound>,
+    /// The bounded offline validity the intersection was taken under, when it applied.
+    pub offline: Option<HeldBound>,
+}
+
+/// Which time bound on authority a snapshot is of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundIdentity {
+    /// A membership lease, by the digest of its signing input.
+    Lease(kr_protocol::scalars::Digest256),
+    /// The bounded offline validity, by the synchronisation it is measured from, when it has one.
+    Offline {
+        /// When that synchronisation happened, in UTC milliseconds.
+        synchronised_at_ms: Option<u64>,
+    },
+}
+
+/// One time bound on authority as it stands: which bound it is, when it ends on the continuous
+/// clock and in UTC, and whether a restrictive change has ended it.
+///
+/// A snapshot never changes once it is published; a change publishes a new one, with a new
+/// version, through the bound's [`BoundCell`]. Every decision and every copy is taken from one
+/// snapshot of each bound it reads, so no reader pairs one snapshot's continuous deadline with
+/// another's UTC deadline. Between barriers a snapshot's deadlines never move earlier: a renewal
+/// that does not narrow ends no earlier on either clock, and anything that ends a bound sooner is a
+/// restrictive change, which a barrier follows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BoundSnapshot {
+    /// Which publication of its cell this is. Versions only rise, across every cell of this host.
+    pub version: u64,
+    /// The bound it is of.
+    pub identity: BoundIdentity,
+    /// When it ends on the continuous clock, when it does.
+    pub continuous_deadline: Option<ContinuousInstant>,
+    /// When it ends in UTC milliseconds, when it does: the first moment outside it.
+    pub utc_deadline_ms: Option<u64>,
+    /// Whether a restrictive change ended it: a lease dropped or withdrawn, or an offline bound
+    /// with nothing to show it holding.
+    pub ended: bool,
+}
+
+impl BoundSnapshot {
+    /// Whether the bound has ended at `now` on the continuous clock, or at `utc_ms`, this host's
+    /// reading of UTC through its floor.
+    ///
+    /// Both clocks only move forward, so a reader that finds an end finds one every later reader
+    /// finds too: an end takes effect without being written anywhere.
+    #[must_use]
+    pub fn ended_at(&self, now: ContinuousInstant, utc_ms: u64) -> bool {
+        self.ended
+            || self
+                .continuous_deadline
+                .is_some_and(|deadline| now >= deadline)
+            || self
+                .utc_deadline_ms
+                .is_some_and(|deadline| utc_ms >= deadline)
+    }
+
+    /// Whether it has ended on the continuous clock at `now`, whatever UTC says: the half no
+    /// wall clock can move.
+    #[must_use]
+    pub fn ended_on_the_continuous_clock(&self, now: ContinuousInstant) -> bool {
+        self.continuous_deadline
+            .is_some_and(|deadline| now >= deadline)
+    }
+
+    /// Whether this snapshot states the same bound as `other`, whatever their versions.
+    fn states(&self, other: &Self) -> bool {
+        self.identity == other.identity
+            && self.continuous_deadline == other.continuous_deadline
+            && self.utc_deadline_ms == other.utc_deadline_ms
+            && self.ended == other.ended
+    }
+}
+
+/// The versions every cell's snapshots are numbered from.
+static BOUND_VERSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// One time bound's cell: the snapshot in force, published whole through one atomic pointer.
+///
+/// A writer builds the whole new snapshot and swaps the pointer; a reader loads it once and decides
+/// from that value. The swap is one atomic store, so wherever a writer stops, a reader gets the old
+/// snapshot or the new one, whole. Loading takes no lock and never waits, which is what a check
+/// deciding inside a poll needs. Every publication is made under the host policy's lock.
+#[derive(Debug)]
+pub struct BoundCell(arc_swap::ArcSwap<BoundSnapshot>);
+
+impl BoundCell {
+    /// A cell publishing its first snapshot.
+    #[must_use]
+    pub fn new(
+        identity: BoundIdentity,
+        continuous_deadline: Option<ContinuousInstant>,
+        utc_deadline_ms: Option<u64>,
+        ended: bool,
+    ) -> Arc<Self> {
+        Arc::new(Self(arc_swap::ArcSwap::from_pointee(BoundSnapshot {
+            version: BOUND_VERSIONS.fetch_add(1, Ordering::SeqCst),
+            identity,
+            continuous_deadline,
+            utc_deadline_ms,
+            ended,
+        })))
+    }
+
+    /// The snapshot in force.
+    #[must_use]
+    pub fn load(&self) -> Arc<BoundSnapshot> {
+        self.0.load_full()
+    }
+
+    /// Publishes a new snapshot stating `identity`, its deadlines and whether it has ended, unless
+    /// the one in force already states exactly that. Called under the host policy's lock.
+    pub(crate) fn publish(
+        &self,
+        identity: BoundIdentity,
+        continuous_deadline: Option<ContinuousInstant>,
+        utc_deadline_ms: Option<u64>,
+        ended: bool,
+    ) {
+        let next = BoundSnapshot {
+            version: 0,
+            identity,
+            continuous_deadline,
+            utc_deadline_ms,
+            ended,
+        };
+        if self.0.load().states(&next) {
+            return;
+        }
+        self.0.store(Arc::new(BoundSnapshot {
+            version: BOUND_VERSIONS.fetch_add(1, Ordering::SeqCst),
+            ..next
+        }));
+    }
+
+    /// Ends the bound: a restrictive change dropped or withdrew it.
+    pub(crate) fn end(&self) {
+        let current = self.load();
+        self.publish(
+            current.identity,
+            current.continuous_deadline,
+            current.utc_deadline_ms,
+            true,
+        );
+    }
+}
+
+/// One bound a decision was taken under: its cell, and the snapshot the decision loaded from it.
+///
+/// What was decided stands on the snapshot, once loaded. What is asked afterwards asks the cell:
+/// a relayed batch whether the cell still publishes the snapshot it was decided under, and a
+/// response whether the bound, as it stands when the response is written, still holds.
+#[derive(Clone, Debug)]
+pub struct HeldBound {
+    cell: Arc<BoundCell>,
+    snapshot: Arc<BoundSnapshot>,
+}
+
+impl HeldBound {
+    /// Loads `cell` once.
+    #[must_use]
+    pub fn load(cell: &Arc<BoundCell>) -> Self {
+        let snapshot = cell.load();
+        #[cfg(test)]
+        publishing::after_a_load();
+        Self {
+            cell: Arc::clone(cell),
+            snapshot,
+        }
+    }
+
+    /// The snapshot the decision was taken under.
+    #[must_use]
+    pub fn snapshot(&self) -> &BoundSnapshot {
+        &self.snapshot
+    }
+
+    /// When it ends on the continuous clock, as the decision loaded it.
+    #[must_use]
+    pub fn continuous_deadline(&self) -> Option<ContinuousInstant> {
+        self.snapshot.continuous_deadline
+    }
+
+    /// When it ends in UTC milliseconds, as the decision loaded it.
+    #[must_use]
+    pub fn utc_deadline_ms(&self) -> Option<u64> {
+        self.snapshot.utc_deadline_ms
+    }
+
+    /// Whether the bound, as its cell publishes it now, still holds at these readings: what a
+    /// response is written under.
+    #[must_use]
+    pub fn stands_at(&self, now: ContinuousInstant, utc_ms: u64) -> Stands {
+        judged(&self.cell.load(), now, utc_ms)
+    }
+
+    /// Whether the cell still publishes the snapshot the decision was taken under, and it still
+    /// holds at these readings: what a relayed batch is written under. A renewal publishes a new
+    /// snapshot, so a batch decided before it is decided again.
+    #[must_use]
+    pub fn holds_as_decided(&self, now: ContinuousInstant, utc_ms: u64) -> Stands {
+        let current = self.cell.load();
+        if current.version != self.snapshot.version {
+            return Stands::Moved;
+        }
+        judged(&current, now, utc_ms)
+    }
+}
+
+impl PartialEq for HeldBound {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.cell, &other.cell) && self.snapshot == other.snapshot
+    }
+}
+
+impl Eq for HeldBound {}
+
+/// Whether a bound still holds where a check reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stands {
+    /// It holds.
+    Holds,
+    /// Its cell published another snapshot since the decision.
+    Moved,
+    /// It has ended on the continuous clock, or a restrictive change ended it.
+    EndedOnTheContinuousClock,
+    /// It has ended at this host's reading of UTC, which is owed its record.
+    EndedInUtc,
+}
+
+fn judged(snapshot: &BoundSnapshot, now: ContinuousInstant, utc_ms: u64) -> Stands {
+    if snapshot.ended || snapshot.ended_on_the_continuous_clock(now) {
+        Stands::EndedOnTheContinuousClock
+    } else if snapshot
+        .utc_deadline_ms
+        .is_some_and(|deadline| utc_ms >= deadline)
+    {
+        Stands::EndedInUtc
+    } else {
+        Stands::Holds
+    }
+}
+
+/// Where this host's own tests stop a reader between two loads.
+#[cfg(test)]
+pub(crate) mod publishing {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnMut()>;
+
+    thread_local! {
+        static AFTER_A_LOAD: RefCell<Option<Hook>> = RefCell::new(None);
+    }
+
+    fn run(hook: &'static std::thread::LocalKey<RefCell<Option<Hook>>>) {
+        let taken = hook.with(|hook| hook.borrow_mut().take());
+        if let Some(mut run) = taken {
+            run();
+        }
+    }
+
+    pub(super) fn after_a_load() {
+        run(&AFTER_A_LOAD);
+    }
+
+    /// Runs `hook` once, on this thread, the next time a reader has loaded a cell.
+    pub(crate) fn stop_after_a_load(hook: impl FnMut() + 'static) {
+        AFTER_A_LOAD.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
 }
 
 /// The highest UTC reading this host has decided anything from, and whether that reading is on
@@ -312,10 +581,53 @@ pub struct HostPolicy {
     /// decision: enrolling in a second organisation must not undo it.
     exclusively_managed: bool,
     offline: Option<OfflineValidityPolicy>,
+    /// The bounded offline validity as it stands, on both clocks, published whole: its UTC end
+    /// from the policy above and its continuous end from the anchor the daemon took for the
+    /// synchronisation it is measured from. Shared by every copy of this policy, and published
+    /// only once the policy holding a change is written down.
+    offline_cell: Arc<BoundCell>,
     /// When the host last woke or started, in UTC milliseconds.
     revalidated_at_ms: u64,
     /// The highest UTC reading this host has decided anything from.
     utc_floor: Arc<UtcFloor>,
+}
+
+/// The offline cell a policy starts with, before the daemon has anchored anything: a bound that has
+/// synchronised shows nothing holding it until its anchor is published, and one that never has is
+/// outside its bound from the moment it is chosen.
+fn offline_cell(offline: Option<&OfflineValidityPolicy>) -> Arc<BoundCell> {
+    match offline {
+        None => BoundCell::new(
+            BoundIdentity::Offline {
+                synchronised_at_ms: None,
+            },
+            None,
+            None,
+            false,
+        ),
+        Some(offline) => {
+            let synchronised_at_ms = offline.last_synchronised_at_ms.as_ref().map(|at| at.get());
+            BoundCell::new(
+                BoundIdentity::Offline { synchronised_at_ms },
+                None,
+                offline_utc_end(offline),
+                true,
+            )
+        }
+    }
+}
+
+/// The first UTC moment outside an offline bound, when there is one: its last synchronisation
+/// plus the maximum, plus one, when the clock can represent it. One it cannot is a bound every
+/// representable moment is inside, and a bound that never synchronised has no end to state here
+/// because it never began.
+#[must_use]
+pub fn offline_utc_end(offline: &OfflineValidityPolicy) -> Option<u64> {
+    offline.last_synchronised_at_ms.as_ref().and_then(|last| {
+        last.get()
+            .checked_add(offline.maximum_offline_ms.get())?
+            .checked_add(1)
+    })
 }
 
 impl HostPolicy {
@@ -329,6 +641,7 @@ impl HostPolicy {
             lease_records: BTreeMap::new(),
             exclusively_managed: false,
             offline: None,
+            offline_cell: offline_cell(None),
             revalidated_at_ms: 0,
             utc_floor: Arc::new(UtcFloor::default()),
         }
@@ -696,6 +1009,7 @@ impl HostPolicy {
             lease_records: organisation::restored_records(&stored.lease_records),
             exclusively_managed: stored.exclusively_managed,
             offline: stored.offline.0,
+            offline_cell: offline_cell(stored.offline.0.as_ref()),
             revalidated_at_ms: 0,
             utc_floor,
         }
@@ -710,6 +1024,66 @@ impl HostPolicy {
     #[must_use]
     pub const fn offline_validity(&self) -> Option<&OfflineValidityPolicy> {
         self.offline.as_ref()
+    }
+
+    /// The bounded offline validity's cell ([`BoundCell`]).
+    #[must_use]
+    pub const fn offline_cell(&self) -> &Arc<BoundCell> {
+        &self.offline_cell
+    }
+
+    /// Publishes this policy's leases in their cells, as the policy stands once it is written down
+    /// in place of `previous`: each installed lease's own snapshot, and an end for each lease
+    /// `previous` held that this policy does not, dropped at a rotation or withdrawn with its
+    /// enrolment. Called under the host policy's lock, after the write and before the policy is
+    /// put in force, so a reader that loads a cell sees what the policy it could read says.
+    pub(crate) fn publish_leases(&self, previous: &Self) {
+        for installed in self.installed_leases() {
+            installed.publish();
+        }
+        for earlier in previous.installed_leases() {
+            if !self
+                .installed_leases()
+                .any(|kept| Arc::ptr_eq(kept.cell(), earlier.cell()))
+            {
+                earlier.cell().end();
+            }
+        }
+    }
+
+    /// Publishes every bound this policy states in its cell, as a daemon does once the policy is
+    /// written down in place of `previous`, for a caller that decides under a policy of its own
+    /// outside a daemon: its leases as [`Self::publish_leases`] does, and its offline bound with no
+    /// continuous end, which only a daemon's anchor measures, so its UTC end alone decides it.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn publish_unanchored(&self, previous: &Self) {
+        self.publish_leases(previous);
+        match self.offline.as_ref() {
+            None => self.offline_cell.publish(
+                BoundIdentity::Offline {
+                    synchronised_at_ms: None,
+                },
+                None,
+                None,
+                false,
+            ),
+            Some(offline) => {
+                let synchronised_at_ms =
+                    offline.last_synchronised_at_ms.as_ref().map(|at| at.get());
+                self.offline_cell.publish(
+                    BoundIdentity::Offline { synchronised_at_ms },
+                    None,
+                    offline_utc_end(offline),
+                    synchronised_at_ms.is_none(),
+                );
+            }
+        }
+    }
+
+    fn installed_leases(&self) -> impl Iterator<Item = &organisation::InstalledLease> {
+        self.enrolments
+            .values()
+            .flat_map(Enrolment::installed_leases)
     }
 
     /// Records a successful authority-feed synchronisation.
@@ -769,7 +1143,7 @@ impl HostPolicy {
                 // a decision with no presenting connection resolves it alike, and no caller can
                 // supply an account or a key of its own. Both clocks decide, and nothing else
                 // does: an open transport is not a lease.
-                let installed = enrolment
+                let (installed, held) = enrolment
                     .lease_for_device(grant.recipient_device_id, request.continuous_now, now_ms)
                     .map_err(|missing| match missing {
                         MemberLease::Unbound => Refusal::MembershipUnattributed,
@@ -790,7 +1164,8 @@ impl HostPolicy {
                 Ok(PolicyIntersection {
                     rights,
                     organisation_id: Some(requirement.organisation_id),
-                    lease: Some(installed.bound()),
+                    lease: Some(held),
+                    offline: None,
                 })
             }
             None => {
@@ -809,22 +1184,34 @@ impl HostPolicy {
                 // The bounded offline policy is for *remote* personal access. Section 10 puts it
                 // there in so many words, and a person at the keyboard of their own machine is not
                 // the case it is about: refusing them because a cloud feed is unreachable would be
-                // the cloud dependency the default is written to avoid.
-                if request.ingress != ActorIngress::LocalIpc
-                    && let Some(offline) = self.offline.as_ref()
-                    && !offline.is_inside_bound(now_ms)
-                {
-                    return Err(Refusal::OfflineValidityLapsed {
-                        last_synchronised_at_ms: offline
-                            .last_synchronised_at_ms
-                            .as_ref()
-                            .map(|at| at.get()),
-                    });
-                }
+                // the cloud dependency the default is written to avoid. It is decided from one load
+                // of its cell, in UTC here; the caller holds the decision to the same snapshot's
+                // continuous end.
+                let offline = match self.offline.as_ref() {
+                    Some(offline) if request.ingress != ActorIngress::LocalIpc => {
+                        let held = HeldBound::load(&self.offline_cell);
+                        let snapshot = held.snapshot();
+                        if snapshot.ended
+                            || snapshot
+                                .utc_deadline_ms
+                                .is_some_and(|deadline| now_ms >= deadline)
+                        {
+                            return Err(Refusal::OfflineValidityLapsed {
+                                last_synchronised_at_ms: offline
+                                    .last_synchronised_at_ms
+                                    .as_ref()
+                                    .map(|at| at.get()),
+                            });
+                        }
+                        Some(held)
+                    }
+                    _ => None,
+                };
                 Ok(PolicyIntersection {
                     rights: grant.actions.clone(),
                     organisation_id: None,
                     lease,
+                    offline,
                 })
             }
         }
@@ -844,13 +1231,13 @@ impl HostPolicy {
         device_id: DeviceId,
         now: ContinuousInstant,
         now_ms: u64,
-    ) -> std::result::Result<LeaseBound, Refusal> {
+    ) -> std::result::Result<HeldBound, Refusal> {
         let mut seen = None;
         for enrolment in self.enrolments.values() {
             match enrolment.lease_for_device(device_id, now, now_ms) {
                 // One usable lease is enough: this device's member is in good standing somewhere
                 // this host answers to.
-                Ok(installed) => return Ok(installed.bound()),
+                Ok((_, held)) => return Ok(held),
                 Err(MemberLease::Unbound) => {}
                 Err(MemberLease::NoLease) => {
                     seen.get_or_insert(MembershipRefusal::NoLease);
@@ -974,5 +1361,282 @@ mod tests {
         floor.establish_continuity();
         let bound = floor.bound(expiry, 2_000);
         assert!(!bound.unproven && bound.answerable() && !bound.passed);
+    }
+}
+
+#[cfg(test)]
+mod one_snapshot_of_each_bound {
+    //! Every decision about a time bound is taken from one snapshot of it, published whole.
+
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use kr_crypto::keys::AuthorisationKeyPair;
+    use kr_protocol::actor::ActorIngress;
+    use kr_protocol::grant::{
+        EnvironmentSelector, Grant, GrantExpiry, HistoryScope, OrganisationRequirement,
+        SessionSelector,
+    };
+    use kr_protocol::ids::{
+        AccountId, AuthorityRevision, ControllerGeneration, DeviceId, EnvironmentId, GrantId,
+    };
+    use kr_protocol::method::Method;
+    use kr_protocol::rights::ActionRight;
+    use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs};
+    use kr_protocol::sharing::MembershipRefusal;
+    use kr_transport::clock::{ContinuousClock as _, ManualClock};
+
+    use super::{BoundCell, BoundIdentity, HostPolicy, publishing};
+    use crate::grants::organisation::LeasePresentation;
+    use crate::grants::organisation::testing::TestOrganisation;
+    use crate::grants::{AccessRequest, Refusal};
+    use crate::service::net::devices::ObservedUtc;
+
+    const NOW_MS: u64 = 1_800_000_000_000;
+    const MINUTE: Duration = Duration::from_secs(60);
+
+    /// A host enrolled in one organisation, holding a lease it installed and published for a
+    /// member's device, and that device's organisation grant.
+    struct Leased {
+        policy: HostPolicy,
+        organisation: TestOrganisation,
+        key: AuthorisationKeyPair,
+        account: AccountId,
+        grant: Grant,
+        clock: ManualClock,
+    }
+
+    impl Leased {
+        fn new() -> Self {
+            let clock = ManualClock::new();
+            let organisation = TestOrganisation::new(0x31, NOW_MS - 60 * 60 * 1000);
+            let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
+            let verified = policy
+                .verify_enrolment(&organisation.authority(NOW_MS), Some(&reading(NOW_MS)))
+                .expect("the chain verifies");
+            policy.enrol(verified).expect("the host enrols");
+            let device_id = DeviceId::new(kr_ipc::new_uuid());
+            let grant = Grant {
+                grant_id: GrantId::new(kr_ipc::new_uuid()),
+                parent_grant_id: Nullable::null(),
+                issuer_device_id: device_id,
+                recipient_device_id: device_id,
+                authority_revision: AuthorityRevision::new(1),
+                environment_selector: EnvironmentSelector::Any,
+                session_selector: SessionSelector::Any,
+                actions: [ActionRight::SessionView].into_iter().collect(),
+                history: HistoryScope {
+                    lower_bound_ms: Nullable::null(),
+                    include_live_screen: false,
+                    named_questions: CanonicalSet::new(),
+                    named_approvals: CanonicalSet::new(),
+                },
+                expiry: GrantExpiry::Never,
+                organisation: Nullable::some(OrganisationRequirement {
+                    organisation_id: organisation.organisation_id,
+                    policy_revision: AuthorityRevision::new(1),
+                }),
+            };
+            let mut leased = Self {
+                policy,
+                organisation,
+                key: AuthorisationKeyPair::generate().expect("a device key"),
+                account: AccountId::new("ada").expect("an account"),
+                grant,
+                clock,
+            };
+            leased.present(NOW_MS, NOW_MS);
+            leased
+        }
+
+        /// Presents a lease issued at `issued_ms` at the UTC reading `at_ms`, and publishes the
+        /// policy that holds it.
+        fn present(&mut self, issued_ms: u64, at_ms: u64) {
+            let lease = self.organisation.lease(
+                &self.account,
+                *self.key.public(),
+                issued_ms,
+                &[ActionRight::SessionView],
+            );
+            let before = self.policy.clone();
+            self.policy
+                .install_lease(LeasePresentation {
+                    lease: &lease,
+                    device_id: self.grant.recipient_device_id,
+                    proven_key: self.key.public(),
+                    reading: Some(reading(at_ms)),
+                    now: self.clock.now(),
+                    generation: ControllerGeneration::new(1),
+                })
+                .expect("the lease installs");
+            self.policy.publish_leases(&before);
+        }
+
+        /// The member device's cell.
+        fn cell(&self) -> Arc<BoundCell> {
+            Arc::clone(
+                self.policy
+                    .enrolment(self.organisation.organisation_id)
+                    .and_then(|enrolment| enrolment.installed(&self.account, self.key.public()))
+                    .expect("a lease is installed")
+                    .cell(),
+            )
+        }
+
+        /// The member device's request at the UTC reading `at_ms`.
+        fn decide(&self, at_ms: u64) -> Result<super::PolicyIntersection, Refusal> {
+            let request = AccessRequest {
+                method: Method::SessionList,
+                ingress: ActorIngress::PairedDevice,
+                environment_id: EnvironmentId::new(kr_ipc::new_uuid()),
+                session_id: None,
+                claims_geometry: false,
+                own_subject: None,
+                now_ms: at_ms,
+                continuous_now: self.clock.now(),
+            };
+            self.policy.intersect(&self.grant, &request, at_ms)
+        }
+    }
+
+    fn reading(at_ms: u64) -> ObservedUtc {
+        ObservedUtc {
+            now: TimestampMs::new(at_ms),
+            behind_ms: 0,
+        }
+    }
+
+    fn lease_expired() -> Result<super::PolicyIntersection, Refusal> {
+        Err(Refusal::MembershipUnusable {
+            refusal: MembershipRefusal::LeaseExpired,
+        })
+    }
+
+    /// A lease is decided from one snapshot of its cell. A publication made after the reader
+    /// loaded the cell, moving the continuous deadline earlier and the UTC deadline later, is not
+    /// what the decision stands on: it carries the snapshot it loaded, whole, and the next reader
+    /// takes the new one, whole.
+    #[test]
+    fn a_lease_is_decided_from_one_snapshot_of_its_cell() {
+        let leased = Leased::new();
+        let cell = leased.cell();
+        let loaded = cell.load();
+        let (continuous, utc) = (
+            loaded.continuous_deadline.expect("a continuous end"),
+            loaded.utc_deadline_ms.expect("a UTC end"),
+        );
+        let earlier = leased
+            .clock
+            .now()
+            .checked_add(MINUTE)
+            .expect("a minute out");
+        assert!(earlier < continuous);
+        let publishing_to = Arc::clone(&cell);
+        let identity = loaded.identity;
+        publishing::stop_after_a_load(move || {
+            publishing_to.publish(identity, Some(earlier), Some(utc + 60_000), false);
+        });
+
+        let decided = leased.decide(NOW_MS).expect("the lease answers");
+        let held = decided.lease.expect("a lease answered for it");
+        assert_eq!(
+            (held.continuous_deadline(), held.utc_deadline_ms()),
+            (Some(continuous), Some(utc)),
+            "the decision carries the snapshot it loaded, whole"
+        );
+        let published = cell.load();
+        assert_ne!(published.version, loaded.version, "the publication landed");
+        assert_eq!(
+            (published.continuous_deadline, published.utc_deadline_ms),
+            (Some(earlier), Some(utc + 60_000))
+        );
+
+        // The next reader takes the new snapshot whole: past its continuous end, with UTC well
+        // inside both, the lease is refused.
+        leased.clock.advance(MINUTE * 2);
+        assert_eq!(leased.decide(NOW_MS + 120_000), lease_expired());
+
+        // The control: with no publication, a reader at the same moment decides as the one
+        // snapshot says.
+        let unmoved = Leased::new();
+        unmoved.clock.advance(MINUTE * 2);
+        let decided = unmoved
+            .decide(NOW_MS + 120_000)
+            .expect("inside the one snapshot");
+        assert_eq!(
+            decided.lease.map(|held| *held.snapshot()),
+            Some(*unmoved.cell().load())
+        );
+    }
+
+    /// An end a reader finds while a renewal is being published is the snapshot it loaded, and it
+    /// leaves the renewal live for the reader after it: finding an end writes nothing into the
+    /// cell.
+    #[test]
+    fn an_end_found_during_a_renewal_is_the_old_snapshots_and_the_renewal_stays_live() {
+        let leased = Leased::new();
+        let cell = leased.cell();
+        let loaded = cell.load();
+        // Past the installed lease's continuous end.
+        leased.clock.advance(MINUTE * 15);
+        let renewed = leased
+            .clock
+            .now()
+            .checked_add(MINUTE * 10)
+            .expect("ten minutes out");
+        let publishing_to = Arc::clone(&cell);
+        let identity = loaded.identity;
+        let utc = loaded.utc_deadline_ms;
+        publishing::stop_after_a_load(move || {
+            publishing_to.publish(identity, Some(renewed), utc, false);
+        });
+
+        assert_eq!(
+            leased.decide(NOW_MS),
+            lease_expired(),
+            "the end is the loaded snapshot's"
+        );
+        let after = cell.load();
+        assert_eq!(after.continuous_deadline, Some(renewed));
+        assert!(!after.ended, "and nothing was written into the cell");
+        let decided = leased
+            .decide(NOW_MS)
+            .expect("the renewal answers the next reader");
+        assert_eq!(
+            decided.lease.map(|held| held.continuous_deadline()),
+            Some(Some(renewed))
+        );
+    }
+
+    /// A renewal that does not narrow keeps the installed continuous deadline when its own
+    /// conversion is earlier, as when it is presented after UTC ran ahead of the continuous clock,
+    /// and publishes it through the device's one cell.
+    #[test]
+    fn a_renewal_that_does_not_narrow_keeps_the_installed_continuous_deadline() {
+        let mut leased = Leased::new();
+        let cell = leased.cell();
+        let installed = cell.load();
+        // UTC reads ten minutes on while the continuous clock moved one second: the renewal's own
+        // conversion is under six minutes, far earlier than the installed deadline.
+        leased.clock.advance(Duration::from_secs(1));
+        leased.present(NOW_MS + 60_000, NOW_MS + 10 * 60_000);
+
+        assert!(
+            Arc::ptr_eq(&leased.cell(), &cell),
+            "the renewal publishes through the device's cell"
+        );
+        let published = cell.load();
+        assert_ne!(published.version, installed.version);
+        assert_ne!(published.identity, installed.identity, "another lease");
+        assert_eq!(
+            published.continuous_deadline, installed.continuous_deadline,
+            "the installed continuous deadline is kept"
+        );
+        assert_eq!(
+            published.utc_deadline_ms,
+            Some(NOW_MS + 60_000 + kr_protocol::account::MEMBERSHIP_LEASE_MAX_LIFETIME_MS),
+            "and the renewal's own signed expiry is its UTC end"
+        );
+        assert!(matches!(published.identity, BoundIdentity::Lease(_)));
     }
 }

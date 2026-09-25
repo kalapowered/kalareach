@@ -2632,7 +2632,12 @@ impl RemoteConnection {
             .ok()?;
         Some(RelayGrant {
             epoch,
-            until: decision.offline_until,
+            until: decision
+                .decided
+                .permitted
+                .offline
+                .as_ref()
+                .and_then(crate::grants::policy::HeldBound::continuous_deadline),
             lapses_at_ms: decision.decided.lapses_at_ms,
         })
     }
@@ -4998,7 +5003,12 @@ mod write_boundary {
         let relaying = Relaying {
             grant: RelayGrant {
                 epoch: controller.authority_epoch(),
-                until: decision.offline_until,
+                until: decision
+                    .decided
+                    .permitted
+                    .offline
+                    .as_ref()
+                    .and_then(crate::grants::policy::HeldBound::continuous_deadline),
                 lapses_at_ms: None,
             },
             redecide: &redecide,

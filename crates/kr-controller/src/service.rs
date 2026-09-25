@@ -1201,6 +1201,18 @@ impl Controller {
         {
             eprintln!("kr-controller: could not forget stale offline bound records: {error}");
         }
+        // The offline bound's cell states both of its ends from here, before anything is decided
+        // under it.
+        {
+            let policy = policy
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            net::publish_offline_bound(
+                policy.offline_cell(),
+                policy.offline_validity(),
+                offline_anchor,
+            );
+        }
         // The automation service carries out its change-set nodes through the change-set service,
         // so it takes that rather than opening anything of its own beside its journal. The grant
         // each definition names is read from the stores this daemon holds and decided under this
@@ -2670,6 +2682,10 @@ impl Controller {
         {
             eprintln!("kr-controller: could not forget stale offline bound records: {error}");
         }
+        // The time bounds the written policy states, published under its lock before it is put in
+        // force, so a reader that loads a cell sees what the policy it could read says.
+        candidate.publish_leases(&held);
+        net::publish_offline_bound(candidate.offline_cell(), candidate.offline_validity(), next);
         *held = candidate;
         *anchor = next;
         // Published with the policy, under its lock, so a decision that reads this epoch reads the
@@ -2804,6 +2820,9 @@ impl Controller {
             None => self.sharing.grants().store_policy(&snapshot)?,
         }
         self.utc_floor.wrote(snapshot.utc_floor_ms.get());
+        // The lease's snapshot in its cell, under the policy's lock, before the policy holding it
+        // is put in force.
+        candidate.publish_leases(&held);
         *held = candidate;
         // Published with the policy, under its lock, as every change of the policy is.
         self.advance_authority_epoch();
@@ -3144,12 +3163,6 @@ impl Controller {
         })?;
         let waited = self.clock.now().saturating_duration_since(read_at);
         let now_ms = now_ms.saturating_add(u64::try_from(waited.as_millis()).unwrap_or(u64::MAX));
-        // The bound a remote holder under a personal grant is held to, which is the policy's own
-        // rule for when it applies.
-        let offline = (ingress != kr_protocol::actor::ActorIngress::LocalIpc
-            && record.grant.organisation.as_ref().is_none())
-        .then(|| policy.offline_validity().copied())
-        .flatten();
         let decided = crate::grants::standing_at_dispatch(
             record,
             &mut policy,
@@ -3157,8 +3170,7 @@ impl Controller {
             ingress,
             now_ms,
             self.clock.now(),
-        )
-        .map(|intersection| intersection.rights);
+        );
         // Its anchor on the continuous clock, read now: a grant that ran out there is refused
         // whatever the wall clock says, once its end is written down. Until then authority is
         // unavailable, because a daemon started in a new boot, where this anchor means nothing,
@@ -3179,27 +3191,26 @@ impl Controller {
             }
             decided => decided,
         };
-        let decided = match (decided, offline) {
-            (Ok(rights), Some(offline)) => {
-                let lapsed = crate::grants::Refusal::OfflineValidityLapsed {
-                    last_synchronised_at_ms: offline
-                        .last_synchronised_at_ms
-                        .as_ref()
+        // The offline bound the decision loaded, held to its continuous end as well, as a paired
+        // device's request is: run out on the clock that cannot be wound back, it is refused, and
+        // the time it spent is written down.
+        let decided = match decided {
+            Ok(intersection)
+                if intersection.offline.as_ref().is_some_and(|offline| {
+                    offline
+                        .snapshot()
+                        .ended_on_the_continuous_clock(self.clock.now())
+                }) =>
+            {
+                self.write_offline_time(&policy);
+                Err(crate::grants::Refusal::OfflineValidityLapsed {
+                    last_synchronised_at_ms: policy
+                        .offline_validity()
+                        .and_then(|offline| offline.last_synchronised_at_ms.as_ref())
                         .map(|at| at.get()),
-                };
-                match self.offline_until(&offline) {
-                    // The anchor is taken with the bound, so a bound without one is one this host
-                    // cannot show to be holding.
-                    Err(net::NoAnchor) => Err(lapsed),
-                    // Run out on the clock that cannot be wound back.
-                    Ok(Some(until)) if self.clock.now() >= until => {
-                        self.write_offline_time(&policy);
-                        Err(lapsed)
-                    }
-                    Ok(_) => Ok(rights),
-                }
+                })
             }
-            (decided, _) => decided,
+            decided => decided.map(|intersection| intersection.rights),
         };
         decided.map_err(|refusal| {
             if refusal.is_clock_decided() {

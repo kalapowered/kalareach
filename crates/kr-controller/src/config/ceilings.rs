@@ -196,7 +196,7 @@ pub fn decide_with_ceiling(
     let Some(ceiling) = ceiling else {
         let permitted =
             decide(grant, record, policy, request.clone()).map_err(CeilingRefusal::Refused)?;
-        let lapses_at_ms = lapses_at_ms(grant, policy, &request, permitted.lease);
+        let lapses_at_ms = lapses_at_ms(grant, &permitted);
         return Ok(Decided {
             permitted,
             removed: CanonicalSet::new(),
@@ -249,7 +249,7 @@ pub fn decide_with_ceiling(
         .copied()
         .filter(|right| !policy_rights.contains(right))
         .collect();
-    let lapses_at_ms = lapses_at_ms(grant, policy, &request, permitted.lease);
+    let lapses_at_ms = lapses_at_ms(grant, &permitted);
     Ok(Decided {
         permitted,
         removed,
@@ -264,36 +264,29 @@ pub fn decide_with_ceiling(
 /// Three bounds can end a paired device's authority on a clock: the grant's own expiry; for a
 /// caller that is not at this machine under a personal grant, the bounded offline validity an
 /// owner chose, which holds up to the last moment inside it; and the signed expiry of the
-/// membership lease the decision was taken under, whose continuous deadline the decision carries
-/// beside it ([`Permitted::lease`]). Everything else that ends a decision is an event, and moves
+/// membership lease the decision was taken under. The last two are the snapshots the decision
+/// loaded ([`Permitted::lease`] and [`Permitted::offline`]), whose continuous deadlines it carries
+/// beside them. Everything else that ends a decision is an event, and moves
 /// [`crate::service::Controller`]'s authority epoch.
-fn lapses_at_ms(
-    grant: &Grant,
-    policy: &HostPolicy,
-    request: &AccessRequest,
-    lease: Option<crate::grants::organisation::LeaseBound>,
-) -> Option<u64> {
+fn lapses_at_ms(grant: &Grant, permitted: &Permitted) -> Option<u64> {
     let expiry = match grant.expiry {
         kr_protocol::grant::GrantExpiry::Never => None,
         kr_protocol::grant::GrantExpiry::At { expires_at_ms } => Some(expires_at_ms.get()),
     };
-    let offline = (request.ingress != kr_protocol::actor::ActorIngress::LocalIpc
-        && grant.organisation.as_ref().is_none())
-    .then(|| policy.offline_validity())
+    [
+        expiry,
+        permitted
+            .offline
+            .as_ref()
+            .and_then(crate::grants::policy::HeldBound::utc_deadline_ms),
+        permitted
+            .lease
+            .as_ref()
+            .and_then(crate::grants::policy::HeldBound::utc_deadline_ms),
+    ]
+    .into_iter()
     .flatten()
-    .and_then(|offline| {
-        // The first moment outside the bound, when the clock can represent it. One it cannot is a
-        // bound every representable moment is inside.
-        offline.last_synchronised_at_ms.as_ref().and_then(|last| {
-            last.get()
-                .checked_add(offline.maximum_offline_ms.get())?
-                .checked_add(1)
-        })
-    });
-    [expiry, offline, lease.map(|lease| lease.expires_at_ms)]
-        .into_iter()
-        .flatten()
-        .min()
+    .min()
 }
 
 /// Why a request was refused once every intersection had been applied.

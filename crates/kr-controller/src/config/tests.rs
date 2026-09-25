@@ -842,6 +842,7 @@ fn a_decision_lapses_at_its_grants_expiry_or_the_end_of_the_offline_bound() {
         };
         let mut policy = crate::grants::HostPolicy::personal(AuthorityRevision::new(1));
         policy.set_offline_validity(offline);
+        policy.publish_unanchored(&policy.clone());
         ceilings::decide_with_ceiling(
             None,
             &grant,

@@ -13,6 +13,9 @@ name = "kr-controller"
 path = "src/bin/kr-controller.rs"
 
 [dependencies]
+# Each time bound on authority is published whole through one atomic pointer, which the write
+# boundary reads inside a poll.
+arc-swap.workspace = true
 # The delivery credential the gateway reads is 32 bytes in unpadded base64url.
 base64.workspace = true
 clap.workspace = true

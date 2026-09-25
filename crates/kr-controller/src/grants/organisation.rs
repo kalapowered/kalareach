@@ -30,6 +30,7 @@
 //! bound to, and to no other.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use kr_crypto::sign::SigningTranscript;
@@ -45,6 +46,7 @@ use kr_protocol::scalars::{AuthorisationKey, Digest256, Signature64};
 use kr_transport::clock::ContinuousInstant;
 
 use super::durable::{StoredBinding, StoredEnrolment, StoredLeaseRecord};
+use super::policy::{BoundCell, BoundIdentity, HeldBound};
 use crate::service::net::devices::ObservedUtc;
 
 /// How far this host's clock may be behind a lease's issue time, and how much earlier than its
@@ -195,12 +197,29 @@ impl LeaseRefused {
 }
 
 /// A lease this host installed, and when it ends on the continuous clock.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Its cell ([`BoundCell`]) is the member device's: a lease that replaces it keeps the cell and
+/// publishes its own snapshot there once the policy holding it is written down, and a lease that is
+/// dropped or withdrawn ends the snapshot there. A reader that loaded the cell therefore sees the
+/// bound as the host policy stands.
+#[derive(Clone, Debug)]
 pub struct InstalledLease {
     lease: MembershipLease,
     digest: Digest256,
     continuous_deadline: ContinuousInstant,
+    cell: Arc<BoundCell>,
 }
+
+impl PartialEq for InstalledLease {
+    fn eq(&self, other: &Self) -> bool {
+        self.lease == other.lease
+            && self.digest == other.digest
+            && self.continuous_deadline == other.continuous_deadline
+            && Arc::ptr_eq(&self.cell, &other.cell)
+    }
+}
+
+impl Eq for InstalledLease {}
 
 impl InstalledLease {
     /// The lease as it was presented.
@@ -238,24 +257,29 @@ impl InstalledLease {
         utc_ms < self.lease.payload.expires_at_ms.get()
     }
 
-    /// Its two deadlines, as a decision under it carries them.
+    /// The member device's cell, loaded once: the lease's two deadlines as a decision under it
+    /// carries them.
     #[must_use]
-    pub fn bound(&self) -> LeaseBound {
-        LeaseBound {
-            continuous_deadline: self.continuous_deadline,
-            expires_at_ms: self.lease.payload.expires_at_ms.get(),
-        }
+    pub fn bound(&self) -> HeldBound {
+        HeldBound::load(&self.cell)
     }
-}
 
-/// The two deadlines of the lease a decision was taken under: when it ends on the continuous
-/// clock, and its signed expiry on UTC. A decision holds only while both are ahead.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LeaseBound {
-    /// When the lease ends on the continuous clock.
-    pub continuous_deadline: ContinuousInstant,
-    /// Its signed expiry, in UTC milliseconds.
-    pub expires_at_ms: u64,
+    /// The cell this lease publishes its snapshot through.
+    #[must_use]
+    pub const fn cell(&self) -> &Arc<BoundCell> {
+        &self.cell
+    }
+
+    /// Publishes this lease's snapshot in its cell, unless the cell already states it. Called
+    /// under the host policy's lock, once the policy holding it is written down.
+    pub(crate) fn publish(&self) {
+        self.cell.publish(
+            BoundIdentity::Lease(self.digest),
+            Some(self.continuous_deadline),
+            Some(self.lease.payload.expires_at_ms.get()),
+            false,
+        );
+    }
 }
 
 /// One device bound to a member account, by the first verified lease it presented.
@@ -528,7 +552,8 @@ impl Enrolment {
         self.members.get(&device_id)
     }
 
-    /// The lease in force for the member `device_id` is bound to, at both readings.
+    /// The lease in force for the member `device_id` is bound to, at both readings, with its cell
+    /// loaded once: the lease is decided from that snapshot and carried as it.
     ///
     /// # Errors
     ///
@@ -539,16 +564,22 @@ impl Enrolment {
         device_id: DeviceId,
         now: ContinuousInstant,
         utc_ms: u64,
-    ) -> Result<&InstalledLease, MemberLease> {
+    ) -> Result<(&InstalledLease, HeldBound), MemberLease> {
         let binding = self.members.get(&device_id).ok_or(MemberLease::Unbound)?;
         let installed = self
             .installed(&binding.account_id, &binding.device_key)
             .ok_or(MemberLease::NoLease)?;
-        if installed.in_force(now, utc_ms) {
-            Ok(installed)
-        } else {
+        let held = installed.bound();
+        if held.snapshot().ended_at(now, utc_ms) {
             Err(MemberLease::Expired)
+        } else {
+            Ok((installed, held))
         }
+    }
+
+    /// Every lease installed here now.
+    pub(crate) fn installed_leases(&self) -> impl Iterator<Item = &InstalledLease> {
+        self.installed.values()
     }
 
     /// Removes `device_id`'s binding: the device was revoked. Returns whether it was bound.
@@ -947,12 +978,26 @@ pub(crate) fn install(
             installed_in: presentation.generation,
         },
     );
+    // The member device's cell: the one its earlier lease published through, which this lease
+    // takes over once the policy holding it is written down, or a new one.
+    let cell = enrolment.installed.get(&installed_key).map_or_else(
+        || {
+            BoundCell::new(
+                BoundIdentity::Lease(digest),
+                Some(continuous_deadline),
+                Some(payload.expires_at_ms.get()),
+                false,
+            )
+        },
+        |earlier| Arc::clone(&earlier.cell),
+    );
     enrolment.installed.insert(
         installed_key,
         InstalledLease {
             lease: lease.clone(),
             digest,
             continuous_deadline,
+            cell,
         },
     );
     if binds {

@@ -53,6 +53,10 @@ companion-platform = { path = "apps/companion/native/platform", version = "=0.1.
 # tests build their own trust roots and generations, which needs the same random source and key
 # pair types that crate signs with.
 aws-lc-rs = "=1.18.1"
+# One atomic pointer to a value published whole. The controller publishes each time bound on
+# authority through one, so a reader inside a poll loads it without a lock. Already in the tree
+# through the transport's dependencies.
+arc-swap = "=1.9.2"
 base64 = "=0.23.1"
 boot-time = "=0.1.3"
 cap-fs-ext = "=4.0.3"

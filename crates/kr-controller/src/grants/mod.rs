@@ -303,9 +303,12 @@ pub struct Permitted {
     pub rights: CanonicalSet<ActionRight>,
     /// The revision the decision was taken under.
     pub authority_revision: AuthorityRevision,
-    /// The deadlines of the membership lease the decision was taken under, when one answered for
-    /// it: the decision holds only while both are ahead.
-    pub lease: Option<organisation::LeaseBound>,
+    /// The membership lease the decision was taken under, when one answered for it: the decision
+    /// holds only while both of its deadlines are ahead.
+    pub lease: Option<policy::HeldBound>,
+    /// The bounded offline validity the decision was taken under, when it applied: the decision
+    /// holds only while both of its deadlines are ahead.
+    pub offline: Option<policy::HeldBound>,
     /// The requirements this decision could not answer, for the subject to answer.
     ///
     /// Resource ownership, a pairing transcript, a service credential, a local caller's token and
@@ -475,6 +478,7 @@ pub fn decide(
         rights: intersection.rights,
         authority_revision: policy.authority_revision(),
         lease: intersection.lease,
+        offline: intersection.offline,
         unresolved,
     })
 }

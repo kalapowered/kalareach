@@ -1469,6 +1469,7 @@ fn the_offline_validity_policy_is_optional_and_bounded_when_it_is_chosen() {
         last_synchronised_at_ms: Nullable::null(),
     }));
     bounded.note_feed_synchronised(100_000);
+    bounded.publish_unanchored(&bounded.clone());
     decide(
         &owner,
         &stored,
@@ -2296,18 +2297,24 @@ fn the_intersection_finds_the_lease_through_the_bindings_key() {
         "nor for a push rule naming its grant"
     );
 
-    // The control: this device's own renewal answers both.
+    // The control: this device's own renewal answers both, once the policy holding it is
+    // published as a daemon publishes it.
     let renewed = organisation.lease(2, &account(), *phone.public(), AT_MS, VIEW);
+    let before = policy.clone();
     policy
         .install_lease(LeasePresentation {
             device_id: device_id(0xf1),
             ..presented(&renewed, phone.public(), AT_MS, clock.now(), 1)
         })
         .expect("the renewal installs");
+    policy.publish_unanchored(&before);
     let answered = standing(&mut policy).expect("this device's own lease answers");
     assert_eq!(answered.rights, VIEW.iter().copied().collect());
     assert_eq!(
-        answered.lease.map(|lease| lease.expires_at_ms),
+        answered
+            .lease
+            .as_ref()
+            .and_then(kr_controller::grants::policy::HeldBound::utc_deadline_ms),
         Some(AT_MS + organisation_support::LEASE_MS),
         "and the decision carries that lease's deadlines"
     );
