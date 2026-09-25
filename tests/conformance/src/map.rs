@@ -14,7 +14,8 @@
 //!   module;
 //! * in test code, a comment on a function keys every test of the same target whose body calls it,
 //!   which is how a case that thin per-shell or per-platform tests share is keyed where it is
-//!   written;
+//!   written; a call is resolved by its path, so a local of the same name, a method and a function
+//!   of the same name in another module key nothing;
 //! * a `const` or `static` case table names identifiers in its `covers` fields, and those key every
 //!   test of the same package whose body names the table.
 //!
@@ -246,15 +247,36 @@ struct Table {
     mentions: Vec<(Identifier, String)>,
 }
 
+/// A function of test code whose comments name rows: the tests that call it are keyed to them.
+struct Helper {
+    name: String,
+    file: String,
+    module: Vec<String>,
+    mentions: Vec<(Identifier, String)>,
+}
+
+/// A test and what its body names: the functions it calls and the case tables it reads.
+struct Use {
+    target: TargetId,
+    name: String,
+    module: Vec<String>,
+    uses: BTreeSet<String>,
+    calls: BTreeSet<Vec<String>>,
+}
+
 fn rust_package(map: &mut Map, sources: &mut Sources, root: &Path, package: &Package) {
     let mut tables: Vec<Table> = Vec::new();
-    let mut uses: Vec<(TargetId, String, BTreeSet<String>)> = Vec::new();
+    let mut uses: Vec<Use> = Vec::new();
     // A helper module can be part of several targets, and a helper one of them calls is keyed
     // there; it is a reference only when no target of the package calls it.
     let mut called: BTreeSet<(String, String)> = BTreeSet::new();
     let mut uncalled: BTreeMap<(String, String), Vec<(Identifier, String)>> = BTreeMap::new();
     for target in &package.targets {
-        let mut helpers: Vec<Table> = Vec::new();
+        let mut helpers: Vec<Helper> = Vec::new();
+        let mut scope = Scope {
+            modules: BTreeSet::new(),
+            functions: BTreeSet::new(),
+        };
         let first_use = uses.len();
         let test_target = matches!(target.id.kind, TargetKind::Test | TargetKind::Bench);
         let (modules, warnings) =
@@ -281,14 +303,27 @@ fn rust_package(map: &mut Map, sources: &mut Sources, root: &Path, package: &Pac
                 &mut helpers,
                 &mut uses,
             );
+            scope.modules.insert(module.path.clone());
+            scope
+                .functions
+                .extend(module.entries.iter().filter_map(|entry| match entry {
+                    Entry::Item(item) if item.kind == "fn" => {
+                        item.name.clone().map(|name| (module.path.clone(), name))
+                    }
+                    _ => None,
+                }));
         }
         // A keyed function of test code keys the tests of this target that call it: a case a
         // family of thin tests shares, one per shell or per platform, is keyed where it is written.
         for helper in helpers {
             let callers: Vec<String> = uses[first_use..]
                 .iter()
-                .filter(|(_, _, used)| used.contains(&helper.name))
-                .map(|(_, name, _)| name.clone())
+                .filter(|test| {
+                    test.calls
+                        .iter()
+                        .any(|path| reaches(path, &test.module, &scope, &helper))
+                })
+                .map(|test| test.name.clone())
                 .collect();
             let known = (helper.file.clone(), helper.name.clone());
             if callers.is_empty() {
@@ -324,9 +359,9 @@ fn rust_package(map: &mut Map, sources: &mut Sources, root: &Path, package: &Pac
         }
     }
     for table in tables {
-        let consumers: Vec<&(TargetId, String, BTreeSet<String>)> = uses
+        let consumers: Vec<&Use> = uses
             .iter()
-            .filter(|(_, _, used)| used.contains(&table.name))
+            .filter(|test| test.uses.contains(&table.name))
             .collect();
         for (identifier, source) in &table.mentions {
             if consumers.is_empty() {
@@ -339,12 +374,12 @@ fn rust_package(map: &mut Map, sources: &mut Sources, root: &Path, package: &Pac
                     ),
                 );
             }
-            for (target, name, _) in &consumers {
+            for test in &consumers {
                 map.key(
                     *identifier,
                     Place::Rust {
-                        target: target.clone(),
-                        name: name.clone(),
+                        target: test.target.clone(),
+                        name: test.name.clone(),
                     },
                     Binding::CaseTable,
                     source.clone(),
@@ -354,13 +389,86 @@ fn rust_package(map: &mut Map, sources: &mut Sources, root: &Path, package: &Pac
     }
 }
 
+/// The modules and functions of one target, which is what a call is resolved against.
+struct Scope {
+    modules: BTreeSet<Vec<String>>,
+    functions: BTreeSet<(Vec<String>, String)>,
+}
+
+impl Scope {
+    /// How many functions called `name` the modules under `within` hold, `within` included.
+    fn count_under(&self, within: &[String], name: &str) -> usize {
+        self.functions
+            .iter()
+            .filter(|(module, function)| function == name && module.starts_with(within))
+            .count()
+    }
+}
+
+/// Whether a call written in the module `from` by `path` reaches `helper`.
+///
+/// A path of one name reaches the nearest function of that name in `from` or one of its parents,
+/// the way a test module's `use super::*` reaches the helpers of its file; where none of them has
+/// one, it reaches the target's only function of that name, which a `use` brought in. A longer path
+/// names a module, read from `crate`, `self` or `super` where it starts with one, and otherwise
+/// from `from` and then from the root of the target. It reaches that module's own function of the
+/// name, or, where the module has none, the only function of the name below it, which a
+/// `pub use` of a child module brought up.
+fn reaches(path: &[String], from: &[String], scope: &Scope, helper: &Helper) -> bool {
+    let Some((name, qualifier)) = path.split_last() else {
+        return false;
+    };
+    if *name != helper.name {
+        return false;
+    }
+    if qualifier.is_empty() {
+        let nearest = (0..=from.len())
+            .rev()
+            .map(|depth| &from[..depth])
+            .find(|module| scope.functions.contains(&(module.to_vec(), name.clone())));
+        return match nearest {
+            Some(module) => module == helper.module.as_slice(),
+            None => scope.count_under(&[], name) == 1,
+        };
+    }
+    let candidates: Vec<Vec<String>> = match qualifier[0].as_str() {
+        "crate" => vec![qualifier[1..].to_vec()],
+        "self" | "super" => {
+            let mut base = from.to_vec();
+            let mut rest = &qualifier[usize::from(qualifier[0] == "self")..];
+            while let Some((first, tail)) = rest.split_first()
+                && first == "super"
+            {
+                base.pop();
+                rest = tail;
+            }
+            base.extend_from_slice(rest);
+            vec![base]
+        }
+        _ => vec![
+            from.iter().chain(qualifier).cloned().collect(),
+            qualifier.to_vec(),
+        ],
+    };
+    let Some(module) = candidates
+        .into_iter()
+        .find(|candidate| scope.modules.contains(candidate))
+    else {
+        return false;
+    };
+    if scope.functions.contains(&(module.clone(), name.clone())) {
+        return module == helper.module;
+    }
+    helper.module.starts_with(&module) && scope.count_under(&module, name) == 1
+}
+
 fn rust_module(
     map: &mut Map,
     target: &TargetId,
     module: &Module,
     tables: &mut Vec<Table>,
-    helpers: &mut Vec<Table>,
-    uses: &mut Vec<(TargetId, String, BTreeSet<String>)>,
+    helpers: &mut Vec<Helper>,
+    uses: &mut Vec<Use>,
 ) {
     let prefix = module.path.join("::");
     let full = |name: &str| {
@@ -459,7 +567,13 @@ fn rust_module(
                     );
                     section_keyed = true;
                 }
-                uses.push((target.clone(), name, test.uses.clone()));
+                uses.push(Use {
+                    target: target.clone(),
+                    name,
+                    module: module.path.clone(),
+                    uses: test.uses.clone(),
+                    calls: test.calls.clone(),
+                });
             }
             Entry::Item(item) => {
                 let mut found = Vec::new();
@@ -490,9 +604,10 @@ fn rust_module(
                         });
                     }
                 } else if module.test_code && item.kind == "fn" && !found.is_empty() {
-                    helpers.push(Table {
+                    helpers.push(Helper {
                         name: item.name.clone().unwrap_or_default(),
                         file: module.file.clone(),
+                        module: module.path.clone(),
                         mentions: found,
                     });
                 } else {
