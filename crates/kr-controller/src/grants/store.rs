@@ -206,6 +206,37 @@ pub struct GrantRevocation {
     /// True when one of the revoked grants covered every session, so the fence is not narrowed by
     /// the session list.
     pub covers_every_session: bool,
+    /// The debt this revocation wrote in the transaction that revoked, when it withdrew live
+    /// authority: one row for the whole change, retired only by a barrier that follows it.
+    pub debt: Option<DebtId>,
+}
+
+/// The identity of one restrictive change's fence debt.
+///
+/// Drawn fresh for every change, so no two changes share a row and nothing can absorb one debt
+/// into another: a debt is retired only by a barrier whose revision advanced after its own
+/// restriction took effect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DebtId(kr_protocol::scalars::Uuid);
+
+impl DebtId {
+    /// A fresh identity.
+    #[must_use]
+    pub fn fresh() -> Self {
+        Self(kr_ipc::new_uuid())
+    }
+
+    /// The identity's bytes, as the row keys it.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        self.0.as_bytes()
+    }
+}
+
+impl core::fmt::Display for DebtId {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Display::fmt(&self.0, formatter)
+    }
 }
 
 impl GrantRevocation {
@@ -315,7 +346,8 @@ impl GrantDirectory {
                      expires_at_ms       INTEGER NOT NULL
                  );
                  CREATE TABLE IF NOT EXISTS fence_debt (
-                     grant_id      BLOB PRIMARY KEY NOT NULL,
+                     debt_id        BLOB PRIMARY KEY NOT NULL,
+                     covers         TEXT NOT NULL,
                      recorded_at_ms INTEGER NOT NULL
                  );
                  CREATE TABLE IF NOT EXISTS grant_deadlines (
@@ -337,6 +369,7 @@ impl GrantDirectory {
         migrate_receipts(&connection)?;
         migrate_grants(&connection)?;
         migrate_policy(&connection)?;
+        migrate_fence_debt(&connection)?;
         Ok(Self {
             connection: std::sync::Mutex::new(connection),
             live: Arc::new(LiveClaims::default()),
@@ -731,7 +764,14 @@ impl GrantDirectory {
             // holds, so a check made before it is a check with a read still to come.
             let subtree = Self::subtree_to_revoke(connection, grant_id)?;
             still_admitted()?;
-            let revocation = Self::revoke_subtree(connection, grant_id, &subtree, now_ms)?;
+            let revocation = Self::revoke_subtree(
+                connection,
+                grant_id,
+                &subtree,
+                now_ms,
+                &mut None,
+                &format!("the revocation of grant {grant_id}"),
+            )?;
             if let Some(hold) = claim {
                 record_withdrawal(connection, hold, &revocation.revoked)?;
             }
@@ -771,6 +811,7 @@ impl GrantDirectory {
                 devices: BTreeSet::new(),
                 sessions: BTreeSet::new(),
                 covers_every_session: false,
+                debt: None,
             };
             merged.devices.insert(device_id);
             // Every subtree is read before any of them is written, so the check below is the last
@@ -799,13 +840,19 @@ impl GrantDirectory {
                 subtrees.push((grant_id, subtree));
             }
             still_admitted()?;
+            // One change, one debt, however many subtrees it withdraws.
+            let covers = format!("the revocation of device {device_id}'s grants");
+            let mut debt = None;
             for (grant_id, subtree) in &subtrees {
-                let one = Self::revoke_subtree(connection, *grant_id, subtree, now_ms)?;
+                let one = Self::revoke_subtree(
+                    connection, *grant_id, subtree, now_ms, &mut debt, &covers,
+                )?;
                 merged.revoked.extend(one.revoked);
                 merged.devices.extend(one.devices);
                 merged.sessions.extend(one.sessions);
                 merged.covers_every_session |= one.covers_every_session;
             }
+            merged.debt = debt;
             if let Some(hold) = claim {
                 record_withdrawal(connection, hold, &merged.revoked)?;
             }
@@ -823,9 +870,10 @@ impl GrantDirectory {
         connection: &Connection,
         grant_id: GrantId,
         now_ms: u64,
+        covers: &str,
     ) -> Result<GrantRevocation> {
         let subtree = Self::subtree_to_revoke(connection, grant_id)?;
-        Self::revoke_subtree(connection, grant_id, &subtree, now_ms)
+        Self::revoke_subtree(connection, grant_id, &subtree, now_ms, &mut None, covers)
     }
 
     /// The grants one revocation would withdraw: the named one and everything below it.
@@ -843,11 +891,17 @@ impl GrantDirectory {
     }
 
     /// Withdraws a subtree [`Self::subtree_to_revoke`] read, inside the caller's transaction.
+    ///
+    /// The first live grant it withdraws writes the change's one debt row into `debt`, which names
+    /// what the change was (`covers`); a later subtree of the same change finds it written and
+    /// writes nothing more.
     fn revoke_subtree(
         connection: &Connection,
         grant_id: GrantId,
         subtree: &[GrantRecord],
         now_ms: u64,
+        debt: &mut Option<DebtId>,
+        covers: &str,
     ) -> Result<GrantRevocation> {
         let mut revoked = Vec::new();
         let mut devices = BTreeSet::new();
@@ -886,17 +940,12 @@ impl GrantDirectory {
             if let Some(session_id) = record.session_id {
                 sessions.insert(session_id);
             }
-            if record.is_active() {
-                // Debt only for authority that was live. Withdrawing a proposal nobody redeemed
+            if record.is_active() && debt.is_none() {
+                // Debt only for authority that was live, and one row for the change, written in
+                // the transaction that is its restriction. Withdrawing a proposal nobody redeemed
                 // takes nothing away from anybody, so there is nothing to fence, and recording it
                 // would make an ordinary cancellation fence the host later.
-                connection
-                    .execute(
-                        "INSERT OR IGNORE INTO fence_debt (grant_id, recorded_at_ms)
-                         VALUES (?1, ?2)",
-                        params![record.grant.grant_id.get().as_bytes().as_slice(), moment],
-                    )
-                    .map_err(ControllerError::registry)?;
+                *debt = Some(owe_within(connection, covers, now_ms)?);
             }
             revoked.push(record.grant.grant_id);
         }
@@ -906,6 +955,7 @@ impl GrantDirectory {
             devices,
             sessions,
             covers_every_session,
+            debt: *debt,
         })
     }
 
@@ -1177,7 +1227,12 @@ impl GrantDirectory {
                 });
             }
             // The proposal goes with it. It was never active, so this leaves nothing to fence.
-            Self::revoke_within(connection, invitation.grant_id, now_ms)
+            Self::revoke_within(
+                connection,
+                invitation.grant_id,
+                now_ms,
+                &format!("the withdrawal of invitation {invitation_id}"),
+            )
         })
     }
 
@@ -1240,74 +1295,46 @@ impl GrantDirectory {
             }
             check(&source)?;
             write_grant(connection, replacement, &encoded)?;
-            Self::revoke_within(connection, source_grant_id, now_ms)
+            Self::revoke_within(
+                connection,
+                source_grant_id,
+                now_ms,
+                &format!("the transfer of control away from grant {source_grant_id}"),
+            )
         });
         self.after_effect(transferred, ran_out.get())
     }
 
     // --- Fence debt -------------------------------------------------------------------------
 
-    /// Records that a revocation needs a fence that has not happened yet.
+    /// Writes one restrictive change's fence debt, under a fresh identity, and returns it.
     ///
-    /// A revocation is two halves: the rows change here, and the daemon then advances the
-    /// authority revision and fences what was admitted under it. If the second half fails, a retry
-    /// would find nothing *newly* revoked and read the work as done. So the first half writes the
-    /// debt down, by grant, and only a completed fence clears it. A timestamp would not do: two
-    /// revocations in the same millisecond, or one while the host's time floor is holding the
-    /// reading constant, are indistinguishable by time and distinguishable by identity.
-    ///
-    /// A device revocation that touched no grant row still owes a fence, so it records the device's
-    /// identity in the same table under its own key.
+    /// A change that narrows authority some copy may still hold writes this before its restriction
+    /// takes effect, and only a barrier whose revision advanced after the restriction retires it.
+    /// The row names what it covers for the record; it is keyed by nothing the caller chose, so no
+    /// two changes can share one and no write can absorb another's. A revocation of stored grants
+    /// writes its row inside the transaction that revokes, which is its restriction.
     ///
     /// # Errors
     ///
-    /// Returns a storage error when the rows cannot be written.
-    pub fn owe_fence(
-        &self,
-        keys: impl IntoIterator<Item = GrantId>,
-        now_ms: u64,
-    ) -> Result<Vec<GrantId>> {
-        let keys: Vec<GrantId> = keys.into_iter().collect();
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.in_transaction(|connection| {
-            let mut written = Vec::new();
-            for key in keys {
-                let rows = connection
-                    .execute(
-                        "INSERT OR IGNORE INTO fence_debt (grant_id, recorded_at_ms)
-                         VALUES (?1, ?2)",
-                        params![
-                            key.get().as_bytes().as_slice(),
-                            i64::try_from(now_ms).unwrap_or(i64::MAX),
-                        ],
-                    )
-                    .map_err(ControllerError::registry)?;
-                if rows > 0 {
-                    written.push(key);
-                }
-            }
-            // What *this* call wrote. A caller that finds its work already done clears only its
-            // own intent: debt that was already there belongs to an attempt that has not been
-            // fenced, and erasing it would leave that withdrawal unfenced for ever.
-            Ok(written)
-        })
+    /// Returns a storage error when the row cannot be written.
+    pub fn owe_fence(&self, covers: &str, now_ms: u64) -> Result<DebtId> {
+        self.in_transaction(|connection| owe_within(connection, covers, now_ms))
     }
 
-    /// Returns the revocations still owed a fence.
+    /// Returns every fence debt on disk, oldest first.
     ///
-    /// The caller takes this list, fences, and hands the same list back to
-    /// [`Self::fence_completed`]. Reading and clearing the whole table instead would let one fence
-    /// retire debt a revocation recorded while that fence was waiting on a worker.
+    /// A daemon that starts reads these as owed a barrier: whatever restriction each stands for
+    /// took effect before the stop or never will, and a barrier that repeats one withdraws and
+    /// grants nothing.
     ///
     /// # Errors
     ///
     /// Returns a storage error when the rows cannot be read.
-    pub fn fence_owed(&self) -> Result<Vec<GrantId>> {
+    pub fn fence_owed(&self) -> Result<Vec<DebtId>> {
         let rows: Vec<Option<Vec<u8>>> = self.with(|connection| {
-            let mut statement =
-                connection.prepare("SELECT grant_id FROM fence_debt ORDER BY grant_id")?;
+            let mut statement = connection
+                .prepare("SELECT debt_id FROM fence_debt ORDER BY recorded_at_ms, debt_id")?;
             let rows = statement
                 .query_map([], |row| row.get(0))?
                 .collect::<rusqlite::Result<Vec<Option<Vec<u8>>>>>()?;
@@ -1315,29 +1342,29 @@ impl GrantDirectory {
         })?;
         Ok(rows
             .into_iter()
-            .filter_map(|bytes| bytes.as_deref().and_then(uuid_of).map(GrantId::new))
+            .filter_map(|bytes| bytes.as_deref().and_then(uuid_of).map(DebtId))
             .collect())
     }
 
-    /// Clears exactly the debt a completed fence covered.
+    /// Deletes exactly the debts a completed barrier captured.
     ///
-    /// Called only after the revision advanced and the connections were fenced, and only for the
-    /// rows that fence was started for. Clearing the table would retire a revocation that arrived
-    /// while this fence was waiting, and that one has had no fence of its own.
+    /// Called only once the barrier's revision advanced and its fence was announced, and only for
+    /// the rows it captured: a debt published while it ran has had no barrier of its own.
     ///
     /// # Errors
     ///
-    /// Returns a storage error when the rows cannot be written.
-    pub fn fence_completed(&self, covered: &[GrantId]) -> Result<()> {
+    /// Returns a storage error when the rows cannot be deleted. They stay on disk then, and the
+    /// next start raises one more barrier for them.
+    pub fn fence_completed(&self, covered: &[DebtId]) -> Result<()> {
         if covered.is_empty() {
             return Ok(());
         }
         self.in_transaction(|connection| {
-            for key in covered {
+            for debt in covered {
                 connection
                     .execute(
-                        "DELETE FROM fence_debt WHERE grant_id = ?1",
-                        params![key.get().as_bytes().as_slice()],
+                        "DELETE FROM fence_debt WHERE debt_id = ?1",
+                        params![debt.as_bytes().as_slice()],
                     )
                     .map_err(ControllerError::registry)?;
             }
@@ -2107,6 +2134,40 @@ fn migrate_grants(connection: &Connection) -> Result<()> {
     transaction.commit().map_err(ControllerError::registry)
 }
 
+/// Brings the fence debt forward, once, from the shape earlier builds wrote.
+///
+/// Earlier builds keyed a debt by what it withdrew, a grant's identity or a device's, and wrote it
+/// with `INSERT OR IGNORE`, so a second withdrawal of the same thing before a fence could be
+/// absorbed into the first's row. Each row now stands for one restrictive change under an identity
+/// no other change writes. A row an earlier build wrote is still a debt this host owes: it is kept,
+/// under the identity it had, and says it came from an earlier build. Inside one immediate
+/// transaction, so two processes opening one store change it once.
+///
+/// Remove this once no supported upgrade starts from a build that keyed its debt by grant.
+fn migrate_fence_debt(connection: &Connection) -> Result<()> {
+    let transaction =
+        rusqlite::Transaction::new_unchecked(connection, rusqlite::TransactionBehavior::Immediate)
+            .map_err(ControllerError::registry)?;
+    let columns: BTreeSet<String> = transaction
+        .prepare("SELECT name FROM pragma_table_info('fence_debt')")
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| row.get(0))?
+                .collect::<rusqlite::Result<BTreeSet<String>>>()
+        })
+        .map_err(ControllerError::registry)?;
+    if columns.contains("grant_id") {
+        transaction
+            .execute_batch(
+                "ALTER TABLE fence_debt RENAME COLUMN grant_id TO debt_id;
+                 ALTER TABLE fence_debt ADD COLUMN covers TEXT NOT NULL
+                     DEFAULT 'a withdrawal an earlier build recorded';",
+            )
+            .map_err(ControllerError::registry)?;
+    }
+    transaction.commit().map_err(ControllerError::registry)
+}
+
 /// Upgrades the stored policy row, once, from the shape earlier builds wrote.
 ///
 /// Earlier builds wrote each enrolment as two numbers, a pinned key revision and a pinned policy
@@ -2336,6 +2397,22 @@ fn read_row(row: &rusqlite::Row<'_>) -> Row {
         revoked_at_ms: revoked.map(|moment| u64::try_from(moment).unwrap_or_default()),
         revoked_by_parent: by_parent.as_deref().and_then(uuid_of).map(GrantId::new),
     })
+}
+
+/// Writes one change's fence debt inside the caller's transaction ([`GrantDirectory::owe_fence`]).
+fn owe_within(connection: &Connection, covers: &str, now_ms: u64) -> Result<DebtId> {
+    let debt = DebtId::fresh();
+    connection
+        .execute(
+            "INSERT INTO fence_debt (debt_id, covers, recorded_at_ms) VALUES (?1, ?2, ?3)",
+            params![
+                debt.as_bytes().as_slice(),
+                covers,
+                i64::try_from(now_ms).unwrap_or(i64::MAX),
+            ],
+        )
+        .map_err(ControllerError::registry)?;
+    Ok(debt)
 }
 
 fn uuid_of(bytes: &[u8]) -> Option<kr_protocol::scalars::Uuid> {

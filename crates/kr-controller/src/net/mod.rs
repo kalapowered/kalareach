@@ -322,11 +322,10 @@ impl Network {
 
     /// Revokes one device, and reports which workers have not yet acknowledged it.
     ///
-    /// The record and the authority revision move in one critical section, in the lock order the
-    /// daemon's own revocation takes. That is what closes the window a revocation would otherwise
-    /// have: a connection cannot be admitted between the moment the record is withdrawn and the
-    /// moment the revision that fences the live ones is in force, because both happen before the
-    /// registry lock is released.
+    /// A restrictive change in the order every one takes: its debt is written, its restriction
+    /// (the record) takes effect, and the daemon's one barrier retires the debt. The device cannot
+    /// be admitted once its record is withdrawn, and the barrier fences whatever was admitted under
+    /// it before.
     ///
     /// A revocation is not complete when it is recorded. It is complete for a worker once that
     /// worker has acknowledged the revision and said what its fence did, or has been confirmed
@@ -563,54 +562,35 @@ impl NetworkHost {
 
     /// Revokes one device and fences whatever it was doing.
     ///
-    /// The order is the contract. The live fence goes first, because it is the only step that
-    /// cannot fail and the only one whose absence would leave a revoked device being served: the
-    /// registration is withdrawn, the connection's write boundary is closed, and what it owned at
-    /// its worker is released. Only then is the record written and the revision advanced, both
-    /// inside the same critical section, so nothing can be admitted between a withdrawn record and
-    /// the revision that fences the connections already admitted. A failure after the fence is
-    /// reported with the fence standing rather than silently leaving it undone.
+    /// The order is the contract: the debt, then the live fence, the record and the barrier. A
+    /// failure after the fence is reported with the fence standing rather than silently leaving it
+    /// undone.
     async fn revoke_device(
         &self,
         device_id: DeviceId,
     ) -> Result<kr_protocol::action::RevocationBarrier> {
         let controller = self.daemon()?;
-        let revision = {
-            let mut registry = controller.registry.lock().await;
-            let revoked = kr_transport::listener::device_principal(&device_id);
-            // The connections this fences are this device's. Nobody else's authority was
-            // withdrawn, and a local terminal losing its connection because a phone was revoked
-            // would be a fence on the wrong thing.
-            let mut admitted = controller.admitted_table();
-            admitted.retain(|_, connection| connection.actor_id != revoked);
-            drop(admitted);
-            self.withdraw_device(device_id);
-            self.devices.revoke(device_id, kr_ipc::now_ms())?;
-            registry.advance_authority_revision()?;
-            let revision = registry.authority_revision()?;
-            // The connections that were *not* withdrawn hold authority this revocation did not
-            // touch, so they are admitted at the revision now in force. Leaving them at the
-            // previous one would refuse their next mutation as revoked and make one device's
-            // revocation everybody's reconnection. What the revision still fences is work already
-            // admitted: a mutation carries the revision it was admitted under, and one admitted
-            // before this point is refused inside its own transaction as it was before.
-            let mut admitted = controller.admitted_table();
-            for connection in admitted.values_mut() {
-                connection.admitted_revision = revision;
-            }
-            drop(admitted);
-            revision
-        };
-        controller.leases.revoke(revision);
-        // The host policy decides a paired device's request against the revision in force, and a
-        // device paired after this revocation is issued a grant at this revision.
-        controller
-            .policy
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .advance_authority_revision(revision);
+        // The debt first, pending, so a stop after the record changes still owes a barrier.
+        let debt = controller.owe_debt(
+            &format!("the revocation of device {device_id}"),
+            crate::service::Reach::Device(device_id),
+        )?;
+        // The live fence, because it is the only step that cannot fail and the only one whose
+        // absence would leave a revoked device being served: its connections' write boundaries are
+        // closed and what they owned at their workers is released.
+        self.withdraw_device(device_id);
+        // The restriction. The debt is published whether or not it landed: a barrier for a
+        // revocation whose record did not change withdraws nothing more, and a failure is reported
+        // with the fence standing rather than silently leaving it undone.
+        let recorded = self.devices.revoke(device_id, kr_ipc::now_ms());
+        controller.publish_debts(&[(debt, crate::service::Reach::Device(device_id))]);
+        // The barrier withdraws this device's registrations and admits every other connection at
+        // the revision it advances to: nobody else's authority was withdrawn, and a local terminal
+        // losing its connection because a phone was revoked would be a fence on the wrong thing.
+        let barrier = controller.barrier().await;
+        recorded?;
         controller.unbind_device(device_id);
-        controller.announce_authority_revision().await
+        barrier
     }
 
     /// Establishes this host's clock again, on an owner's authority.

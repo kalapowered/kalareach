@@ -215,7 +215,11 @@ fn a_withdrawal_that_loses_its_admission_at_the_store_writes_nothing() {
         .expect("revoked");
 }
 
-/// A fence a revocation owes survives the failure of the half that would have cleared it.
+/// Every restrictive change writes one debt of its own, under an identity no other change writes,
+/// in the transaction that is its restriction, and it survives the failure of the barrier that
+/// would retire it. A revocation and a device's revocation each write one row however many grants
+/// they withdraw; a repeat that withdraws nothing, and a proposal nobody redeemed, write none; and
+/// two changes of the same authority write two rows, so neither can absorb the other.
 #[test]
 fn a_revocation_writes_its_fence_debt_down_before_the_fence_is_attempted() {
     let directory = GrantDirectory::in_memory().expect("a grant store");
@@ -223,43 +227,122 @@ fn a_revocation_writes_its_fence_debt_down_before_the_fence_is_attempted() {
     directory
         .issue(&record(held.clone()), || Ok(()))
         .expect("written");
+    let child = grant(
+        3,
+        Some(held.grant_id),
+        &[ActionRight::SessionView],
+        GrantExpiry::Never,
+    );
+    directory.issue(&record(child), || Ok(())).expect("written");
 
     assert!(
         directory.fence_owed().expect("readable").is_empty(),
         "nothing is owed before anything is revoked"
     );
-    directory
+    let first = directory
         .revoke(held.grant_id, 4_000, || Ok(()))
-        .expect("revoked");
-    let owed = directory.fence_owed().expect("readable");
+        .expect("revoked")
+        .debt
+        .expect("a live withdrawal owes a fence");
     assert_eq!(
-        owed,
-        vec![held.grant_id],
-        "the debt is written in the same transaction as the revocation"
+        directory.fence_owed().expect("readable"),
+        vec![first],
+        "one row for the whole subtree, written in the same transaction as the revocation"
+    );
+    assert_eq!(
+        directory
+            .revoke(held.grant_id, 4_050, || Ok(()))
+            .expect("a repeat")
+            .debt,
+        None,
+        "a repeat withdraws nothing and owes nothing more"
     );
 
-    // A second revocation arrives while the first fence is still waiting. Clearing what the first
-    // fence covered must not retire the second one's debt.
+    // A second revocation arrives while the first fence is still waiting. It owes a debt of its
+    // own, and clearing what the first fence covered must not retire it.
     let second = grant(2, None, &[ActionRight::SessionView], GrantExpiry::Never);
     directory
         .issue(&record(second.clone()), || Ok(()))
         .expect("written");
-    directory
+    let second_debt = directory
         .revoke(second.grant_id, 4_100, || Ok(()))
-        .expect("revoked");
+        .expect("revoked")
+        .debt
+        .expect("a live withdrawal owes a fence");
+    assert_ne!(second_debt, first);
     directory
-        .fence_completed(&owed)
+        .fence_completed(&[first])
         .expect("the first fence finished");
     assert_eq!(
         directory.fence_owed().expect("readable"),
-        vec![second.grant_id],
+        vec![second_debt],
         "a revocation that arrived during a fence still owes one of its own"
     );
-
     directory
-        .fence_completed(&[second.grant_id])
+        .fence_completed(&[second_debt])
         .expect("the second fence finished");
     assert!(directory.fence_owed().expect("readable").is_empty());
+
+    // A device's revocation withdraws both of its live grants under one row; a proposal nobody
+    // redeemed takes nothing away and owes nothing.
+    for (byte, live) in [(4, true), (5, true), (6, false)] {
+        let held = grant(byte, None, &[ActionRight::SessionView], GrantExpiry::Never);
+        let stored = if live { record(held) } else { proposal(held) };
+        directory.issue(&stored, || Ok(())).expect("written");
+    }
+    let device = directory
+        .revoke_device(device_id(0xf1), 4_200, || Ok(()), None)
+        .expect("revoked");
+    assert_eq!(device.revoked.len(), 3);
+    assert_eq!(
+        directory.fence_owed().expect("readable"),
+        vec![device.debt.expect("a live withdrawal owes a fence")]
+    );
+    directory
+        .fence_completed(&directory.fence_owed().expect("readable"))
+        .expect("finished");
+
+    // Two changes of the same thing, each writing its own debt before its restriction, are two
+    // rows under two identities.
+    let one = directory.owe_fence("a change", 4_300).expect("written");
+    let other = directory.owe_fence("a change", 4_300).expect("written");
+    assert_ne!(one, other);
+    let owed: std::collections::BTreeSet<_> = directory
+        .fence_owed()
+        .expect("readable")
+        .into_iter()
+        .collect();
+    assert_eq!(owed, [one, other].into_iter().collect());
+}
+
+/// A store an earlier build wrote keyed its fence debt by what it withdrew. That debt is still
+/// owed: it comes forward as one debt under the identity it had, which a barrier retires like any
+/// other, and a second opening changes nothing.
+#[test]
+fn a_fence_debt_an_earlier_build_wrote_is_still_owed() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let path = directory.path().join("grants.sqlite3");
+    {
+        let earlier = rusqlite::Connection::open(&path).expect("opens");
+        earlier
+            .execute_batch(
+                "CREATE TABLE fence_debt (
+                     grant_id       BLOB PRIMARY KEY NOT NULL,
+                     recorded_at_ms INTEGER NOT NULL
+                 );
+                 INSERT INTO fence_debt (grant_id, recorded_at_ms)
+                     VALUES (x'07070707070707070707070707070707', 1000);",
+            )
+            .expect("the earlier shape");
+    }
+    let store = GrantDirectory::open(&path).expect("the store opens and comes forward");
+    let owed = store.fence_owed().expect("readable");
+    assert_eq!(owed.len(), 1, "the earlier debt is still owed");
+    drop(store);
+    let store = GrantDirectory::open(&path).expect("a second opening");
+    assert_eq!(store.fence_owed().expect("readable"), owed);
+    store.fence_completed(&owed).expect("a barrier retires it");
+    assert!(store.fence_owed().expect("readable").is_empty());
 }
 
 /// A claim excludes every other attempt, however long its own attempt runs, and an attempt that
