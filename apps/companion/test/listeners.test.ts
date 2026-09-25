@@ -331,6 +331,21 @@ describe('the scripted host', () => {
     expect(await settled(later)).toBe(false)
   })
 
+  it('refuses the way native code does: with a rejected promise, and never with a throw first', async () => {
+    const { port, controls } = fakeHost()
+    controls.setConnected(false)
+    const asked: Promise<unknown>[] = []
+    // Held or not, a read out of contact is refused, and the refusal is the promise's.
+    const held = controls.hold('sessionList')
+    expect(() => asked.push(port.agentSnapshot({}))).not.toThrow()
+    expect(() => asked.push(port.hostInfo())).not.toThrow()
+    expect(() => asked.push(port.sessionList({}))).not.toThrow()
+    held.release()
+    for (const answer of asked) {
+      await expect(answer).rejects.toMatchObject({ code: 'RESOURCE_UNAVAILABLE' })
+    }
+  })
+
   it('keeps a refusal as the held answer, and stops holding once released', async () => {
     const { port, controls } = fakeHost()
     const held = controls.hold('sessionRead')

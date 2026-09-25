@@ -289,6 +289,14 @@ export type HeldRead =
   | 'attentionRead'
   | 'sessionRead'
   | 'launchSurface'
+  | 'agentSnapshot'
+  | 'sessionList'
+  | 'hostInfo'
+  | 'environmentList'
+  | 'changesetRead'
+  | 'storageStatus'
+  | 'pluginList'
+  | 'terminalProjection'
 
 /** The reads of one kind a test is holding. */
 export interface HeldReads {
@@ -354,6 +362,8 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
   const importedImages: string[] = []
   const uploaded: string[] = []
   const nodes: DocumentNode[] = startingConversation()
+  /** How far above its live screen each session's view is looking, in rows. */
+  const rowsAbove = new Map<string, number>()
   const acknowledged = new Set<string>()
   const deletedArtefacts = new Set<string>()
   const openedPanes: string[] = []
@@ -464,19 +474,22 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       return Promise.resolve(found)
     },
 
-    hostInfo: () => {
-      requireConnection()
-      return Promise.resolve(hostInfo())
-    },
-    environmentList: () => {
-      requireConnection()
-      return Promise.resolve(environments())
-    },
+    hostInfo: () =>
+      reading('hostInfo', () => {
+        requireConnection()
+        return hostInfo()
+      }),
+    environmentList: () =>
+      reading('environmentList', () => {
+        requireConnection()
+        return environments()
+      }),
 
-    sessionList: () => {
-      requireConnection()
-      return Promise.resolve(sessions())
-    },
+    sessionList: () =>
+      reading('sessionList', () => {
+        requireConnection()
+        return sessions()
+      }),
     sessionRead: (params) =>
       reading('sessionRead', () => {
         requireConnection()
@@ -530,10 +543,11 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       })
     },
 
-    agentSnapshot: () => {
-      requireConnection()
-      return Promise.resolve({ nodes: [...nodes] })
-    },
+    agentSnapshot: () =>
+      reading('agentSnapshot', () => {
+        requireConnection()
+        return { nodes: [...nodes] }
+      }),
     agentCommands: () =>
       Promise.resolve({
         commands: [
@@ -686,12 +700,24 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       return Promise.resolve(settledAs('grant.create', 'applied'))
     },
 
-    pluginList: () => Promise.resolve(packages() as unknown),
+    pluginList: () =>
+      reading('pluginList', () => {
+        requireConnection()
+        return packages()
+      }),
     catalogueList: () => Promise.resolve(packages() as unknown),
 
-    changesetRead: () => Promise.resolve(changesets() as unknown),
+    changesetRead: () =>
+      reading('changesetRead', () => {
+        requireConnection()
+        return changesets()
+      }),
 
-    storageStatus: () => Promise.resolve(retained(deletedArtefacts) as unknown),
+    storageStatus: () =>
+      reading('storageStatus', () => {
+        requireConnection()
+        return retained(deletedArtefacts)
+      }),
     storageObjectDelete: (params) => {
       const id = (params as { object_id?: string }).object_id
       const artefact = retained(new Set()).artefacts.find((each) => each.object_id === id)
@@ -705,16 +731,24 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       return Promise.resolve(settledAs('storage.object.delete', 'applied'))
     },
 
-    terminalProjection: () => {
-      requireConnection()
-      return Promise.resolve(projection())
-    },
+    terminalProjection: (params) =>
+      reading('terminalProjection', () => {
+        requireConnection()
+        const sessionId = (params as { session_id?: string } | null)?.session_id ?? SESSION_MAIN
+        return projection(sessionId, rowsAbove.get(sessionId) ?? 0)
+      }),
     terminalInput: (params) => {
       requireConnection()
       return Promise.resolve({ accepted: true, sequence: '1', echo: params })
     },
-    attachmentViewport: () =>
-      Promise.resolve(settledAs('attachment.viewport', 'applied')),
+    // The window a view asks for is where its screen starts from then on: a number of rows above
+    // the live screen, or the live screen itself.
+    attachmentViewport: (params) => {
+      const asked = params as { session_id?: string; viewport?: { rows_above?: number } } | null
+      const sessionId = asked?.session_id ?? SESSION_MAIN
+      rowsAbove.set(sessionId, Math.max(0, asked?.viewport?.rows_above ?? 0))
+      return Promise.resolve(settledAs('attachment.viewport', 'applied'))
+    },
 
     pairingView: () => Promise.resolve(pairing),
     pairingSetOrigin: (origin) => {
@@ -1178,12 +1212,38 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     }
   }
 
-  return { port, controls }
+  return { port: answeringAsNativeCodeDoes(port), controls }
 }
 
 /** What a held read's place holds once it has been answered. */
 function answered(): void {
   // An answer is given once.
+}
+
+/**
+ * The port with every refusal delivered the way native code delivers it.
+ *
+ * A command the desktop shell carries answers with a promise, and a refusal is that promise's
+ * rejection: nothing is ever thrown before the promise exists. The methods above refuse by
+ * throwing, which is the plainest way to write a refusal, so each is called here and a throw
+ * becomes the rejection a page would receive. A scripted host that threw would let a page pass
+ * against a failure shape no real host produces.
+ */
+function answeringAsNativeCodeDoes(port: HostPort): HostPort {
+  const answering: Record<string, unknown> = {}
+  for (const [name, method] of Object.entries(port) as [string, (...args: unknown[]) => unknown][]) {
+    answering[name] = (...args: unknown[]): unknown => {
+      try {
+        return method(...args)
+      } catch (refusal: unknown) {
+        return new Promise((_, reject) => {
+          // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors -- a refusal is the data native code rejects with, never an Error
+          reject(refusal)
+        })
+      }
+    }
+  }
+  return answering as unknown as HostPort
 }
 
 /** The scripted call, held apart from the host's own state because it is this device's. */
@@ -1761,42 +1821,63 @@ function grants(): IssuedGrants {
 /**
  * A projected screen with the two things the raw view has to get right: a cluster the renderer
  * cannot reproduce, and a viewport above the live end.
+ *
+ * Each session has a screen of its own, so a view that shows one session's screen under another's
+ * name is caught by what it draws. A window `rowsAbove` rows above the live screen starts where
+ * that many rows up would, and never above the oldest row the host retains.
  */
-function projection(): ProjectedScreen {
+function projection(sessionId: string, rowsAbove: number): ProjectedScreen {
   const line = (row: number, text: string) => ({
     row,
     cells: [...text].map((character) => ({ text: character, width: 1 }))
   })
+  const screen =
+    sessionId === SESSION_MAIN
+      ? {
+          dimensions: { columns: '80', rows: '8' },
+          rows: [
+            line(101, '$ cargo test -p kr-client'),
+            line(102, '   Compiling kr-client v0.1.0'),
+            line(103, '    Finished test profile in 12.4s'),
+            {
+              row: 104,
+              cells: [
+                { text: 'o', width: 1 },
+                { text: 'k', width: 1 },
+                { text: ' ', width: 1 },
+                // A family emoji: one cluster, two columns, and no font here can draw it.
+                { text: '\u{1F468}‍\u{1F469}‍\u{1F467}', width: 2 },
+                { text: '', width: 0 },
+                { text: ' ', width: 1 },
+                { text: 'd', width: 1 },
+                { text: 'o', width: 1 },
+                { text: 'n', width: 1 },
+                { text: 'e', width: 1 }
+              ]
+            },
+            line(105, 'test result: ok. 143 passed'),
+            line(106, '$ '),
+            line(107, ''),
+            line(108, '')
+          ],
+          cursor: { column: 2, row: 106, visible: true }
+        }
+      : {
+          dimensions: { columns: '100', rows: '4' },
+          rows: [
+            line(201, '$ pnpm -r build'),
+            line(202, 'apps/companion build: done'),
+            line(203, '$ '),
+            line(204, '')
+          ],
+          cursor: { column: 2, row: 203, visible: true }
+        }
+  const oldest = 1
+  const liveTop = screen.rows[0]?.row ?? oldest
   return {
-    dimensions: { columns: '80', rows: '8' },
-    rows: [
-      line(101, '$ cargo test -p kr-client'),
-      line(102, '   Compiling kr-client v0.1.0'),
-      line(103, '    Finished test profile in 12.4s'),
-      {
-        row: 104,
-        cells: [
-          { text: 'o', width: 1 },
-          { text: 'k', width: 1 },
-          { text: ' ', width: 1 },
-          // A family emoji: one cluster, two columns, and no font here can draw it.
-          { text: '\u{1F468}‍\u{1F469}‍\u{1F467}', width: 2 },
-          { text: '', width: 0 },
-          { text: ' ', width: 1 },
-          { text: 'd', width: 1 },
-          { text: 'o', width: 1 },
-          { text: 'n', width: 1 },
-          { text: 'e', width: 1 }
-        ]
-      },
-      line(105, 'test result: ok. 143 passed'),
-      line(106, '$ '),
-      line(107, ''),
-      line(108, '')
-    ],
-    cursor: { column: 2, row: 106, visible: true },
-    viewport_top_row: null,
-    oldest_retained_row: 1,
+    ...screen,
+    viewport_top_row: rowsAbove > 0 ? Math.max(oldest, liveTop - rowsAbove) : null,
+    oldest_retained_row: oldest,
     palette_provenance: 'client_probe',
     palette: [
       '#071217', '#a2352e', '#315e4a', '#7b500d', '#1a57b5', '#6b4d8a', '#2f6f74', '#dcdcda',
