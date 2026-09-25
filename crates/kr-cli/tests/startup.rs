@@ -2891,7 +2891,8 @@ fn a_manager_holding_anything_but_the_definition_kr_wrote_is_not_asked_to_start_
 /// reached through a link to a directory that is also named `service.d`.
 ///
 /// For each, `kr new` names the command the manager would run and the setup action, and nothing
-/// is started. Once the person has removed it, `kr new` goes on.
+/// is started: the other command leaves a mark when it runs, and there is none. Once the person
+/// has removed the drop-in, `kr new` goes on.
 #[cfg(target_os = "linux")]
 #[test]
 fn no_drop_in_anywhere_changes_the_command_the_user_manager_runs() {
@@ -2906,6 +2907,7 @@ fn no_drop_in_anywhere_changes_the_command_the_user_manager_runs() {
         .to_path_buf();
     let own = units.join(format!("{}.service.d", host.label()));
     let linked = host.tree.root().join("overrides/service.d");
+    let mark = host.tree.root().join("the-other-command-ran");
     for (place, drop_in) in [
         (
             "a drop-in every service reads",
@@ -2918,8 +2920,14 @@ fn no_drop_in_anywhere_changes_the_command_the_user_manager_runs() {
     ] {
         let directory = drop_in.parent().expect("a drop-in directory");
         std::fs::create_dir_all(directory).expect("a drop-in directory");
-        std::fs::write(&drop_in, "[Service]\nExecStart=\nExecStart=/bin/true\n")
-            .expect("a drop-in");
+        std::fs::write(
+            &drop_in,
+            format!(
+                "[Service]\nExecStart=\nExecStart=/usr/bin/touch {}\n",
+                mark.display()
+            ),
+        )
+        .expect("a drop-in");
         if directory == linked {
             std::os::unix::fs::symlink(&linked, &own).expect("the unit's own directory, linked");
         }
@@ -2930,13 +2938,14 @@ fn no_drop_in_anywhere_changes_the_command_the_user_manager_runs() {
         assert_eq!(failure["code"], "HOST_NOT_CONFIGURED", "{place}: {failure}");
         let message = failure["message"].as_str().unwrap_or_default();
         assert!(
-            message.contains("/bin/true"),
+            message.contains("/usr/bin/touch"),
             "{place}: the failure names the command the manager would run: {message}"
         );
         assert!(
             message.contains("kr host startup --set service"),
             "{place}: and the setup action: {message}"
         );
+        assert!(!mark.exists(), "{place}: the other command never ran");
         assert_eq!(host.daemon(), None, "{place}: nothing was started");
         assert!(!host.answers(), "{place}: nothing answers");
 
@@ -2953,6 +2962,132 @@ fn no_drop_in_anywhere_changes_the_command_the_user_manager_runs() {
         output.status.success(),
         "{created}; it said {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    host.close(&created);
+}
+
+/// KR-REQ-07.12: on Linux every question kr puts to the user manager and every request it makes
+/// go the same way, through `systemctl --user` with the runtime directory set, so the manager whose
+/// definition kr checked is the manager it asks to start the daemon.
+///
+/// With `SYSTEMCTL_FORCE_BUS=1` and a session bus address where no bus is, `systemctl` finds no
+/// manager; so `kr new` reaches none either, says so, and nothing is started anywhere. Without
+/// them, the same `kr new` has the test's own manager start the daemon.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_user_manager_kr_checks_is_the_one_it_asks() {
+    let Some(host) = ServiceHost::create() else {
+        return;
+    };
+    host.select_service();
+    let nowhere = format!(
+        "unix:path={}",
+        host.tree.root().join("no-bus-here").display()
+    );
+    let mut elsewhere = host.new_session();
+    elsewhere
+        .env("SYSTEMCTL_FORCE_BUS", "1")
+        .env("DBUS_SESSION_BUS_ADDRESS", &nowhere);
+
+    let output = start(elsewhere).finish("kr new pointed at no bus");
+    let failure = document(&output, "kr new");
+    assert_ne!(output.status.code(), Some(0), "{failure}");
+    assert_eq!(failure["code"], "ENVIRONMENT_UNAVAILABLE", "{failure}");
+    assert_eq!(host.daemon(), None, "nothing was started");
+    assert!(!host.answers(), "nothing answers");
+
+    let output = start(host.new_session()).finish("kr new");
+    let created = document(&output, "kr new");
+    assert!(
+        output.status.success(),
+        "{created}; it said {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    host.assert_started_by_the_manager(
+        host.daemon()
+            .expect("the test's own manager reports the daemon it started"),
+    );
+    host.close(&created);
+}
+
+/// KR-REQ-07.12: on Linux a drop-in that sets the daemon's command is refused even when the
+/// manager prints the command exactly as kr wrote it. The drop-in keeps kr's program and words
+/// and only joins two of them into one, which `systemctl show` prints the same way, so it is the
+/// drop-in itself that is read: the command comes from kr's own file or not at all.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_drop_in_that_resplits_the_command_is_refused_though_it_prints_the_same() {
+    let Some(host) = ServiceHost::create() else {
+        return;
+    };
+    host.select_service();
+    let written = std::fs::read_to_string(host.definition()).expect("the definition");
+    let command = written
+        .lines()
+        .find(|line| line.starts_with("ExecStart="))
+        .expect("the definition's command");
+    let resplit = command.replacen("\"--runtime-dir\" \"", "\"--runtime-dir ", 1);
+    assert_ne!(
+        resplit, command,
+        "the command names its runtime directory: {command}"
+    );
+    let own = host
+        .definition()
+        .with_file_name(format!("{}.service.d", host.label()));
+    std::fs::create_dir_all(&own).expect("the unit's own drop-in directory");
+    let drop_in = own.join("20-resplit.conf");
+    std::fs::write(&drop_in, format!("[Service]\nExecStart=\n{resplit}\n")).expect("a drop-in");
+    host.reload();
+
+    let output = start(host.new_session()).finish("kr new");
+    let failure = document(&output, "kr new");
+    assert_eq!(failure["code"], "HOST_NOT_CONFIGURED", "{failure}");
+    let message = failure["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(&drop_in.display().to_string()) && message.contains("ExecStart"),
+        "the failure names the drop-in and the key it sets: {message}"
+    );
+    assert_eq!(host.daemon(), None, "nothing was started");
+    assert!(!host.answers(), "nothing answers");
+}
+
+/// KR-REQ-07.12: on Linux a drop-in every service reads that leaves commands alone, such as the
+/// timeout policy some distributions ship for every user service, is the host's own: the setup
+/// names it and `kr new` has the manager start the daemon under it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_host_wide_timeout_drop_in_is_the_hosts_and_the_daemon_starts_under_it() {
+    let Some(host) = ServiceHost::create() else {
+        return;
+    };
+    let every_service = host
+        .definition()
+        .parent()
+        .expect("the user unit directory")
+        .join("service.d");
+    std::fs::create_dir_all(&every_service).expect("the directory every service reads");
+    let drop_in = every_service.join("10-timeout-abort.conf");
+    std::fs::write(&drop_in, "[Service]\nTimeoutStopFailureMode=abort\n").expect("a drop-in");
+
+    let chosen = host.select_service();
+    assert!(
+        chosen["notes"]
+            .as_array()
+            .is_some_and(|notes| notes.iter().any(|note| note
+                .as_str()
+                .is_some_and(|note| note.contains(&drop_in.display().to_string())))),
+        "the setup names the drop-in the manager reads: {chosen}"
+    );
+    let output = start(host.new_session()).finish("kr new");
+    let created = document(&output, "kr new");
+    assert!(
+        output.status.success(),
+        "{created}; it said {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    host.assert_started_by_the_manager(
+        host.daemon()
+            .expect("the service manager reports the daemon it started"),
     );
     host.close(&created);
 }
