@@ -13,6 +13,9 @@ name: release-baselines
 # the workspace for its tests rather than the release's own executables.
 
 on:
+  push:
+    branches:
+      - task/T-INSTALL-baselines-run1
   workflow_dispatch:
   schedule:
     # Every night, away from the hour, when the hosted runners are busiest.
