@@ -1316,12 +1316,17 @@ impl Broker {
 
     /// Binds one component to one instance, with the grants and trust it was given.
     ///
+    /// A binding identifier names one package for as long as it is bound: what its decoder
+    /// interpreted carries that package's meaning. The same package may bind it again, which
+    /// replaces its grants and trust and drops its actions and its fault state.
+    ///
     /// # Errors
     ///
     /// Returns [`BrokerError::Trust`] when a trust record breaks a rule,
     /// [`BrokerError::PermissionDenied`] when the trust was granted to a different package or the
-    /// grant it depends on is absent, and [`BrokerError::LedgerUnavailable`] when the record
-    /// cannot be written.
+    /// grant it depends on is absent, [`BrokerError::InvalidArgument`] when the identifier is
+    /// bound to another package, and [`BrokerError::LedgerUnavailable`] when the record cannot be
+    /// written.
     #[allow(clippy::too_many_arguments)]
     pub fn bind(
         &self,
@@ -1354,6 +1359,21 @@ impl Broker {
             }
         }
         let mut state = self.state();
+        let package = PackageIdentity {
+            plugin_id: plugin_id.clone(),
+            publisher_id: publisher_id.clone(),
+            package_digest,
+        };
+        if let Some(bound) = state.bindings.get(&binding_id)
+            && bound.package() != package
+        {
+            return Err(BrokerError::invalid(format!(
+                "binding {binding_id} runs {}, and an identifier names one package for as long as \
+                 it is bound, so {} does not take it",
+                bound.package().name(),
+                package.beside(&bound.package())
+            )));
+        }
         let record = BindingRecord {
             binding_id,
             application_instance_id,
@@ -5058,12 +5078,12 @@ impl BrokerState {
                     pending.resource.method
                 )));
             }
-            // The answer carries the meaning the interpreting package gave the request, and it is
-            // written with the table of the connection it goes out on. A connection whose
-            // identifier was restored under another package's tables would write it in that
-            // package's terms, so the two are one package or the answer is refused. A connection
-            // that is not open carries no answer at all, and is refused where its transport is
-            // looked up.
+            // The answer carries the meaning the interpreting package gave the request: the
+            // binding that answers is its decoder running that package, and the connection the
+            // answer goes out on reads that package's table. An identifier bound to another package
+            // after a restart would answer with another meaning, and a connection reading another
+            // package's table would write it in another's terms. A connection that is not open
+            // carries no answer at all, and is refused where its transport is looked up.
             let entry = self.ledger.decoding(resource_id)?.ok_or_else(|| {
                 BrokerError::PreconditionFailed {
                     detail: format!(
@@ -5073,6 +5093,13 @@ impl BrokerState {
                 }
             })?;
             let interpreted_by = PackageIdentity::of_entry(&entry);
+            if binding.package() != interpreted_by {
+                return Err(BrokerError::denied(format!(
+                    "{resource_id} was interpreted by {}, and binding {binding_id} now runs {}",
+                    interpreted_by.name(),
+                    binding.package().beside(&interpreted_by)
+                )));
+            }
             let connection = pending.resource.request.connection;
             if let Some(present) = self.connection_package(connection)
                 && present != interpreted_by
