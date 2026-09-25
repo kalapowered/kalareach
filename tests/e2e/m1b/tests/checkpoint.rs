@@ -19,6 +19,13 @@ use kr_protocol::pairing::{Locator, QrPayload};
 /// A served candidate is sent the record before its upgrade is even answered.
 const PROBE: Duration = Duration::from_secs(5);
 
+/// How long a room is given to stop serving an invitation's record once the invitation ended.
+///
+/// The host releases the locator before it answers the call that ended the invitation, so a room
+/// that still serves the record this long afterwards is one the release did not reach; the record
+/// then lasts until the invitation's own expiry.
+const RELEASE_WAIT: Duration = Duration::from_secs(30);
+
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -137,13 +144,16 @@ fn the_site_answers_and_a_host_reserves_its_invitations_there() {
 
     let withdrawn = host.kr_json(&["pair", "cancel", &invitation_id]);
     println!("the invitation was withdrawn: {}", withdrawn["status"]);
-    let served = runtime
-        .block_on(room::serves_record(&origin, &locator, PROBE))
-        .unwrap_or_else(|why| panic!("the room could not be asked: {why}"));
-    assert!(
-        !served,
-        "once the invitation is withdrawn, its locator's room serves no record"
-    );
+    let stopped = runtime
+        .block_on(room::stops_serving(&origin, &locator, PROBE, RELEASE_WAIT))
+        .unwrap_or_else(|why| panic!("the room could not be asked: {why}"))
+        .unwrap_or_else(|| {
+            panic!(
+                "once the invitation is withdrawn, its locator's room serves no record: a new \
+                 candidate was still served it {RELEASE_WAIT:?} after the withdrawal"
+            )
+        });
+    println!("a new candidate was served no record {stopped:?} after the withdrawal");
 
     let closing = close(&run, &host);
     println!("{closing}");
@@ -274,13 +284,16 @@ fn a_device_pairs_by_code_through_the_site_and_by_direct_qr_over_loopback() {
     );
 
     // The deployment gave its locator back once the invitation was consumed.
-    let served = runtime
-        .block_on(room::serves_record(&origin, &locator, PROBE))
-        .unwrap_or_else(|why| panic!("the room could not be asked: {why}"));
-    assert!(
-        !served,
-        "once the invitation is consumed, its locator's room serves no record"
-    );
+    let stopped = runtime
+        .block_on(room::stops_serving(&origin, &locator, PROBE, RELEASE_WAIT))
+        .unwrap_or_else(|why| panic!("the room could not be asked: {why}"))
+        .unwrap_or_else(|| {
+            panic!(
+                "once the invitation is consumed, its locator's room serves no record: a new \
+                 candidate was still served it {RELEASE_WAIT:?} after the pairing committed"
+            )
+        });
+    println!("a new candidate was served no record {stopped:?} after the pairing committed");
 
     // A direct invitation on a host with an owner: each owner step is the first device's.
     let second = runtime.block_on(Device::create("second device", &run.root().join("d2")));

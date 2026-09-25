@@ -213,3 +213,33 @@ fn host_and_port(authority: &str) -> Result<(&str, u16), String> {
         None => Ok((authority, 443)),
     }
 }
+
+/// Asks the room of `locator` again until a new candidate is served no record, for at most
+/// `within`, and returns how long after the first question the question began that found it
+/// serving none; `None` when the room still served the record at the end.
+///
+/// Each question is [`serves_record`] with `probe`: a served candidate learns so at once, so a
+/// room that keeps serving is asked again after a second, and one that serves nothing ends the
+/// wait.
+///
+/// # Errors
+///
+/// Returns why the room could not be asked.
+pub async fn stops_serving(
+    origin: &RendezvousOrigin,
+    locator: &Locator,
+    probe: Duration,
+    within: Duration,
+) -> Result<Option<Duration>, String> {
+    let started = tokio::time::Instant::now();
+    loop {
+        let asked = started.elapsed();
+        if !serves_record(origin, locator, probe).await? {
+            return Ok(Some(asked));
+        }
+        if started.elapsed() >= within {
+            return Ok(None);
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
