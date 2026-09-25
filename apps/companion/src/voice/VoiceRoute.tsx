@@ -24,7 +24,7 @@ import {
   type RunningCall
 } from './model'
 import { useApp } from '../app/state'
-import { failureMessage as portFailureMessage } from '../host/port'
+import { failureMessage as portFailureMessage, follow, watch } from '../host/port'
 import type { HostPort, VoiceCallState } from '../host/port'
 import type { VoiceAction, VoiceDelegateParams } from '@kalareach/protocol'
 import type { Surface } from '../mobile/platform'
@@ -223,33 +223,28 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
 
   // Whether this device is reaching the host. The backend publishes the connection's state, and
   // cancelling a turn is the one control that depends on it, so the screen follows the answer
-  // rather than assuming the connection it started with is still there.
-  useEffect(() => {
-    let current = true
-    void ask(() => port.connectionState())
-      .then((state) => {
-        if (current) setHostReachable(state.connected)
-      })
-      .catch(() => {
-        if (current) setHostReachable(false)
-      })
-    const stop = port.subscribe((event) => {
-      const body = event.body as { kind?: string; connected?: boolean } | null
-      if (body?.kind === 'connection' && typeof body.connected === 'boolean') {
-        setHostReachable(body.connected)
-      }
-    })
-    return () => {
-      current = false
-      stop()
-    }
-  }, [port])
+  // rather than assuming the connection it started with is still there. The state is read once
+  // the listener is registered, and a change heard before the read answers is the newer one.
+  useEffect(
+    () =>
+      follow(
+        (listener) => port.onConnection(listener),
+        () => port.connectionState(),
+        (state) => {
+          setHostReachable(state.connected)
+        },
+        () => {
+          setHostReachable(false)
+        }
+      ),
+    [port]
+  )
 
   // A delegation the provider announced to this call. It is submitted to the host over this
   // device's own connection, never to the service, and what the row says is what the host answered.
   useEffect(() => {
     if (!call) return undefined
-    return port.subscribe((event) => {
+    return watch([port.subscribe((event) => {
       const body = event.body as {
         kind?: string
         delegation_id?: string
@@ -285,7 +280,7 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
         setCall,
         setNotice
       )
-    })
+    })]).stop
   }, [call, port])
 
   const actions = useMemo<VoiceSurfaceActions>(

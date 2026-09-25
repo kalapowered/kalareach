@@ -172,6 +172,10 @@ pub enum Refusal {
         /// When it expired, in UTC milliseconds.
         expired_at_ms: u64,
     },
+    /// The decision reads this host's clock, and this boot's clock continuity is lost: the file
+    /// that kept this host's readings in this boot has gone, so nothing proves where the bound
+    /// stands until the owner establishes the clock again ([`policy::UtcFloor::bound`]).
+    ClockUnproven,
 }
 
 impl Refusal {
@@ -241,20 +245,23 @@ impl Refusal {
                     .to_owned()
             }
             Self::FloorUnrecorded | Self::ExpiryUnrecorded { .. } => FLOOR_UNRECORDED.to_owned(),
+            Self::ClockUnproven => CLOCK_CONTINUITY_LOST.to_owned(),
         }
     }
 
     /// The protocol error a refusal becomes.
     ///
-    /// Every one but [`Self::FloorUnrecorded`] and [`Self::ExpiryUnrecorded`] is
-    /// `PERMISSION_DENIED`. A caller learns that its authority does not reach the request; which
-    /// of this host's grants exist, and which revisions it has seen, is not a question a refused
-    /// caller gets answered. The exceptions say nothing about the caller's authority: they are this
-    /// host's store, and they pass when the store takes the write.
+    /// Every one but [`Self::FloorUnrecorded`], [`Self::ExpiryUnrecorded`] and
+    /// [`Self::ClockUnproven`] is `PERMISSION_DENIED`. A caller learns that its authority does not
+    /// reach the request; which of this host's grants exist, and which revisions it has seen, is
+    /// not a question a refused caller gets answered. The exceptions say nothing about the caller's
+    /// authority: the first two are this host's store, and they pass when the store takes the
+    /// write; the third is this host's clock, and it passes when the owner establishes it.
     #[must_use]
     pub fn to_protocol_error(&self) -> ProtocolError {
         let code = match self {
             Self::FloorUnrecorded | Self::ExpiryUnrecorded { .. } => ErrorCode::StorageUnavailable,
+            Self::ClockUnproven => ErrorCode::ClockUntrusted,
             _ => ErrorCode::PermissionDenied,
         };
         ProtocolError::new(code, self.detail())
@@ -265,6 +272,21 @@ impl Refusal {
 /// clock floor it would stand on is owed its record.
 pub const FLOOR_UNRECORDED: &str = "this host could not write down the clock reading this \
                                     decision stands on, so it does not decide it until it can";
+
+/// What a caller is told when a decision that reads this host's clock is not taken because this
+/// boot's clock continuity is lost.
+pub const CLOCK_CONTINUITY_LOST: &str = "this host lost the record of the clock readings it took \
+     in this boot, so it cannot prove whether a time bound has passed until its owner establishes \
+     the clock again with `kr host clock --establish`";
+
+/// The refusal of anything that reads this host's clock while this boot's clock continuity is
+/// lost ([`CLOCK_CONTINUITY_LOST`]).
+#[must_use]
+pub fn continuity_lost() -> crate::error::ControllerError {
+    crate::error::ControllerError::ClockUntrusted {
+        detail: CLOCK_CONTINUITY_LOST.to_owned(),
+    }
+}
 
 /// What a permitted request carries away from the intersection.
 ///
@@ -354,13 +376,19 @@ pub fn decide(
             grant_id: grant.grant_id,
         });
     }
-    // Nothing that reads the clock is decided while the floor it would stand on is owed its
-    // record: a daemon that stopped before that record landed would start again on an older floor
-    // and could decide the other way. What reads the clock is the grant's expiry and this host's
-    // own time bounds on its use, so the debt is asked about whatever the grant's own expiry is. A
-    // lapse found here is owed its record by the caller, which writes the floor it stood on.
-    if policy.utc_floor().is_owed() && policy.stands_on_the_clock(grant, request.ingress) {
-        return Err(Refusal::FloorUnrecorded);
+    // Nothing that reads the clock is decided while this boot's clock continuity is lost, and
+    // nothing while the floor it would stand on is owed its record: a daemon that stopped before
+    // that record landed would start again on an older floor and could decide the other way. What
+    // reads the clock is the grant's expiry and this host's own time bounds on its use, so both
+    // are asked about whatever the grant's own expiry is. A lapse found here is owed its record by
+    // the caller, which writes the floor it stood on.
+    if policy.stands_on_the_clock(grant, request.ingress) {
+        if policy.utc_floor().continuity_lost() {
+            return Err(Refusal::ClockUnproven);
+        }
+        if policy.utc_floor().is_owed() {
+            return Err(Refusal::FloorUnrecorded);
+        }
     }
     if bound.passed {
         let expired_at_ms = match grant.expiry {
@@ -498,9 +526,15 @@ pub fn standing_at_dispatch(
             grant_id: grant.grant_id,
         });
     }
-    // As [`decide`]: nothing that reads the clock is decided while its floor is owed its record.
-    if policy.utc_floor().is_owed() && policy.stands_on_the_clock(grant, ingress) {
-        return Err(Refusal::FloorUnrecorded);
+    // As [`decide`]: nothing that reads the clock is decided while this boot's clock continuity is
+    // lost, or while its floor is owed its record.
+    if policy.stands_on_the_clock(grant, ingress) {
+        if policy.utc_floor().continuity_lost() {
+            return Err(Refusal::ClockUnproven);
+        }
+        if policy.utc_floor().is_owed() {
+            return Err(Refusal::FloorUnrecorded);
+        }
     }
     if bound.passed {
         let expired_at_ms = match grant.expiry {

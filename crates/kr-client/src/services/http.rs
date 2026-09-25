@@ -14,10 +14,10 @@
 //! | HTTPS, except on loopback | A managed-service request carries a credential; plain HTTP is admitted only for the loopback address a development deployment serves on |
 //! | No credentials in the address | A password in a URL is sent before anything is verified and is not part of this protocol's authentication |
 //! | No redirects | A redirect moves a signed request to an address its credential does not name. The answer is returned as it came, so a caller sees the redirect rather than following it |
-//! | Certificate and hostname verification | Both stay on. There is no option here that turns either off |
+//! | Certificate and hostname verification, against the platform's trust ([`platform_tls`]) | Both stay on. There is no option here that turns either off, and no environment variable chooses the trust |
 //! | Finite connect, read and total deadlines | Every call ends. The total deadline covers reading the body, so an answer that never finishes arriving is a failure rather than a wait |
 //! | A bounded answer, measured while it is read | A stated content length is the sender's claim. The bound is applied to the bytes as they arrive, and an answer past it is refused rather than truncated, because half an envelope is not an answer |
-//! | No cookies, no ambient proxy, no decompression | Each of those is something between this client and the service that this client did not ask for |
+//! | No cookies, no decompression, and no proxy but the one its caller names | Each of those is something between this client and the service that this client did not ask for. A host names the proxy its configuration document selects, a device names none, and nothing is read from the environment |
 //! | Nothing sent again that may have arrived | The service sees one request at most for one dispatch. A request of which no byte was written may travel on another connection, because nothing arrived to be repeated |
 //!
 //! # One request per dispatch
@@ -77,14 +77,19 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::error::ErrorCode;
 use kr_protocol::service::GatewayOrigin;
+use kr_transport::config::ProxyUrl;
+use rustls::client::danger::ServerCertVerifier;
+use rustls::crypto::CryptoProvider;
+use rustls::pki_types::CertificateDer;
 use url::{Host, Url};
 
 use super::ServiceFuture;
 use super::account::AccountHttp;
 use super::relay::{ServiceHttp, ServiceHttpAnswer};
 use crate::error::{ClientError, Result};
+use crate::shown::Shown;
 
 /// How long a connection may take to establish.
 pub const DEFAULT_CONNECT_DEADLINE: Duration = Duration::from_secs(5);
@@ -101,8 +106,9 @@ pub const DEFAULT_TOTAL_DEADLINE: Duration = Duration::from_secs(20);
 /// room for the JSON that encodes it. An operation that pages items states its own.
 pub const DEFAULT_RESPONSE_LIMIT_BYTES: u64 = 64 * 1024;
 
-/// The lowest TLS version this transport negotiates.
-const MINIMUM_TLS_VERSION: reqwest::tls::Version = reqwest::tls::Version::TLS_1_2;
+/// The TLS versions this product's clients negotiate: 1.3, and 1.2 with a server that has no newer.
+const PROTOCOL_VERSIONS: &[&rustls::SupportedProtocolVersion] =
+    &[&rustls::version::TLS13, &rustls::version::TLS12];
 
 /// Where an exchange had reached.
 ///
@@ -280,35 +286,57 @@ impl fmt::Debug for HttpService {
 }
 
 impl HttpService {
-    /// Builds a transport for one gateway, with this client's own deadlines and bounds.
+    /// Builds a transport for one gateway, with this client's own deadlines and bounds, that
+    /// reaches the gateway directly.
     ///
     /// # Errors
     ///
     /// Returns an error when the origin is not one this transport will address, or when the
-    /// platform's TLS configuration cannot be read.
+    /// platform's certificate verification cannot be set up.
     pub fn new(origin: GatewayOrigin) -> Result<Self> {
         Self::with(origin, HttpDeadlines::default(), ResponseLimits::default())
     }
 
-    /// Builds a transport with stated deadlines and bounds.
+    /// Builds a transport with stated deadlines and bounds, that reaches its gateway directly.
     ///
     /// # Errors
     ///
     /// Returns an error when the origin is not one this transport will address, when a deadline is
-    /// zero, or when the platform's TLS configuration cannot be read.
+    /// zero, or when the platform's certificate verification cannot be set up.
     pub fn with(
         origin: GatewayOrigin,
         deadlines: HttpDeadlines,
         limits: ResponseLimits,
     ) -> Result<Self> {
-        Self::build(origin, deadlines, limits, None)
+        Self::through(origin, deadlines, limits, None)
+    }
+
+    /// Builds a transport with stated deadlines and bounds, that reaches its gateway through
+    /// `proxy`, or directly when that is `None`.
+    ///
+    /// The proxy is always the caller's to name. A host passes the one its configuration document
+    /// selects, and a device, which has no such document, passes none. Nothing is read from the
+    /// environment either way, and a proxy that cannot be reached is not gone around.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the origin is not one this transport will address, when a deadline is
+    /// zero, or when the platform's certificate verification cannot be set up.
+    pub fn through(
+        origin: GatewayOrigin,
+        deadlines: HttpDeadlines,
+        limits: ResponseLimits,
+        proxy: Option<&ProxyUrl>,
+    ) -> Result<Self> {
+        Self::build(origin, deadlines, limits, proxy, &[])
     }
 
     fn build(
         origin: GatewayOrigin,
         deadlines: HttpDeadlines,
         limits: ResponseLimits,
-        extra_root: Option<&[u8]>,
+        proxy: Option<&ProxyUrl>,
+        extra_roots: &[CertificateDer<'static>],
     ) -> Result<Self> {
         let address = Url::parse(origin.as_str())
             .map_err(|_| refused("this client cannot read the gateway origin it was given"))?;
@@ -321,8 +349,7 @@ impl HttpService {
             return Err(refused("every transport deadline is a positive interval"));
         }
 
-        install_crypto_provider();
-        let mut builder = reqwest::Client::builder()
+        let client = builder_trusting(proxy, extra_roots)?
             .user_agent(concat!("kalareach/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(deadlines.connect)
             .read_timeout(deadlines.read)
@@ -334,15 +361,7 @@ impl HttpService {
             // opening another connection for a request it has not started writing.
             .retry(reqwest::retry::never())
             .referer(false)
-            .no_proxy()
             .http1_only()
-            .tls_version_min(MINIMUM_TLS_VERSION);
-        if let Some(root) = extra_root {
-            let certificate = reqwest::Certificate::from_der(root)
-                .map_err(|_| refused("this client cannot read the certificate it was given"))?;
-            builder = builder.add_root_certificate(certificate);
-        }
-        let client = builder
             .build()
             .map_err(|_| refused("this client could not configure its transport"))?;
 
@@ -411,9 +430,9 @@ impl HttpService {
             ));
         }
         if !same_origin(&self.address, &requested) {
-            return Err(refused(format!(
+            return Err(refused(crate::shown!(
                 "this client is configured for {} and was asked to call another origin",
-                self.origin.as_str()
+                self.origin.clone()
             )));
         }
         Ok(requested)
@@ -430,7 +449,7 @@ impl HttpService {
         headers: &[(&str, &str)],
     ) -> Result<ServiceHttpAnswer> {
         let limit = self.limits.of(target.path());
-        let named = format!("{}{}", self.origin.as_str(), target.path());
+        let named = crate::shown!("{}{}", self.origin.clone(), Shown::route(target.path()));
 
         let mut request = self.client.request(method, target);
         if let Some((content_type, bytes)) = body {
@@ -592,35 +611,210 @@ fn install_crypto_provider() {
     });
 }
 
+/// Starts an HTTP client with this product's trust and the proxy it is given, and nothing of the
+/// environment's.
+///
+/// An HTTP client this product builds outside the network endpoint starts here, so two things are
+/// decided in one place: the certificates it trusts are [`platform_tls`]'s, and it goes through
+/// `proxy`, or directly, and never through a proxy the environment names. Its deadlines, its
+/// redirects and its retries are its caller's.
+///
+/// # Errors
+///
+/// Returns an error when the platform's certificate verification cannot be set up.
+pub fn client_builder(proxy: Option<&ProxyUrl>) -> Result<reqwest::ClientBuilder> {
+    builder_trusting(proxy, &[])
+}
+
+/// As [`client_builder`], also trusting `extra_roots`.
+fn builder_trusting(
+    proxy: Option<&ProxyUrl>,
+    extra_roots: &[CertificateDer<'static>],
+) -> Result<reqwest::ClientBuilder> {
+    install_crypto_provider();
+    let mut tls = platform_tls(extra_roots).map_err(|_| {
+        refused("this client could not set up the platform's certificate verification")
+    })?;
+    // HTTP/1.1 is the one protocol these clients speak, so it is the one they offer.
+    tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let builder = reqwest::Client::builder().tls_backend_preconfigured(tls);
+    Ok(match proxy {
+        Some(proxy) => builder.proxy(
+            reqwest::Proxy::all(proxy.as_url().clone())
+                .map_err(|_| refused("this client cannot use the proxy it was given"))?,
+        ),
+        None => builder.no_proxy(),
+    })
+}
+
+/// The TLS client configuration this product's clients verify a server with.
+///
+/// TLS 1.3, or 1.2 with a server that has no newer, and the trust [`platform_verifier`] describes.
+/// `extra_roots` adds authorities beside the platform's: every shipped client passes none, and a
+/// test passes the authority its own server was issued by.
+///
+/// # Errors
+///
+/// Returns the reason when the platform's certificate verification cannot be set up.
+pub fn platform_tls(
+    extra_roots: &[CertificateDer<'static>],
+) -> std::result::Result<rustls::ClientConfig, rustls::Error> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = platform_verifier(Arc::clone(&provider), extra_roots)?;
+    Ok(rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(PROTOCOL_VERSIONS)?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth())
+}
+
+/// Who this product trusts to vouch for a server.
+///
+/// On macOS, Windows, iOS and Android it is the operating system's own verifier, whose trust
+/// settings are the person's to manage there and which reads nothing from the environment. On
+/// Linux the platform verifier reads `SSL_CERT_FILE` and `SSL_CERT_DIR`, and while either is set it
+/// trusts only what they name, so an inherited variable would decide who may answer for a service.
+/// There it is the distribution's own certificate store instead, read from its fixed locations with
+/// neither variable consulted: an authority given only through them is not trusted until it is
+/// installed in the system store.
+fn platform_verifier(
+    provider: Arc<CryptoProvider>,
+    extra_roots: &[CertificateDer<'static>],
+) -> std::result::Result<Arc<dyn ServerCertVerifier>, rustls::Error> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add_parsable_certificates(system_store::certificates());
+        for root in extra_roots {
+            roots.add(root.clone())?;
+        }
+        if roots.is_empty() {
+            return Err(rustls::Error::General(
+                "no certificate authority was found in the system store".to_owned(),
+            ));
+        }
+        let verifier =
+            rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
+                .build()
+                .map_err(|error| rustls::Error::General(error.to_string()))?;
+        Ok(verifier)
+    }
+    #[cfg(target_os = "android")]
+    {
+        // Android's verifier takes no authority beside the platform's, and no shipped client
+        // passes one.
+        let _ = extra_roots;
+        Ok(Arc::new(rustls_platform_verifier::Verifier::new(provider)?))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        Ok(Arc::new(
+            rustls_platform_verifier::Verifier::new_with_extra_roots(
+                extra_roots.iter().cloned(),
+                provider,
+            )?,
+        ))
+    }
+}
+
+/// The distribution's certificate store, read where the platform verifier reads it when neither
+/// variable names another place.
+///
+/// The locations are openssl-probe 0.2.1's for Linux (`CERTIFICATE_FILE_NAMES` and
+/// `CERTIFICATE_DIRS`), the crate the platform verifier asks, and they are taken the way it takes
+/// them: the first bundle that exists, and every directory that exists. openssl-probe hands them
+/// out only through a function that reads both variables first, so the lists are written here.
+#[cfg(target_os = "linux")]
+mod system_store {
+    use std::path::Path;
+
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject;
+
+    /// The bundles one distribution or another keeps its authorities in. The first that exists is
+    /// read.
+    const BUNDLES: [&str; 8] = [
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/ca-bundle.pem",
+        "/etc/pki/tls/cacert.pem",
+        "/etc/ssl/cert.pem",
+        "/opt/etc/ssl/certs/ca-certificates.crt",
+        "/etc/ssl/certs/cacert.pem",
+    ];
+
+    /// The directories of single authorities. Every one that exists is read.
+    const DIRECTORIES: [&str; 3] = [
+        "/etc/ssl/certs",
+        "/etc/pki/tls/certs",
+        "/etc/security/certificates",
+    ];
+
+    /// Every certificate the store holds, each once.
+    pub(super) fn certificates() -> Vec<CertificateDer<'static>> {
+        let mut found = Vec::new();
+        if let Some(bundle) = BUNDLES.iter().map(Path::new).find(|path| path.exists()) {
+            read(bundle, &mut found);
+        }
+        for directory in DIRECTORIES.iter().map(Path::new) {
+            let Ok(entries) = std::fs::read_dir(directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                // A directory of authorities is mostly links, so what counts is what a link names.
+                if std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
+                    read(&path, &mut found);
+                }
+            }
+        }
+        found.sort_unstable_by(|one, other| one.as_ref().cmp(other.as_ref()));
+        found.dedup();
+        found
+    }
+
+    /// Adds the certificates one file holds. A file that cannot be read, and anything in one that
+    /// is not a certificate, is passed over, as the platform verifier passes it over.
+    fn read(path: &Path, into: &mut Vec<CertificateDer<'static>>) {
+        if let Ok(certificates) = CertificateDer::pem_file_iter(path) {
+            into.extend(certificates.filter_map(std::result::Result::ok));
+        }
+    }
+}
+
 /// A request this client would not send. Nothing left this device.
-fn refused(what: impl Into<String>) -> ClientError {
-    ClientError::Host(ProtocolError::new(ErrorCode::InvalidArgument, what.into()))
+fn refused(what: impl Into<Shown>) -> ClientError {
+    ClientError::refusal(ErrorCode::InvalidArgument, what.into())
 }
 
 /// The service was never reached, so the request was not carried out.
-fn unreachable(named: &str, why: &str) -> ClientError {
-    ClientError::Host(ProtocolError::new(
+fn unreachable(named: &Shown, why: Shown) -> ClientError {
+    ClientError::refusal(
         ErrorCode::UpstreamUnavailable,
-        format!("{named} could not be reached: {why}"),
-    ))
+        crate::shown!("{} could not be reached: {}", *named, why),
+    )
 }
 
 /// The request may have been carried out and this client cannot see whether it was.
-fn uncertain(named: &str, why: &str) -> ClientError {
-    ClientError::Host(ProtocolError::new(
+fn uncertain(named: &Shown, why: Shown) -> ClientError {
+    ClientError::refusal(
         ErrorCode::OutcomeUnknown,
-        format!("{named}: {why}"),
-    ))
+        crate::shown!("{}: {}", *named, why),
+    )
 }
 
 /// An answer past the bound its operation is read under.
 ///
 /// It is an unknown outcome rather than a plain failure: the request reached the service and the
 /// service answered, so whatever it did is done, and what this client lacks is the answer.
-fn too_large(named: &str, limit: u64) -> ClientError {
+fn too_large(named: &Shown, limit: u64) -> ClientError {
     uncertain(
         named,
-        &format!("its answer is larger than the {limit} bytes this client reads"),
+        crate::shown!(
+            "its answer is larger than the {} bytes this client reads",
+            limit
+        ),
     )
 }
 
@@ -643,7 +837,7 @@ fn phase_of(error: &reqwest::Error) -> ExchangePhase {
 /// inside the connector happened before any request byte was written, so the request was not
 /// carried out. Everything else may have been: a deadline, a connection that ended and an answer
 /// that could not be read all leave a request that the service may have acted on.
-fn failure(named: &str, phase: ExchangePhase, error: &reqwest::Error) -> ClientError {
+fn failure(named: &Shown, phase: ExchangePhase, error: &reqwest::Error) -> ClientError {
     let cause = if error.is_timeout() {
         "this client's deadline ran out"
     } else if error.is_decode() {
@@ -651,11 +845,11 @@ fn failure(named: &str, phase: ExchangePhase, error: &reqwest::Error) -> ClientE
     } else {
         "the exchange ended"
     };
-    let why = format!("{cause} {}", phase.as_str());
+    let why = crate::shown!("{} {}", cause, phase.as_str());
 
     match phase {
-        ExchangePhase::Connect => unreachable(named, &why),
-        ExchangePhase::Request | ExchangePhase::Answer => uncertain(named, &why),
+        ExchangePhase::Connect => unreachable(named, why),
+        ExchangePhase::Request | ExchangePhase::Answer => uncertain(named, why),
     }
 }
 
@@ -671,7 +865,13 @@ impl HttpService {
         limits: ResponseLimits,
         root: &[u8],
     ) -> Result<Self> {
-        Self::build(origin, deadlines, limits, Some(root))
+        Self::build(
+            origin,
+            deadlines,
+            limits,
+            None,
+            &[CertificateDer::from(root.to_vec())],
+        )
     }
 }
 
@@ -2637,10 +2837,11 @@ mod tests {
         // make one phase unreadable.
         for phase in ExchangePhase::ALL {
             for cause in CAUSES {
-                let why = format!("{cause} {}", phase.as_str());
+                let why = crate::shown!("{} {}", cause, phase.as_str());
+                let named = Shown::said(NAMED);
                 let error = match phase {
-                    ExchangePhase::Connect => unreachable(NAMED, &why),
-                    ExchangePhase::Request | ExchangePhase::Answer => uncertain(NAMED, &why),
+                    ExchangePhase::Connect => unreachable(&named, why),
+                    ExchangePhase::Request | ExchangePhase::Answer => uncertain(&named, why),
                 };
                 assert_eq!(ExchangePhase::of(&error), Some(phase), "{error}");
             }
@@ -2657,7 +2858,7 @@ mod tests {
             ExchangePhase::of(&refused("a request address carries no credentials")),
             None
         );
-        assert_eq!(ExchangePhase::of(&too_large(NAMED, 64)), None);
+        assert_eq!(ExchangePhase::of(&too_large(&Shown::said(NAMED), 64)), None);
     }
 
     /* ---------------------------------------------------------------------- */
@@ -2688,5 +2889,42 @@ mod tests {
         let error = HttpService::with(origin, deadlines, ResponseLimits::default())
             .expect_err("a deadline of nothing");
         assert_eq!(code(&error), ErrorCode::InvalidArgument);
+    }
+
+    /// A transport whose certificate verification cannot be set up says so in this client's words,
+    /// and nothing of the verifier's words or of the certificates it was given.
+    ///
+    /// The setup fails here because the verifier reads the root it is given, and Android's takes no
+    /// root beside the platform's, so the case does not arise there and the test is left out.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn a_verification_that_cannot_be_set_up_says_nothing_of_what_it_was_given() {
+        use crate::shown::marker::{MARKER, assert_unmarked, failure_renderings};
+
+        let root = MARKER.as_bytes();
+        // The negative control: the verifier refuses the certificate in words of its own.
+        let own = platform_tls(&[CertificateDer::from(root.to_vec())])
+            .map(|_| ())
+            .expect_err("that is no certificate")
+            .to_string();
+        let refused = HttpService::trusting(
+            GatewayOrigin::new("https://gateway.example").expect("an origin"),
+            out_of_reach(),
+            ResponseLimits::default(),
+            root,
+        )
+        .map(|_| ())
+        .expect_err("that is no certificate");
+        // The neutral control: what could not be set up, in this client's words.
+        let said = refused.to_string();
+        assert_eq!(
+            said,
+            "INVALID_ARGUMENT: this client could not set up the platform's certificate verification"
+        );
+        assert!(!said.contains(&own), "{said}");
+        assert_unmarked(
+            "a verification that cannot be set up",
+            &failure_renderings(refused),
+        );
     }
 }

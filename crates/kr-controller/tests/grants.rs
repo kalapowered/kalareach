@@ -23,6 +23,8 @@
 //! | KR-REQ-24.15 | `expiry_is_revalidated_after_a_wake_and_a_restored_old_policy_cannot_revive_authority` |
 
 use std::sync::Arc;
+
+use kr_controller::grants::policy::UtcFloor;
 use std::time::Duration;
 
 mod net_support;
@@ -213,7 +215,11 @@ fn a_withdrawal_that_loses_its_admission_at_the_store_writes_nothing() {
         .expect("revoked");
 }
 
-/// A fence a revocation owes survives the failure of the half that would have cleared it.
+/// Every restrictive change writes one debt of its own, under an identity no other change writes,
+/// in the transaction that is its restriction, and it survives the failure of the barrier that
+/// would retire it. A revocation and a device's revocation each write one row however many grants
+/// they withdraw; a repeat that withdraws nothing, and a proposal nobody redeemed, write none; and
+/// two changes of the same authority write two rows, so neither can absorb the other.
 #[test]
 fn a_revocation_writes_its_fence_debt_down_before_the_fence_is_attempted() {
     let directory = GrantDirectory::in_memory().expect("a grant store");
@@ -221,43 +227,196 @@ fn a_revocation_writes_its_fence_debt_down_before_the_fence_is_attempted() {
     directory
         .issue(&record(held.clone()), || Ok(()))
         .expect("written");
+    let child = grant(
+        3,
+        Some(held.grant_id),
+        &[ActionRight::SessionView],
+        GrantExpiry::Never,
+    );
+    directory.issue(&record(child), || Ok(())).expect("written");
 
     assert!(
         directory.fence_owed().expect("readable").is_empty(),
         "nothing is owed before anything is revoked"
     );
-    directory
+    let first = directory
         .revoke(held.grant_id, 4_000, || Ok(()))
-        .expect("revoked");
-    let owed = directory.fence_owed().expect("readable");
+        .expect("revoked")
+        .debt
+        .expect("a live withdrawal owes a fence");
     assert_eq!(
-        owed,
-        vec![held.grant_id],
-        "the debt is written in the same transaction as the revocation"
+        directory.fence_owed().expect("readable"),
+        vec![first],
+        "one row for the whole subtree, written in the same transaction as the revocation"
+    );
+    assert_eq!(
+        directory
+            .revoke(held.grant_id, 4_050, || Ok(()))
+            .expect("a repeat")
+            .debt,
+        None,
+        "a repeat withdraws nothing and owes nothing more"
     );
 
-    // A second revocation arrives while the first fence is still waiting. Clearing what the first
-    // fence covered must not retire the second one's debt.
+    // A second revocation arrives while the first fence is still waiting. It owes a debt of its
+    // own, and clearing what the first fence covered must not retire it.
     let second = grant(2, None, &[ActionRight::SessionView], GrantExpiry::Never);
     directory
         .issue(&record(second.clone()), || Ok(()))
         .expect("written");
-    directory
+    let second_debt = directory
         .revoke(second.grant_id, 4_100, || Ok(()))
-        .expect("revoked");
+        .expect("revoked")
+        .debt
+        .expect("a live withdrawal owes a fence");
+    assert_ne!(second_debt, first);
     directory
-        .fence_completed(&owed)
+        .fence_completed(&[first])
         .expect("the first fence finished");
     assert_eq!(
         directory.fence_owed().expect("readable"),
-        vec![second.grant_id],
+        vec![second_debt],
         "a revocation that arrived during a fence still owes one of its own"
     );
-
     directory
-        .fence_completed(&[second.grant_id])
+        .fence_completed(&[second_debt])
         .expect("the second fence finished");
     assert!(directory.fence_owed().expect("readable").is_empty());
+
+    // A device's revocation withdraws both of its live grants under one row; a proposal nobody
+    // redeemed takes nothing away and owes nothing.
+    for (byte, live) in [(4, true), (5, true), (6, false)] {
+        let held = grant(byte, None, &[ActionRight::SessionView], GrantExpiry::Never);
+        let stored = if live { record(held) } else { proposal(held) };
+        directory.issue(&stored, || Ok(())).expect("written");
+    }
+    let device = directory
+        .revoke_device(device_id(0xf1), 4_200, || Ok(()), None)
+        .expect("revoked");
+    assert_eq!(device.revoked.len(), 3);
+    assert_eq!(
+        directory.fence_owed().expect("readable"),
+        vec![device.debt.expect("a live withdrawal owes a fence")]
+    );
+    directory
+        .fence_completed(&directory.fence_owed().expect("readable"))
+        .expect("finished");
+
+    // Two changes of the same thing, each writing its own debt before its restriction, are two
+    // rows under two identities.
+    let one = directory.owe_fence("a change", 4_300).expect("written");
+    let other = directory.owe_fence("a change", 4_300).expect("written");
+    assert_ne!(one, other);
+    let owed: std::collections::BTreeSet<_> = directory
+        .fence_owed()
+        .expect("readable")
+        .into_iter()
+        .collect();
+    assert_eq!(owed, [one, other].into_iter().collect());
+}
+
+/// A voice grant's withdrawal owes no fence, on every revocation path: no worker holds work under a
+/// grant that carries `voice.use`. A voice grant and the call under it write no row, whether the
+/// grant itself or the device holding it is revoked. A grant delegated from a voice grant that
+/// does not carry `voice.use` is not a voice grant, and the change that withdraws it writes its one
+/// row.
+#[test]
+fn a_voice_grants_withdrawal_owes_no_fence() {
+    let directory = GrantDirectory::in_memory().expect("a grant store");
+    let voice_rights = [ActionRight::VoiceUse, ActionRight::SessionView];
+    let standing = grant(1, None, &voice_rights, GrantExpiry::Never);
+    directory
+        .issue(&record(standing.clone()), || Ok(()))
+        .expect("written");
+    let call = grant(
+        2,
+        Some(standing.grant_id),
+        &voice_rights,
+        GrantExpiry::Never,
+    );
+    directory.issue(&record(call), || Ok(())).expect("written");
+    let withdrawn = directory
+        .revoke(standing.grant_id, 4_000, || Ok(()))
+        .expect("revoked");
+    assert_eq!(withdrawn.revoked.len(), 2, "the call went with its grant");
+    assert_eq!(
+        withdrawn.debt, None,
+        "a voice grant's withdrawal owes no fence"
+    );
+    assert!(directory.fence_owed().expect("readable").is_empty());
+
+    // The device's revocation withdraws its voice grants under no row either.
+    let other = grant(3, None, &voice_rights, GrantExpiry::Never);
+    directory.issue(&record(other), || Ok(())).expect("written");
+    let device = directory
+        .revoke_device(device_id(0xf1), 4_100, || Ok(()), None)
+        .expect("revoked");
+    assert_eq!(device.revoked.len(), 1);
+    assert_eq!(device.debt, None);
+    assert!(directory.fence_owed().expect("readable").is_empty());
+
+    // The control: a grant delegated from a voice grant that carries no voice right owes the row
+    // its withdrawal writes.
+    let sharing = grant(
+        4,
+        None,
+        &[
+            ActionRight::VoiceUse,
+            ActionRight::SessionView,
+            ActionRight::SessionShare,
+        ],
+        GrantExpiry::Never,
+    );
+    directory
+        .issue(&record(sharing.clone()), || Ok(()))
+        .expect("written");
+    let delegated = grant(
+        5,
+        Some(sharing.grant_id),
+        &[ActionRight::SessionView],
+        GrantExpiry::Never,
+    );
+    directory
+        .issue(&record(delegated), || Ok(()))
+        .expect("written");
+    let withdrawn = directory
+        .revoke(sharing.grant_id, 4_200, || Ok(()))
+        .expect("revoked");
+    assert_eq!(withdrawn.revoked.len(), 2);
+    assert_eq!(
+        directory.fence_owed().expect("readable"),
+        vec![withdrawn.debt.expect("the delegated grant owes a fence")]
+    );
+}
+
+/// A store an earlier build wrote keyed its fence debt by what it withdrew. That debt is still
+/// owed: it comes forward as one debt under the identity it had, which a barrier retires like any
+/// other, and a second opening changes nothing.
+#[test]
+fn a_fence_debt_an_earlier_build_wrote_is_still_owed() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let path = directory.path().join("grants.sqlite3");
+    {
+        let earlier = rusqlite::Connection::open(&path).expect("opens");
+        earlier
+            .execute_batch(
+                "CREATE TABLE fence_debt (
+                     grant_id       BLOB PRIMARY KEY NOT NULL,
+                     recorded_at_ms INTEGER NOT NULL
+                 );
+                 INSERT INTO fence_debt (grant_id, recorded_at_ms)
+                     VALUES (x'07070707070707070707070707070707', 1000);",
+            )
+            .expect("the earlier shape");
+    }
+    let store = GrantDirectory::open(&path).expect("the store opens and comes forward");
+    let owed = store.fence_owed().expect("readable");
+    assert_eq!(owed.len(), 1, "the earlier debt is still owed");
+    drop(store);
+    let store = GrantDirectory::open(&path).expect("a second opening");
+    assert_eq!(store.fence_owed().expect("readable"), owed);
+    store.fence_completed(&owed).expect("a barrier retires it");
+    assert!(store.fence_owed().expect("readable").is_empty());
 }
 
 /// A claim excludes every other attempt, however long its own attempt runs, and an attempt that
@@ -1899,7 +2058,11 @@ fn a_stored_policy_is_read_back_with_its_restrictions_and_its_floors() {
         .stored_policy()
         .expect("readable")
         .expect("present");
-    let mut restored = HostPolicy::restore(&stored, AuthorityRevision::new(3));
+    let mut restored = HostPolicy::restore(
+        &stored,
+        AuthorityRevision::new(3),
+        Arc::new(UtcFloor::at(stored.utc_floor_ms.get())),
+    );
     assert!(
         restored.is_exclusively_managed(),
         "a restart is not an amnesty"
@@ -2589,14 +2752,16 @@ async fn a_local_revocation_advances_the_revision_and_answers_through_the_barrie
     );
 
     // And the revision survives a restart of the policy, because it was written down.
+    let stored = controller
+        .sharing()
+        .grants()
+        .stored_policy()
+        .expect("readable")
+        .expect("present");
     let restored = HostPolicy::restore(
-        &controller
-            .sharing()
-            .grants()
-            .stored_policy()
-            .expect("readable")
-            .expect("present"),
+        &stored,
         before,
+        Arc::new(UtcFloor::at(stored.utc_floor_ms.get())),
     );
     assert_eq!(restored.accepted_floor(), result.authority_revision);
 }
@@ -3184,10 +3349,9 @@ async fn a_revocation_whose_record_was_never_written_is_answered_from_the_rows_a
 /// bound, and ended before its fence, still has its withdrawal read back whole, and its retry
 /// settles the fence it owes.
 ///
-/// The retry raises that fence and is then refused on its own connection, as every retry that
-/// raises one is; the answer a later retry would carry names more grants than one control frame
-/// may hold, which the caller's decoder refuses whatever produced it. What is asserted is the
-/// record and the fence.
+/// The attempt stops with the daemon that made it, and the next start raises that fence; the answer
+/// a retry would carry names more grants than one control frame may hold, which the caller's
+/// decoder refuses whatever produced it. What is asserted is the record and the fence, raised once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_withdrawal_larger_than_one_message_is_read_back_and_its_fence_settled() {
     let host = Serving::start().await;
@@ -3263,6 +3427,10 @@ async fn a_withdrawal_larger_than_one_message_is_read_back_and_its_fence_settled
         "every grant the revocation withdrew"
     );
 
+    drop(client);
+    let host = host.restart().await;
+    let controller = &host.controller;
+    let mut client = host.client().await;
     let _ = client.repeat(&mutation).await;
     assert_eq!(
         controller.policy().authority_revision().get(),
@@ -3280,11 +3448,11 @@ async fn a_withdrawal_larger_than_one_message_is_read_back_and_its_fence_settled
     );
 }
 
-/// KR-REQ-09.08 and 10.45: a revocation whose attempt withdrew its grant and ended before its fence
-/// ran is answered once that fence has run. The fence is the one the withdrawal owed and it runs
-/// once. Like every connection that fence withdraws, the one whose retry raised it is told to open
-/// a new connection; the retry on the new one is answered, and carries the revision the fence
-/// advanced to.
+/// KR-REQ-09.08 and 10.45: a revocation whose attempt withdrew its grant and stopped before its
+/// fence ran is answered once that fence has run. The attempt stops with the daemon that made it,
+/// so the fence the withdrawal owed is raised by the next start, once, before anything is served;
+/// the retry is answered from the rows, carries the revision that fence advanced to, and raises no
+/// second one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unfinished_revocation_pays_the_fence_it_still_owes_before_it_is_answered() {
     let host = Serving::start().await;
@@ -3352,25 +3520,14 @@ async fn an_unfinished_revocation_pays_the_fence_it_still_owes_before_it_is_answ
             .is_empty(),
         "the withdrawal owes its fence"
     );
-
-    let fenced = client
-        .repeat(&mutation)
-        .await
-        .expect("the daemon answers")
-        .expect_err("the fence the retry raised withdrew this connection's registration too");
-    assert_eq!(
-        fenced.code,
-        kr_protocol::error::ErrorCode::PermissionDenied,
-        "{fenced:?}"
-    );
-    assert!(
-        fenced.message.contains("open a new connection"),
-        "{fenced:?}"
-    );
+    // The attempt stops before its fence, with the daemon that made it.
+    drop(client);
+    let host = host.restart().await;
+    let controller = &host.controller;
     assert_eq!(
         controller.policy().authority_revision().get(),
         before.get() + 1,
-        "the fence the withdrawal owed ran"
+        "the start raised the fence the withdrawal owed"
     );
 
     let mut client = host.client().await;

@@ -12,7 +12,7 @@ publish.workspace = true
 kr-cbor.workspace = true
 kr-crypto.workspace = true
 kr-protocol.workspace = true
-rustix = { workspace = true, features = ["fs", "net", "process", "time"] }
+rustix = { workspace = true, features = ["fs", "mm", "net", "process", "time"] }
 serde.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
@@ -27,8 +27,9 @@ interprocess.workspace = true
 sysinfo.workspace = true
 widestring.workspace = true
 # The owner-only access-control list a private directory carries is built and read through
-# `advapi32`, which is what this feature brings in beyond the workspace's own list.
-windows-sys = { workspace = true, features = ["Win32_Security_Authorization"] }
+# `advapi32`, and the clock floor's file is mapped through `kernel32`'s file mappings: those two
+# features are what this crate brings in beyond the workspace's own list.
+windows-sys = { workspace = true, features = ["Win32_Security_Authorization", "Win32_System_Memory"] }
 
 [features]
 # A disposable owner-only host tree for the other host crates' tests.
@@ -38,11 +39,13 @@ testing = []
 kr-ipc = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 
-# The workspace forbids unsafe code, which a crate that asks the Windows kernel directly cannot
-# honour. This crate denies it instead and allows it in exactly three Windows modules, each of which
-# says why: `clock::windows` (the interrupt-time counter), `paths::windows` (owner-only access-control
-# lists) and `identity::process_times` (a process's creation time and whether it has exited).
-# Nothing else in this crate may relax the rule.
+# The workspace forbids unsafe code, which a crate that asks the kernel directly cannot honour. This
+# crate denies it instead and allows it in exactly five modules, each of which says why:
+# `clock::windows` (the interrupt-time counter), `paths::windows` (owner-only access-control lists),
+# `identity::process_times` (a process's creation time and whether it has exited),
+# `floor::platform` (the shared mapping of the clock floor's file and the atomics on it, on each
+# platform) and `starter::windows` (the launch pipe, a process's facts and a child created
+# suspended). Nothing else in this crate may relax the rule.
 [lints.rust]
 missing_docs = "warn"
 unsafe_code = "deny"

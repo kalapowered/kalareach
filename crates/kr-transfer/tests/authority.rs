@@ -284,6 +284,67 @@ fn a_handle_keeps_its_object_and_a_replaced_path_does_not_extend_the_grant() {
     ));
 }
 
+/// Section 24: a name the authority changes is durable before the record that depends on it, so
+/// the directory holding it is flushed first, through a second handle opened from the one the
+/// authority holds with the right the name needs. While a handle that shares no writing holds that
+/// directory, the second handle cannot be opened: a new subdirectory is reported as the flush it
+/// could not make, and so is a flush for a file's name. Once that handle is let go, both go
+/// through.
+#[cfg(windows)]
+#[test]
+fn a_name_is_not_reported_durable_while_its_directory_cannot_be_flushed() {
+    use kr_ipc::paths::NameKind;
+
+    let root = tempfile::tempdir().expect("a temporary directory");
+    let authority =
+        AuthorisedDirectory::open_root(environment(), root.path()).expect("opens the authority");
+    let name = RelativeName::parse("made").expect("a valid relative name");
+
+    let held = hold_without_shared_writing(root.path());
+    let refused = authority
+        .create_subdirectory(&name)
+        .expect_err("the new directory's name cannot be flushed");
+    assert!(
+        matches!(refused, Escape::Unopenable { .. }),
+        "the refusal is the flush's: {refused:?}"
+    );
+    assert!(
+        matches!(
+            authority.sync(NameKind::File),
+            Err(Escape::Unopenable { .. })
+        ),
+        "nor can a file's"
+    );
+    drop(held);
+
+    authority
+        .create_subdirectory(&name)
+        .expect("with the directory free, the creation goes through");
+    authority
+        .sync(NameKind::File)
+        .expect("and so does a flush for a file's name");
+}
+
+/// Holds a directory through a handle that shares no writing with any other.
+///
+/// A name can still be created or removed in the directory while it is held, since that opens the
+/// name rather than the directory, but nothing can open the directory itself with a right to add
+/// to it, which is what a flush of it has to do on Windows.
+#[cfg(windows)]
+fn hold_without_shared_writing(directory: &Path) -> std::fs::File {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    };
+
+    std::fs::OpenOptions::new()
+        .access_mode(FILE_LIST_DIRECTORY)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(directory)
+        .expect("the directory is held")
+}
+
 /// Reads one file through an authority, which is the only way a test is allowed to reach it.
 fn read_through(authority: &AuthorisedDirectory, name: &RelativeName) -> String {
     use std::io::Read as _;

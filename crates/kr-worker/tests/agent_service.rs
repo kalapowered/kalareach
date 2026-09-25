@@ -49,6 +49,10 @@ struct Host {
     endpoint: kr_ipc::paths::Endpoint,
     environment_id: kr_protocol::ids::EnvironmentId,
     journal_path: std::path::PathBuf,
+    /// The control daemon's identity, to forward a paired device's request as the daemon does.
+    controller: Arc<ControllerIdentity>,
+    /// The boot the daemon proves its generation against.
+    boot: kr_protocol::identity::BootIdentity,
 }
 
 fn build() -> BuildId {
@@ -268,6 +272,7 @@ async fn host() -> Host {
         worker_endpoint: None,
         send_queue_bytes: 1024 * 1024,
         resident_bytes: 64 * 1024,
+        time: kr_worker::action::time::TimeSources::system(),
         launch_profile: kr_protocol::session::LaunchProfile::default(),
     };
     let journal_path = config.journal_path.clone().expect("the harness journals");
@@ -292,7 +297,7 @@ async fn host() -> Host {
             endpoint.clone(),
             ServiceBinding {
                 environment_id,
-                boot_identity: boot,
+                boot_identity: boot.clone(),
                 controller_public_key: *controller.public_key(),
                 controller_generation: ControllerGeneration::new(1),
                 journal_path: Some(journal_path),
@@ -309,6 +314,8 @@ async fn host() -> Host {
         endpoint,
         environment_id,
         journal_path: journal_path_for_tests,
+        controller,
+        boot,
     }
 }
 
@@ -719,6 +726,15 @@ impl UpstreamDispatch for CountingUpstream {
     }
 }
 
+/// The installed package this suite's tables are pinned with and its bindings run.
+fn installed() -> kr_worker::broker::PackageIdentity {
+    kr_worker::broker::PackageIdentity {
+        plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+        publisher_id: PublisherId::new("kalareach").expect("valid"),
+        package_digest: Digest256::from_bytes([5; 32]),
+    }
+}
+
 fn approval_table() -> kr_protocol::gateway::DeclarativeTable {
     let mut table = kr_protocol::gateway::DeclarativeTable {
         plugin_id: PluginId::new("kalareach.codex").expect("valid"),
@@ -751,9 +767,9 @@ fn approval_table() -> kr_protocol::gateway::DeclarativeTable {
 /// The host set up by `register` is the rich half. This is the native half: the qualified table,
 /// the authenticated connection, the transport that would carry an answer out, and one request a
 /// decoder has given meaning to.
-fn offer_approval(
+fn offer_approval<U: UpstreamDispatch + 'static>(
     host: &Host,
-    upstream: Arc<CountingUpstream>,
+    upstream: Arc<U>,
 ) -> kr_protocol::ids::PendingResourceId {
     let broker = host.service.broker();
     broker
@@ -794,6 +810,7 @@ fn offer_approval(
     broker
         .pin_table(
             instance(),
+            installed(),
             approval_table(),
             kr_protocol::gateway::RichMethodTable {
                 table_version: kr_protocol::ids::MethodTableVersion::new(1),
@@ -1600,7 +1617,7 @@ async fn kr_req_09_a_request_that_went_and_was_never_answered_leaves_an_unknown_
     register(&host, None);
     let broker = host.service.broker();
     broker
-        .pin_table(instance(), upstream_table(), upstream_rich())
+        .pin_table(instance(), installed(), upstream_table(), upstream_rich())
         .expect("the installed tables are pinned");
     broker
         .open_native_connection(
@@ -1853,21 +1870,23 @@ async fn kr_req_11_37_a_receipt_fault_the_broker_never_saw_is_still_its_gap() {
     );
 }
 
-/// Registers the plugin action the resource tests below call, on the approval tests' binding.
+/// Registers the plugin action the resource tests below call, on the approval tests' binding: a
+/// component's `upstream.prompt` that names the pending resource it acts on.
 fn register_answer_action(host: &Host) {
+    let declared: kr_plugin_sdk::effect::ActionDeclaration =
+        serde_json::from_value(serde_json::json!({
+            "id": "approval.answer",
+            "label": "Answer",
+            "effect": "upstream.prompt",
+            "implementation": { "type": "component" },
+            "parameters": { "parameters": [] },
+            "description": "A prompt its component prepares",
+            "confirmation_required": false,
+        }))
+        .expect("a declaration the manifest format reads");
     host.service
         .broker()
-        .register_actions(
-            binding(),
-            [kr_worker::broker::RegisteredAction {
-                name: kr_protocol::broker::ActionName::new("approval.answer").expect("valid"),
-                grant: BrokerGrant::UpstreamAction,
-                effect: kr_protocol::authority::EffectClass::Write,
-                capability: Some(capability("agent.prompt")),
-                needs_draft: false,
-                operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
-            }],
-        )
+        .register_actions(binding(), &[declared])
         .expect("the action is registered");
 }
 
@@ -1900,6 +1919,7 @@ fn offer_elsewhere(host: &Host) -> kr_protocol::ids::PendingResourceId {
     broker
         .pin_table(
             elsewhere,
+            installed(),
             approval_table(),
             kr_protocol::gateway::RichMethodTable {
                 table_version: kr_protocol::ids::MethodTableVersion::new(1),
@@ -2046,5 +2066,745 @@ async fn kr_req_12_18_a_plugin_answer_is_refused_for_the_resource_it_names() {
         upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
         0,
         "nothing was carried to the upstream"
+    );
+}
+
+/// A Claude Code channel served for this suite's instance on the host's own broker: the instance
+/// launched, the connector read from a package laid out as the store extracts it, the package
+/// bound and its actions registered as the installation's binder will, and the channel server's
+/// end of the connection to drive.
+struct ServedChannel {
+    lines: tokio::io::Lines<tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+    writes: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    connector: Arc<kr_worker::broker::connectors::InstalledConnector>,
+    root: std::path::PathBuf,
+    _retire: tokio::sync::oneshot::Sender<()>,
+}
+
+impl ServedChannel {
+    async fn open(host: &Host) -> Self {
+        use kr_worker::broker::bridge::{
+            AdmittedBridge, BridgeProcess, BridgeStream, BridgeSurface,
+        };
+        use kr_worker::broker::connectors::{InstalledConnector, decoding_trust, fixture};
+        let broker = Arc::clone(host.service.broker());
+        let launched = ProcessStartIdentity::new(41, ProcessStartSource::MacosProcBsdInfo, 900);
+        broker
+            .register_instance(
+                instance(),
+                IntegrationMode::NativeBridge,
+                None,
+                Some(ManagedProcess::new(
+                    instance(),
+                    launched.clone(),
+                    TransportHandle {
+                        transport: BrokerTransport::PrivateSocket,
+                        application_instance_id: instance(),
+                        executable_digest: Digest256::from_bytes([3; 32]),
+                        process: launched.clone(),
+                    },
+                    Credential::from_bytes([9; 32]),
+                    false,
+                    TimestampMs::new(1),
+                )),
+            )
+            .expect("the launched instance is registered");
+        let root = std::env::temp_dir().join(format!("kr-channel-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(&root).expect("the store's directory");
+        let source =
+            fixture::claude_code_package(&root, std::path::Path::new("/opt/kalareach/bin/kr-hook"))
+                .expect("the package is written");
+        let connector =
+            Arc::new(InstalledConnector::read(source).expect("the installed package reads"));
+        let package_binding = BrokerBindingId::new(Uuid::from_bytes([0x33; 16]));
+        broker
+            .bind(
+                package_binding,
+                instance(),
+                connector.plugin_id(),
+                PublisherId::new("kalareach").expect("valid"),
+                connector.package_digest(),
+                BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
+                decoding_trust(&connector, TimestampMs::new(1)),
+                TimestampMs::new(1),
+            )
+            .expect("the package is bound");
+        broker
+            .register_actions(package_binding, &connector.manifest().actions)
+            .expect("its actions are registered");
+        let (ours, theirs) = tokio::io::duplex(64 * 1024);
+        let (reader, writer) = tokio::io::split(theirs);
+        let admitted = AdmittedBridge {
+            surface: BridgeSurface::Channel,
+            process: BridgeProcess {
+                identity: ProcessStartIdentity::new(43, ProcessStartSource::MacosProcBsdInfo, 902),
+                starter: Some(launched),
+                started: None,
+            },
+            stream: BridgeStream::new(
+                Box::new(reader),
+                Box::new(writer),
+                Vec::new(),
+                kr_worker::broker::Framing::new(kr_protocol::gateway::NativeFraming::JsonLines),
+            ),
+        };
+        let (retire, retired) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(kr_worker::broker::channels::serve(
+            kr_worker::broker::channels::ChannelLaunch {
+                broker,
+                application_instance_id: instance(),
+                connector: Arc::clone(&connector),
+                version: Some(fixture::QUALIFIED_VERSION.to_owned()),
+                site: host.environment_id,
+                os_user: "person".to_owned(),
+                views: None,
+            },
+            admitted,
+            async move {
+                let _ = retired.await;
+            },
+        ));
+        let (ours_reader, writes) = tokio::io::split(ours);
+        Self {
+            lines: tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(ours_reader)),
+            writes,
+            connector,
+            root,
+            _retire: retire,
+        }
+    }
+
+    /// Relays one tool approval, as the forwarder does, and waits for it to be interpreted.
+    async fn relay(
+        &mut self,
+        host: &Host,
+        request_id: &str,
+    ) -> kr_protocol::ids::PendingResourceId {
+        let frame = serde_json::json!({
+            "method": "notifications/claude/channel/permission_request",
+            "params": {
+                "request_id": request_id,
+                "tool_name": "Bash",
+                "description": "List the files here",
+                "input_preview": "ls -la",
+            },
+        });
+        tokio::io::AsyncWriteExt::write_all(&mut self.writes, format!("{frame}\n").as_bytes())
+            .await
+            .expect("the frame is written");
+        let started = tokio::time::Instant::now();
+        loop {
+            let found = host
+                .service
+                .broker()
+                .pending_resources()
+                .into_iter()
+                .find(|resource| {
+                    resource.request.upstream.as_str() == format!("\"{request_id}\"")
+                        && resource.interpretation_verified
+                });
+            if let Some(resource) = found {
+                return resource.resource_id;
+            }
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "the approval is interpreted"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Reads the next frame this host wrote on the channel.
+    async fn next(&mut self) -> serde_json::Value {
+        let line = tokio::time::timeout(LIVENESS_DEADLINE, self.lines.next_line())
+            .await
+            .expect("the channel is written to in time")
+            .expect("the channel reads")
+            .expect("the channel is open");
+        serde_json::from_str(&line).expect("a frame is JSON")
+    }
+}
+
+impl Drop for ServedChannel {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+/// One `plugin.action.invoke` of the channel package's answer action.
+fn channel_answer(
+    client: &LocalClient,
+    host: &Host,
+    connector: &kr_worker::broker::connectors::InstalledConnector,
+    request_id: u64,
+    resource_id: kr_protocol::ids::PendingResourceId,
+    decision: &str,
+) -> MutationRequest {
+    MutationRequest {
+        request_id: RequestId::new(request_id),
+        method: Method::PluginActionInvoke.into(),
+        method_version: MethodVersion::V1,
+        action_id: ActionId::new(kr_ipc::new_uuid()),
+        grant_id: Nullable::null(),
+        target: ActionTarget {
+            environment_id: host.environment_id,
+            session_id: Nullable::some(host.session_id),
+            session_epoch: Nullable::some(SessionEpoch::V1),
+            application_instance_id: Nullable::some(instance()),
+            agent_binding_revision: Nullable::some(AgentBindingRevision::new(1)),
+        },
+        expected: ParamsValue::empty(),
+        action_window_id: client.action_window().action_window_id.clone(),
+        requested_ttl_ms: DurationMs::new(60_000),
+        params: ParamsValue::from_typed(&kr_protocol::agent::PluginActionInvokeParams {
+            target: AgentMutationTarget {
+                subject: subject(host.session_id, instance()),
+                binding_revision: AgentBindingRevision::new(1),
+            },
+            plugin_id: connector.plugin_id(),
+            action: kr_protocol::broker::ActionName::new("approval.answer").expect("valid"),
+            draft_id: Nullable::null(),
+            resource_id: Nullable::some(resource_id),
+            parameters: kr_protocol::scalars::Bytes::from(
+                serde_json::to_vec(&serde_json::json!({ "decision": decision })).expect("encodes"),
+            ),
+        })
+        .expect("encodes"),
+    }
+}
+
+/// KR-REQ-12.18 and KR-REQ-11.34: with the Claude Code package bound as the installation's binder
+/// will bind it, `plugin.action.invoke` of its answer action writes the application's own verdict
+/// on the channel, once, from the table's decision destination with no component involved, and
+/// returns the action's own result with a receipt that says it was applied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_18_a_plugin_answer_goes_out_on_the_channel_and_reports_the_action() {
+    let host = host().await;
+    let mut channel = ServedChannel::open(&host).await;
+    let resource_id = channel.relay(&host, "abcde").await;
+    let mut client = cli(&host).await;
+
+    let mutation = channel_answer(&client, &host, &channel.connector, 60, resource_id, "allow");
+    let action_id = mutation.action_id;
+    let outcome = send(&mut client, mutation).await;
+    let Outcome::Ok(result) = outcome else {
+        panic!("the answer is carried: {outcome:?}");
+    };
+    let result: kr_protocol::agent::PluginActionInvokeResult =
+        result.to_typed().expect("the action's own result");
+    assert_eq!(result.action.as_str(), "approval.answer");
+    assert_eq!(
+        result.mutation.provenance,
+        kr_protocol::broker::ActionProvenance::UpstreamTypedRpc
+    );
+    assert_eq!(
+        channel.next().await,
+        serde_json::json!({
+            "method": "notifications/claude/channel/permission",
+            "params": { "request_id": "abcde", "behavior": "allow" }
+        })
+    );
+    assert_eq!(
+        receipt(&mut client, action_id).await.state,
+        ReceiptState::Applied
+    );
+    assert_eq!(
+        host.service
+            .broker()
+            .pending(resource_id)
+            .expect("held")
+            .state,
+        kr_protocol::gateway::PendingState::Resolved
+    );
+
+    // Once: the resource has its answer, and a second one is refused before its marker.
+    let again = channel_answer(&client, &host, &channel.connector, 61, resource_id, "deny");
+    let again_id = again.action_id;
+    assert!(matches!(send(&mut client, again).await, Outcome::Error(_)));
+    assert_eq!(
+        receipt(&mut client, again_id).await.state,
+        ReceiptState::Rejected
+    );
+}
+
+/// A transport whose `submit` blocks until it is let go: one whose queue is held somewhere this
+/// host cannot see.
+#[derive(Debug)]
+struct BlockingUpstream {
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl UpstreamDispatch for BlockingUpstream {
+    fn admit(&self, _request: &UpstreamRequest) -> Result<(), BrokerError> {
+        Ok(())
+    }
+
+    fn submit(&self, _request: &UpstreamRequest) -> Result<PendingTransmission, BrokerError> {
+        let _ = self
+            .release
+            .lock()
+            .expect("the release is not poisoned")
+            .recv_timeout(std::time::Duration::from_secs(120));
+        Ok(PendingTransmission::settled(Ok(UpstreamOutcome {
+            upstream_request_id: None,
+            turn_id: None,
+            provenance: kr_protocol::broker::ActionProvenance::UpstreamTypedRpc,
+        })))
+    }
+}
+
+/// Section 9: an admitted operation whose transport blocks while it takes the operation is answered
+/// when the upstream deadline passes, as an outcome nobody can establish, and not whenever the
+/// transport lets go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transport_that_blocks_as_it_takes_an_operation_meets_the_upstream_deadline() {
+    let host = host().await;
+    let (release, held) = std::sync::mpsc::channel();
+    register(
+        &host,
+        Some(Arc::new(BlockingUpstream {
+            release: std::sync::Mutex::new(held),
+        }) as Arc<dyn UpstreamDispatch>),
+    );
+    let mut client = cli(&host).await;
+    let mutation = prompt_mutation(&client, &host, 70);
+    let action_id = mutation.action_id;
+    let started = tokio::time::Instant::now();
+    let deadline = kr_worker::service::UPSTREAM_SUBMIT_DEADLINE;
+    let outcome = tokio::time::timeout(
+        deadline + std::time::Duration::from_secs(30),
+        send(&mut client, mutation),
+    )
+    .await
+    .expect("the caller is answered at the deadline, not when the transport lets go");
+    let waited = started.elapsed();
+    let _ = release.send(());
+    let Outcome::Error(error) = outcome else {
+        panic!("a transmission that never finished is not applied: {outcome:?}");
+    };
+    assert_eq!(error.code, ErrorCode::UpstreamUnavailable);
+    assert!(
+        waited < deadline + std::time::Duration::from_secs(20),
+        "answered after {waited:?}, at a deadline of {deadline:?}"
+    );
+    assert_eq!(
+        receipt(&mut client, action_id).await.state,
+        ReceiptState::Unknown,
+        "whether it reached the upstream cannot be established"
+    );
+}
+
+/// The state one pending resource is in now.
+fn state_of(
+    host: &Host,
+    resource_id: kr_protocol::ids::PendingResourceId,
+) -> kr_protocol::gateway::PendingState {
+    host.service
+        .broker()
+        .pending(resource_id)
+        .expect("the resource is held")
+        .state
+}
+
+/// Section 9 and KR-REQ-11.27: an answer whose transport blocks while it takes it is settled as
+/// uncertain when the upstream deadline passes, before its receipt is recorded and before its
+/// caller hears; the transport letting go afterwards, and saying it took the answer, settles
+/// nothing again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_09_an_answer_whose_transport_blocks_is_uncertain_before_its_caller_hears() {
+    let host = host().await;
+    let (release, held) = std::sync::mpsc::channel();
+    register(&host, None);
+    let resource_id = offer_approval(
+        &host,
+        Arc::new(BlockingUpstream {
+            release: std::sync::Mutex::new(held),
+        }),
+    );
+    let mut client = cli(&host).await;
+    let mutation = approval_mutation(&client, &host, 71, resource_id);
+    let action_id = mutation.action_id;
+    let deadline = kr_worker::service::UPSTREAM_SUBMIT_DEADLINE;
+    let outcome = tokio::time::timeout(
+        deadline + std::time::Duration::from_secs(30),
+        send(&mut client, mutation),
+    )
+    .await
+    .expect("the caller is answered at the deadline, not when the transport lets go");
+    let when_answered = state_of(&host, resource_id);
+    let Outcome::Error(error) = outcome else {
+        panic!("an answer that never finished going is not applied: {outcome:?}");
+    };
+    assert_eq!(error.code, ErrorCode::UpstreamUnavailable);
+    assert_eq!(
+        when_answered,
+        kr_protocol::gateway::PendingState::Uncertain,
+        "the resource was settled before the caller heard"
+    );
+
+    let _ = release.send(());
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(
+        state_of(&host, resource_id),
+        kr_protocol::gateway::PendingState::Uncertain,
+        "what the transport did afterwards settles nothing again"
+    );
+    assert_eq!(
+        receipt(&mut client, action_id).await.state,
+        ReceiptState::Unknown
+    );
+}
+
+/// Section 9 and KR-REQ-11.27: an answer the transport took and the upstream never acknowledged is
+/// settled as uncertain at the upstream deadline, before its caller hears.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_09_an_answer_never_acknowledged_is_uncertain_before_its_caller_hears() {
+    let host = host().await;
+    let (_never, waiting) = tokio::sync::oneshot::channel::<()>();
+    register(&host, None);
+    let resource_id = offer_approval(
+        &host,
+        Arc::new(WaitingUpstream {
+            release: std::sync::Mutex::new(Some(waiting)),
+            carried: std::sync::atomic::AtomicUsize::new(0),
+        }),
+    );
+    let mut client = cli(&host).await;
+    let mutation = approval_mutation(&client, &host, 72, resource_id);
+    let action_id = mutation.action_id;
+    let deadline = kr_worker::service::UPSTREAM_SUBMIT_DEADLINE;
+    let outcome = tokio::time::timeout(
+        deadline + std::time::Duration::from_secs(30),
+        send(&mut client, mutation),
+    )
+    .await
+    .expect("the caller is answered at the deadline");
+    let when_answered = state_of(&host, resource_id);
+    let Outcome::Error(error) = outcome else {
+        panic!("an answer nobody acknowledged is not applied: {outcome:?}");
+    };
+    assert_eq!(error.code, ErrorCode::UpstreamUnavailable);
+    assert_eq!(
+        when_answered,
+        kr_protocol::gateway::PendingState::Uncertain,
+        "the resource was settled before the caller heard"
+    );
+    assert_eq!(
+        receipt(&mut client, action_id).await.state,
+        ReceiptState::Unknown
+    );
+}
+
+/// Connects as the control daemon and proves the generation this worker accepts.
+async fn daemon(host: &Host) -> LocalClient {
+    let mut daemon = LocalClient::connect(&host.endpoint, LocalClientKind::Controller, build())
+        .await
+        .expect("connects as the daemon");
+    let identity = Arc::clone(&host.controller);
+    let boot = host.boot.clone();
+    daemon
+        .present_generation(move |nonce| {
+            identity
+                .generation_token(ControllerGeneration::new(1), &boot, nonce)
+                .map_err(kr_ipc::IpcError::from)
+        })
+        .await
+        .expect("the worker accepts the generation");
+    daemon
+}
+
+/// One `plugin.action.invoke` of the suite's package on the suite's instance.
+fn plugin_invocation(
+    host: &Host,
+    request_id: u64,
+    action_window_id: kr_protocol::ids::ActionWindowId,
+    action: &str,
+    resource_id: Nullable<kr_protocol::ids::PendingResourceId>,
+    parameters: &[u8],
+) -> MutationRequest {
+    MutationRequest {
+        request_id: RequestId::new(request_id),
+        method: Method::PluginActionInvoke.into(),
+        method_version: MethodVersion::V1,
+        action_id: ActionId::new(kr_ipc::new_uuid()),
+        grant_id: Nullable::null(),
+        target: ActionTarget {
+            environment_id: host.environment_id,
+            session_id: Nullable::some(host.session_id),
+            session_epoch: Nullable::some(SessionEpoch::V1),
+            application_instance_id: Nullable::some(instance()),
+            agent_binding_revision: Nullable::some(AgentBindingRevision::new(1)),
+        },
+        expected: ParamsValue::empty(),
+        action_window_id,
+        requested_ttl_ms: DurationMs::new(60_000),
+        params: ParamsValue::from_typed(&kr_protocol::agent::PluginActionInvokeParams {
+            target: AgentMutationTarget {
+                subject: subject(host.session_id, instance()),
+                binding_revision: AgentBindingRevision::new(1),
+            },
+            plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+            action: kr_protocol::broker::ActionName::new(action).expect("valid"),
+            draft_id: Nullable::null(),
+            resource_id,
+            parameters: kr_protocol::scalars::Bytes::from(parameters.to_vec()),
+        })
+        .expect("encodes"),
+    }
+}
+
+/// Forwards one mutation as the control daemon does for a paired device acting under a grant
+/// that carries `grant_rights`.
+async fn forward_as_device(
+    daemon: &mut LocalClient,
+    mutation: &MutationRequest,
+    grant_rights: &[kr_protocol::rights::ActionRight],
+) -> std::result::Result<ParamsValue, kr_protocol::error::ProtocolError> {
+    let envelope = kr_protocol::actor::ActorEnvelope {
+        actor_id: kr_protocol::ids::ActorId::new("device:a-test-phone").expect("an actor"),
+        ingress: kr_protocol::actor::ActorIngress::PairedDevice,
+        device_id: Nullable::some(kr_protocol::ids::DeviceId::new(Uuid::from_bytes([9; 16]))),
+        grant_id: Nullable::some(kr_protocol::ids::GrantId::new(Uuid::from_bytes([8; 16]))),
+        grant_revision: Nullable::some(kr_protocol::ids::AuthorityRevision::new(1)),
+        controller_generation: ControllerGeneration::new(1),
+        connection_id: kr_protocol::ids::ConnectionId::new(Uuid::from_bytes([7; 16])),
+    };
+    daemon
+        .forward(
+            mutation,
+            &envelope,
+            &grant_rights.iter().copied().collect(),
+            kr_protocol::scalars::U64::new(kr_ipc::clock::boot_elapsed_ms() + 30_000),
+        )
+        .await
+        .expect("the forward reaches the worker")
+}
+
+/// Registers one action of each class a paired device could invoke on the approval tests'
+/// binding, as the package declares them: an answer through the connector table's decision
+/// destination, and a prompt and an attachment its component prepares.
+fn register_class_actions(host: &Host) {
+    let declared = |id: &str, effect: &str, implementation: serde_json::Value| {
+        serde_json::from_value::<kr_plugin_sdk::effect::ActionDeclaration>(serde_json::json!({
+            "id": id,
+            "label": id,
+            "effect": effect,
+            "implementation": implementation,
+            "parameters": { "parameters": [] },
+            "description": format!("{id}, as the package declares it"),
+            "confirmation_required": false,
+        }))
+        .expect("a declaration the manifest format reads")
+    };
+    let refused = host
+        .service
+        .broker()
+        .register_actions(
+            binding(),
+            &[
+                declared(
+                    "request.answer",
+                    "approval.respond",
+                    serde_json::json!({ "type": "decision_destination", "decision": "decision" }),
+                ),
+                declared(
+                    "prompt.send",
+                    "upstream.prompt",
+                    serde_json::json!({ "type": "component" }),
+                ),
+                declared(
+                    "draft.attach",
+                    "upstream.attachment",
+                    serde_json::json!({ "type": "component" }),
+                ),
+            ],
+        )
+        .expect("the actions are registered");
+    assert!(refused.is_empty(), "{refused:?}");
+}
+
+/// Offers one more request on the approval tests' connection, interpreted by their binding.
+fn offer_another(host: &Host, id: u64) -> kr_protocol::ids::PendingResourceId {
+    let broker = host.service.broker();
+    let opaque = broker
+        .forward_native(
+            kr_protocol::ids::GatewayConnectionId::new(1),
+            format!(r#"{{"id":{id},"method":"session/request_permission"}}"#).as_bytes(),
+            TimestampMs::new(4),
+        )
+        .expect("forwarded")
+        .1
+        .expect("it expects a response");
+    broker
+        .interpret(
+            binding(),
+            opaque.resource_id,
+            kr_protocol::broker::DecodedProjection {
+                schema_version: "kr-approval/1".to_owned(),
+                summary: "the agent wants to write a file".to_owned(),
+                decisions: vec![kr_protocol::broker::OfferedDecision {
+                    option_id: "allow".to_owned(),
+                    label: "Allow".to_owned(),
+                }],
+            },
+            None,
+            TimestampMs::new(5),
+        )
+        .expect("interpreted")
+        .resource_id
+}
+
+/// KR-REQ-11.47 and KR-REQ-23.30: `plugin.action.invoke` holds a caller acting under a grant to
+/// the rights its action's declared class needs, as the method's entry says it intersects them: an
+/// answer needs `agent.approval.respond`, a prompt `agent.prompt`, and an attachment `agent.prompt`
+/// and `files.upload`. A paired device whose grant lacks one is refused before the marker, and
+/// nothing is carried. One whose grant holds them passes, and so does the local owner, who acts
+/// under no grant: each answer is admitted and carried, and the prompt and the attachment meet the
+/// refusal every component action meets here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_47_a_forwarded_action_needs_the_rights_of_its_class() {
+    use kr_protocol::rights::ActionRight;
+    let host = host().await;
+    let upstream = Arc::new(CountingUpstream::default());
+    register(
+        &host,
+        Some(Arc::clone(&upstream) as Arc<dyn UpstreamDispatch>),
+    );
+    let first = offer_approval(&host, Arc::clone(&upstream));
+    let second = offer_another(&host, 12);
+    register_class_actions(&host);
+    let mut daemon = daemon(&host).await;
+    let window = || kr_protocol::ids::ActionWindowId::new("forwarded").expect("a window");
+    let every = [
+        ActionRight::AgentApprovalRespond,
+        ActionRight::AgentPrompt,
+        ActionRight::FilesUpload,
+    ];
+    let without = |missing: ActionRight| {
+        every
+            .iter()
+            .copied()
+            .filter(|right| *right != missing)
+            .collect::<Vec<_>>()
+    };
+    let decision = br#"{"decision":"allow"}"#.as_slice();
+
+    for (request_id, action, resource, parameters, missing) in [
+        (
+            100,
+            "request.answer",
+            Nullable::some(first),
+            decision,
+            ActionRight::AgentApprovalRespond,
+        ),
+        (
+            101,
+            "prompt.send",
+            Nullable::null(),
+            b"{}".as_slice(),
+            ActionRight::AgentPrompt,
+        ),
+        (
+            102,
+            "draft.attach",
+            Nullable::null(),
+            b"{}".as_slice(),
+            ActionRight::FilesUpload,
+        ),
+    ] {
+        let refusal = forward_as_device(
+            &mut daemon,
+            &plugin_invocation(&host, request_id, window(), action, resource, parameters),
+            &without(missing),
+        )
+        .await
+        .expect_err(action);
+        assert_eq!(
+            refusal.code,
+            ErrorCode::PermissionDenied,
+            "{action} without {}: {refusal:?}",
+            missing.as_str()
+        );
+    }
+    assert_eq!(
+        upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "nothing was carried"
+    );
+    assert_eq!(
+        host.service
+            .broker()
+            .pending(first)
+            .expect("still held")
+            .state,
+        kr_protocol::gateway::PendingState::Pending,
+        "and the request is still pending"
+    );
+
+    for (request_id, action) in [(110, "prompt.send"), (111, "draft.attach")] {
+        let refusal = forward_as_device(
+            &mut daemon,
+            &plugin_invocation(&host, request_id, window(), action, Nullable::null(), b"{}"),
+            &every,
+        )
+        .await
+        .expect_err("no component's prepared effect reaches this broker");
+        assert_eq!(
+            refusal.code,
+            ErrorCode::UnsupportedCapability,
+            "{action}, with the rights its class needs: {refusal:?}"
+        );
+    }
+    forward_as_device(
+        &mut daemon,
+        &plugin_invocation(
+            &host,
+            112,
+            window(),
+            "request.answer",
+            Nullable::some(first),
+            decision,
+        ),
+        &every,
+    )
+    .await
+    .expect("an answer under a grant with its right is admitted and carried");
+
+    let mut client = cli(&host).await;
+    for (request_id, action) in [(120, "prompt.send"), (121, "draft.attach")] {
+        let mutation = plugin_invocation(
+            &host,
+            request_id,
+            client.action_window().action_window_id.clone(),
+            action,
+            Nullable::null(),
+            b"{}",
+        );
+        let Outcome::Error(refusal) = send(&mut client, mutation).await else {
+            panic!("no component's prepared effect reaches this broker");
+        };
+        assert_eq!(
+            refusal.code,
+            ErrorCode::UnsupportedCapability,
+            "{action}, from the local owner: {refusal:?}"
+        );
+    }
+    let mutation = plugin_invocation(
+        &host,
+        122,
+        client.action_window().action_window_id.clone(),
+        "request.answer",
+        Nullable::some(second),
+        decision,
+    );
+    let outcome = send(&mut client, mutation).await;
+    assert!(
+        matches!(outcome, Outcome::Ok(_)),
+        "the local owner's answer is admitted and carried: {outcome:?}"
+    );
+    assert_eq!(
+        upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the two answers were carried"
     );
 }

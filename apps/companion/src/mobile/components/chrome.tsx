@@ -75,7 +75,8 @@ export function TopBar({
   readonly onBack?: () => void
   readonly backLabel?: string
   readonly action?: ReactNode
-  readonly connection: { readonly connected: boolean; readonly reason: string | null }
+  /** Where the connection stands, or null before anything has answered which. */
+  readonly connection: { readonly connected: boolean; readonly reason: string | null } | null
   readonly surface: Surface
 }): ReactNode {
   const target = minimumTarget(surface)
@@ -108,13 +109,23 @@ export function TopBar({
       </span>
       <h1>{title}</h1>
       <span className="m-topbar-side">{action}</span>
-      <p className="m-connection" title={connection.reason ?? undefined}>
-        <span className={`status-dot${connection.connected ? '' : ' offline'}`} aria-hidden="true" />
-        <span>
-          {connection.connected
-            ? 'In contact with this host'
-            : (connection.reason ?? 'Not in contact')}
-        </span>
+      <p className="m-connection" title={connection?.reason ?? undefined}>
+        {connection === null ? (
+          // Before the first answer there is no state to show, so there is no dot to colour.
+          <span>Checking the connection…</span>
+        ) : (
+          <>
+            <span
+              className={`status-dot${connection.connected ? '' : ' offline'}`}
+              aria-hidden="true"
+            />
+            <span>
+              {connection.connected
+                ? 'In contact with this host'
+                : (connection.reason ?? 'Not in contact')}
+            </span>
+          </>
+        )}
       </p>
     </header>
   )

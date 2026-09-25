@@ -194,19 +194,23 @@ pub enum Hidden {
     OutsideTheGrammar(PredicateError),
 }
 
-impl core::fmt::Display for Hidden {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl crate::shown::Said for Hidden {
+    fn said(&self) -> crate::shown::Shown {
         match self {
-            Self::PredicateFalse => formatter.write_str("its condition is not met"),
-            Self::UnknownFact { fact } => {
-                write!(formatter, "this client does not know {fact}")
-            }
+            Self::PredicateFalse => crate::shown::Shown::said("its condition is not met"),
+            // The fact is named by the package, in the condition it wrote for the control.
+            Self::UnknownFact { fact } => crate::shown!(
+                "this client does not know {}",
+                crate::shown::Shown::package(&crate::shown::ControlText::declared(fact.clone()))
+            ),
             Self::OutsideTheGrammar(error) => {
-                write!(formatter, "its condition is not a valid one: {error}")
+                crate::shown!("its condition is not a valid one: {}", *error)
             }
         }
     }
 }
+
+crate::display_as_said!(Hidden);
 
 /// Whether a control is shown.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -365,17 +369,25 @@ pub enum NotInvocable {
     },
 }
 
-impl core::fmt::Display for NotInvocable {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl crate::shown::Said for NotInvocable {
+    fn said(&self) -> crate::shown::Shown {
         match self {
-            Self::Hidden(reason) => write!(formatter, "the control is not shown: {reason}"),
+            Self::Hidden(reason) => crate::shown!("the control is not shown: {}", *reason),
             Self::Disabled { because, reason } => match reason {
-                Some(reason) => write!(formatter, "the control is disabled: {reason}"),
-                None => write!(formatter, "the control is disabled: {because}"),
+                // The reason the package gives a person, which it wrote to be shown.
+                Some(reason) => crate::shown!(
+                    "the control is disabled: {}",
+                    crate::shown::Shown::package(&crate::shown::ControlText::declared(
+                        reason.clone()
+                    ))
+                ),
+                None => crate::shown!("the control is disabled: {}", *because),
             },
         }
     }
 }
+
+crate::display_as_said!(NotInvocable);
 
 /// Builds the invocation a person's press produces.
 ///
@@ -410,12 +422,25 @@ pub fn invoke(
 }
 
 /// One thing a client draws.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Rendered {
     /// A node this build knows, drawn with the client's own standard components.
     Node(Box<DocumentNode>),
     /// A node this build does not know, drawn as an unsupported-content block.
     Unsupported(UnsupportedNode),
+}
+
+impl core::fmt::Debug for Rendered {
+    /// Which kind of rendering it is and how many controls it holds, never the document.
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Node(node) => formatter
+                .debug_struct("Node")
+                .field("controls", &node.body.controls().len())
+                .finish_non_exhaustive(),
+            Self::Unsupported(_) => formatter.write_str("Unsupported(..)"),
+        }
+    }
 }
 
 impl Rendered {

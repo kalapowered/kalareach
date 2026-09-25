@@ -81,6 +81,15 @@ async fn host() -> Host {
 /// opens, and the host's recovery and its own maintenance are what act on them. A test that wrote
 /// them afterwards would be testing a different sequence.
 async fn host_prepared(prepare: impl FnOnce(&std::path::Path)) -> Host {
+    host_with(prepare, |_| kr_worker::action::time::TimeSources::system()).await
+}
+
+/// Starts a host as [`host_prepared`] does, whose session's time contract reads the clocks and
+/// the clock floor `time` gives it for the environment.
+async fn host_with(
+    prepare: impl FnOnce(&std::path::Path),
+    time: impl FnOnce(&kr_ipc::paths::EnvironmentPaths) -> kr_worker::action::time::TimeSources,
+) -> Host {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
@@ -108,7 +117,10 @@ async fn host_prepared(prepare: impl FnOnce(&std::path::Path)) -> Host {
         std::fs::create_dir_all(parent).expect("the journal directory");
     }
     prepare(&journal_path);
-    let config = session_config(&environment, session_id);
+    let config = SessionConfig {
+        time: time(&environment),
+        ..session_config(&environment, session_id)
+    };
     let journal_path = config
         .journal_path
         .clone()
@@ -176,6 +188,7 @@ fn session_config(
         worker_endpoint: None,
         send_queue_bytes: 1024 * 1024,
         resident_bytes: 64 * 1024,
+        time: kr_worker::action::time::TimeSources::system(),
         launch_profile: kr_protocol::session::LaunchProfile::default(),
     }
 }
@@ -1299,6 +1312,44 @@ fn an_upstream_identifier_never_becomes_a_kalareach_identifier() {
 /// KR-REQ-09.09: authority, expiry, identity, binding and preconditions are all rechecked in the
 /// serial dispatch path, and a refusal commits a rejection rather than an effect.
 /// KR-REQ-06.02: a mutation naming any session epoch but the current one, 1, is refused as stale.
+/// A worker states the clock floor it maps, by the floor's identity, in its answer to every hello,
+/// so a control daemon can tell whether it decides UTC deadlines from the daemon's own floor. A
+/// worker that maps none states none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_worker_states_the_clock_floor_it_maps_in_its_hello() {
+    let identity = std::sync::Mutex::new(None);
+    let floored = host_with(
+        |_| {},
+        |environment| {
+            let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
+            let floor = kr_ipc::floor::SharedFloor::create(
+                &environment.utc_floor_file(),
+                environment.environment_id(),
+                kr_ipc::identity::boot_epoch(&boot).expect("a boot epoch"),
+                0,
+            )
+            .expect("the environment's floor");
+            *identity.lock().expect("not poisoned") = floor.identity();
+            kr_worker::action::time::TimeSources::system().with_floor(Arc::new(floor))
+        },
+    )
+    .await;
+    let identity = identity
+        .into_inner()
+        .expect("not poisoned")
+        .expect("a mapped floor has an identity");
+    let client = cli(&floored).await;
+    assert_eq!(
+        kr_protocol::local::stated_utc_floor(&client.acknowledgement().capabilities),
+        Some(*identity.as_bytes())
+    );
+
+    // The control: a worker that maps no floor states none.
+    let unfloored = host().await;
+    let client = cli(&unfloored).await;
+    assert!(client.acknowledgement().capabilities.is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_serial_path_rechecks_authority_expiry_identity_binding_and_preconditions() {
     let host = host().await;

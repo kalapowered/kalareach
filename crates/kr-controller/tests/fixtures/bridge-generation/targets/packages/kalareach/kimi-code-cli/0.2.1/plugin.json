@@ -1,0 +1,140 @@
+{
+  "manifest_version": 1,
+  "publisher_id": "kalareach",
+  "plugin_name": "kimi-code-cli",
+  "version": "0.2.1",
+  "display_name": "Kimi Code CLI",
+  "description": "Recognises the kimi.com Kimi Code CLI distribution, reads its agent protocol through a declarative table and stops the turn it is running.",
+  "sdk_range": ">=0.1.1, <0.2.0",
+  "wit_range": ">=0.1.0, <0.2.0",
+  "source": {
+    "repository": "https://github.com/kalapowered/kalareach-plugins",
+    "revision": "aea3b0db45c5883fc7d110d57b9ae6bcb92f707d"
+  },
+  "match_rules": [
+    {
+      "id": "kimi-code-cli-home",
+      "executable": {
+        "file_stem": "kimi",
+        "path_suffix": [
+          ".kimi-code",
+          "bin"
+        ],
+        "version_range": null
+      },
+      "distribution": null,
+      "confidence": "inferred"
+    },
+    {
+      "id": "kimi-code-cli-executable",
+      "executable": {
+        "file_stem": "kimi",
+        "path_suffix": [],
+        "version_range": null
+      },
+      "distribution": null,
+      "confidence": "inferred"
+    }
+  ],
+  "platforms": [
+    {
+      "os": "linux",
+      "architectures": [
+        "x86_64",
+        "aarch64"
+      ]
+    },
+    {
+      "os": "mac_os",
+      "architectures": [
+        "aarch64"
+      ]
+    },
+    {
+      "os": "windows",
+      "architectures": [
+        "x86_64"
+      ]
+    }
+  ],
+  "payloads": [
+    {
+      "role": "asset",
+      "path": "README.md",
+      "digest": "53f57fd74212cc387a3091577ae75d3bc8181b6e48b735b4bc2888fd22fdccb6",
+      "size_bytes": "5842"
+    },
+    {
+      "role": "connector",
+      "path": "connector.json",
+      "digest": "5f98316a33332a62c3358fe534801bc83e9e81d641c4fa9b4b81e5f82bdbd391",
+      "size_bytes": "8697"
+    },
+    {
+      "role": "fixture",
+      "path": "fixtures/conformance.json",
+      "digest": "774cb7f425d9bcf21e5637201abbc9cb4c4ae20da6bb07e7fbb3e9dfa447187e",
+      "size_bytes": "4881"
+    },
+    {
+      "role": "asset",
+      "path": "fixtures/frames.json",
+      "digest": "0ddc7b9ed451d642372078b8aed8e43651de7bdd2cbeaca66898a4669e34f59d",
+      "size_bytes": "8151"
+    },
+    {
+      "role": "presentation",
+      "path": "presentation.json",
+      "digest": "36af5d987758aa5da9f54eef0ac9e15358f802856b8b2b0b764363bac7ee09cc",
+      "size_bytes": "4117"
+    }
+  ],
+  "capabilities": [
+    {
+      "capability": "metadata.match",
+      "reason": "Recognise the kimi.com distribution from its own installation directory, and the executable name as a guess"
+    },
+    {
+      "capability": "presentation.declarative",
+      "reason": "Show what the Kimi Code CLI session is doing and the controls for its turn"
+    },
+    {
+      "capability": "broker.semantic_events",
+      "reason": "Read the turn and tool updates the selected agent-protocol execution reports"
+    },
+    {
+      "capability": "upstream.action",
+      "reason": "Ask Kimi Code CLI to stop the turn it is running when you press Stop"
+    }
+  ],
+  "actions": [
+    {
+      "id": "turn.cancel",
+      "label": "Stop the turn",
+      "effect": "upstream.cancel",
+      "implementation": {
+        "type": "upstream_cancel"
+      },
+      "parameters": {
+        "parameters": []
+      },
+      "description": "Cancel the turn the bound Kimi Code CLI execution is running, which ends it as interrupted",
+      "confirmation_required": false
+    },
+    {
+      "id": "session.refresh",
+      "label": "Refresh",
+      "effect": "observe",
+      "implementation": {
+        "type": "presentation"
+      },
+      "parameters": {
+        "parameters": []
+      },
+      "description": "Draw this package's document again from the session state the host already holds",
+      "confirmation_required": false
+    }
+  ],
+  "attachments": null,
+  "native_bridge": null
+}

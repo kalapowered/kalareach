@@ -22,6 +22,7 @@
 
 use std::path::{Path, PathBuf};
 
+use kr_ipc::paths::NameKind;
 use kr_protocol::scalars::{Digest256, Nullable};
 use kr_protocol::skill::{
     AgentTarget, AgentToolsInstallResult, AgentToolsParams, AgentToolsRemoveResult,
@@ -30,6 +31,11 @@ use kr_protocol::skill::{
 };
 use serde_json::{Map, Value, json};
 
+use crate::catalogue::files::{
+    PRIVATE, READABLE, create_directory_durably, digest_of, display, guard_access_controls, hex,
+    home_directory, missing_ancestors, read_digest, storage, supported_platform, sync_directory,
+    write_atomically,
+};
 use crate::error::{ControllerError, Result};
 
 /// The skill instructions, compiled in.
@@ -54,6 +60,12 @@ pub const ENTRY_ARGS: &[&str] = &["agent-tools", "--stdio"];
 /// writes the deadline into the agent's configuration, so it writes the same number into the
 /// environment the agent launches the server with.
 pub const DEADLINE_VARIABLE: &str = "KR_TOOL_DEADLINE_MS";
+
+/// What a person does where this host will not change an agent's installation itself.
+const SERVER_BY_HAND: &str = "add the server with the agent's own command instead";
+
+/// What a person does where this host will not rewrite an agent's configuration document.
+const CONFIGURATION_BY_HAND: &str = "add or remove the server with the agent's own command instead";
 
 /// Where one agent keeps its skills and its tool-server configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -564,7 +576,7 @@ impl Installer {
                         Some(_) => {
                             std::fs::remove_file(path).map_err(storage)?;
                             if let Some(parent) = Path::new(path).parent() {
-                                sync_directory(parent)?;
+                                sync_directory(parent, NameKind::File)?;
                             }
                             removed.push(operation.clone());
                         }
@@ -596,7 +608,7 @@ impl Installer {
                     match std::fs::remove_dir(path) {
                         Ok(()) => {
                             if let Some(parent) = Path::new(path).parent() {
-                                sync_directory(parent)?;
+                                sync_directory(parent, NameKind::Directory)?;
                             }
                             removed.push(operation.clone());
                         }
@@ -608,7 +620,7 @@ impl Installer {
         let record = self.record_path(params);
         if record.exists() {
             std::fs::remove_file(&record).map_err(storage)?;
-            sync_directory(&self.records)?;
+            sync_directory(&self.records, NameKind::File)?;
         }
         Ok(AgentToolsRemoveResult {
             agent: params.agent,
@@ -792,7 +804,7 @@ impl Installer {
 
     /// Reads what a removal would work from, refusing everything it cannot do.
     fn removable(&self, params: &AgentToolsParams) -> Result<Option<InstallationRecord>> {
-        supported_platform()?;
+        supported_platform(&format!("install or remove {SKILL_NAME}"), SERVER_BY_HAND)?;
         // A removal of something never installed still has to know where it would have been, or it
         // is not the removal of anything in particular.
         self.layout(params)?;
@@ -804,7 +816,7 @@ impl Installer {
         // longer there.
         for operation in &record.manifest.operations {
             if let ChangeOperation::AddConfigurationEntry { path, .. } = operation {
-                guard_access_controls(Path::new(path))?;
+                guard_access_controls(Path::new(path), CONFIGURATION_BY_HAND)?;
             }
         }
         Ok(Some(record))
@@ -822,7 +834,7 @@ impl Installer {
     /// there and this host did not write it, and [`ControllerError::InvalidArgument`] when the
     /// scope needs a project directory that was not given.
     pub fn check(&self, params: &AgentToolsParams) -> Result<()> {
-        supported_platform()?;
+        supported_platform(&format!("install or remove {SKILL_NAME}"), SERVER_BY_HAND)?;
         let layout = self.layout(params)?;
         let root = layout.skills.clone();
         self.check_before_writing(params, &layout, &root)
@@ -882,7 +894,7 @@ impl Installer {
             self.check_container(configuration)?;
             // The document's own protection, before anything is written. This host's own files
             // carry no such risk: they are its records and the package it wrote.
-            guard_access_controls(&configuration.path)?;
+            guard_access_controls(&configuration.path, CONFIGURATION_BY_HAND)?;
         }
         Ok(())
     }
@@ -1129,7 +1141,7 @@ impl Installer {
                 // This host created the document and nothing else was ever added to it.
                 std::fs::remove_file(path).map_err(storage)?;
                 if let Some(parent) = path.parent() {
-                    sync_directory(parent)?;
+                    sync_directory(parent, NameKind::File)?;
                 }
                 return Ok(Removal::Removed);
             }
@@ -1384,7 +1396,7 @@ impl Installer {
             return Ok(());
         };
         std::fs::rename(only, &path).map_err(storage)?;
-        sync_directory(&self.records)
+        sync_directory(&self.records, NameKind::File)
     }
 
     fn recorded(&self, params: &AgentToolsParams) -> Result<Option<InstallationRecord>> {
@@ -1707,26 +1719,6 @@ fn removal_order(operations: &[ChangeOperation]) -> Vec<&ChangeOperation> {
     ordered
 }
 
-/// Creates a directory and makes the entry that names it durable.
-fn create_directory_durably(path: &Path) -> Result<bool> {
-    let mut created = false;
-    for directory in missing_ancestors(path) {
-        match std::fs::create_dir(&directory) {
-            Ok(()) => created = true,
-            // Something else made it between the look and the call. It is not this host's to
-            // claim, and claiming it would let a later removal delete somebody else's directory.
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(storage(error)),
-        }
-        // The parent's own entry for it, not the new directory's contents: what has to survive is
-        // the name, because everything written inside it is reached through that name.
-        if let Some(parent) = directory.parent() {
-            sync_directory(parent)?;
-        }
-    }
-    Ok(created)
-}
-
 /// Returns true when this file name is one a build of this host gives an installation record.
 ///
 /// The name is `<agent>-<scope>.json`, or `<agent>-<scope>-<digest>.json` for a project. An
@@ -1759,176 +1751,6 @@ fn is_legacy_user_record(name: &str, prefix: &str) -> bool {
 
 fn is_digest_name(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-/// Refuses a change to an agent's installation on a platform this host cannot make one safely on.
-///
-/// Section 24 asks an effect to be durable before the record that accounts for it, and section 9
-/// asks a dispatch marker to survive the crash it exists for. Both rest on making a directory's own
-/// entries durable, which this host cannot do on Windows (see [`sync_directory`]). Rather than make
-/// a change it cannot account for after a crash, it makes none: `kr skill status` still reports
-/// what is there, and the agent's own command adds the server until the Windows qualification
-/// supplies a durable barrier.
-fn supported_platform() -> Result<()> {
-    // A compile-time value rather than a conditional body, so both answers are checked on every
-    // platform this crate builds for.
-    if cfg!(windows) {
-        return Err(ControllerError::PermissionDenied {
-            detail: format!(
-                "this host cannot yet install or remove {SKILL_NAME} on Windows, because it has no \
-                 way to make the directory entries behind an installation durable; add the server \
-                 with the agent's own command instead"
-            ),
-        });
-    }
-    Ok(())
-}
-
-/// Refuses to replace a document whose protection this host cannot carry across.
-///
-/// A replacement by rename gives the new file its own access control. The mode bits are carried
-/// across; an access-control list is not, and reapplying one needs the platform's own calls. An
-/// agent's configuration can hold a credential, and somebody who restricted it beyond the mode bits
-/// meant it, so a document carrying one is refused before anything is written rather than quietly
-/// weakened.
-fn guard_access_controls(path: &Path) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    if extended_access_controls(path)? {
-        return Err(ControllerError::PermissionDenied {
-            detail: format!(
-                "{} is protected by an access-control list, and changing it here would not carry \
-                 that across; add or remove the server with the agent's own command instead",
-                display(path)
-            ),
-        });
-    }
-    // Changing it means writing a new file beside it and renaming that over it. A directory that
-    // grants access to whatever is created in it would give that grant to the replacement, and the
-    // document being replaced does not have it. The write itself checks the copy it made; this
-    // check is here so the refusal comes before anything is installed rather than half way through.
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    if inheritable_access_controls(parent)? {
-        return Err(ControllerError::PermissionDenied {
-            detail: format!(
-                "{} grants access to the files created in it, which {} does not have, and changing \
-                 that document here would replace it with one that does; add or remove the server \
-                 with the agent's own command instead",
-                display(parent),
-                display(path)
-            ),
-        });
-    }
-    Ok(())
-}
-
-/// Returns true when the file carries access controls its mode bits do not describe.
-///
-/// # Errors
-///
-/// Returns [`ControllerError::Storage`] when the file's access controls cannot be read, because a
-/// protection this host cannot read is one it cannot promise to keep.
-#[cfg(target_os = "macos")]
-fn extended_access_controls(path: &Path) -> Result<bool> {
-    // A file with no list of its own has an empty one here: this platform keeps no mode bits in it,
-    // so anything in it is an extra grant or an extra restriction somebody added.
-    exacl::getfacl(path, None)
-        .map(|entries| !entries.is_empty())
-        .map_err(storage)
-}
-
-#[cfg(target_os = "linux")]
-fn extended_access_controls(path: &Path) -> Result<bool> {
-    // This platform keeps a POSIX access-control list in one extended attribute, and a file without
-    // that attribute is described by its mode bits alone.
-    let mut probe = [0_u8; 1];
-    interpret_probe(rustix::fs::getxattr(
-        path,
-        "system.posix_acl_access",
-        &mut probe[..],
-    ))
-}
-
-/// Turns the answer to an access-control probe into what it says about the file.
-#[cfg(target_os = "linux")]
-fn interpret_probe(answer: std::result::Result<usize, rustix::io::Errno>) -> Result<bool> {
-    match answer {
-        // There is a list. One byte of it is as much as this needs to know, so a list longer than
-        // the byte offered for it answers the question as well as a shorter one would.
-        Ok(_) | Err(rustix::io::Errno::RANGE) => Ok(true),
-        Err(rustix::io::Errno::NODATA) => Ok(false),
-        // Anything else is a failure to look, including a filesystem that does not answer this
-        // question: a refusal to answer is not an answer of "none". An NFSv4 share keeps its list
-        // somewhere else entirely and refuses this one, and a file protected there must not be
-        // replaced on the strength of a probe that never saw its protection.
-        Err(error) => Err(storage(std::io::Error::from(error))),
-    }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn extended_access_controls(path: &Path) -> Result<bool> {
-    // Nothing here can read this platform's access controls, so nothing here can promise to keep
-    // them. An existing document is refused rather than replaced.
-    let _ = path;
-    Ok(true)
-}
-
-/// Returns true when files created in this directory are given access controls by it.
-///
-/// # Errors
-///
-/// Returns [`ControllerError::Storage`] when the directory's access controls cannot be read.
-#[cfg(target_os = "macos")]
-fn inheritable_access_controls(directory: &Path) -> Result<bool> {
-    exacl::getfacl(directory, None)
-        .map(|entries| {
-            entries
-                .iter()
-                .any(|entry| entry.flags.contains(exacl::Flag::FILE_INHERIT))
-        })
-        .map_err(storage)
-}
-
-#[cfg(target_os = "linux")]
-fn inheritable_access_controls(directory: &Path) -> Result<bool> {
-    // What a directory gives the files made in it is its default list, in an attribute of its own.
-    let mut probe = [0_u8; 1];
-    interpret_probe(rustix::fs::getxattr(
-        directory,
-        "system.posix_acl_default",
-        &mut probe[..],
-    ))
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn inheritable_access_controls(directory: &Path) -> Result<bool> {
-    let _ = directory;
-    Ok(true)
-}
-
-/// Makes a directory's own entries durable.
-///
-/// A rename or an unlink is not on disk until the directory holding it is. On Unix that is an
-/// `fsync` of the directory itself; Windows offers no equivalent for a directory handle, and a
-/// record written there is durable only as far as the platform's own ordering makes it.
-fn sync_directory(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let directory = std::fs::File::open(path).map_err(storage)?;
-        directory.sync_all().map_err(storage)?;
-    }
-    // Windows has no equivalent this crate can reach: flushing a handle's buffers there needs
-    // write access, and a directory handle cannot be opened for writing. An installation on
-    // Windows is therefore as durable as the platform's own ordering makes it, which is a gap the
-    // Windows qualification has to close rather than one this code can paper over. It is named
-    // here and in the contact documentation instead of being claimed as durability it does not
-    // have.
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-    Ok(())
 }
 
 /// Returns true when two operations are about the same thing.
@@ -2019,21 +1841,6 @@ fn files() -> [(&'static str, &'static str); 3] {
     ]
 }
 
-/// Returns the directories that have to be created for this path to exist, outermost first.
-fn missing_ancestors(path: &Path) -> Vec<PathBuf> {
-    let mut missing = Vec::new();
-    let mut current = Some(path);
-    while let Some(directory) = current {
-        if directory.is_dir() {
-            break;
-        }
-        missing.push(directory.to_path_buf());
-        current = directory.parent();
-    }
-    missing.reverse();
-    missing
-}
-
 fn read_to_string(path: &Path) -> Result<Option<String>> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(Some(text)),
@@ -2052,124 +1859,8 @@ fn read_json(path: &Path) -> Result<Value> {
     }
 }
 
-fn read_digest(path: &Path) -> Result<Option<Digest256>> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(Some(digest_of(&bytes))),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(storage(error)),
-    }
-}
-
-fn digest_of(bytes: &[u8]) -> Digest256 {
-    Digest256::from_bytes(kr_cbor::sha256(bytes))
-}
-
-/// The permissions a skill file is created with. It is documentation an agent reads.
-const READABLE: u32 = 0o644;
-
-/// The permissions a configuration document or a host record is created with.
-///
-/// An agent's configuration can hold a credential, so one this host creates is the owner's alone.
-const PRIVATE: u32 = 0o600;
-
-/// Writes a file so a failure part way through cannot truncate what was there.
-///
-/// The replacement carries the permissions of what it replaces: a document somebody kept private
-/// must not become world-readable because this host rewrote it under its own umask. A file that
-/// did not exist is created with `default_mode`.
-fn write_atomically(path: &Path, bytes: &[u8], default_mode: u32) -> Result<()> {
-    use std::io::Write as _;
-
-    let parent = path.parent().unwrap_or(Path::new("."));
-    // A distinct name per write. A fixed one is a collision between two callers writing the same
-    // file, and each would see the other's half-written bytes.
-    let temporary = parent.join(format!(
-        ".{}.{}.kalareach",
-        file_name(path),
-        hex(&kr_cbor::sha256(kr_ipc::new_uuid().as_bytes())[..6])
-    ));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-
-        // The permissions are set before the content exists. Writing first and narrowing after
-        // would leave a readable copy of a private document for as long as the write takes, and
-        // for good after a crash.
-        let mode = std::fs::metadata(path)
-            .ok()
-            .map_or(default_mode, |existing| {
-                existing.permissions().mode() & 0o777
-            });
-        options.mode(mode);
-    }
-    #[cfg(not(unix))]
-    let _ = default_mode;
-    let mut file = options.open(&temporary).map_err(storage)?;
-    // The copy that is about to take an existing file's place, before anything is written into it.
-    // A directory can give what is created in it access its own files do not have, and the rename
-    // below would hand that to the document being replaced.
-    if path.exists() && extended_access_controls(&temporary)? {
-        drop(file);
-        let _ = std::fs::remove_file(&temporary);
-        return Err(ControllerError::PermissionDenied {
-            detail: format!(
-                "a new file in {} is given an access-control list by the directory itself, so \
-                 replacing {} here would change who can read it",
-                display(parent),
-                display(path)
-            ),
-        });
-    }
-    file.write_all(bytes).map_err(storage)?;
-    // The bytes reach the disk before the rename that publishes them, and the directory entry
-    // reaches it before this call returns, so a record written before an effect is on disk before
-    // the effect begins.
-    file.sync_all().map_err(storage)?;
-    drop(file);
-    std::fs::rename(&temporary, path).map_err(storage)?;
-    // The rename is not on disk until the directory holding it is. A failure here is reported
-    // rather than swallowed: a record that claims durability it does not have is worse than one
-    // that says it could not be written.
-    sync_directory(parent)
-}
-
-fn file_name(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "file".to_owned())
-}
-
-fn display(path: &Path) -> String {
-    path.display().to_string()
-}
-
 fn is_empty_object(value: &Value) -> bool {
     value.as_object().is_some_and(Map::is_empty)
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().fold(String::new(), |mut text, byte| {
-        use std::fmt::Write as _;
-        let _ = write!(text, "{byte:02x}");
-        text
-    })
-}
-
-fn storage(error: std::io::Error) -> ControllerError {
-    ControllerError::Storage {
-        operation: "change an agent's configuration",
-        detail: error.to_string(),
-    }
-}
-
-/// Returns this user's home directory.
-fn home_directory() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
 }
 
 /// Returns the command an agent runs to reach the tools.
@@ -3075,18 +2766,6 @@ mod tests {
                 if detail.contains("given an access-control list by the directory")),
             "{refused:?}"
         );
-    }
-
-    /// The Linux probe's answers, including the one that is not an answer.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_probe_that_cannot_answer_is_not_read_as_no_list() {
-        assert!(interpret_probe(Ok(1)).expect("a list"));
-        assert!(interpret_probe(Err(rustix::io::Errno::RANGE)).expect("a longer list"));
-        assert!(!interpret_probe(Err(rustix::io::Errno::NODATA)).expect("no list"));
-        // An NFSv4 share keeps its list somewhere this probe cannot see and refuses the question.
-        // A refusal to answer is not an answer of "none".
-        assert!(interpret_probe(Err(rustix::io::Errno::NOTSUP)).is_err());
     }
 
     #[test]

@@ -6,8 +6,10 @@
 //! TLS with the first byte; one set to STARTTLS (port 587) says `EHLO` and `STARTTLS` in the clear,
 //! and nothing more: a server that does not offer the upgrade is not sent to, and one that sends
 //! anything between agreeing to it and starting it is not trusted with the rest. The server's
-//! certificate is verified by the operating system's own verifier, the one the managed HTTPS
-//! transport uses, and there is no way to switch that off.
+//! certificate is verified against the platform's trust, the one the managed HTTPS transport uses
+//! (on Linux the distribution's certificate store, whatever `SSL_CERT_FILE` or `SSL_CERT_DIR`
+//! says), and there is no way to switch that off. The connection is the server's own: submission
+//! goes through no proxy.
 //!
 //! # What each answer means
 //!
@@ -210,49 +212,32 @@ impl std::fmt::Debug for MailSubmission {
 }
 
 impl MailSubmission {
-    /// Submission verified by the operating system's certificate verifier.
+    /// Submission verified against the platform's trust, the one every TLS client of this product
+    /// uses ([`kr_client::services::http::platform_tls`]): on Linux the distribution's certificate
+    /// store, and no environment variable choosing another.
     ///
     /// A host with no usable verifier gets a submission that sends nothing and says why, rather
     /// than one that sends without verifying.
     #[must_use]
     pub fn verified() -> Self {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        Self::with_verifier(
-            rustls_platform_verifier::Verifier::new(Arc::clone(&provider)),
-            provider,
-        )
+        Self::with_tls(kr_client::services::http::platform_tls(&[]))
     }
 
-    /// Submission verified by the operating system's certificate verifier, which also trusts one
-    /// more authority: the one a test's own mail server is issued by.
+    /// Submission verified against the platform's trust, which also trusts one more authority:
+    /// the one a test's own mail server is issued by.
     ///
     /// It is the same verifier with the same checks, and nothing in it can switch verification
     /// off. It exists only in builds made for this crate's own tests.
     #[cfg(feature = "testing")]
     #[must_use]
     pub fn trusting(authority: &[u8]) -> Self {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        Self::with_verifier(
-            rustls_platform_verifier::Verifier::new_with_extra_roots(
-                [rustls::pki_types::CertificateDer::from(authority.to_vec())],
-                Arc::clone(&provider),
-            ),
-            provider,
-        )
+        Self::with_tls(kr_client::services::http::platform_tls(&[
+            rustls::pki_types::CertificateDer::from(authority.to_vec()),
+        ]))
     }
 
-    fn with_verifier(
-        verifier: Result<rustls_platform_verifier::Verifier, rustls::Error>,
-        provider: Arc<rustls::crypto::CryptoProvider>,
-    ) -> Self {
-        let tls = verifier
-            .and_then(|verifier| {
-                Ok(rustls::ClientConfig::builder_with_provider(provider)
-                    .with_safe_default_protocol_versions()?
-                    .dangerous()
-                    .with_custom_certificate_verifier(Arc::new(verifier))
-                    .with_no_client_auth())
-            })
+    fn with_tls(tls: Result<rustls::ClientConfig, rustls::Error>) -> Self {
+        let tls = tls
             .map(Arc::new)
             .map_err(|error| format!("this host has no certificate verifier for mail: {error}"));
         Self {

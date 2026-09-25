@@ -7,7 +7,7 @@
  * saying so after the service stopped answering.
  */
 
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 
@@ -433,5 +433,94 @@ describe('the rate a start accepts', () => {
     })
     expect(screen.queryByRole('button', { name: /Start/ })).not.toBeInTheDocument()
     expect(watched.voiceStart).not.toHaveBeenCalled()
+  })
+})
+
+describe('whether this device is reaching the host', () => {
+  /** The screen, against a host the test has prepared. */
+  function show(port: HostPort): void {
+    render(
+      <AppProvider port={port}>
+        <VoiceRoute surface="desktop" />
+      </AppProvider>
+    )
+  }
+
+  /** Starts a call from the choice the host answered, and waits for the call screen. */
+  async function startCall(): Promise<void> {
+    await waitForChoice()
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Start voice session' }))
+    await screen.findByRole('button', { name: 'End session' })
+  }
+
+  /** The one control here that asks the host, so it follows whether the host is reached. */
+  const askHost = () => screen.getByRole('button', { name: 'Show what the host selected' })
+
+  const OUT_OF_REACH = /This device is not reaching the host\./
+
+  // KR-REQ-13.02: the connection is read only once its listener is registered, so a host lost
+  // while the listener registers is shown as lost rather than as the state read before it.
+  it('shows a change made while its listener registers', async () => {
+    const { port, controls } = fakeHost()
+    const complete = controls.holdRegistrations()
+    show(port)
+    await startCall()
+    expect(askHost()).toBeEnabled()
+
+    act(() => {
+      controls.setConnected(false)
+    })
+    await act(async () => {
+      complete()
+      await Promise.resolve()
+    })
+
+    await waitFor(() => {
+      expect(askHost()).toBeDisabled()
+    })
+    expect(screen.getByText(OUT_OF_REACH)).toBeInTheDocument()
+  })
+
+  it('keeps a change it heard over a read that answers after it', async () => {
+    const { port, controls } = fakeHost()
+    const held = controls.hold('connectionState')
+    show(port)
+    await startCall()
+    await waitFor(() => {
+      expect(held.count).toBe(1)
+    })
+
+    act(() => {
+      controls.setConnected(false)
+    })
+    await waitFor(() => {
+      expect(askHost()).toBeDisabled()
+    })
+    // The read was made while the host was reached, and its answer arrives only now.
+    await act(async () => {
+      held.release()
+      await Promise.resolve()
+    })
+    expect(askHost()).toBeDisabled()
+    expect(screen.getByText(OUT_OF_REACH)).toBeInTheDocument()
+  })
+
+  it('shows what it read when nothing changed in between', async () => {
+    const { port } = fakeHost()
+    show({
+      ...port,
+      connectionState: () =>
+        Promise.resolve({
+          connected: false,
+          environment_id: null,
+          reason: 'this host cannot be contacted right now'
+        })
+    })
+    await startCall()
+
+    await waitFor(() => {
+      expect(askHost()).toBeDisabled()
+    })
+    expect(screen.getByText(OUT_OF_REACH)).toBeInTheDocument()
   })
 })

@@ -19,6 +19,7 @@ worker directly for what a session owns.
 | `kr doctor` | — | Read-only diagnostics, this host's effective configuration, and support bundles |
 | `kr host power` | — | Show or change whether this host stays awake for work it has admitted |
 | `kr host terminal` | — | Show the terminal applications this host has, and which one a new window opens in |
+| `kr host startup` | — | Show or choose how `kr new` starts this environment's control daemon when none is running |
 | `kr bridge --stdio` | — | Serve this environment to a local process bridge on standard input and output |
 | `kr bridge [list/enrol/forget/refresh]` | — | The environments this host has enrolled, and what it last saw of them |
 | `kr pair [invite/confirm/cancel/status]` | `kr p` | Pair a device: issue an invitation, approve the device that answers it, withdraw one, or read one |
@@ -121,6 +122,43 @@ forwarding input here, so the command says how many bytes it could not deliver. 
 does not report both colours has shared no palette, and the command says so rather than recording a
 provenance nothing measured. `--invisible --palette probe` is refused for the same reason: there is
 no terminal to ask.
+
+### When no control daemon is running
+
+`kr new` asks the environment's control daemon for the session, and a host where none is running
+has to have been set up for one to be started. One that was not is answered `HOST_NOT_CONFIGURED`
+with what to do: start the daemon, `kr-controller`, or choose the standalone start with
+`kr host startup --set standalone`. The command installs no service, enables no lingering and
+obtains no privilege on the way.
+
+With the standalone start chosen, `kr new` starts the daemon itself when nothing listens on the
+environment's endpoint: the `kr-controller` installed beside `kr`, detached from the command. It runs
+in a session and a process group of its own with no controlling terminal and none of the command's
+standard streams, works in the environment's own state directory, and is told the environment's own
+runtime and state roots. It inherits the command's environment, `PATH` included, exactly as a daemon
+started by hand from the same shell does, so the tools it runs by name are the ones that shell
+finds. It is otherwise an ordinary start: its keys go where an installed daemon keeps them, it serves
+the usual owner-only endpoints, and it takes the environment's singleton lock and advances its
+generation. That lock is what leaves one daemon when several commands start one at once; a daemon
+that cannot take it ends, and the command that started it goes on with the one that did. The start
+is for this installation's own environment only, and a command that names another environment is
+told to start that environment's daemon.
+
+The command waits up to 30 seconds for an answer, then creates the session exactly as it would with
+a daemon that was already running. In text form it first says, on standard error, which daemon it
+started. A daemon that has not answered in 30 seconds ends the command with
+`ENVIRONMENT_UNAVAILABLE` and exit status 1, naming the process, whether it is still running and the
+last line of its log. What the daemon writes goes to `controller.log` in the environment's state
+directory, which has to be a file of this user's that nobody else can read or write; a log grown
+past 1 MiB is emptied when the next start begins. The command does not end a daemon that is slow to
+come up, such as one waiting for somebody to allow it into a credential store: it may still come up,
+and the lock keeps a second one from serving beside it.
+
+Something that is listening on the endpoint and does not answer within 10 seconds is reported the
+same way, `ENVIRONMENT_UNAVAILABLE`, and nothing is started beside it.
+
+Other commands never start a daemon. `kr list`, `kr status` and the rest answer `HOST_NOT_CONFIGURED`
+with the same setup action when none is running.
 
 ### Shell mode
 
@@ -551,13 +589,14 @@ this device cannot be removed afterwards, the command says the worker took the a
 cannot be read after an attempt, the command says so beside what the attempt established, never in
 place of it, and exits with 1.
 
-`kr question drafts` reads each kept answer's question again. An answer whose question is still
-pending at the revision it answered is offered, and stays kept. Any other is retired: its question
-was answered, cancelled or expired, moved to another revision, or its session is gone; the command
-does not send it, and it is no longer kept. An answer whose question its session no longer lists,
-while the session's daemon does not record the session ended, is unlisted: it stays kept and is not
-offered, and `kr question send` neither sends nor retires it. The command sends nothing, however
-often it runs. `kr question send` is the one way a kept answer is sent: it reads the question once
+`kr question drafts` reads each kept answer's question again and finds the answer offered, unlisted
+or retired. An answer whose question is still pending at the revision it answered is offered, and
+stays kept. An answer whose question its session no longer lists, while the session's daemon does
+not record the session ended, is unlisted: it stays kept and is not offered, and `kr question send`
+neither sends nor retires it. Every other answer is retired: its question was answered, cancelled or
+expired, or moved to another revision, or its session no longer lists it and the daemon records the
+session ended. The command does not send a retired answer, and it is no longer kept. The command
+sends nothing, however often it runs. `kr question send` is the one way a kept answer is sent: it reads the question once
 more and sends the answer only while that question is still what the person answered. An answer
 whose outcome was not known is retired by the next `kr question drafts` if it did arrive, so it is
 never sent twice. When `kr question send` cannot send it, the failure keeps its own code and says
@@ -592,7 +631,8 @@ manifest: every directory created, every file written, and the configuration ent
 
 What cannot be done safely is refused before anything changes: a file or a server entry this host
 did not write, a configuration document whose access controls a replacement could not carry, and
-every installation change on Windows, where this host has no way to make the change durable. After
+every installation change on Windows, where this host does not read access-control lists and so
+cannot tell whether a replacement would change who can read a file. After
 an interrupted installation, `kr skill install` says so and lists under `unresolved` anything that
 neither it nor a removal can account for.
 
@@ -698,6 +738,15 @@ eleven fields, and each says `applies at the next start`: the daemon reads them 
 no environment variable reaches them. The `configuration-network` check reports what the running
 network and voice services are doing, and warns when the document now selects a different network
 or voice broker, which takes a restart to put into force.
+
+The `configuration-overrides` check names the two variables that take part in the precedence, and
+the variables this build reads outside it that are set here, each with what it selects: the
+platform's locations and login, and the proxy variables and `SystemRoot` that the endpoint's
+network library reads itself. It also says that `SSL_CERT_FILE` and `SSL_CERT_DIR` are not read,
+and which of them is set: an authority given only through one of them is not trusted by the
+managed-service, rendezvous, delivery, plugin repository and mail clients until it is installed in
+the system store. The network endpoint's relays and discovery servers are verified against the
+public anchors and `network.relay_trust_anchors` instead.
 
 Asking for the diagnostics is what puts this host's configuration into force, so a ceiling somebody
 edited by hand takes effect during the run. One that changes what a caller may do withdraws the
@@ -997,6 +1046,22 @@ already permitted needs. When the host answers that this one needs the owner, `k
 `OWNER_CONFIRMATION_REQUIRED` and says to confirm and install it from an owner device. It leaves no
 confirmation waiting.
 
+## `kr host startup`
+
+```sh
+kr host startup                        # what is chosen, and where it was chosen
+kr host startup --set standalone       # kr new starts the control daemon itself when none runs
+kr host startup --clear                # choose nothing; kr new says what to set up instead
+```
+
+The choice is the `startup.controller` selection of the versioned per-user host configuration
+document, and `--set` and `--clear` each apply one validated revision of it, making the
+environment's own directories first on a host where no daemon has run yet. No daemon is asked and
+none is started: `kr new` reads the choice the next time it finds no daemon running, which is why
+`kr doctor` reports it as applying at the next start. Writing it installs no service, enables no
+lingering and obtains no privilege. `standalone` is the one way this build knows. The standalone
+start runs the daemon in a session of its own, which Windows does not have, so there it is refused.
+
 ## `kr host power`
 
 Automatic sleep is the machine's own policy, and `kr` changes it only when you ask:
@@ -1069,6 +1134,50 @@ the host's sleep setting is doing:
 }
 ```
 
+`kr status --json` also carries `terminal_attachments`: each terminal attachment of the session as
+its worker reports it, with how it is presented and why. `presentation` is `direct` or `viewport`,
+and `presentation_reason` is null for a direct attachment, which needs no reason, and for a
+viewport whose worker was built before reasons existed. It is null as a whole for a session read
+from the control daemon, which has no live worker to ask; when the worker answered the session read
+and not the question about its attachments, within 10 seconds of being asked,
+`terminal_attachments_unread` says why.
+
+```json
+{
+  "terminal_attachments": [
+    {
+      "attachment_id": "0f8e2a64-9b1d-4c3e-8a57-2b6d9e1f4c70",
+      "presentation": "viewport",
+      "presentation_reason": "size_mismatch",
+      "dimensions": { "columns": 100, "rows": 30 },
+      "terminal_profile_id": "xterm-256color"
+    }
+  ]
+}
+```
+
+The text form prints one line per terminal attachment, and a viewport's line names its reason and
+what it means:
+
+```text
+attachment 0f8e2a64-9b1d-4c3e-8a57-2b6d9e1f4c70: viewport (size_mismatch): its size is not the session's
+```
+
+The reason is the first of these that holds, in this order:
+
+| Reason | What keeps the attachment off the live stream |
+| --- | --- |
+| `no_terminal_profile` | its client declared no terminal profile, as `--no-probe` does |
+| `unqualified_terminal_profile` | the profile its client declared is not one this build has qualified |
+| `size_mismatch` | its size is not the session's |
+| `history_window` | its window is above the live screen |
+| `stream_not_carryable` | the session's output is no longer something a terminal can be handed as it is |
+| `restoration_incomplete` | the screen it was last given could not carry everything the application addresses, such as a pending wrap |
+| `awaiting_parser_boundary` | forwarding waits for the session's output to reach the end of a sequence |
+
+The first three last as long as the attachment stays as it is, the window until the person
+returns to the live screen, and the others pass by themselves.
+
 A closed session carries its record instead of a null: whose it is, how it closed, the owned
 processes the closure terminated and anything that survived it.
 
@@ -1135,6 +1244,24 @@ inhibition line.
 power object holds the setting, whether an assertion is held, its reason, the facility holding it,
 the power source, the counts behind the decision, and either the holder or the reason nothing is
 held.
+
+`kr host startup --json` returns what is chosen and where it was chosen. `controller` is
+`standalone` or null, `source` is `host_configuration` or `default`, `document_state` is the
+document's condition as `kr doctor` names it, and `revision` is the document's revision as text:
+
+```json
+{
+  "ok": true,
+  "environment_id": "70a528be-be60-4cfb-870e-e3d3ba30344d",
+  "startup": {
+    "controller": "standalone",
+    "source": "host_configuration",
+    "document": "/home/example/.config/kalareach/environments/70a528be/config.json",
+    "document_state": "loaded",
+    "revision": "4"
+  }
+}
+```
 
 `kr pair invite --json` returns the invitation:
 

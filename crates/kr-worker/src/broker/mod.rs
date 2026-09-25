@@ -46,11 +46,14 @@
 //! application that took the foreground. And it does not answer a request twice, whatever
 //! reconnects.
 
+#[cfg(unix)]
+pub mod adoption;
 pub mod agents;
 pub mod arbitration;
 pub mod attach;
 pub mod bridge;
 pub mod capability;
+pub mod channels;
 pub mod commands;
 pub mod connectors;
 pub mod duplex;
@@ -124,9 +127,9 @@ pub use crate::broker::listener::{
     BoundBinary, BridgeHello, ListenerAddress, Registration, reject_browser_origin,
 };
 pub use crate::broker::methods::{
-    ActionInFlight, AnswerInFlight, Caller, MutationAdmission, MutationInFlight,
-    PendingTransmission, RegisteredAction, Responsible, UpstreamBody, UpstreamDispatch,
-    UpstreamOutcome, UpstreamRequest, command, subject,
+    ActionInFlight, AnswerInFlight, Caller, MarkedAnswer, MutationAdmission, MutationInFlight,
+    PendingTransmission, RegisteredAction, Responsible, TakenMutation, UpstreamBody,
+    UpstreamDispatch, UpstreamOutcome, UpstreamRequest, command, subject,
 };
 pub use crate::broker::process::{
     BackendStop, BrokerTransport, Credential, ManagedProcess, SourceFrame, TransportHandle,
@@ -167,6 +170,50 @@ pub const MAX_RETAINED_FRAMES: usize = 64;
 /// How many bytes of unconsumed source frames one instance holds.
 pub const MAX_RETAINED_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
+/// One installed package, as its installation names it: the package, its publisher and the
+/// installed hash.
+///
+/// The hash is the digest of the package's manifest, and the manifest names every other file of
+/// the package by digest, so the hash names the component too where the package ships one. Two
+/// packages are one package only when all three agree: the same identifier at other bytes, or from
+/// another publisher, is another package.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackageIdentity {
+    /// The package.
+    pub plugin_id: PluginId,
+    /// Its publisher.
+    pub publisher_id: PublisherId,
+    /// The installed package's hash.
+    pub package_digest: Digest256,
+}
+
+impl PackageIdentity {
+    /// Returns the package a decoder entry records as the one that interpreted its request.
+    #[must_use]
+    pub fn of_entry(entry: &DecoderLedgerEntry) -> Self {
+        Self {
+            plugin_id: entry.plugin_id.clone(),
+            publisher_id: entry.publisher_id.clone(),
+            package_digest: entry.package_digest,
+        }
+    }
+
+    /// Names the package for a person: its identifier and its publisher.
+    fn name(&self) -> String {
+        format!("{} from {}", self.plugin_id, self.publisher_id)
+    }
+
+    /// Names the package for a person beside another it is being told apart from, saying so when
+    /// the two differ only in their bytes.
+    fn beside(&self, other: &Self) -> String {
+        if self.plugin_id == other.plugin_id && self.publisher_id == other.publisher_id {
+            format!("{} at other bytes", self.name())
+        } else {
+            self.name()
+        }
+    }
+}
+
 /// One component bound to one application instance.
 #[derive(Clone, Debug)]
 pub struct Binding {
@@ -178,7 +225,8 @@ pub struct Binding {
     pub plugin_id: PluginId,
     /// That package's publisher, shown beside anything this binding produced.
     pub publisher_id: PublisherId,
-    /// The digest of the exact component bytes.
+    /// The installed package's hash: the digest of its manifest, which names the component and
+    /// every other file of the package by digest.
     pub package_digest: Digest256,
     /// The three grants, held separately.
     pub grants: BrokerGrants,
@@ -194,6 +242,16 @@ pub struct Binding {
 }
 
 impl Binding {
+    /// Returns the package this binding runs.
+    #[must_use]
+    pub fn package(&self) -> PackageIdentity {
+        PackageIdentity {
+            plugin_id: self.plugin_id.clone(),
+            publisher_id: self.publisher_id.clone(),
+            package_digest: self.package_digest,
+        }
+    }
+
     /// Returns true when this binding may decode the named method into a pending resource.
     ///
     /// Three things must hold together: the approval-interpreter grant, a recorded trust record,
@@ -256,7 +314,7 @@ pub struct Instance {
     /// The commands the upstream advertises.
     commands: Vec<kr_protocol::agent::AgentCommand>,
     /// The unconsumed source frames the broker is holding for this instance's decoders.
-    frames: BTreeMap<SourceEventHandle, SourceFrame>,
+    frames: BTreeMap<SourceEventHandle, RetainedFrame>,
     /// The order those frames arrived in, so the oldest is the one that goes.
     frame_order: std::collections::VecDeque<SourceEventHandle>,
     /// How many bytes those frames hold.
@@ -269,6 +327,20 @@ pub struct Instance {
     /// Absent is the default and the safe one: every reverse file operation is then refused with a
     /// reason, and nothing is opened.
     host_files: Option<std::sync::Arc<HostFiles>>,
+}
+
+/// One source frame the broker holds, with the package whose table recorded it.
+#[derive(Debug)]
+struct RetainedFrame {
+    /// The frame.
+    frame: SourceFrame,
+    /// The package whose table the recording connection read it with, where a connection did.
+    ///
+    /// A request belongs to that package, and only that package's decoder gives it a meaning. It
+    /// is kept with the frame rather than read from the connection later, so a connection that
+    /// closes, or whose identifier is restored under another package's tables, changes nothing
+    /// about whose request this is.
+    recorder: Option<PackageIdentity>,
 }
 
 impl Instance {
@@ -298,11 +370,13 @@ impl Instance {
             .or_else(|| self.bridge.suspension())
     }
 
-    /// Holds one frame, forgetting the oldest unconsumed ones if it must.
-    fn retain(&mut self, frame: SourceFrame) {
+    /// Holds one frame, with the package whose table recorded it, forgetting the oldest
+    /// unconsumed ones if it must.
+    fn retain(&mut self, frame: SourceFrame, recorder: Option<PackageIdentity>) {
         self.frame_bytes = self.frame_bytes.saturating_add(frame.bytes().len());
         self.frame_order.push_back(frame.handle.clone());
-        self.frames.insert(frame.handle.clone(), frame);
+        self.frames
+            .insert(frame.handle.clone(), RetainedFrame { frame, recorder });
         while self.frames.len() > MAX_RETAINED_FRAMES || self.frame_bytes > MAX_RETAINED_FRAME_BYTES
         {
             let Some(oldest) = self.frame_order.pop_front() else {
@@ -314,8 +388,8 @@ impl Instance {
 
     /// Forgets one frame, because it has been consumed or evicted.
     fn release(&mut self, handle: &SourceEventHandle) {
-        if let Some(frame) = self.frames.remove(handle) {
-            self.frame_bytes = self.frame_bytes.saturating_sub(frame.bytes().len());
+        if let Some(held) = self.frames.remove(handle) {
+            self.frame_bytes = self.frame_bytes.saturating_sub(held.frame.bytes().len());
         }
         self.frame_order.retain(|held| held != handle);
     }
@@ -608,6 +682,15 @@ struct BrokerState {
     /// the connector publisher's semantic trust grant." A table presented at connection time is
     /// compared with this, so a package cannot open a connection with a table nobody installed.
     pinned_tables: BTreeMap<(ApplicationInstanceId, PluginId), PinnedTable>,
+    /// The installed package each connection identifier belongs to, for good.
+    ///
+    /// A declarative connection takes its pin's package when it opens, and a pin replaced while it
+    /// is open changes nothing about it; a channel names its own package and is held here from
+    /// the first request it records. An identifier keeps its package after its connection closes
+    /// and across a restart, which reads it back from the ledger for every identifier that still
+    /// holds an unresolved resource. Its requests are that package's, so a restoration under
+    /// another package's tables is refused: those tables would read, answer and reconcile them.
+    connection_packages: BTreeMap<GatewayConnectionId, PackageIdentity>,
     /// Every observer of this broker's transitions.
     ///
     /// One registry, the broker's own. A gateway asks for it rather than supplying one, so a
@@ -651,6 +734,11 @@ pub struct PinnedTable {
     pub table: kr_protocol::gateway::DeclarativeTable,
     /// The closed rich method table for its upstream version.
     pub rich: kr_protocol::gateway::RichMethodTable,
+    /// The installed package the tables came from.
+    ///
+    /// A request a connection records with these tables is that package's request, and only that
+    /// package's decoder gives it a meaning.
+    pub package: PackageIdentity,
 }
 
 /// The trusted broker.
@@ -669,6 +757,10 @@ pub struct Broker {
     /// Where the next recovery stops before it writes the gap, for this host's own tests.
     #[cfg(feature = "testing")]
     recovery_pause: Mutex<Option<RecoveryPause>>,
+    /// Where the next answer a channel writes stops before it is written, for this host's own
+    /// tests.
+    #[cfg(feature = "testing")]
+    channel_write_pause: Mutex<Option<channels::WritePause>>,
 }
 
 /// The two ends of one armed pause: what says the recovery arrived, and what lets it go on.
@@ -750,6 +842,11 @@ impl Broker {
         let stream_generation = ledger.advance_stream_generation()?;
         let announced: BTreeMap<PendingResourceId, u64> =
             ledger.latest_events()?.into_iter().collect();
+        // And each identifier that still holds an unresolved resource keeps the package it
+        // recorded its requests under, so a restart refuses a restoration under another package's
+        // tables as the process before it did.
+        let connection_packages: BTreeMap<GatewayConnectionId, PackageIdentity> =
+            ledger.connection_packages()?.into_iter().collect();
         Ok(Self {
             state: Mutex::new(BrokerState {
                 session_id,
@@ -770,6 +867,7 @@ impl Broker {
                 drafts: None,
                 connection_dispatch: BTreeMap::new(),
                 pinned_tables: BTreeMap::new(),
+                connection_packages,
                 watchers: crate::broker::duplex::Observatory::new(),
                 announced,
                 next_event,
@@ -780,6 +878,8 @@ impl Broker {
             recorder: Mutex::new(recorder),
             #[cfg(feature = "testing")]
             recovery_pause: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            channel_write_pause: Mutex::new(None),
         })
     }
 
@@ -1106,6 +1206,22 @@ impl Broker {
             .and_then(|instance| instance.dispatch.clone())
     }
 
+    /// Returns whether an instance of this broker names `process` as its own, by its whole
+    /// identity.
+    ///
+    /// A launch registers its instance with the process that presented itself, and that process
+    /// keeps its identity when it execs the program, so a program the integration launched is held
+    /// here from its admission on. Adoption asks this before it records anything.
+    #[must_use]
+    pub fn holds_process(&self, process: &ProcessStartIdentity) -> bool {
+        self.state().instances.values().any(|instance| {
+            instance
+                .process
+                .as_ref()
+                .is_some_and(|held| held.process.matches(process))
+        })
+    }
+
     /// Records that another attachment is watching one instance.
     pub fn attach(&self, application_instance_id: ApplicationInstanceId) {
         if let Some(instance) = self.state().instances.get_mut(&application_instance_id) {
@@ -1200,12 +1316,17 @@ impl Broker {
 
     /// Binds one component to one instance, with the grants and trust it was given.
     ///
+    /// A binding identifier names one package for as long as it is bound: what its decoder
+    /// interpreted carries that package's meaning. The same package may bind it again, which
+    /// replaces its grants and trust and drops its actions and its fault state.
+    ///
     /// # Errors
     ///
     /// Returns [`BrokerError::Trust`] when a trust record breaks a rule,
     /// [`BrokerError::PermissionDenied`] when the trust was granted to a different package or the
-    /// grant it depends on is absent, and [`BrokerError::LedgerUnavailable`] when the record
-    /// cannot be written.
+    /// grant it depends on is absent, [`BrokerError::InvalidArgument`] when the identifier is
+    /// bound to another package, and [`BrokerError::LedgerUnavailable`] when the record cannot be
+    /// written.
     #[allow(clippy::too_many_arguments)]
     pub fn bind(
         &self,
@@ -1238,6 +1359,21 @@ impl Broker {
             }
         }
         let mut state = self.state();
+        let package = PackageIdentity {
+            plugin_id: plugin_id.clone(),
+            publisher_id: publisher_id.clone(),
+            package_digest,
+        };
+        if let Some(bound) = state.bindings.get(&binding_id)
+            && bound.package() != package
+        {
+            return Err(BrokerError::invalid(format!(
+                "binding {binding_id} runs {}, and an identifier names one package for as long as \
+                 it is bound, so {} does not take it",
+                bound.package().name(),
+                package.beside(&bound.package())
+            )));
+        }
         let record = BindingRecord {
             binding_id,
             application_instance_id,
@@ -1319,6 +1455,45 @@ impl Broker {
         Ok(())
     }
 
+    /// Withdraws one binding's right to answer what it decodes, leaving its decoding in place.
+    ///
+    /// The installation's grants narrow when `approval.respond` leaves them: the binding's trust
+    /// no longer encodes a response, the change is written, and every answer path meets the
+    /// recheck at the claim that refuses a decoder which may no longer encode. What it already
+    /// interpreted stays interpreted and visible.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnknownSubject`] when this broker holds no such binding, and
+    /// [`BrokerError::LedgerUnavailable`] when the change cannot be written.
+    pub fn withdraw_answering(&self, binding_id: BrokerBindingId) -> Result<()> {
+        let mut state = self.state();
+        let binding = state
+            .bindings
+            .get(&binding_id)
+            .ok_or_else(|| unknown_binding(binding_id))?;
+        let trust = binding.trust.clone().map(|trust| DecodingTrust {
+            may_encode_response: false,
+            ..trust
+        });
+        let record = BindingRecord {
+            binding_id,
+            application_instance_id: binding.application_instance_id,
+            grants: binding.grants.clone(),
+            trust: trust.clone(),
+            bound_at: TimestampMs::new(0),
+        };
+        state.stored(kr_ipc::now_ms(), "withdrawing an answer right", |ledger| {
+            ledger.put_binding(&record)
+        })?;
+        let binding = state
+            .bindings
+            .get_mut(&binding_id)
+            .ok_or_else(|| unknown_binding(binding_id))?;
+        binding.trust = trust;
+        Ok(())
+    }
+
     /// Records that a component fault has disabled one binding's rich capabilities.
     ///
     /// Native traffic is untouched: nothing in this function reaches the forwarding path.
@@ -1377,7 +1552,8 @@ impl Broker {
         let handle = SourceEventHandle::new(format!("src-{}", kr_ipc::new_uuid()))
             .map_err(|error| BrokerError::invalid(format!("source handle: {error}")))?;
         let frame = SourceFrame::new(handle.clone(), instance.source_generation, bytes, now)?;
-        instance.retain(frame);
+        // No connection recorded it, so no package's decoder may give it a meaning.
+        instance.retain(frame, None);
         Ok(handle)
     }
 
@@ -1391,7 +1567,8 @@ impl Broker {
         self.state()
             .instances
             .get(&application_instance_id)
-            .and_then(|instance| instance.frames.get(handle).cloned())
+            .and_then(|instance| instance.frames.get(handle))
+            .map(|held| held.frame.clone())
     }
 
     // -- the decoder path ---------------------------------------------------------------------
@@ -1604,6 +1781,19 @@ impl Broker {
         Ok(())
     }
 
+    /// Returns the directory one instance's upstream may ask this host to read or write in, where
+    /// one is granted.
+    #[must_use]
+    pub fn host_files(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+    ) -> Option<std::sync::Arc<HostFiles>> {
+        self.state()
+            .instances
+            .get(&application_instance_id)
+            .and_then(|instance| instance.host_files.clone())
+    }
+
     /// Withdraws one instance's granted host directory.
     ///
     /// Nothing new is admitted under it from here. An operation already admitted holds the grant
@@ -1690,6 +1880,7 @@ impl Broker {
         // did.
         state.volatile.note_native_request();
         let suspends_rich_mutations = classification.suspends_rich_mutations();
+        let recorder = state.connection_package(connection);
         if let Some(instance) = state.instances.get_mut(&application_instance_id) {
             if suspends_rich_mutations {
                 instance.rich_suspension = Some(format!(
@@ -1697,7 +1888,7 @@ impl Broker {
                      asked for is unknown"
                 ));
             }
-            instance.retain(source_frame);
+            instance.retain(source_frame, recorder);
         }
         Ok(ClientRequest {
             intent_id: intent.intent_id,
@@ -1915,9 +2106,10 @@ impl Broker {
     /// 2. **Schema policy.** Is the projection written against a schema version the trust covers,
     ///    with decisions this trust permits? An interpretation outside the policy is not one this
     ///    trust was granted for.
-    /// 3. **Binding and generation.** The frame is looked up by its handle in this binding's own
-    ///    instance, so nothing the caller says about its generation or digest is believed, and a
-    ///    frame from an execution that has gone is refused.
+    /// 3. **Binding, package and generation.** The frame is looked up by its handle in this
+    ///    binding's own instance, so nothing the caller says about its generation or digest is
+    ///    believed; the package whose table recorded it must be the one this binding runs, at the
+    ///    same bytes; and a frame from an execution that has gone is refused.
     /// 4. **Non-reuse.** Consuming the source, recording the decoder and making the row actionable
     ///    are one transaction, keyed by the broker's own event identity. A decoder gets one
     ///    interpretation per event, and the claim is durable so a restart does not reopen it.
@@ -1936,153 +2128,8 @@ impl Broker {
         deadline_ms: Option<TimestampMs>,
         now: TimestampMs,
     ) -> Result<PendingResource> {
-        let mut state = self.state();
-        // Interpreting a request into something a person answers is rich work. While the journal
-        // is faulted the native forwarding path continues and this does not.
-        state.volatile.require_rich_work()?;
-        let binding = state
-            .bindings
-            .get(&binding_id)
-            .ok_or_else(|| unknown_binding(binding_id))?;
-        if !binding.grants.holds(BrokerGrant::ApprovalInterpreter) {
-            return Err(BrokerError::Grant(
-                kr_protocol::broker::GrantError::NotHeld {
-                    grant: BrokerGrant::ApprovalInterpreter,
-                },
-            ));
-        }
-        if let Some(reason) = binding.rich_disabled.as_ref() {
-            return Err(BrokerError::UnsupportedCapability {
-                detail: format!("this binding's rich capabilities are disabled: {reason}"),
-            });
-        }
-        let pending = state
-            .arbitration
-            .get(resource_id)
-            .ok_or_else(|| BrokerError::unknown(format!("no pending resource {resource_id}")))?
-            .resource
-            .clone();
-        if pending.state != PendingState::Pending {
-            return Err(BrokerError::Arbitration(
-                kr_protocol::gateway::ArbitrationError::AlreadyResolved {
-                    state: pending.state,
-                },
-            ));
-        }
-        let binding = state
-            .bindings
-            .get(&binding_id)
-            .ok_or_else(|| unknown_binding(binding_id))?;
-        if binding.application_instance_id != pending.application_instance_id {
-            return Err(BrokerError::denied(format!(
-                "binding {binding_id} is not bound to {}",
-                pending.application_instance_id
-            )));
-        }
-        if !binding.may_decode(&pending.method) {
-            return Err(BrokerError::denied(format!(
-                "this binding is not trusted to decode {}",
-                pending.method
-            )));
-        }
-        let trust = binding
-            .trust
-            .as_ref()
-            .ok_or_else(|| BrokerError::denied("this binding holds no decoding trust"))?;
-        trust.check_projection(&projection)?;
-        let plugin_id = binding.plugin_id.clone();
-        let publisher_id = binding.publisher_id.clone();
-        let package_digest = binding.package_digest;
-        let application_instance_id = pending.application_instance_id;
-
-        // The frame is the one *this request* was recorded from. A caller naming any other would
-        // put one request's bytes in another's ledger row, so it does not get to name one.
-        let handle = state
-            .arbitration
-            .source_of(resource_id)
-            .cloned()
-            .ok_or_else(|| BrokerError::PreconditionFailed {
-                detail: format!("{resource_id} was not recorded from a source event of its own"),
-            })?;
-        let handle = &handle;
-        let instance = state
-            .instances
-            .get(&application_instance_id)
-            .ok_or_else(|| unknown_instance(application_instance_id))?;
-        let frame = instance.frames.get(handle).cloned().ok_or_else(|| {
-            BrokerError::PreconditionFailed {
-                detail: format!(
-                    "source event {handle} has already been consumed, so {resource_id} has already \
-                     been interpreted"
-                ),
-            }
-        })?;
-        if frame.generation != instance.source_generation {
-            return Err(BrokerError::PreconditionFailed {
-                detail: format!(
-                    "source event {handle} is from generation {} and the binding is at {}",
-                    frame.generation, instance.source_generation
-                ),
-            });
-        }
-        // Section 11 requires the ledger to retain the original source, and a partial copy is not
-        // the original. A request too large to keep whole is not turned into an approval: it is
-        // still forwarded opaquely on the native path, which depends on nothing this host stores.
-        if frame.bytes().len() > MAX_RETAINED_SOURCE_BYTES {
-            return Err(BrokerError::UnsupportedCapability {
-                detail: format!(
-                    "source event {handle} is {} bytes and an approval's original source is \
-                     retained whole up to {MAX_RETAINED_SOURCE_BYTES}",
-                    frame.bytes().len()
-                ),
-            });
-        }
-
-        let entry = DecoderLedgerEntry {
-            binding_id,
-            plugin_id,
-            publisher_id,
-            package_digest,
-            method: pending.method.clone(),
-            upstream_request_id: pending.request.upstream.clone(),
-            source_generation: frame.generation,
-            source_digest: frame.digest,
-            source_bytes: Bytes::from(frame.bytes().to_vec()),
-            projection,
-            deadline_ms: Nullable::from(deadline_ms),
-            decoded_at: now,
-        };
-        let interpreted = PendingResource {
-            kind: PendingKind::Approval,
-            deadline_ms: Nullable::from(deadline_ms),
-            interpretation_verified: true,
-            ..pending
-        };
-        // A recorded request becoming an answerable approval is a durable change of that resource,
-        // so its own event goes in the same transaction as the change.
-        let event = state.next_transition_event(
-            &interpreted,
-            now,
-            crate::broker::ledger::TransitionCause::Interpreted,
-            None,
-        );
-        let admitted = state.stored(now, "an interpretation", |ledger| {
-            ledger.admit_resource(handle, binding_id, &entry, &interpreted, now, &event)
-        })?;
-        if !admitted {
-            return Err(BrokerError::PreconditionFailed {
-                detail: format!("source event {handle} has already produced an interpretation"),
-            });
-        }
-        state.remember(&event);
-        state.publish(&interpreted, &event);
-        state
-            .arbitration
-            .set_interpretation(resource_id, interpreted.clone(), binding_id)?;
-        if let Some(instance) = state.instances.get_mut(&application_instance_id) {
-            instance.release(handle);
-        }
-        Ok(interpreted)
+        self.state()
+            .interpret_in(binding_id, resource_id, projection, deadline_ms, now)
     }
 
     /// Returns the decoder entry behind one pending resource.
@@ -2528,15 +2575,18 @@ impl Broker {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut written: Vec<(PendingResource, Option<BrokerBindingId>, bool)> = Vec::new();
         for _ in 0..RECOVERY_PASSES {
-            let (records, closing, row, applied) = {
+            let (records, packages, closing, row, applied) = {
                 let state = self.state();
                 state.may_recover()?;
                 let mut closing = state.volatile.gap().cloned().ok_or_else(|| {
                     BrokerError::invalid("the gateway is fenced with no gap open")
                 })?;
                 closing.closed_at = Nullable::some(now);
+                let records = state.arbitration.volatile_records();
+                let packages = state.packages_of(&records);
                 (
-                    state.arbitration.volatile_records(),
+                    records,
+                    packages,
                     closing,
                     state.volatile.row(),
                     state.faults_applied,
@@ -2551,9 +2601,12 @@ impl Broker {
                 .cloned()
                 .collect();
             let sequence = match recorder.as_mut() {
-                Some(recorder) => recorder.commit_recovery(&fresh, &closing, row)?,
+                Some(recorder) => recorder.commit_recovery(&fresh, &packages, &closing, row)?,
                 // A ledger held in memory: one connection, no file, nothing to wait on.
-                None => self.state().ledger.commit_recovery(&fresh, &closing, row)?,
+                None => self
+                    .state()
+                    .ledger
+                    .commit_recovery(&fresh, &packages, &closing, row)?,
             };
             written = records;
             let mut state = self.state();
@@ -2824,23 +2877,38 @@ impl Broker {
     ///
     /// The declarative table's recorded digest is checked against the digest of what it declares,
     /// so the qualification names the semantics that were qualified rather than a label beside
-    /// them.
+    /// them. The tables are pinned with the installed package they came from, and a connection
+    /// opened with them records its requests as that package's.
     ///
     /// # Errors
     ///
     /// Returns [`BrokerError::Table`] when either table is not one the core will interpret, which
-    /// includes a declarative table whose digest is not the digest of its own content.
+    /// includes a declarative table whose digest is not the digest of its own content, and
+    /// [`BrokerError::InvalidArgument`] when the declarative table names another package or
+    /// publisher than the one it is pinned with.
     pub fn pin_table(
         &self,
         application_instance_id: ApplicationInstanceId,
+        package: PackageIdentity,
         table: kr_protocol::gateway::DeclarativeTable,
         rich: kr_protocol::gateway::RichMethodTable,
     ) -> Result<()> {
         table.validate()?;
         rich.qualify(&table.upstream_protocol_version)?;
+        if table.plugin_id != package.plugin_id || table.publisher_id != package.publisher_id {
+            return Err(BrokerError::invalid(format!(
+                "this table is {} from {}, and it is pinned with {} from {}: a table is pinned \
+                 with the installed package it came from",
+                table.plugin_id, table.publisher_id, package.plugin_id, package.publisher_id
+            )));
+        }
         self.state().pinned_tables.insert(
             (application_instance_id, table.plugin_id.clone()),
-            PinnedTable { table, rich },
+            PinnedTable {
+                table,
+                rich,
+                package,
+            },
         );
         Ok(())
     }
@@ -2924,6 +2992,7 @@ impl Broker {
             pinned.rich,
             installed_protocol_version,
         )?;
+        state.connection_packages.insert(connection, pinned.package);
         // A connection that begins inside a gap is carried by its owner for the whole of its life.
         if state.volatile.mode() != kr_protocol::gateway::GatewayMode::Normal {
             state.continuous.insert(connection);
@@ -2956,6 +3025,7 @@ impl Broker {
             pinned.rich,
             installed_protocol_version,
         )?;
+        state.connection_packages.insert(connection, pinned.package);
         Ok(connection)
     }
 
@@ -2970,7 +3040,8 @@ impl Broker {
     /// # Errors
     ///
     /// Returns [`BrokerError::PermissionDenied`] when the identifier is live, belongs to another
-    /// instance, or names no retained resource of this one, and whatever
+    /// instance, names no retained resource of this one, or recorded its requests under another
+    /// package than the one whose tables would restore it, and whatever
     /// [`Broker::open_native_connection`] refuses.
     pub fn restore_native_connection(
         &self,
@@ -2982,7 +3053,9 @@ impl Broker {
         installed_protocol_version: &str,
     ) -> Result<()> {
         let mut state = self.state();
-        if state.gateway.connection(connection).is_some() {
+        // A live connection of either kind: an identifier a channel holds is live too, and
+        // restoring it as a declarative connection would give one identifier two readers.
+        if state.gateway.contains(connection) {
             return Err(BrokerError::denied(format!(
                 "{connection} is a live connection, and a restoration is not a replacement"
             )));
@@ -3039,6 +3112,27 @@ impl Broker {
             ));
         }
         let pinned = state.pinned_table(application_instance_id, plugin_id)?;
+        // The identifier keeps the package it recorded its requests under, across a restart too.
+        // Another package's tables would read those requests, correlate the native client's
+        // answers to them and reconcile them in that package's terms, so they do not get the
+        // identifier.
+        match state.connection_packages.get(&connection) {
+            Some(recorded) if *recorded == pinned.package => {}
+            Some(recorded) => {
+                return Err(BrokerError::denied(format!(
+                    "{connection} holds requests of {}, and a restoration under the tables of {} \
+                     would read them in another package's terms",
+                    recorded.name(),
+                    pinned.package.beside(recorded)
+                )));
+            }
+            None => {
+                return Err(BrokerError::denied(format!(
+                    "{connection} names no package this host recorded its requests under, so \
+                     nothing says whose requests they are"
+                )));
+            }
+        }
         state.gateway.open_native(
             connection,
             application_instance_id,
@@ -3274,7 +3368,6 @@ impl Broker {
         self.state()
             .gateway
             .observers(application_instance_id)
-            .map(|connection| connection.connection)
             .collect()
     }
 
@@ -3365,26 +3458,43 @@ impl Broker {
 
     // -- registered actions -------------------------------------------------------------------
 
-    /// Records the actions one package registered.
+    /// Registers the actions one package declared, as its manifest declares them.
+    ///
+    /// A registration takes the package's declarations and nothing else, so every registered
+    /// action's grant, effect, capability, operation and decision parameter are what its declared
+    /// class and implementation derive ([`RegisteredAction::from_declaration`]). What an action
+    /// is called, or labelled, does not enter into it. The registered set replaces what the
+    /// binding held.
+    ///
+    /// A declaration this host does not register as an invocable action (decoding, which is a
+    /// grant; terminal input, which is the input lease's; an answer a component would prepare) is
+    /// left out, and returned with the reason, which names it.
     ///
     /// # Errors
     ///
     /// Returns [`BrokerError::UnknownSubject`] when this broker holds no such binding.
-    pub fn register_actions(
+    pub fn register_actions<'a>(
         &self,
         binding_id: BrokerBindingId,
-        actions: impl IntoIterator<Item = RegisteredAction>,
-    ) -> Result<()> {
+        declarations: impl IntoIterator<Item = &'a kr_plugin_sdk::effect::ActionDeclaration>,
+    ) -> Result<Vec<BrokerError>> {
+        let mut registered = BTreeMap::new();
+        let mut refused = Vec::new();
+        for declaration in declarations {
+            match RegisteredAction::from_declaration(declaration) {
+                Ok(action) => {
+                    registered.insert(action.name.clone(), action);
+                }
+                Err(refusal) => refused.push(refusal),
+            }
+        }
         let mut state = self.state();
         let binding = state
             .bindings
             .get_mut(&binding_id)
             .ok_or_else(|| unknown_binding(binding_id))?;
-        binding.actions = actions
-            .into_iter()
-            .map(|action| (action.name.clone(), action))
-            .collect();
-        Ok(())
+        binding.actions = registered;
+        Ok(refused)
     }
 
     /// Returns the binding one package holds against one instance.
@@ -3526,9 +3636,7 @@ impl BrokerState {
     fn reconcile_connected_in(&mut self, now: TimestampMs) -> Option<VolatileTransition> {
         let generation = self.volatile.generation();
         for (application_instance_id, connection) in self.volatile.owed() {
-            if !self.continuous.contains(&connection)
-                || self.gateway.connection(connection).is_none()
-            {
+            if !self.continuous.contains(&connection) || !self.gateway.contains(connection) {
                 continue;
             }
             let of_scope = |pending: &&Pending| {
@@ -3570,6 +3678,182 @@ impl BrokerState {
             return None;
         }
         self.finish_recovery(generation, now).ok()
+    }
+
+    /// Verifies a decoder's interpretation under the lock the caller holds. See
+    /// [`Broker::interpret`].
+    fn interpret_in(
+        &mut self,
+        binding_id: BrokerBindingId,
+        resource_id: PendingResourceId,
+        projection: DecodedProjection,
+        deadline_ms: Option<TimestampMs>,
+        now: TimestampMs,
+    ) -> Result<PendingResource> {
+        // Interpreting a request into something a person answers is rich work. While the journal
+        // is faulted the native forwarding path continues and this does not.
+        self.volatile.require_rich_work()?;
+        let binding = self
+            .bindings
+            .get(&binding_id)
+            .ok_or_else(|| unknown_binding(binding_id))?;
+        if !binding.grants.holds(BrokerGrant::ApprovalInterpreter) {
+            return Err(BrokerError::Grant(
+                kr_protocol::broker::GrantError::NotHeld {
+                    grant: BrokerGrant::ApprovalInterpreter,
+                },
+            ));
+        }
+        if let Some(reason) = binding.rich_disabled.as_ref() {
+            return Err(BrokerError::UnsupportedCapability {
+                detail: format!("this binding's rich capabilities are disabled: {reason}"),
+            });
+        }
+        let pending = self
+            .arbitration
+            .get(resource_id)
+            .ok_or_else(|| BrokerError::unknown(format!("no pending resource {resource_id}")))?
+            .resource
+            .clone();
+        if pending.state != PendingState::Pending {
+            return Err(BrokerError::Arbitration(
+                kr_protocol::gateway::ArbitrationError::AlreadyResolved {
+                    state: pending.state,
+                },
+            ));
+        }
+        let binding = self
+            .bindings
+            .get(&binding_id)
+            .ok_or_else(|| unknown_binding(binding_id))?;
+        if binding.application_instance_id != pending.application_instance_id {
+            return Err(BrokerError::denied(format!(
+                "binding {binding_id} is not bound to {}",
+                pending.application_instance_id
+            )));
+        }
+        if !binding.may_decode(&pending.method) {
+            return Err(BrokerError::denied(format!(
+                "this binding is not trusted to decode {}",
+                pending.method
+            )));
+        }
+        let trust = binding
+            .trust
+            .as_ref()
+            .ok_or_else(|| BrokerError::denied("this binding holds no decoding trust"))?;
+        trust.check_projection(&projection)?;
+        let package = binding.package();
+        let application_instance_id = pending.application_instance_id;
+
+        // The frame is the one *this request* was recorded from. A caller naming any other would
+        // put one request's bytes in another's ledger row, so it does not get to name one.
+        let handle = self
+            .arbitration
+            .source_of(resource_id)
+            .cloned()
+            .ok_or_else(|| BrokerError::PreconditionFailed {
+                detail: format!("{resource_id} was not recorded from a source event of its own"),
+            })?;
+        let handle = &handle;
+        let instance = self
+            .instances
+            .get(&application_instance_id)
+            .ok_or_else(|| unknown_instance(application_instance_id))?;
+        let held = instance
+            .frames
+            .get(handle)
+            .ok_or_else(|| BrokerError::PreconditionFailed {
+                detail: format!(
+                    "source event {handle} has already been consumed, so {resource_id} has already \
+                     been interpreted"
+                ),
+            })?;
+        // The request is the package's whose table recorded it. Another package's decoder, or
+        // this package's at other bytes, reads it with a meaning the recording table never gave
+        // it, however that decoder is trusted.
+        match held.recorder.as_ref() {
+            Some(recorder) if *recorder == package => {}
+            Some(recorder) => {
+                return Err(BrokerError::denied(format!(
+                    "{resource_id} is a request of {}, and binding {binding_id} runs {}",
+                    recorder.name(),
+                    package.beside(recorder)
+                )));
+            }
+            None => {
+                return Err(BrokerError::denied(format!(
+                    "{resource_id} was recorded by no connection of an installed package, so no \
+                     decoder gives it a meaning"
+                )));
+            }
+        }
+        let frame = held.frame.clone();
+        if frame.generation != instance.source_generation {
+            return Err(BrokerError::PreconditionFailed {
+                detail: format!(
+                    "source event {handle} is from generation {} and the binding is at {}",
+                    frame.generation, instance.source_generation
+                ),
+            });
+        }
+        // Section 11 requires the ledger to retain the original source, and a partial copy is not
+        // the original. A request too large to keep whole is not turned into an approval: it is
+        // still forwarded opaquely on the native path, which depends on nothing this host stores.
+        if frame.bytes().len() > MAX_RETAINED_SOURCE_BYTES {
+            return Err(BrokerError::UnsupportedCapability {
+                detail: format!(
+                    "source event {handle} is {} bytes and an approval's original source is \
+                     retained whole up to {MAX_RETAINED_SOURCE_BYTES}",
+                    frame.bytes().len()
+                ),
+            });
+        }
+
+        let entry = DecoderLedgerEntry {
+            binding_id,
+            plugin_id: package.plugin_id,
+            publisher_id: package.publisher_id,
+            package_digest: package.package_digest,
+            method: pending.method.clone(),
+            upstream_request_id: pending.request.upstream.clone(),
+            source_generation: frame.generation,
+            source_digest: frame.digest,
+            source_bytes: Bytes::from(frame.bytes().to_vec()),
+            projection,
+            deadline_ms: Nullable::from(deadline_ms),
+            decoded_at: now,
+        };
+        let interpreted = PendingResource {
+            kind: PendingKind::Approval,
+            deadline_ms: Nullable::from(deadline_ms),
+            interpretation_verified: true,
+            ..pending
+        };
+        // A recorded request becoming an answerable approval is a durable change of that resource,
+        // so its own event goes in the same transaction as the change.
+        let event = self.next_transition_event(
+            &interpreted,
+            now,
+            crate::broker::ledger::TransitionCause::Interpreted,
+            None,
+        );
+        let admitted = self.stored(now, "an interpretation", |ledger| {
+            ledger.admit_resource(handle, binding_id, &entry, &interpreted, now, &event)
+        })?;
+        if !admitted {
+            return Err(BrokerError::PreconditionFailed {
+                detail: format!("source event {handle} has already produced an interpretation"),
+            });
+        }
+        self.remember(&event);
+        self.publish(&interpreted, &event);
+        self.arbitration
+            .set_interpretation(resource_id, interpreted.clone(), binding_id)?;
+        if let Some(instance) = self.instances.get_mut(&application_instance_id) {
+            instance.release(handle);
+        }
+        Ok(interpreted)
     }
 
     /// Runs writes made under this lock during a recovery, taking the store's lock without waiting.
@@ -3755,6 +4039,42 @@ impl BrokerState {
         );
     }
 
+    /// Returns the package one connection identifier belongs to: an open channel's own, or the
+    /// one held for the identifier since its connection opened or recorded its first request.
+    fn connection_package(&self, connection: GatewayConnectionId) -> Option<PackageIdentity> {
+        if let Some(channel) = self.gateway.channel(connection) {
+            return Some(PackageIdentity {
+                plugin_id: channel.plugin_id.clone(),
+                publisher_id: channel.publisher_id.clone(),
+                package_digest: channel.package_digest,
+            });
+        }
+        self.connection_packages.get(&connection).cloned()
+    }
+
+    /// Returns the package each connection of these records belongs to, for the recovery that
+    /// commits them: a connection whose first request was recorded inside the gap has its package
+    /// written with it.
+    fn packages_of(
+        &self,
+        records: &[(PendingResource, Option<BrokerBindingId>, bool)],
+    ) -> Vec<(GatewayConnectionId, ApplicationInstanceId, PackageIdentity)> {
+        let mut packages: BTreeMap<GatewayConnectionId, (ApplicationInstanceId, PackageIdentity)> =
+            BTreeMap::new();
+        for (resource, _, _) in records {
+            let connection = resource.request.connection;
+            if let Some(package) = self.connection_package(connection) {
+                packages
+                    .entry(connection)
+                    .or_insert((resource.application_instance_id, package));
+            }
+        }
+        packages
+            .into_iter()
+            .map(|(connection, (instance, package))| (connection, instance, package))
+            .collect()
+    }
+
     /// Returns what one method of one connection asks this host to perform, when it asks for
     /// anything.
     fn reverse_operation(
@@ -3791,8 +4111,7 @@ impl BrokerState {
         }
         let application_instance_id = self
             .gateway
-            .connection(connection)
-            .map(|held| held.application_instance_id)
+            .instance_of(connection)
             .ok_or_else(|| BrokerError::unknown(format!("no gateway connection {connection}")))?;
         // The native path keeps working while the journal is faulted. What the gap records is
         // that it did.
@@ -3858,8 +4177,15 @@ impl BrokerState {
             crate::broker::ledger::TransitionCause::Recorded,
             None,
         );
+        // The request is the package's whose table read it, and it stays that package's whatever
+        // becomes of the connection: the package is kept with the source frame, held for the
+        // identifier, and written with the record, so a restart knows it too.
+        let recorder = self.connection_package(connection);
         if self.volatile.writes_are_durable() {
-            match self.ledger.record_opaque(&resource, &event) {
+            match self
+                .ledger
+                .record_opaque(&resource, recorder.as_ref(), &event)
+            {
                 Ok(()) => {}
                 // The store failed under a native request. The fence goes up here, in memory, and
                 // the request is kept as what it now is: a resource of the gap, announced and not
@@ -3882,8 +4208,13 @@ impl BrokerState {
         // A request recorded while a recovery is running belongs to an upstream that has not said
         // what it still holds, so it joins what that recovery owes.
         self.volatile.owe_one(application_instance_id, connection);
+        if let Some(recorder) = recorder.as_ref() {
+            self.connection_packages
+                .entry(connection)
+                .or_insert_with(|| recorder.clone());
+        }
         if let Some(instance) = self.instances.get_mut(&application_instance_id) {
-            instance.retain(source_frame);
+            instance.retain(source_frame, recorder);
         }
         Ok(Some(resource))
     }
@@ -3892,7 +4223,8 @@ impl BrokerState {
     ///
     /// The recheck covers everything that could have changed while the answer was being encoded:
     /// the resource's own state, its deadline, the instance it belongs to, the generation that
-    /// produced it, and whether the decoder that interpreted it may still encode an answer.
+    /// produced it, whether the decoder that interpreted it may still encode an answer, and whether
+    /// the connection the answer goes out on still reads that decoder's package's table.
     fn claim_in(
         &mut self,
         resource_id: PendingResourceId,
@@ -4442,7 +4774,6 @@ impl BrokerState {
         let authorised: Vec<GatewayConnectionId> = self
             .gateway
             .observers(resource.application_instance_id)
-            .map(|connection| connection.connection)
             .collect();
         self.watchers.publish(
             &authorised,
@@ -4745,6 +5076,39 @@ impl BrokerState {
                 return Err(BrokerError::denied(format!(
                     "the decoder that interpreted {resource_id} may no longer answer {}",
                     pending.resource.method
+                )));
+            }
+            // The answer carries the meaning the interpreting package gave the request: the
+            // binding that answers is its decoder running that package, and the connection the
+            // answer goes out on reads that package's table. An identifier bound to another package
+            // after a restart would answer with another meaning, and a connection reading another
+            // package's table would write it in another's terms. A connection that is not open
+            // carries no answer at all, and is refused where its transport is looked up.
+            let entry = self.ledger.decoding(resource_id)?.ok_or_else(|| {
+                BrokerError::PreconditionFailed {
+                    detail: format!(
+                        "{resource_id} has no recorded interpretation, so there is nothing to \
+                         answer"
+                    ),
+                }
+            })?;
+            let interpreted_by = PackageIdentity::of_entry(&entry);
+            if binding.package() != interpreted_by {
+                return Err(BrokerError::denied(format!(
+                    "{resource_id} was interpreted by {}, and binding {binding_id} now runs {}",
+                    interpreted_by.name(),
+                    binding.package().beside(&interpreted_by)
+                )));
+            }
+            let connection = pending.resource.request.connection;
+            if let Some(present) = self.connection_package(connection)
+                && present != interpreted_by
+            {
+                return Err(BrokerError::denied(format!(
+                    "{resource_id} was interpreted by {}, and {connection} now reads the table of \
+                     {}",
+                    interpreted_by.name(),
+                    present.beside(&interpreted_by)
                 )));
             }
         }

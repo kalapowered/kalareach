@@ -190,6 +190,8 @@ pub fn retire(paths: &EnvironmentPaths, session_id: SessionId) -> Result<()> {
 pub struct DescriptorDirectory {
     #[cfg(unix)]
     handle: std::os::fd::OwnedFd,
+    #[cfg(windows)]
+    handle: std::fs::File,
     path: std::path::PathBuf,
 }
 
@@ -241,22 +243,73 @@ impl DescriptorDirectory {
 
     /// Opens and checks the directory, or returns `None` when there is none yet.
     ///
+    /// The directory is opened once, into a handle this keeps, and every check and every entry is
+    /// read through that handle rather than through the name again. Windows has no mode bits, so the
+    /// question the Unix reader asks of a mode is asked of the directory's access-control list, read
+    /// from the handle: it belongs to this user, it grants no account the machine does not already
+    /// trust, and it is protected, so nothing above it in the profile can widen it. A directory that
+    /// is a symbolic link or a junction is refused, as it is on Unix.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the directory cannot be inspected.
-    #[cfg(not(unix))]
+    /// Returns an error when the directory cannot be opened, is a link, or is reachable by anyone
+    /// but this user.
+    #[cfg(windows)]
     pub fn open(path: &Path) -> Result<Option<Self>> {
-        match std::fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.is_dir() => Ok(Some(Self {
+        use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+        use std::os::windows::io::AsHandle as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_TRAVERSE,
+        };
+
+        // Backup semantics let a program open a directory at all; the reparse-point flag opens a
+        // link itself rather than following it, so a link planted here is refused by its attributes
+        // below rather than opening whatever it points at. The access asks for the right to read the
+        // directory's own security information and for the right to traverse it, which is what opening
+        // an entry relative to this handle needs.
+        let handle = match std::fs::OpenOptions::new()
+            .read(true)
+            .access_mode(FILE_GENERIC_READ | FILE_TRAVERSE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+        {
+            Ok(handle) => handle,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(IpcError::io("open", path, error)),
+        };
+        let attributes = handle
+            .metadata()
+            .map_err(|error| IpcError::io("inspect", path, error))?
+            .file_attributes();
+        if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(IpcError::UntrustedFile {
                 path: path.to_path_buf(),
-            })),
-            Ok(_) => Err(IpcError::UntrustedFile {
+                reason: "a descriptor directory must not be a symbolic link or a junction",
+            });
+        }
+        if attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+            return Err(IpcError::UntrustedFile {
                 path: path.to_path_buf(),
                 reason: "a descriptor directory must be a directory",
-            }),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(IpcError::io("inspect", path, error)),
+            });
         }
+        match crate::paths::check_access_list(handle.as_handle(), "a descriptor directory", true) {
+            Ok(()) => {}
+            Err(crate::paths::AccessListRefusal::Policy(detail)) => {
+                return Err(IpcError::DirectoryAccessRefused {
+                    path: path.to_path_buf(),
+                    detail,
+                });
+            }
+            Err(crate::paths::AccessListRefusal::Unreadable(detail)) => {
+                return Err(IpcError::io("inspect", path, std::io::Error::other(detail)));
+            }
+        }
+        Ok(Some(Self {
+            handle,
+            path: path.to_path_buf(),
+        }))
     }
 
     /// Returns the directory this handle names.
@@ -292,10 +345,14 @@ impl DescriptorDirectory {
 
     /// Lists the names inside this directory.
     ///
+    /// The listing is by name, but every file it names is opened relative to the checked directory
+    /// handle and proven to be a child of it before it is read, so a name that appeared for a
+    /// directory swapped since this was opened is refused at the open rather than trusted here.
+    ///
     /// # Errors
     ///
     /// Returns an error when the directory cannot be read.
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     pub fn entries(&self) -> Result<Vec<std::ffi::OsString>> {
         let listing = match std::fs::read_dir(&self.path) {
             Ok(listing) => listing,
@@ -344,7 +401,7 @@ impl DescriptorDirectory {
                 reason: "a descriptor is larger than any descriptor this host writes",
             });
         }
-        check_owner(path, &metadata)?;
+        check_owner(&file, path, &metadata)?;
         let mut bytes = Vec::new();
         // Bounded by one byte more than the maximum, so a file that grew between the check and the
         // read is refused rather than read.
@@ -393,22 +450,41 @@ impl DescriptorDirectory {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     fn open_entry(&self, path: &Path) -> Result<Option<std::fs::File>> {
-        use std::os::windows::fs::OpenOptionsExt as _;
+        use std::os::windows::fs::MetadataExt as _;
+        use std::os::windows::io::AsHandle as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
-        // Windows refuses to open a reparse point when the flag is set, which covers the symbolic
-        // links and junctions a planted descriptor could use.
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        match std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)
-        {
-            Ok(file) => Ok(Some(file)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(IpcError::io("open", path, error)),
+        // A descriptor is a file inside this directory, named by its last component only.
+        let Some(name) = path.file_name() else {
+            return Err(IpcError::UntrustedFile {
+                path: path.to_path_buf(),
+                reason: "a descriptor is a file inside the descriptor directory",
+            });
+        };
+        // Opened relative to the directory handle that was checked, which is what makes the file the
+        // one inside that directory: a directory swapped for another since it was checked is never
+        // consulted, and a descriptor replaced by a rename while this runs opens as one whole
+        // version or the other. The open does not follow a reparse point, so a symbolic link or a
+        // junction planted under a descriptor's name opens as the link itself and is refused by its
+        // attributes below rather than sending this wherever it points.
+        let Some(file) = crate::paths::open_child(self.handle.as_handle(), name)
+            .map_err(|error| IpcError::io("open", path, error))?
+        else {
+            return Ok(None);
+        };
+        let attributes = file
+            .metadata()
+            .map_err(|error| IpcError::io("inspect", path, error))?
+            .file_attributes();
+        if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(IpcError::UntrustedFile {
+                path: path.to_path_buf(),
+                reason: "a descriptor must not be a symbolic link or a junction",
+            });
         }
+        Ok(Some(file))
     }
 }
 
@@ -428,7 +504,7 @@ const fn clear_non_blocking(_file: &std::fs::File, _path: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn check_owner(path: &Path, metadata: &std::fs::Metadata) -> Result<()> {
+fn check_owner(_file: &std::fs::File, path: &Path, metadata: &std::fs::Metadata) -> Result<()> {
     use std::os::unix::fs::MetadataExt as _;
 
     if metadata.uid() != crate::paths::current_uid() {
@@ -446,11 +522,27 @@ fn check_owner(path: &Path, metadata: &std::fs::Metadata) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn check_owner(_path: &Path, _metadata: &std::fs::Metadata) -> Result<()> {
-    // The Windows qualification pass adds the explicit protected access-control list check here;
-    // the directory lives inside the user's own profile.
-    Ok(())
+/// Checks a descriptor file's access-control list, read from the handle it was opened through.
+///
+/// The question the Unix reader asks of an owner and a mode, asked of the list instead: the file
+/// belongs to this user and grants no account the machine does not already trust. The list need not
+/// be protected, unlike the directory's: a descriptor inherits the owner-only entry the directory
+/// carries, and demanding protection of it would refuse a file that is owner-only exactly because it
+/// inherited that entry.
+#[cfg(windows)]
+fn check_owner(file: &std::fs::File, path: &Path, _metadata: &std::fs::Metadata) -> Result<()> {
+    use std::os::windows::io::AsHandle as _;
+
+    match crate::paths::check_access_list(file.as_handle(), "a descriptor", false) {
+        Ok(()) => Ok(()),
+        Err(crate::paths::AccessListRefusal::Policy(_)) => Err(IpcError::UntrustedFile {
+            path: path.to_path_buf(),
+            reason: "a descriptor's access-control list grants an account this host does not trust",
+        }),
+        Err(crate::paths::AccessListRefusal::Unreadable(detail)) => {
+            Err(IpcError::io("inspect", path, std::io::Error::other(detail)))
+        }
+    }
 }
 
 #[cfg(test)]

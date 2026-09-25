@@ -16,6 +16,9 @@
 //!   confirm this one, the command says so and stops: the confirmation is an owner device's own,
 //!   given with the installation it confirms, so nothing is left waiting here for it.
 
+use kr_client::error::refusal;
+use kr_client::shown;
+use kr_client::shown::Shown;
 use kr_ipc::paths::HostPaths;
 use kr_protocol::catalogue::{
     CatalogueListParams, CatalogueListResult, CataloguePinParams, CataloguePinResult,
@@ -31,8 +34,7 @@ use kr_protocol::scalars::Nullable;
 
 use crate::cli::{
     PluginArguments, PluginCommand, PluginInstallArguments, PluginListArguments,
-    PluginPinArguments, PluginRepoAddArguments, PluginRepoArguments, PluginRepoCommand,
-    PluginRepoPinArguments,
+    PluginPinArguments, PluginRepoArguments, PluginRepoCommand, PluginRepoPinArguments,
 };
 use crate::daemon::{Daemon, identifier};
 use crate::error::{CliError, Result};
@@ -60,7 +62,7 @@ pub async fn run(paths: &HostPaths, command: PluginCommand, json: bool) -> Resul
 async fn repo(paths: &HostPaths, command: PluginRepoCommand, json: bool) -> Result<()> {
     match command {
         PluginRepoCommand::List(arguments) => repo_list(paths, &arguments, json).await,
-        PluginRepoCommand::Add(arguments) => Err(repo_add(&arguments)),
+        PluginRepoCommand::Add(_) => Err(repo_add()),
         PluginRepoCommand::Sync(arguments) => repo_sync(paths, &arguments, json).await,
         PluginRepoCommand::Pin(arguments) => repo_pin(paths, &arguments, json).await,
         PluginRepoCommand::Remove(arguments) => repo_remove(paths, &arguments, json).await,
@@ -113,7 +115,7 @@ async fn install(paths: &HostPaths, arguments: &PluginInstallArguments, json: bo
     let installed = match installed {
         Ok(installed) => installed,
         Err(CliError::Refused(refusal)) if refusal.code == ErrorCode::OwnerConfirmationRequired => {
-            return Err(needs_owner_device(arguments, &refusal));
+            return Err(needs_owner_device(&refusal));
         }
         Err(error) => return Err(error),
     };
@@ -138,13 +140,13 @@ async fn install(paths: &HostPaths, arguments: &PluginInstallArguments, json: bo
 }
 
 /// The refusal an installation that needs the owner's confirmation ends with.
-fn needs_owner_device(arguments: &PluginInstallArguments, host: &ProtocolError) -> CliError {
-    CliError::Refused(ProtocolError::new(
+fn needs_owner_device(host: &ProtocolError) -> CliError {
+    CliError::Refused(refusal(
         ErrorCode::OwnerConfirmationRequired,
-        format!(
-            "installing {} {} from {} enlarges what it may do, which only the owner confirms: \
-             confirm it and install it from an owner device. Nothing was installed ({})",
-            arguments.plugin, arguments.version, arguments.catalogue, host.message
+        shown!(
+            "installing this release enlarges what the package may do, which only the owner \
+             confirms: confirm it and install it from an owner device. Nothing was installed ({})",
+            Shown::protocol(host)
         ),
     ))
 }
@@ -261,13 +263,12 @@ async fn repo_list(paths: &HostPaths, arguments: &PluginListArguments, json: boo
 ///
 /// A request to add a repository carries the owner's signed confirmation of the exact root it
 /// adopts, and there is no such request without one. Only an owner device signs one.
-fn repo_add(arguments: &PluginRepoAddArguments) -> CliError {
-    CliError::Refused(ProtocolError::new(
+fn repo_add() -> CliError {
+    CliError::Refused(refusal(
         ErrorCode::OwnerConfirmationRequired,
-        format!(
-            "adding the repository {} adopts its trust root, which only the owner confirms, on an \
+        Shown::said(
+            "adding a repository adopts its trust root, which only the owner confirms, on an \
              owner device: add it from an owner device. Nothing was sent to this host",
-            arguments.catalogue
         ),
     ))
 }

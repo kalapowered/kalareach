@@ -364,6 +364,42 @@ async fn an_exhausted_allowance_is_an_answer_with_the_grace_left() {
     assert!(answer.granted().is_none());
 }
 
+/// KR-REQ-04.19: a lease answer that names one member twice is not an answer this client reads.
+/// One reader would send traffic to the first relay and another to the second, and a lease may
+/// have been issued whichever it was, so it is an unknown outcome and nothing retries it.
+#[tokio::test]
+async fn a_lease_answer_that_names_a_member_twice_is_an_unknown_outcome() {
+    let answer = granted_answer();
+    let once = r#""relay_url":"https://relay-1.reach.kala.to""#;
+    let repeated = answer.replacen(
+        once,
+        r#""relay_url":"https://relay-1.reach.kala.to","relay_url":"https://relay-2.reach.kala.to""#,
+        1,
+    );
+    assert_ne!(
+        repeated, answer,
+        "the answer names the relay once to begin with"
+    );
+    let http = Recorder::new(&repeated);
+    let service = ManagedRelayLeaseService::new(
+        origin(),
+        http.clone(),
+        Installation::new(ServiceRequestSigner::Installation),
+    );
+
+    let error = service
+        .issue(&issue_request())
+        .await
+        .expect_err("a member named twice");
+    assert_eq!(error.code(), ErrorCode::OutcomeUnknown);
+    assert_eq!(error.code().retry_category(), RetryCategory::OutcomeUnknown);
+
+    // The control: the same answer naming it once is a lease.
+    http.answer_with(200, &answer);
+    let answer = service.issue(&issue_request()).await.expect("a lease");
+    assert!(answer.granted().is_some());
+}
+
 #[tokio::test]
 async fn a_refusal_arrives_as_the_code_the_service_named() {
     let http = Recorder::new(&granted_answer());
@@ -501,8 +537,8 @@ async fn a_refusal_arrives_as_the_code_the_service_named() {
     assert_eq!(error.code().retry_category(), RetryCategory::OutcomeUnknown);
 
     // A proxy's error page is not a refusal and not a caller's mistake: it is transient, because
-    // asking again after it may well work.
-    http.answer_with(502, "<html><body>Bad Gateway</body></html>");
+    // asking again after it may well work. A 502 or 504 is a lost answer instead, tested below.
+    http.answer_with(503, "<html><body>Service Unavailable</body></html>");
     let error = service
         .issue(&issue_request())
         .await
@@ -518,6 +554,81 @@ async fn a_refusal_arrives_as_the_code_the_service_named() {
         .await
         .expect_err("a wrong origin");
     assert_eq!(error.code(), ErrorCode::HostNotConfigured);
+}
+
+/// KR-REQ-04.11: a lease answer that something in front of the service lost is an unknown outcome.
+/// The service has the request, and may have issued and installed a lease, when a gateway answers
+/// 502 or 504 with a page of its own, so nothing asks again by itself. The same holds for a
+/// revocation. The service's own fault arrives in its envelope and stays transient, and a success
+/// this client cannot read stays an unknown outcome.
+#[tokio::test]
+async fn a_lease_answer_a_gateway_lost_is_an_unknown_outcome() {
+    let http = Recorder::new(&granted_answer());
+    let service = ManagedRelayLeaseService::new(
+        origin(),
+        http.clone(),
+        Installation::new(ServiceRequestSigner::Installation),
+    );
+
+    for (status, page) in [
+        (502, "<html><body>Bad Gateway</body></html>"),
+        (504, "<html><body>Gateway Timeout</body></html>"),
+    ] {
+        http.answer_with(status, page);
+        let error = service
+            .issue(&issue_request())
+            .await
+            .expect_err("an answer the gateway lost");
+        // The service received the request, so a lease may exist for the pair.
+        let (url, sent) = http.last();
+        assert_eq!(url, "https://reach.kala.to/api/relay/lease", "{status}");
+        assert_eq!(sent["body"]["byte_ceiling"], "4194304", "{status}");
+        assert_eq!(error.code(), ErrorCode::OutcomeUnknown, "{status}");
+        assert_eq!(
+            error.code().retry_category(),
+            RetryCategory::OutcomeUnknown,
+            "{status}"
+        );
+        assert!(
+            !error
+                .decision(RequestClass::IdempotentRead)
+                .retries_automatically(),
+            "{status}"
+        );
+
+        let error = service
+            .revoke(
+                RelayLeaseId::new(Uuid::from_bytes([0x11; 16])),
+                LeaseEndReason::Finished,
+            )
+            .await
+            .expect_err("an answer the gateway lost");
+        assert_eq!(error.code(), ErrorCode::OutcomeUnknown, "{status}");
+    }
+
+    // The controls. The service's own fault is its envelope, and a caller waits and asks again.
+    http.answer_with(
+        500,
+        &serde_json::json!({
+            "ok": false,
+            "error": { "code": "INTERNAL", "message": "The request could not be completed." }
+        })
+        .to_string(),
+    );
+    let error = service
+        .issue(&issue_request())
+        .await
+        .expect_err("the service's own fault");
+    assert_eq!(error.code(), ErrorCode::UpstreamUnavailable);
+    assert_eq!(error.code().retry_category(), RetryCategory::Transient);
+
+    // A success this client cannot read.
+    http.answer_with(200, "not an envelope");
+    let error = service
+        .issue(&issue_request())
+        .await
+        .expect_err("an unreadable success");
+    assert_eq!(error.code(), ErrorCode::OutcomeUnknown);
 }
 
 #[tokio::test]

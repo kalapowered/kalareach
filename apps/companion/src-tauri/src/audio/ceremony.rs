@@ -5,37 +5,49 @@
 //! cannot be authorized by provider speech alone. A statement from the model that the user
 //! confirmed something is content, never authority.
 //!
-//! The ceremony requires user-presence verification on the unlocked screen of the paired device:
-//! on macOS, through Apple's LocalAuthentication (`LAContext`); on non-macOS desktop, by refusing
-//! `UNAVAILABLE`. Once presence is verified, the client signs `VoiceConfirmationProof` over
-//! `CBOR(["kr-voice/confirm/1", request])` using the paired device's `authorisation` key.
+//! The ceremony requires user-presence verification on the unlocked screen of the paired device,
+//! through the platform's own ceremony (`crate::verify`): Touch ID or the password on macOS,
+//! Windows Hello on Windows, and none elsewhere, which refuses with `UNAVAILABLE`. Once presence is
+//! verified, the client signs `VoiceConfirmationProof` over `CBOR(["kr-voice/confirm/1", request])`
+//! using the paired device's `authorisation` key.
 
+use std::time::Duration;
+
+use kr_client::pairing::owner::{Ceremony, CeremonyOutcome};
 use kr_crypto::keys::AuthorisationKeyPair;
 use kr_protocol::voice::{VoiceConfirmationProof, VoiceConfirmationRequest};
 
 use crate::error::{CommandError, Result};
-use crate::verify::verify_owner_presence;
 
-/// Prompts the user on the device's unlocked screen and signs a confirmation challenge upon approval.
+/// Asks the person through `ceremony` and signs the confirmation challenge when they confirm
+/// before it expires.
 ///
 /// # Errors
 ///
-/// Returns `PERMISSION_DENIED` if the user declines or fails verification,
-/// `UNAVAILABLE` on platforms without a native verification ceremony, or an error if signing fails.
-pub fn confirm_voice_action(
+/// Returns `PERMISSION_DENIED` if the user declines or fails verification or the challenge expires
+/// first, `UNAVAILABLE` on a device without a verification ceremony, or an error if signing fails.
+pub async fn confirm_voice_action(
+    ceremony: &dyn Ceremony,
     authorisation_key: &AuthorisationKeyPair,
     request: &VoiceConfirmationRequest,
 ) -> Result<VoiceConfirmationProof> {
-    let reason = format!("Authorise voice action: {}", request.action.as_str());
-    let presence = verify_owner_presence(&reason)?;
-
-    if !presence.verified {
-        return Err(CommandError::refused(
+    let reason = format!("authorise the voice action {}", request.action.as_str());
+    let within = Duration::from_millis(
+        request
+            .expires_at_ms
+            .get()
+            .saturating_sub(kr_ipc::now_ms().get()),
+    );
+    match ceremony.verify(&reason, within).await {
+        CeremonyOutcome::Confirmed => sign_voice_confirmation(authorisation_key, request),
+        CeremonyOutcome::NotConfirmed => Err(CommandError::refused(
             "the unlocked-screen ceremony was not completed",
-        ));
+        )),
+        CeremonyOutcome::Unavailable => Err(CommandError::unavailable(
+            "this device has no user-verification ceremony; confirm from a separately paired \
+             owner device",
+        )),
     }
-
-    sign_voice_confirmation(authorisation_key, request)
 }
 
 /// Signs a voice confirmation request with the paired device's authorization key.

@@ -9,6 +9,8 @@
 //! runtime directory, so `kr attach` reads one, challenges the worker named in it, and attaches —
 //! which is what keeps attaching possible while the daemon is restarting.
 
+use kr_client::shown;
+use kr_client::shown::{Said, Shown};
 use kr_ipc::client::LocalClient;
 use kr_ipc::paths::{EnvironmentPaths, HostPaths};
 use kr_protocol::error::ErrorCode;
@@ -46,8 +48,8 @@ impl SessionSelector {
         text.parse::<SessionId>()
             .map(Self::Identifier)
             .map_err(|_| {
-                CliError::Usage(format!(
-                    "{text} is neither a display number nor a session identifier"
+                CliError::Usage(Shown::said(
+                    "the text given is neither a display number nor a session identifier",
                 ))
             })
     }
@@ -58,15 +60,6 @@ impl SessionSelector {
         match self {
             Self::Display(number) => descriptor.display_number.get() == *number,
             Self::Identifier(session_id) => descriptor.session_id == *session_id,
-        }
-    }
-}
-
-impl core::fmt::Display for SessionSelector {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Display(number) => write!(formatter, "{number}"),
-            Self::Identifier(session_id) => write!(formatter, "{session_id}"),
         }
     }
 }
@@ -134,21 +127,24 @@ pub fn select(paths: &HostPaths, named: Option<&str>) -> Result<KnownEnvironment
             .into_iter()
             .find(|known| known.environment_id == installation)
             .ok_or_else(|| {
-                CliError::HostUnavailable(format!(
-                    "this host's environment {installation} has no runtime directory; start the \
-                     control daemon, or name an environment"
+                CliError::HostUnavailable(shown!(
+                    "this host's environment {} has no runtime directory; start the \
+                     control daemon, or name an environment",
+                    installation
                 ))
             });
     };
-    let wanted: EnvironmentId = text
-        .parse()
-        .map_err(|_| CliError::Usage(format!("{text} is not an environment identifier")))?;
+    let wanted: EnvironmentId = text.parse().map_err(|_| {
+        CliError::Usage(Shown::said(
+            "the text given is not an environment identifier",
+        ))
+    })?;
     known
         .into_iter()
         .find(|known| known.environment_id == wanted)
         // A selector that names an environment this host does not have is refused rather than
         // quietly answered by the default one.
-        .ok_or_else(|| CliError::HostUnavailable(format!("this host has no environment {wanted}")))
+        .ok_or_else(|| CliError::HostUnavailable(shown!("this host has no environment {}", wanted)))
 }
 
 /// Finds the descriptor a selector names.
@@ -177,10 +173,10 @@ pub fn find(
         }
     }
     match found.len() {
-        0 => Err(CliError::UnknownSession(selector.to_string())),
+        0 => Err(CliError::UnknownSession(selector.said())),
         1 => Ok(found.remove(0)),
         // The command never selects the first match.
-        _ => Err(CliError::AmbiguousSession(selector.to_string())),
+        _ => Err(CliError::AmbiguousSession(selector.said())),
     }
 }
 
@@ -194,9 +190,10 @@ pub async fn open_worker(descriptor: &WorkerDescriptor, build_id: BuildId) -> Re
     let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build_id)
         .await
         .map_err(|error| {
-            CliError::HostUnavailable(format!(
-                "could not reach session {}: {error}",
-                descriptor.session_id
+            CliError::HostUnavailable(shown!(
+                "could not reach session {}: {}",
+                descriptor.session_id,
+                Shown::ipc(&error)
             ))
         })?;
     // A descriptor is data on disk. Nothing in it is acted on until the worker behind the endpoint
@@ -204,6 +201,18 @@ pub async fn open_worker(descriptor: &WorkerDescriptor, build_id: BuildId) -> Re
     client.verify_worker(descriptor).await?;
     Ok(client)
 }
+
+/// What a person does about an environment whose control daemon is not running: start one, or
+/// set this installation up for `kr new` to start one itself.
+#[cfg(unix)]
+pub const SETUP_ACTION: &str = "start the control daemon, kr-controller, for it, or, for this \
+                                installation's own environment, select the standalone start with \
+                                `kr host startup --set standalone` so that `kr new` starts one";
+
+/// What a person does about an environment whose control daemon is not running: start one. The
+/// standalone start runs the daemon in a session of its own, which this platform does not have.
+#[cfg(not(unix))]
+pub const SETUP_ACTION: &str = "start the control daemon, kr-controller, for it";
 
 /// Connects to the control daemon.
 ///
@@ -216,12 +225,18 @@ pub async fn open_controller(paths: &EnvironmentPaths, build_id: BuildId) -> Res
     let endpoint = paths.controller_endpoint()?;
     LocalClient::connect(&endpoint, LocalClientKind::Cli, build_id)
         .await
-        .map_err(|error| {
-            CliError::HostUnavailable(format!(
-                "no KalaReach host is running for this environment: {error}; start the control \
-                 daemon, kr-controller, for it"
-            ))
-        })
+        .map_err(|error| not_running(&error, Shown::said(SETUP_ACTION)))
+}
+
+/// The failure a command that needs a control daemon is given when none answers: what went wrong,
+/// and `action`, what the person does about it.
+#[must_use]
+pub fn not_running(error: &kr_ipc::IpcError, action: Shown) -> CliError {
+    CliError::HostUnavailable(shown!(
+        "no KalaReach host is running for this environment: {}; {}",
+        Shown::ipc(error),
+        action
+    ))
 }
 
 /// Resolves a selector that names no live descriptor, through what the environment's daemon
@@ -257,14 +272,17 @@ pub async fn retained_session(
             .map_err(CliError::Refused)?
             .to_typed()
             .map_err(|error| {
-                CliError::Other(format!("the host's answer could not be read: {error}"))
+                CliError::Other(shown!(
+                    "the host's answer could not be read: {}",
+                    Shown::cbor(&error)
+                ))
             })?;
     listed
         .sessions
         .iter()
         .find(|summary| summary.display_number.get() == number)
         .map(|summary| summary.session_id)
-        .ok_or_else(|| CliError::UnknownSession(selector.to_string()))
+        .ok_or_else(|| CliError::UnknownSession(selector.said()))
 }
 
 /// What the environment's daemon holds for a session that no descriptor names.
@@ -316,7 +334,10 @@ pub async fn registered(
     match outcome {
         Ok(value) => {
             let read: SessionReadResult = value.to_typed().map_err(|error| {
-                CliError::Other(format!("the host's answer could not be read: {error}"))
+                CliError::Other(shown!(
+                    "the host's answer could not be read: {}",
+                    Shown::cbor(&error)
+                ))
             })?;
             let summary = read.session;
             Ok(match summary.closure.0 {
@@ -340,7 +361,7 @@ pub async fn registered(
             record: None,
         }),
         Err(refusal) if refusal.code == ErrorCode::UnknownSession => {
-            Err(CliError::UnknownSession(selector.to_string()))
+            Err(CliError::UnknownSession(selector.said()))
         }
         Err(refusal) => Err(CliError::Refused(refusal)),
     }

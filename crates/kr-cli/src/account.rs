@@ -19,24 +19,31 @@
 //! **The destination is this host's runtime root and nothing else.** The path is derived from the
 //! runtime root the host already owns; the operator names the file to read, not the file to write.
 
+use kr_client::shown;
+use kr_client::shown::Shown;
 use std::path::{Path, PathBuf};
 
+use kr_client::services::account::{scope_names, scope_words};
 use kr_client::services::voice::{
     ACCOUNT_TOKEN_FILE_LIMIT, StoredAccountToken, VOICE_SCOPE, account_token_path,
 };
 use kr_ipc::paths::HostPaths;
 
 use crate::error::{CliError, Result};
+use crate::shown::named;
 
 /// What an import did, for a person and for `--json`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Imported {
     /// Where the token was written.
     pub path: String,
-    /// The origin it belongs to.
+    /// The origin it belongs to, as a diagnostic names one: the scheme, the host and the port.
     pub origin: String,
-    /// The scopes it carries.
-    pub scopes: Vec<String>,
+    /// The scopes it carries that this build knows, by name.
+    pub scopes: Vec<&'static str>,
+    /// How many scopes it carries that this build does not know. They are counted, not repeated:
+    /// a scope is whatever the file said.
+    pub unknown_scopes: usize,
     /// When it stops being accepted, in UTC milliseconds, or null when the issuer did not say.
     pub expires_at_ms: Option<u64>,
     /// True when it carries the scope managed voice needs.
@@ -54,11 +61,10 @@ impl Imported {
             format!("Wrote the account token to {}.", self.path),
             format!("It belongs to {}.", self.origin),
         ];
-        lines.push(if self.scopes.is_empty() {
-            "It carries no scopes.".to_owned()
-        } else {
-            format!("It carries {}.", self.scopes.join(", "))
-        });
+        lines.push(format!(
+            "It carries {}.",
+            scope_words(&self.scopes, self.unknown_scopes)
+        ));
         if let Some(expires_at_ms) = self.expires_at_ms {
             lines.push(format!(
                 "It stops being accepted at {expires_at_ms} in UTC milliseconds."
@@ -70,6 +76,61 @@ impl Imported {
             ));
         }
         lines
+    }
+}
+
+/// What `kr account token show` says of the token this host reads, for a person and for `--json`.
+///
+/// The origin and the scopes are said as a diagnostic says them: the scheme, the host and the
+/// port, and the scopes this build knows by name with the others counted. A stored origin can carry
+/// a user name and a password in front of the host, and a scope is whatever the file said.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Held {
+    /// Where this host reads its account token.
+    pub path: String,
+    /// True when a token is imported there.
+    pub imported: bool,
+    /// The origin it belongs to, when one is imported.
+    pub origin: Option<String>,
+    /// The scopes it carries that this build knows, by name.
+    pub scopes: Vec<&'static str>,
+    /// How many scopes it carries that this build does not know.
+    pub unknown_scopes: usize,
+    /// The token's description, for a person.
+    #[serde(skip)]
+    description: Option<String>,
+}
+
+impl Held {
+    /// What `path` holds, as `stored` read it.
+    #[must_use]
+    pub fn of(path: &Path, stored: Option<&StoredAccountToken>) -> Self {
+        let (scopes, unknown_scopes) =
+            stored.map_or_else(|| (Vec::new(), 0), |stored| scope_names(&stored.scopes));
+        Self {
+            path: path.display().to_string(),
+            imported: stored.is_some(),
+            origin: stored.map(|stored| Shown::address(&stored.origin).into_string()),
+            scopes,
+            unknown_scopes,
+            description: stored.map(|stored| stored.description().into_string()),
+        }
+    }
+
+    /// The lines a person reads. The token itself is never in them.
+    #[must_use]
+    pub fn lines(&self) -> Vec<String> {
+        vec![
+            format!("This host reads its account token from {}.", self.path),
+            self.description.as_ref().map_or_else(
+                || {
+                    "No account token has been imported. Write one with `kr account token import \
+                     <path>`."
+                        .to_owned()
+                },
+                |description| format!("It holds {description}."),
+            ),
+        ]
     }
 }
 
@@ -97,30 +158,37 @@ pub fn import_into(source: &Path, runtime_root: &Path) -> Result<Imported> {
     // The operator names the file to read. The file to write is derived from the runtime root this
     // host already owns, so there is no argument that could put a token somewhere else.
     if !destination.starts_with(runtime_root) {
-        return Err(CliError::Usage(
-            "an account token is written inside this host's runtime directory".to_owned(),
-        ));
+        return Err(CliError::Usage(Shown::said(
+            "an account token is written inside this host's runtime directory",
+        )));
     }
     let bytes = read_source(source)?;
     let stored = StoredAccountToken::read(&bytes).map_err(|error| {
         // The refusal from the reader names the shape, never the value.
-        CliError::Usage(format!("{} could not be read: {error}", source.display()))
+        CliError::Usage(shown!("{} could not be read: {}", named(source), error))
     })?;
 
-    std::fs::create_dir_all(runtime_root)
-        .map_err(|error| CliError::Usage(format!("{}: {error}", runtime_root.display())))?;
+    std::fs::create_dir_all(runtime_root).map_err(|error| {
+        CliError::Usage(shown!(
+            "{}: {}",
+            Shown::root(runtime_root),
+            Shown::io(&error)
+        ))
+    })?;
     kr_ipc::paths::write_owner_only_file(
         &destination,
-        &stored
-            .write()
-            .map_err(|error| CliError::Usage(format!("the token could not be written: {error}")))?,
+        &stored.write().map_err(|error| {
+            CliError::Usage(shown!("the token could not be written: {}", error))
+        })?,
     )
     .map_err(CliError::from)?;
 
+    let (scopes, unknown_scopes) = scope_names(&stored.scopes);
     Ok(Imported {
         path: destination.display().to_string(),
-        origin: stored.origin.clone(),
-        scopes: stored.scopes.clone(),
+        origin: Shown::address(&stored.origin).into_string(),
+        scopes,
+        unknown_scopes,
         expires_at_ms: stored.expires_at_ms,
         carries_voice_scope: stored.carries(VOICE_SCOPE),
     })
@@ -139,14 +207,15 @@ pub fn token_path() -> Result<PathBuf> {
 /// Reads the operator's file, bounded.
 fn read_source(source: &Path) -> Result<Vec<u8>> {
     let metadata = std::fs::metadata(source)
-        .map_err(|error| CliError::Usage(format!("{}: {error}", source.display())))?;
+        .map_err(|error| CliError::Usage(shown!("{}: {}", named(source), Shown::io(&error))))?;
     if metadata.len() > ACCOUNT_TOKEN_FILE_LIMIT {
-        return Err(CliError::Usage(format!(
+        return Err(CliError::Usage(shown!(
             "{} is larger than an account token document",
-            source.display()
+            named(source)
         )));
     }
-    std::fs::read(source).map_err(|error| CliError::Usage(format!("{}: {error}", source.display())))
+    std::fs::read(source)
+        .map_err(|error| CliError::Usage(shown!("{}: {}", named(source), Shown::io(&error))))
 }
 
 #[cfg(test)]
@@ -242,5 +311,104 @@ mod tests {
         let error =
             import_into(&root.path().join("absent.json"), root.path()).expect_err("it is refused");
         assert!(matches!(error, CliError::Usage(_)));
+    }
+
+    /// A stored document with the marker in the path, the query and the fragment of its origin,
+    /// and in its user information when `credentials` is set, in a scope, and as the token.
+    fn marked_document(credentials: bool) -> String {
+        let marker = crate::shown::marker::MARKER;
+        let user = if credentials {
+            format!("{marker}:{marker}@")
+        } else {
+            String::new()
+        };
+        format!(
+            r#"{{"origin":"https://{user}reach.example/{marker}?{marker}#{marker}",
+                "accessToken":"{marker}","scopes":["voice","{marker}"],"expiresAtMs":1700000000000}}"#
+        )
+    }
+
+    /// `kr account token import` says the origin as a diagnostic names one and the scopes this
+    /// build knows, and counts the others: a stored origin can carry a user name and a password,
+    /// and a scope is whatever the file said.
+    #[test]
+    fn an_import_says_the_origin_and_scopes_without_what_the_file_put_in_them() {
+        use crate::shown::marker::{MARKER, assert_unmarked};
+
+        // An origin with credentials in it is not printed at all; one without is its scheme and
+        // host.
+        for (credentials, origin, places) in [
+            (true, "<not printed>", 5),
+            (false, "https://reach.example", 3),
+        ] {
+            let root = runtime_root();
+            let source = root.path().join("from-the-operator.json");
+            std::fs::write(&source, marked_document(credentials)).expect("the operator's file");
+            let imported = import_into(&source, root.path()).expect("the token is imported");
+            // The negative control: the stored record holds the marker in the origin's user
+            // information, path, query and fragment and in the second scope, where the import
+            // reported them whole.
+            let stored =
+                kr_client::services::voice::AccountTokenFile::at(PathBuf::from(&imported.path))
+                    .stored()
+                    .expect("the host reads it back");
+            assert_eq!(
+                stored.origin.matches(MARKER).count(),
+                places,
+                "{}",
+                stored.origin
+            );
+            assert!(stored.scopes.iter().any(|scope| scope == MARKER));
+
+            assert_eq!(imported.origin, origin);
+            assert_eq!(imported.scopes, ["voice"]);
+            assert_eq!(imported.unknown_scopes, 1);
+            assert_unmarked(
+                "an import",
+                &[
+                    imported.lines().join("\n"),
+                    serde_json::to_string(&imported).expect("the machine-readable answer"),
+                    format!("{imported:?}"),
+                    format!("{imported:#?}"),
+                ],
+            );
+        }
+    }
+
+    /// `kr account token show` says the same of the token this host reads, for a person and for a
+    /// script.
+    #[test]
+    fn a_shown_token_says_the_origin_and_scopes_without_what_the_file_put_in_them() {
+        use crate::shown::marker::{MARKER, assert_unmarked};
+
+        let root = runtime_root();
+        let path = account_token_path(root.path());
+        kr_ipc::paths::write_owner_only_file(&path, marked_document(false).as_bytes())
+            .expect("the stored token");
+        let stored = kr_client::services::voice::AccountTokenFile::at(path.clone())
+            .stored()
+            .expect("the host reads it");
+        // The negative control: what the command printed at `origin` and `scopes`.
+        assert!(
+            stored.origin.contains(MARKER) && stored.scopes.iter().any(|scope| scope == MARKER)
+        );
+
+        let held = Held::of(&path, Some(&stored));
+        assert_eq!(held.origin.as_deref(), Some("https://reach.example"));
+        assert_eq!(held.scopes, ["voice"]);
+        assert_eq!(held.unknown_scopes, 1);
+        assert_unmarked(
+            "a shown token",
+            &[
+                held.lines().join("\n"),
+                serde_json::to_string(&held).expect("the machine-readable answer"),
+                format!("{held:?}"),
+                format!("{held:#?}"),
+            ],
+        );
+
+        let nothing = Held::of(&path, None);
+        assert!(!nothing.imported);
+        assert!(nothing.lines()[1].starts_with("No account token has been imported."));
     }
 }

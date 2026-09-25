@@ -58,10 +58,21 @@ pub trait Content: std::fmt::Debug + Send + Sync {
 }
 
 /// Content already held in memory.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Held {
     bytes: Vec<u8>,
     digest: Digest256,
+}
+
+impl std::fmt::Debug for Held {
+    /// How much is held and its digest, never the bytes.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Held")
+            .field("bytes", &self.bytes.len())
+            .field("digest", &self.digest)
+            .finish()
+    }
 }
 
 impl Held {
@@ -96,24 +107,24 @@ impl Content for Held {
 
 /// A refusal that leaves the plan exactly as it was.
 fn refuse(message: &'static str) -> ClientError {
-    ClientError::Host(kr_protocol::error::ProtocolError::new(
+    ClientError::refusal(
         kr_protocol::error::ErrorCode::InvalidArgument,
-        message,
-    ))
+        crate::shown::Shown::said(message),
+    )
 }
 
 fn out_of_range() -> ClientError {
-    ClientError::Host(kr_protocol::error::ProtocolError::new(
+    ClientError::refusal(
         kr_protocol::error::ErrorCode::InvalidArgument,
-        "the upload asked for a range the content does not hold",
-    ))
+        crate::shown::Shown::said("the upload asked for a range the content does not hold"),
+    )
 }
 
 /// What the upload names itself as.
 ///
 /// These are the fields `upload.begin` reserves against, and the ones the published handle repeats.
 /// The filename is metadata: the host never builds a storage path from it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Subject {
     /// The environment that will own the bytes.
     pub environment_id: EnvironmentId,
@@ -125,6 +136,21 @@ pub struct Subject {
     pub declared_media_type: String,
     /// The original filename, kept for display.
     pub original_file_name: String,
+}
+
+impl std::fmt::Debug for Subject {
+    /// Where the upload belongs, and how long its declared names are, never the names: a file
+    /// name is a person's own.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Subject")
+            .field("environment_id", &self.environment_id)
+            .field("session_id", &self.session_id)
+            .field("device_id", &self.device_id)
+            .field("declared_media_type_bytes", &self.declared_media_type.len())
+            .field("original_file_name_bytes", &self.original_file_name.len())
+            .finish()
+    }
 }
 
 /// What the caller should send next.
@@ -274,16 +300,18 @@ impl Upload {
             }))),
             Phase::Sending => {
                 let transfer_id = self.transfer_id.ok_or_else(|| {
-                    ClientError::Host(kr_protocol::error::ProtocolError::new(
+                    ClientError::refusal(
                         kr_protocol::error::ErrorCode::InvalidArgument,
-                        "the upload is sending chunks without a transfer identity",
-                    ))
+                        crate::shown::Shown::said(
+                            "the upload is sending chunks without a transfer identity",
+                        ),
+                    )
                 })?;
                 let index = self.next_missing_chunk().ok_or_else(|| {
-                    ClientError::Host(kr_protocol::error::ProtocolError::new(
+                    ClientError::refusal(
                         kr_protocol::error::ErrorCode::InvalidArgument,
-                        "the upload is sending chunks with none missing",
-                    ))
+                        crate::shown::Shown::said("the upload is sending chunks with none missing"),
+                    )
                 })?;
                 Ok(Step::Chunk(Box::new(
                     self.chunk_params(transfer_id, index)?,
@@ -291,10 +319,12 @@ impl Upload {
             }
             Phase::Publishing => {
                 let transfer_id = self.transfer_id.ok_or_else(|| {
-                    ClientError::Host(kr_protocol::error::ProtocolError::new(
+                    ClientError::refusal(
                         kr_protocol::error::ErrorCode::InvalidArgument,
-                        "the upload is publishing without a transfer identity",
-                    ))
+                        crate::shown::Shown::said(
+                            "the upload is publishing without a transfer identity",
+                        ),
+                    )
                 })?;
                 Ok(Step::Finish(UploadFinishParams {
                     transfer_id,
@@ -304,10 +334,10 @@ impl Upload {
             }
             Phase::Published => {
                 let handle = self.handle.clone().ok_or_else(|| {
-                    ClientError::Host(kr_protocol::error::ProtocolError::new(
+                    ClientError::refusal(
                         kr_protocol::error::ErrorCode::InvalidArgument,
-                        "the upload is published without a handle",
-                    ))
+                        crate::shown::Shown::said("the upload is published without a handle"),
+                    )
                 })?;
                 Ok(Step::Done(Box::new(handle)))
             }
@@ -423,18 +453,20 @@ impl Upload {
         if self.transfer_id.as_ref() == Some(transfer_id) {
             return Ok(());
         }
-        Err(ClientError::Host(kr_protocol::error::ProtocolError::new(
+        Err(ClientError::refusal(
             kr_protocol::error::ErrorCode::InvalidArgument,
-            "the answer names a transfer this upload is not driving",
-        )))
+            crate::shown::Shown::said("the answer names a transfer this upload is not driving"),
+        ))
     }
 
     fn adopt_bitmap(&mut self, encoded: &Bytes) -> Result<()> {
         let bitmap = ChunkBitmap::decode(encoded, self.layout.chunk_count.get()).map_err(|_| {
-            ClientError::Host(kr_protocol::error::ProtocolError::new(
+            ClientError::refusal(
                 kr_protocol::error::ErrorCode::InvalidArgument,
-                "the host's received-chunk bitmap does not fit the layout it chose",
-            ))
+                crate::shown::Shown::said(
+                    "the host's received-chunk bitmap does not fit the layout it chose",
+                ),
+            )
         })?;
         self.sent = Some(bitmap);
         Ok(())
@@ -451,16 +483,16 @@ impl Upload {
         index: u64,
     ) -> Result<UploadChunkParams> {
         let len = self.layout.length_of(index).ok_or_else(|| {
-            ClientError::Host(kr_protocol::error::ProtocolError::new(
+            ClientError::refusal(
                 kr_protocol::error::ErrorCode::InvalidArgument,
-                "the layout has no chunk at that index",
-            ))
+                crate::shown::Shown::said("the layout has no chunk at that index"),
+            )
         })?;
         let offset = self.layout.offset_of(index).ok_or_else(|| {
-            ClientError::Host(kr_protocol::error::ProtocolError::new(
+            ClientError::refusal(
                 kr_protocol::error::ErrorCode::InvalidArgument,
-                "the layout has no offset for that chunk",
-            ))
+                crate::shown::Shown::said("the layout has no offset for that chunk"),
+            )
         })?;
         let bytes = self.content.read_at(offset, len)?;
         if bytes.len() as u64 != len {

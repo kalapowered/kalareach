@@ -26,7 +26,7 @@ Two roots, both owner-only, both checked rather than assumed on every open.
 | Root | macOS | Linux | Override | Holds |
 | --- | --- | --- | --- | --- |
 | runtime | `$TMPDIR/kalareach` | `$XDG_RUNTIME_DIR/kalareach` | `KR_RUNTIME_DIR` | the control socket, the rendezvous socket, worker endpoints, published descriptors |
-| state | `~/Library/Application Support/KalaReach` | `$XDG_STATE_HOME/kalareach` | `KR_STATE_DIR` | the registry, worker journals, output spools, generated job definitions, the secret-store fallback, the transfer store and its staging area, the backup store and its staged ciphertext |
+| state | `~/Library/Application Support/KalaReach` | `$XDG_STATE_HOME/kalareach` | `KR_STATE_DIR` | the registry, worker journals, output spools, generated job definitions, the secret-store fallback, the transfer store and its staging area, the backup store and its staged ciphertext, and what a daemon `kr new` started writes (`controller.log`) |
 
 Everything above a root is created with the platform's ordinary permissions; `/tmp` is
 world-writable by design and `~/.cache` is usually group-readable, and neither is KalaReach's to
@@ -84,7 +84,8 @@ configuration file this host reads.
   },
   "secrets": [{ "name": "relay", "store": "login_keychain", "item": "kalareach/relay" }],
   "network": { "enabled": true, "relay_urls": ["https://relay.example.com"] },
-  "voice": { "broker_origin": "https://voice.example.com" }
+  "voice": { "broker_origin": "https://voice.example.com" },
+  "startup": { "controller": "standalone" }
 }
 ```
 
@@ -170,7 +171,7 @@ an older build read joins nothing because of them.
 | `network.relay_only` | every packet through the relay, and no direct path | `true` or `false`; `true` needs at least one relay |
 | `network.local_discovery` | discovery of peers on the local network | `true` or `false` |
 | `network.mainline_dht` | the public Mainline DHT, which carries no KalaReach service guarantee | `true` or `false` |
-| `network.proxy_url` | the HTTP proxy the endpoint reaches its relays and Pkarr servers through; the DNS lookup does not use it, and absent reaches them directly | an absolute `http` or `https` origin, with no user information, no path and no trailing slash |
+| `network.proxy_url` | the HTTP proxy this host's outbound HTTPS goes through: the endpoint's relays and Pkarr servers, the rendezvous, delivery and webhooks, and plugin repositories; name lookups and mail submission do not use it, and absent everything goes directly | an absolute `http` or `https` origin, with no user information, no path and no trailing slash |
 | `voice.broker_origin` | the managed broker a device's voice session talks to | an absolute `https` or `http` origin in lower case, with no path and no port its scheme already implies |
 
 A field the document does not write selects nothing, because there is no public relay or discovery
@@ -187,9 +188,17 @@ the document accepts is therefore one the endpoint accepts. A value outside thes
 whole document invalid, as it would in any other section: the host keeps its product defaults,
 `kr doctor` names the key and withholds the value, and an edit to another section is refused until
 the document is fixed. The proxy is this machine's own choice, and no invitation or host bundle
-carries it. Without one, the endpoint reaches its relays and Pkarr servers directly, apart from
-iroh's relay latency probe and captive-portal check, which then follow `HTTP_PROXY`, `HTTPS_PROXY`
-and `ALL_PROXY` when those are set.
+carries it.
+
+One rule covers the proxy. Every outbound HTTPS connection this host makes goes through it when the
+document names one: the endpoint's relays and Pkarr servers, the rendezvous it reserves a code's
+locator at and opens the room at, delivery to the push gateway and to webhook addresses, and plugin
+repositories. Nothing goes around it, so an address the proxy cannot reach fails, a webhook
+included. Mail submission is SMTP and connects directly, and name lookups go directly too. Without
+a proxy every one of those connections goes directly, apart from iroh's relay latency probe and
+captive-portal check, which then follow `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` when those are
+set. The daemon reads the proxy when it starts, like the rest of the section, and every client takes
+that one reading.
 
 The daemon reads both sections once, when it starts, because that is when its endpoint and its
 voice service are built. `kr doctor` prints each field with its value, its source
@@ -201,6 +210,38 @@ document now selects something other than what the daemon started with, the chec
 edit applies at the next start. What only the start can find out, a trust anchor file that is
 missing or empty or a bind address somebody else holds, stops the start with the key named, rather
 than leaving a host that appears to run and cannot be reached.
+
+### How the daemon is started
+
+A headless or SSH-first host has its per-user daemon started on demand, and only once it has been
+set up for that. The document's `startup` section records the setup:
+
+```json
+"startup": { "controller": "standalone" }
+```
+
+| Field | What it selects | What it accepts |
+| --- | --- | --- |
+| `startup.controller` | how `kr new` starts this environment's control daemon when none is running; absent starts none, and `kr new` answers `HOST_NOT_CONFIGURED` with the setup action | `standalone` |
+
+`standalone` is the standalone headless profile, for a host with no service manager set up to start
+the daemon. `kr new` then runs the `kr-controller` installed beside it, detached: in a session and a
+process group of its own with no controlling terminal, its standard streams going to
+`controller.log` in the environment's state directory, working in that directory, and given the
+environment's own runtime and state roots. It inherits the command's environment, `PATH` included,
+as a daemon started by hand from the same shell does. Its IPC is the owner-only endpoints every
+daemon serves, and it takes the environment's singleton lock and advances its generation like any
+other start; several commands starting it at once leave one daemon. The command waits up to 30
+seconds for it to answer, and
+[docs/cli/README.md](../cli/README.md#when-no-control-daemon-is-running) says what a person sees.
+
+`kr host startup` writes the section as one validated edit with no daemon running, and `kr doctor`
+reports it with its source and as applying at the next start. Like the network and the voice
+broker, no request, profile or environment variable reaches it, so a variable exported in one
+terminal cannot make a command start a daemon on a host that was never set up to have one started.
+Neither writing the choice nor starting the daemon installs a service, enables lingering or obtains
+a privilege. A value this build does not know makes the document invalid, and the host starts
+nothing.
 
 ### What leaves this host
 
@@ -353,19 +394,26 @@ No other inherited variable takes part in the precedence. No entry in that table
 organisation restriction, a grant ceiling, a hard resource limit or a provider origin, and none can:
 each entry has to name an ordinary preference, and those are not.
 
-Two other groups of variables this build reads are outside the precedence, and `kr doctor` lists
-all of them rather than leaving the sentence above to be read as more than it says.
+Three other groups of variables this build reads are outside the precedence, and `kr doctor` lists
+those set here rather than leaving the sentence above to be read as more than it says.
 
 | Group | Variables | What they select |
 | --- | --- | --- |
-| platform locations | `TMPDIR`, `XDG_RUNTIME_DIR`, `XDG_STATE_HOME`, `XDG_CONFIG_HOME`, `HOME`, `LOCALAPPDATA` | the operating system's own conventional directories, which is what the native locations above are derived from |
-| session readings | `PATH`, `DISPLAY`, `XAUTHORITY`, `XDG_SESSION_ID`, `SESSIONNAME` | what the platform says about the login this host is running in and where a capability probe looks for the tools it reports on |
+| platform locations | `TMPDIR`, `XDG_RUNTIME_DIR`, `XDG_STATE_HOME`, `XDG_CONFIG_HOME`, `HOME`, `LOCALAPPDATA`, `USERPROFILE` | the operating system's own conventional directories, which is what the native locations above are derived from, and on Windows the home an agent's tool configuration is written under |
+| session readings | `PATH`, `DISPLAY`, `XAUTHORITY`, `XDG_SESSION_ID`, `SESSIONNAME`, `USER`, `LOGNAME`, `USERNAME` | what the platform says about the login this host is running in, its account name included, and where a capability probe looks for the tools it reports on |
+| network library | `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` and their lower-case spellings, `REQUEST_METHOD`, `SystemRoot` | with no `network.proxy_url`, the proxy iroh's relay latency probe and captive-portal check go through; and on Windows where the endpoint reads the hosts file. iroh reads these itself and offers no way not to |
 
-Neither group reaches authority or a provider origin. No variable selects a network service or the
-voice broker: those are provider origins and a trust decision, and they are the configuration
-document's `network` and `voice` sections. No variable names this host's owner either: the owner is
-recorded through local IPC, by the pairing that establishes it (see "Pairing and the host's owner"
-below).
+No group reaches authority, a provider origin or whom this host trusts. The network library's
+variables move where two relay checks and a lookup go; they choose no relay, no service and no
+trust. No variable selects a network service, the proxy or the voice broker: those are the
+configuration document's `network` and `voice` sections. The managed-service, rendezvous, delivery,
+plugin repository and mail clients verify a server against the platform's own store, and
+`SSL_CERT_FILE` and `SSL_CERT_DIR` are not read, so an authority given only through them is not
+trusted by those clients until it is installed in the system store; `kr doctor` says so. The
+endpoint verifies its relays and discovery servers against the public anchors and
+`network.relay_trust_anchors`, and a private authority for those is named there.
+No variable names this host's owner either: the owner is recorded through local IPC, by the pairing
+that establishes it (see "Pairing and the host's owner" below).
 
 ### Ceilings
 
@@ -694,6 +742,20 @@ asked for and the ceiling of the repository it came from, both held with the ins
 enabling, pinning, granting and uninstalling it all work with no enrolment behind them. Enabling one
 whose payloads are no longer cached is refused as unavailable offline, because there is no longer a
 root to verify a fetch against.
+
+An installed release whose manifest carries a native bridge recipe, installed with
+`native_bridge.install` granted, has the recipe applied in the application's own directory once the
+installation has committed; removing the package, or a grant that withdraws that capability, takes
+it out again, and enabling or disabling the package leaves it. After every plugin change, and each
+time the daemon starts, the package's bridge is brought to what its installation wants, so a recipe
+a stopped daemon left part way is finished or taken out before anything else is served. The recipe
+keeps a journal of its own for each package under `native-bridges/` in the environment's state
+directory, apart from the catalogue's records, and never changes a method's answer or receipt: an
+installation's answer says what the catalogue did, and the journal says what the recipe did. No
+recipe is applied yet: its version check needs a signed record that names the application's
+executable by digest, which no release carries, so every recipe is refused and the journal says
+why. `docs/plugins/catalogue.md` has what is checked before anything is written and what a removal
+leaves.
 
 The registry admits a paired device to all thirteen of these methods, and the daemon serves them
 through the same module a local caller reaches, so a device's `catalogue.list` and the owner's are
@@ -2267,11 +2329,11 @@ recover from. Exclusive creation is also what stops a second admission of the sa
 writing over ciphertext the first is still accounting for, and that second admission is refused
 outright.
 
-One limit is stated rather than implied. **On Windows nothing flushes a directory entry**: there
-is no portable way to do it, and opening a directory as a file fails outright, so a staging write
-that tried would fail after the ciphertext was already on the disk. The contents are written and
-flushed on every platform, so a reader never sees a file half written; what a Windows host does not
-get is the guarantee that a *name* survives losing power.
+The directories are flushed on every platform. Windows flushes a directory only through a handle
+that may change it, so there each is opened with the one right its change used: the directory that
+holds the file with the right to add a file, and each directory above it, up to the staging root,
+with the right to add a directory. A removal of staged ciphertext flushes the same directories, and
+is not reported as done until that flush has succeeded.
 
 A crash between the file and the row leaves ciphertext no row claims, and the staging directory is
 walked for exactly that. The staging directory is held as an absolute path whatever the caller
@@ -3746,10 +3808,38 @@ eventually read as permission.
 ### Decoding trust
 
 An installed connector is a semantic trust boundary, and the record that says so names the package
-identifier, the publisher, the digest of the exact component bytes, the upstream methods it covers,
-the projection schema versions it may write against and how many decisions one projection may
-offer. Trust granted to one package is never another's: a binding whose package, publisher or
-digest differs from the record is refused when it is bound, not when it first decodes something.
+identifier, the publisher, the installed package's hash (the digest of its manifest, which names the
+component and every other file of the package by digest), the upstream methods it covers, the
+projection schema versions it may write against, how many decisions one projection may offer and
+whether it may encode an answer. Trust granted to one package is never another's: a binding whose
+package, publisher or digest differs from the record is refused when it is bound, not when it first
+decodes something.
+
+The record is derived from what the installation granted and from the installed package's own
+connector table, never from anything a component reports. Without `approval.decode` there is none.
+The methods are the routes that carry, towards this host, the requests the table's decision
+destination answers; a projection offers at most the decisions the destination maps; the schema
+versions are `kalareach.decision/1`, and `kalareach.plugin.decoded-request/<WIT version>` as well
+for a package that ships a component; and the record encodes an answer only with `approval.respond`.
+A request whose method the record does not cover stays recorded and opaque, and the native client
+answers it. A table with no decision destination gives no trust at all. That includes a protocol
+whose answer is a response to the request itself, such as the Agent Client Protocol's permission
+request, which a decision destination cannot name: its requests are recorded, forwarded and
+answered by the native client alone.
+
+A request belongs to the package whose table recorded it, and that package is kept with the
+request's source. A connection identifier keeps the package it recorded requests under for good,
+across a restart too, which reads it back from the ledger: the identifier is never restored under
+another package's tables, so any answer to its requests, the native client's included, goes out on
+a connection that reads that package's table. Only a binding of that package, at the same bytes,
+interprets a request, and a rich answer to it needs the binding that interpreted it to run that
+package still: a binding identifier names one package for as long as it is bound, and one bound
+again after a restart to another package answers nothing the first interpreted.
+
+Narrowing an installation's grants narrows the record where it is written. `approval.respond`
+leaving takes the answer away and leaves the decoding; `approval.decode` leaving withdraws the
+interpreter grant and the record with it. What was already interpreted stays visible, and a rich
+answer to it is refused at the claim; the native client can still answer it.
 
 The ledger retains, for every request a decoder interpreted: the package and its publisher, the
 digest of its bytes, the upstream method and request identifier, the original source bytes whole,
@@ -3771,7 +3861,9 @@ at.
 The hand-over to a component belongs to the plugin host, which owns the runtime that invokes
 `prepare_action`. The broker issues and spends the token around the operation it dispatches itself,
 and a `plugin.action.invoke` that would cross into that runtime is refused before the dispatch
-marker rather than carried.
+marker rather than carried. An action that answers through its connector's decision destination
+does not cross into it: no component prepares the answer, so no token is issued, and the broker
+writes the answer from the connector's table under the approval's own claim.
 
 ### Capability evidence
 
@@ -3985,6 +4077,15 @@ read may return is refused rather than cut short, a write over its bound is refu
 is opened, and a read returns text. A write replaces the file's content; a file that does not exist
 is created, readable and writable by its owner only and never executable.
 
+A launch from the shell is granted the directory the shell reported for its command, for reading
+only, when its connector's installation holds `filesystem.read`. The worker opens the directory off
+the session's lock once it has established the launch's backend, and grants it only when it is the
+directory the launched process works in, as the kernel keeps it: a directory moved away and
+replaced at its path before the open is not granted. What is granted is then that directory,
+whatever its path names later, and a read that would cross into another mount is refused. The grant
+ends with the instance, or with the session. No other launch is granted a directory, and no launch
+is granted writing.
+
 The request is recorded, what to do about it is decided, and the one admission to answer it is taken
 with the dispatch marker committed, all under the broker's one lock and all before the operation
 runs. No native answer and no rich answer can take that admission afterwards, so this host's answer
@@ -4142,6 +4243,41 @@ registered, and the process must be running the forwarder the installation put i
 session identifier in the environment is carried as a diagnostic and decides none of it. A refused
 bridge is closed without a word; an admitted one is answered with one admission line.
 
+Such an application can also be launched from the managed shell, when its connector integrates the
+command the person typed. The worker then establishes a backend before the shell forks: an
+endpoint, a credential and a launch record in a fresh owner-only directory, with nothing reserved.
+The forked child runs the installation's `kr-hook launch`, which presents its own process with the
+credential. The worker admits it only as the root shell's own child, started after the establish,
+running the file the worker hashed with the vector it answered. Then it registers the instance,
+publishes the registration naming that process and commits, and only then does the launcher exec
+the program in place, so the registration names the program before it runs. Anything short of the
+commit runs the command as typed, without the integration's flags. Every bridge of such a launch is
+also checked against the running image: the process must still execute what was hashed, and one
+mismatch refuses that bridge and every later one. The launcher's contract is in the Claude Code
+bridge's documentation.
+
+A program the integration did not launch is adopted, never given a gateway after the fact. Four
+times a second, while a command has the terminal, the worker reads the terminal's foreground group,
+and records a process in it that the root shell started itself, that no instance holds and whose
+executable an installed connector recognises. It becomes a native terminal instance with the profile
+it was observed running: the kernel's executable and argument vector, its digest, and the bypass
+the shell's question was answered with, where there was one. It has no process record and no
+credential, so none of its bridges is admitted, and it ends when its process exits. A launched
+program is never adopted as well: its launch registered the process that presented itself, which
+keeps its identity when it execs the program. Reading a program's image runs on its own, so a slow
+reading delays only the next identification, and a program's exit is found at the next look
+whatever is being read. Until the worker receives the installed connectors, nothing is recognised
+and nothing is adopted.
+
+The session announces each of its agent instances to its attached views: when a launch is committed
+or a program adopted, when an instance's bridges are refused and why, and when it ends. It counts
+the announcements, keeps the list of live instances and publishes each announcement under its own
+lock, and a subscription or a snapshot carries that list with the count of the last announcement it
+includes, read under the same lock. A view installs the list and applies the announcements counted
+after it, so it holds every live instance once. A session that closes ends the instances of the
+programs it is ending, launched or adopted, and announces those ends while its views are still
+attached. Nothing about an instance is announced after its end.
+
 An admitted hook sends one observation and waits for this host to apply it and close the connection.
 When that exchange completes, the host has the report before the hook answers the application. It
 does not when the hook reaches its deadline first, or when the application moves on without waiting,
@@ -4175,9 +4311,17 @@ identifier is used again (an exact retry, or another question of the same instan
 identifier, with a recorded thread or none), no later report binds either question; one already
 bound by then was bound by its own call's report and stays bound.
 
-The gateway hands an admitted channel's connection to its caller, which serves the application's own
-protocol on it as JSON lines within the gateway's native frame bound. The Claude Code bridge is
-described in [`docs/bridges/claude-code/README.md`](../bridges/claude-code/README.md).
+An admitted channel is served by this host for as long as it is open, on a gateway connection of its
+own kind, and only the launched application's own: its starter must be the process the launch
+registered, an instance has one channel open at a time, and the connector's table must be qualified
+for the version a signed qualification record names for the executable the launch hashed. What it
+relays goes through the same native admission as any upstream request and is recorded as a pending
+resource with its source frame; whether that can be answered is decided by the decoding trust and
+the arbitration above, as for any connection. A frame its table does not route towards this host
+closes it. However it closes, and in any mode, it settles what it relayed as what has already
+happened: what was never dispatched is cancelled and what was dispatched is uncertain, so no closed
+channel holds a recovery open. The Claude Code bridge is described in
+[`docs/bridges/claude-code/README.md`](../bridges/claude-code/README.md).
 
 ## Agent methods
 
@@ -4236,11 +4380,28 @@ permit that carried its answer.
 An answer's transport is the one that speaks for the connection whose resource it resolves, chosen
 when the answer is admitted; a connection that has gone is `UPSTREAM_UNAVAILABLE` before anything
 is claimed. The transport work happens after the session boundary ends, because terminal ingestion
-needs that boundary and an upstream that is slow to answer must not stop a person typing.
+needs that boundary and an upstream that is slow to answer must not stop a person typing. The
+transport's own call that takes the operation runs on a thread of its own, and the worker waits for
+it and for the upstream's answer for ten seconds at most, so a transport that blocks cannot hold the
+caller past them. At that bound an answer's resource is settled as uncertain first, the receipt then
+records an outcome nobody can establish, and only then is the caller told `UPSTREAM_UNAVAILABLE`.
+What the transport does afterwards settles nothing.
+
+A binding's actions are registered from its package's declarations and from nothing else. The
+grant, the effect, the capability, the operation and the rights of each follow from its declared
+effect class and implementation, and what an action is called, or labelled, changes none of them.
+A declaration this host does not register as an action (decoding, terminal input, an answer a
+component would prepare) is left out, with its reason.
 
 `plugin.action.invoke` validates the registered action, the grant that action declares, its effect
 class and whether a draft the action needs was named, and then issues the action token that
-authorises the one invocation that follows. The declaration is read inside the admission and kept
+authorises the one invocation that follows. A caller acting under a grant must hold the rights the
+action's class needs (an answer `agent.approval.respond`, a prompt `agent.prompt`, an attachment
+`agent.prompt` and `files.upload`), or the call is refused before the dispatch marker; the local
+owner on this worker's own socket, naming no grant, is its own authority. An action goes to the
+upstream as the rich method its name selects only when the right that method needs is one the class
+of the operation it prepares carries, and the transport is asked about that operation as soon as a
+plan names it. The declaration is read inside the admission and kept
 with it, and the plan the component returns is refused unless the declaration in force is still the
 one the invocation was admitted under: a package that re-registered the action while its component
 was working has withdrawn the invitation. The draft is resolved before the admission takes its lock
@@ -4260,6 +4421,16 @@ the token was spent to invite the work and is not proof by the time the work com
 transmits is the plan that was validated: the operation it prepares travels in the frame, carried
 in the permit rather than attested by a flag beside it. The draft store itself — whose the draft is
 and what else it holds — is not this host's, and what it supplies here is the snapshot.
+
+An action whose implementation is its connector's decision destination is an approval answer, and
+`plugin.action.invoke` admits it as one: every check an approval answer meets applies, in the
+transaction `agent.approval.respond` uses, with the action's own checks inside it. The call must
+name the resource it answers. The action must be registered for this binding with the
+`approval.respond` effect, and the binding must still hold that action's grant. This binding must be
+the resource's decoder, because the answer carries the decoder's meaning, and the decision, read
+from the parameter the action names for it, must be one the interpretation offered. No action token
+is issued and no component is asked: the answer is written from the connection's own table under
+the approval's claim, and the method answers with its own result, the mutation and the action.
 
 An adapter checkpoints the cursor it consumed, and the cursor survives a restart. A restart resumes
 the numbering after it, so a new entry never takes a cursor an adapter has already passed and a

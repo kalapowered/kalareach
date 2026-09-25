@@ -123,6 +123,10 @@ pub async fn print(command: &BridgeCommand, json: bool) -> Result<()> {
 
 /// Renders one result as the machine-readable form.
 fn to_json<T: serde::Serialize>(value: &T) -> Result<String> {
-    serde_json::to_string_pretty(value)
-        .map_err(|error| crate::error::CliError::Other(error.to_string()))
+    serde_json::to_string_pretty(value).map_err(|error| {
+        crate::error::CliError::Other(kr_client::shown!(
+            "the result could not be written: {}",
+            kr_client::shown::Shown::json(&error)
+        ))
+    })
 }

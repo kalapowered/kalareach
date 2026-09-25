@@ -26,7 +26,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use kr_protocol::account::{MEMBERSHIP_LEASE_MAX_LIFETIME_MS, MembershipLease, PolicyAuthority};
 use kr_protocol::actor::ActorIngress;
@@ -65,38 +65,52 @@ pub struct PolicyIntersection {
 /// revalidated after a wake, and a revalidation that trusts a smaller number than the last one is
 /// not a revalidation. It only ever rises.
 ///
-/// There is one of it, shared by every holder of the policy and read without the policy's lock.
-/// A raise lands here at its source, whoever makes it and whatever lock it holds, and a reading
-/// is taken from here whoever takes it. So a reader that cannot wait for the lock, the write
-/// boundary deciding inside a poll whether a relayed batch may still go, reads the floor a
-/// decision raised a moment ago under the lock; and a reading that reader takes itself raises the
-/// same floor every later decision stands on. A copy kept beside the policy would fall behind
-/// whenever something raised the floor without updating the copy.
+/// There is one of it for the whole host. Its words are the environment's shared clock floor
+/// ([`kr_ipc::floor::SharedFloor`]), which every process of the environment maps: a reading this
+/// daemon publishes is the floor every worker decides from, and a reading a worker publishes is
+/// the floor every later decision here stands on. So there is no copy of it anywhere that could
+/// fall behind, in this process or another. A raise lands at its source, whoever makes it and
+/// whatever lock it holds, and a reading is taken from the word whoever takes it: the write
+/// boundary deciding inside a poll whether a relayed batch may still go reads the floor a decision
+/// raised a moment ago under the policy's lock.
 ///
 /// # What a decision may stand on
 ///
-/// The floor in memory is only as good as its record. A daemon that stops before a raised floor is
-/// written down starts again on the older one, and after a clock wound back it would decide the
-/// other way. So the floor also keeps what is owed a record: the highest floor a decision stood on
-/// that has to outlive this process, beside the highest floor written down. While the first is
-/// ahead of the second, or while a start could not write the floor at all, the floor is **owed its
-/// record**. [`Self::bound`] is the one rule every decision about a time bound is taken through: a
-/// bound that can pass is not decided while the floor is owed its record, and a bound that has
-/// passed says whether the floor on disk already covers the moment it passed. An effect in the
-/// grant store refuses a lapse the floor does not cover yet and owes its record; a decision on a
-/// request answers the lapse and its caller writes the record straight after. A bound that never
-/// passes stands on no floor and is decided as before, so a personal grant that never expires is
-/// untouched by any of this.
-#[derive(Debug, Default)]
+/// The floor is only as good as its record. A daemon that stops before a raised floor is written
+/// down starts again on the older one, and after a clock wound back it would decide the other way.
+/// So the floor also keeps what is owed a record: the highest floor a decision stood on that has
+/// to outlive this process, in this daemon or in a worker, beside the highest floor written down.
+/// While the first is ahead of the second, or while a start could not write the floor at all, the
+/// floor is **owed its record**. [`Self::bound`] is the one rule every decision about a time bound
+/// is taken through: a bound that can pass is not decided while the floor is owed its record, and
+/// a bound that has passed says whether the floor on disk already covers the moment it passed. An
+/// effect in the grant store refuses a lapse the floor does not cover yet and owes its record; a
+/// decision on a request answers the lapse and its caller writes the record straight after. A
+/// bound that never passes stands on no floor and is decided as before, so a personal grant that
+/// never expires is untouched by any of this.
+///
+/// # A boot whose clock continuity was lost
+///
+/// A daemon that starts in a boot whose floor's file has gone creates a new one, and a reading
+/// published only in the lost file may have passed a deadline that nothing on record shows as
+/// passed. Until the owner establishes the clock again, every bound that can pass is answered as
+/// unproven ([`Bound::unproven`]), whatever its continuous deadline says.
+#[derive(Debug)]
 pub struct UtcFloor {
-    /// The highest reading decided from.
-    floor: AtomicU64,
-    /// The highest floor a decision stood on that is owed its record.
-    owed: AtomicU64,
-    /// The highest floor written down.
-    written: AtomicU64,
+    /// The floor, the highest floor owed its record and the highest floor written down.
+    words: Arc<kr_ipc::floor::SharedFloor>,
     /// True while no write of the floor is known to have landed since this daemon started.
     unwritten: AtomicBool,
+    /// True while this boot's clock continuity is lost and the owner has not established the clock
+    /// again.
+    continuity_lost: AtomicBool,
+}
+
+impl Default for UtcFloor {
+    /// A floor of this process's own at zero.
+    fn default() -> Self {
+        Self::at(0)
+    }
 }
 
 /// What one time bound comes to at one reading of this host's clock ([`UtcFloor::bound`]).
@@ -110,8 +124,12 @@ pub struct Bound {
     /// nothing to cover.
     pub recorded: bool,
     /// Whether the floor is owed its record, so that no bound which can pass is decided now.
-    /// Never set for a bound that never passes.
+    /// Never set for a bound that never passes. Also set, with [`Self::unproven`], while this
+    /// boot's clock continuity is lost, so a caller that asks only this refuses too.
     pub owed: bool,
+    /// Whether this boot's clock continuity is lost, so nothing proves where a bound that can pass
+    /// stands until the owner establishes the clock. Never set for a bound that never passes.
+    pub unproven: bool,
 }
 
 impl Bound {
@@ -127,25 +145,49 @@ impl Bound {
 }
 
 impl UtcFloor {
-    /// A floor at `floor_ms`, read back from where it was written down.
+    /// A floor of this process's own at `floor_ms`, read back from where it was written down.
+    ///
+    /// For a caller with no runtime directory: a unit test of something that decides from a
+    /// floor. The daemon decides from the environment's shared floor ([`Self::on`]).
     #[must_use]
-    pub const fn at(floor_ms: u64) -> Self {
+    pub fn at(floor_ms: u64) -> Self {
+        Self::on(
+            Arc::new(kr_ipc::floor::SharedFloor::in_process(floor_ms)),
+            floor_ms,
+        )
+    }
+
+    /// The floor whose words are `words`, raised to `durable_ms`, the floor this host last wrote
+    /// down, with that much of it recorded.
+    ///
+    /// A floor file created in this boot already holds at least that; one created by this start
+    /// holds exactly that. Either way the boot's floor starts where the host's record stands.
+    #[must_use]
+    pub fn on(words: Arc<kr_ipc::floor::SharedFloor>, durable_ms: u64) -> Self {
+        words.raise(durable_ms);
+        words.record(durable_ms);
         Self {
-            floor: AtomicU64::new(floor_ms),
-            owed: AtomicU64::new(0),
-            written: AtomicU64::new(floor_ms),
+            words,
             unwritten: AtomicBool::new(false),
+            continuity_lost: AtomicBool::new(false),
         }
     }
 
+    /// The shared words this floor is, for a caller that hands them to a worker or checks their
+    /// name.
+    #[must_use]
+    pub const fn words(&self) -> &Arc<kr_ipc::floor::SharedFloor> {
+        &self.words
+    }
+
     /// Raises the floor to `now_ms` when that is later, and returns the reading this host decides
-    /// from: the later of the two.
+    /// from: the later of the two, the word as the raise left it.
     ///
     /// Only ever forward. A reading below the floor is a clock that went backwards, and section 9
     /// already says what a host does about that; what this guarantees is that it does not become a
     /// second chance for something already expired. It never waits, so a poll may call it.
     pub fn observe(&self, now_ms: u64) -> u64 {
-        self.floor.fetch_max(now_ms, Ordering::SeqCst).max(now_ms)
+        self.words.raise(now_ms)
     }
 
     /// The reading this host decides from at `now_ms`, without raising the floor.
@@ -157,17 +199,17 @@ impl UtcFloor {
     /// The floor.
     #[must_use]
     pub fn get(&self) -> u64 {
-        self.floor.load(Ordering::SeqCst)
+        self.words.load()
     }
 
     /// Records that a decision stood on the floor at `at_ms` and is owed its record.
     pub fn owe(&self, at_ms: u64) {
-        self.owed.fetch_max(at_ms, Ordering::SeqCst);
+        self.words.owe(at_ms);
     }
 
     /// Records that the floor has been written down up to `floor_ms`.
     pub fn wrote(&self, floor_ms: u64) {
-        self.written.fetch_max(floor_ms, Ordering::SeqCst);
+        self.words.record(floor_ms);
         self.unwritten.store(false, Ordering::SeqCst);
     }
 
@@ -180,24 +222,42 @@ impl UtcFloor {
     /// The highest floor written down.
     #[must_use]
     pub fn written(&self) -> u64 {
-        self.written.load(Ordering::SeqCst)
+        self.words.recorded()
     }
 
-    /// Whether the floor is owed its record.
+    /// Whether the floor is owed its record: by a start that could not write it, or by a lapse any
+    /// process of this host decided on a floor that is not written down yet.
     #[must_use]
     pub fn is_owed(&self) -> bool {
-        self.unwritten.load(Ordering::SeqCst)
-            || self.owed.load(Ordering::SeqCst) > self.written.load(Ordering::SeqCst)
+        self.unwritten.load(Ordering::SeqCst) || self.words.owed() > self.words.recorded()
+    }
+
+    /// Records that this boot's clock continuity is lost: a start found this boot's floor gone.
+    pub fn lose_continuity(&self) {
+        self.continuity_lost.store(true, Ordering::SeqCst);
+    }
+
+    /// Records that the owner established the clock again, which ends a lost continuity.
+    pub fn establish_continuity(&self) {
+        self.continuity_lost.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether this boot's clock continuity is lost, so no bound that can pass is decided.
+    #[must_use]
+    pub fn continuity_lost(&self) -> bool {
+        self.continuity_lost.load(Ordering::SeqCst)
     }
 
     /// Decides one time bound at `now_ms`, the later of it and the floor, raising the floor.
     ///
     /// This is the rule the floor's record imposes, in one place. A bound that never passes stands
     /// on no floor. One that can pass is not decided while the floor is owed its record: the
-    /// answer says so, and the caller refuses rather than decides. One that has passed at a moment
-    /// the floor on disk does not cover yet is a refusal whose record is still to be written: the
-    /// caller owes the floor at [`Bound::at_ms`], and answers the lapse only once that record is
-    /// written, or answers it and writes it straight after, as a paired device's decision does.
+    /// answer says so, and the caller refuses rather than decides. Nor is it while this boot's
+    /// clock continuity is lost: the answer is unproven, and owed as well, so a caller that asks
+    /// only whether it is owed refuses too. One that has passed at a moment the floor on disk does
+    /// not cover yet is a refusal whose record is still to be written: the caller owes the floor
+    /// at [`Bound::at_ms`], and answers the lapse only once that record is written, or answers it
+    /// and writes it straight after, as a paired device's decision does.
     pub fn bound(&self, expiry: GrantExpiry, now_ms: u64) -> Bound {
         let at_ms = self.observe(now_ms);
         let GrantExpiry::At { expires_at_ms } = expiry else {
@@ -206,14 +266,25 @@ impl UtcFloor {
                 passed: false,
                 recorded: true,
                 owed: false,
+                unproven: false,
             };
         };
+        if self.continuity_lost() {
+            return Bound {
+                at_ms,
+                passed: false,
+                recorded: true,
+                owed: true,
+                unproven: true,
+            };
+        }
         let passed = !expiry.is_valid_at(at_ms);
         Bound {
             at_ms,
             passed,
             recorded: !passed || self.written() >= expires_at_ms.get(),
             owed: self.is_owed(),
+            unproven: false,
         }
     }
 }
@@ -603,8 +674,15 @@ impl HostPolicy {
     /// The floor is the higher of what was stored and what the registry holds, so neither half can
     /// take the other back: a restored policy file cannot lower the revision the daemon has
     /// reached, and a registry read cannot lower the floor the policy recorded.
+    ///
+    /// The clock floor is the host's, not the policy's: `utc_floor` is the one the daemon opened
+    /// for this boot, already raised to `stored`'s record of it ([`UtcFloor::on`]).
     #[must_use]
-    pub fn restore(stored: &StoredPolicy, authority_revision: AuthorityRevision) -> Self {
+    pub fn restore(
+        stored: &StoredPolicy,
+        authority_revision: AuthorityRevision,
+        utc_floor: Arc<UtcFloor>,
+    ) -> Self {
         let floor =
             AuthorityRevision::new(stored.accepted_floor.get().max(authority_revision.get()));
         Self {
@@ -619,7 +697,7 @@ impl HostPolicy {
             exclusively_managed: stored.exclusively_managed,
             offline: stored.offline.0,
             revalidated_at_ms: 0,
-            utc_floor: Arc::new(UtcFloor::at(stored.utc_floor_ms.get())),
+            utc_floor,
         }
     }
 
@@ -787,5 +865,114 @@ impl HostPolicy {
             },
             None => Refusal::MembershipUnattributed,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use kr_ipc::floor::SharedFloor;
+    use kr_protocol::grant::GrantExpiry;
+    use kr_protocol::ids::{BootEpoch, EnvironmentId};
+    use kr_protocol::scalars::TimestampMs;
+
+    use super::UtcFloor;
+
+    /// A floor file, and a second mapping of it as a worker of the host holds one.
+    fn two_mappings(name: &str) -> (std::path::PathBuf, Arc<SharedFloor>, Arc<SharedFloor>) {
+        let suffix = kr_ipc::new_uuid().to_string();
+        let root = std::env::temp_dir().join(format!("kr-policy-{name}-{}", &suffix[..8]));
+        kr_ipc::paths::create_private_tree(&root, &root).expect("a private directory");
+        let path = root.join("utc-floor");
+        let environment_id = EnvironmentId::new(kr_ipc::new_uuid());
+        let boot_epoch = BootEpoch::new(5);
+        let first =
+            Arc::new(SharedFloor::create(&path, environment_id, boot_epoch, 0).expect("created"));
+        let second =
+            Arc::new(SharedFloor::open(&path, environment_id, boot_epoch).expect("mapped"));
+        (root, first, second)
+    }
+
+    /// The daemon's floor is the host's shared word: a reading another process publishes is the
+    /// reading every decision here stands on, a lapse another process owes is owed here, and the
+    /// record rule is the one it was. There is one floor, not a copy beside the word.
+    #[test]
+    fn the_shared_floor_keeps_the_record_rule_of_the_daemons_floor() {
+        let (root, words, second) = two_mappings("record");
+        let floor = UtcFloor::on(Arc::clone(&words), 1_000);
+        assert_eq!(
+            second.load(),
+            1_000,
+            "the floor starts at the host's record"
+        );
+        assert_eq!(second.recorded(), 1_000);
+        let expiry = GrantExpiry::At {
+            expires_at_ms: TimestampMs::new(5_000),
+        };
+
+        // The control: nothing raised past the expiry, so the bound is live and nothing is owed.
+        let bound = floor.bound(expiry, 2_000);
+        assert!(!bound.passed && bound.answerable(), "{bound:?}");
+        // A raise that decides no lapse owes nothing.
+        second.raise(4_000);
+        assert!(!floor.is_owed());
+        assert_eq!(floor.get(), second.load());
+
+        // Another process's reading passes the expiry. This process's own clock is behind it, and
+        // the bound has passed all the same, at a moment the record does not cover yet.
+        second.raise(6_000);
+        let bound = floor.bound(expiry, 2_000);
+        assert!(
+            bound.passed && !bound.recorded && !bound.answerable(),
+            "{bound:?}"
+        );
+        assert_eq!(bound.at_ms, 6_000);
+        assert_eq!(floor.get(), second.load());
+
+        // A lapse that process decided on it is owed its record here too.
+        second.owe(6_000);
+        assert!(floor.is_owed());
+        let bound = floor.bound(expiry, 2_000);
+        assert!(bound.owed, "{bound:?}");
+
+        // Written down: the record covers the lapse, in the word every process reads.
+        floor.wrote(6_000);
+        assert!(!floor.is_owed());
+        assert_eq!(second.recorded(), 6_000);
+        let bound = floor.bound(expiry, 2_000);
+        assert!(
+            bound.passed && bound.recorded && bound.answerable(),
+            "{bound:?}"
+        );
+
+        // A start whose write failed owes its record until a write lands.
+        floor.could_not_write();
+        assert!(floor.is_owed());
+        floor.wrote(floor.get());
+        assert!(!floor.is_owed());
+        // Every mapping ends before the file goes: on Windows a mapped file cannot be removed.
+        drop((floor, words, second));
+        std::fs::remove_dir_all(&root).expect("removed");
+    }
+
+    /// While this boot's clock continuity is lost, every bound that can pass is unproven, and owed
+    /// as well, so a caller that asks only whether it is owed refuses too; a bound that never
+    /// passes is decided as before.
+    #[test]
+    fn a_lost_clock_continuity_leaves_every_bound_that_can_pass_unproven() {
+        let floor = UtcFloor::at(1_000);
+        let expiry = GrantExpiry::At {
+            expires_at_ms: TimestampMs::new(5_000),
+        };
+        floor.lose_continuity();
+        let bound = floor.bound(expiry, 2_000);
+        assert!(bound.unproven && bound.owed && !bound.passed && !bound.answerable());
+        let never = floor.bound(GrantExpiry::Never, 2_000);
+        assert!(!never.unproven && never.answerable());
+        // The control: once the owner establishes the clock, the bound is decided again.
+        floor.establish_continuity();
+        let bound = floor.bound(expiry, 2_000);
+        assert!(!bound.unproven && bound.answerable() && !bound.passed);
     }
 }

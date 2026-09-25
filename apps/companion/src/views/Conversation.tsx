@@ -31,12 +31,16 @@ import { useApp, useSession } from '../app/state'
 import {
   failureCode,
   failureMessage,
+  watch,
   type DroppedFile,
-  type SessionSubject
+  type SessionSubject,
+  type Watch
 } from '../host/port'
 import { renderMarkdown } from '../markdown/render'
+import { ask } from '../mobile/model/call'
 import {
   applyNodes,
+  installSnapshot,
   nodesAbove,
   prependHistory,
   setFollowing,
@@ -109,13 +113,18 @@ export function Conversation({
   readonly sessionId: string
   readonly subject: SessionSubject
   readonly connected: boolean
-  readonly launch: LaunchSurface | null
+  /** The launch surface as it was read, and the prompt's generation as the view knows it now. */
+  readonly launch: { readonly surface: LaunchSurface; readonly promptGeneration: string } | null
   readonly onLaunched: () => void
 }): ReactNode {
   const { port, say } = useApp()
   const { state, update } = useSession(sessionId)
   const [insertion, setInsertion] = useState<string | null>(null)
   const [commands, setCommands] = useState<readonly AgentCommand[]>([])
+  // Why the newest read of the document was refused, for the session it was read for.
+  const [unread, setUnread] = useState<{ readonly sessionId: string; readonly reason: string } | null>(
+    null
+  )
   const scroller = useRef<HTMLDivElement | null>(null)
   const anchor = useRef<{ nodeId: string; offsetTop: number } | null>(null)
 
@@ -153,26 +162,91 @@ export function Conversation({
     [update]
   )
 
+  // The document is read once the stream's listener is registered, so no node can fall between the
+  // read and the listener, and read again when the host is heard to be back. While a read is on its
+  // way, the nodes the stream delivers are held rather than shown, and its answer installs them by
+  // `installSnapshot`'s rule: the snapshot's order stands and what arrived meanwhile follows it.
+  // Only the newest read of the watch that is running is installed.
   useEffect(() => {
-    let cancelled = false
-    port
-      .agentSnapshot({ session_id: sessionId })
-      .then((snapshot) => {
-        if (cancelled) return
-        update((current) => ({
-          ...current,
-          conversation: applyNodes(current.conversation, snapshot.nodes),
-          loaded: true
+    // Held from the start: nothing is shown before the first read has answered.
+    let held: DocumentNode[] | null = []
+    let watching: Watch | null = null
+    const read = () => {
+      const current = watching?.read() ?? null
+      if (current === null) return
+      if (held === null) {
+        // What arrived before this read keeps its place ahead of anything held from now on.
+        batcher.flushNow()
+        held = []
+      }
+      const settle = (snapshot: readonly DocumentNode[] | null, refusal: string | null) => {
+        if (!current()) return
+        const arrived = held ?? []
+        held = null
+        update((session) => ({
+          ...session,
+          conversation:
+            snapshot === null
+              ? applyNodes(session.conversation, arrived)
+              : installSnapshot(session.conversation, snapshot, arrived),
+          loaded: session.loaded || snapshot !== null
         }))
-      })
-      .catch(() => {
-        // A snapshot that cannot be read leaves the view as it was, and the banner says why.
-      })
-    return () => {
-      cancelled = true
-      batcher.discard()
+        setUnread(refusal === null ? null : { sessionId, reason: refusal })
+      }
+      // A port can refuse before it returns a promise; that refusal is an answer like any other.
+      ask(() => port.agentSnapshot({ session_id: sessionId }))
+        .then((snapshot) => {
+          settle(snapshot.nodes, null)
+        })
+        .catch((failure: unknown) => {
+          settle(null, failureMessage(failure))
+        })
     }
-  }, [port, sessionId, batcher, update])
+    watching = watch(
+      [
+        port.subscribe((event) => {
+          const body = event.body as { kind?: string; node?: DocumentNode; receipt?: unknown }
+          // An event belongs to the stream it names. A view showing one session ignores another's
+          // rather than folding it into what the person is looking at.
+          if (body.kind === 'node' && body.node && eventIsFor(event.stream_id, sessionId)) {
+            if (held === null) batcher.push(body.node)
+            else held.push(body.node)
+          }
+          if (body.kind === 'receipt' && body.receipt) {
+            const receipt = body.receipt as Parameters<typeof settled>[1]
+            let refused: string | null = null
+            update((current) => ({
+              ...current,
+              submissions: current.submissions.map((submission) => {
+                if (submission.actionId !== receipt.action_id) return submission
+                const next = settled(submission, receipt)
+                if (wasRefused(next.state)) refused = next.localId
+                return next
+              })
+            }))
+            // A refusal that arrives later is the same refusal: the text comes back then too.
+            if (refused) returnRefusedText(refused)
+          }
+        }),
+        port.onConnection((state) => {
+          if (state.connected) read()
+        })
+      ],
+      read,
+      (failure) => {
+        // A view that cannot follow the stream reads nothing, and says why.
+        setUnread({ sessionId, reason: failureMessage(failure) })
+      }
+    )
+    const started = watching
+    return () => {
+      started.stop()
+      batcher.discard()
+      // A refusal belongs to the watch whose read it answered: a return to the session reads again
+      // and shows nothing from before until that read has answered.
+      setUnread(null)
+    }
+  }, [port, sessionId, batcher, update, returnRefusedText])
 
   useEffect(() => {
     let cancelled = false
@@ -190,33 +264,6 @@ export function Conversation({
       cancelled = true
     }
   }, [port, sessionId])
-
-  useEffect(() => {
-    const stop = port.subscribe((event) => {
-      const body = event.body as { kind?: string; node?: DocumentNode; receipt?: unknown }
-      // An event belongs to the stream it names. A view showing one session ignores another's
-      // rather than folding it into what the person is looking at.
-      if (body.kind === 'node' && body.node && eventIsFor(event.stream_id, sessionId)) {
-        batcher.push(body.node)
-      }
-      if (body.kind === 'receipt' && body.receipt) {
-        const receipt = body.receipt as Parameters<typeof settled>[1]
-        let refused: string | null = null
-        update((current) => ({
-          ...current,
-          submissions: current.submissions.map((submission) => {
-            if (submission.actionId !== receipt.action_id) return submission
-            const next = settled(submission, receipt)
-            if (wasRefused(next.state)) refused = next.localId
-            return next
-          })
-        }))
-        // A refusal that arrives later is the same refusal: the text comes back then too.
-        if (refused) returnRefusedText(refused)
-      }
-    })
-    return stop
-  }, [port, batcher, sessionId, update, returnRefusedText])
 
   const controlState: ControlState = useMemo(() => {
     const present = new Set(state.conversation.nodes.map((node) => node.id))
@@ -354,7 +401,7 @@ export function Conversation({
     [port, state.draft.draftId, subject, update, say]
   )
 
-  useEffect(() => port.onFilesDropped(attach), [port, attach])
+  useEffect(() => watch([port.onFilesDropped(attach)]).stop, [port, attach])
 
   // Losing contact removes the association, not the draft. That is a fact about the connection, so
   // it is derived here rather than written into the stored draft: the text, the revision and the
@@ -365,6 +412,7 @@ export function Conversation({
   )
 
   const banner = reconnectBanner(connected, state.submissions)
+  const refusal = unread?.sessionId === sessionId ? unread.reason : null
   const rendered = useMemo(() => visibleNodes(state.conversation), [state.conversation])
   const hidden = nodesAbove(state.conversation)
 
@@ -519,6 +567,12 @@ export function Conversation({
     <div className="conversation" data-testid="conversation">
       {banner ? <Banner tone={banner.tone} title={banner.title} detail={banner.detail} /> : null}
 
+      {refusal !== null ? (
+        <div data-testid="conversation-unread">
+          <Banner tone="warning" title="This conversation could not be read" detail={refusal} />
+        </div>
+      ) : null}
+
       {state.submissions.length > 0 ? (
         <ul className="pending-actions" data-testid="pending-actions">
           {state.submissions.map((submission) => (
@@ -568,9 +622,10 @@ export function Conversation({
         />
       </div>
 
-      {launch?.prompt_is_empty ? (
+      {launch?.surface.prompt_is_empty ? (
         <LaunchSurfaceView
-          surface={launch}
+          surface={launch.surface}
+          promptGeneration={launch.promptGeneration}
           subject={subject}
           sessionId={sessionId}
           connected={connected}
@@ -1005,12 +1060,15 @@ function ControlButton({
  */
 function LaunchSurfaceView({
   surface,
+  promptGeneration,
   subject,
   sessionId,
   connected,
   onLaunched
 }: {
   readonly surface: LaunchSurface
+  /** The prompt's generation now, which a read that answered late may already be behind. */
+  readonly promptGeneration: string
   readonly subject: SessionSubject
   readonly sessionId: string
   readonly connected: boolean
@@ -1021,7 +1079,7 @@ function LaunchSurfaceView({
   // and reading the surface again is what makes them usable: a person looks at the prompt, and the
   // refreshed proof is what re-enables the buttons.
   const [drawnAt, setDrawnAt] = useState(surface.prompt_generation)
-  const stale = drawnAt !== surface.prompt_generation || !connected
+  const stale = drawnAt !== promptGeneration || !connected
 
   return (
     <section className="launch-surface" data-testid="launch-surface" data-stale={stale}>
@@ -1047,7 +1105,7 @@ function LaunchSurfaceView({
                     {
                       session_id: sessionId,
                       command: { arguments: [...profile.arguments] },
-                      expected_prompt_generation: surface.prompt_generation,
+                      expected_prompt_generation: promptGeneration,
                       expected_buffer_revision: surface.buffer_revision
                     },
                     subject
@@ -1080,7 +1138,7 @@ function LaunchSurfaceView({
             <Button
               data-testid="launch-refresh"
               onClick={() => {
-                setDrawnAt(surface.prompt_generation)
+                setDrawnAt(promptGeneration)
               }}
             >
               I have looked at the prompt

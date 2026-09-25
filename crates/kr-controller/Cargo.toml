@@ -16,7 +16,6 @@ path = "src/bin/kr-controller.rs"
 # The delivery credential the gateway reads is 32 bytes in unpadded base64url.
 base64.workspace = true
 clap.workspace = true
-futures-util.workspace = true
 kr-automation.workspace = true
 iroh.workspace = true
 kr-cbor.workspace = true
@@ -40,10 +39,10 @@ kr-voice.workspace = true
 kr-attention.workspace = true
 kr-worker.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
-# The rendezvous room's WebSocket and mail submission, each opened on a TLS stream verified
-# against the platform's trust store, with no way to switch the verification off.
+# Mail submission, opened on a TLS stream verified against the platform's trust, which kr-client
+# builds for every TLS client here, with no way to switch the verification off. The rendezvous
+# room's socket is kr-client's.
 rustls.workspace = true
-rustls-platform-verifier.workspace = true
 # The older answer shape a compatibility reader accepts publishes its schema like any protocol
 # message, so it is checked before typed decoding like any other.
 schemars.workspace = true
@@ -53,7 +52,6 @@ thiserror.workspace = true
 toml_edit.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls.workspace = true
-tokio-websockets.workspace = true
 # A webhook's address is parsed once to find the origin it is delivered through.
 url.workspace = true
 
@@ -84,7 +82,10 @@ kr-transfer.workspace = true
 rcgen.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
 tempfile.workspace = true
-# A loopback room for the host's WebSocket to attach to.
+# The catalogue's fetch, asked directly, to show which proxy a repository is fetched through.
+tough.workspace = true
+# A loopback room for the host's WebSocket to attach to, and the room's end of it.
+futures-util.workspace = true
 tokio-websockets = { workspace = true, features = ["server"] }
 
 [lints]

@@ -53,6 +53,7 @@ use kr_plugin_sdk::plugin::PluginManifest;
 
 use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
 use cap_std::fs::{Dir, OpenOptions};
+use kr_ipc::paths::{NameKind, flush_held_directory};
 
 use crate::authority::Permit;
 use crate::budget::{BudgetLedger, Resource, ResourceLimit, Stage};
@@ -835,7 +836,7 @@ impl Store {
                 .map_err(|error| stopped(changed, error))?;
             changed += 1;
         }
-        flushed_after_publication(&accepted, &accepted.path)
+        flushed_after_publication(&accepted, &accepted.path, NameKind::File)
     }
 
     /// Returns the most the accepted checkpoint counts at any moment while `working` is published
@@ -1652,7 +1653,7 @@ impl StagedPackage {
                     .dir
                     .rename(&self.name, &layout.packages.dir, &name)
                     .map_err(|source| CatalogueError::storage(&destination, &source))?;
-                flushed_after_publication(&layout.packages, &destination)?;
+                flushed_after_publication(&layout.packages, &destination, NameKind::Directory)?;
             }
             Err(source) => return Err(CatalogueError::storage(&destination, &source)),
             Ok(metadata) if metadata.is_dir() => self.repair_in_place(&layout.packages)?,
@@ -1680,9 +1681,12 @@ impl StagedPackage {
         )?;
         // Every directory between the package and a file it declares has to be a directory, not a
         // link: a rename through a linked directory would write outside the package. The whole
-        // package is checked before anything is replaced, so a refusal changes nothing.
+        // package is checked before anything is replaced, so a refusal changes nothing. How many of
+        // those directories are there already is kept: the rest are made by this repair.
+        let mut present: BTreeMap<&str, usize> = BTreeMap::new();
         for relative in self.written.keys() {
             let mut directory = package.try_clone()?;
+            let mut depth = 0;
             for component in Path::new(relative)
                 .parent()
                 .into_iter()
@@ -1703,9 +1707,11 @@ impl StagedPackage {
                             Path::new(part),
                             false,
                         )?;
+                        depth += 1;
                     }
                 }
             }
+            present.insert(relative.as_str(), depth);
         }
         let mut replaced: Vec<PathBuf> = Vec::new();
         let stopped = |replaced: &[PathBuf], error: CatalogueError| {
@@ -1720,10 +1726,15 @@ impl StagedPackage {
                 }
             }
         };
-        // Every directory from a replaced file up to the package's own holds a new entry, a
-        // replaced file or a directory created for one, so each of them is flushed.
-        let mut touched: BTreeMap<PathBuf, Area> = BTreeMap::new();
-        for relative in self.written.keys() {
+        // Every directory from a replaced file up to the package's own is flushed, each for the
+        // kind of name it gained: a file's for the directory a file was renamed into, whatever else
+        // it gained, and a directory's for one this repair made a directory in. A directory above
+        // the file that gained nothing, because what is below it was there already, is flushed on
+        // Unix as it always was, since a flush there asks nothing of the directory. On Windows a
+        // flush opens the directory with the right to add to it, which such a directory may not
+        // grant and which this repair did not use, so it is left alone.
+        let mut touched: BTreeMap<PathBuf, (Area, Option<NameKind>)> = BTreeMap::new();
+        for (relative, depth_present) in &present {
             let relative = Path::new(relative);
             let staged = self.dir.path.join(relative);
             let target = package.path.join(relative);
@@ -1752,7 +1763,12 @@ impl StagedPackage {
             let mut directory = package
                 .try_clone()
                 .map_err(|error| stopped(&replaced, error))?;
-            for component in relative.parent().into_iter().flat_map(Path::components) {
+            for (depth, component) in relative
+                .parent()
+                .into_iter()
+                .flat_map(Path::components)
+                .enumerate()
+            {
                 let next = open_child(
                     &directory.dir,
                     &directory.path.join(component),
@@ -1760,13 +1776,25 @@ impl StagedPackage {
                     false,
                 )
                 .map_err(|error| stopped(&replaced, error))?;
-                touched.insert(directory.path.clone(), directory);
+                let made_here = depth >= *depth_present;
+                let (_, gained) = touched
+                    .entry(directory.path.clone())
+                    .or_insert((directory, None));
+                if made_here && gained.is_none() {
+                    *gained = Some(NameKind::Directory);
+                }
                 directory = next;
             }
-            touched.insert(directory.path.clone(), directory);
+            touched.insert(directory.path.clone(), (directory, Some(NameKind::File)));
         }
-        for directory in touched.values() {
-            flushed_after_publication(directory, &package.path)?;
+        for (directory, gained) in touched.values() {
+            match gained {
+                Some(kind) => flushed_after_publication(directory, &package.path, *kind)?,
+                None if cfg!(unix) => {
+                    flushed_after_publication(directory, &package.path, NameKind::Directory)?;
+                }
+                None => {}
+            }
         }
         Ok(())
     }
@@ -1805,16 +1833,20 @@ fn write_atomically(
     bytes: &[u8],
 ) -> CatalogueResult<()> {
     let directory = rename_into_place(staging, area, relative, bytes)?;
-    flushed_after_publication(&directory, &area.path.join(relative))
+    flushed_after_publication(&directory, &area.path.join(relative), NameKind::File)
 }
 
-/// Flushes the directory a publication renamed something into.
+/// Flushes the directory a publication renamed something into, for the kind of name it renamed.
 ///
 /// The rename has happened by then, so a flush that fails does not undo anything: it leaves the
 /// publication in place and its durability unconfirmed, which is an uncertain outcome rather than
 /// a failure that changed nothing.
-fn flushed_after_publication(directory: &Area, published: &Path) -> CatalogueResult<()> {
-    flush_directory(directory).map_err(|error| CatalogueError::PublicationUncertain {
+fn flushed_after_publication(
+    directory: &Area,
+    published: &Path,
+    kind: NameKind,
+) -> CatalogueResult<()> {
+    flush_directory(directory, kind).map_err(|error| CatalogueError::PublicationUncertain {
         detail: format!(
             "{} is in place and its directory did not confirm it: {error}",
             published.display()
@@ -1880,39 +1912,21 @@ fn rename_into_place(
     Ok(directory)
 }
 
-/// Flushes a directory entry so a rename survives a power loss, where the platform offers it.
+/// Flushes a directory the store holds, so the names changed in it survive a power loss.
 ///
-/// Unix can flush an open directory. Windows cannot, and its own rename durability is the
-/// filesystem's; the comment above a rename says what the platform gives rather than claiming one
-/// guarantee everywhere.
-fn flush_directory(directory: &Area) -> CatalogueResult<()> {
+/// The directory is flushed through a second handle opened from the one held, never through its
+/// name, so it is the directory the store holds whatever that name reaches by now. `kind` is the
+/// name that changed in it, a file's or a directory's, which is the right that handle asks for on
+/// Windows.
+fn flush_directory(directory: &Area, kind: NameKind) -> CatalogueResult<()> {
     #[cfg(test)]
     if flush_fault::fails(&directory.path) {
         return Err(CatalogueError::StorageUnavailable {
             detail: format!("{}: the flush was made to fail", directory.path.display()),
         });
     }
-    #[cfg(unix)]
-    {
-        use rustix::fs::{Mode, OFlags};
-        let failed = |source: rustix::io::Errno| {
-            CatalogueError::storage(&directory.path, &std::io::Error::from(source))
-        };
-        // The handle is opened for finding names, which on Linux is a descriptor that cannot be
-        // flushed, so the directory is opened for reading through it first. `.` is the directory
-        // the handle holds, whatever its name reaches by now.
-        let readable = rustix::fs::openat(
-            &directory.dir,
-            ".",
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(failed)?;
-        rustix::fs::fsync(&readable).map_err(failed)?;
-    }
-    #[cfg(not(unix))]
-    let _ = directory;
-    Ok(())
+    flush_held_directory(&directory.dir, kind)
+        .map_err(|source| CatalogueError::storage(&directory.path, &source))
 }
 
 /// Where the unit tests make a checkpoint publication stop: after a number of documents were
@@ -2026,34 +2040,40 @@ pub(crate) mod flush_fault {
 }
 
 /// Flushes every directory in a directory tree, deepest first, following no link.
+///
+/// Each directory is flushed for the names made in it: a file's where it holds a file, and a
+/// directory's where it holds directories alone.
 fn flush_tree(directory: &Area) -> CatalogueResult<()> {
-    #[cfg(unix)]
-    {
-        let entries = directory
-            .dir
-            .entries()
-            .map_err(|source| CatalogueError::storage(&directory.path, &source))?;
-        for entry in entries {
-            let entry =
-                entry.map_err(|source| CatalogueError::storage(&directory.path, &source))?;
-            let name = entry.file_name();
-            let kind = entry
-                .file_type()
-                .map_err(|source| CatalogueError::storage(&directory.path.join(&name), &source))?;
-            if kind.is_dir() {
-                flush_tree(&open_child(
-                    &directory.dir,
-                    &directory.path.join(&name),
-                    Path::new(&name),
-                    false,
-                )?)?;
-            }
+    let entries = directory
+        .dir
+        .entries()
+        .map_err(|source| CatalogueError::storage(&directory.path, &source))?;
+    let mut holds_file = false;
+    for entry in entries {
+        let entry = entry.map_err(|source| CatalogueError::storage(&directory.path, &source))?;
+        let name = entry.file_name();
+        let kind = entry
+            .file_type()
+            .map_err(|source| CatalogueError::storage(&directory.path.join(&name), &source))?;
+        if kind.is_dir() {
+            flush_tree(&open_child(
+                &directory.dir,
+                &directory.path.join(&name),
+                Path::new(&name),
+                false,
+            )?)?;
+        } else {
+            holds_file = true;
         }
-        flush_directory(directory)?;
     }
-    #[cfg(not(unix))]
-    let _ = directory;
-    Ok(())
+    flush_directory(
+        directory,
+        if holds_file {
+            NameKind::File
+        } else {
+            NameKind::Directory
+        },
+    )
 }
 
 #[cfg(test)]
@@ -3163,6 +3183,262 @@ mod tests {
                 Err(other) => panic!("refused for another reason: {other:?}"),
                 Ok(_) => panic!("a second lock was granted while the first was held"),
             }
+        }
+    }
+
+    /// Holds a directory through a handle that shares no writing with any other.
+    ///
+    /// A name can still be created or removed in the directory while it is held, since that opens
+    /// the name rather than the directory, but nothing can open the directory itself with a right
+    /// to add to it, which is what a flush of it has to do on Windows.
+    #[cfg(windows)]
+    fn hold_without_shared_writing(directory: &Path) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        /// The right to list a directory, which is all the handle holds.
+        const FILE_LIST_DIRECTORY: u32 = 0x0001;
+        /// Reading is shared with other handles.
+        const FILE_SHARE_READ: u32 = 0x0001;
+        /// Deleting is shared; writing is not.
+        const FILE_SHARE_DELETE: u32 = 0x0004;
+        /// What lets a program open a directory at all.
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+        std::fs::OpenOptions::new()
+            .access_mode(FILE_LIST_DIRECTORY)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(directory)
+            .expect("the directory is held")
+    }
+
+    /// KR-REQ-11.06: a staged package is flushed, every directory of its tree, before it is renamed
+    /// into place, each through a second handle opened from the one the store holds. While a
+    /// handle that shares no writing holds one of those directories, the activation is refused by
+    /// that directory's flush, before the rename, and nothing is activated; once that handle is let
+    /// go, every directory of a staged tree is flushed.
+    #[cfg(windows)]
+    #[test]
+    fn a_package_whose_staged_tree_cannot_be_flushed_is_not_activated() {
+        let (_directory, store) = store();
+        let digest = PayloadDigest::of(b"manifest");
+        let stage = || {
+            let mut staged = store.stage_package(digest).expect("a staging directory");
+            staged
+                .write(&path("plugin.json"), b"manifest")
+                .expect("written");
+            staged
+                .write(&path("assets/icon.txt"), b"icon")
+                .expect("written");
+            staged
+        };
+
+        let staged = stage();
+        let assets = staged.dir.path.join("assets");
+        let held = hold_without_shared_writing(&assets);
+        let refused = owned(|permit| staged.activate(permit));
+        drop(held);
+        // The flush's own refusal names the directory it could not flush. A refusal naming the
+        // destination instead would come from the rename, which a flush that did nothing reaches.
+        match refused {
+            Err(CatalogueError::StorageUnavailable { detail }) => assert!(
+                detail.starts_with(&assets.display().to_string()),
+                "refused for another reason: {detail}"
+            ),
+            other => panic!("activated, or refused for another reason: {other:?}"),
+        }
+        assert!(!store.package_dir(digest).exists(), "nothing was activated");
+
+        let staged = stage();
+        flush_tree(&staged.dir).expect("with nothing holding it, the staged tree is flushed");
+        staged.abandon();
+    }
+
+    /// Runs a program and returns what it printed, failing the test when it fails.
+    #[cfg(windows)]
+    fn run_program(program: &str, arguments: &[&std::ffi::OsStr]) -> String {
+        let output = std::process::Command::new(program)
+            .args(arguments)
+            .output()
+            .unwrap_or_else(|error| panic!("{program} starts: {error}"));
+        let printed = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success(),
+            "{program} failed: {printed}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        printed
+    }
+
+    /// Refuses this account the right to add one kind of name to one directory, and nothing else,
+    /// until it is dropped.
+    #[cfg(windows)]
+    struct AddingRefused {
+        directory: PathBuf,
+        account: String,
+    }
+
+    #[cfg(windows)]
+    impl AddingRefused {
+        fn on(directory: &Path, kind: NameKind) -> Self {
+            use std::os::windows::fs::OpenOptionsExt as _;
+
+            /// The right to add a file to a directory.
+            const FILE_ADD_FILE: u32 = 0x0002;
+            /// The right to add a directory to one.
+            const FILE_ADD_SUBDIRECTORY: u32 = 0x0004;
+            /// What lets a program open a directory at all.
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+            // The right refused, as the list names it, and as a handle asks for it; then the
+            // right left alone.
+            let (entry, refused_right, kept_right) = match kind {
+                NameKind::File => ("WD", FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY),
+                NameKind::Directory => ("AD", FILE_ADD_SUBDIRECTORY, FILE_ADD_FILE),
+            };
+            let printed = run_program(
+                "whoami.exe",
+                &[
+                    "/user".as_ref(),
+                    "/fo".as_ref(),
+                    "csv".as_ref(),
+                    "/nh".as_ref(),
+                ],
+            );
+            let account = printed
+                .trim()
+                .rsplit(',')
+                .next()
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_owned();
+            assert!(
+                account.starts_with("S-1-"),
+                "this account's identifier: {printed}"
+            );
+            // An entry for this directory alone, which nothing created inside it inherits.
+            run_program(
+                "icacls.exe",
+                &[
+                    directory.as_os_str(),
+                    "/deny".as_ref(),
+                    format!("*{account}:({entry})").as_ref(),
+                ],
+            );
+            let refused = Self {
+                directory: directory.to_path_buf(),
+                account,
+            };
+            let open = |right: u32| {
+                std::fs::OpenOptions::new()
+                    .access_mode(right)
+                    .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                    .open(directory)
+            };
+            // The list is what refuses it: an account holding a privilege that overrides lists
+            // would be let through, and for it this arrangement cannot be made.
+            assert_eq!(
+                open(refused_right)
+                    .expect_err("the right is refused")
+                    .kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{kind:?}"
+            );
+            open(kept_right).expect("and the other right is not");
+            refused
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for AddingRefused {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("icacls.exe")
+                .arg(&self.directory)
+                .arg("/remove:d")
+                .arg(format!("*{}", self.account))
+                .output();
+        }
+    }
+
+    /// KR-REQ-11.06: a package repaired in place has each directory it changed flushed for the
+    /// kind of name that directory gained. Here the package's own directory may gain a directory
+    /// and not a file: the repair makes `assets` in it and renames the missing file into `assets`,
+    /// so the package's directory is flushed with the right to add a directory and `assets` with
+    /// the right to add a file, and the repair reports success.
+    #[cfg(windows)]
+    #[test]
+    fn a_repair_flushes_each_directory_for_the_kind_of_name_it_gained() {
+        let (_directory, store) = store();
+        let digest = PayloadDigest::of(b"manifest");
+        let package = store.package_dir(digest);
+        std::fs::create_dir_all(&package).expect("a package directory already in place");
+        std::fs::write(package.join("plugin.json"), b"manifest").expect("its manifest, intact");
+        let mut staged = store.stage_package(digest).expect("a staging directory");
+        staged
+            .write(&path("plugin.json"), b"manifest")
+            .expect("written");
+        staged
+            .write(&path("assets/icon.txt"), b"icon")
+            .expect("written");
+
+        let refused = AddingRefused::on(&package, NameKind::File);
+        let repaired = owned(|permit| staged.activate(permit));
+        drop(refused);
+        assert_eq!(repaired.expect("the repair is made and flushed"), package);
+        assert_eq!(
+            std::fs::read(package.join("assets").join("icon.txt")).expect("the repaired file"),
+            b"icon"
+        );
+    }
+
+    /// KR-REQ-11.06: a directory a repair passes through without changing is not asked for a
+    /// right the repair did not use. Here `assets` is already in place and the package's own
+    /// directory may gain a file and not a directory: the repair renames the missing file into
+    /// `assets`, flushes `assets` with the right to add a file, leaves the package's directory,
+    /// which gained nothing, unflushed, and reports success.
+    #[cfg(windows)]
+    #[test]
+    fn a_repair_asks_nothing_of_a_directory_it_did_not_change() {
+        let (_directory, store) = store();
+        let digest = PayloadDigest::of(b"manifest");
+        let package = store.package_dir(digest);
+        std::fs::create_dir_all(package.join("assets")).expect("a package already in place");
+        std::fs::write(package.join("plugin.json"), b"manifest").expect("its manifest, intact");
+        let mut staged = store.stage_package(digest).expect("a staging directory");
+        staged
+            .write(&path("plugin.json"), b"manifest")
+            .expect("written");
+        staged
+            .write(&path("assets/icon.txt"), b"icon")
+            .expect("written");
+
+        let refused = AddingRefused::on(&package, NameKind::Directory);
+        let repaired = owned(|permit| staged.activate(permit));
+        drop(refused);
+        assert_eq!(repaired.expect("the repair is made and flushed"), package);
+        assert_eq!(
+            std::fs::read(package.join("assets").join("icon.txt")).expect("the repaired file"),
+            b"icon"
+        );
+    }
+
+    /// A directory the store holds is flushed through a second handle opened from the one held,
+    /// for either kind of name, so a handle that shares no writing stops the flush and the flush is
+    /// made once that handle is let go.
+    #[cfg(windows)]
+    #[test]
+    fn a_store_directory_is_flushed_through_the_handle_the_store_holds() {
+        let (_directory, store) = store();
+        let layout = store.layout().expect("the store's directories");
+        for kind in [NameKind::File, NameKind::Directory] {
+            let held = hold_without_shared_writing(&layout.index.path);
+            let refused = flush_directory(&layout.index, kind);
+            drop(held);
+            assert!(
+                matches!(refused, Err(CatalogueError::StorageUnavailable { .. })),
+                "{kind:?}: {refused:?}"
+            );
+            flush_directory(&layout.index, kind).expect("flushed once nothing holds it");
         }
     }
 }

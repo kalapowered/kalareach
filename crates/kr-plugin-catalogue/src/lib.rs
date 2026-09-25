@@ -64,6 +64,7 @@ pub mod install;
 pub mod repository;
 pub mod search;
 pub mod store;
+pub mod transport;
 pub mod trust;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -287,17 +288,26 @@ pub struct Catalogue {
 }
 
 impl Catalogue {
-    /// Opens the catalogue under `root`, with no broker bound.
+    /// Opens the catalogue under `root`, with no broker bound, fetching its repositories through
+    /// `transport`.
+    ///
+    /// The transport is its host's: a host builds it with its own trust and the proxy its
+    /// configuration selects ([`transport::RepositoryTransport`]), and a test hands in one of its
+    /// own.
     ///
     /// # Errors
     ///
     /// Returns [`CatalogueError::StorageUnavailable`] when the directory or its database cannot be
     /// opened.
-    pub fn open(root: &Path) -> CatalogueResult<Self> {
-        Self::with_broker(root, Arc::new(UnboundBroker))
+    pub fn open(
+        root: &Path,
+        transport: Arc<dyn tough::Transport + Send + Sync>,
+    ) -> CatalogueResult<Self> {
+        Self::with_broker(root, Arc::new(UnboundBroker), transport)
     }
 
-    /// Opens the catalogue under `root`, against one broker.
+    /// Opens the catalogue under `root`, against one broker, fetching its repositories through
+    /// `transport`.
     ///
     /// What an earlier daemon enrolled and installed is still enrolled and installed: it is in the
     /// database, which is read where it is needed rather than copied into memory here.
@@ -306,7 +316,11 @@ impl Catalogue {
     ///
     /// Returns [`CatalogueError::StorageUnavailable`] when the directory or its database cannot be
     /// opened, or `root` is a link or not a directory.
-    pub fn with_broker(root: &Path, broker: Arc<dyn BrokerBridge>) -> CatalogueResult<Self> {
+    pub fn with_broker(
+        root: &Path,
+        broker: Arc<dyn BrokerBridge>,
+        transport: Arc<dyn tough::Transport + Send + Sync>,
+    ) -> CatalogueResult<Self> {
         let root = store::normal(root);
         std::fs::create_dir_all(&root).map_err(|source| CatalogueError::storage(&root, &source))?;
         // The records are written here and every repository's files under here, so a directory
@@ -318,9 +332,7 @@ impl Catalogue {
             bindings: Bindings::new(),
             fetches_network: true,
             broker,
-            // The client's default transport, which reads a local directory mirror or fetches
-            // over HTTP/HTTPS using tough's HTTP feature with rustls-platform-verifier.
-            transport: Arc::new(tough::DefaultTransport::new()),
+            transport,
         })
     }
 
@@ -2652,6 +2664,14 @@ mod tests {
     use kr_protocol::error::{ErrorCode, ProtocolError};
     use kr_protocol::receipt::ReceiptState;
 
+    /// The transport a test opens its catalogue with: repositories on the internal disk, read by
+    /// `file` URL, and nothing fetched over a network.
+    fn local() -> Arc<dyn tough::Transport + Send + Sync> {
+        Arc::new(transport::RepositoryTransport::local_only(
+            "a test reads its repositories from disk",
+        ))
+    }
+
     /// Copies the published development generation onto the internal disk and enrols it.
     fn development() -> (tempfile::TempDir, Catalogue, RepositoryId) {
         let home = tempfile::tempdir().expect("a temporary directory");
@@ -2685,8 +2705,8 @@ mod tests {
             CapabilityCeiling::default_ceiling(),
         )
         .expect("an enrolment");
-        let mut catalogue =
-            Catalogue::open(&home.path().join("catalogue")).expect("an openable catalogue");
+        let mut catalogue = Catalogue::open(&home.path().join("catalogue"), local())
+            .expect("an openable catalogue");
         catalogue
             .enrol(enrolment, true)
             .expect("the owner adopted the root");
@@ -2825,7 +2845,7 @@ mod tests {
                     .enable_all()
                     .build()
                     .expect("a runtime");
-                let mut first = Catalogue::open(&directory).expect("a second catalogue");
+                let mut first = Catalogue::open(&directory, local()).expect("a second catalogue");
                 runtime
                     .block_on(first.sync(&first_id))
                     .expect("roots 2 and 3, and generation 3");
@@ -3060,7 +3080,7 @@ mod tests {
     ) -> (Catalogue, RepositoryId) {
         let id = RepositoryId::new("official").expect("a valid identifier");
         let mut catalogue =
-            Catalogue::open(&home.join("catalogue")).expect("an openable catalogue");
+            Catalogue::open(&home.join("catalogue"), local()).expect("an openable catalogue");
         catalogue
             .enrol(
                 Enrolment::new(
@@ -3125,7 +3145,8 @@ mod tests {
             }
 
             drop(catalogue);
-            let mut catalogue = Catalogue::open(&home.path().join("catalogue")).expect("reopens");
+            let mut catalogue =
+                Catalogue::open(&home.path().join("catalogue"), local()).expect("reopens");
             let (timestamp, snapshot) = floors(&catalogue, &id);
             assert!(
                 [1, 2].contains(&timestamp) && [1, 2].contains(&snapshot),
@@ -3211,7 +3232,8 @@ mod tests {
             assert!(outcome.is_err(), "{stop:?}: {outcome:?}");
 
             drop(catalogue);
-            let mut catalogue = Catalogue::open(&home.path().join("catalogue")).expect("reopens");
+            let mut catalogue =
+                Catalogue::open(&home.path().join("catalogue"), local()).expect("reopens");
             let enrolled = catalogue.enrolled(&id).expect("enrolled");
             let kept: tough::schema::Signed<tough::schema::Root> =
                 serde_json::from_slice(&enrolled.enrolment.root).expect("a root");
@@ -3415,7 +3437,7 @@ mod tests {
             .settle_failure(&key, &failure, 3)
             .expect("recorded");
         drop(catalogue);
-        let reopened = Catalogue::open(&home.path().join("catalogue")).expect("reopens");
+        let reopened = Catalogue::open(&home.path().join("catalogue"), local()).expect("reopens");
         assert_eq!(
             reopened
                 .receipt(&key)
@@ -3499,7 +3521,8 @@ mod tests {
         assert!(retained_on_disk(&catalogue, &id) <= limit);
 
         drop(catalogue);
-        let mut catalogue = Catalogue::open(&home.path().join("catalogue")).expect("reopens");
+        let mut catalogue =
+            Catalogue::open(&home.path().join("catalogue"), local()).expect("reopens");
         catalogue
             .sync(&id)
             .await
@@ -3553,7 +3576,8 @@ mod tests {
             );
 
             drop(catalogue);
-            let mut catalogue = Catalogue::open(&home.path().join("catalogue")).expect("reopens");
+            let mut catalogue =
+                Catalogue::open(&home.path().join("catalogue"), local()).expect("reopens");
             assert!(
                 retained_on_disk(&catalogue, &id) <= limit,
                 "stopped at {stop}: {} against {limit}",
@@ -3635,7 +3659,8 @@ mod tests {
             .expect("an enrolment")
         };
         let id = RepositoryId::new("official").expect("a valid identifier");
-        let mut probe = Catalogue::open(&home.path().join("probe-catalogue")).expect("openable");
+        let mut probe =
+            Catalogue::open(&home.path().join("probe-catalogue"), local()).expect("openable");
         probe
             .enrol(probe_generation(&probe_at), true)
             .expect("enrolled");
@@ -3665,7 +3690,8 @@ mod tests {
 
         let at = home.path().join("case");
         publish(&first, &at);
-        let mut catalogue = Catalogue::open(&home.path().join("catalogue")).expect("openable");
+        let mut catalogue =
+            Catalogue::open(&home.path().join("catalogue"), local()).expect("openable");
         catalogue
             .enrol(probe_generation(&at), true)
             .expect("enrolled");
@@ -3899,7 +3925,8 @@ mod tests {
         uncertain_receipt(&mut catalogue, "sync", sync_failure.answer());
         uncertain_receipt(&mut catalogue, "install", install_failure.answer());
         drop(catalogue);
-        let mut reopened = Catalogue::open(&home.path().join("catalogue")).expect("reopens");
+        let mut reopened =
+            Catalogue::open(&home.path().join("catalogue"), local()).expect("reopens");
         assert_eq!(reopened.recover_interrupted(8).expect("recorded"), 0);
         uncertain_receipt(&mut reopened, "sync", sync_failure.answer());
         uncertain_receipt(&mut reopened, "install", install_failure.answer());

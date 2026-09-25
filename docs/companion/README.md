@@ -25,6 +25,29 @@ it.
   open_external       ──────────▶ the scheme policy, then the platform opener
 ```
 
+Native code tells the page about changes through listeners: the connection's state, the host's
+events, where the account stands, pairing, owner confirmations and dropped files. The shell
+registers a listener asynchronously and drops whatever it publishes before then. Each listener
+therefore resolves only once it is registered, and a screen reads the state it follows only after
+that, so no change can fall between the two. Nor does a screen show an answer once its listeners
+have stopped, or when they could not be registered. A change that arrives before the read's answer
+is at least as new as that answer, and the screen keeps it. A screen that reads again, on a change,
+a retry, a refresh or an action, shows only its newest read's answer, and the raw terminal view shows
+nothing it read for a session it has left. The conversation reads its document once its stream
+listener is registered, and again when the host is heard to be back: the nodes the stream delivers
+meanwhile follow the document in the order they arrived, and a node the document already holds is
+replaced only by a newer revision of it. In a session, when the launch surface was read at an older
+prompt generation than the view has heard since, its buttons start disabled.
+
+Nothing claims contact, or its loss, before an answer says which. Until the first answer the
+desktop's bar and the phone's say they are checking the connection, with no status dot, and a phone
+session opened from a notification shows no banner about the host.
+
+Each raw terminal view, on the desktop and on the phone, reads the session's snapshot and says how
+the host presents it: the session's output directly, or a viewport with the host's reason in the
+host's own words. It reads the summary of its own attachment and no other, and a viewport whose
+worker reported no reason says so, and is never shown as direct.
+
 ## The boundary
 
 The window is a WebView and the WebView is not trusted. Section 13 of the specification fixes what
@@ -61,6 +84,11 @@ that means, and each rule is a fact about a file here rather than a convention:
 - **Exports are written where a dialog put them.** The page asks for a destination, the platform's
   own save dialog answers, and the backend remembers that answer for exactly one write. A path the
   page names is refused.
+- **Pairing's secrets stay native.** The page types a code or asks for the pasteboard to be read,
+  and is shown views: an invitation's service and proposed rights in words, an attempt's state, the
+  grouped value both devices show, and a confirmation's description. It is never sent an
+  invitation's text or secret, a key, a transcript, a challenge or a proof, and it cannot complete
+  a confirmation: `owner.confirmation.complete` is a method only native code calls.
 
 `src-tauri/tests/boundary.rs` reads those files and holds them to those sentences.
 
@@ -69,6 +97,69 @@ page runs, and the terminal library assigns `toString` to one of its own namespa
 is being evaluated; against a frozen inherited property that assignment throws and the window comes
 up empty. The setting is written into `tauri.conf.json` as `false` rather than left out, so the
 choice is visible where the rest of the boundary is.
+
+## Pairing with a host
+
+"Pair with a host" is where this computer becomes one of a host's devices, and it runs in native
+code, in `src-tauri/src/device`. The page asks for a code or for the pasteboard to be read, and
+native code does the rest with `kr-client`'s pairing module:
+
+- This computer's keys are in the platform's secret store, the Keychain, the Credential Manager or
+  the Secret Service, under "KalaReach Companion". The name it offers a host is its host name.
+- A code's tries are counted in `pairing-budget` in the application's data directory, under a key
+  kept in the same store, so a restart, a reboot or a second copy of the application spends from
+  the same five.
+- The hosts it is paired with, and an attempt still waiting for its owner, are records in
+  `pairing`, each written whole and renamed into place. They hold no secret.
+- The service it pairs through is `https://reach.kala.to` until the person picks another, and the
+  choice is kept in `pairing-origin`.
+
+An invitation on the pasteboard is read by native code, not by the page. A code invitation that
+names a service other than this computer's raises the system's own alert, modal to the companion's
+window, before anything connects there. The alert names both services, and declining it connects
+nowhere. Each change reaches the page as a view on the `kr://pairing` event. The page reads each
+view, and the connection's state for the indicator in its top bar, only once its listener is
+registered, and keeps a change it heard over a read that answers later.
+
+`src-tauri/tests/pairing.rs` pairs this computer both ways against kr-controller's in-process host,
+confirms one request as its owner and declines another. It calls the pairing commands the way the
+page does, through the invoke path on Tauri's mock runtime, and keeps every answer and every
+payload of the two events the application publishes. None of them carries an invitation's text or
+secret, the code's secret characters, a challenge's identifier, nonce or digest, the owner's proof,
+the transcript and bundle digests the owner approves, or a key of this computer, the owner or the
+host, and a secret planted in one event is found by the same scan. The same suite runs the watcher
+against two hosts that share a relay and against a host that answers nothing, and reads a code for
+another service through a stub alert that declines and then accepts it.
+
+## An owner's confirmations
+
+On a computer that is one of a host's owner devices, `src-tauri/src/owner.rs` asks each such host
+every two seconds what it wants confirmed. Each visit ends within ten seconds, so a host that takes
+the connection and answers nothing is out of contact until the next round and holds up no other
+host. The requests head Attention, and each row has its title,
+its description in one line, the time left, and a button named for this computer's ceremony:
+"Confirm with Touch ID", "Confirm with your password" on a Mac without Touch ID, or "Confirm with
+Windows Hello". A computer with no ceremony, Linux among them, shows no button and says where to
+confirm instead. A request whose description does not match what it would authorise says it could
+not be checked, and has no button either.
+
+New requests are announced once, on whichever screen is open, in one message for all that arrive
+together, with "Review", which opens Attention and moves focus to the first of them. Requests that
+arrive while the message is showing join it in place, so whatever has focus in it keeps focus. "Not
+now" sets a request aside until it expires, and it stays aside when the person leaves Attention and
+comes back. For a device being added, the row shows the value both devices should show, and a screen
+reader hears it spelled out one character at a time.
+
+The button sends native code a reference and nothing else. Native code finds the request it listed
+under that reference and asks the operating system, which draws the prompt and prints the
+request's description in it:
+`LAContext` on macOS, and Windows Hello through `UserConsentVerifier` for this window on Windows.
+The prompt is bounded by the challenge's remaining lifetime. Only a confirmation inside it signs,
+with this computer's key, and completes the challenge; when the time runs out the prompt is
+dismissed and the answer is "not confirmed". Nothing on the page can answer the prompt, so a click
+that desktop automation synthesises can start a review and cannot finish one. While a review runs,
+the watcher does not connect to another host whose configuration shares the reviewed host's relay,
+because that connection would close the endpoint the answer goes over.
 
 ## The design system
 
@@ -120,6 +211,12 @@ pnpm -C apps/companion build       # the production bundle
 cargo test -p companion-tauri      # the backend, including the boundary
 ```
 
+On Windows the same command runs `tests/windows_hello.rs`, which reads what Windows reports about
+Windows Hello and checks that the page is sent that ceremony or none. Its tests that raise Windows
+Hello's dialog are ignored: they need a signed-in desktop with Windows Hello set up, and the file
+says how to run them there. They check that the dialog prints the exact message the review gave
+Windows Hello.
+
 The end-to-end run builds a second entry, `harness.html`, which is the same application against a
 host that answers without a machine behind it. The production build has one entry and does not carry
 it.
@@ -134,3 +231,7 @@ pnpm -C apps/companion tauri build
 
 macOS is the first target. Windows and Linux compile from the same source; their packaging is not
 covered by the checks above.
+
+On Windows, with Microsoft's linker, the build links the application manifest into every binary it
+makes, the test binaries included. The native dialogs need version 6 of the common controls, and a
+binary without the manifest that selects it cannot start.

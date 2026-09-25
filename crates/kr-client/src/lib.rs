@@ -24,8 +24,10 @@
 //! | [`controls`] | What a client shows, and what it lets a person invoke |
 //! | [`drafts`] | Drafts this device owns, and the attachment that only presents one |
 //! | [`ipc`] | The local socket or named pipe, with the host-stamped freshness context |
+//! | [`pairing`] | Pairing from a device's side: the room socket, the invitation reader, both candidate modes, the paired hosts and the owner's confirmations |
 //! | [`projection`] | The screen a projected client holds, and the renderer that draws it |
 //! | [`session`] | Requests, receipts, events and the action window |
+//! | [`shown`] | The one type of text a diagnostic may show, and the only ways input becomes it |
 //! | [`sync`] | Encrypted settings sync, its compare-and-swap client and its privacy hook |
 //! | [`cursors`] | Cursors, receipts and the order state is restored in |
 //! | [`reconnect`] | The reconnect loop and what it refuses to carry across |
@@ -49,6 +51,7 @@ pub mod drafts;
 pub mod encoder;
 pub mod error;
 pub mod ipc;
+pub mod pairing;
 /// The projected screen a client paints, and the pinned Unicode width model it measures with.
 ///
 /// Present when the `terminal` feature is on, which is the default. A client on a system with no
@@ -60,6 +63,7 @@ pub mod recovery;
 pub mod retry;
 pub mod services;
 pub mod session;
+pub mod shown;
 pub mod sync;
 pub mod transport;
 pub mod uploads;
@@ -67,3 +71,4 @@ pub mod viewport;
 
 pub use error::{ClientError, Result};
 pub use session::{Session, Settled};
+pub use shown::{IoFault, Plain, Said, Shown};

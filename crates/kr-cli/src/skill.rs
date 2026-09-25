@@ -6,6 +6,8 @@
 //! configuration entry added. A removal replays that record, and anything that has changed since
 //! is reported and left alone.
 
+use kr_client::shown;
+use kr_client::shown::Shown;
 use kr_ipc::client::LocalClient;
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::ids::{ActionId, EnvironmentId};
@@ -27,18 +29,19 @@ use crate::error::{CliError, Result};
 /// a project scope names no directory and none can be resolved.
 pub fn parse(agent: &str, scope: &str, project_dir: Option<&str>) -> Result<AgentToolsParams> {
     let agent: AgentTarget = agent.parse().map_err(|_| {
-        CliError::Usage(format!(
-            "{agent} is not one of the agents this host installs for: {}",
-            AgentTarget::ALL
-                .iter()
-                .map(|target| target.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
+        CliError::Usage(shown!(
+            "the agent given is not one this host installs for: {}",
+            Shown::joined(
+                AgentTarget::ALL
+                    .iter()
+                    .map(|target| Shown::said(target.as_str())),
+                ", "
+            )
         ))
     })?;
     let scope: InstallScope = scope
         .parse()
-        .map_err(|_| CliError::Usage(format!("{scope} is not a scope; use user or project")))?;
+        .map_err(|_| CliError::Usage(Shown::said("the scope is user or project")))?;
     let project_dir = match (scope, project_dir) {
         (InstallScope::Project, Some(directory)) => Some(absolute(directory)?),
         // A project installation without a directory means this one, which is what a person in a
@@ -302,9 +305,12 @@ async fn mutate<T: kr_protocol::wire::WireMessage>(
 fn decode<T: kr_protocol::wire::WireMessage>(
     value: kr_protocol::envelope::ParamsValue,
 ) -> Result<T> {
-    value
-        .to_typed()
-        .map_err(|error| CliError::Other(format!("the host's answer could not be read: {error}")))
+    value.to_typed().map_err(|error| {
+        CliError::Other(shown!(
+            "the host's answer could not be read: {}",
+            Shown::cbor(&error)
+        ))
+    })
 }
 
 fn absolute(directory: &str) -> Result<String> {
@@ -313,7 +319,12 @@ fn absolute(directory: &str) -> Result<String> {
         path.to_path_buf()
     } else {
         std::env::current_dir()
-            .map_err(|error| CliError::Other(format!("this directory cannot be read: {error}")))?
+            .map_err(|error| {
+                CliError::Other(shown!(
+                    "this directory cannot be read: {}",
+                    Shown::io(&error)
+                ))
+            })?
             .join(path)
     };
     // The path is resolved rather than canonicalised, because a project directory that does not

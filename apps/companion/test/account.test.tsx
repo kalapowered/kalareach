@@ -7,12 +7,13 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { act, render, screen, within } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 import { App } from '../src/App'
 import { AppProvider, type Place } from '../src/app/state'
 import { fakeHost } from '../src/host/fake'
+import type { HostPort } from '../src/host/port'
 import { PURCHASE_WORDS, type AccountView } from '../src/model/account'
 
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
@@ -188,5 +189,83 @@ describe('the desktop Account sheet', () => {
       expect(sheet.querySelector('a[href]')).toBeNull()
       expect(sheet.querySelector('form')).toBeNull()
     }
+  })
+})
+
+describe('where the device stands is read once the panel is listening (KR-REQ-13.02)', () => {
+  /** The application, against a host the test has prepared. */
+  function open(port: HostPort): void {
+    render(
+      <AppProvider port={port} initialPlace={{ view: 'attention' }}>
+        <App />
+      </AppProvider>
+    )
+  }
+
+  const SIGNED_IN: AccountView = {
+    state: 'signed_in',
+    email: 'sam@example.com',
+    name: null,
+    usage_readable: false,
+    generation: 'aaaa',
+    outcome: null
+  }
+
+  /** The sidebar's Account item, which names who is signed in. */
+  const item = () => screen.getByRole('button', { name: /^Account/ })
+
+  it('shows a sign-in finished while its listener registers', async () => {
+    const { port, controls } = fakeHost()
+    const complete = controls.holdRegistrations()
+    open(port)
+
+    act(() => {
+      controls.account.set(SIGNED_IN)
+    })
+    await act(async () => {
+      complete()
+      await Promise.resolve()
+    })
+
+    await waitFor(() => {
+      expect(item()).toHaveTextContent('sam@example.com')
+    })
+  })
+
+  it('keeps a change it heard over a read that answers after it', async () => {
+    const { port, controls } = fakeHost()
+    const held = controls.hold('accountStatus')
+    open(port)
+    await waitFor(() => {
+      expect(held.count).toBe(1)
+    })
+
+    act(() => {
+      controls.account.set(SIGNED_IN)
+    })
+    expect(item()).toHaveTextContent('sam@example.com')
+    // The read was made while the device was signed out, and its answer arrives only now.
+    await act(async () => {
+      held.release()
+      await Promise.resolve()
+    })
+    expect(item()).toHaveTextContent('sam@example.com')
+  })
+
+  it('shows what it read when nothing changed in between', async () => {
+    const { port, controls } = fakeHost()
+    controls.account.set(SIGNED_IN)
+    const held = controls.hold('accountStatus')
+    open(port)
+    await waitFor(() => {
+      expect(held.count).toBe(1)
+    })
+    expect(item()).not.toHaveTextContent('sam@example.com')
+
+    await act(async () => {
+      held.release()
+      await Promise.resolve()
+    })
+    expect(item()).toHaveTextContent('sam@example.com')
   })
 })

@@ -56,6 +56,102 @@ pub enum TerminalPresentationMode {
     Viewport,
 }
 
+impl TerminalPresentationMode {
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Viewport => "viewport",
+        }
+    }
+}
+
+/// Why a terminal attachment is shown a viewport of the canonical grid rather than the live byte
+/// stream.
+///
+/// Direct presentation needs every one of these conditions to hold, and an attachment that is not
+/// direct is given one reason: the first in this order that does not hold. The order runs from what
+/// lasts as long as the attachment stays as it is, its terminal and then its size, through where
+/// its window is, to the session's own state, which passes by itself: the output leaving what a
+/// terminal can be handed, a restoration that could not carry the screen, and forwarding waiting
+/// for a parser boundary.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PresentationReason {
+    /// The client declared no terminal profile, so what the session's output would do on its
+    /// terminal is not known.
+    NoTerminalProfile,
+    /// The client declared a terminal profile this build has not qualified to take the session's
+    /// output unchanged.
+    UnqualifiedTerminalProfile,
+    /// The attachment's own size is not the session's canonical size.
+    SizeMismatch,
+    /// The attachment's window is above the live screen, on rows the session retained.
+    HistoryWindow,
+    /// The session's output is no longer something a physical terminal can be handed.
+    StreamNotCarryable,
+    /// The screen the attachment was last given could not carry the state the application
+    /// addresses next.
+    RestorationIncomplete,
+    /// Forwarding waits for the session's output to reach a parser-ground boundary.
+    AwaitingParserBoundary,
+}
+
+impl PresentationReason {
+    /// Every reason, in the order the first that holds is reported.
+    pub const ALL: [Self; 7] = [
+        Self::NoTerminalProfile,
+        Self::UnqualifiedTerminalProfile,
+        Self::SizeMismatch,
+        Self::HistoryWindow,
+        Self::StreamNotCarryable,
+        Self::RestorationIncomplete,
+        Self::AwaitingParserBoundary,
+    ];
+
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoTerminalProfile => "no_terminal_profile",
+            Self::UnqualifiedTerminalProfile => "unqualified_terminal_profile",
+            Self::SizeMismatch => "size_mismatch",
+            Self::HistoryWindow => "history_window",
+            Self::StreamNotCarryable => "stream_not_carryable",
+            Self::RestorationIncomplete => "restoration_incomplete",
+            Self::AwaitingParserBoundary => "awaiting_parser_boundary",
+        }
+    }
+
+    /// Returns what the reason means, for a person.
+    #[must_use]
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::NoTerminalProfile => {
+                "its client declared no terminal profile, so what the session's output would do on \
+                 its terminal is not known"
+            }
+            Self::UnqualifiedTerminalProfile => {
+                "the terminal profile its client declared is not one this build has qualified"
+            }
+            Self::SizeMismatch => "its size is not the session's",
+            Self::HistoryWindow => "its window is above the live screen",
+            Self::StreamNotCarryable => {
+                "the session's output is no longer something a terminal can be handed as it is"
+            }
+            Self::RestorationIncomplete => {
+                "the screen it was last given could not carry everything the application addresses"
+            }
+            Self::AwaitingParserBoundary => {
+                "forwarding waits for the session's output to reach the end of a sequence"
+            }
+        }
+    }
+}
+
 /// What an attachment asks to be able to do.
 ///
 /// A request is not a grant. The host intersects these with the actor's rights, and an attachment
@@ -129,6 +225,10 @@ pub struct GeometryState {
 }
 
 /// One attachment of a session.
+///
+/// Closed, as every object a write result reaches is: `session.attach` answers with one, and
+/// section 23 keeps a mutation's schema closed for the negotiated version, so a field this build
+/// does not declare is refused rather than ignored.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AttachmentSummary {
@@ -144,6 +244,16 @@ pub struct AttachmentSummary {
     pub dimensions: Nullable<Dimensions>,
     /// How the attachment displays the canonical grid.
     pub presentation: Nullable<TerminalPresentationMode>,
+    /// Why a terminal attachment is shown a viewport, when it is.
+    ///
+    /// Section 8 asks every presentation to be reported with its reason. A direct attachment needs
+    /// none and an attachment that is not a terminal has no presentation, so both leave this out,
+    /// and a direct attachment's summary is byte for byte what a client built before reasons
+    /// expects. A worker built before reasons leaves it out of every summary, and a reader takes
+    /// that as no reason reported rather than as a direct presentation: `presentation` says which
+    /// the attachment is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation_reason: Option<PresentationReason>,
     /// The terminal profile it presents.
     pub terminal_profile_id: Nullable<String>,
     /// The capabilities the host granted, which are the requested ones intersected with the
@@ -380,5 +490,141 @@ mod tests {
                 .expect("and so does one that named nothing");
         assert!(!unqualified.attachment_id.is_present());
         assert!(!unqualified.line_token.is_present());
+    }
+    /// The summary a reader built before reasons holds: the same fields without the reason, and
+    /// closed, as that reader's schema was.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    struct ClosedSummary {
+        attachment_id: AttachmentId,
+        ordinal: AttachmentOrdinal,
+        mode: AttachMode,
+        claim_geometry: bool,
+        dimensions: Nullable<Dimensions>,
+        presentation: Nullable<TerminalPresentationMode>,
+        terminal_profile_id: Nullable<String>,
+        granted: CanonicalSet<AttachmentCapability>,
+        attached_at_ms: TimestampMs,
+    }
+
+    /// A summary a later host might write: every field this build knows, and one it does not.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+    struct LaterSummary {
+        #[serde(flatten)]
+        summary: AttachmentSummary,
+        a_later_field: String,
+    }
+
+    fn summary(
+        presentation: TerminalPresentationMode,
+        reason: Option<PresentationReason>,
+    ) -> AttachmentSummary {
+        AttachmentSummary {
+            attachment_id: AttachmentId::new(crate::scalars::Uuid::from_bytes([7; 16])),
+            ordinal: AttachmentOrdinal::new(1),
+            mode: AttachMode::Terminal,
+            claim_geometry: false,
+            dimensions: Nullable::some(Dimensions::new(80, 24)),
+            presentation: Nullable::some(presentation),
+            presentation_reason: reason,
+            terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+            granted: CanonicalSet::new(),
+            attached_at_ms: TimestampMs::new(1),
+        }
+    }
+
+    fn closed(summary: &AttachmentSummary) -> ClosedSummary {
+        ClosedSummary {
+            attachment_id: summary.attachment_id,
+            ordinal: summary.ordinal,
+            mode: summary.mode,
+            claim_geometry: summary.claim_geometry,
+            dimensions: summary.dimensions,
+            presentation: summary.presentation,
+            terminal_profile_id: summary.terminal_profile_id.clone(),
+            granted: summary.granted.clone(),
+            attached_at_ms: summary.attached_at_ms,
+        }
+    }
+
+    /// The bytes a value goes on the wire as.
+    fn wire<T: Serialize>(value: &T) -> Vec<u8> {
+        kr_cbor::encode(&kr_cbor::to_canonical_value(value).expect("encodes"))
+    }
+
+    fn read<T: crate::wire::WireMessage>(bytes: &[u8]) -> Result<T, kr_cbor::CborError> {
+        crate::wire::decode(bytes, &kr_cbor::Limits::DEFAULT)
+    }
+
+    /// KR-REQ-08.02: a summary a worker built before reasons writes is read by this build, as one
+    /// with no reason reported, through the same decoder every answer goes through.
+    #[test]
+    fn a_summary_written_before_reasons_is_read_with_no_reason() {
+        let earlier = closed(&summary(TerminalPresentationMode::Viewport, None));
+        let read: AttachmentSummary = read(&wire(&earlier)).expect("an earlier summary reads");
+        assert_eq!(
+            read.presentation.as_ref(),
+            Some(&TerminalPresentationMode::Viewport)
+        );
+        assert_eq!(read.presentation_reason, None, "no reason was reported");
+    }
+
+    /// KR-REQ-08.02: a direct attachment has no reason to carry, and its summary goes on the wire
+    /// as exactly the bytes a summary had before reasons existed.
+    #[test]
+    fn a_direct_summary_is_written_as_it_was_before_reasons() {
+        let direct = summary(TerminalPresentationMode::Direct, None);
+        assert_eq!(wire(&direct), wire(&closed(&direct)));
+        let reread: AttachmentSummary = read(&wire(&direct)).expect("reads back");
+        assert_eq!(reread, direct);
+    }
+
+    /// KR-REQ-08.02: a viewport's summary carries its reason, and a reader whose schema was closed
+    /// before reasons existed refuses it. That reader is the one this addition breaks; a reader of
+    /// this build reads the reason back.
+    #[test]
+    fn a_projected_summary_carries_its_reason_and_a_closed_earlier_reader_refuses_it() {
+        let projected = summary(
+            TerminalPresentationMode::Viewport,
+            Some(PresentationReason::SizeMismatch),
+        );
+        let bytes = wire(&projected);
+        assert!(
+            matches!(
+                read::<ClosedSummary>(&bytes),
+                Err(kr_cbor::CborError::UnknownField { .. })
+            ),
+            "a closed earlier reader refuses the field it does not know"
+        );
+        let reread: AttachmentSummary = read(&bytes).expect("this build reads the reason");
+        assert_eq!(
+            reread.presentation_reason,
+            Some(PresentationReason::SizeMismatch)
+        );
+        for reason in PresentationReason::ALL {
+            assert_eq!(
+                serde_json::to_value(reason).expect("encodes"),
+                serde_json::json!(reason.as_str()),
+                "the wire word is the one as_str names"
+            );
+            assert!(!reason.describe().is_empty());
+        }
+    }
+
+    /// A summary is part of a write result, so it stays closed: a field this build does not declare
+    /// is refused by this build's reader too, as section 23 keeps every mutation's schema.
+    #[test]
+    fn a_field_this_build_does_not_declare_is_refused() {
+        let later = LaterSummary {
+            summary: summary(
+                TerminalPresentationMode::Viewport,
+                Some(PresentationReason::HistoryWindow),
+            ),
+            a_later_field: "something a later build knows".to_owned(),
+        };
+        assert!(matches!(
+            read::<AttachmentSummary>(&wire(&later)),
+            Err(kr_cbor::CborError::UnknownField { .. })
+        ));
     }
 }

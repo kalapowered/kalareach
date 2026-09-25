@@ -1026,6 +1026,136 @@
       ],
       "type": "object"
     },
+    "AgentInstanceEvent": {
+      "additionalProperties": false,
+      "description": "One change to a session's agent instances, as an attached view is told about it.",
+      "properties": {
+        "instance": {
+          "$ref": "#/$defs/AgentInstanceSummary",
+          "description": "What the instance is now."
+        },
+        "sequence": {
+          "$ref": "#/$defs/U64",
+          "description": "This announcement's position in the session's own count of them.\n\nA view that installed an [`AgentInstanceList`] applies the announcements whose sequence is\nabove the list's and discards the rest."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session."
+        }
+      },
+      "required": [
+        "session_id",
+        "sequence",
+        "instance"
+      ],
+      "type": "object"
+    },
+    "AgentInstanceList": {
+      "additionalProperties": false,
+      "description": "A session's live agent instances, as a view installs them.\n\nThe session keeps the list and counts its announcements under its own lock, and it announces\nunder that lock too, so every announcement is either in a list or after it: its sequence says\nwhich. A view installs the list, then applies the announcements above its sequence, and so\nholds every live instance once.",
+      "properties": {
+        "instances": {
+          "description": "Every instance of the session that has not ended, in identifier order.",
+          "items": {
+            "$ref": "#/$defs/AgentInstanceSummary"
+          },
+          "type": "array"
+        },
+        "sequence": {
+          "$ref": "#/$defs/U64",
+          "description": "The sequence of the last announcement the list includes, or zero before the first."
+        }
+      },
+      "required": [
+        "sequence",
+        "instances"
+      ],
+      "type": "object"
+    },
+    "AgentInstanceSummary": {
+      "additionalProperties": false,
+      "description": "One agent instance of a session, as the session announces it.\n\nSection 12 has a program the integrated route did not launch detected and observed rather than\ngiven a gateway after the fact, and a person watching the session needs to tell the two apart:\na launched instance can have rich bridges, and an adopted one never does. This says which it\nis, how it came to run and, where its bridges are refused, why.",
+      "properties": {
+        "application_instance_id": {
+          "$ref": "#/$defs/ApplicationInstanceId",
+          "description": "The instance."
+        },
+        "bypass": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CommandBypassReason"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why the shell ran the program as typed, where the session answered it with a bypass."
+        },
+        "ended_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When the instance ended. A view drops an ended instance from its list."
+        },
+        "mode": {
+          "$ref": "#/$defs/IntegrationMode",
+          "description": "How the program is integrated: `native_bridge` for a launch the integration made, and\n`native_terminal` for a program that was adopted."
+        },
+        "plugin_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PluginId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The plugin whose connector recognised the program, where one did."
+        },
+        "profile_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LaunchProfileId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The launch profile recorded for the program, where one was."
+        },
+        "refusal": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why the instance's bridges are refused, where they are."
+        },
+        "started_at": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the session learned the instance was running."
+        }
+      },
+      "required": [
+        "application_instance_id",
+        "plugin_id",
+        "profile_id",
+        "mode",
+        "bypass",
+        "started_at",
+        "ended_at",
+        "refusal"
+      ],
+      "type": "object"
+    },
     "AgentMutationResult": {
       "additionalProperties": false,
       "description": "What one accepted agent mutation did.",
@@ -2361,7 +2491,7 @@
     },
     "AttachmentSummary": {
       "additionalProperties": false,
-      "description": "One attachment of a session.",
+      "description": "One attachment of a session.\n\nClosed, as every object a write result reaches is: `session.attach` answers with one, and\nsection 23 keeps a mutation's schema closed for the negotiated version, so a field this build\ndoes not declare is refused rather than ignored.",
       "properties": {
         "attached_at_ms": {
           "$ref": "#/$defs/TimestampMs",
@@ -2412,6 +2542,17 @@
             }
           ],
           "description": "How the attachment displays the canonical grid."
+        },
+        "presentation_reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PresentationReason"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why a terminal attachment is shown a viewport, when it is.\n\nSection 8 asks every presentation to be reported with its reason. A direct attachment needs\nnone and an attachment that is not a terminal has no presentation, so both leave this out,\nand a direct attachment's summary is byte for byte what a client built before reasons\nexpects. A worker built before reasons leaves it out of every summary, and a reader takes\nthat as no reason reported rather than as a direct presentation: `presentation` says which\nthe attachment is."
         },
         "terminal_profile_id": {
           "anyOf": [
@@ -3531,7 +3672,7 @@
     "AuthorisationKey": {
       "contentEncoding": "base64url",
       "description": "A 32-byte Ed25519 authorisation public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
-      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$",
       "type": "string"
     },
     "AuthorisedLocation": {
@@ -4252,7 +4393,7 @@
     "Bytes": {
       "contentEncoding": "base64url",
       "description": "An opaque byte string. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
-      "pattern": "^[A-Za-z0-9_-]*$",
+      "pattern": "^([A-Za-z0-9_-]{4})*([A-Za-z0-9_-][AQgw]|[A-Za-z0-9_-]{2}[AEIMQUYcgkosw048])?$",
       "type": "string"
     },
     "CallerToken": {
@@ -7000,6 +7141,13 @@
           },
           "type": "array"
         },
+        "startup": {
+          "$ref": "#/$defs/StartupSelection",
+          "default": {
+            "controller": null
+          },
+          "description": "How this environment's control daemon is started when a command finds none running.\n\nRead by `kr new` when it finds no daemon to ask, so a change applies at the next start.\nNo environment variable reaches it."
+        },
         "version": {
           "default": 1,
           "description": "The schema version this document is written against.",
@@ -8116,6 +8264,16 @@
         "signature"
       ],
       "type": "object"
+    },
+    "ControllerStartup": {
+      "description": "One way of starting this environment's control daemon.",
+      "oneOf": [
+        {
+          "const": "standalone",
+          "description": "The standalone headless profile, for a host with no service manager to ask: a command\nthat finds no daemon running starts `kr-controller` itself, detached from the command,\nin a session of its own and with the environment's own directories. The daemon takes\nthe environment's singleton lock and advances its generation as every daemon does, so\nseveral commands starting one at once leave one daemon.",
+          "type": "string"
+        }
+      ]
     },
     "CwdRevision": {
       "description": "The revision of the root shell's working directory. It advances whenever the directory changes.",
@@ -9916,7 +10074,7 @@
     "Digest256": {
       "contentEncoding": "base64url",
       "description": "A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
-      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$",
       "type": "string"
     },
     "Dimensions": {
@@ -11219,7 +11377,7 @@
     "EndpointKey": {
       "contentEncoding": "base64url",
       "description": "A 32-byte iroh endpoint public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
-      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$",
       "type": "string"
     },
     "EnvelopeId": {
@@ -12201,6 +12359,10 @@
       "additionalProperties": false,
       "description": "The result of `events.snapshot`.\n\nEvery field is present state, not a replay: installing a snapshot emits no bell, no clipboard\nwrite, no notification and no query.",
       "properties": {
+        "agent_instances": {
+          "$ref": "#/$defs/AgentInstanceList",
+          "description": "The session's live agent instances when the snapshot was taken.\n\nA resynchronised view installs them and applies the announcements above\n[`crate::projection::AgentInstanceList::sequence`] that its stream still delivers."
+        },
         "agent_resources": {
           "$ref": "#/$defs/AgentResourceSnapshot",
           "description": "One page of the agent resources this session's host still arbitrates.\n\nA client that lost its place installs the whole session from this call, and the resources\nare part of that state: without them a resynchronised view would show the screen and none\nof the requests waiting on a person. The page named by `agent_resources_from` is returned,\nso the same call that takes the snapshot also reads the rest of it."
@@ -12245,7 +12407,8 @@
         "attachments",
         "oldest_retained_cursor",
         "taken_at_ms",
-        "agent_resources"
+        "agent_resources",
+        "agent_instances"
       ],
       "type": "object"
     },
@@ -12293,6 +12456,10 @@
       "additionalProperties": false,
       "description": "The result of `events.subscribe`.",
       "properties": {
+        "agent_instances": {
+          "$ref": "#/$defs/AgentInstanceList",
+          "description": "The session's live agent instances, read under the same lock that starts the queue.\n\nAn announcement is either in this list or among the events that follow it, and its\nsequence says which: a view applies the announcements above\n[`crate::projection::AgentInstanceList::sequence`] and discards the rest."
+        },
         "agent_resources": {
           "$ref": "#/$defs/AgentResourceSnapshot",
           "description": "The first page of the agent resources this subscription starts from.\n\nIt is taken with the subscription rather than fetched beside it, and that is what makes it\nusable: the queue this call returns begins at the same moment, so a resolution is either in\nthe state described here or in the events that follow, never in neither. A view applies the\nevents whose position is above [`AgentResourceSnapshot::cursor`] and ignores the rest.\n\nOne answer carries one bounded page of it, because a host that arbitrates a large number\nof resources would otherwise answer with a frame no peer can receive. When\n[`AgentResourceSnapshot::continue_after`] is present the rest is read with `events.snapshot`\nbefore the events are applied."
@@ -12326,7 +12493,8 @@
         "from_cursor",
         "oldest_retained_cursor",
         "gap",
-        "agent_resources"
+        "agent_resources",
+        "agent_instances"
       ],
       "type": "object"
     },
@@ -15226,7 +15394,7 @@
     "KeyId": {
       "contentEncoding": "base64url",
       "description": "A 32-byte key identifier: the SHA-256 of the domain-separated encoding of a key purpose and public key.",
-      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$",
       "type": "string"
     },
     "KeyQueueSnapshot": {
@@ -15888,7 +16056,7 @@
     "Mac256": {
       "contentEncoding": "base64url",
       "description": "A 32-byte HMAC-SHA-256 tag. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
-      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$",
       "type": "string"
     },
     "MachineId": {
@@ -16986,7 +17154,7 @@
         },
         {
           "const": "sync.compare_exchange",
-          "description": "Publish encrypted settings or draft state under a compare-and-exchange generation.",
+          "description": "Publish encrypted settings, draft state or the recovery bundle under a compare-and-exchange generation.",
           "type": "string"
         },
         {
@@ -17693,7 +17861,7 @@
             }
           ],
           "default": null,
-          "description": "The HTTP proxy the endpoint reaches its relays and Pkarr servers through, as an absolute\n`http` or `https` origin such as `http://proxy.example.com:3128`. The DNS lookup does\nnot use it. It is this machine's own choice: no invitation or host bundle carries it.\nIt names no user and no password, because a proxy that needs credentials is not\nsupported."
+          "description": "The HTTP proxy this host's outbound HTTPS goes through, as an absolute `http` or\n`https` origin such as `http://proxy.example.com:3128`: the network endpoint's relays\nand Pkarr servers, the rendezvous, delivery and webhooks, and plugin repositories.\nNothing goes around it, so an address it cannot reach fails. Name lookups and mail\nsubmission do not use it. It is this machine's own choice: no invitation or host bundle\ncarries it. It names no user and no password, because a proxy that needs credentials is\nnot supported."
         },
         "relay_only": {
           "anyOf": [
@@ -18060,7 +18228,7 @@
     "Nonce256": {
       "contentEncoding": "base64url",
       "description": "A 32-byte nonce. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
-      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$",
       "type": "string"
     },
     "Notification": {
@@ -18101,7 +18269,7 @@
     "NotificationPreviewKey": {
       "contentEncoding": "base64url",
       "description": "A 32-byte X25519 notification-preview public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
-      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$",
       "type": "string"
     },
     "NotificationState": {
@@ -21315,6 +21483,46 @@
         {
           "const": "invisible",
           "description": "Create without any local terminal attachment.",
+          "type": "string"
+        }
+      ]
+    },
+    "PresentationReason": {
+      "description": "Why a terminal attachment is shown a viewport of the canonical grid rather than the live byte\nstream.\n\nDirect presentation needs every one of these conditions to hold, and an attachment that is not\ndirect is given one reason: the first in this order that does not hold. The order runs from what\nlasts as long as the attachment stays as it is, its terminal and then its size, through where\nits window is, to the session's own state, which passes by itself: the output leaving what a\nterminal can be handed, a restoration that could not carry the screen, and forwarding waiting\nfor a parser boundary.",
+      "oneOf": [
+        {
+          "const": "no_terminal_profile",
+          "description": "The client declared no terminal profile, so what the session's output would do on its\nterminal is not known.",
+          "type": "string"
+        },
+        {
+          "const": "unqualified_terminal_profile",
+          "description": "The client declared a terminal profile this build has not qualified to take the session's\noutput unchanged.",
+          "type": "string"
+        },
+        {
+          "const": "size_mismatch",
+          "description": "The attachment's own size is not the session's canonical size.",
+          "type": "string"
+        },
+        {
+          "const": "history_window",
+          "description": "The attachment's window is above the live screen, on rows the session retained.",
+          "type": "string"
+        },
+        {
+          "const": "stream_not_carryable",
+          "description": "The session's output is no longer something a physical terminal can be handed.",
+          "type": "string"
+        },
+        {
+          "const": "restoration_incomplete",
+          "description": "The screen the attachment was last given could not carry the state the application\naddresses next.",
+          "type": "string"
+        },
+        {
+          "const": "awaiting_parser_boundary",
+          "description": "Forwarding waits for the session's output to reach a parser-ground boundary.",
           "type": "string"
         }
       ]
@@ -25369,7 +25577,7 @@
     "RelayInstanceKey": {
       "contentEncoding": "base64url",
       "description": "A 32-byte Ed25519 relay instance public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
-      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$",
       "type": "string"
     },
     "RelayInstanceRegistration": {
@@ -28050,6 +28258,20 @@
       ],
       "type": "object"
     },
+    "SealedRecoveryBundle": {
+      "additionalProperties": false,
+      "description": "The owner's recovery bundle as a service stores it: one `secretstream` object.\n\nThe stream carries its own header, so there is no nonce beside it, and no declared bucket: section\n20 lets a service see an object's size. The service holds the bytes and nothing it could open:\nthe key is derived from the recovery seed and the origin and locator the bundle is kept at.",
+      "properties": {
+        "ciphertext": {
+          "$ref": "#/$defs/Bytes",
+          "description": "The sealed bundle."
+        }
+      },
+      "required": [
+        "ciphertext"
+      ],
+      "type": "object"
+    },
     "SealedSyncObject": {
       "additionalProperties": false,
       "description": "One encrypted synchronised object as it is stored.\n\nThe service holds the nonce and the ciphertext and the declared bucket. It holds no plaintext\nfield of any kind: what an object is about is inside the encryption, and the kind beside it is\nwhat the service needs to answer a read for that kind.",
@@ -28077,7 +28299,7 @@
     "SecretBytes32": {
       "contentEncoding": "base64url",
       "description": "Thirty-two secret bytes. The Rust representation clears them when it is dropped and redacts them in diagnostics; a consumer in another language must apply its own handling, because a JSON string carries no such guarantee.",
-      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$",
       "type": "string"
     },
     "SecretReference": {
@@ -28274,7 +28496,7 @@
     "ServiceAdmissionKey": {
       "contentEncoding": "base64url",
       "description": "A 32-byte Ed25519 service admission public key, which signs relay leases. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
-      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$",
       "type": "string"
     },
     "ServiceRequestPayload": {
@@ -29316,7 +29538,7 @@
     "Signature64": {
       "contentEncoding": "base64url",
       "description": "A 64-byte Ed25519 detached signature. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
-      "pattern": "^[A-Za-z0-9_-]{86}$",
+      "pattern": "^[A-Za-z0-9_-]{85}[AQgw]$",
       "type": "string"
     },
     "SignedArchiveManifest": {
@@ -29662,10 +29884,29 @@
       ],
       "type": "object"
     },
+    "StartupSelection": {
+      "additionalProperties": false,
+      "description": "How this environment's control daemon is started when a command finds none running.\n\nSection 7 lets `kr new` start the per-user controller only on a host that was set up for\nit, and makes every other host answer `HOST_NOT_CONFIGURED` with the setup action. This is\nwhere that setup is recorded: absent unless an owner, or an installer, chose it. No request,\nprofile or environment variable reaches it, so a variable exported in one terminal cannot\nmake a command start a daemon on a host that was never set up to have one started.",
+      "properties": {
+        "controller": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ControllerStartup"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "How the control daemon is started. Absent starts none."
+        }
+      },
+      "type": "object"
+    },
     "StoredEnvelopeKey": {
       "contentEncoding": "base64url",
       "description": "A 32-byte X25519 stored-envelope public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
-      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$",
       "type": "string"
     },
     "StreamCursor": {
@@ -29969,6 +30210,11 @@
         {
           "const": "client_selection",
           "description": "A client's own selection and position: which session it was looking at and where.",
+          "type": "string"
+        },
+        {
+          "const": "recovery_bundle",
+          "description": "The owner's recovery bundle, at the stable locator the recovery kit prints.\n\nKey material a restore authenticates with the kit and reads, never authority: it grants\nnothing, and a restore that reads it recreates no host control.",
           "type": "string"
         }
       ]
@@ -34298,6 +34544,15 @@
     "agent_draft_add_attachment_result": {
       "$ref": "#/$defs/AgentDraftAddAttachmentResult"
     },
+    "agent_instance_event": {
+      "$ref": "#/$defs/AgentInstanceEvent"
+    },
+    "agent_instance_list": {
+      "$ref": "#/$defs/AgentInstanceList"
+    },
+    "agent_instance_summary": {
+      "$ref": "#/$defs/AgentInstanceSummary"
+    },
     "agent_mutation_result": {
       "$ref": "#/$defs/AgentMutationResult"
     },
@@ -35650,6 +35905,9 @@
     },
     "sealed_envelope": {
       "$ref": "#/$defs/SealedEnvelope"
+    },
+    "sealed_recovery_bundle": {
+      "$ref": "#/$defs/SealedRecoveryBundle"
     },
     "semantic_change": {
       "$ref": "#/$defs/SemanticChange"

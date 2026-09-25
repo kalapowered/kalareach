@@ -55,7 +55,7 @@ pub struct Plan {
 }
 
 /// Why a plan handed back was not consumed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum PlanRefusal {
     /// No plan with this identity is waiting: it was never made here, was cancelled, or was
     /// already consumed.
@@ -71,6 +71,8 @@ pub enum PlanRefusal {
     #[error("the collection changed after the plan was made; plan it again")]
     Stale,
 }
+
+crate::debug_as_display!(PlanRefusal);
 
 /// The plans waiting for the owner, for the life of this process.
 #[derive(Debug, Default)]

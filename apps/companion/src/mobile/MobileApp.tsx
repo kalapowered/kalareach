@@ -13,7 +13,7 @@ import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react
 
 import { useApp } from '../app/state'
 import { Toast } from '../components/ui'
-import { failureMessage } from '../host/port'
+import { failureMessage, follow } from '../host/port'
 import {
   AccountGlyph,
   AttentionGlyph,
@@ -28,7 +28,6 @@ import { Inbox } from './views/Inbox'
 import { MobileHosts, MobileSessions } from './views/Places'
 import { MobileSession } from './views/MobileSession'
 import type { Channel } from '../model/account'
-import { ask } from './model/call'
 import { useKeyboardInset, useLifecycle } from './useLifecycle'
 import { detectSurface, type Surface } from './platform'
 import './mobile.css'
@@ -92,10 +91,12 @@ export function MobileApp({
   const [place, setPlace] = useState<Place>(() =>
     placeFromAddress(typeof window === 'undefined' ? '' : window.location.search)
   )
-  const [connection, setConnection] = useState<{ connected: boolean; reason: string | null }>({
-    connected: false,
-    reason: null
-  })
+  // Where the connection stands, as the shell's first answer or a change since said it: null until
+  // then, so neither the bar nor a session claims contact or its loss before anything has answered.
+  const [connection, setConnection] = useState<{
+    readonly connected: boolean
+    readonly reason: string | null
+  } | null>(null)
   const [actionable, setActionable] = useState(0)
   const lifecycle = useLifecycle(storage)
   useKeyboardInset()
@@ -124,29 +125,23 @@ export function MobileApp({
     }
   }, [])
 
-  useEffect(() => {
-    let watching = true
-    const read = () => {
-      ask(() => port.connectionState())
-        .then((state) => {
-          if (!watching) return
+  // The connection is read once its listener is registered, so no change falls between the two.
+  // Each change native code publishes carries the state and its reason, so nothing is read again,
+  // and a change heard before the read answers is the newer one.
+  useEffect(
+    () =>
+      follow(
+        (listener) => port.onConnection(listener),
+        () => port.connectionState(),
+        (state) => {
           setConnection({ connected: state.connected, reason: state.reason })
-        })
-        .catch((failure: unknown) => {
-          if (!watching) return
+        },
+        (failure) => {
           setConnection({ connected: false, reason: failureMessage(failure) })
-        })
-    }
-    read()
-    const stop = port.subscribe((event) => {
-      const body = event.body as { kind?: string }
-      if (body.kind === 'connection') read()
-    })
-    return () => {
-      watching = false
-      stop()
-    }
-  }, [port])
+        }
+      ),
+    [port]
+  )
 
   const destinations = useMemo<readonly Destination[]>(
     () => [
@@ -215,7 +210,7 @@ export function MobileApp({
             sessionId={place.sessionId}
             surface={resolved}
             lifecycle={lifecycle}
-            connected={connection.connected}
+            connected={connection?.connected ?? null}
           />
         ) : null}
         {place.tab === 'hosts' ? <MobileHosts surface={resolved} /> : null}

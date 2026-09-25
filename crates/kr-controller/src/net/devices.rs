@@ -66,6 +66,9 @@ pub struct ClockTrust {
     distrusted: std::sync::Mutex<bool>,
     /// The wall clock this decision is about: the daemon's own.
     wall: crate::service::WallClock,
+    /// The host's clock floor, which every reading taken here is published in before anything is
+    /// decided from it.
+    floor: Arc<crate::grants::policy::UtcFloor>,
 }
 
 impl std::fmt::Debug for ClockTrust {
@@ -78,19 +81,39 @@ impl std::fmt::Debug for ClockTrust {
 }
 
 impl Default for ClockTrust {
-    /// A decision about the machine's own wall clock.
+    /// A decision about the machine's own wall clock, over a floor of this process's own.
     fn default() -> Self {
-        Self::new(crate::service::WallClock::system())
+        Self::new(
+            crate::service::WallClock::system(),
+            Arc::new(crate::grants::policy::UtcFloor::default()),
+        )
     }
 }
 
 impl ClockTrust {
-    /// A decision about `wall`, trusted until a step back says otherwise.
+    /// A decision about `wall`, trusted until a step back says otherwise, publishing every reading
+    /// in `floor`.
     #[must_use]
-    pub fn new(wall: crate::service::WallClock) -> Self {
+    pub fn new(
+        wall: crate::service::WallClock,
+        floor: Arc<crate::grants::policy::UtcFloor>,
+    ) -> Self {
         Self {
             distrusted: std::sync::Mutex::new(false),
             wall,
+            floor,
+        }
+    }
+
+    /// Publishes a reading in the host's floor and returns the moment to decide from: the floor as
+    /// the reading left it.
+    ///
+    /// The raw sample stays where rollback is detected, in the device store's mark: the floor only
+    /// moves forward, so it cannot show that the wall clock went back.
+    fn published(&self, observed: ObservedUtc) -> ObservedUtc {
+        ObservedUtc {
+            now: TimestampMs::new(self.floor.observe(observed.now.get())),
+            behind_ms: observed.behind_ms,
         }
     }
 
@@ -121,7 +144,12 @@ impl ClockTrust {
             // here and retried by whoever calls [`Self::settle`] until it lands.
             let _ = devices.note_clock_untrusted(observed.now);
         }
-        if *distrusted || devices.clock_untrusted()? {
+        // Published whatever is decided from it: a reading any process of this host took is the
+        // floor every later decision stands on.
+        let observed = self.published(observed);
+        // A boot whose clock continuity is lost has no reading anything may be decided against
+        // until the owner establishes the clock, which is a clock this host does not trust.
+        if *distrusted || devices.clock_untrusted()? || self.floor.continuity_lost() {
             return Ok(None);
         }
         Ok(Some(observed))
@@ -143,7 +171,7 @@ impl ClockTrust {
             *distrusted = true;
             let _ = devices.note_clock_untrusted(observed.now);
         }
-        Ok(observed.now)
+        Ok(self.published(observed).now)
     }
 
     /// Writes down a decision this host is holding, until the write lands.
@@ -159,7 +187,7 @@ impl ClockTrust {
         Ok(())
     }
 
-    /// Establishes the clock again, at the moment an owner authenticated.
+    /// Establishes the clock again, at the moment an owner authenticated, and returns that moment.
     ///
     /// The mark moves to that moment and the decision is cleared, in one transition: an
     /// observation taken against the old mark cannot land after it, because it would have to take
@@ -168,13 +196,14 @@ impl ClockTrust {
     /// # Errors
     ///
     /// Returns an error when the record cannot be written. The decision stands if it cannot.
-    pub fn establish(&self, devices: &DeviceDirectory) -> Result<()> {
+    pub fn establish(&self, devices: &DeviceDirectory) -> Result<TimestampMs> {
         let mut distrusted = self.held();
         // Read inside the boundary, like every other reading of this clock: the moment the owner
         // established is the moment this host is at now, not one sampled before it got here.
-        devices.trust_clock(self.wall_now())?;
+        let established = self.wall_now();
+        devices.trust_clock(established)?;
         *distrusted = false;
-        Ok(())
+        Ok(established)
     }
 
     fn held(&self) -> std::sync::MutexGuard<'_, bool> {
@@ -1538,6 +1567,64 @@ mod tests {
     use kr_protocol::ids::AuthorityRevision;
     use kr_protocol::rights::ActionRight;
     use kr_protocol::scalars::{CanonicalSet, Nullable};
+
+    /// Every reading the clock decision takes is published in the host's floor before anything is
+    /// decided from it, and the moment decided from is the floor's value, whichever process raised
+    /// it. The raw sample still decides a rollback: the floor only moves forward.
+    #[test]
+    fn a_sample_is_published_and_decided_from_the_floor() {
+        let devices = DeviceDirectory::in_memory().expect("a directory");
+        let wall = Arc::new(std::sync::atomic::AtomicU64::new(1_000_000));
+        let floor = Arc::new(crate::grants::policy::UtcFloor::at(0));
+        let trust = ClockTrust::new(
+            {
+                let wall = Arc::clone(&wall);
+                crate::service::WallClock::from_fn(move || {
+                    wall.load(std::sync::atomic::Ordering::SeqCst)
+                })
+            },
+            Arc::clone(&floor),
+        );
+        let sampled = trust
+            .sample(&devices)
+            .expect("readable")
+            .expect("a trusted clock");
+        assert_eq!(sampled.now.get(), 1_000_000);
+        assert_eq!(floor.get(), 1_000_000, "the sample is in the floor");
+
+        // Another process of the host publishes a later reading: it is the moment decided from.
+        floor.observe(1_010_000);
+        let sampled = trust
+            .sample(&devices)
+            .expect("readable")
+            .expect("a trusted clock");
+        assert_eq!(sampled.now.get(), 1_010_000);
+        assert_eq!(
+            trust.observe(&devices).expect("readable").get(),
+            1_010_000,
+            "a reading taken for a record is the floor's value too"
+        );
+
+        // The control: a step back past the tolerance still distrusts the clock, although the
+        // floor stands above the sample.
+        wall.store(1_000_000 - 60_000, std::sync::atomic::Ordering::SeqCst);
+        assert!(trust.sample(&devices).expect("readable").is_none());
+        assert_eq!(floor.get(), 1_010_000);
+    }
+
+    /// While this boot's clock continuity is lost there is no reading anything may be decided
+    /// against, whatever the wall clock says, until the owner establishes the clock.
+    #[test]
+    fn a_lost_clock_continuity_is_a_clock_this_host_does_not_trust() {
+        let devices = DeviceDirectory::in_memory().expect("a directory");
+        let floor = Arc::new(crate::grants::policy::UtcFloor::at(0));
+        let trust = ClockTrust::new(crate::service::WallClock::system(), Arc::clone(&floor));
+        assert!(trust.sample(&devices).expect("readable").is_some());
+        floor.lose_continuity();
+        assert!(trust.sample(&devices).expect("readable").is_none());
+        floor.establish_continuity();
+        assert!(trust.sample(&devices).expect("readable").is_some());
+    }
 
     fn record(byte: u8) -> DeviceRecord {
         DeviceRecord {

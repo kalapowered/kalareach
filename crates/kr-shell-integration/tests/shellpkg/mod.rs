@@ -51,9 +51,6 @@ pub const REPLY: Duration = Duration::from_secs(20);
 /// How long the step given to an editor that only reaches its queue when the reader steps lasts.
 pub const STEP: Duration = Duration::from_millis(60);
 
-/// The environment variable that turns a missing package into a failure rather than a skip.
-pub const REQUIRE: &str = "KR_REQUIRE_SHELL_PACKAGES";
-
 /// Which side of the endpoint has gone, or `None` where it is whole.
 ///
 /// A write that found the peer gone and a read that reached the end of the stream are separate
@@ -155,11 +152,16 @@ fn cache_root() -> PathBuf {
 }
 
 impl Package {
-    /// Finds the built package, or says why it is not there.
+    /// Finds this tree's own built package, or says why it is not there.
+    ///
+    /// The installation's `current` names a build, and a build is named by a digest of what it was
+    /// built from, so the build it names is this tree's only when this tree's inputs are the ones it
+    /// was built from. A build of other inputs, left by a build of another tree, is not this tree's
+    /// package, and a suite that drove it would be testing somebody else's patches.
     ///
     /// # Errors
     ///
-    /// Returns the reason a test should skip: the package has not been built here.
+    /// Returns why this tree's package is not here.
     pub fn find(kind: ShellKind) -> Result<Self, String> {
         let name = kind.as_str();
         let root = cache_root().join(name);
@@ -189,6 +191,12 @@ impl Package {
                 format!("{} has no identity record ({error})", record_path.display())
             })?)
             .map_err(|error| format!("{} does not decode ({error})", record_path.display()))?;
+        identity::this_trees(kind, &identity, &record).map_err(|reason| {
+            format!(
+                "{} names {name} {identity}, which is not this tree's package: {reason}; {how}",
+                pointer.display()
+            )
+        })?;
         let executable = PathBuf::from(
             record["shell"]["executable"]
                 .as_str()
@@ -214,25 +222,24 @@ impl Package {
         })
     }
 
-    /// Returns the package, or prints the reason and returns `None` so the test can stop.
+    /// Returns this tree's built package, for a check that drives it.
+    ///
+    /// Every check that drives a package is left out of an ordinary run, which has no packages, and
+    /// runs with `--include-ignored` where the packages have been built: continuous integration's
+    /// shell-packages job, `scripts/e2e-fence.sh` and the build box's verification. A run that
+    /// includes it has said the packages are there, so one that is not fails and says why.
     ///
     /// # Panics
     ///
-    /// Panics when [`REQUIRE`] is set, which is what continuous integration does: there the build
-    /// is a step of the same job, so an absent package is a failure rather than a skip.
+    /// Panics when this tree's package is not here.
     #[must_use]
-    pub fn found(kind: ShellKind) -> Option<Self> {
-        match Self::find(kind) {
-            Ok(package) => Some(package),
-            Err(reason) => {
-                assert!(
-                    std::env::var_os(REQUIRE).is_none(),
-                    "{REQUIRE} is set and the package is missing: {reason}"
-                );
-                println!("skipped: {reason}");
-                None
-            }
-        }
+    pub fn built(kind: ShellKind) -> Self {
+        Self::find(kind).unwrap_or_else(|reason| {
+            panic!(
+                "this check drives this tree's built {} package, which is not here: {reason}",
+                kind.as_str()
+            )
+        })
     }
 
     /// The patches the identity record names, as the handshake must declare them.
@@ -464,6 +471,39 @@ pub fn worker_decision(
     resolution.to_answer(None)
 }
 
+/// The text a shell is told for `path`, such as the endpoint it connects to.
+///
+/// The endpoint travels as text, in the shell's environment and in the contract, so a path that
+/// is not text cannot be told to a shell: a lossy copy names another path, and the shell would
+/// connect to one nothing is bound at. Such a path is refused with the reason instead.
+///
+/// # Panics
+///
+/// Panics when `path` is not UTF-8.
+#[must_use]
+pub fn told(path: &Path) -> String {
+    path.to_str()
+        .unwrap_or_else(|| {
+            panic!(
+                "{} is not UTF-8, so no shell can be told it",
+                path.display()
+            )
+        })
+        .to_owned()
+}
+
+/// The module search path a PowerShell package's host starts with: the package's own modules
+/// first, then whatever this process was given, each exactly as the system spells it.
+#[must_use]
+pub fn module_search_path(package: &Package) -> std::ffi::OsString {
+    let mut path = package.module_directory.clone().into_os_string();
+    if let Some(existing) = std::env::var_os("PSModulePath") {
+        path.push(":");
+        path.push(existing);
+    }
+    path
+}
+
 /// One live session: the worker's endpoint, the shell under a pseudo-terminal, and the frames
 /// between them.
 pub struct Session {
@@ -559,7 +599,7 @@ impl Session {
             .expect("an owner-only runtime directory");
 
         let endpoint_path = runtime.join("shell-bridge");
-        let endpoint = BridgeEndpoint::unix(endpoint_path.to_string_lossy().into_owned());
+        let endpoint = BridgeEndpoint::unix(told(&endpoint_path));
         endpoint
             .validate()
             .expect("the endpoint path fits a socket address");
@@ -587,7 +627,7 @@ impl Session {
             })
             .expect("a pseudo-terminal");
 
-        let mut command = CommandBuilder::new(package.executable.to_string_lossy().into_owned());
+        let mut command = CommandBuilder::new(&package.executable);
         match package.kind {
             ShellKind::PowerShell => {
                 // The host reads its profile and drops into its own read loop; nothing else about
@@ -595,12 +635,7 @@ impl Session {
                 command.arg("-NoLogo");
                 // The qualified editor and this module are selected before the profile runs, which
                 // is what the marked block then imports by name.
-                let mut module_path = package.module_directory.to_string_lossy().into_owned();
-                if let Some(existing) = std::env::var_os("PSModulePath") {
-                    module_path.push(':');
-                    module_path.push_str(&existing.to_string_lossy());
-                }
-                command.env("PSModulePath", module_path);
+                command.env("PSModulePath", module_search_path(package));
                 // The host's own image needs its runtime's location, which the qualification
                 // recorded from the launcher that started the host it qualified.
                 if let Some(environment) = package.record["launch"]["environment"].as_object() {
@@ -2109,9 +2144,23 @@ fn a_terminal_that_stopped_reading_ends_a_write_at_its_deadline() {
     drop(taking);
 }
 
+/// An endpoint whose path is not text is refused by name, rather than told to the shell as a
+/// lossy copy that names another path.
+#[test]
+#[should_panic(expected = "is not UTF-8, so no shell can be told it")]
+fn a_path_that_is_not_text_is_refused_rather_than_told_as_another() {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let path = PathBuf::from(std::ffi::OsString::from_vec(
+        b"/tmp/kr-shell-\xff/rt/shell-bridge".to_vec(),
+    ));
+    let _ = told(&path);
+}
+
 mod cases;
 mod commands;
 mod dialect;
+mod identity;
 mod inbox;
 mod stacks;
 

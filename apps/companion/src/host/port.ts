@@ -15,6 +15,8 @@ import type {
   Dimensions4,
   EnvironmentCapabilitiesResult,
   EnvironmentListResult,
+  EventsSnapshotParams,
+  EventsSnapshotResult,
   HostInfoResult,
   Receipt,
   SessionListResult,
@@ -125,28 +127,161 @@ export interface SettingsPane {
   readonly url: string
 }
 
-/** The rendezvous origin this device is configured with. */
-export interface RendezvousOrigin {
+/* ---- Pairing ------------------------------------------------------------------------------------
+ *
+ * This computer pairs with a host in native code. The page types a code or presses a button, and
+ * is told where the attempt has got to: never an invitation's text, a secret, a key, a transcript,
+ * a challenge or a proof. The one secret the page holds is a code a person types into its field.
+ */
+
+/** The service codes go through. */
+export interface PairingOrigin {
   readonly origin: string
   readonly host: string
   readonly is_default: boolean
 }
 
-/** What a scanned QR payload turned out to be. */
-export type ScannedCode =
+/** Which of the outcomes a person is told apart an attempt ended with. */
+export type FailureKind =
+  | 'malformed'
+  | 'device_tries_used'
+  | 'service_unreachable'
+  | 'service_not_pairing'
+  | 'no_host_answered'
+  | 'not_authenticated'
+  | 'host_tries_used'
+  | 'expired'
+  | 'timed_out'
+  | 'did_not_finish'
+  | 'declined'
+  | 'withdrawn'
+  | 'host_restarted'
+  | 'another_device_waiting'
+  | 'host_unreachable'
+  | 'host_mismatch'
+  | 'already_paired'
+  | 'not_an_invitation'
+  | 'newer_invitation'
+  | 'nothing_to_paste'
+  | 'store_failed'
+  | 'approval_unknown'
+
+/** How an attempt ended, with the tries this computer has left when it was charged. */
+export interface PairingFailure {
+  readonly kind: FailureKind
+  readonly tries_left: number | null
+}
+
+/** What a paired host is shown as. */
+export interface PairedHostView {
+  readonly name: string | null
+  readonly owner: boolean
+  /** What this computer may do there, in words. */
+  readonly authority: string
+  readonly grant_expires_at_ms: number | null
+}
+
+/** Where an attempt has got to. */
+export type AttemptState =
+  | { readonly state: 'idle' }
   | {
-      readonly mode: 'code'
-      readonly origin: RendezvousOrigin
-      readonly code: string
-      /** True when the QR names an origin other than the configured one. */
-      readonly needs_origin_confirmation: boolean
+      readonly state: 'working'
+      readonly stage: 'reaching_service' | 'checking_code' | 'reaching_host'
     }
   | {
-      readonly mode: 'direct'
-      readonly invitation_id: string
-      readonly endpoint_id: string
-      readonly expires_at_ms: string
+      readonly state: 'awaiting_approval'
+      readonly value: string
+      readonly expires_at_ms: number | null
+      readonly rights: readonly string[]
+      /** What those rights would let this computer do, in words. */
+      readonly authority: string
+      readonly grant_expires_at_ms: number | null
     }
+  | {
+      readonly state: 'reconnecting'
+      readonly value: string | null
+      readonly expires_at_ms: number | null
+    }
+  | { readonly state: 'paired'; readonly host: PairedHostView }
+  | {
+      readonly state: 'ended'
+      readonly failure: PairingFailure
+      /** How the attempt was made: a direct invitation is tried again only by pasting it again. */
+      readonly mode: 'code' | 'direct'
+      /** The service a code attempt went through, which its failures name, when known. */
+      readonly service: string | null
+    }
+
+/** What a person is shown of an invitation read from the pasteboard. */
+export interface InvitationSummary {
+  readonly mode: 'code' | 'direct'
+  readonly origin_host: string | null
+  readonly names_another_origin: boolean
+  readonly rights: readonly string[] | null
+  /** What a direct invitation's rights would let this computer do, in words. */
+  readonly authority: string | null
+  readonly grant_expires_at_ms: number | null
+  readonly expires_at_ms: number | null
+}
+
+/** One host this computer is paired with. */
+export interface HostRow {
+  readonly name: string
+  readonly owner: boolean
+  /** What this computer may do there, in words. */
+  readonly authority: string
+  readonly grant_expires_at_ms: number | null
+  readonly in_contact: boolean | null
+}
+
+/** Everything the pairing screen shows. */
+export interface PairingView {
+  readonly origin: PairingOrigin
+  readonly device_name: string
+  readonly state: AttemptState
+  readonly invitation: InvitationSummary | null
+  readonly hosts: readonly HostRow[]
+}
+
+/** What reading the pasteboard found. */
+export interface PasteView {
+  readonly invitation: InvitationSummary | null
+  readonly failure: FailureKind | null
+  readonly cleared: boolean
+  readonly declined: boolean
+}
+
+/** The ceremony this computer offers an owner. */
+export type CeremonyKind = 'touch_id' | 'password' | 'windows_hello' | 'none'
+
+/** One confirmation a host this computer owns asks for. */
+export interface ConfirmationRequest {
+  readonly reference: string
+  readonly host_name: string
+  readonly title: string
+  readonly detail: string | null
+  readonly value: string | null
+  readonly expires_at_ms: number
+  readonly checkable: boolean
+}
+
+/** The confirmations this computer's hosts ask for. */
+export interface OwnerView {
+  readonly ceremony: CeremonyKind
+  readonly requests: readonly ConfirmationRequest[]
+}
+
+/**
+ * How a review ended. `unknown` is an answer the host was sent and never acknowledged: it may have
+ * taken it, and whether it did shows in what it lists next.
+ */
+export type ReviewOutcome =
+  | 'confirmed'
+  | 'not_confirmed'
+  | 'expired'
+  | 'cannot_check'
+  | 'no_ceremony'
+  | 'unknown'
 
 /* ---- Voice ------------------------------------------------------------------------------------
  *
@@ -214,13 +349,6 @@ export interface VoiceClosure {
   readonly settled: Settled<VoiceStopResult> | null
   /** Why the host could not be told, when it could not. */
   readonly host_failure: HostError | null
-}
-
-/** What the platform's user-verification ceremony reported. */
-export interface OwnerPresence {
-  readonly verified: boolean
-  readonly mechanism: string
-  readonly reason: string
 }
 
 /** A link the backend is willing to open. */
@@ -330,6 +458,12 @@ export interface DroppedFile {
 export interface HostPort {
   /** Whether a host connection is live, and why not when it is not. */
   connectionState(): Promise<ConnectionState>
+  /**
+   * Calls `listener` with the connection's state each time native code publishes it. Resolves once
+   * the listener is registered, with the function that stops it: a state read after that cannot
+   * miss a change.
+   */
+  onConnection(listener: (state: ConnectionState) => void): Promise<() => void>
 
   hostInfo(): Promise<HostInfoResult>
   environmentList(): Promise<EnvironmentListResult>
@@ -407,6 +541,12 @@ export interface HostPort {
   storageStatus(params: unknown): Promise<unknown>
   storageObjectDelete(params: unknown, subject: SessionSubject): Promise<Settled>
 
+  /**
+   * One session as the host installs it: every attachment with how it is presented and why, who
+   * owns the size and who holds input. It carries no screen.
+   */
+  eventsSnapshot(params: EventsSnapshotParams): Promise<EventsSnapshotResult>
+  /** The projected screen a raw terminal view draws: rows of resolved cells, the cursor, the window. */
   terminalProjection(params: unknown): Promise<ProjectedScreen>
   terminalInput(params: unknown): Promise<unknown>
   attachmentViewport(params: unknown, subject: SessionSubject): Promise<Settled>
@@ -450,10 +590,36 @@ export interface HostPort {
   /** What the native call is doing right now. */
   voiceCallState(): Promise<VoiceCallState>
 
-  pairingOrigin(): Promise<RendezvousOrigin>
-  pairingSetOrigin(origin: string): Promise<RendezvousOrigin>
-  pairingScan(payload: string): Promise<ScannedCode>
-  pairingVerifyOwner(reason: string): Promise<OwnerPresence>
+  /** Everything the pairing screen shows. */
+  pairingView(): Promise<PairingView>
+  /** Changes the service codes go through, before an attempt starts. */
+  pairingSetOrigin(origin: string): Promise<PairingOrigin>
+  /** Starts pairing with a code the person typed. Native code parses it and never hands it back. */
+  pairingStartCode(code: string): Promise<void>
+  /** Reads an invitation from the pasteboard in native code, and holds it. */
+  pairingPaste(): Promise<PasteView>
+  /** Starts pairing with the invitation read from the pasteboard. */
+  pairingStartRead(): Promise<void>
+  /** Ends the attempt on this computer, or drops a pasted invitation. */
+  pairingStop(): Promise<void>
+  /**
+   * Tells `listener` each time the pairing screen's state changes. Resolves, with the function
+   * that stops it, once the listener is registered: nothing published before then reaches it.
+   */
+  onPairing(listener: (view: PairingView) => void): Promise<() => void>
+
+  /** The confirmations this computer's hosts ask for. */
+  ownerConfirmations(): Promise<OwnerView>
+  /**
+   * Reviews one confirmation: native code checks it, the platform's own ceremony asks the person,
+   * and only a confirmed ceremony signs it. The page names the reference and nothing else.
+   */
+  ownerConfirmationReview(reference: string): Promise<ReviewOutcome>
+  /**
+   * Tells `listener` each time the confirmations change. Resolves, with the function that stops
+   * it, once the listener is registered: nothing published before then reaches it.
+   */
+  onConfirmations(listener: (view: OwnerView) => void): Promise<() => void>
 
   openExternal(url: string): Promise<ApprovedLink>
   importRemoteImage(url: string): Promise<ImportedImage>
@@ -498,14 +664,157 @@ export interface HostPort {
   /** The account's usage, and nothing about money. */
   accountUsage(): Promise<UsageView>
 
-  /** Where the device stands, each time it changes by itself. The returned function unsubscribes. */
-  onAccount(listener: (view: AccountView) => void): () => void
+  /**
+   * Tells `listener` where the device stands each time that changes by itself. Resolves, with the
+   * function that stops it, once the listener is registered: nothing published before then
+   * reaches it.
+   */
+  onAccount(listener: (view: AccountView) => void): Promise<() => void>
 
-  /** Subscribes to the host's events. The returned function unsubscribes. */
-  subscribe(listener: (event: HostEvent) => void): () => void
+  /**
+   * Tells `listener` each event the host publishes. Resolves, with the function that stops it,
+   * once the listener is registered: nothing published before then reaches it. The connection's
+   * own changes are `onConnection`'s.
+   */
+  subscribe(listener: (event: HostEvent) => void): Promise<() => void>
 
-  /** The files the platform handed this window, as they are dropped. */
-  onFilesDropped(listener: (files: readonly DroppedFile[]) => void): () => void
+  /**
+   * Tells `listener` the files the platform hands this window, as they are dropped. Resolves, with
+   * the function that stops it, once the listener is registered.
+   */
+  onFilesDropped(listener: (files: readonly DroppedFile[]) => void): Promise<() => void>
+}
+
+/**
+ * A view's listeners, from their registration until they stop, and the reads made meanwhile.
+ *
+ * A view reads the state its listeners follow only while every one of them is registered, so no
+ * change they would hear can fall between a read and them, and it shows a read's answer only while
+ * the watch runs and no newer read has been started. `read` holds a view to both: it starts nothing
+ * before every listener is registered or once the watch has ended, and it answers the check each
+ * answer is shown under.
+ */
+export interface Watch {
+  /** Ends the watch: every listener stops, and no read started in it is answered after this. */
+  readonly stop: () => void
+  /**
+   * Starts a read. Until every listener is registered, and once the watch has ended, there is none
+   * to start and this answers null. Otherwise it answers a check that stays true while this is the
+   * newest read started and the watch has not ended.
+   */
+  readonly read: () => (() => boolean) | null
+}
+
+/**
+ * Listens, and then reads.
+ *
+ * Every listener the port offers resolves once it is registered. This registers all of
+ * `registrations` and, once every one of them is, calls `listening`, where a view starts its first
+ * read. `stop` stops them all, including one whose registration completes after it, and `listening`
+ * is never called after it. The first registration that fails ends the watch at once, as `stop`
+ * does, and goes to `failed`.
+ */
+export function watch(
+  registrations: readonly Promise<() => void>[],
+  listening: () => void = () => undefined,
+  failed: (failure: unknown) => void = () => undefined
+): Watch {
+  let stage: 'registering' | 'listening' | 'ended' = 'registering'
+  let unregistered = registrations.length
+  let newest = 0
+  const stops: (() => void)[] = []
+  const stop = () => {
+    stage = 'ended'
+    for (const each of stops.splice(0)) each()
+  }
+  const registered = () => {
+    if (stage !== 'registering') return
+    stage = 'listening'
+    listening()
+  }
+  if (unregistered === 0) void Promise.resolve().then(registered)
+  for (const registration of registrations) {
+    void registration.then(
+      (unlisten) => {
+        if (stage === 'ended') {
+          unlisten()
+          return
+        }
+        stops.push(unlisten)
+        unregistered -= 1
+        if (unregistered === 0) registered()
+      },
+      (failure: unknown) => {
+        if (stage === 'ended') return
+        stop()
+        failed(failure)
+      }
+    )
+  }
+  return {
+    stop,
+    read: () => {
+      if (stage !== 'listening') return null
+      newest += 1
+      const started = newest
+      return () => stage === 'listening' && started === newest
+    }
+  }
+}
+
+/**
+ * Follows one state whose every change carries the state itself.
+ *
+ * `listen` registers for its changes and `read` asks for it once that registration is complete,
+ * so no change falls between the two. `show` is given every change heard, and the read's answer
+ * only when no change was heard first: a change heard before the answer is at least as new as it.
+ * `failed` is given a failure to register or to read, on the same terms. The returned function
+ * stops following, including a registration that completes after it was called.
+ */
+export function follow<T>(
+  listen: (listener: (value: T) => void) => Promise<() => void>,
+  read: () => Promise<T>,
+  show: (value: T) => void,
+  failed: (failure: unknown) => void
+): () => void {
+  let stopped = false
+  let heard = false
+  const following: Watch = watch(
+    [
+      listen((value) => {
+        if (stopped) return
+        heard = true
+        show(value)
+      })
+    ],
+    () => {
+      const current = following.read()
+      if (current === null) return
+      const answered = (settle: () => void) => {
+        if (current() && !heard) settle()
+      }
+      // A port can refuse before it returns a promise; that refusal is an answer like any other.
+      void (async () => {
+        try {
+          const value = await read()
+          answered(() => {
+            show(value)
+          })
+        } catch (failure: unknown) {
+          answered(() => {
+            failed(failure)
+          })
+        }
+      })()
+    },
+    (failure) => {
+      if (!heard) failed(failure)
+    }
+  )
+  return () => {
+    stopped = true
+    following.stop()
+  }
 }
 
 /** One row of the projected screen, as the raw view draws it. */
@@ -572,11 +881,13 @@ export function isHostError(value: unknown): value is HostError {
   )
 }
 
-/** The message to show for a failure, whatever shape it arrived in. */
+/**
+ * The message to show for a failure, whatever shape it arrived in, and never an empty one: a
+ * failure that came with no words of its own is still a failure, and says so in these.
+ */
 export function failureMessage(value: unknown): string {
-  if (isHostError(value)) return value.message
-  if (value instanceof Error) return value.message
-  return 'Something went wrong.'
+  const own = isHostError(value) || value instanceof Error ? value.message : ''
+  return own.trim().length > 0 ? own : 'Something went wrong.'
 }
 
 /** The protocol code of a failure, or null when it did not carry one. */

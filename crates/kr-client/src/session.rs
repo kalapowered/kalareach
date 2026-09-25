@@ -44,12 +44,26 @@ use crate::transport::ControlTransport;
 pub const EVENT_BUFFER: usize = 1024;
 
 /// What the host answered one request with.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 enum Answer {
     /// A read's response.
     Response(Response),
     /// A mutation's receipt.
     Receipt(Box<Receipt>),
+}
+
+impl std::fmt::Debug for Answer {
+    /// Which kind of answer it is and, for a receipt, the action and its state; never a result.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Response(_) => formatter.write_str("Response(..)"),
+            Self::Receipt(receipt) => formatter
+                .debug_struct("Receipt")
+                .field("action_id", &receipt.action_id)
+                .field("state", &receipt.state)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 /// How the host settled one mutation.
@@ -60,12 +74,26 @@ enum Answer {
 /// receipt carries the action's durable execution state, which is what a caller asks about when it
 /// does not know whether its action happened. A host sends whichever it has; this names which
 /// arrived rather than making a caller guess.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum Settled {
     /// The host answered with the method's own result.
     Result(ParamsValue),
     /// The host answered with a receipt for the action.
     Receipt(Box<Receipt>),
+}
+
+impl std::fmt::Debug for Settled {
+    /// Which kind of settlement it is and, for a receipt, the action and its state; never a result.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Result(_) => formatter.write_str("Result(..)"),
+            Self::Receipt(receipt) => formatter
+                .debug_struct("Receipt")
+                .field("action_id", &receipt.action_id)
+                .field("state", &receipt.state)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 impl Settled {
@@ -100,16 +128,14 @@ impl Settled {
     {
         match self {
             Self::Result(value) => Ok(value.to_typed()?),
-            Self::Receipt(receipt) => {
-                Err(ClientError::Host(kr_protocol::error::ProtocolError::new(
-                    kr_protocol::error::ErrorCode::OutcomeUnknown,
-                    format!(
-                        "action {} is {} and has no result yet",
-                        receipt.action_id,
-                        receipt.state.as_str()
-                    ),
-                )))
-            }
+            Self::Receipt(receipt) => Err(ClientError::refusal(
+                kr_protocol::error::ErrorCode::OutcomeUnknown,
+                crate::shown!(
+                    "action {} is {} and has no result yet",
+                    receipt.action_id,
+                    receipt.state.as_str()
+                ),
+            )),
         }
     }
 }
@@ -207,11 +233,13 @@ impl Outcomes {
         let unknown = self.submitted.contains_key(&action_id);
         let receipted = self.receipts.get(&action_id).is_some();
         if unknown || receipted {
-            return Err(ClientError::Host(kr_protocol::error::ProtocolError::new(
+            return Err(ClientError::refusal(
                 kr_protocol::error::ErrorCode::InvalidArgument,
-                "that action is one this client is still accounting for, so it cannot carry \
+                crate::shown::Shown::said(
+                    "that action is one this client is still accounting for, so it cannot carry \
                  another request",
-            )));
+                ),
+            ));
         }
         Ok(())
     }
@@ -495,10 +523,10 @@ impl Session {
                 Outcome::Ok(value) => Ok(Ok(value)),
                 Outcome::Error(error) => Ok(Err(error)),
             },
-            Answer::Receipt(_) => Err(ClientError::Host(kr_protocol::error::ProtocolError::new(
+            Answer::Receipt(_) => Err(ClientError::refusal(
                 kr_protocol::error::ErrorCode::InvalidArgument,
-                "a read was answered with a receipt",
-            ))),
+                crate::shown::Shown::said("a read was answered with a receipt"),
+            )),
         }
     }
 
@@ -772,9 +800,9 @@ impl Session {
         params: &kr_protocol::input::InputWriteParams,
     ) -> Result<kr_protocol::input::InputWriteResult> {
         let entry = Method::InputWrite.entry();
-        debug_assert_eq!(
-            entry.idempotency,
-            kr_protocol::authority::IdempotencyBehaviour::OrderedStream
+        debug_assert!(
+            entry.idempotency == kr_protocol::authority::IdempotencyBehaviour::OrderedStream,
+            "input is written as an ordered stream"
         );
         let request_id = self.next_request_id();
         let waiter = self.register(request_id)?;
@@ -790,10 +818,10 @@ impl Session {
                 Outcome::Ok(value) => Ok(value.to_typed()?),
                 Outcome::Error(error) => Err(ClientError::from(error)),
             },
-            Answer::Receipt(_) => Err(ClientError::Host(kr_protocol::error::ProtocolError::new(
+            Answer::Receipt(_) => Err(ClientError::refusal(
                 kr_protocol::error::ErrorCode::InvalidArgument,
-                "raw input is an ordered stream and receives no receipt",
-            ))),
+                crate::shown::Shown::said("raw input is an ordered stream and receives no receipt"),
+            )),
         }
     }
 
@@ -895,7 +923,9 @@ struct Waiter {
 
 impl Waiter {
     async fn wait(mut self) -> Result<Answer> {
-        let receiver = self.receiver.take().expect("a waiter waits once");
+        let Some(receiver) = self.receiver.take() else {
+            unreachable!("a waiter waits once");
+        };
         receiver.await.map_err(|_| ClientError::ConnectionEnded)
     }
 }
@@ -1027,4 +1057,46 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) -> bool {
         | ControlFrame::AttentionBarrierAcknowledged(_) => return false,
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::rendering::{NEVER_RENDERED, renders_only};
+
+    fn receipt() -> Receipt {
+        Receipt {
+            action_id: ActionId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16])),
+            actor_id: kr_protocol::ids::ActorId::new("device:test").expect("a principal"),
+            method: Method::SessionCreate.into(),
+            method_version: kr_protocol::method::MethodVersion::V1,
+            revision: kr_protocol::scalars::U64::new(2),
+            state: kr_protocol::receipt::ReceiptState::Dispatching,
+            reason: Nullable::null(),
+            payload_digest: kr_protocol::scalars::Digest256::from_bytes([0; 32]),
+            accepted_deadline_ms: Nullable::null(),
+            error: Nullable::null(),
+            updated_at_ms: kr_protocol::scalars::TimestampMs::new(0),
+        }
+    }
+
+    /// An answer and a settlement render which kind they are and, for a receipt, the action and
+    /// its state, exactly: never a result a host sent.
+    #[test]
+    fn an_answer_and_a_settlement_render_only_their_kind_and_the_receipts_place() {
+        let result =
+            ParamsValue::from_typed(&BTreeMap::from([("text", NEVER_RENDERED)])).expect("a result");
+        let receipt_rendered = "Receipt{action_id:ActionId(Uuid(\
+                                01010101-0101-0101-0101-010101010101)),state:Dispatching,..}";
+        renders_only(&Settled::Result(result.clone()), "Result(..)");
+        renders_only(&Settled::Receipt(Box::new(receipt())), receipt_rendered);
+        renders_only(
+            &Answer::Response(kr_protocol::envelope::Response {
+                request_id: RequestId::new(1),
+                outcome: kr_protocol::envelope::Outcome::Ok(result),
+            }),
+            "Response(..)",
+        );
+        renders_only(&Answer::Receipt(Box::new(receipt())), receipt_rendered);
+    }
 }

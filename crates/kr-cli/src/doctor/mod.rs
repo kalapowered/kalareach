@@ -18,6 +18,8 @@
 pub mod bundle;
 pub mod configuration;
 
+use kr_client::shown;
+use kr_client::shown::Shown;
 use kr_protocol::hostinfo::{
     DoctorStatus, EffectiveConfiguration, HostDoctorResult, HostInfoResult,
 };
@@ -285,9 +287,18 @@ pub async fn content_export(
         .map_err(CliError::Ipc)?
         .map_err(CliError::Refused)?
         .to_typed()
-        .map_err(|error| CliError::Other(error.to_string()))?;
-    let bytes = serde_json::to_vec_pretty(&listed)
-        .map_err(|error| CliError::Other(format!("this export could not be written: {error}")))?;
+        .map_err(|error| {
+            CliError::Other(shown!(
+                "the host's session list could not be read: {}",
+                Shown::cbor(&error)
+            ))
+        })?;
+    let bytes = serde_json::to_vec_pretty(&listed).map_err(|error| {
+        CliError::Other(shown!(
+            "this export could not be written: {}",
+            Shown::json(&error)
+        ))
+    })?;
     use kr_protocol::hostinfo::export::Sentence;
 
     Ok(vec![bundle::Content {

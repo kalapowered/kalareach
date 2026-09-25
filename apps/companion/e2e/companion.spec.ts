@@ -11,6 +11,8 @@
 
 import { expect, test, type Page } from '@playwright/test'
 
+import { terminalAttachment } from '../src/terminal/modes'
+
 import { PRESENTATION_DEADLINE } from './bounds'
 
 /** Where a screenshot for the evidence goes. */
@@ -187,6 +189,177 @@ test.describe('the semantic view', () => {
   })
 })
 
+test.describe('reading once it is listening', () => {
+  /** Where a screenshot for this browser goes, so each engine keeps its own. */
+  const shotFor = (name: string): string => shot(`${name}-${test.info().project.name}`)
+
+  // KR-REQ-13.11: the surface is read at one prompt generation and answers after the prompt has
+  // moved on, so the buttons it draws are disabled.
+  test('draws the launch buttons disabled when the prompt moved before the surface answered', async ({
+    page
+  }) => {
+    await open(page)
+    const held = await page.evaluateHandle(() => {
+      const host = window.krTestHost
+      if (!host) throw new Error('the harness has no scripted host')
+      return host.hold('launchSurface')
+    })
+    await page.getByRole('button', { name: 'Sessions' }).click()
+    await page.getByTestId('session-row-1').click()
+    await page.getByTestId('conversation').waitFor()
+    await expect.poll(() => held.evaluate((reads) => reads.count)).toBe(1)
+
+    await page.evaluate(() => {
+      window.krTestHost?.changePromptGeneration()
+    })
+    await held.evaluate((reads) => {
+      reads.release()
+    })
+
+    const surface = page.getByTestId('launch-surface')
+    await expect(page.getByTestId('launch-stale')).toBeVisible()
+    await expect(surface.getByRole('button', { name: /Codex/ })).toBeDisabled()
+    await page.screenshot({ path: shotFor('launch-13.11-overtaken'), fullPage: true })
+  })
+
+  // KR-REQ-13.02: before its first answer the session view claims nothing: no lost contact and no
+  // launch button.
+  test('the session view claims nothing before its first answer', async ({ page }) => {
+    await open(page)
+    const complete = await page.evaluateHandle(() => {
+      const host = window.krTestHost
+      if (!host) throw new Error('the harness has no scripted host')
+      return host.holdRegistrations()
+    })
+    await page.getByRole('button', { name: 'Sessions' }).click()
+    await page.getByTestId('session-row-1').click()
+    await page.getByTestId('conversation').waitFor()
+
+    await expect(page.getByText('Not in contact with this host')).toHaveCount(0)
+    await expect(page.getByTestId('launch-surface')).toHaveCount(0)
+    await page.screenshot({ path: shotFor('session-13.02-before-answer'), fullPage: true })
+
+    await complete.evaluate((done) => {
+      done()
+    })
+    await expect(page.getByText('Session 1 · Waiting for you')).toBeVisible()
+    await expect(page.getByTestId('launch-surface')).toBeVisible()
+    await expect(page.getByText('Not in contact with this host')).toHaveCount(0)
+  })
+
+  // KR-REQ-13.02: the phone's shell, its inbox and its account, before and after their first
+  // answers. The shell registers as the page loads, so the registrations are held from then.
+  test('the phone claims nothing before its first answers', async ({ page }) => {
+    await page.addInitScript(() => {
+      let host: unknown
+      Object.defineProperty(window, 'krTestHost', {
+        configurable: true,
+        get: () => host,
+        set: (controls: { holdRegistrations: () => () => void }) => {
+          host = controls
+          ;(window as unknown as { krRegistered: () => void }).krRegistered =
+            controls.holdRegistrations()
+        }
+      })
+    })
+    await page.goto('/harness.html?surface=ios')
+    const connection = page.locator('.m-connection')
+
+    // Neither contact nor its loss: the bar says it is checking, with no dot to colour.
+    await expect(connection).toHaveText('Checking the connection…')
+    await expect(connection.locator('.status-dot')).toHaveCount(0)
+    await expect(page.getByText('Reading the inbox…')).toBeVisible()
+    await page.screenshot({ path: shotFor('phone-13.02-before-answer'), fullPage: true })
+    await page.getByRole('button', { name: /^Account/ }).click()
+    await expect(page.getByTestId('account-panel')).toHaveAttribute('aria-busy', 'true')
+    await expect(page.getByRole('button', { name: 'Sign in' })).toHaveCount(0)
+    await page.screenshot({ path: shotFor('phone-account-before-answer'), fullPage: true })
+
+    await page.evaluate(() => {
+      ;(window as unknown as { krRegistered: () => void }).krRegistered()
+    })
+    await expect(connection).toHaveText('In contact with this host')
+    await expect(page.getByRole('button', { name: 'Sign in' })).toBeVisible()
+    await page.getByRole('button', { name: /^Attention/ }).click()
+    await expect(page.locator('[data-attention="a-2"]')).toBeVisible()
+    await page.screenshot({ path: shotFor('phone-13.02-after-answer'), fullPage: true })
+  })
+})
+
+test.describe('nothing claimed before the first answer', () => {
+  /** Where a screenshot for this browser goes, so each engine keeps its own. */
+  const shotFor = (name: string): string => shot(`${name}-${test.info().project.name}`)
+
+  /**
+   * Holds the shell's first connection read from the moment the scripted host exists, before the
+   * page has asked anything, and keeps the held read where the test can answer it.
+   */
+  async function holdFirstConnectionRead(page: Page): Promise<void> {
+    await page.addInitScript(() => {
+      let host: unknown
+      Object.defineProperty(window, 'krTestHost', {
+        configurable: true,
+        get: () => host,
+        set: (controls: { hold: (read: string) => unknown }) => {
+          host = controls
+          ;(window as unknown as { krHeldConnection: unknown }).krHeldConnection =
+            controls.hold('connectionState')
+        }
+      })
+    })
+  }
+
+  /** Answers the held connection read. */
+  async function answerConnection(page: Page): Promise<void> {
+    await page.evaluate(() => {
+      ;(window as unknown as { krHeldConnection: { release: () => void } }).krHeldConnection.release()
+    })
+  }
+
+  for (const [label, size] of [
+    ['desktop', { width: 1280, height: 800 }],
+    ['phone-width', { width: 390, height: 844 }]
+  ] as const) {
+    // KR-REQ-13.02: the desktop bar says neither "connected" nor "not in contact" before the shell
+    // has answered; it says it is checking, with no dot.
+    test(`the desktop bar claims nothing before its first answer, at ${label} width`, async ({ page }) => {
+      await page.setViewportSize(size)
+      await holdFirstConnectionRead(page)
+      await open(page)
+      const connection = page.locator('.topbar .connection')
+
+      await expect(connection).toHaveText('Checking the connection…')
+      await expect(connection.locator('.status-dot')).toHaveCount(0)
+      await page.screenshot({ path: shotFor(`desktop-13.02-before-answer-${label}`), fullPage: true })
+
+      await answerConnection(page)
+      await expect(connection).toHaveText('Connected to this machine')
+      await expect(connection.locator('.status-dot')).toHaveCount(1)
+    })
+  }
+
+  // KR-REQ-13.02: a phone session opened from a notification claims no loss of contact before the
+  // shell has answered, and neither does the bar above it.
+  test('a phone session opened from a notification claims nothing before its first answer', async ({
+    page
+  }) => {
+    await page.setViewportSize({ width: 390, height: 844 })
+    await holdFirstConnectionRead(page)
+    await page.goto('/harness.html?surface=ios&session=8a7b6c50-22bb-4c3d-8e4f-000000000101')
+    await expect(page.getByLabel('Message this session')).toBeVisible()
+    const connection = page.locator('.m-connection')
+
+    await expect(connection).toHaveText('Checking the connection…')
+    await expect(connection.locator('.status-dot')).toHaveCount(0)
+    await expect(page.getByText('Not in contact with this host')).toHaveCount(0)
+    await page.screenshot({ path: shotFor('phone-session-13.02-before-answer'), fullPage: true })
+
+    await answerConnection(page)
+    await expect(connection).toHaveText('In contact with this host')
+    await expect(page.getByText('Not in contact with this host')).toHaveCount(0)
+  })
+})
+
 test.describe('closing a session', () => {
   test('says what closing does before it is committed', async ({ page }) => {
     await openSession(page)
@@ -302,6 +475,84 @@ test.describe('the raw terminal', () => {
   })
 })
 
+test.describe('how the host presents a raw view', () => {
+  const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+  const VIEW = terminalAttachment(SESSION_MAIN)
+
+  /** Where a screenshot for this browser goes, so each engine keeps its own. */
+  const shotFor = (name: string): string => shot(`${name}-${test.info().project.name}`)
+
+  /** Opens the harness in one colour mode, whatever the system's. */
+  async function inTheme(page: Page, theme: 'light' | 'dark'): Promise<void> {
+    await page.addInitScript((mode) => {
+      localStorage.setItem('kalareach-theme', mode)
+    }, theme)
+  }
+
+  for (const theme of ['light', 'dark'] as const) {
+    // KR-REQ-08.02: the desktop raw view says it is a viewport, and why, in the host's words.
+    test(`the desktop raw view says how it is presented and why, ${theme}, at 320 px`, async ({
+      page
+    }) => {
+      await inTheme(page, theme)
+      await openSession(page)
+      await page.evaluate((view) => {
+        window.krTestHost?.presentAttachment(view, 'viewport', 'size_mismatch')
+      }, VIEW)
+      await page.getByRole('tab', { name: 'Terminal' }).click()
+      await page.setViewportSize({ width: 320, height: 720 })
+
+      await expect(page.getByTestId('terminal-presentation')).toHaveText(
+        "This view is shown a viewport because its size is not the session's."
+      )
+      await expect(page.locator('html')).toHaveAttribute('data-theme', theme)
+      await page.screenshot({
+        path: shotFor(`terminal-presentation-08.02-desktop-320-${theme}`),
+        fullPage: true
+      })
+    })
+
+    // KR-REQ-08.02: the phone's raw view says the same, in the same words.
+    test(`the phone's raw view says how it is presented and why, ${theme}, at 320 px`, async ({
+      page
+    }) => {
+      await inTheme(page, theme)
+      await page.setViewportSize({ width: 320, height: 720 })
+      await page.goto(`/harness.html?surface=ios&session=${SESSION_MAIN}`)
+      await page.evaluate((view) => {
+        window.krTestHost?.presentAttachment(view, 'viewport', 'no_terminal_profile')
+      }, VIEW)
+      await page.getByRole('tab', { name: 'Terminal' }).click()
+
+      await expect(page.getByTestId('terminal-presentation')).toHaveText(
+        "This view is shown a viewport because its client declared no terminal profile, so what the session's output would do on its terminal is not known."
+      )
+      await expect(page.locator('html')).toHaveAttribute('data-theme', theme)
+      await page.screenshot({
+        path: shotFor(`terminal-presentation-08.02-phone-320-${theme}`),
+        fullPage: true
+      })
+    })
+  }
+
+  // KR-REQ-08.02: a direct view shows no reason, and once its window moves above the live screen
+  // it reads the snapshot again and gives the reason then in force.
+  test('a direct view gives the reason for a viewport once its window moves', async ({ page }) => {
+    await openSession(page)
+    await page.getByRole('tab', { name: 'Terminal' }).click()
+    const presentation = page.getByTestId('terminal-presentation')
+    await expect(presentation).toHaveText("This view is shown the session's output directly.")
+
+    await page.getByRole('tab', { name: 'View' }).click()
+    await page.getByTestId('terminal-surface').hover()
+    await page.mouse.wheel(0, 120)
+    await expect(presentation).toHaveText(
+      'This view is shown a viewport because its window is above the live screen.'
+    )
+    await page.screenshot({ path: shotFor('terminal-presentation-08.02-moved'), fullPage: true })
+  })
+})
+
 test.describe('packages', () => {
   test('searches the catalogue with no network and says so', async ({ page }) => {
     await open(page)
@@ -316,39 +567,132 @@ test.describe('packages', () => {
 })
 
 test.describe('pairing', () => {
-  test('shows the origin, and confirms a hostname before switching to it', async ({ page }) => {
+  test('pairs from a typed code, shows the value, and names the service first', async ({
+    page
+  }) => {
     await open(page)
-    await page.getByRole('button', { name: 'Add a device' }).click()
-    await expect(page.getByTestId('rendezvous-origin')).toHaveText('https://rendezvous.kala.to')
-    await expect(page.getByTestId('change-origin')).toBeVisible()
+    await page.getByRole('button', { name: 'Pair with a host' }).click()
+    await expect(page.getByRole('heading', { name: 'Pair with a host' })).toBeVisible()
+    await expect(page.getByTestId('pairing-service')).toHaveText('reach.kala.to')
+    await expect(page.getByTestId('change-service')).toBeVisible()
     await page.screenshot({ path: shot('pairing-10.18'), fullPage: true })
 
-    // A scanned payload pasted into the code field is read the same way a camera scan is.
-    await page.getByTestId('code-input').fill(
-      JSON.stringify({
-        version: 1,
-        mode: 'code',
-        rendezvous_origin: 'https://pair.example.org',
-        code: 'KALA4821xy'
+    await page.getByLabel('Pairing code').fill('aB3x-Yz7-9Qw')
+    await page.getByTestId('pair').click()
+    await expect(page.getByTestId('pairing-status')).toHaveText('Reaching the pairing service')
+    await page.evaluate(() => {
+      window.krTestHost?.setPairing({
+        state: {
+          state: 'awaiting_approval',
+          value: 'f3c1 46fd',
+          expires_at_ms: Date.now() + 5 * 60_000,
+          rights: ['session.view'],
+          authority: 'view sessions',
+          grant_expires_at_ms: null
+        }
       })
-    )
-    await expect(page.getByTestId('scanned-origin-host')).toHaveText('pair.example.org')
-    await expect(page.getByTestId('rendezvous-origin')).toHaveText('https://rendezvous.kala.to')
+    })
+    await expect(page.getByRole('heading', { name: 'Check this value on the host' })).toBeFocused()
+    await expect(page.getByTestId('verification-value')).toContainText('f3c1')
+    await page.screenshot({ path: shot('pairing-value-10.37'), fullPage: true })
+  })
+
+  test('says a pasted text that is not an invitation is not one', async ({ page }) => {
+    await open(page)
+    await page.getByRole('button', { name: 'Pair with a host' }).click()
+    await page.evaluate(() => {
+      window.krTestHost?.setPasteboard({
+        invitation: null,
+        failure: 'not_an_invitation',
+        cleared: false,
+        declined: false
+      })
+    })
+    await page.getByTestId('paste-invitation').click()
+    await expect(page.getByTestId('paste-failure')).toHaveText('That is not a KalaReach invitation.')
     await page.screenshot({ path: shot('pairing-10.17'), fullPage: true })
+  })
+
+  test('an owner confirmation heads Attention and is left to this computer to review', async ({
+    page
+  }) => {
+    await open(page)
+    await page.evaluate(() => {
+      window.krTestHost?.setConfirmations({
+        ceremony: 'touch_id',
+        requests: [
+          {
+            reference: 'request-1',
+            host_name: 'studio',
+            title: 'Pair a new device',
+            detail: 'studio will let pixel-8 view sessions, for 1 hour.',
+            value: 'f3c1 46fd',
+            expires_at_ms: Date.now() + 120_000,
+            checkable: true
+          },
+          {
+            reference: 'request-2',
+            host_name: 'build-box',
+            title: 'Confirm a request from build-box',
+            detail: null,
+            value: null,
+            expires_at_ms: Date.now() + 90_000,
+            checkable: false
+          }
+        ]
+      })
+    })
+    const rows = page.getByTestId('confirmation-row')
+    await expect(rows).toHaveCount(2)
+    await expect(page.getByRole('heading', { name: 'Your hosts need your confirmation' })).toBeVisible()
+    await expect(rows.nth(0).getByTestId('confirm-request')).toHaveText('Confirm with Touch ID')
+    await expect(rows.nth(1).getByTestId('cannot-check')).toBeVisible()
+    await expect(rows.nth(1).getByTestId('confirm-request')).toHaveCount(0)
+    await page.screenshot({
+      path: shot('owner-confirmations-10.06'),
+      fullPage: true,
+      animations: 'disabled'
+    })
+
+    await rows.nth(0).getByTestId('confirm-request').click()
+    await expect(page.locator('.toast')).toContainText('Confirmed. studio can go ahead.')
+    await expect(rows).toHaveCount(1)
+    expect(await page.evaluate(() => window.krTestHost?.reviewed ?? [])).toEqual(['request-1'])
+
+    await rows.nth(0).getByTestId('not-now').click()
+    await expect(page.getByTestId('confirmations')).toHaveCount(0)
   })
 })
 
 test.describe('a control that commits on a completed action', () => {
-  // KR-REQ-13.07: in the engine, a key commits the owner confirmation on its release and no click
+  // KR-REQ-13.07: in the engine, a key commits an owner's confirmation on its release and no click
   // follows it, so nothing is left waiting for one; a click that counts no press, as WebKit's
   // accessibility activation and a script's `click()` send, then commits it; and the click the
-  // engine sends after a pointer's release counts that press. Every commit shows a toast of its
-  // own, so a new toast is a commit.
+  // engine sends after a pointer's release counts that press. Every commit asks native code for a
+  // review, which this host answers "not confirmed" with a toast of its own and the request left
+  // in place, so a new toast is a commit.
   test('a key commit leaves nothing behind that a click without a press meets', async ({ page }) => {
     for (const key of ['Enter', 'Space']) {
       await open(page)
-      await page.getByRole('button', { name: 'Add a device' }).click()
-      const confirm = page.getByTestId('verify-owner')
+      await page.evaluate(() => {
+        window.krTestHost?.setReviewOutcome('not_confirmed')
+        window.krTestHost?.setConfirmations({
+          ceremony: 'touch_id',
+          requests: [
+            {
+              reference: 'request-1',
+              host_name: 'studio',
+              title: 'Pair a new device',
+              detail: null,
+              value: 'f3c1 46fd',
+              expires_at_ms: Date.now() + 120_000,
+              checkable: true
+            }
+          ]
+        })
+      })
+      const confirm = page.getByTestId('confirm-request')
+      await expect(confirm).toHaveText('Confirm with Touch ID')
       await confirm.evaluate((element) => {
         const counts: number[] = []
         element.addEventListener('click', (event) => {
@@ -360,10 +704,11 @@ test.describe('a control that commits on a completed action', () => {
         page.evaluate(() => (window as unknown as { krClickCounts: number[] }).krClickCounts)
       const fresh = page.locator('.toast:not([data-kr-seen])')
       const committed = async (): Promise<void> => {
-        await expect(fresh).toContainText('Verified on this device.')
+        await expect(fresh).toContainText('Not confirmed. Nothing changed.')
         await fresh.evaluate((toast) => {
           toast.setAttribute('data-kr-seen', '')
         })
+        await expect(confirm).toBeEnabled()
       }
 
       await confirm.focus()
@@ -380,6 +725,13 @@ test.describe('a control that commits on a completed action', () => {
       await confirm.click()
       await committed()
       expect(await counts(), 'the click after a release counts the press').toEqual([0, 1])
+
+      const reviewed = await page.evaluate(() => window.krTestHost?.reviewed ?? [])
+      expect(reviewed, 'each commit asked for one review of the request').toEqual([
+        'request-1',
+        'request-1',
+        'request-1'
+      ])
     }
   })
 })

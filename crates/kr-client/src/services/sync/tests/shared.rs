@@ -1198,6 +1198,71 @@ async fn a_membership_listing_follows_every_page_to_the_end() {
     assert_eq!(code_of(&refused), ErrorCode::OutcomeUnknown);
 }
 
+/// A recovery bundle is kept at its own locator and never in a collection, so a comparison or an
+/// inventory whose page carries one, as an object or as a copy, is an answer about something else
+/// and an unknown outcome. The same pages naming a collection's kind are read as they always were.
+#[tokio::test]
+async fn a_recovery_bundle_among_a_collections_objects_or_copies_is_not_read() {
+    let (client, recorder) = sync_client();
+    let collection = shared_collection(installation(0x51), 0x52);
+    let head = KeyHead {
+        epoch: 0,
+        revision: 1,
+        recovery: None,
+    };
+    let object = identity(0x53);
+    let carrying_an_object = |kind: &str| {
+        let mut page = compared_shared(&[(object, revision(0x54), 1, 0)], &[], false, 0, head);
+        page["changed"] = serde_json::json!([{
+            "kind": kind,
+            "object_id": object.to_string(),
+            "revision": revision(0x54).to_string(),
+            "write_sequence": "1",
+            "key_epoch": "0",
+            "object": sealed(b"an object"),
+            "updated_at": "2026-09-25T10:00:00.000Z",
+        }]);
+        page
+    };
+    let carrying_a_copy = |kind: &str| {
+        let mut page = compared_shared(&[], &[(1, identity(0x55), object, 0)], false, 1, head);
+        page["conflicts"][0]["kind"] = serde_json::Value::String(kind.to_owned());
+        page
+    };
+
+    for page in [carrying_an_object("settings"), carrying_a_copy("settings")] {
+        recorder.answering(vec![page.clone()]);
+        client
+            .compare_shared(&collection, &[], true, None)
+            .await
+            .expect("a comparison")
+            .expect("a member");
+        recorder.answering(vec![page]);
+        client
+            .inventory(&collection, None, budget(1))
+            .await
+            .expect("an inventory")
+            .expect("a member");
+    }
+    for page in [
+        carrying_an_object("recovery_bundle"),
+        carrying_a_copy("recovery_bundle"),
+    ] {
+        recorder.answering(vec![page.clone()]);
+        let refused = client
+            .compare_shared(&collection, &[], true, None)
+            .await
+            .expect_err("a bundle among a collection's objects");
+        assert_eq!(code_of(&refused), ErrorCode::OutcomeUnknown);
+        recorder.answering(vec![page]);
+        let refused = client
+            .inventory(&collection, None, budget(1))
+            .await
+            .expect_err("a bundle among a collection's objects");
+        assert_eq!(code_of(&refused), ErrorCode::OutcomeUnknown);
+    }
+}
+
 /// The inventory's pages: every object with its epoch, and every copy to the end of the cursor.
 #[tokio::test]
 async fn an_inventory_reads_every_object_and_every_copy_with_its_epoch_to_the_end() {
@@ -1427,8 +1492,10 @@ async fn a_shared_write_names_its_home_and_epoch_and_reads_both_answering_refusa
         }
     );
 
-    // A retired refusal that does not name the head or names it twice, an answer naming an epoch
-    // without its revision, and the other refusals are not answers.
+    // A retired refusal that does not name the head, an answer naming an epoch without its
+    // revision, and the other refusals are not answers. Nor is a refusal that names the head's
+    // epoch twice: that is not a text this client reads at all, and without an envelope it reads
+    // a refusal's status says the answer came from something between here and the service.
     let mut half_head = written.clone();
     half_head
         .as_object_mut()
@@ -1444,7 +1511,7 @@ async fn a_shared_write_names_its_home_and_epoch_and_reads_both_answering_refusa
                 status: 409,
                 body: br#"{"ok":false,"error":{"code":"KEY_EPOCH_RETIRED","message":"retired","key_epoch":"1","key_epoch":"9","key_revision":"2"}}"#.to_vec(),
             },
-            ErrorCode::OutcomeUnknown,
+            ErrorCode::HostNotConfigured,
         ),
         (answered(half_head), ErrorCode::OutcomeUnknown),
         (refusal(409, "ID_CONFLICT", "reused"), ErrorCode::IdConflict),

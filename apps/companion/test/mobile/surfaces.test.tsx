@@ -11,13 +11,15 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 import { AppProvider } from '../../src/app/state'
 import { fakeHost, type FakeHostControls } from '../../src/host/fake'
+import type { HostPort } from '../../src/host/port'
 import { Shell } from '../../src/mobile/entry'
 import { MobileApp, type MobileBuild } from '../../src/mobile/MobileApp'
+import { Inbox } from '../../src/mobile/views/Inbox'
 import { PURCHASE_WORDS } from '../../src/model/account'
 import { TOUCH_TARGET, type MobilePlatform } from '../../src/mobile/platform'
 
@@ -426,3 +428,338 @@ describe('what a build must not let happen twice (KR-ACC-012)', () => {
     expect(screen.getByLabelText('Message this session')).toHaveValue('a')
   })
 })
+
+describe('the shell and the inbox read once they are listening (KR-REQ-13.02)', () => {
+  /** The phone, opened on the inbox, against a host the test has prepared. */
+  function openPhone(port: HostPort): void {
+    render(
+      <AppProvider port={port}>
+        <MobileApp surface="ios" storage={null} />
+      </AppProvider>
+    )
+  }
+
+  /** What the bar along the top says about the connection. */
+  const topBar = () => document.querySelector('.m-connection')?.textContent ?? ''
+
+  /** Whether the inbox shows the entry `id`. */
+  const shows = (id: string) => document.querySelector(`[data-attention="${id}"]`) !== null
+
+  /** Waits for the inbox to show what a read answered. */
+  async function inboxRead(): Promise<void> {
+    await waitFor(() => {
+      expect(shows('a-2')).toBe(true)
+    })
+  }
+
+  /** Another device answers `id`: the host drops it from the inbox and says the inbox changed. */
+  async function answeredElsewhere(
+    port: HostPort,
+    controls: FakeHostControls,
+    id: string
+  ): Promise<void> {
+    await act(async () => {
+      await port.attentionAcknowledge({ attention_id: id }, {})
+      controls.emit({ stream_id: 'attention', sequence: id, body: { kind: 'attention' } })
+    })
+  }
+
+  const UNREACHABLE = 'this host cannot be contacted right now'
+
+  it('shows a host lost while the shell registers its listener', async () => {
+    const { port, controls } = fakeHost()
+    const complete = controls.holdRegistrations()
+    openPhone(port)
+
+    act(() => {
+      controls.setConnected(false)
+    })
+    await act(async () => {
+      complete()
+      await Promise.resolve()
+    })
+
+    await waitFor(() => {
+      expect(topBar()).toBe(UNREACHABLE)
+    })
+  })
+
+  it('keeps a lost connection it heard over a read that answers after it', async () => {
+    const { port, controls } = fakeHost()
+    const held = controls.hold('connectionState')
+    openPhone(port)
+    await waitFor(() => {
+      expect(held.count).toBe(1)
+    })
+
+    act(() => {
+      controls.setConnected(false)
+    })
+    // The first read was made while the host was reached, and answers only now.
+    await act(async () => {
+      held.answer(0)
+      await Promise.resolve()
+    })
+    expect(topBar()).toBe(UNREACHABLE)
+  })
+
+  it('leaves the newer connection state when two reads answer in reverse order', async () => {
+    const { port, controls } = fakeHost()
+    const held = controls.hold('connectionState')
+    openPhone(port)
+    await waitFor(() => {
+      expect(held.count).toBe(1)
+    })
+
+    act(() => {
+      controls.setConnected(false)
+    })
+    await act(async () => {
+      held.answer(1)
+      await Promise.resolve()
+    })
+    await act(async () => {
+      held.answer(0)
+      await Promise.resolve()
+    })
+    expect(topBar()).toBe(UNREACHABLE)
+  })
+
+  it('shows the connection it read when nothing changed in between', async () => {
+    const { port, controls } = fakeHost()
+    const held = controls.hold('connectionState')
+    openPhone(port)
+    await waitFor(() => {
+      expect(held.count).toBe(1)
+    })
+
+    await act(async () => {
+      held.answer(0)
+      await Promise.resolve()
+    })
+    expect(topBar()).toBe('In contact with this host')
+  })
+
+  it('shows an inbox change made while its listeners register', async () => {
+    const { port, controls } = fakeHost()
+    const complete = controls.holdRegistrations()
+    openPhone(port)
+
+    await answeredElsewhere(port, controls, 'a-1')
+    await act(async () => {
+      complete()
+      await Promise.resolve()
+    })
+
+    await inboxRead()
+    expect(shows('a-1')).toBe(false)
+  })
+
+  it('shows no inbox read that a change it heard has overtaken', async () => {
+    const { port, controls } = fakeHost()
+    const held = controls.hold('attentionRead')
+    openPhone(port)
+    await waitFor(() => {
+      expect(held.count).toBe(1)
+    })
+
+    await answeredElsewhere(port, controls, 'a-1')
+    await waitFor(() => {
+      expect(held.count).toBe(2)
+    })
+    // The first read was made before the change, and answers first.
+    await act(async () => {
+      held.answer(0)
+      await Promise.resolve()
+    })
+    expect(shows('a-1')).toBe(false)
+
+    await act(async () => {
+      held.answer(1)
+      await Promise.resolve()
+    })
+    await inboxRead()
+    expect(shows('a-1')).toBe(false)
+  })
+
+  it('leaves the newer inbox when two reads answer in reverse order', async () => {
+    const { port, controls } = fakeHost()
+    const held = controls.hold('attentionRead')
+    openPhone(port)
+    await waitFor(() => {
+      expect(held.count).toBe(1)
+    })
+
+    await answeredElsewhere(port, controls, 'a-1')
+    await waitFor(() => {
+      expect(held.count).toBe(2)
+    })
+    await act(async () => {
+      held.answer(1)
+      await Promise.resolve()
+    })
+    await inboxRead()
+    expect(shows('a-1')).toBe(false)
+
+    await act(async () => {
+      held.answer(0)
+      await Promise.resolve()
+    })
+    expect(shows('a-1')).toBe(false)
+    expect(shows('a-2')).toBe(true)
+  })
+
+  // One listener is registered and the other is not: a change the first hears starts no read, and
+  // when the second cannot be registered, nothing read afterwards clears what the inbox says.
+  it('reads nothing until both listeners are registered, and keeps a registration failure', async () => {
+    const { port, controls } = fakeHost()
+    const held = controls.hold('attentionRead')
+    let refuse: (reason: unknown) => void = () => {}
+    render(
+      <AppProvider
+        port={{
+          ...port,
+          onConnection: () =>
+            new Promise<() => void>((_, reject) => {
+              refuse = reject
+            })
+        }}
+      >
+        <Inbox surface="ios" onOpenSession={() => undefined} />
+      </AppProvider>
+    )
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    await answeredElsewhere(port, controls, 'a-1')
+    expect(held.count).toBe(0)
+
+    await act(async () => {
+      refuse({
+        code: 'INTERNAL',
+        message: 'The shell did not register the listener.',
+        user_action: 'retry'
+      })
+      await Promise.resolve()
+    })
+    expect(await screen.findByText('The inbox could not be read')).toBeInTheDocument()
+
+    await act(async () => {
+      held.release()
+      await Promise.resolve()
+    })
+    expect(screen.getByText('The inbox could not be read')).toBeInTheDocument()
+    expect(shows('a-2')).toBe(false)
+  })
+
+  it('shows the inbox it read when nothing changed in between', async () => {
+    const { port, controls } = fakeHost()
+    const held = controls.hold('attentionRead')
+    openPhone(port)
+    await waitFor(() => {
+      expect(held.count).toBe(1)
+    })
+
+    await act(async () => {
+      held.answer(0)
+      await Promise.resolve()
+    })
+    await inboxRead()
+    for (const id of ['a-1', 'a-2', 'a-3', 'a-4']) expect(shows(id)).toBe(true)
+  })
+})
+
+describe('the phone claims no contact before its first answer (KR-REQ-13.02)', () => {
+  const MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+  const LOST = 'Not in contact with this host'
+
+  /** What the bar along the top says about the connection, and whether it shows a dot. */
+  const topBar = () => document.querySelector('.m-connection')?.textContent ?? ''
+  const topBarDot = () => document.querySelector('.m-connection .status-dot')
+
+  /** Opens the phone on one session, as a person tapping a notification about it does. */
+  function openFromNotification(port: HostPort): void {
+    window.history.replaceState(null, '', `/?session=${MAIN}`)
+    try {
+      render(
+        <AppProvider port={port}>
+          <MobileApp surface="ios" storage={null} />
+        </AppProvider>
+      )
+    } finally {
+      window.history.replaceState(null, '', '/')
+    }
+  }
+
+  it('says neither contact nor its loss, in the bar or the session, until the shell answers', async () => {
+    const { port, controls } = fakeHost()
+    const held = controls.hold('connectionState')
+    openFromNotification(port)
+    await waitFor(() => {
+      expect(held.count).toBe(1)
+    })
+    await screen.findByLabelText('Message this session')
+
+    expect(topBar()).toBe('Checking the connection…')
+    expect(topBarDot()).toBeNull()
+    expect(screen.queryByText(LOST)).toBeNull()
+
+    await act(async () => {
+      held.release()
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+    expect(topBar()).toBe('In contact with this host')
+    expect(topBarDot()).not.toBeNull()
+    expect(screen.queryByText(LOST)).toBeNull()
+  })
+
+  it('shows the loss of contact once the shell has answered with it', async () => {
+    const { port, controls } = fakeHost()
+    const held = controls.hold('connectionState')
+    controls.setConnected(false)
+    openFromNotification(port)
+    await waitFor(() => {
+      expect(held.count).toBe(1)
+    })
+    expect(screen.queryByText(LOST)).toBeNull()
+
+    await act(async () => {
+      held.release()
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+    expect(topBar()).toBe('this host cannot be contacted right now')
+    expect(await screen.findByText(LOST)).toBeInTheDocument()
+  })
+
+  it('shows a first read that failed as a failure, in its own words', async () => {
+    const { port } = fakeHost()
+    openFromNotification({
+      ...port,
+      connectionState: () =>
+        Promise.reject({
+          code: 'INTERNAL',
+          message: 'The backend did not answer.',
+          user_action: 'retry'
+        })
+    })
+    await waitFor(() => {
+      expect(topBar()).toBe('The backend did not answer.')
+    })
+    expect(topBarDot()?.classList.contains('offline')).toBe(true)
+  })
+
+  it('shows the contact it read when nothing was held', async () => {
+    const { port } = fakeHost()
+    openFromNotification(port)
+    await waitFor(() => {
+      expect(topBar()).toBe('In contact with this host')
+    })
+    expect(screen.queryByText(LOST)).toBeNull()
+  })
+})
+

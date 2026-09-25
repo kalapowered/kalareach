@@ -18,7 +18,8 @@ import { Pairing } from './views/Pairing'
 import { Plugins } from './views/Plugins'
 import { Session } from './views/Session'
 import { Setup } from './setup/Setup'
-import { failureMessage } from './host/port'
+import { failureMessage, follow } from './host/port'
+import { useConfirmations } from './pairing/Confirmations'
 
 const NAVIGATION: readonly { readonly place: Place; readonly label: string }[] = [
   { place: { view: 'attention' }, label: 'Attention' },
@@ -31,8 +32,14 @@ const NAVIGATION: readonly { readonly place: Place; readonly label: string }[] =
 /** The application. */
 export function App(): ReactNode {
   const { place, go, toast, dismissToast, port, say } = useApp()
-  const [connected, setConnected] = useState(true)
-  const [reason, setReason] = useState<string | null>(null)
+  const confirmations = useConfirmations()
+  const waiting = confirmations?.requests.length ?? 0
+  // Where the connection stands, as its first answer or a change since said it: null until then,
+  // so the bar claims neither contact nor its loss before anything has answered.
+  const [connection, setConnection] = useState<{
+    readonly connected: boolean
+    readonly reason: string | null
+  } | null>(null)
   const account = useAccount(port)
   const [accountOpen, setAccountOpen] = useState(false)
 
@@ -47,33 +54,23 @@ export function App(): ReactNode {
     }
   }, [account.view, accountOpen, say])
 
-  useEffect(() => {
-    let watching = true
-    // A failure to answer is itself an answer: the window says it is not connected, and says why,
-    // rather than leaving a rejected promise for nobody.
-    port
-      .connectionState()
-      .then((state) => {
-        if (!watching) return
-        setConnected(state.connected)
-        setReason(state.reason)
-      })
-      .catch((failure: unknown) => {
-        if (!watching) return
-        setConnected(false)
-        setReason(failureMessage(failure))
-      })
-    const stop = port.subscribe((event) => {
-      const body = event.body as { kind?: string; connected?: boolean }
-      if (body.kind === 'connection' && typeof body.connected === 'boolean') {
-        setConnected(body.connected)
-      }
-    })
-    return () => {
-      watching = false
-      stop()
-    }
-  }, [port])
+  // The state is read once the listener is registered, so no change can fall between the two, and
+  // a change heard before the read answers is at least as new as it.
+  useEffect(
+    () =>
+      follow(
+        (listener) => port.onConnection(listener),
+        () => port.connectionState(),
+        (state) => {
+          setConnection({ connected: state.connected, reason: state.reason })
+        },
+        // A failure to answer is itself an answer: the window says it is not connected, and why.
+        (failure) => {
+          setConnection({ connected: false, reason: failureMessage(failure) })
+        }
+      ),
+    [port]
+  )
 
   // The last input device decides whether anything animates. A keyboard-driven change is instant;
   // a pointer-driven one gets its transition back.
@@ -112,6 +109,11 @@ export function App(): ReactNode {
               }}
             >
               {item.label}
+              {item.place.view === 'attention' && waiting > 0 ? (
+                <span className="count" aria-label={`${waiting} waiting for confirmation`}>
+                  {waiting}
+                </span>
+              ) : null}
             </button>
           ))}
         </nav>
@@ -124,7 +126,7 @@ export function App(): ReactNode {
               go({ view: 'pairing' })
             }}
           >
-            Add a device
+            Pair with a host
           </button>
           <button
             type="button"
@@ -156,8 +158,16 @@ export function App(): ReactNode {
         <header className="topbar">
           <span className="row">
             <span className="connection">
-              <span className={`status-dot${connected ? '' : ' offline'}`} />
-              {connected ? 'Connected to this machine' : (reason ?? 'Not in contact')}
+              {connection === null ? (
+                'Checking the connection…'
+              ) : (
+                <>
+                  <span className={`status-dot${connection.connected ? '' : ' offline'}`} />
+                  {connection.connected
+                    ? 'Connected to this machine'
+                    : (connection.reason ?? 'Not in contact')}
+                </>
+              )}
             </span>
           </span>
         </header>

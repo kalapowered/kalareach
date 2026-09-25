@@ -161,7 +161,16 @@ fn the_capabilities_grant_no_shell_no_filesystem_and_no_general_http() {
         })
         .collect();
 
-    for forbidden in ["shell:", "fs:", "http:", "process:", "os:"] {
+    // The pasteboard is read in native code, where an invitation's text stays, so the page is
+    // granted no clipboard permission at all.
+    for forbidden in [
+        "shell:",
+        "fs:",
+        "http:",
+        "process:",
+        "os:",
+        "clipboard-manager:",
+    ] {
         assert!(
             !granted.iter().any(|name| name.starts_with(forbidden)),
             "the interface is granted {forbidden}, which the boundary does not permit"

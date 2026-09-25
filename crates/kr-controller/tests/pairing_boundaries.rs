@@ -803,7 +803,7 @@ async fn an_authentication_failure_says_nothing_more() {
         )
         .await;
     let error = match refused {
-        Err(kr_transport::TransportError::Handshake(error)) => error,
+        Err(kr_transport::TransportError::Refused(error)) => error,
         other => panic!("refused, not {other:?}"),
     };
     assert_eq!(error.code, ErrorCode::PairingAuthFailed);

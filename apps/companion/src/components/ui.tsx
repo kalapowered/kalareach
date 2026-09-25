@@ -332,12 +332,37 @@ export function Banner({
 
 /* ---- The toast ------------------------------------------------------------------------------- */
 
-/** One passing message. */
+/** The one thing a passing message offers to do. */
+export interface ToastAction {
+  /** The name of its button. */
+  readonly label: string
+  readonly act: () => void
+}
+
+/** One passing message, and what it offers to do, if anything. */
 export interface ToastMessage {
   readonly id: number
   readonly text: string
   readonly tone: 'success' | 'danger' | 'pending'
+  readonly action?: ToastAction
+  /**
+   * What the message is about. A message on the topic of the one showing takes its place in place,
+   * keeping its identity, so the toast stays put and whatever has focus in it keeps focus.
+   */
+  readonly topic?: string
+  /**
+   * Which time the words are said, for a message updated in place: a new count puts the words in
+   * the live region anew, so a screen reader says them again even when they read the same.
+   */
+  readonly said?: number
 }
+
+/**
+ * How long a message stays once nothing holds it: long enough to read, and longer when it offers
+ * something to do, which takes a decision as well as a reading.
+ */
+const TOAST_MS = 4200
+const TOAST_WITH_ACTION_MS = 8000
 
 /** Shows the newest message, and takes it away. */
 export function Toast({
@@ -347,17 +372,55 @@ export function Toast({
   readonly message: ToastMessage | null
   readonly onDismiss: () => void
 }): ReactNode {
+  if (!message) return null
+  return <ToastBody key={message.id} message={message} onDismiss={onDismiss} />
+}
+
+/**
+ * One message. It stays while the pointer rests on it or focus is inside it, so its action can
+ * always be reached before it goes, and it goes its time after both have left.
+ */
+function ToastBody({
+  message,
+  onDismiss
+}: {
+  readonly message: ToastMessage
+  readonly onDismiss: () => void
+}): ReactNode {
+  // The pointer and focus hold it apart: either one is enough.
+  const [pointer, setPointer] = useState(false)
+  const [focused, setFocused] = useState(false)
+  const held = pointer || focused
   useEffect(() => {
-    if (!message) return
-    const handle = setTimeout(onDismiss, 4200)
+    if (held) return
+    const handle = setTimeout(
+      onDismiss,
+      message.action === undefined ? TOAST_MS : TOAST_WITH_ACTION_MS
+    )
     return () => {
       clearTimeout(handle)
     }
-  }, [message, onDismiss])
+  }, [held, message, onDismiss])
 
-  if (!message) return null
+  const { action } = message
   return (
-    <div className="toast" role="status" aria-live="polite" key={message.id}>
+    <div
+      className="toast"
+      role="status"
+      aria-live="polite"
+      onPointerEnter={() => {
+        setPointer(true)
+      }}
+      onPointerLeave={() => {
+        setPointer(false)
+      }}
+      onFocus={() => {
+        setFocused(true)
+      }}
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget)) setFocused(false)
+      }}
+    >
       <span
         className={
           message.tone === 'danger'
@@ -370,7 +433,17 @@ export function Toast({
       >
         {message.tone === 'danger' ? '!' : message.tone === 'pending' ? '…' : '✓'}
       </span>
-      <span>{message.text}</span>
+      <span key={message.said ?? 0}>{message.text}</span>
+      {action === undefined ? null : (
+        <Button
+          onClick={() => {
+            action.act()
+            onDismiss()
+          }}
+        >
+          {action.label}
+        </Button>
+      )}
       <IconButton label="Dismiss" onClick={onDismiss}>
         ×
       </IconButton>

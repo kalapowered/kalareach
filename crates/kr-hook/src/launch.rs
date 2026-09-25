@@ -88,6 +88,7 @@ struct Record {
 pub fn run(
     invocation: &[OsString],
     hold_after_admission: Option<Duration>,
+    hold_before_exec: Option<&Path>,
 ) -> std::process::ExitCode {
     let started = Instant::now();
     let Some((executable, vector)) = invocation
@@ -101,7 +102,7 @@ pub fn run(
     let vector: Vec<OsString> = vector.to_vec();
     let Some(registration) = std::env::var_os(REGISTRATION_VARIABLE) else {
         // Not a launch: nothing names a backend, so the program runs exactly as it was given.
-        return exec(&executable, &vector, false);
+        return exec_after(hold_before_exec, &executable, &vector, false);
     };
     let registration = PathBuf::from(registration);
     let typed = match typed_vector(&registration, &vector) {
@@ -120,7 +121,7 @@ pub fn run(
             crate::report(&format!(
                 "the backend's launch record cannot be read ({why}), so the program runs as typed"
             ));
-            return exec(&executable, &typed, true);
+            return exec_after(hold_before_exec, &executable, &typed, true);
         }
     };
     match present(&executable, &vector, &registration, &record, started) {
@@ -131,7 +132,7 @@ pub fn run(
             match go(&mut admitted) {
                 Ok(()) => {
                     close(admitted);
-                    exec(&executable, &vector, false)
+                    exec_after(hold_before_exec, &executable, &vector, false)
                 }
                 Err(why) => {
                     crate::report(&format!(
@@ -139,7 +140,7 @@ pub fn run(
                          typed"
                     ));
                     close(admitted);
-                    exec(&executable, &typed, true)
+                    exec_after(hold_before_exec, &executable, &typed, true)
                 }
             }
         }
@@ -147,10 +148,33 @@ pub fn run(
             crate::report(&format!(
                 "the backend did not admit this launch ({why}), so the program runs as typed"
             ));
-            exec(&executable, &typed, true)
+            exec_after(hold_before_exec, &executable, &typed, true)
         }
     }
 }
+
+/// Executes the program as [`exec`] does, after waiting for `barrier` to exist where one is named.
+///
+/// The barrier is the host's own tests': it holds whichever route the launcher took, committed or
+/// as typed, until a test has finished changing the executable, and nothing a shell runs names
+/// one. The wait is bounded, so a test that never makes the file still ends.
+fn exec_after(
+    barrier: Option<&Path>,
+    executable: &Path,
+    vector: &[OsString],
+    without_backend: bool,
+) -> std::process::ExitCode {
+    if let Some(barrier) = barrier {
+        let started = Instant::now();
+        while !barrier.exists() && started.elapsed() < BARRIER_LIMIT {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    exec(executable, vector, without_backend)
+}
+
+/// The longest a launcher waits at a test's barrier before it goes on by itself.
+const BARRIER_LIMIT: Duration = Duration::from_secs(120);
 
 /// Returns what was typed: the answered vector without the added flags the registration's file
 /// name places, `registration.<at>.<count>`.

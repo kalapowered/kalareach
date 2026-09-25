@@ -31,7 +31,9 @@ use kr_protocol::scalars::Uuid;
 use kr_protocol::session::CommandIntegration;
 use kr_protocol::session::EnvironmentVariable;
 use kr_worker::broker::Broker;
-use kr_worker::broker::commands::{CommandBackends, CommandBackendsConfig, EstablishRequest};
+use kr_worker::broker::commands::{
+    BackendState, CommandBackends, CommandBackendsConfig, EstablishRequest,
+};
 use kr_worker::broker::connectors::{ConnectorSources, fixture};
 use kr_worker::persistence::JournalHealth;
 
@@ -50,6 +52,11 @@ const SCRIPT: &str = r#"report="$REPORT"
 } > "$report.part" && mv "$report.part" "$report"
 if [ -n "$HOOK" ]; then
   if [ -n "$WAIT_FOR" ]; then while [ ! -f "$WAIT_FOR" ]; do sleep 0.02; done; fi
+  if [ -n "$NESTED" ]; then
+    /bin/bash -c 'printf "%s" "$HOOK_EVENT" | "$HOOK" claude-code hook' > "$report.nested" 2>&1
+    echo done > "$report.nested.hooked"
+    if [ -n "$THEN_OWN" ]; then while [ ! -f "$THEN_OWN" ]; do sleep 0.02; done; fi
+  fi
   printf '%s' "$HOOK_EVENT" | "$HOOK" claude-code hook > "$report.hook" 2>&1
   echo done > "$report.hooked"
   if [ -n "$AGAIN_AFTER" ]; then
@@ -104,6 +111,33 @@ fn retarget(link: &Path, target: &Path) {
     std::fs::rename(&staged, link).expect("the link is replaced");
 }
 
+/// Writes `staged` over `program`'s own bytes, in the same inode, and puts its modification time
+/// back.
+///
+/// The bytes are written by a process of its own, which starts nothing, and not by this one: this
+/// test binary runs its cases on several threads, and a child another thread starts while this one
+/// holds the program open for writing is handed a copy of that descriptor and keeps it until its
+/// own program takes over, and no process can execute the program while any descriptor holds it
+/// open for writing (`kr_ipc::testing::place_program` says the same of placing one). The time is
+/// put back through a descriptor opened to read, which the kernel lets the file's owner do.
+#[cfg(target_os = "linux")]
+fn rewrite_in_place(staged: &Path, program: &Path, modified: std::time::SystemTime) {
+    let wrote = std::process::Command::new("dd")
+        .arg(format!("if={}", staged.display()))
+        .arg(format!("of={}", program.display()))
+        .args(["conv=notrunc", "status=none"])
+        .stdin(std::process::Stdio::null())
+        .status()
+        .expect("dd runs");
+    assert!(
+        wrote.success(),
+        "its bytes written back, one changed: {wrote}"
+    );
+    std::fs::File::open(program)
+        .and_then(|file| file.set_modified(modified))
+        .expect("its modification time put back");
+}
+
 /// A POSIX shell running `script`, with nothing of a surrounding session in its environment.
 fn sh(script: &str) -> std::process::Command {
     let mut command = std::process::Command::new("/bin/sh");
@@ -140,15 +174,43 @@ struct Shell {
     placed: Placed,
     runtime: tokio::runtime::Runtime,
     broker: Arc<Broker>,
-    backends: CommandBackends,
+    sources: Arc<ConnectorSources>,
+    backends: Arc<CommandBackends>,
     executable: PathBuf,
     other: PathBuf,
     reports: PathBuf,
     generation: std::sync::atomic::AtomicU64,
+    /// The session whose attached view hears the launches' announcements, where one was made.
+    view: Option<View>,
+}
+
+/// A session with one attached view, the way the worker delivers to its clients.
+struct View {
+    runtime: Arc<kr_worker::runtime::SessionRuntime>,
+    stream: std::sync::Mutex<kr_worker::output::OutputStream>,
 }
 
 impl Shell {
     fn new() -> Self {
+        Self::with_source(|source| source, false)
+    }
+
+    /// A shell whose connector's installation is granted to read files as well.
+    fn reading() -> Self {
+        Self::with_source(fixture::reading, false)
+    }
+
+    /// A shell whose session has an attached view, which the backends announce to.
+    fn viewed() -> Self {
+        Self::with_source(|source| source, true)
+    }
+
+    fn with_source(
+        installed: impl FnOnce(
+            kr_worker::broker::connectors::ConnectorSource,
+        ) -> kr_worker::broker::connectors::ConnectorSource,
+        viewed: bool,
+    ) -> Self {
         let placed = Placed::new();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -164,38 +226,91 @@ impl Shell {
         let store = placed.host.root().join("store");
         std::fs::create_dir_all(&store).expect("a store");
         let sources = Arc::new(ConnectorSources::new());
-        let source = fixture::claude_code_package(&store, &placed.forwarder)
-            .expect("the package is written");
+        let source = installed(
+            fixture::claude_code_package(&store, &placed.forwarder)
+                .expect("the package is written"),
+        );
         assert!(sources.replace(vec![source]).is_empty());
         let broker = Arc::new(
             Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens"),
         );
         // The host tree itself, so a backend's socket path stays inside the bound it has on macOS.
         let runtime_dir = placed.host.root().to_path_buf();
-        let backends = CommandBackends::new(
+        let mut backends = CommandBackends::new(
             Arc::clone(&broker),
             CommandBackendsConfig {
                 session_id: session(),
                 environment_id: EnvironmentId::new(Uuid::from_bytes([4; 16])),
                 os_user: "someone".to_owned(),
                 runtime_dir,
-                sources,
+                sources: Arc::clone(&sources),
                 launcher: Some(placed.forwarder.clone()),
             },
             runtime.handle().clone(),
         );
+        let view = viewed.then(|| {
+            let _entered = runtime.enter();
+            View::open(&placed.host)
+        });
+        if let Some(view) = view.as_ref() {
+            backends = backends.with_views(Arc::downgrade(&view.runtime));
+        }
+        let backends = Arc::new(backends);
+        // The viewed session holds its backends, as a worker's session does, so its closing ends
+        // them.
+        if let Some(view) = view.as_ref() {
+            view.runtime
+                .session()
+                .set_command_backends(Arc::clone(&backends));
+        }
         let reports = placed.host.root().join("reports");
         std::fs::create_dir_all(&reports).expect("a directory for reports");
         Self {
             placed,
             runtime,
             broker,
+            sources,
             backends,
             executable,
             other,
             reports,
             generation: std::sync::atomic::AtomicU64::new(1),
+            view,
         }
+    }
+
+    /// Waits until the launch the confirmation pause holds is committed, its launcher waiting to be
+    /// told.
+    ///
+    /// That is the point between a launch's admission and its program's exec at which a test changes
+    /// the program: the launcher execs only on the word the pause holds back. It waits for that word
+    /// for the commit deadline only, and then runs what was typed, so a test that changes the program
+    /// also holds the launcher at a barrier ([`Shell::launcher_until`]) that it lets go only once the
+    /// change is complete: whichever route the launcher then takes, it cannot execute the program
+    /// before the change, or while the program's file is open for writing.
+    fn at_the_confirmation(&self, arrived: tokio::sync::oneshot::Receiver<()>) {
+        self.runtime
+            .block_on(async { tokio::time::timeout(LIVENESS, arrived).await })
+            .expect("the launch is committed")
+            .expect("and paused before the launcher is told");
+    }
+
+    /// The next announcement about an agent instance the session's view is sent.
+    fn announcement(&self) -> kr_protocol::projection::AgentInstanceEvent {
+        let view = self.view.as_ref().expect("a shell with a view");
+        let mut stream = view.stream.lock().expect("the view's stream");
+        self.runtime.block_on(async {
+            loop {
+                match tokio::time::timeout(LIVENESS, stream.recv()).await {
+                    Ok(Some(kr_worker::output::OutputDelivery::AgentInstance { event, bytes })) => {
+                        stream.written(bytes);
+                        return *event;
+                    }
+                    Ok(Some(delivery)) => stream.written(delivery.len()),
+                    Ok(None) | Err(_) => panic!("no announcement reached the view"),
+                }
+            }
+        })
     }
 
     fn integration() -> CommandIntegration {
@@ -232,6 +347,15 @@ impl Shell {
     }
 
     fn establish_with(&self, executable: &Path, typed: &[String]) -> CommandBackend {
+        self.establish_where(executable, typed, self.placed.host.root())
+    }
+
+    /// Establishes a backend for an invocation the shell reported running in `cwd`.
+    fn establish_in(&self, cwd: &Path) -> CommandBackend {
+        self.establish_where(&self.executable, &Self::typed(), cwd)
+    }
+
+    fn establish_where(&self, executable: &Path, typed: &[String], cwd: &Path) -> CommandBackend {
         let generation = self
             .generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -248,7 +372,7 @@ impl Shell {
                 added: &added,
                 integration: &integration,
                 executable: executable.to_str().expect("a text path"),
-                cwd: self.placed.host.root().to_str().expect("a text path"),
+                cwd: cwd.to_str().expect("a text path"),
                 cwd_revision: CwdRevision::new(1),
                 root_shell: kr_ipc::identity::current_process_start_identity()
                     .expect("this process"),
@@ -275,6 +399,65 @@ impl Shell {
         self.placed.command(&arguments)
     }
 
+    /// The launcher's command line for an answer, held before it executes the program, on
+    /// whichever route it took, until `barrier` exists.
+    fn launcher_until(
+        &self,
+        executable: &Path,
+        vector: &[String],
+        barrier: &Path,
+    ) -> std::process::Command {
+        let mut arguments = vec![
+            "launch".to_owned(),
+            "--hold-before-exec".to_owned(),
+            barrier.display().to_string(),
+            "--".to_owned(),
+            executable.display().to_string(),
+        ];
+        arguments.extend(vector.iter().cloned());
+        let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+        self.placed.command(&arguments)
+    }
+
+    /// Waits for the report a launched program writes, and says what became of the launcher's
+    /// process when none comes: its exit status and what it said.
+    fn report_from(&self, name: &str, child: &mut std::process::Child) -> BTreeMap<String, String> {
+        let path = self.reports.join(name);
+        let started = Instant::now();
+        let mut exited: Option<Instant> = None;
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                return text
+                    .lines()
+                    .filter_map(|line| line.split_once('='))
+                    .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                    .collect();
+            }
+            if exited.is_none() && matches!(child.try_wait(), Ok(Some(_))) {
+                exited = Some(Instant::now());
+            }
+            let gone = exited.is_some_and(|at| at.elapsed() > Duration::from_secs(2));
+            if gone || started.elapsed() >= LIVENESS {
+                match child.try_wait().ok().flatten() {
+                    Some(status) => {
+                        let mut said = String::new();
+                        if let Some(stderr) = child.stderr.as_mut() {
+                            let _ = std::io::Read::read_to_string(stderr, &mut said);
+                        }
+                        panic!(
+                            "the program reported by now: the launcher's process ended with \
+                             {status} and said: {said}"
+                        );
+                    }
+                    None => panic!(
+                        "the program reported by now: the launcher's process is still running"
+                    ),
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Starts the launcher for an answer, with its variable, writing its report under `name`.
     fn launch(
         &self,
@@ -284,6 +467,20 @@ impl Shell {
     ) -> std::process::Child {
         let mut command = self.launcher(&self.executable, &Self::answered(), None);
         self.prepare(&mut command, Some(answer), name, env);
+        command.spawn().expect("the launcher starts")
+    }
+
+    /// Starts the launcher in `cwd`, as the shell's child runs in the directory the shell reported.
+    fn launch_from(
+        &self,
+        answer: &CommandBackend,
+        name: &str,
+        env: &[(&str, &str)],
+        cwd: &Path,
+    ) -> std::process::Child {
+        let mut command = self.launcher(&self.executable, &Self::answered(), None);
+        self.prepare(&mut command, Some(answer), name, env);
+        command.current_dir(cwd);
         command.spawn().expect("the launcher starts")
     }
 
@@ -351,8 +548,101 @@ impl Shell {
 
 impl Drop for Shell {
     fn drop(&mut self) {
-        self.backends.close();
+        let _ = self.backends.close();
     }
+}
+
+impl View {
+    /// Opens a session whose shell is `cat`, attaches one view to it and subscribes that view.
+    fn open(host: &kr_ipc::testing::TempHost) -> Self {
+        let mut requested = kr_protocol::scalars::CanonicalSet::new();
+        requested.insert(kr_protocol::attachment::AttachmentCapability::ObserveTerminal);
+        let config = kr_worker::session::SessionConfig {
+            session_id: session(),
+            session_epoch: kr_protocol::ids::SessionEpoch::V1,
+            environment_id: host.environment_id(),
+            display_number: kr_protocol::session::DisplayNumber::new(1),
+            shell: kr_worker::testing::posix_script("exec cat"),
+            shell_mode: kr_protocol::session::ShellMode::NativeCompat,
+            worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+            desktop: kr_protocol::identity::DesktopBinding::none(),
+            dimensions: kr_protocol::session::Dimensions::new(80, 24),
+            journal_path: Some(host.environment().journal_database(session())),
+            spool_directory: Some(host.environment().session_spool(session())),
+            worker_endpoint: None,
+            send_queue_bytes: 8 * 1024 * 1024,
+            resident_bytes: 1024 * 1024,
+            time: kr_worker::action::time::TimeSources::system(),
+            launch_profile: kr_protocol::session::LaunchProfile::default(),
+        };
+        let mut opened = kr_worker::session::Session::open(config).expect("the session opens");
+        opened.launch().expect("its shell starts");
+        let attachment_id = kr_protocol::ids::AttachmentId::new(Uuid::from_bytes([5; 16]));
+        let params = kr_protocol::attachment::SessionAttachParams {
+            session_id: session(),
+            mode: kr_protocol::attachment::AttachMode::Terminal,
+            claim_geometry: false,
+            dimensions: kr_protocol::scalars::Nullable::some(
+                kr_protocol::session::Dimensions::new(80, 24),
+            ),
+            terminal_profile_id: kr_protocol::scalars::Nullable::some("xterm-256color".to_owned()),
+            requested: requested.clone(),
+        };
+        opened
+            .attach(&params, requested, attachment_id)
+            .expect("the view attaches");
+        let stream = opened
+            .subscribe(attachment_id)
+            .expect("the view subscribes");
+        let runtime = Arc::new(
+            kr_worker::runtime::SessionRuntime::start(
+                opened,
+                Arc::new(kr_ipc::clock::SystemSharedClock),
+            )
+            .expect("the session runs"),
+        );
+        Self {
+            runtime,
+            stream: std::sync::Mutex::new(stream),
+        }
+    }
+}
+
+/// The variable that makes a placed copy of this test binary the stand-in program an adoption
+/// finds: it sleeps for as many seconds as it names.
+const STAND_IN: &str = "KR_ADOPTION_STAND_IN";
+
+/// The stand-in program's body. Run by the test harness with nothing set, it does nothing.
+#[test]
+fn the_stand_in_program() {
+    if let Ok(seconds) = std::env::var(STAND_IN) {
+        std::thread::sleep(Duration::from_secs(seconds.parse().unwrap_or(60)));
+    }
+}
+
+/// Starts a program named `claude` that the integration did not launch, as this process's own
+/// child in a process group of its own: a copy of this test binary running only the stand-in, as
+/// a shell with job control starts a foreground job.
+fn stand_in(placed: &Placed) -> std::process::Child {
+    use std::os::unix::process::CommandExt as _;
+
+    let directory = placed.host.root().join("adopted");
+    std::fs::create_dir_all(&directory).expect("a directory for the stand-in");
+    let program = directory.join(fixture::COMMAND);
+    kr_ipc::testing::place_program(
+        &std::env::current_exe().expect("this test's own binary"),
+        &program,
+    );
+    std::process::Command::new(&program)
+        .args(["--exact", "the_stand_in_program", "--test-threads", "1"])
+        .env(STAND_IN, "60")
+        .current_dir(placed.host.root())
+        .process_group(0)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("the stand-in starts")
 }
 
 /// Waits for a process to end, within the liveness bound.
@@ -521,12 +811,10 @@ fn kr_req_05_09_a_refused_launch_runs_the_invocation_as_typed() {
 
     // An executable that is a script.
     let script = shell.placed.host.root().join("bin").join("script");
-    std::fs::write(&script, "#!/bin/sh\nexec /bin/sh \"$@\"\n").expect("a script");
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-            .expect("executable");
-    }
+    // Written aside and placed by a process of its own, as a program this process starts is.
+    let text = shell.placed.host.root().join("script.text");
+    std::fs::write(&text, "#!/bin/sh\nexec /bin/sh \"$@\"\n").expect("a script");
+    kr_ipc::testing::place_program(&text, &script);
     let answer = shell.establish_for(&script);
     let mut scripted = shell.launcher(&script, &Shell::answered(), None);
     shell.prepare(&mut scripted, Some(&answer), "script", &[]);
@@ -653,14 +941,17 @@ fn kr_req_11_34_the_launched_program_s_hook_moves_the_binding_and_a_replaced_one
     });
     let _ = finish(child);
 
-    // Replaced while the launcher holds after its admission, and put back once it runs.
+    // Replaced while the launcher waits to be told its launch is committed, and put back once it
+    // runs.
     let (program, another) = shells();
     let swapped = shell.placed.host.root().join("bin").join("swapped");
     std::os::unix::fs::symlink(program, &swapped).expect("the program");
     let answer = shell.establish_for(&swapped);
     let go = shell.placed.host.root().join("go-swapped");
     let go_text = go.display().to_string();
-    let mut held = shell.launcher(&swapped, &Shell::answered(), Some(1000));
+    let changed = shell.placed.host.root().join("swapped.changed");
+    let (arrived, release) = shell.backends.pause_before_confirming();
+    let mut held = shell.launcher_until(&swapped, &Shell::answered(), &changed);
     shell.prepare(
         &mut held,
         Some(&answer),
@@ -672,11 +963,12 @@ fn kr_req_11_34_the_launched_program_s_hook_moves_the_binding_and_a_replaced_one
             ("LINGER", "2"),
         ],
     );
-    let held = held.spawn().expect("the launcher starts");
-    let registration = Shell::registration(&answer);
-    eventually("the launch is admitted", || registration.exists());
+    let mut held = held.spawn().expect("the launcher starts");
+    shell.at_the_confirmation(arrived);
     retarget(&swapped, another);
-    let report = shell.report("swapped");
+    std::fs::write(&changed, "").expect("the change is complete");
+    release.send(()).expect("the launch goes on");
+    let report = shell.report_from("swapped", &mut held);
     assert_eq!(report["registered"], "yes", "the launch went ahead");
     retarget(&swapped, program);
     std::fs::write(&go, "").expect("the hook may run");
@@ -811,7 +1103,7 @@ fn kr_req_12_07_a_launch_whose_session_closed_before_it_went_runs_as_typed() {
     eventually("the launch is admitted", || registration.exists());
     let admitted_at = Instant::now();
     let instance = Shell::registered_instance(&answer);
-    shell.backends.close();
+    let _ = shell.backends.close();
     eventually("the admission ends with its backend", || {
         shell.broker.binding_state(instance).is_err()
     });
@@ -841,7 +1133,7 @@ fn kr_req_12_07_a_launch_whose_session_closed_before_it_was_confirmed_runs_as_ty
         .block_on(async { tokio::time::timeout(LIVENESS, arrived).await })
         .expect("the launch is committed")
         .expect("and paused before the launcher is told");
-    shell.backends.close();
+    let _ = shell.backends.close();
     let _ = finish(child);
     assert_typed(
         &shell.report("unconfirmed"),
@@ -1017,7 +1309,7 @@ fn kr_req_12_07_a_launcher_resumed_after_its_session_closed_runs_as_typed() {
         .env("VALUE", fixture::FLAGS[1]);
     let child = stopped.spawn().expect("the shell starts");
     wait_stopped(child.id());
-    shell.backends.close();
+    let _ = shell.backends.close();
     assert!(
         !Shell::directory(&answer).exists(),
         "the session's backends are gone"
@@ -1096,9 +1388,13 @@ fn kr_req_05_09_a_replacement_that_maps_the_hashed_program_is_refused() {
         "-c".to_owned(),
         MAPPING_PROGRAM.to_owned(),
     ];
+    // Found before anything starts: it runs a program of its own, which on a loaded machine can take
+    // longer than a launcher waits.
+    let python = python3();
     let answer = shell.establish_with(&path, &typed);
-    let registration = Shell::registration(&answer);
-    let mut held = shell.launcher(&path, &Shell::answered_for(&typed), Some(1000));
+    let changed = shell.placed.host.root().join("mapped.changed");
+    let (arrived, release) = shell.backends.pause_before_confirming();
+    let mut held = shell.launcher_until(&path, &Shell::answered_for(&typed), &changed);
     let mapped = program.display().to_string();
     shell.prepare(
         &mut held,
@@ -1111,10 +1407,12 @@ fn kr_req_05_09_a_replacement_that_maps_the_hashed_program_is_refused() {
             ("LINGER", "2"),
         ],
     );
-    let held = held.spawn().expect("the launcher starts");
-    eventually("the launch is admitted", || registration.exists());
-    retarget(&path, &python3());
-    let report = shell.report("mapped");
+    let mut held = held.spawn().expect("the launcher starts");
+    shell.at_the_confirmation(arrived);
+    retarget(&path, &python);
+    std::fs::write(&changed, "").expect("the change is complete");
+    release.send(()).expect("the launch goes on");
+    let report = shell.report_from("mapped", &mut held);
     assert_eq!(report["registered"], "yes", "the launch went ahead");
     let instance = instance_of(&report);
     hooked(&shell, "mapped");
@@ -1132,14 +1430,28 @@ fn kr_req_05_09_a_replacement_that_maps_the_hashed_program_is_refused() {
 #[cfg(target_os = "linux")]
 #[test]
 fn kr_req_05_09_a_program_rewritten_in_place_after_it_was_hashed_is_refused() {
-    use std::io::Write as _;
     let shell = Shell::new();
     let hook = shell.placed.forwarder.display().to_string();
     let program = shell.placed.host.root().join("bin").join("rewritten");
-    std::fs::copy("/bin/bash", &program).expect("a copy of the program, which Linux runs anywhere");
+    // A copy of the program, which Linux runs anywhere, placed by a process of its own: see
+    // `rewrite_in_place`.
+    kr_ipc::testing::place_program(Path::new("/bin/bash"), &program);
     let answer = shell.establish_for(&program);
-    let registration = Shell::registration(&answer);
-    let mut held = shell.launcher(&program, &Shell::answered(), Some(1000));
+    // The changed bytes are made before the launch, in a file nothing runs, so the window holds
+    // only the write itself.
+    let mut bytes = std::fs::read(&program).expect("the program's bytes");
+    // The file's last byte, in its section headers, which nothing reads to run it.
+    if let Some(last) = bytes.last_mut() {
+        *last ^= 0xff;
+    }
+    let staged = shell.placed.host.root().join("rewritten.bytes");
+    std::fs::write(&staged, &bytes).expect("the changed bytes, staged");
+    let modified = std::fs::metadata(&program)
+        .and_then(|metadata| metadata.modified())
+        .expect("its modification time");
+    let changed = shell.placed.host.root().join("rewritten.changed");
+    let (arrived, release) = shell.backends.pause_before_confirming();
+    let mut held = shell.launcher_until(&program, &Shell::answered(), &changed);
     shell.prepare(
         &mut held,
         Some(&answer),
@@ -1150,28 +1462,13 @@ fn kr_req_05_09_a_program_rewritten_in_place_after_it_was_hashed_is_refused() {
             ("LINGER", "2"),
         ],
     );
-    let held = held.spawn().expect("the launcher starts");
-    eventually("the launch is admitted", || registration.exists());
-    let mut bytes = std::fs::read(&program).expect("the program's bytes");
-    // The file's last byte, in its section headers, which nothing reads to run it.
-    if let Some(last) = bytes.last_mut() {
-        *last ^= 0xff;
-    }
-    let modified = std::fs::metadata(&program)
-        .and_then(|metadata| metadata.modified())
-        .expect("its modification time");
-    {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&program)
-            .expect("the same inode, opened to write");
-        file.write_all(&bytes)
-            .expect("its bytes written back, one changed");
-        file.set_modified(modified)
-            .expect("its modification time put back");
-        file.sync_all().expect("written");
-    }
-    let report = shell.report("rewritten");
+    let mut held = held.spawn().expect("the launcher starts");
+    shell.at_the_confirmation(arrived);
+    rewrite_in_place(&staged, &program, modified);
+    // Nothing holds the program open for writing now: the launcher may execute it.
+    std::fs::write(&changed, "").expect("the change is complete");
+    release.send(()).expect("the launch goes on");
+    let report = shell.report_from("rewritten", &mut held);
     assert_eq!(report["registered"], "yes", "the launch went ahead");
     let instance = instance_of(&report);
     hooked(&shell, "rewritten");
@@ -1321,8 +1618,9 @@ fn kr_req_05_09_a_code_directory_copied_into_changed_code_vouches_for_nothing() 
     let path = shell.placed.host.root().join("bin").join("stale");
     std::os::unix::fs::symlink(&changed, &path).expect("the program");
     let answer = shell.establish_for(&path);
-    let registration = Shell::registration(&answer);
-    let mut held = shell.launcher(&path, &Shell::answered(), Some(1000));
+    let replaced = shell.placed.host.root().join("stale.changed");
+    let (arrived, release) = shell.backends.pause_before_confirming();
+    let mut held = shell.launcher_until(&path, &Shell::answered(), &replaced);
     shell.prepare(
         &mut held,
         Some(&answer),
@@ -1333,10 +1631,12 @@ fn kr_req_05_09_a_code_directory_copied_into_changed_code_vouches_for_nothing() 
             ("LINGER", "2"),
         ],
     );
-    let held = held.spawn().expect("the launcher starts");
-    eventually("the launch is admitted", || registration.exists());
+    let mut held = held.spawn().expect("the launcher starts");
+    shell.at_the_confirmation(arrived);
     retarget(&path, program);
-    let report = shell.report("stale");
+    std::fs::write(&replaced, "").expect("the change is complete");
+    release.send(()).expect("the launch goes on");
+    let report = shell.report_from("stale", &mut held);
     assert_eq!(report["registered"], "yes", "the launch went ahead");
     let instance = instance_of(&report);
     hooked(&shell, "stale");
@@ -1359,7 +1659,8 @@ fn kr_req_12_07_an_upgrade_while_the_program_runs_leaves_it_its_bridges() {
     let (program, another) = shells();
     let path = shell.placed.host.root().join("bin").join("upgraded");
     if cfg!(target_os = "linux") {
-        std::fs::copy(program, &path).expect("a copy of the program, which Linux runs anywhere");
+        // A copy of the program, which Linux runs anywhere, placed by a process of its own.
+        kr_ipc::testing::place_program(program, &path);
     } else {
         std::os::unix::fs::symlink(program, &path).expect("the program");
     }
@@ -1405,4 +1706,631 @@ fn kr_req_12_07_an_upgrade_while_the_program_runs_leaves_it_its_bridges() {
         "the running program's second hook is admitted after the upgrade"
     );
     let _ = finish(child);
+}
+
+/// A text file reached from the root directory through another mount, where this host has one:
+/// Linux's `/proc/version`, on procfs, and on macOS this crate's own manifest when the source tree
+/// is on a volume of its own.
+fn across_a_mount() -> Option<PathBuf> {
+    if cfg!(target_os = "linux") {
+        return Some(PathBuf::from("/proc/version"));
+    }
+    use std::os::unix::fs::MetadataExt as _;
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let root = std::fs::metadata("/").ok()?.dev();
+    let file = std::fs::metadata(&manifest).ok()?.dev();
+    (root != file).then_some(manifest)
+}
+
+/// Performs one reverse read through a grant, as the gateway does for an upstream that asks.
+fn read_through(
+    files: &Arc<kr_worker::broker::host::HostFiles>,
+    path: &Path,
+) -> kr_worker::broker::host::Answer {
+    let body = serde_json::json!({ "params": { "path": path.display().to_string() } });
+    let body = body.as_object().expect("an object");
+    match kr_worker::broker::host::Plan::decide(
+        body,
+        "params",
+        kr_protocol::gateway::ReverseOperation::FilesystemRead,
+        Some(files),
+        EnvironmentId::new(Uuid::from_bytes([4; 16])),
+        true,
+    ) {
+        kr_worker::broker::host::Plan::Perform(performance) => performance.perform().answer,
+        kr_worker::broker::host::Plan::Refuse(refusal) => {
+            kr_worker::broker::host::Answer::Refused(refusal)
+        }
+    }
+}
+
+/// KR-REQ-12.16: a launch whose connector's installation may read files is granted the directory
+/// the shell reported for the invocation, for reading and confined to its own mount. A reverse read
+/// inside it runs in the host's environment; one that crosses into another mount is refused; and a
+/// launch whose connector may not read files is granted no directory at all.
+#[test]
+fn kr_req_12_16_a_launch_is_granted_the_directory_it_was_resolved_in_for_reading() {
+    let shell = Shell::reading();
+    let project = shell.placed.host.root().join("project");
+    std::fs::create_dir_all(&project).expect("a project directory");
+    std::fs::write(project.join("notes.txt"), "first\nsecond\n").expect("a file in it");
+    let answer = shell.establish_in(&project);
+    let child = shell.launch_from(&answer, "reading", &[("LINGER", "2")], &project);
+    let instance = instance_of(&shell.report("reading"));
+    let files = shell
+        .broker
+        .host_files(instance)
+        .expect("the directory it was resolved in is granted");
+    assert_eq!(files.access(), kr_worker::broker::host::FileAccess::Read);
+    let kr_worker::broker::host::Answer::Result(read) =
+        read_through(&files, &project.join("notes.txt"))
+    else {
+        panic!("a read inside the granted directory runs");
+    };
+    assert!(read.to_string().contains("first"), "{read}");
+    let (status, said) = finish(child);
+    assert!(status.success(), "{said}");
+    eventually("the grant ends with the instance", || {
+        shell.broker.host_files(instance).is_none()
+    });
+
+    // A directory whose tree holds another mount: a read of a text file that would cross into it is
+    // refused, where this host has such a file.
+    if let Some(across) = across_a_mount() {
+        let answer = shell.establish_in(Path::new("/"));
+        let child = shell.launch_from(&answer, "root", &[("LINGER", "2")], Path::new("/"));
+        let instance = instance_of(&shell.report("root"));
+        let files = shell
+            .broker
+            .host_files(instance)
+            .expect("the root directory is granted");
+        let read = read_through(&files, &across);
+        assert!(
+            matches!(read, kr_worker::broker::host::Answer::Refused(_)),
+            "a read of {} crosses into another mount and is refused: {read:?}",
+            across.display()
+        );
+        let _ = finish(child);
+    }
+
+    // A connector whose installation may not read files.
+    let plain = Shell::new();
+    let answer = plain.establish();
+    let child = plain.launch(&answer, "plain", &[("LINGER", "1")]);
+    let instance = instance_of(&plain.report("plain"));
+    assert!(
+        plain.broker.host_files(instance).is_none(),
+        "no directory is granted without the grant to read files"
+    );
+    let _ = finish(child);
+}
+
+/// KR-REQ-12.16: the directory a launch is granted is opened off the establish, which the session
+/// runs under its own lock. An open that takes its time, as one on a filesystem that has stopped
+/// answering does, holds neither the establish nor its answer, and the launch that follows still
+/// finds the directory granted.
+#[test]
+fn kr_req_12_16_a_directory_slow_to_open_does_not_hold_the_establish() {
+    let shell = Shell::reading();
+    let project = shell.placed.host.root().join("slow");
+    std::fs::create_dir_all(&project).expect("a project directory");
+    let (arrived, release) = shell.backends.pause_before_opening_the_directory();
+    let started = Instant::now();
+    let answer = shell.establish_in(&project);
+    let took = started.elapsed();
+    arrived
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the directory's open is reached");
+    assert!(
+        took < Duration::from_secs(1),
+        "the establish waited {took:?} for the directory's open"
+    );
+    release.send(()).expect("the open is let go");
+    let child = shell.launch_from(&answer, "slow", &[("LINGER", "2")], &project);
+    let instance = instance_of(&shell.report("slow"));
+    assert!(
+        shell.broker.host_files(instance).is_some(),
+        "the launch is granted the directory once it is open"
+    );
+    let _ = finish(child);
+}
+
+/// Sets a directory's permission bits.
+fn set_mode(directory: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(mode))
+        .expect("the directory's mode is set");
+}
+
+/// How many observations one instance's history holds.
+fn observed(shell: &Shell, instance: ApplicationInstanceId) -> usize {
+    shell
+        .broker
+        .agent_snapshot(
+            &kr_protocol::agent::AgentSnapshotParams {
+                subject: kr_worker::broker::subject(session(), instance),
+                from_node: kr_protocol::scalars::Nullable::null(),
+            },
+            &kr_worker::broker::GrantLowerBound {
+                from: kr_protocol::ids::StreamCursor::new(0),
+            },
+        )
+        .map_or(0, |snapshot| snapshot.entries.len())
+}
+
+/// KR-REQ-12.07: a launch whose registration cannot be written after its instance was registered
+/// gives back what it took, and only that. The invocation runs as typed, an instance registered
+/// beside it stays, and a retry of the same invocation is launched, which it could not be if the
+/// failed launch still held its instance.
+#[test]
+fn kr_req_12_07_a_registration_that_cannot_be_written_gives_back_only_its_own() {
+    let shell = Shell::new();
+    let beside = ApplicationInstanceId::new(Uuid::from_bytes([8; 16]));
+    shell
+        .broker
+        .register_instance(
+            beside,
+            kr_protocol::broker::IntegrationMode::NativeTerminal,
+            None,
+            None,
+        )
+        .expect("an instance beside the launch");
+    let answer = shell.establish();
+    let directory = Shell::directory(&answer);
+    // Read-only: everything the launch reads is there, and its registration cannot be written.
+    set_mode(&directory, 0o500);
+    let child = shell.launch(&answer, "unwritten", &[]);
+    let report = shell.report("unwritten");
+    let (status, said) = finish(child);
+    set_mode(&directory, 0o700);
+    assert!(status.success(), "{said}");
+    assert_typed(&report, "a launch whose registration could not be written");
+    assert!(
+        !Shell::registration(&answer).exists(),
+        "nothing was published"
+    );
+    assert!(
+        shell.broker.binding_state(beside).is_ok(),
+        "an instance the launch did not take stays"
+    );
+
+    let child = shell.launch(&answer, "retried", &[("LINGER", "1")]);
+    let report = shell.report("retried");
+    assert_eq!(
+        report["registered"], "yes",
+        "the retry is launched: the failed launch gave its instance back"
+    );
+    assert!(
+        shell.broker.binding_state(instance_of(&report)).is_ok(),
+        "under the backend's own instance"
+    );
+    let _ = finish(child);
+    assert!(shell.broker.binding_state(beside).is_ok());
+}
+
+/// KR-REQ-11.34: only the launched program's own hook reports its selection. A process the program
+/// started, as a nested Claude Code inheriting its variables would be, has its hook admitted,
+/// since it descends from the program, and recorded, and its report moves nothing; the program's
+/// own report then selects the thread.
+#[test]
+fn kr_req_11_34_a_nested_process_s_session_start_is_recorded_and_moves_nothing() {
+    let shell = Shell::new();
+    let hook = shell.placed.forwarder.display().to_string();
+    let answer = shell.establish();
+    let own = shell.placed.host.root().join("own-hook");
+    let own_text = own.display().to_string();
+    let child = shell.launch(
+        &answer,
+        "nested",
+        &[
+            ("HOOK", hook.as_str()),
+            ("HOOK_EVENT", SESSION_START),
+            ("NESTED", "1"),
+            ("THEN_OWN", own_text.as_str()),
+            ("LINGER", "2"),
+        ],
+    );
+    let instance = instance_of(&shell.report("nested"));
+    eventually("the nested process's hook has run", || {
+        shell.reports.join("nested.nested.hooked").exists()
+    });
+    eventually("its report is recorded", || observed(&shell, instance) == 1);
+    assert_eq!(
+        selected(&shell, instance),
+        None,
+        "a nested process's report moves nothing"
+    );
+    std::fs::write(&own, "").expect("the program's own hook may run");
+    hooked(&shell, "nested");
+    eventually("the program's own report selects the thread", || {
+        selected(&shell, instance).as_deref() == Some(THREAD)
+    });
+    assert_eq!(observed(&shell, instance), 2);
+    let _ = finish(child);
+}
+
+/// KR-REQ-12.07: a session's views hear its agent instances in the order they came and went: a
+/// launch once it is committed, a program adopted beside it, and each end, the launch's once its
+/// endpoint, credential, registration and launch record are gone.
+#[test]
+fn kr_req_12_07_a_launch_an_adoption_and_their_ends_reach_a_view_in_order() {
+    let shell = Shell::viewed();
+    let view = shell.view.as_ref().expect("a view");
+    let answer = shell.establish();
+    let directory = Shell::directory(&answer);
+    let registration = Shell::registration(&answer);
+    let child = shell.launch(&answer, "announced", &[("LINGER", "3")]);
+    let launched = instance_of(&shell.report("announced"));
+
+    let started = shell.announcement();
+    assert_eq!(started.instance.application_instance_id, launched);
+    assert_eq!(
+        started.instance.mode,
+        kr_protocol::broker::IntegrationMode::NativeBridge
+    );
+    assert!(!started.instance.ended_at.is_present());
+    assert!(started.instance.refusal.as_ref().is_none());
+    assert_eq!(
+        started.instance.profile_id.as_ref(),
+        shell
+            .broker
+            .profile_of(launched)
+            .map(|profile| profile.profile_id)
+            .as_ref(),
+        "the launch's own profile"
+    );
+
+    // A program the root shell ran beside it, which the integration did not launch.
+    let mut other = stand_in(&shell.placed);
+    let adoptions = kr_worker::broker::adoption::Adoptions::new(
+        Arc::clone(&shell.broker),
+        Arc::clone(&shell.sources),
+        EnvironmentId::new(Uuid::from_bytes([4; 16])),
+    )
+    .with_views(Arc::downgrade(&view.runtime));
+    let foreground = kr_worker::broker::adoption::Foreground {
+        group: i32::try_from(other.id()).expect("a process identifier"),
+        root_shell: kr_ipc::identity::current_process_start_identity().expect("this process"),
+        answered: Vec::new(),
+    };
+    eventually("the program is adopted", || {
+        !adoptions.look(&foreground).is_empty()
+    });
+    let adopted = shell.announcement();
+    assert_eq!(
+        adopted.instance.mode,
+        kr_protocol::broker::IntegrationMode::NativeTerminal
+    );
+    assert!(adopted.sequence.get() > started.sequence.get());
+
+    let (status, said) = finish(child);
+    assert!(status.success(), "{said}");
+    let ended = shell.announcement();
+    assert_eq!(ended.instance.application_instance_id, launched);
+    assert!(ended.instance.ended_at.is_present(), "the launch's end");
+    assert!(ended.sequence.get() > adopted.sequence.get());
+    let left: Vec<String> = std::fs::read_dir(&directory)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        left.is_empty() && !registration.exists(),
+        "by then its endpoint, credential, registration and launch record are gone: {left:?}"
+    );
+
+    let _ = other.kill();
+    let _ = other.wait();
+    let swept = adoptions.sweep();
+    assert_eq!(swept.len(), 1, "the adopted program's end: {swept:?}");
+    let adopted_ended = shell.announcement();
+    assert_eq!(
+        adopted_ended.instance.application_instance_id,
+        adopted.instance.application_instance_id
+    );
+    assert!(adopted_ended.instance.ended_at.is_present());
+    assert!(adopted_ended.sequence.get() > ended.sequence.get());
+    assert!(
+        view.runtime
+            .session()
+            .agent_instances()
+            .instances
+            .is_empty(),
+        "the session lists no instance once both have ended"
+    );
+}
+
+/// KR-REQ-12.07, KR-REQ-05.09: when a launched program's bridge is refused for what its process
+/// executes, the session's views are told why, once, and the reason stands in the instance's
+/// announcements until its end.
+#[test]
+fn kr_req_12_07_a_refused_bridge_is_announced_with_its_reason() {
+    let shell = Shell::viewed();
+    let hook = shell.placed.forwarder.display().to_string();
+    let (_, another) = shells();
+    let second = SESSION_START.replace(THREAD, SECOND_THREAD);
+    let then_exec = another.display().to_string();
+    let answer = shell.establish();
+    let child = shell.launch(
+        &answer,
+        "refused",
+        &[
+            ("HOOK", hook.as_str()),
+            ("HOOK_EVENT", SESSION_START),
+            ("HOOK_EVENT_2", second.as_str()),
+            ("THEN_EXEC", then_exec.as_str()),
+        ],
+    );
+    let instance = instance_of(&shell.report("refused"));
+    let started = shell.announcement();
+    assert_eq!(started.instance.application_instance_id, instance);
+    assert!(
+        started.instance.refusal.as_ref().is_none(),
+        "nothing is refused yet"
+    );
+    eventually("the other program's hook has run", || {
+        shell.reports.join("refused.hooked2").exists()
+    });
+    let refused = shell.announcement();
+    assert_eq!(refused.instance.application_instance_id, instance);
+    assert!(!refused.instance.ended_at.is_present());
+    let why = refused
+        .instance
+        .refusal
+        .as_ref()
+        .expect("the views are told why its bridges are refused")
+        .clone();
+    assert!(refused.sequence.get() > started.sequence.get());
+    let _ = finish(child);
+    let ended = shell.announcement();
+    assert!(ended.instance.ended_at.is_present(), "then its end");
+    assert_eq!(
+        ended.instance.refusal.as_ref(),
+        Some(&why),
+        "the refusal stands to the end"
+    );
+}
+
+/// KR-REQ-12.16: the directory a launch is granted is the one its program runs in. A directory
+/// moved away and replaced at its path before the grant's directory is opened is not granted:
+/// what was opened is not where the launched process works.
+#[test]
+fn kr_req_12_16_a_directory_replaced_before_it_is_opened_is_not_granted() {
+    let shell = Shell::reading();
+    let project = shell.placed.host.root().join("replaced");
+    std::fs::create_dir_all(&project).expect("a project directory");
+    let (arrived, release) = shell.backends.pause_before_opening_the_directory();
+    let answer = shell.establish_in(&project);
+    arrived
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the directory's open is reached");
+    // The launcher starts in the directory, as the shell's child would, and the directory is then
+    // moved away and another made at its path, before the open.
+    let child = shell.launch_from(&answer, "replaced", &[("LINGER", "2")], &project);
+    std::fs::rename(&project, shell.placed.host.root().join("moved"))
+        .expect("the directory is moved away");
+    std::fs::create_dir(&project).expect("another directory at its path");
+    release.send(()).expect("the open is let go");
+    let instance = instance_of(&shell.report("replaced"));
+    assert!(
+        shell.broker.binding_state(instance).is_ok(),
+        "the launch went ahead"
+    );
+    assert!(
+        shell.broker.host_files(instance).is_none(),
+        "the directory opened is not the one the program runs in, so none is granted"
+    );
+    let _ = finish(child);
+}
+
+/// KR-REQ-12.07, KR-REQ-12.16: a session that closes ends the instances of the programs it is
+/// ending and tells its views so while they are attached: the launch's instance and its grant end,
+/// and the session lists nothing. Its program's own exit, later, announces nothing more.
+#[test]
+fn kr_req_12_07_a_session_that_closes_ends_its_launches_and_tells_its_views() {
+    let shell = Shell::with_source(fixture::reading, true);
+    let view = shell.view.as_ref().expect("a view");
+    let project = shell.placed.host.root().join("closing");
+    std::fs::create_dir_all(&project).expect("a project directory");
+    let answer = shell.establish_in(&project);
+    let child = shell.launch_from(&answer, "closing", &[("LINGER", "3")], &project);
+    let instance = instance_of(&shell.report("closing"));
+    let started = shell.announcement();
+    assert_eq!(started.instance.application_instance_id, instance);
+    assert!(shell.broker.host_files(instance).is_some(), "granted");
+
+    let _ = view
+        .runtime
+        .session()
+        .begin_close(kr_protocol::session::ClosureReason::CloseRequested);
+    let ended = shell.announcement();
+    assert_eq!(ended.instance.application_instance_id, instance);
+    assert!(ended.instance.ended_at.is_present(), "the end is announced");
+    assert!(ended.sequence.get() > started.sequence.get());
+    assert!(
+        shell.broker.binding_state(instance).is_err(),
+        "the instance ended with its session"
+    );
+    assert!(
+        shell.broker.host_files(instance).is_none(),
+        "and its grant with it"
+    );
+    assert!(
+        view.runtime
+            .session()
+            .agent_instances()
+            .instances
+            .is_empty(),
+        "the session lists nothing it is ending"
+    );
+
+    let (status, said) = finish(child);
+    assert!(status.success(), "{said}");
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        view.runtime.session().agent_instances().sequence.get(),
+        ended.sequence.get(),
+        "the program's own exit announces nothing more"
+    );
+}
+
+/// KR-REQ-12.07, KR-REQ-12.16: a session that closes leaves no instance of its launches behind,
+/// whatever stage a launch had reached: one committed and not yet confirmed to its launcher, and
+/// one admitted and not yet going. Each backend is retired before its instance is ended, so no
+/// commit can follow the close, and nothing the close finds decides whether the instance ends.
+#[test]
+fn kr_req_12_07_a_session_that_closes_mid_launch_leaves_no_instance() {
+    // Committed, and paused before the launcher is told.
+    let shell = Shell::with_source(fixture::reading, true);
+    let view = shell.view.as_ref().expect("a view");
+    let project = shell.placed.host.root().join("committed");
+    std::fs::create_dir_all(&project).expect("a project directory");
+    let (arrived, release) = shell.backends.pause_before_confirming();
+    let answer = shell.establish_in(&project);
+    let child = shell.launch_from(&answer, "committed", &[], &project);
+    shell
+        .runtime
+        .block_on(async { tokio::time::timeout(LIVENESS, arrived).await })
+        .expect("the launch is committed")
+        .expect("and paused before the launcher is told");
+    let instance = Shell::registered_instance(&answer);
+    assert!(shell.broker.binding_state(instance).is_ok());
+    let _ = view
+        .runtime
+        .session()
+        .begin_close(kr_protocol::session::ClosureReason::CloseRequested);
+    assert!(
+        shell.broker.binding_state(instance).is_err(),
+        "the committed launch's instance ends with its session"
+    );
+    assert!(shell.broker.host_files(instance).is_none(), "and its grant");
+    assert!(
+        view.runtime
+            .session()
+            .agent_instances()
+            .instances
+            .is_empty(),
+        "and the session lists nothing"
+    );
+    let _ = release.send(());
+    let _ = finish(child);
+    assert_typed(
+        &shell.report("committed"),
+        "a launch whose session closed before it was confirmed",
+    );
+
+    // Admitted, and holding before it says it is going.
+    let shell = Shell::with_source(fixture::reading, true);
+    let view = shell.view.as_ref().expect("a view");
+    let answer = shell.establish();
+    let registration = Shell::registration(&answer);
+    let mut held = shell.launcher(&shell.executable, &Shell::answered(), Some(3000));
+    shell.prepare(&mut held, Some(&answer), "admitted", &[]);
+    let held = held.spawn().expect("the launcher starts");
+    eventually("the launch is admitted", || registration.exists());
+    let instance = Shell::registered_instance(&answer);
+    let _ = view
+        .runtime
+        .session()
+        .begin_close(kr_protocol::session::ClosureReason::CloseRequested);
+    assert!(
+        shell.broker.binding_state(instance).is_err(),
+        "an admitted launch's instance ends with its session too"
+    );
+    assert!(
+        view.runtime
+            .session()
+            .agent_instances()
+            .instances
+            .is_empty()
+    );
+    let _ = finish(held);
+    assert_typed(
+        &shell.report("admitted"),
+        "a launch whose session closed before it went",
+    );
+}
+
+/// KR-REQ-12.07, KR-REQ-12.16: a launch that commits after its session has started to close, and
+/// before the close retires its backend, ends with the session too: the close reads nothing of the
+/// launch before the retirement, so whatever the launch did in between, its instance and its grant
+/// end, and its launcher, never told, runs what was typed. Each step waits at a pause the test lets
+/// go of, so the order is the same on any machine: the launch going and not committed, the close
+/// started, the commit, and then the retirement.
+#[test]
+fn kr_req_12_07_a_launch_committed_while_its_session_closes_leaves_no_instance() {
+    let shell = Shell::reading();
+    let project = shell.placed.host.root().join("raced");
+    std::fs::create_dir_all(&project).expect("a project directory");
+    let answer = shell.establish_in(&project);
+    let (going, commit) = shell.backends.pause_before_committing();
+    let (retiring, go_on) = shell.backends.pause_before_retiring();
+    let (mut committed, confirm) = shell.backends.pause_before_confirming();
+    // The program runs only once the test is done, whichever route its launcher takes, so the
+    // process the instance names is there throughout.
+    let done = shell.placed.host.root().join("raced.done");
+    let mut held = shell.launcher_until(&shell.executable, &Shell::answered(), &done);
+    shell.prepare(&mut held, Some(&answer), "raced", &[]);
+    held.current_dir(&project);
+    let mut held = held.spawn().expect("the launcher starts");
+
+    // The launch says it is going, and waits before it is committed.
+    shell
+        .runtime
+        .block_on(async { tokio::time::timeout(LIVENESS, going).await })
+        .expect("the launch says it is going")
+        .expect("and waits before it is committed");
+    let instance = Shell::registered_instance(&answer);
+    assert!(
+        matches!(
+            shell.backends.state_of(instance),
+            Some(BackendState::Launching)
+        ),
+        "the launch is going and not committed"
+    );
+
+    // The session starts to close, and the close waits before it retires the backend.
+    let backends = Arc::clone(&shell.backends);
+    let closing = std::thread::spawn(move || backends.close());
+    retiring
+        .recv_timeout(LIVENESS)
+        .expect("the close reaches the backend");
+    assert!(
+        shell.backends.state_of(instance).is_none(),
+        "the close has taken the session's backends"
+    );
+    assert!(
+        matches!(
+            committed.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "nothing committed before the close started"
+    );
+
+    // The launch commits in between.
+    commit.send(()).expect("the launch commits");
+    shell.at_the_confirmation(committed);
+    assert!(shell.broker.binding_state(instance).is_ok(), "committed");
+
+    // The close retires the backend, and ends what the launch committed.
+    go_on.send(()).expect("the close goes on");
+    let _ = closing.join().expect("the close finishes");
+    assert!(
+        shell.broker.binding_state(instance).is_err(),
+        "a launch that committed while its session closed ends with it"
+    );
+    assert!(
+        shell.broker.host_files(instance).is_none(),
+        "and so does its grant"
+    );
+    let _ = confirm.send(());
+    std::fs::write(&done, "").expect("the program may run");
+    assert_typed(
+        &shell.report_from("raced", &mut held),
+        "a launch committed while its session closed",
+    );
+    let _ = finish(held);
 }

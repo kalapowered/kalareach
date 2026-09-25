@@ -109,6 +109,20 @@ export type InstanceInvalidation =
  */
 export type ApplicationInstanceId = string
 /**
+ * Why an invocation ran exactly as it was typed.
+ *
+ * Section 12: an absolute-path invocation and a user-disabled integration keep their actual
+ * bypassed execution, with only verified observation and the terminal's own capabilities.
+ */
+export type CommandBypassReason =
+  | 'not_integrated'
+  | 'disabled'
+  | 'absolute_path'
+  | 'unmanaged_shell'
+  | 'not_interactive'
+  | 'backend_unavailable'
+  | 'session_closing'
+/**
  * Prompt or steering text carried inline. The normative bound is 65536                             bytes of UTF-8; maxLength counts characters and is therefore a                             necessary rather than a sufficient condition.
  */
 export type PromptText = string
@@ -194,6 +208,25 @@ export type AttachmentCapability = 'observe_terminal' | 'observe_semantic' | 'in
  * How a terminal attachment displays the canonical grid.
  */
 export type TerminalPresentationMode = 'direct' | 'viewport'
+/**
+ * Why a terminal attachment is shown a viewport of the canonical grid rather than the live byte
+ * stream.
+ *
+ * Direct presentation needs every one of these conditions to hold, and an attachment that is not
+ * direct is given one reason: the first in this order that does not hold. The order runs from what
+ * lasts as long as the attachment stays as it is, its terminal and then its size, through where
+ * its window is, to the session's own state, which passes by itself: the output leaving what a
+ * terminal can be handed, a restoration that could not carry the screen, and forwarding waiting
+ * for a parser boundary.
+ */
+export type PresentationReason =
+  | 'no_terminal_profile'
+  | 'unqualified_terminal_profile'
+  | 'size_mismatch'
+  | 'history_window'
+  | 'stream_not_carryable'
+  | 'restoration_incomplete'
+  | 'awaiting_parser_boundary'
 /**
  * Where an attachment's window sits in the session's rows.
  *
@@ -513,6 +546,10 @@ export type ChangeSetVersion = string
  * well is a second, separate choice.
  */
 export type SleepInhibitionSetting = 'off' | 'mains_only' | 'battery_too'
+/**
+ * One way of starting this environment's control daemon.
+ */
+export type ControllerStartup = 'standalone'
 /**
  * The host's answer to a client proof.
  */
@@ -1586,20 +1623,6 @@ export type RichOperation =
  */
 export type FenceId = string
 /**
- * Why an invocation ran exactly as it was typed.
- *
- * Section 12: an absolute-path invocation and a user-disabled integration keep their actual
- * bypassed execution, with only verified observation and the terminal's own capabilities.
- */
-export type CommandBypassReason =
-  | 'not_integrated'
-  | 'disabled'
-  | 'absolute_path'
-  | 'unmanaged_shell'
-  | 'not_interactive'
-  | 'backend_unavailable'
-  | 'session_closing'
-/**
  * What the worker tells the bridge about the fence.
  *
  * The bridge cannot conclude that its acknowledgement published a fence: the hold may have expired
@@ -1776,6 +1799,9 @@ export interface KalaReachProtocol {
   agent_commands_result?: AgentCommandsResult
   agent_draft_add_attachment_params?: AgentDraftAddAttachmentParams
   agent_draft_add_attachment_result?: AgentDraftAddAttachmentResult
+  agent_instance_event?: AgentInstanceEvent
+  agent_instance_list?: AgentInstanceList
+  agent_instance_summary?: AgentInstanceSummary1
   agent_mutation_result?: AgentMutationResult1
   agent_prompt_params?: AgentPromptParams
   agent_resource_cause?: AgentResourceCause
@@ -2230,6 +2256,7 @@ export interface KalaReachProtocol {
   root_eof_detach_result?: RootEofDetachResult
   run_tests_params?: RunTestsParams
   sealed_envelope?: SealedEnvelope
+  sealed_recovery_bundle?: SealedRecoveryBundle
   semantic_change?: SemanticChange
   semantic_continuation?: SemanticContinuation
   service_request_signature?: ServiceRequestSignature
@@ -3474,6 +3501,119 @@ export interface DraftAttachment1 {
   upstream_evidence: string | null
 }
 /**
+ * One change to a session's agent instances, as an attached view is told about it.
+ */
+export interface AgentInstanceEvent {
+  instance: AgentInstanceSummary
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  sequence: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * What the instance is now.
+ */
+export interface AgentInstanceSummary {
+  /**
+   * One foreground application within a terminal session.
+   */
+  application_instance_id: string
+  /**
+   * Why the shell ran the program as typed, where the session answered it with a bypass.
+   */
+  bypass: CommandBypassReason | null
+  /**
+   * When the instance ended. A view drops an ended instance from its list.
+   */
+  ended_at: TimestampMs | null
+  /**
+   * How the program is integrated: `native_bridge` for a launch the integration made, and
+   * `native_terminal` for a program that was adopted.
+   */
+  mode: 'native_terminal' | 'gateway' | 'native_bridge'
+  /**
+   * The plugin whose connector recognised the program, where one did.
+   */
+  plugin_id: PluginId | null
+  /**
+   * The launch profile recorded for the program, where one was.
+   */
+  profile_id: LaunchProfileId | null
+  /**
+   * Why the instance's bridges are refused, where they are.
+   */
+  refusal: string | null
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  started_at: string
+}
+/**
+ * A session's live agent instances, as a view installs them.
+ *
+ * The session keeps the list and counts its announcements under its own lock, and it announces
+ * under that lock too, so every announcement is either in a list or after it: its sequence says
+ * which. A view installs the list, then applies the announcements above its sequence, and so
+ * holds every live instance once.
+ */
+export interface AgentInstanceList {
+  /**
+   * Every instance of the session that has not ended, in identifier order.
+   */
+  instances: AgentInstanceSummary1[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  sequence: string
+}
+/**
+ * One agent instance of a session, as the session announces it.
+ *
+ * Section 12 has a program the integrated route did not launch detected and observed rather than
+ * given a gateway after the fact, and a person watching the session needs to tell the two apart:
+ * a launched instance can have rich bridges, and an adopted one never does. This says which it
+ * is, how it came to run and, where its bridges are refused, why.
+ */
+export interface AgentInstanceSummary1 {
+  /**
+   * One foreground application within a terminal session.
+   */
+  application_instance_id: string
+  /**
+   * Why the shell ran the program as typed, where the session answered it with a bypass.
+   */
+  bypass: CommandBypassReason | null
+  /**
+   * When the instance ended. A view drops an ended instance from its list.
+   */
+  ended_at: TimestampMs | null
+  /**
+   * How the program is integrated: `native_bridge` for a launch the integration made, and
+   * `native_terminal` for a program that was adopted.
+   */
+  mode: 'native_terminal' | 'gateway' | 'native_bridge'
+  /**
+   * The plugin whose connector recognised the program, where one did.
+   */
+  plugin_id: PluginId | null
+  /**
+   * The launch profile recorded for the program, where one was.
+   */
+  profile_id: LaunchProfileId | null
+  /**
+   * Why the instance's bridges are refused, where they are.
+   */
+  refusal: string | null
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  started_at: string
+}
+/**
  * What one accepted agent mutation did.
  */
 export interface AgentMutationResult1 {
@@ -4491,6 +4631,10 @@ export interface AttachmentHandle1 {
 }
 /**
  * One attachment of a session.
+ *
+ * Closed, as every object a write result reaches is: `session.attach` answers with one, and
+ * section 23 keeps a mutation's schema closed for the negotiated version, so a field this build
+ * does not declare is refused rather than ignored.
  */
 export interface AttachmentSummary {
   /**
@@ -4526,6 +4670,17 @@ export interface AttachmentSummary {
    * How the attachment displays the canonical grid.
    */
   presentation: TerminalPresentationMode | null
+  /**
+   * Why a terminal attachment is shown a viewport, when it is.
+   *
+   * Section 8 asks every presentation to be reported with its reason. A direct attachment needs
+   * none and an attachment that is not a terminal has no presentation, so both leave this out,
+   * and a direct attachment's summary is byte for byte what a client built before reasons
+   * expects. A worker built before reasons leaves it out of every summary, and a reader takes
+   * that as no reason reported rather than as a direct presentation: `presentation` says which
+   * the attachment is.
+   */
+  presentation_reason?: PresentationReason | null
   /**
    * The terminal profile it presents.
    */
@@ -8847,6 +9002,7 @@ export interface ConfigurationDocument {
    * looks like when it is enforced rather than promised.
    */
   secrets?: SecretReference[]
+  startup?: StartupSelection
   /**
    * The schema version this document is written against.
    */
@@ -8969,11 +9125,13 @@ export interface NetworkSelection {
    */
   pkarr_resolver_url?: string | null
   /**
-   * The HTTP proxy the endpoint reaches its relays and Pkarr servers through, as an absolute
-   * `http` or `https` origin such as `http://proxy.example.com:3128`. The DNS lookup does
-   * not use it. It is this machine's own choice: no invitation or host bundle carries it.
-   * It names no user and no password, because a proxy that needs credentials is not
-   * supported.
+   * The HTTP proxy this host's outbound HTTPS goes through, as an absolute `http` or
+   * `https` origin such as `http://proxy.example.com:3128`: the network endpoint's relays
+   * and Pkarr servers, the rendezvous, delivery and webhooks, and plugin repositories.
+   * Nothing goes around it, so an address it cannot reach fails. Name lookups and mail
+   * submission do not use it. It is this machine's own choice: no invitation or host bundle
+   * carries it. It names no user and no password, because a proxy that needs credentials is
+   * not supported.
    */
   proxy_url?: string | null
   /**
@@ -9038,6 +9196,18 @@ export interface SecretReference {
    * The secure store it lives in.
    */
   store: string
+}
+/**
+ * How this environment's control daemon is started when a command finds none running.
+ *
+ * Read by `kr new` when it finds no daemon to ask, so a change applies at the next start.
+ * No environment variable reaches it.
+ */
+export interface StartupSelection {
+  /**
+   * How the control daemon is started. Absent starts none.
+   */
+  controller?: ControllerStartup | null
 }
 /**
  * The managed voice broker this host names to its paired devices.
@@ -11626,6 +11796,7 @@ export interface EventsSnapshotParams {
  * write, no notification and no query.
  */
 export interface EventsSnapshotResult {
+  agent_instances: AgentInstanceList1
   agent_resources: AgentResourceSnapshot1
   /**
    * Every current attachment, in join order.
@@ -11646,6 +11817,22 @@ export interface EventsSnapshotResult {
    * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
   taken_at_ms: string
+}
+/**
+ * The session's live agent instances when the snapshot was taken.
+ *
+ * A resynchronised view installs them and applies the announcements above
+ * [`crate::projection::AgentInstanceList::sequence`] that its stream still delivers.
+ */
+export interface AgentInstanceList1 {
+  /**
+   * Every instance of the session that has not ended, in identifier order.
+   */
+  instances: AgentInstanceSummary1[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  sequence: string
 }
 /**
  * One page of the agent resources this session's host still arbitrates.
@@ -11862,6 +12049,7 @@ export interface EventsSubscribeParams {
  * The result of `events.subscribe`.
  */
 export interface EventsSubscribeResult {
+  agent_instances: AgentInstanceList2
   agent_resources: AgentResourceSnapshot2
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
@@ -11880,6 +12068,23 @@ export interface EventsSubscribeResult {
    * The stream identifier notifications will carry.
    */
   stream_id: string
+}
+/**
+ * The session's live agent instances, read under the same lock that starts the queue.
+ *
+ * An announcement is either in this list or among the events that follow it, and its
+ * sequence says which: a view applies the announcements above
+ * [`crate::projection::AgentInstanceList::sequence`] and discards the rest.
+ */
+export interface AgentInstanceList2 {
+  /**
+   * Every instance of the session that has not ended, in identifier order.
+   */
+  instances: AgentInstanceSummary1[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  sequence: string
 }
 /**
  * The first page of the agent resources this subscription starts from.
@@ -21759,6 +21964,19 @@ export interface VersionRef11 {
   version: string
 }
 /**
+ * The owner's recovery bundle as a service stores it: one `secretstream` object.
+ *
+ * The stream carries its own header, so there is no nonce beside it, and no declared bucket: section
+ * 20 lets a service see an object's size. The service holds the bytes and nothing it could open:
+ * the key is derived from the recovery seed and the origin and locator the bundle is kept at.
+ */
+export interface SealedRecoveryBundle {
+  /**
+   * The sealed bundle.
+   */
+  ciphertext: string
+}
+/**
  * One semantic change in the changed-since-last-visit view.
  */
 export interface SemanticChange {
@@ -22032,6 +22250,10 @@ export interface SessionAttachResult {
 }
 /**
  * One attachment of a session.
+ *
+ * Closed, as every object a write result reaches is: `session.attach` answers with one, and
+ * section 23 keeps a mutation's schema closed for the negotiated version, so a field this build
+ * does not declare is refused rather than ignored.
  */
 export interface AttachmentSummary1 {
   /**
@@ -22067,6 +22289,17 @@ export interface AttachmentSummary1 {
    * How the attachment displays the canonical grid.
    */
   presentation: TerminalPresentationMode | null
+  /**
+   * Why a terminal attachment is shown a viewport, when it is.
+   *
+   * Section 8 asks every presentation to be reported with its reason. A direct attachment needs
+   * none and an attachment that is not a terminal has no presentation, so both leave this out,
+   * and a direct attachment's summary is byte for byte what a client built before reasons
+   * expects. A worker built before reasons leaves it out of every summary, and a reader takes
+   * that as no reason reported rather than as a direct presentation: `presentation` says which
+   * the attachment is.
+   */
+  presentation_reason?: PresentationReason | null
   /**
    * The terminal profile it presents.
    */
@@ -23451,7 +23684,7 @@ export interface SyncConflictCopy {
   /**
    * What kind of object it is.
    */
-  kind: 'settings' | 'draft' | 'client_selection'
+  kind: 'settings' | 'draft' | 'client_selection' | 'recovery_bundle'
   object: SealedSyncObject
   /**
    * The object the rejected write was about.
@@ -23490,7 +23723,7 @@ export interface SyncObjectRecord {
   /**
    * What kind of object it is.
    */
-  kind: 'settings' | 'draft' | 'client_selection'
+  kind: 'settings' | 'draft' | 'client_selection' | 'recovery_bundle'
   object: SealedSyncObject1
   /**
    * The object.

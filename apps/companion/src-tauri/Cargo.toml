@@ -36,12 +36,17 @@ kr-client.workspace = true
 kr-crypto.workspace = true
 # Where the host on this machine keeps its runtime directory and its controller endpoint.
 kr-ipc.workspace = true
+# The candidate's attempt budget, kept on this computer's disk under its own secret store.
+kr-pairing.workspace = true
 kr-protocol.workspace = true
 kr-voice.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+# The name this computer offers a host it pairs with.
+sysinfo.workspace = true
 tauri.workspace = true
+tauri-plugin-clipboard-manager.workspace = true
 tauri-plugin-dialog.workspace = true
 tauri-plugin-opener.workspace = true
 thiserror.workspace = true
@@ -69,17 +74,34 @@ objc2.workspace = true
 objc2-foundation = { workspace = true, features = ["std", "NSString", "NSError"] }
 objc2-local-authentication = { workspace = true, features = ["std", "LAContext", "LAError", "block2"] }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+# Windows Hello, the owner's confirmation on Windows.
+windows = { workspace = true, features = ["Foundation", "Security_Credentials_UI", "Win32_Foundation", "Win32_System_WinRT"] }
+# `std` is what lets a ceremony await Windows Hello's answer rather than block on it.
+windows-future = { workspace = true, features = ["std"] }
+
 [features]
 # What `tauri build` turns on, and what a release build must have: the interface comes from the
 # bundle rather than from a development server.
 custom-protocol = ["tauri/custom-protocol"]
 
 [dev-dependencies]
+# The pairing suite runs this computer against kr-controller's in-process daemon, whose test
+# support it includes by path.
+iroh.workspace = true
+kr-controller = { workspace = true, features = ["testing"] }
+kr-ipc = { workspace = true, features = ["testing"] }
+kr-transport.workspace = true
 tempfile.workspace = true
-# Paused time, so the phone session's waits run in a test without taking that long.
-tokio = { workspace = true, features = ["test-util"] }
+# Paused time, so the phone session's waits run in a test without taking that long, and the
+# pairing suite's multi-threaded runtime.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 # The mock runtime, so a test can call a command the way the page does: through the invoke path.
 tauri = { workspace = true, features = ["test"] }
+
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+# A window of the test's own, with safe code, for Windows Hello's dialog to belong to.
+tao.workspace = true
 
 # The workspace forbids unsafe code, which the macOS user-verification ceremony cannot honour: it
 # is a call into Apple's LocalAuthentication runtime and there is no safe wrapper for it. This

@@ -23,8 +23,9 @@
 //!
 //! It is written and flushed to the device before the write leaves, and the write is not sent if
 //! that fails. It stays until the next write replaces it, as the store's own memory of the write
-//! does. What is known of the write is written again when an answer arrives or the write is
-//! settled. That second writing can fail and leave the record saying less than the store knows,
+//! does, except for a write refused before anything left: that one is taken back, the record it
+//! replaced put back or, where there was none, the record removed. What is known of the write is
+//! written again when an answer arrives or the write is settled. That second writing can fail and leave the record saying less than the store knows,
 //! which is the safe direction: a restart then asks about the write again, and the service answers
 //! the same way.
 //!
@@ -43,6 +44,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::recovery::{RecoveryError, Result};
 use crate::services::SyncPosition;
+use crate::shown::{IoFault, Shown};
 
 /// The most a stored record may take, in bytes.
 ///
@@ -57,6 +59,15 @@ const PARTIAL_EXTENSION: &str = "bundle-write-partial";
 /// The extension of the lock a store holds while it is open.
 const LOCK_EXTENSION: &str = "bundle-lock";
 
+/// A write record's file as a failure may name it: whole when this store wrote its name.
+fn stored(path: &Path) -> Shown {
+    Shown::stored(
+        path,
+        &[],
+        &[RECORD_EXTENSION, PARTIAL_EXTENSION, LOCK_EXTENSION],
+    )
+}
+
 /// The last write a bundle store sent, as the store records it.
 ///
 /// It holds what settling and recognising that write take and nothing else. A read recognises the
@@ -65,7 +76,7 @@ const LOCK_EXTENSION: &str = "bundle-lock";
 /// compared against. Neither the bundle nor its ciphertext is here: a write the service says it
 /// applied is read back from the locator, so nothing that settles a lost write needs the bundle's
 /// bytes.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct WriteRecord {
     /// Where the bundle is stored: the service origin and the locator.
@@ -90,6 +101,20 @@ pub(super) struct WriteRecord {
     pub(super) sent: Digest256,
     /// What is known of what became of it.
     pub(super) known: Known,
+}
+
+impl std::fmt::Debug for WriteRecord {
+    /// The origin as a diagnostic names one and the write's place; never the locator.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WriteRecord")
+            .field(
+                "service_origin",
+                &Shown::address(&self.context.service_origin),
+            )
+            .field("expected", &self.expected)
+            .finish_non_exhaustive()
+    }
 }
 
 /// What a store knows of what became of its last write.
@@ -146,13 +171,17 @@ impl RecordFile {
             .create(true)
             .truncate(false)
             .open(&lock_path)
-            .map_err(|source| storage(&lock_path, source))?;
+            .map_err(|source| storage(stored(&lock_path), source))?;
         match lock.try_lock() {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => {
-                return Err(RecoveryError::BundleStoreInUse { path: lock_path });
+                return Err(RecoveryError::BundleStoreInUse {
+                    path: stored(&lock_path),
+                });
             }
-            Err(std::fs::TryLockError::Error(source)) => return Err(storage(&lock_path, source)),
+            Err(std::fs::TryLockError::Error(source)) => {
+                return Err(storage(stored(&lock_path), source));
+            }
         }
         let file = Self {
             directory: directory.to_path_buf(),
@@ -163,7 +192,7 @@ impl RecordFile {
         match std::fs::remove_file(&file.partial) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => return Err(storage(&file.partial, source)),
+            Err(source) => return Err(storage(stored(&file.partial), source)),
         }
         let record = file.read(context)?;
         Ok((file, record))
@@ -174,10 +203,10 @@ impl RecordFile {
         let bytes = match std::fs::read(&self.path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(source) => return Err(storage(&self.path, source)),
+            Err(source) => return Err(storage(stored(&self.path), source)),
         };
         let unreadable = || RecoveryError::UnreadableWriteRecord {
-            path: self.path.clone(),
+            path: stored(&self.path),
         };
         // A record this build cannot read is refused rather than ignored: it may be the only
         // account of a write that can still land, and a store that dropped it would write again
@@ -203,7 +232,7 @@ impl RecordFile {
         let bytes = kr_cbor::to_canonical_vec(record)?;
         if bytes.len() > MAX_RECORD_BYTES {
             return Err(RecoveryError::UnreadableWriteRecord {
-                path: self.path.clone(),
+                path: stored(&self.path),
             });
         }
         // A partial file an earlier failure in this process could not remove is not a record, and
@@ -212,23 +241,48 @@ impl RecordFile {
         match std::fs::remove_file(&self.partial) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => return Err(storage(&self.partial, source)),
+            Err(source) => return Err(storage(stored(&self.partial), source)),
         }
-        write_whole(&self.partial, &bytes).map_err(|source| storage(&self.partial, source))?;
+        write_whole(&self.partial, &bytes)
+            .map_err(|source| storage(stored(&self.partial), source))?;
         // A rename within one directory replaces the name in one step, so a reader finds the old
         // record or the new one and never a record half written.
         if let Err(source) = std::fs::rename(&self.partial, &self.path) {
             let _ = std::fs::remove_file(&self.partial);
-            return Err(storage(&self.path, source));
+            return Err(storage(stored(&self.path), source));
         }
-        sync_directory(&self.directory).map_err(|source| storage(&self.directory, source))
+        kr_ipc::paths::flush_directory(&self.directory, kr_ipc::paths::NameKind::File)
+            .map_err(|source| storage(Shown::root(&self.directory), source))
+    }
+
+    /// Puts back the record a write that never left replaced: `previous`, or no record at all
+    /// where there was none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecoveryError::Storage`] when the disk will not take it back. The record of the
+    /// write that never left then stays, saying the write is outstanding, and a store opened over
+    /// it ends that write as it ends any lost one, once the service can be asked: a fence, and a
+    /// read after it where the fence cannot say the write never ran. Nothing ran under that identity,
+    /// so whatever the fence answers, the write left nothing behind.
+    pub(super) fn restore(&self, previous: Option<&WriteRecord>) -> Result<()> {
+        if let Some(previous) = previous {
+            return self.save(previous);
+        }
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(storage(stored(&self.path), source)),
+        }
+        kr_ipc::paths::flush_directory(&self.directory, kr_ipc::paths::NameKind::File)
+            .map_err(|source| storage(Shown::root(&self.directory), source))
     }
 }
 
-fn storage(path: &Path, source: std::io::Error) -> RecoveryError {
+fn storage(path: Shown, source: std::io::Error) -> RecoveryError {
     RecoveryError::Storage {
-        path: path.to_path_buf(),
-        source,
+        path,
+        fault: IoFault::from(source),
     }
 }
 
@@ -268,19 +322,92 @@ fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     written
 }
 
-/// Flushes a directory entry, so a name that was replaced stays that way after a crash.
-///
-/// Unix only. This build flushes no directory on Windows and makes no claim there that a record it
-/// wrote survives losing power; what holds on both is that a record is flushed before it is renamed
-/// into place, so a reader never finds one half written.
-fn sync_directory(directory: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        std::fs::File::open(directory)?.sync_all()?;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::rendering::{NEVER_RENDERED, renders_only};
+
+    /// A write's record renders the origin as a diagnostic names one and the place the write
+    /// compared against, exactly: never the locator, and never the origin's credentials.
+    #[test]
+    fn a_write_record_renders_only_its_origin_and_its_place() {
+        let record = WriteRecord {
+            context: RecoveryContext {
+                service_origin: format!("https://{NEVER_RENDERED}@reach.example"),
+                bundle_locator: NEVER_RENDERED.to_owned(),
+            },
+            expected: Nullable::null(),
+            request_id: Uuid::from_bytes([2; 16]),
+            signed_at_ms: TimestampMs::new(6),
+            sent: Digest256::from_bytes([3; 32]),
+            known: Known::Unsettled,
+        };
+        renders_only(
+            &record,
+            "WriteRecord{service_origin:\"<notprinted>\",expected:Nullable(None),..}",
+        );
     }
-    #[cfg(not(unix))]
-    {
-        let _ = directory;
+
+    /// A record the disk will not take back is named by the name the store gave it, which is a
+    /// digest of the location it is the record of, with the kind of fault: never by the location,
+    /// whose origin and locator a kit supplied. A directory it cannot flush is named as the one the
+    /// store was given.
+    #[test]
+    fn a_record_the_disk_will_not_take_back_says_nothing_of_its_location() {
+        use crate::shown::marker::{MARKER, assert_unmarked, failure_renderings};
+
+        let disk = tempfile::tempdir().expect("a directory");
+        let directory = disk.path().join("records");
+        std::fs::create_dir(&directory).expect("the store's directory");
+        let context = RecoveryContext {
+            service_origin: format!("https://{MARKER}:{MARKER}@reach.example/{MARKER}"),
+            bundle_locator: MARKER.to_owned(),
+        };
+        let (file, record) = RecordFile::open(&directory, &context).expect("the record's place");
+        assert!(record.is_none());
+        // The negative control: the location holds the marker, and the record's name does not.
+        assert!(context.bundle_locator.contains(MARKER));
+        assert!(!file.path.to_string_lossy().contains(MARKER));
+
+        // A directory in the record's place, which no platform removes as a file.
+        std::fs::create_dir(&file.path).expect("a directory in the record's place");
+        let refused = file
+            .restore(None)
+            .expect_err("a directory is not removed as a record");
+        // The neutral control: the record's own name and the kind of fault.
+        let said = refused.to_string();
+        let name = file
+            .path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .expect("a name");
+        assert!(
+            said.starts_with("the recovery bundle's write record at ") && said.contains(name),
+            "{said}"
+        );
+        assert_unmarked(
+            "a record the disk would not take back",
+            &failure_renderings(refused),
+        );
+        std::fs::remove_dir(&file.path).expect("the directory in the record's place");
+
+        // The store's directory gone: the record is not there to remove, and the directory
+        // cannot be flushed.
+        std::fs::remove_dir_all(&directory).expect("the store's directory");
+        let unflushed = file
+            .restore(None)
+            .expect_err("a directory that is gone is not flushed");
+        let said = unflushed.to_string();
+        assert!(
+            said.starts_with(&format!(
+                "the recovery bundle's write record at {} could not be used: ",
+                directory.display()
+            )),
+            "{said}"
+        );
+        assert_unmarked(
+            "a directory the store cannot flush",
+            &failure_renderings(unflushed),
+        );
     }
-    Ok(())
 }

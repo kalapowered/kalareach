@@ -5,14 +5,19 @@
 //! behaviour that establishes it without searching. Where a test establishes less than its row
 //! asks for, the name says what it does establish and the comment says what is left.
 
+use kr_plugin_sdk::capability::PluginCapability;
+use kr_plugin_sdk::effect::ActionDeclaration;
 use kr_protocol::agent::{
     AgentApprovalRespondParams, AgentApprovalRespondResult, AgentMutationTarget,
+    PluginActionInvokeParams,
 };
+use kr_protocol::authority::EffectClass;
 use kr_protocol::broker::{
     ActionName, ActionProvenance, ActionTokenClaim, AuthenticationState, BinaryIdentity,
     BrokerGrant, BrokerGrants, DecodedProjection, DecodingTrust, InstanceCapabilityIdentity,
     InstanceCapabilityRecord, InstanceCapabilityState, InstanceEvidenceSource,
     InstanceInvalidation, IntegrationMode, LaunchProfile, LaunchRefusal, OfferedDecision,
+    PreparedEffect, PreparedOperation,
 };
 use kr_protocol::gateway::{
     DeclarativeEntry, DeclarativeTable, DownstreamRequestId, NativeFraming, NativeMethodClass,
@@ -26,13 +31,16 @@ use kr_protocol::ids::{
     StreamCursor, UpstreamMethod, UpstreamRequestId,
 };
 use kr_protocol::rights::ActionRight;
-use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, U64, Uuid};
+use kr_protocol::scalars::{Bytes, CanonicalSet, Digest256, Nullable, TimestampMs, U64, Uuid};
 #[cfg(unix)]
 use kr_worker::broker::InstanceEnding;
+use kr_worker::broker::bridge::BridgeProcess;
+use kr_worker::broker::connectors::{DECISION_SCHEMA, InstalledConnector, decoding_trust, fixture};
 use kr_worker::broker::{
-    Broker, BrokerError, BrokerTransport, Caller, Credential, ForegroundMark, Invocation,
-    ManagedProcess, MutationAdmission, PendingTransmission, Probe, ReconcileScope, TransportHandle,
-    UpstreamBody, UpstreamDispatch, UpstreamOutcome, UpstreamRequest, subject,
+    Broker, BrokerError, BrokerTransport, Caller, Credential, ForegroundMark, Invocation, Ledger,
+    ManagedProcess, MutationAdmission, PackageIdentity, PendingTransmission, Probe, ReconcileScope,
+    RegisteredAction, TransportHandle, UpstreamArrival, UpstreamBody, UpstreamDispatch,
+    UpstreamOutcome, UpstreamRequest, subject,
 };
 use kr_worker::persistence::JournalHealth;
 
@@ -198,10 +206,166 @@ fn package() -> PluginId {
     PluginId::new("kalareach.codex").expect("valid")
 }
 
-fn declarative_table() -> DeclarativeTable {
-    let mut table = DeclarativeTable {
+/// The installed package this suite's tables are pinned with and its bindings run.
+fn installed() -> PackageIdentity {
+    PackageIdentity {
         plugin_id: PluginId::new("kalareach.codex").expect("valid"),
         publisher_id: PublisherId::new("kalareach").expect("valid"),
+        package_digest: Digest256::from_bytes([5; 32]),
+    }
+}
+
+/// Another installed package, trusted for the same method by a trust of its own.
+fn other_package() -> PackageIdentity {
+    PackageIdentity {
+        plugin_id: PluginId::new("kalareach.other").expect("valid"),
+        publisher_id: PublisherId::new("kalareach").expect("valid"),
+        package_digest: Digest256::from_bytes([6; 32]),
+    }
+}
+
+/// The suite's own package at other bytes.
+fn other_bytes() -> PackageIdentity {
+    PackageIdentity {
+        package_digest: Digest256::from_bytes([7; 32]),
+        ..installed()
+    }
+}
+
+/// Binds one package to instance 2 as an approval interpreter, trusted by a record of its own for
+/// the suite's permission method.
+fn bind_decoder(broker: &Broker, binding_id: BrokerBindingId, package: &PackageIdentity) {
+    let trusted = DecodingTrust {
+        plugin_id: package.plugin_id.clone(),
+        publisher_id: package.publisher_id.clone(),
+        package_digest: package.package_digest,
+        ..trust(&[permission_method()], true)
+    };
+    broker
+        .bind(
+            binding_id,
+            instance(2),
+            package.plugin_id.clone(),
+            package.publisher_id.clone(),
+            package.package_digest,
+            BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
+            Some(trusted),
+            TimestampMs::new(1),
+        )
+        .expect("the decoder is bound");
+}
+
+/// A package store of this test's own, on the internal disk.
+fn package_store() -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!("kr-broker-packages-{}", kr_ipc::new_uuid()));
+    std::fs::create_dir_all(&root).expect("the store's directory is created");
+    root
+}
+
+/// The Claude Code connector read from its installed package, with a Wasm component in the
+/// package when `component` says so, and the installation's grants without `withheld`.
+fn claude_code(
+    root: &std::path::Path,
+    component: bool,
+    withheld: &[PluginCapability],
+) -> InstalledConnector {
+    let forwarder = std::path::Path::new("/opt/kalareach/bin/kr-hook");
+    let mut source = if component {
+        fixture::claude_code_package_with_component(root, forwarder)
+    } else {
+        fixture::claude_code_package(root, forwarder)
+    }
+    .expect("the package is written");
+    for capability in withheld {
+        source.granted.remove(capability);
+    }
+    InstalledConnector::read(source).expect("the installed package reads")
+}
+
+/// The projection schema a component's decoded request is written against: the plugin
+/// contract's own, at the WIT version this build speaks.
+fn component_schema() -> String {
+    format!(
+        "kalareach.plugin.decoded-request/{}",
+        kr_plugin_sdk::version::WIT_VERSION
+    )
+}
+
+/// The method a Claude Code channel relays a tool approval as.
+fn channel_permission_method() -> UpstreamMethod {
+    UpstreamMethod::new("notifications/claude/channel/permission_request").expect("valid")
+}
+
+/// The application's own channel for instance 2, opened for one connector.
+fn open_channel(broker: &Broker, connector: &InstalledConnector) -> GatewayConnectionId {
+    broker
+        .open_bridge_channel(
+            instance(2),
+            &BridgeProcess {
+                identity: process_identity(43, 902),
+                starter: Some(process_identity(41, 900)),
+                started: None,
+            },
+            connector,
+            Some(fixture::QUALIFIED_VERSION),
+        )
+        .expect("the application's own channel is opened")
+}
+
+/// Relays one tool approval on a channel, as the forwarder does, and returns what the broker
+/// recorded for it.
+fn relay(
+    broker: &Broker,
+    connection: GatewayConnectionId,
+    request_id: &str,
+    now: u64,
+) -> PendingResource {
+    let frame = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": channel_permission_method().as_str(),
+        "params": {
+            "request_id": request_id,
+            "tool_name": "Bash",
+            "description": "List the files here",
+            "input_preview": "ls -la",
+        },
+    })
+    .to_string();
+    let Ok(UpstreamArrival::Forward {
+        resource: Some(relayed),
+        ..
+    }) = broker.receive_upstream(
+        connection,
+        frame.as_bytes(),
+        EnvironmentId::new(Uuid::from_bytes([7; 16])),
+        "person",
+        TimestampMs::new(now),
+    )
+    else {
+        panic!("the relayed approval is recorded");
+    };
+    relayed
+}
+
+/// Binds a transport on the suite's connection, as its owner does when it serves one.
+fn carry_answers(broker: &Broker) -> std::sync::Arc<RecordingUpstream> {
+    let upstream = std::sync::Arc::new(RecordingUpstream::default());
+    broker.bind_connection_dispatch(
+        GatewayConnectionId::new(1),
+        std::sync::Arc::clone(&upstream) as _,
+    );
+    upstream
+}
+
+fn declarative_table() -> DeclarativeTable {
+    declarative_table_of(&installed())
+}
+
+/// The suite's declarative table, as one installed package's own.
+fn declarative_table_of(package: &PackageIdentity) -> DeclarativeTable {
+    let mut table = DeclarativeTable {
+        plugin_id: package.plugin_id.clone(),
+        publisher_id: package.publisher_id.clone(),
         table_version: MethodTableVersion::new(1),
         upstream_protocol_version: "1".to_owned(),
         digest: Digest256::from_bytes([1; 32]),
@@ -309,45 +473,41 @@ impl UpstreamDispatch for RecordingUpstream {
     }
 }
 
-/// A transport that stops the host at the moment the bytes go.
-///
-/// Section 24 puts the durable marker before the effect so that this state is readable
-/// afterwards: the marker is in, the answer may already have reached the upstream, and nothing
-/// records what came of it. Reconciliation, not a second answer, is what settles it.
+/// A transport that panics as it takes an answer, in a host that goes on running.
 #[derive(Debug, Default)]
-struct StoppingUpstream;
+struct PanickingUpstream;
 
-const STOPPED: &str =
-    "this test stops the host here, after the marker and before the outcome is recorded";
+const PANICKED: &str = "this transport panics as it takes the answer, after the marker";
 
-impl UpstreamDispatch for StoppingUpstream {
+impl UpstreamDispatch for PanickingUpstream {
     fn admit(&self, _request: &UpstreamRequest) -> Result<(), BrokerError> {
         Ok(())
     }
 
     fn submit(&self, _request: &UpstreamRequest) -> Result<PendingTransmission, BrokerError> {
-        panic!("{STOPPED}")
+        panic!("{PANICKED}")
     }
 }
 
-/// Puts the transport that stops the host on the connection answers go out on.
+/// Puts the transport that panics on the connection answers go out on.
 ///
 /// An admission carries the transport it was taken with, so this is bound before the answer is
 /// admitted rather than after.
-fn stop_the_host_at_the_bytes(broker: &Broker) {
+fn panic_at_the_bytes(broker: &Broker) {
     broker.bind_connection_dispatch(
         GatewayConnectionId::new(1),
-        std::sync::Arc::new(StoppingUpstream) as _,
+        std::sync::Arc::new(PanickingUpstream) as _,
     );
 }
 
-/// Runs one step that transmits over that transport, and checks the host stopped in it.
-fn stopping(step: impl FnOnce()) {
-    let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(step));
-    let payload = stopped.expect_err("the host stopped where the transport stops it");
+/// Runs one step that transmits over that transport, catches its panic, and checks it was that
+/// transport's.
+fn panicking(step: impl FnOnce()) {
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(step));
+    let payload = caught.expect_err("the transport panicked");
     assert_eq!(
         payload.downcast_ref::<String>().map(String::as_str),
-        Some(STOPPED)
+        Some(PANICKED)
     );
 }
 
@@ -432,7 +592,7 @@ fn broker_recording(
         )
         .expect("the binding is recorded");
     broker
-        .pin_table(instance(2), declarative_table(), rich_table())
+        .pin_table(instance(2), installed(), declarative_table(), rich_table())
         .expect("the installed tables are pinned");
     broker
         .open_native_connection(
@@ -715,7 +875,7 @@ fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_
             )
             .expect("the binding is recorded");
         broker
-            .pin_table(instance(2), declarative_table(), rich_table())
+            .pin_table(instance(2), installed(), declarative_table(), rich_table())
             .expect("the installed tables are pinned");
         broker
             .open_native_connection(
@@ -730,7 +890,7 @@ fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_
         // Binding: a request of another application is not this binding's to interpret. The
         // frame is not a thing a caller names at all: the broker recorded it with the request.
         broker
-            .pin_table(instance(3), declarative_table(), rich_table())
+            .pin_table(instance(3), installed(), declarative_table(), rich_table())
             .expect("the installed tables are pinned");
         broker
             .open_native_connection(
@@ -851,6 +1011,1233 @@ fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_
     let _ = std::fs::remove_dir_all(&directory);
 }
 
+/// KR-REQ-11.25: an installation that granted a component package `approval.decode` gives it
+/// exactly the trust its grants and its connector table derive: its own identifier, publisher and
+/// installed hash, the methods that carry what the table's decision destination answers, as many
+/// decisions as the destination maps, the decision schema and the component's own projection
+/// schema, and encoding because `approval.respond` is granted too. That trust is what its binding
+/// records, in memory and in the ledger a restart reads.
+#[test]
+fn kr_req_11_25_a_component_packages_trust_is_derived_from_its_grants_and_recorded() {
+    let root = package_store();
+    let connector = claude_code(&root, true, &[]);
+    let package = connector.package().clone();
+    let trust =
+        decoding_trust(&connector, TimestampMs::new(1)).expect("approval.decode is granted");
+    assert_eq!(trust.plugin_id, package.plugin_id);
+    assert_eq!(trust.publisher_id.as_str(), "kalareach");
+    assert_eq!(trust.package_digest, package.package_digest);
+    assert_eq!(
+        trust.methods,
+        [channel_permission_method()].into_iter().collect(),
+        "the routes that carry what the decision destination answers"
+    );
+    assert_eq!(
+        trust.schema_versions,
+        [DECISION_SCHEMA.to_owned(), component_schema()]
+            .into_iter()
+            .collect::<CanonicalSet<String>>(),
+        "the table's own schema, and the one a component's decoded request is written against"
+    );
+    assert_eq!(trust.max_decisions, U64::new(2));
+    assert!(trust.may_encode_response);
+
+    let path = root.join("session.sqlite");
+    {
+        let broker = Broker::open(Some(&path), session(), JournalHealth::shared())
+            .expect("the broker opens");
+        broker
+            .register_instance(instance(2), IntegrationMode::NativeBridge, None, None)
+            .expect("the instance is registered");
+        broker
+            .bind(
+                binding(9),
+                instance(2),
+                package.plugin_id.clone(),
+                package.publisher_id.clone(),
+                package.package_digest,
+                BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
+                Some(trust.clone()),
+                TimestampMs::new(1),
+            )
+            .expect("the package is bound with its trust");
+        assert_eq!(
+            broker.binding_record(binding(9)).expect("bound").trust,
+            Some(trust.clone())
+        );
+    }
+    let reopened = Ledger::open(Some(&path), JournalHealth::shared()).expect("the ledger reopens");
+    assert_eq!(
+        reopened
+            .binding(binding(9))
+            .expect("the ledger reads")
+            .expect("the binding is recorded")
+            .trust,
+        Some(trust),
+        "the trust a restart reads is the trust that was derived"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// KR-REQ-11.25: a component package whose installation withheld `approval.decode` has no trust at
+/// all, and one that was not granted `approval.respond` is trusted to decode and never to encode an
+/// answer.
+#[test]
+fn kr_req_11_25_without_approval_decode_a_component_package_decodes_nothing() {
+    let root = package_store();
+    let undecoding = claude_code(&root, true, &[PluginCapability::ApprovalDecode]);
+    assert!(decoding_trust(&undecoding, TimestampMs::new(1)).is_none());
+    let unanswering = claude_code(&root, true, &[PluginCapability::ApprovalRespond]);
+    let trust =
+        decoding_trust(&unanswering, TimestampMs::new(1)).expect("approval.decode is granted");
+    assert!(!trust.may_encode_response);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// KR-REQ-11.25: a package that ships no component keeps the trust its connector table alone gives:
+/// the decision schema, and no schema a component could write against. In everything else it is the
+/// trust the same package with a component gets.
+#[test]
+fn kr_req_11_25_a_package_with_no_component_is_trusted_for_the_decision_schema_alone() {
+    let root = package_store();
+    let declarative = decoding_trust(&claude_code(&root, false, &[]), TimestampMs::new(1))
+        .expect("approval.decode is granted");
+    assert_eq!(
+        declarative.schema_versions,
+        [DECISION_SCHEMA.to_owned()].into_iter().collect()
+    );
+    let with_component = decoding_trust(&claude_code(&root, true, &[]), TimestampMs::new(1))
+        .expect("approval.decode is granted");
+    assert_eq!(
+        DecodingTrust {
+            schema_versions: declarative.schema_versions.clone(),
+            package_digest: declarative.package_digest,
+            ..with_component
+        },
+        declarative
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// KR-REQ-11.26: a request whose method its package's trust does not cover is never given a meaning
+/// by that package's decoder. It stays recorded, opaque and unanswerable here, and the native
+/// client's own answer settles it.
+#[test]
+fn kr_req_11_26_a_method_outside_the_trust_stays_recorded_and_is_answered_natively() {
+    let root = package_store();
+    let connector = claude_code(&root, true, &[]);
+    let package = connector.package().clone();
+    let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
+    broker
+        .register_instance(
+            instance(2),
+            IntegrationMode::Gateway,
+            None,
+            Some(managed(instance(2), true)),
+        )
+        .expect("the instance is registered");
+    broker
+        .bind(
+            binding(9),
+            instance(2),
+            package.plugin_id.clone(),
+            package.publisher_id.clone(),
+            package.package_digest,
+            BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
+            decoding_trust(&connector, TimestampMs::new(1)),
+            TimestampMs::new(1),
+        )
+        .expect("the package is bound with its trust");
+    broker
+        .pin_table(
+            instance(2),
+            package.clone(),
+            declarative_table_of(&package),
+            rich_table(),
+        )
+        .expect("the package's tables are pinned");
+    let connection = broker
+        .open_native_connection(
+            instance(2),
+            &CREDENTIAL,
+            &process_identity(41, 900),
+            &package.plugin_id,
+            "1",
+        )
+        .expect("the native connection is authenticated");
+    assert!(
+        !broker
+            .binding_record(binding(9))
+            .expect("bound")
+            .may_decode(&permission_method()),
+        "the trust covers the relayed approval its table's decision destination answers, and no \
+         other method"
+    );
+
+    let (_, opaque) = broker
+        .forward_native(
+            connection,
+            permission_frame("11").as_bytes(),
+            TimestampMs::new(2),
+        )
+        .expect("the request is forwarded");
+    let opaque = opaque.expect("the method expects a response");
+    let refusal = broker
+        .interpret(
+            binding(9),
+            opaque.resource_id,
+            DecodedProjection {
+                schema_version: DECISION_SCHEMA.to_owned(),
+                ..projection()
+            },
+            None,
+            TimestampMs::new(3),
+        )
+        .expect_err("a method outside the trust is not decoded");
+    assert!(
+        matches!(refusal, BrokerError::PermissionDenied { .. }),
+        "{refusal}"
+    );
+    let held = broker.pending(opaque.resource_id).expect("still recorded");
+    assert_eq!(held.state, PendingState::Pending);
+    assert_eq!(held.kind, PendingKind::ReverseRpc);
+    assert!(!held.interpretation_verified, "and still opaque");
+
+    let answered = broker
+        .native_answer_through(
+            connection,
+            br#"{"id":11,"result":{"outcome":"allow"}}"#,
+            TimestampMs::new(4),
+            |_| Ok(()),
+        )
+        .expect("the native client's answer is carried");
+    assert_eq!(answered.resource_id, opaque.resource_id);
+    assert_eq!(answered.state, PendingState::Resolved);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// KR-REQ-11.26: a request belongs to the package whose table recorded it. On a live declarative
+/// connection and on a live channel, a decoder of that package interprets it, and one of another
+/// package, or of the same package at other bytes, is refused, however it is trusted.
+#[test]
+fn kr_req_11_26_on_a_live_connection_only_the_recording_packages_decoder_interprets() {
+    // A declarative connection, reading with the tables pinned with the suite's package.
+    let broker = broker_with(
+        BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
+        Some(trust(&[permission_method()], true)),
+    );
+    bind_decoder(&broker, binding(10), &other_package());
+    bind_decoder(&broker, binding(11), &other_bytes());
+    let opaque = forward(&broker, "11", 2).expect("forwarded");
+    for (decoder, whose) in [
+        (binding(10), "another package's decoder"),
+        (binding(11), "a decoder of the same package at other bytes"),
+    ] {
+        let refusal = broker
+            .interpret(
+                decoder,
+                opaque.resource_id,
+                projection(),
+                None,
+                TimestampMs::new(3),
+            )
+            .expect_err(whose);
+        assert!(
+            matches!(refusal, BrokerError::PermissionDenied { .. }),
+            "{whose}: {refusal}"
+        );
+    }
+    let interpreted = broker
+        .interpret(
+            binding(9),
+            opaque.resource_id,
+            projection(),
+            None,
+            TimestampMs::new(4),
+        )
+        .expect("the recording package's decoder interprets it");
+    assert!(interpreted.interpretation_verified);
+
+    // A channel, reading with the connector table its own installed package ships.
+    let root = package_store();
+    let connector = claude_code(&root, true, &[]);
+    let package = connector.package().clone();
+    let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
+    broker
+        .register_instance(
+            instance(2),
+            IntegrationMode::NativeBridge,
+            None,
+            Some(managed(instance(2), false)),
+        )
+        .expect("the launched instance is registered");
+    let derived =
+        decoding_trust(&connector, TimestampMs::new(1)).expect("approval.decode is granted");
+    broker
+        .bind(
+            binding(9),
+            instance(2),
+            package.plugin_id.clone(),
+            package.publisher_id.clone(),
+            package.package_digest,
+            BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
+            Some(derived.clone()),
+            TimestampMs::new(1),
+        )
+        .expect("the channel's package is bound");
+    let foreign = other_package();
+    broker
+        .bind(
+            binding(10),
+            instance(2),
+            foreign.plugin_id.clone(),
+            foreign.publisher_id.clone(),
+            foreign.package_digest,
+            BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
+            Some(DecodingTrust {
+                plugin_id: foreign.plugin_id.clone(),
+                publisher_id: foreign.publisher_id.clone(),
+                package_digest: foreign.package_digest,
+                ..derived
+            }),
+            TimestampMs::new(1),
+        )
+        .expect("another package is bound, trusted for the same method");
+    let connection = open_channel(&broker, &connector);
+    let relayed = relay(&broker, connection, "abcde", 2);
+    let refusal = broker
+        .interpret(
+            binding(10),
+            relayed.resource_id,
+            DecodedProjection {
+                schema_version: DECISION_SCHEMA.to_owned(),
+                summary: String::new(),
+                decisions: connector.offered_decisions(),
+            },
+            None,
+            TimestampMs::new(3),
+        )
+        .expect_err("another package's decoder does not read the channel's request");
+    assert!(
+        matches!(refusal, BrokerError::PermissionDenied { .. }),
+        "{refusal}"
+    );
+    let interpreted = broker
+        .interpret_declared(relayed.resource_id, TimestampMs::new(4))
+        .expect("the channel's request is interpreted")
+        .expect("by its own package's binding");
+    assert!(interpreted.interpretation_verified);
+    assert_eq!(
+        broker
+            .decoding(relayed.resource_id)
+            .expect("the ledger reads")
+            .expect("the interpretation is recorded")
+            .binding_id,
+        binding(9)
+    );
+
+    // A channel that closes settles what it relayed, so nothing of it waits for a restoration.
+    assert_eq!(
+        broker.close_bridge_channel(connection, TimestampMs::new(5)),
+        Some(1)
+    );
+    assert!(
+        broker
+            .recorded(relayed.resource_id)
+            .expect("the ledger reads")
+            .expect("recorded")
+            .state
+            .is_terminal()
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// KR-REQ-11.26: a declarative connection's requests stay the recording package's after the
+/// connection closes. Its identifier is not restored under another package's tables, and another
+/// package's decoder is refused the recorder's request. Restored under the recorder's own tables,
+/// with a transport bound again, the answer to what the recorder's decoder interpreted goes, and
+/// the request it has not read yet is its decoder's to read.
+#[tokio::test]
+async fn kr_req_11_26_a_restored_identifier_leaves_its_requests_the_recording_packages() {
+    let broker = broker_with(
+        BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
+        Some(trust(&[permission_method()], true)),
+    );
+    bind_decoder(&broker, binding(10), &other_package());
+    let interpreted = offer(&broker, instance(2), binding(9), "11", 2)
+        .expect("the recording package's decoder interprets it");
+    let unread = forward(&broker, "12", 4).expect("forwarded");
+    let connection = GatewayConnectionId::new(1);
+    broker.close_connection(connection);
+
+    broker
+        .pin_table(
+            instance(2),
+            other_package(),
+            declarative_table_of(&other_package()),
+            rich_table(),
+        )
+        .expect("another package's tables are pinned");
+    let refusal = broker
+        .restore_native_connection(
+            connection,
+            instance(2),
+            &CREDENTIAL,
+            &process_identity(41, 900),
+            &other_package().plugin_id,
+            "1",
+        )
+        .expect_err("the identifier is not restored under another package's tables");
+    assert!(
+        matches!(refusal, BrokerError::PermissionDenied { .. }),
+        "{refusal}"
+    );
+    let refusal = broker
+        .interpret(
+            binding(10),
+            unread.resource_id,
+            projection(),
+            None,
+            TimestampMs::new(5),
+        )
+        .expect_err("another package's decoder does not read the recorder's request");
+    assert!(
+        matches!(refusal, BrokerError::PermissionDenied { .. }),
+        "{refusal}"
+    );
+    assert_eq!(
+        broker.pending(interpreted.resource_id).expect("held").state,
+        PendingState::Pending,
+        "and the recorder's request stays answerable"
+    );
+
+    broker
+        .restore_native_connection(
+            connection,
+            instance(2),
+            &CREDENTIAL,
+            &process_identity(41, 900),
+            &package(),
+            "1",
+        )
+        .expect("the identifier is restored under the recorder's own tables");
+    let upstream = carry_answers(&broker);
+    answer(&broker, interpreted.resource_id, "allow", 7)
+        .await
+        .expect("the recorder's answer goes");
+    assert_eq!(
+        broker
+            .recorded(interpreted.resource_id)
+            .expect("reads")
+            .expect("recorded")
+            .state,
+        PendingState::Resolved
+    );
+    assert_eq!(upstream.submitted().len(), 1);
+    broker
+        .interpret(
+            binding(9),
+            unread.resource_id,
+            projection(),
+            None,
+            TimestampMs::new(8),
+        )
+        .expect("the recorder's decoder reads its request");
+}
+
+/// KR-REQ-11.26 and KR-REQ-11.27: a connection identifier keeps the package it first recorded
+/// requests under, for good. Restoring it under another package's tables is refused in the process
+/// that recorded its requests, and after a restart, which reads the package back from the request's
+/// own record; restored under its own package's tables, the native client's answer settles what it
+/// recorded. A connection whose first request was recorded inside a gap has its package committed
+/// with the gap, and a later restart refuses it the same way.
+#[tokio::test]
+async fn kr_req_11_26_a_connection_identifier_keeps_its_package_across_a_restart() {
+    let mut store = common::SharedStore::open();
+    let path = store.path.clone();
+    let other = other_package();
+    let register_and_pin = |broker: &Broker| {
+        broker
+            .register_instance(
+                instance(2),
+                IntegrationMode::Gateway,
+                None,
+                Some(managed(instance(2), true)),
+            )
+            .expect("the instance is registered");
+        broker
+            .pin_table(instance(2), installed(), declarative_table(), rich_table())
+            .expect("the installed tables are pinned");
+        broker
+            .pin_table(
+                instance(2),
+                other.clone(),
+                declarative_table_of(&other),
+                rich_table(),
+            )
+            .expect("another package's tables are pinned");
+    };
+    let open = |broker: &Broker| {
+        broker
+            .open_native_connection(
+                instance(2),
+                &CREDENTIAL,
+                &process_identity(41, 900),
+                &package(),
+                "1",
+            )
+            .expect("the native connection is authenticated")
+    };
+    let restore = |broker: &Broker, connection: GatewayConnectionId, plugin_id: &PluginId| {
+        broker.restore_native_connection(
+            connection,
+            instance(2),
+            &CREDENTIAL,
+            &process_identity(41, 900),
+            plugin_id,
+            "1",
+        )
+    };
+    let refused = |outcome: Result<(), BrokerError>, what: &str| {
+        let refusal = outcome.expect_err(what);
+        assert!(
+            matches!(refusal, BrokerError::PermissionDenied { .. }),
+            "{what}: {refusal}"
+        );
+    };
+
+    let recorded = {
+        let broker =
+            Broker::open(Some(&path), session(), store.health()).expect("the broker opens");
+        register_and_pin(&broker);
+        let connection = open(&broker);
+        let recorded = forward(&broker, "11", 2).expect("recorded");
+        broker.close_connection(connection);
+        refused(
+            restore(&broker, connection, &other.plugin_id),
+            "another package's tables do not read this identifier's requests",
+        );
+        recorded.resource_id
+    };
+
+    let gapped = {
+        let broker =
+            Broker::open(Some(&path), session(), store.health()).expect("the broker reopens");
+        register_and_pin(&broker);
+        let connection = GatewayConnectionId::new(1);
+        refused(
+            restore(&broker, connection, &other.plugin_id),
+            "the restart reads whose requests the identifier holds",
+        );
+        restore(&broker, connection, &package()).expect("restored under its own package's tables");
+        let answered = broker
+            .native_answer_through(
+                connection,
+                br#"{"id":11,"result":{"outcome":"allow"}}"#,
+                TimestampMs::new(3),
+                |_| Ok(()),
+            )
+            .expect("the native client's answer is carried");
+        assert_eq!(answered.resource_id, recorded);
+        assert_eq!(answered.state, PendingState::Resolved);
+
+        let gapped = open(&broker);
+        broker
+            .refuse_ledger_writes(true)
+            .expect("the store is put in query-only mode");
+        let during = broker
+            .forward_native(
+                gapped,
+                permission_frame("21").as_bytes(),
+                TimestampMs::new(4),
+            )
+            .expect("the native request is still recorded")
+            .1
+            .expect("it expects a response");
+        assert_eq!(
+            during.durability,
+            kr_protocol::session::Durability::Volatile
+        );
+        broker
+            .refuse_ledger_writes(false)
+            .expect("the store takes writes again");
+        store.recover_journal(5);
+        broker
+            .recover(TimestampMs::new(5))
+            .expect("the gap is committed");
+        gapped
+    };
+
+    let restarted =
+        Broker::open(Some(&path), session(), JournalHealth::shared()).expect("the broker reopens");
+    register_and_pin(&restarted);
+    refused(
+        restore(&restarted, gapped, &other.plugin_id),
+        "the gap committed whose requests the identifier holds",
+    );
+    restore(&restarted, gapped, &package()).expect("restored under its own package's tables");
+}
+
+/// KR-REQ-11.26: a binding identifier names one package for as long as it is bound. Binding it
+/// again to another package is refused and leaves the binding as it was; the same package may bind
+/// it again. After a restart, when nothing is bound yet, an identifier bound to another package
+/// cannot answer what the first package's decoder interpreted under it, and the first package bound
+/// under it again, in a later process, can.
+#[tokio::test]
+async fn kr_req_11_26_a_binding_identifier_keeps_its_package() {
+    let foreign = other_package();
+    let bind_as = |broker: &Broker, package: &PackageIdentity| {
+        broker.bind(
+            binding(9),
+            instance(2),
+            package.plugin_id.clone(),
+            package.publisher_id.clone(),
+            package.package_digest,
+            BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
+            Some(DecodingTrust {
+                plugin_id: package.plugin_id.clone(),
+                publisher_id: package.publisher_id.clone(),
+                package_digest: package.package_digest,
+                ..trust(&[permission_method()], true)
+            }),
+            TimestampMs::new(1),
+        )
+    };
+
+    let broker = broker_with(
+        BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
+        Some(trust(&[permission_method()], true)),
+    );
+    offer(&broker, instance(2), binding(9), "11", 2).expect("interpreted");
+    let refusal = bind_as(&broker, &foreign)
+        .expect_err("another package does not take an identifier that is bound");
+    assert!(
+        matches!(refusal, BrokerError::InvalidArgument { .. }),
+        "{refusal}"
+    );
+    assert_eq!(
+        broker.binding_record(binding(9)).expect("bound").package(),
+        installed(),
+        "and the binding is as it was"
+    );
+    bind_as(&broker, &installed()).expect("the same package binds it again");
+
+    // Across restarts, where a restarted process holds no binding until one is made.
+    let directory = std::env::temp_dir().join(format!("kr-broker-{}", kr_ipc::new_uuid()));
+    std::fs::create_dir_all(&directory).expect("the directory is created");
+    let path = directory.join("session.sqlite");
+    let process = |bound: &PackageIdentity| {
+        let broker = Broker::open(Some(&path), session(), JournalHealth::shared())
+            .expect("the broker opens");
+        broker
+            .register_instance(
+                instance(2),
+                IntegrationMode::Gateway,
+                None,
+                Some(managed(instance(2), true)),
+            )
+            .expect("the instance is registered");
+        bind_as(&broker, bound).expect("bound");
+        broker
+            .pin_table(instance(2), installed(), declarative_table(), rich_table())
+            .expect("the installed tables are pinned");
+        broker
+    };
+    let (first, second) = {
+        let broker = process(&installed());
+        broker
+            .open_native_connection(
+                instance(2),
+                &CREDENTIAL,
+                &process_identity(41, 900),
+                &package(),
+                "1",
+            )
+            .expect("the native connection is authenticated");
+        (
+            offer(&broker, instance(2), binding(9), "11", 2).expect("interpreted"),
+            offer(&broker, instance(2), binding(9), "12", 4).expect("interpreted"),
+        )
+    };
+    let restored = |broker: &Broker| {
+        broker
+            .restore_native_connection(
+                GatewayConnectionId::new(1),
+                instance(2),
+                &CREDENTIAL,
+                &process_identity(41, 900),
+                &package(),
+                "1",
+            )
+            .expect("the connection is restored under its own package's tables");
+        equip(broker)
+    };
+    {
+        let broker = process(&foreign);
+        let _upstream = restored(&broker);
+        let refusal = answer(&broker, first.resource_id, "allow", 6)
+            .await
+            .expect_err("another package bound under the identifier does not answer it");
+        assert!(
+            matches!(refusal, BrokerError::PermissionDenied { .. }),
+            "{refusal}"
+        );
+        assert_eq!(
+            broker.pending(first.resource_id).expect("held").state,
+            PendingState::Pending,
+            "refused before any claim"
+        );
+    }
+    let broker = process(&installed());
+    let upstream = restored(&broker);
+    answer(&broker, second.resource_id, "allow", 8)
+        .await
+        .expect("the package that interpreted it answers it");
+    assert_eq!(upstream.submitted().len(), 1);
+    drop(broker);
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// KR-REQ-11.25: narrowing an installation's grants narrows a component package's trust with them.
+/// `approval.respond` leaving takes the answer away and leaves the decoding; `approval.decode`
+/// leaving drops the trust whole. Both are written where a restart reads them.
+#[test]
+fn kr_req_11_25_withdrawing_a_grant_narrows_a_component_packages_trust_where_it_is_recorded() {
+    let root = package_store();
+    let connector = claude_code(&root, true, &[]);
+    let package = connector.package().clone();
+    let path = root.join("session.sqlite");
+    let broker =
+        Broker::open(Some(&path), session(), JournalHealth::shared()).expect("the broker opens");
+    broker
+        .register_instance(instance(2), IntegrationMode::NativeBridge, None, None)
+        .expect("the instance is registered");
+    broker
+        .bind(
+            binding(9),
+            instance(2),
+            package.plugin_id.clone(),
+            package.publisher_id.clone(),
+            package.package_digest,
+            BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
+            decoding_trust(&connector, TimestampMs::new(1)),
+            TimestampMs::new(1),
+        )
+        .expect("the package is bound with its trust");
+    let method = channel_permission_method();
+    let recorded = || {
+        Ledger::open(Some(&path), JournalHealth::shared())
+            .expect("the ledger opens")
+            .binding(binding(9))
+            .expect("the ledger reads")
+            .expect("the binding is recorded")
+    };
+
+    broker
+        .withdraw_answering(binding(9))
+        .expect("approval.respond leaves");
+    let held = broker.binding_record(binding(9)).expect("bound");
+    assert!(held.may_decode(&method), "the decoding stays");
+    assert!(!held.may_encode(&method), "the answer goes");
+    assert_eq!(
+        recorded().trust.map(|trust| trust.may_encode_response),
+        Some(false)
+    );
+
+    broker
+        .withdraw_grant(binding(9), BrokerGrant::ApprovalInterpreter)
+        .expect("approval.decode leaves");
+    let held = broker.binding_record(binding(9)).expect("bound");
+    assert!(held.trust.is_none());
+    assert!(!held.may_decode(&method));
+    assert!(recorded().trust.is_none());
+    drop(broker);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// One action declaration, as a package's manifest writes it.
+fn declaration(
+    id: &str,
+    label: &str,
+    effect: &str,
+    implementation: serde_json::Value,
+) -> ActionDeclaration {
+    serde_json::from_value(serde_json::json!({
+        "id": id,
+        "label": label,
+        "effect": effect,
+        "implementation": implementation,
+        "parameters": { "parameters": [] },
+        "description": format!("{label}, as the package declares it"),
+        "confirmation_required": false,
+    }))
+    .expect("a declaration the manifest format reads")
+}
+
+/// A component's own implementation, which prepares a plan and sends nothing.
+fn by_component() -> serde_json::Value {
+    serde_json::json!({ "type": "component" })
+}
+
+/// Records that instance 2's upstream takes a prompt, as a probe would.
+fn prompts_work(broker: &Broker) {
+    broker
+        .record_capability(evidence(
+            "agent.prompt",
+            InstanceCapabilityState::QualifiedAvailable,
+            InstanceInvalidation::BindingChanged,
+            instance(2),
+        ))
+        .expect("the evidence is recorded");
+}
+
+/// One `plugin.action.invoke` of one package's action on instance 2, with no parameters.
+fn invocation_of(plugin_id: PluginId, action: &str) -> PluginActionInvokeParams {
+    PluginActionInvokeParams {
+        target: AgentMutationTarget {
+            subject: subject(session(), instance(2)),
+            binding_revision: AgentBindingRevision::new(1),
+        },
+        plugin_id,
+        action: ActionName::new(action).expect("valid"),
+        draft_id: Nullable::null(),
+        resource_id: Nullable::null(),
+        parameters: Bytes::from(b"{}".to_vec()),
+    }
+}
+
+/// The digest of the arguments an invocation of [`invocation_of`] executes with.
+fn no_arguments() -> Digest256 {
+    Digest256::from_bytes(kr_cbor::sha256(b"{}"))
+}
+
+/// A component package's channel with one relayed approval that the package's decoder
+/// interpreted as its component does, against the component's own projection schema, with the
+/// package's actions registered and a transport bound to carry an answer.
+fn component_decoded(connector: &InstalledConnector) -> (Broker, PendingResourceId) {
+    let package = connector.package().clone();
+    let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
+    broker
+        .register_instance(
+            instance(2),
+            IntegrationMode::NativeBridge,
+            None,
+            Some(managed(instance(2), false)),
+        )
+        .expect("the launched instance is registered");
+    broker
+        .bind(
+            binding(9),
+            instance(2),
+            package.plugin_id.clone(),
+            package.publisher_id.clone(),
+            package.package_digest,
+            BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
+            decoding_trust(connector, TimestampMs::new(1)),
+            TimestampMs::new(1),
+        )
+        .expect("the package is bound with its trust");
+    broker
+        .register_actions(binding(9), &connector.manifest().actions)
+        .expect("its actions are registered");
+    let connection = open_channel(&broker, connector);
+    let relayed = relay(&broker, connection, "abcde", 2);
+    broker.note_relayed_approval(connection, TimestampMs::new(2));
+    broker
+        .interpret(
+            binding(9),
+            relayed.resource_id,
+            DecodedProjection {
+                schema_version: component_schema(),
+                summary: "Bash wants to list the files here".to_owned(),
+                decisions: connector.offered_decisions(),
+            },
+            None,
+            TimestampMs::new(3),
+        )
+        .expect("the component's interpretation is accepted");
+    broker.bind_connection_dispatch(
+        connection,
+        std::sync::Arc::new(RecordingUpstream::default()) as _,
+    );
+    (broker, relayed.resource_id)
+}
+
+/// KR-REQ-11.47: an action's effect class is the class it declares, and a label cannot change it.
+/// Two `upstream.prompt` declarations, one labelled "Preview (read only)" and one "Send", register
+/// alike: a write that needs the upstream-action grant and the prompt capability and prepares a
+/// submission. An answer labelled as a read registers as the answer it declares. A binding that
+/// holds observation alone is refused the prompt whose label reads as a read, and a read is refused
+/// on the write path whatever its own label says.
+#[test]
+fn kr_req_11_47_a_label_that_reads_as_a_read_registers_as_its_declared_class() {
+    let previewing = declaration(
+        "prompt.preview",
+        "Preview (read only)",
+        "upstream.prompt",
+        by_component(),
+    );
+    let preview = RegisteredAction::from_declaration(&previewing)
+        .expect("an upstream.prompt declaration registers");
+    let send = RegisteredAction::from_declaration(&declaration(
+        "prompt.send",
+        "Send",
+        "upstream.prompt",
+        by_component(),
+    ))
+    .expect("an upstream.prompt declaration registers");
+    assert_eq!(
+        RegisteredAction {
+            name: send.name.clone(),
+            ..preview.clone()
+        },
+        send,
+        "the two register alike but for their names"
+    );
+    assert_eq!(preview.grant, BrokerGrant::UpstreamAction);
+    assert_eq!(preview.effect, EffectClass::Write);
+    assert_eq!(preview.capability, Some(capability("agent.prompt")));
+    assert_eq!(preview.operation, Some(PreparedOperation::UpstreamSubmit));
+    let answer = RegisteredAction::from_declaration(&declaration(
+        "request.view",
+        "View details (read only)",
+        "approval.respond",
+        serde_json::json!({ "type": "decision_destination", "decision": "decision" }),
+    ))
+    .expect("an approval.respond declaration registers");
+    assert_eq!(answer.grant, BrokerGrant::ApprovalInterpreter);
+    assert_eq!(answer.effect, EffectClass::Write);
+    assert_eq!(answer.capability, Some(capability("agent.approval")));
+    assert_eq!(
+        answer.decision.as_ref().map(|decision| decision.as_str()),
+        Some("decision"),
+        "an answer, whatever it is called"
+    );
+
+    let broker = broker_with(BrokerGrants::granted([BrokerGrant::Observation]), None);
+    prompts_work(&broker);
+    let reading = declaration(
+        "conversation.read",
+        "Send now",
+        "observe",
+        serde_json::json!({ "type": "presentation" }),
+    );
+    let refused = broker
+        .register_actions(binding(9), &[previewing, reading])
+        .expect("the actions are registered");
+    assert!(refused.is_empty(), "{refused:?}");
+    assert_eq!(
+        broker
+            .registered_action(binding(9), &preview.name)
+            .expect("bound"),
+        Some(preview),
+        "registered as its declaration derives it"
+    );
+    let refusal = broker
+        .admit_plugin_action(
+            &caller("device-1"),
+            binding(9),
+            &invocation_of(package(), "prompt.preview"),
+            TimestampMs::new(2),
+        )
+        .expect_err("an observation-only binding is refused a write, whatever it is called");
+    assert!(matches!(refusal, BrokerError::Grant(_)), "{refusal}");
+    let refusal = broker
+        .admit_plugin_action(
+            &caller("device-1"),
+            binding(9),
+            &invocation_of(package(), "conversation.read"),
+            TimestampMs::new(3),
+        )
+        .expect_err("a read is not taken on the write path, whatever its label says");
+    assert!(
+        matches!(refusal, BrokerError::InvalidArgument { .. }),
+        "{refusal}"
+    );
+}
+
+/// KR-REQ-11.47: a component's plan is checked against the class its action declared. A plan for
+/// an `upstream.prompt` action that prepares a cancellation, an attachment or terminal text, or
+/// that calls its submission a read, is refused when its token is spent, and nothing is carried
+/// for it; the submission the class declares is validated.
+#[test]
+fn kr_req_11_47_a_plan_whose_operation_is_another_class_is_refused_at_the_spend() {
+    let (broker, upstream) =
+        broker_recording(BrokerGrants::granted([BrokerGrant::UpstreamAction]), None);
+    prompts_work(&broker);
+    broker
+        .register_actions(
+            binding(9),
+            &[declaration(
+                "prompt.send",
+                "Send",
+                "upstream.prompt",
+                by_component(),
+            )],
+        )
+        .expect("the action is registered");
+    let plan = |class: EffectClass, operation: PreparedOperation| PreparedEffect {
+        action: ActionName::new("prompt.send").expect("valid"),
+        class,
+        operation,
+        draft_id: Nullable::null(),
+        argument_hash: no_arguments(),
+    };
+    for (at, class, operation, what) in [
+        (
+            2,
+            EffectClass::Write,
+            PreparedOperation::UpstreamCancel,
+            "a cancellation",
+        ),
+        (
+            3,
+            EffectClass::Write,
+            PreparedOperation::UpstreamAttachment,
+            "an attachment",
+        ),
+        (
+            4,
+            EffectClass::Write,
+            PreparedOperation::TerminalText,
+            "terminal text",
+        ),
+        (
+            5,
+            EffectClass::Read,
+            PreparedOperation::UpstreamSubmit,
+            "a submission called a read",
+        ),
+    ] {
+        let admitted = broker
+            .admit_plugin_action(
+                &caller("device-1"),
+                binding(9),
+                &invocation_of(package(), "prompt.send"),
+                TimestampMs::new(at),
+            )
+            .expect("the invocation is admitted");
+        let refusal = broker
+            .validate_effect(&admitted, &plan(class, operation))
+            .expect_err(what);
+        assert!(
+            matches!(refusal, BrokerError::InvalidArgument { .. }),
+            "{what}: {refusal}"
+        );
+        assert!(
+            broker
+                .record_plugin_action(&admitted, TimestampMs::new(at))
+                .is_err(),
+            "{what}: a plan nobody validated is not carried"
+        );
+        broker.abandon(&admitted);
+    }
+    assert!(upstream.submitted().is_empty(), "nothing was carried");
+
+    let admitted = broker
+        .admit_plugin_action(
+            &caller("device-1"),
+            binding(9),
+            &invocation_of(package(), "prompt.send"),
+            TimestampMs::new(10),
+        )
+        .expect("the invocation is admitted");
+    broker
+        .validate_effect(
+            &admitted,
+            &plan(EffectClass::Write, PreparedOperation::UpstreamSubmit),
+        )
+        .expect("the submission its class declares is validated");
+    assert!(admitted.carries_a_validated_plan());
+}
+
+/// KR-REQ-11.47: an answer to a request a component decoded is an `approval.respond`, and it is
+/// admitted only while that decoder may encode one. It is admitted while the installation grants
+/// both `approval.decode` and `approval.respond`; once either leaves, an answer is refused before
+/// any claim, whether it comes as `agent.approval.respond` or as the package's own answer action,
+/// and the request stays pending for the native client.
+#[test]
+fn kr_req_11_47_an_answer_to_a_component_decoded_request_needs_its_decoder_to_encode() {
+    for narrowing in ["approval.respond", "approval.decode"] {
+        let root = package_store();
+        let connector = claude_code(&root, true, &[]);
+        let (broker, relayed) = component_decoded(&connector);
+        let admitted = broker
+            .admit_approval(
+                &caller("device-1"),
+                &respond(relayed, "allow"),
+                TimestampMs::new(4),
+            )
+            .expect("an answer is admitted while its decoder may encode one");
+        broker.abandon(&admitted);
+        assert_eq!(
+            broker.pending(relayed).expect("held").state,
+            PendingState::Pending,
+            "and given back"
+        );
+
+        match narrowing {
+            "approval.respond" => broker.withdraw_answering(binding(9)),
+            _ => broker.withdraw_grant(binding(9), BrokerGrant::ApprovalInterpreter),
+        }
+        .expect("the installation's grants narrow");
+        let refusal = broker
+            .admit_approval(
+                &caller("device-1"),
+                &respond(relayed, "allow"),
+                TimestampMs::new(5),
+            )
+            .expect_err(narrowing);
+        assert!(
+            matches!(refusal, BrokerError::PermissionDenied { .. }),
+            "{narrowing}: {refusal}"
+        );
+        let refusal = broker
+            .admit_plugin_answer(
+                &caller("device-1"),
+                binding(9),
+                &PluginActionInvokeParams {
+                    resource_id: Nullable::some(relayed),
+                    parameters: Bytes::from(br#"{"decision":"allow"}"#.to_vec()),
+                    ..invocation_of(connector.plugin_id(), "approval.answer")
+                },
+                TimestampMs::new(6),
+            )
+            .expect_err(narrowing);
+        assert!(
+            matches!(
+                refusal,
+                BrokerError::PermissionDenied { .. } | BrokerError::Grant(_)
+            ),
+            "{narrowing}: {refusal}"
+        );
+        assert_eq!(
+            broker.pending(relayed).expect("held").state,
+            PendingState::Pending,
+            "{narrowing}: refused before any claim"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// KR-REQ-11.47: a binding's actions are registered from its package's declarations and from
+/// nothing else, each as its declared class and implementation derive it. A declaration this host
+/// does not register as an invocable action (decoding, terminal input, an answer a component would
+/// prepare) is left out and returned with the reason, which names it, and a later registration
+/// replaces the set whole.
+#[test]
+fn kr_req_11_47_actions_register_only_from_their_declarations() {
+    let root = package_store();
+    let connector = claude_code(&root, true, &[]);
+    let broker = broker_with(
+        BrokerGrants::granted([
+            BrokerGrant::UpstreamAction,
+            BrokerGrant::ApprovalInterpreter,
+        ]),
+        Some(trust(&[permission_method()], true)),
+    );
+    let mut declarations = connector.manifest().actions.clone();
+    declarations.push(declaration(
+        "approval.inspect",
+        "Inspect",
+        "approval.decode",
+        by_component(),
+    ));
+    declarations.push(declaration(
+        "shell.type",
+        "Type it",
+        "terminal.input",
+        serde_json::json!({
+            "type": "terminal_text",
+            "template": [{ "type": "literal", "text": "ls" }],
+        }),
+    ));
+    declarations.push(declaration(
+        "approval.prepared",
+        "Allow",
+        "approval.respond",
+        by_component(),
+    ));
+    let refused: Vec<String> = broker
+        .register_actions(binding(9), &declarations)
+        .expect("the binding is bound")
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(refused.len(), 3, "{refused:?}");
+    for (name, why) in [
+        ("approval.inspect", "decoding"),
+        ("shell.type", "terminal"),
+        ("approval.prepared", "decision destination"),
+    ] {
+        assert!(
+            refused
+                .iter()
+                .any(|reason| reason.contains(name) && reason.contains(why)),
+            "{name} is refused for {why}: {refused:?}"
+        );
+        assert_eq!(
+            broker
+                .registered_action(binding(9), &ActionName::new(name).expect("valid"))
+                .expect("bound"),
+            None,
+            "{name} is not registered"
+        );
+    }
+    for declared in &connector.manifest().actions {
+        let name = ActionName::new(declared.id.as_str()).expect("valid");
+        assert_eq!(
+            broker.registered_action(binding(9), &name).expect("bound"),
+            Some(RegisteredAction::from_declaration(declared).expect("it derives")),
+            "{name} is registered as its declaration derives it"
+        );
+    }
+
+    let replaced = broker
+        .register_actions(binding(9), std::iter::empty())
+        .expect("the binding is bound");
+    assert!(replaced.is_empty());
+    for declared in &connector.manifest().actions {
+        let name = ActionName::new(declared.id.as_str()).expect("valid");
+        assert_eq!(
+            broker.registered_action(binding(9), &name).expect("bound"),
+            None,
+            "{name} went with the set it was registered in"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// KR-REQ-11.27: a transport that panics as it takes an answer, in a host that goes on running,
+/// leaves the resource uncertain before the panic reaches whoever catches it: the marker is in, and
+/// nothing can establish whether the bytes went.
+#[tokio::test]
+async fn kr_req_11_27_a_transport_that_panics_after_the_marker_leaves_the_answer_uncertain() {
+    let (broker, _upstream) = broker_recording(
+        BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
+        Some(trust(&[permission_method()], true)),
+    );
+    let resource = offer(&broker, instance(2), binding(9), "11", 2).expect("the offer is accepted");
+    panic_at_the_bytes(&broker);
+    let admitted =
+        reserve(&broker, resource.resource_id, "allow", 4).expect("the answer reserves it");
+    panicking(|| {
+        let _ = broker.record_approval(&admitted, TimestampMs::new(6));
+    });
+    assert_eq!(
+        broker
+            .pending(resource.resource_id)
+            .expect("recorded")
+            .state,
+        PendingState::Uncertain,
+        "the broker goes on, and the answer that may have gone is uncertain"
+    );
+    assert!(
+        reserve(&broker, resource.resource_id, "allow", 7).is_err(),
+        "and it is never answered again"
+    );
+}
+
 /// KR-REQ-11.27: one resolution per pending resource, and a reconnect reconciles an answer that
 /// went without reissuing it.
 #[tokio::test]
@@ -860,7 +2247,6 @@ async fn kr_req_11_27_one_resolution_each_and_a_reconnect_leaves_a_sent_answer_u
         Some(trust(&[permission_method()], true)),
     );
     let resource = offer(&broker, instance(2), binding(9), "11", 2).expect("the offer is accepted");
-    stop_the_host_at_the_bytes(&broker);
 
     let admitted =
         reserve(&broker, resource.resource_id, "allow", 4).expect("the first answer reserves it");
@@ -883,10 +2269,13 @@ async fn kr_req_11_27_one_resolution_each_and_a_reconnect_leaves_a_sent_answer_u
     );
 
     // The answer leaves this host. The marker goes in immediately before the bytes, and this host
-    // stops before anything records what came of them.
-    stopping(|| {
-        let _ = broker.record_approval(&admitted, TimestampMs::new(6));
-    });
+    // stops there, before anything records what came of them: nothing of it runs afterwards, not
+    // even a destructor, which is what forgetting the marked answer stands for.
+    std::mem::forget(
+        broker
+            .mark_approval(&admitted, TimestampMs::new(6))
+            .expect("the marker is committed"),
+    );
     assert_eq!(
         broker
             .pending(resource.resource_id)
@@ -1808,7 +3197,7 @@ async fn kr_req_11_37_a_committed_gap_records_what_happened_inside_it_and_restor
             .expect("the binding is recorded");
 
         broker
-            .pin_table(instance(2), declarative_table(), rich_table())
+            .pin_table(instance(2), installed(), declarative_table(), rich_table())
             .expect("the installed tables are pinned");
         broker
             .open_native_connection(

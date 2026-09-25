@@ -133,7 +133,7 @@ impl Setup {
 
 impl Drop for Setup {
     fn drop(&mut self) {
-        self.backends.close();
+        let _ = self.backends.close();
         let _ = std::fs::remove_dir_all(&self.directory);
     }
 }
@@ -430,7 +430,7 @@ async fn kr_req_12_07_each_session_has_a_root_of_its_own() {
         .establish(&request(&setup, &claude, &integration, 1))
         .expect("a backend for the other");
     assert_ne!(setup.backends.root(), neighbour.root(), "separate roots");
-    setup.backends.close();
+    let _ = setup.backends.close();
     let their_directory = PathBuf::from(&theirs.environment[0].value)
         .parent()
         .expect("the directory")
@@ -446,5 +446,5 @@ async fn kr_req_12_07_each_session_has_a_root_of_its_own() {
             .exists(),
         "and removes its own"
     );
-    neighbour.close();
+    let _ = neighbour.close();
 }

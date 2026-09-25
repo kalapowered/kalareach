@@ -38,7 +38,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use kr_protocol::broker::{AuthenticationState, BinaryIdentity, IntegrationMode, LaunchProfile};
 use kr_protocol::identity::ProcessStartIdentity;
@@ -196,8 +196,83 @@ struct Backend {
     /// Set when the backend is retired, so a reading of the executable in progress stops.
     stopped: Arc<AtomicBool>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// The operating-system user the session runs as.
+    os_user: String,
+    /// The directory the shell reported for this invocation, for a connector whose installation
+    /// may read files.
+    ///
+    /// The reading that reads the executable opens it first, off the session's lock, and publishes
+    /// the executable's identity only afterwards: an admission waits for that identity, so one that
+    /// has it finds the directory opened, or never to be.
+    host_directory: Arc<std::sync::OnceLock<kr_transfer::authority::AuthorisedDirectory>>,
+    /// The session whose attached views a channel's transitions are delivered to, where one is.
+    views: Option<(SessionId, Weak<crate::runtime::SessionRuntime>)>,
+    /// What the session's views were last told this backend's instance is.
+    ///
+    /// Every announcement about the instance is decided while this is held, and made while it is
+    /// still held, so the views hear its start, a refusal of its bridges and its end in the order
+    /// they were decided, whichever task found each. The session's lock is taken first.
+    announced: Mutex<Announced>,
     #[cfg(feature = "testing")]
     confirm_pause: Arc<Mutex<Option<ConfirmPause>>>,
+    #[cfg(feature = "testing")]
+    commit_pause: Arc<Mutex<Option<ConfirmPause>>>,
+}
+
+/// What a backend's instance was last announced as, and what may still be announced about it.
+#[derive(Debug, Default)]
+struct Announced {
+    /// The instance as the views were told, once its program was announced as started.
+    summary: Option<kr_protocol::projection::AgentInstanceSummary>,
+    /// Why the instance's bridges are refused, where one was, whether or not it was announced yet.
+    refusal: Option<String>,
+    /// Set once the instance's end is decided, by its program's exit or by its session closing.
+    /// Nothing about it is announced afterwards.
+    ended: bool,
+}
+
+impl Announced {
+    /// The program's start, unless its start was announced already or its end came first. A
+    /// refusal found before the start goes out with it.
+    fn start(
+        &mut self,
+        mut summary: kr_protocol::projection::AgentInstanceSummary,
+    ) -> Option<kr_protocol::projection::AgentInstanceSummary> {
+        if self.ended || self.summary.is_some() {
+            return None;
+        }
+        summary.refusal = kr_protocol::scalars::Nullable(self.refusal.clone());
+        self.summary = Some(summary.clone());
+        Some(summary)
+    }
+
+    /// A refusal of the instance's bridges: kept for the start where the start is still to come,
+    /// announced once for each new reason where it went, and never after the end.
+    fn refuse(&mut self, why: &str) -> Option<kr_protocol::projection::AgentInstanceSummary> {
+        let why = bounded_refusal(why);
+        if self.ended || self.refusal.as_deref() == Some(why) {
+            return None;
+        }
+        self.refusal = Some(why.to_owned());
+        let summary = self.summary.as_mut()?;
+        summary.refusal = kr_protocol::scalars::Nullable::some(why.to_owned());
+        Some(summary.clone())
+    }
+
+    /// The instance's end, once, with the refusal that stood: announced where the start was.
+    fn end(
+        &mut self,
+        at: kr_protocol::scalars::TimestampMs,
+    ) -> Option<kr_protocol::projection::AgentInstanceSummary> {
+        if self.ended {
+            return None;
+        }
+        self.ended = true;
+        let summary = self.summary.as_mut()?;
+        summary.ended_at = kr_protocol::scalars::Nullable::some(at);
+        summary.refusal = kr_protocol::scalars::Nullable(self.refusal.clone());
+        Some(summary.clone())
+    }
 }
 
 impl std::fmt::Debug for Backend {
@@ -249,9 +324,27 @@ pub struct CommandBackends {
     publishes_credential_file: bool,
     backends: Mutex<Vec<Arc<Backend>>>,
     hashed: Arc<HashedFiles>,
+    /// The session whose attached views a channel's transitions are delivered to, where one is.
+    ///
+    /// Held weakly: the session holds these backends, so a strong hold would keep both alive.
+    views: Option<Weak<crate::runtime::SessionRuntime>>,
+    /// The session's adoptions, which end with its backends when the session closes.
+    #[cfg(unix)]
+    adoptions: Option<Arc<crate::broker::adoption::Adoptions>>,
     /// Where the next committed launch stops before the launcher is told, for this host's own tests.
     #[cfg(feature = "testing")]
     confirm_pause: Arc<Mutex<Option<ConfirmPause>>>,
+    /// Where the next launch that says it is going stops before it is committed, for this host's
+    /// own tests.
+    #[cfg(feature = "testing")]
+    commit_pause: Arc<Mutex<Option<ConfirmPause>>>,
+    /// Where the next backend's reading stops before it opens the directory it grants, for this
+    /// host's own tests.
+    #[cfg(feature = "testing")]
+    directory_pause: Mutex<Option<DirectoryPause>>,
+    /// Where the next close stops before it retires a backend, for this host's own tests.
+    #[cfg(feature = "testing")]
+    retire_pause: Mutex<Option<DirectoryPause>>,
 }
 
 /// The two ends of one armed pause: what says the launch arrived there, and what lets it go on.
@@ -260,6 +353,17 @@ type ConfirmPause = (
     tokio::sync::oneshot::Sender<()>,
     tokio::sync::oneshot::Receiver<()>,
 );
+
+/// The two ends of one armed pause before a directory is opened, taken on a blocking thread.
+#[cfg(feature = "testing")]
+type DirectoryPause = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+
+/// How long a paused directory open waits to be let go before it goes on by itself.
+///
+/// A pause no test releases, as when the open is somewhere it holds the test up, ends on its own,
+/// so the test fails rather than waits for ever.
+#[cfg(feature = "testing")]
+const DIRECTORY_PAUSE_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl std::fmt::Debug for CommandBackends {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -309,9 +413,34 @@ impl CommandBackends {
             publishes_credential_file: ManagedProcess::publishes_credential_file(),
             backends: Mutex::new(Vec::new()),
             hashed: Arc::new(HashedFiles::default()),
+            views: None,
+            #[cfg(unix)]
+            adoptions: None,
             #[cfg(feature = "testing")]
             confirm_pause: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "testing")]
+            commit_pause: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "testing")]
+            directory_pause: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            retire_pause: Mutex::new(None),
         }
+    }
+
+    /// Delivers the transitions of every channel these backends serve to the session's attached
+    /// views.
+    #[must_use]
+    pub fn with_views(mut self, runtime: Weak<crate::runtime::SessionRuntime>) -> Self {
+        self.views = Some(runtime);
+        self
+    }
+
+    /// Ends the session's adoptions with its backends when the session closes.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn with_adoptions(mut self, adoptions: Arc<crate::broker::adoption::Adoptions>) -> Self {
+        self.adoptions = Some(adoptions);
+        self
     }
 
     /// Stops the next launch that says it is going after it is committed and before the launcher is
@@ -331,6 +460,64 @@ impl CommandBackends {
         let (release, go) = tokio::sync::oneshot::channel();
         *self
             .confirm_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
+        (watch, release)
+    }
+
+    /// Stops the next backend's reading before it opens the directory its launch is granted, for
+    /// this host's own tests: an open that takes its time.
+    ///
+    /// Returns the end that says the reading has arrived there and the end that lets it go on;
+    /// unreleased, it goes on by itself after [`DIRECTORY_PAUSE_LIMIT`]. It is compiled away in
+    /// every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_opening_the_directory(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (arrived, watch) = std::sync::mpsc::channel();
+        let (release, go) = std::sync::mpsc::channel();
+        *self
+            .directory_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
+        (watch, release)
+    }
+
+    /// Stops the next launch that says it is going before it is committed, for this host's own
+    /// tests: the backend is still being launched while it waits.
+    ///
+    /// Returns the end that says the launch has arrived there and the end that lets it go on. It
+    /// is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_committing(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (arrived, watch) = tokio::sync::oneshot::channel();
+        let (release, go) = tokio::sync::oneshot::channel();
+        *self
+            .commit_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
+        (watch, release)
+    }
+
+    /// Stops the next close before it retires its first backend, for this host's own tests: a
+    /// launch can then commit between the close starting and the retirement.
+    ///
+    /// Returns the end that says the close has arrived there and the end that lets it go on, which
+    /// it also does once the test drops that end. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_retiring(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (arrived, watch) = std::sync::mpsc::channel();
+        let (release, go) = std::sync::mpsc::channel();
+        *self
+            .retire_pause
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
         (watch, release)
@@ -440,19 +627,46 @@ impl CommandBackends {
         end_lines(&mut backends, |generation| generation <= prompt_generation);
     }
 
-    /// Retires every backend, because the session is closing, and removes the session's root.
+    /// Retires every backend, because the session is closing, removes the session's root, and
+    /// returns the ends the session is to announce.
     ///
-    /// Nothing a launch is running is ended here: the session's own closure owns the program. A
-    /// launcher that looks now finds nothing to present to, and runs what was typed.
-    pub fn close(&self) {
+    /// No program is stopped here: the session's own closure owns the programs. What ends here is
+    /// each committed launch's instance, with its grant, since the session is ending its program,
+    /// and every instance the session adopted. It is called with the session's lock held, so
+    /// nothing here takes it: the session announces what this returns. A launcher that looks now
+    /// finds nothing to present to, and runs what was typed.
+    #[must_use]
+    pub fn close(&self) -> Vec<kr_protocol::projection::AgentInstanceSummary> {
         let backends = std::mem::take(
             &mut *self
                 .backends
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
+        let mut ended = Vec::new();
         for backend in backends {
+            #[cfg(feature = "testing")]
+            {
+                let armed = self
+                    .retire_pause
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some((arrived, go)) = armed {
+                    let _ = arrived.send(());
+                    let _ = go.recv();
+                }
+            }
+            // Retired first, under its lifecycle lock, so no launch commits under it afterwards;
+            // then whatever instance it registered is ended, whichever state the launch had
+            // reached: a committed one is the session's to end, and one a launch still holds is
+            // given back by that launch's guard, for which an ended instance is nothing to undo.
             backend.retire();
+            ended.extend(backend.end_at_close(&self.broker));
+        }
+        #[cfg(unix)]
+        if let Some(adoptions) = self.adoptions.as_ref() {
+            ended.extend(adoptions.close());
         }
         let root = self
             .root
@@ -462,6 +676,7 @@ impl CommandBackends {
         if let Some(root) = root {
             let _ = std::fs::remove_dir_all(root);
         }
+        ended
     }
 
     /// Returns the session's root, once the first establish has made it.
@@ -590,6 +805,10 @@ impl CommandBackends {
             BrokerError::ledger(format!("could not write the launch record: {error}"))
         })?;
         let (identity_sender, identity) = tokio::sync::watch::channel(None);
+        // A connector whose installation may read files is granted the directory the shell
+        // reported for this invocation.
+        let reads_files =
+            connector.granted(kr_plugin_sdk::capability::PluginCapability::FilesystemRead);
         let backend = Arc::new(Backend {
             application_instance_id,
             prompt_generation: request.prompt_generation,
@@ -606,18 +825,55 @@ impl CommandBackends {
             lifecycle: Lifecycle::new(BackendState::Unbound),
             identity,
             image_refused: Mutex::new(None),
+            announced: Mutex::new(Announced::default()),
             image_verified: crate::broker::image::VerifiedFiles::default(),
             stopped: Arc::new(AtomicBool::new(false)),
             tasks: Mutex::new(Vec::new()),
+            os_user: self.os_user.clone(),
+            host_directory: Arc::new(std::sync::OnceLock::new()),
+            views: self
+                .views
+                .as_ref()
+                .map(|runtime| (self.session_id, Weak::clone(runtime))),
             #[cfg(feature = "testing")]
             confirm_pause: Arc::clone(&self.confirm_pause),
+            #[cfg(feature = "testing")]
+            commit_pause: Arc::clone(&self.commit_pause),
         });
         let reading = {
             let path = PathBuf::from(&backend.invocation.executable);
             let hashed = Arc::clone(&self.hashed);
             let connector = Arc::clone(&backend.connector);
             let stopped = Arc::clone(&backend.stopped);
+            let granted = Arc::clone(&backend.host_directory);
+            let cwd = reads_files.then(|| PathBuf::from(request.cwd));
+            let environment_id = self.environment_id;
+            #[cfg(feature = "testing")]
+            let pause = self
+                .directory_pause
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
             self.handle.spawn_blocking(move || {
+                // The directory first, here rather than under the session's lock, because a path
+                // on a filesystem that has stopped answering can hold its open for as long as it
+                // likes. Opened now, what the launch is granted is the directory at the reported
+                // revision, whatever the path names later; one that cannot be opened leaves the
+                // launch with no directory, and every reverse file request refused. An open that
+                // outlasts the admission's wait for the identity below refuses the launch, which
+                // then runs as typed.
+                if let Some(cwd) = cwd {
+                    #[cfg(feature = "testing")]
+                    if let Some((arrived, go)) = pause {
+                        let _ = arrived.send(());
+                        let _ = go.recv_timeout(DIRECTORY_PAUSE_LIMIT);
+                    }
+                    if let Ok(opened) =
+                        kr_transfer::authority::AuthorisedDirectory::open_root(environment_id, &cwd)
+                    {
+                        let _ = granted.set(opened);
+                    }
+                }
                 let read =
                     crate::broker::image::read_identity(&path, &hashed, &stopped).map(|hashed| {
                         let version = connector
@@ -644,6 +900,91 @@ impl CommandBackends {
 }
 
 impl Backend {
+    /// Announces the committed program to the session's views: launched through the integration,
+    /// with the refusal of its bridges where one came first.
+    fn announce_started(&self) {
+        let summary = kr_protocol::projection::AgentInstanceSummary {
+            application_instance_id: self.application_instance_id,
+            plugin_id: kr_protocol::scalars::Nullable::some(self.connector.plugin_id()),
+            profile_id: kr_protocol::scalars::Nullable::some(self.profile_id.clone()),
+            mode: IntegrationMode::NativeBridge,
+            bypass: kr_protocol::scalars::Nullable::null(),
+            started_at: kr_ipc::now_ms(),
+            ended_at: kr_protocol::scalars::Nullable::null(),
+            refusal: kr_protocol::scalars::Nullable::null(),
+        };
+        self.announce(|announced| announced.start(summary));
+    }
+
+    /// Records why the instance's bridges are refused, and announces it once the program has been.
+    ///
+    /// A refusal stands for every later bridge and is found again by each, so only a new reason is
+    /// announced, and none after the end.
+    fn announce_refusal(&self, why: &str) {
+        self.announce(|announced| announced.refuse(why));
+    }
+
+    /// Announces the end of the program that was announced as started, unless its session's
+    /// closing announced it first.
+    fn announce_ended(&self) {
+        self.announce(|announced| announced.end(kr_ipc::now_ms()));
+    }
+
+    /// Decides one announcement and makes it to the session's views, where this backend was given
+    /// them.
+    ///
+    /// The session's lock is taken first and the announced state second, here and when the
+    /// session's closing ends the instance, so the views hear each instance's announcements in the
+    /// order they were decided and no two locks are ever taken the other way round.
+    fn announce(
+        &self,
+        decide: impl FnOnce(&mut Announced) -> Option<kr_protocol::projection::AgentInstanceSummary>,
+    ) {
+        let runtime = self
+            .views
+            .as_ref()
+            .and_then(|(_, runtime)| runtime.upgrade());
+        let Some(runtime) = runtime else {
+            let _ = decide(
+                &mut self
+                    .announced
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            return;
+        };
+        let mut session = runtime.session();
+        let decided = decide(
+            &mut self
+                .announced
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        if let Some(summary) = decided {
+            session.announce_instance(summary);
+        }
+    }
+
+    /// Ends this retired backend's instance, because its session is closing, and returns what the
+    /// session is to announce.
+    ///
+    /// Called with the session's lock held, after the retirement. Nothing here stops the program,
+    /// which the session's own closure ends; what ends here is the instance, its grant and what the
+    /// views were told, so no list the session keeps names a program it is ending.
+    fn end_at_close(
+        &self,
+        broker: &Broker,
+    ) -> Option<kr_protocol::projection::AgentInstanceSummary> {
+        let _ = broker.end(
+            self.application_instance_id,
+            crate::broker::InstanceEnding::NativeExit,
+        );
+        self.announced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .end(kr_ipc::now_ms())
+    }
+
     fn is_unbound(&self) -> bool {
         matches!(*self.lifecycle.state.borrow(), BackendState::Unbound)
     }
@@ -801,8 +1142,13 @@ async fn admit(
                 let registration = Arc::clone(&registration);
                 tokio::task::spawn_blocking(move || verify(&backend, &registration)).await
             };
-            if !matches!(verdict, Ok(Ok(()))) {
-                return;
+            match verdict {
+                Ok(Ok(())) => {}
+                Ok(Err(why)) => {
+                    backend.announce_refusal(&why);
+                    return;
+                }
+                Err(_) => return,
             }
             let Ok(admitted) = authenticated.admit().await else {
                 return;
@@ -812,10 +1158,32 @@ async fn admit(
                     let _ = backend.gateway.observe_hook(admitted).await;
                 }
                 BridgeSurface::Channel => {
-                    // The Channels consumer serves an admitted channel; until it is given one, the
-                    // channel is closed and Claude Code shows the server as failed.
-                    let mut stream = admitted.stream;
-                    stream.close().await;
+                    // Served in a task of its own, outside the admission bound, for as long as it
+                    // is open. It is not one of the backend's tasks, which retirement aborts: the
+                    // retirement is what ends it, and it ends through its own close, which settles
+                    // what it relayed.
+                    let version = backend
+                        .identity
+                        .borrow()
+                        .as_ref()
+                        .and_then(|read| read.as_ref().ok())
+                        .and_then(|identity| identity.version.clone());
+                    let launch = crate::broker::channels::ChannelLaunch {
+                        broker,
+                        application_instance_id: backend.application_instance_id,
+                        connector: Arc::clone(&backend.connector),
+                        version,
+                        site: environment_id,
+                        os_user: backend.os_user.clone(),
+                        views: backend.views.clone(),
+                    };
+                    let mut state = backend.lifecycle.state.subscribe();
+                    let retired = async move {
+                        let _ = state
+                            .wait_for(|state| matches!(state, BackendState::Retired))
+                            .await;
+                    };
+                    tokio::spawn(crate::broker::channels::serve(launch, admitted, retired));
                 }
             }
         }
@@ -992,6 +1360,18 @@ async fn admit_launch(
             "the admitted launch did not say it is going",
         ));
     }
+    #[cfg(feature = "testing")]
+    {
+        let armed = backend
+            .commit_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            let _ = go.await;
+        }
+    }
     // The commit, under the lifecycle lock: the state, the guard and the supervision together, or,
     // for a backend retired meanwhile, none of them, and the guard gives back.
     let mut guard = Some(guard);
@@ -1091,6 +1471,27 @@ async fn admit_claimed<'a>(
     let registered = reservation
         .register(IntegrationMode::NativeBridge, Some(managed))
         .map_err(|refused| refused.error)?;
+    // The directory the invocation was resolved in, for reading only and confined to its own
+    // mount. The grant is the instance's, so it goes with the instance: a launch given back takes
+    // it along, and so does the program's end. It is granted only when it is the directory the
+    // launched process works in, as the kernel keeps it: the path was opened after the shell
+    // reported it, and a directory moved away and replaced at that path meanwhile is another
+    // directory. A directory no grant can be made from (its handle cannot be taken again, or its
+    // mount cannot be told) is granted nothing, like one that could not be opened.
+    let working = working_directory_of(process.pid.get());
+    if let Some(files) = backend
+        .host_directory
+        .get()
+        .filter(|directory| {
+            working.is_some_and(|working| directory.check_identity(working).is_ok())
+        })
+        .and_then(|directory| directory.try_clone().ok())
+        .and_then(|root| {
+            crate::broker::host::HostFiles::new(root, crate::broker::host::FileAccess::Read).ok()
+        })
+    {
+        broker.grant_host_files(backend.application_instance_id, files)?;
+    }
     let registration = Registration::new(
         backend.gateway.address().clone(),
         backend.profile_id.clone(),
@@ -1126,6 +1527,88 @@ fn confirmation() -> Vec<u8> {
         .into_bytes()
 }
 
+/// Returns the identity of the directory a process works in, as the kernel keeps it: the directory
+/// object itself, whatever path names it now.
+#[cfg(target_os = "linux")]
+fn working_directory_of(pid: u64) -> Option<kr_transfer::authority::ObjectIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = std::fs::metadata(format!("/proc/{pid}/cwd")).ok()?;
+    Some(kr_transfer::authority::ObjectIdentity {
+        device: metadata.dev(),
+        file_id: metadata.ino(),
+    })
+}
+
+/// Returns the identity of the directory a process works in, as the kernel keeps it: the directory
+/// object itself, whatever path names it now.
+#[cfg(target_os = "macos")]
+fn working_directory_of(pid: u64) -> Option<kr_transfer::authority::ObjectIdentity> {
+    let pid = i32::try_from(pid).ok()?;
+    let info: WorkingDirectories = libproc::proc_pid::pidinfo(pid, 0).ok()?;
+    let stat = &info.current.vnode.stat;
+    Some(kr_transfer::authority::ObjectIdentity {
+        device: u64::from(stat.vst_dev),
+        file_id: stat.vst_ino,
+    })
+}
+
+/// No platform record of a process's working directory is read here, so none is granted.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const fn working_directory_of(_pid: u64) -> Option<kr_transfer::authority::ObjectIdentity> {
+    None
+}
+
+/// The kernel's `struct proc_vnodepathinfo`: the current and the root directory of a process.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct WorkingDirectories {
+    current: VnodeWithPath,
+    root: VnodeWithPath,
+}
+
+/// The kernel's `struct vnode_info_path`.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct VnodeWithPath {
+    vnode: Vnode,
+    path: [u8; 1024],
+}
+
+/// The kernel's `struct vnode_info`.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct Vnode {
+    stat: libproc::net_info::VInfoStat,
+    kind: i32,
+    pad: i32,
+    fsid: [i32; 2],
+}
+
+#[cfg(target_os = "macos")]
+impl libproc::proc_pid::PIDInfo for WorkingDirectories {
+    fn flavor() -> libproc::proc_pid::PidInfoFlavor {
+        libproc::proc_pid::PidInfoFlavor::VNodePathInfo
+    }
+}
+
+/// The most bytes of a refusal's reason an announcement carries.
+///
+/// A reason names paths the platform reported, and an announcement is carried whole in every
+/// subscription's answer, so it is bounded where it is made.
+pub const MAX_REFUSAL_BYTES: usize = 512;
+
+/// Returns a refusal's reason cut to [`MAX_REFUSAL_BYTES`], at a character boundary.
+fn bounded_refusal(why: &str) -> &str {
+    if why.len() <= MAX_REFUSAL_BYTES {
+        return why;
+    }
+    let mut end = MAX_REFUSAL_BYTES;
+    while !why.is_char_boundary(end) {
+        end -= 1;
+    }
+    &why[..end]
+}
+
 /// Returns true for the frame a launcher writes when it is about to exec the program.
 fn is_going(frame: &[u8]) -> bool {
     serde_json::from_slice::<serde_json::Value>(frame).is_ok_and(|value| {
@@ -1137,8 +1620,13 @@ fn is_going(frame: &[u8]) -> bool {
     })
 }
 
-/// Watches the committed program for as long as it runs, and ends the instance when it exits.
+/// Announces the committed program, watches it for as long as it runs, and ends the instance and
+/// announces its end when it exits.
+///
+/// The start is announced here rather than where the launch is committed, so the one task that
+/// announces the end has announced the start before it.
 async fn supervise(backend: Arc<Backend>, broker: Arc<Broker>, process: ProcessStartIdentity) {
+    backend.announce_started();
     loop {
         if matches!(
             kr_ipc::identity::process_state(&process),
@@ -1149,6 +1637,7 @@ async fn supervise(backend: Arc<Backend>, broker: Arc<Broker>, process: ProcessS
                 crate::broker::InstanceEnding::NativeExit,
             );
             backend.retire();
+            backend.announce_ended();
             return;
         }
         tokio::time::sleep(SUPERVISION_POLL).await;
@@ -1332,6 +1821,84 @@ const fn forward_now() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn summary() -> kr_protocol::projection::AgentInstanceSummary {
+        kr_protocol::projection::AgentInstanceSummary {
+            application_instance_id: ApplicationInstanceId::new(Uuid::from_bytes([3; 16])),
+            plugin_id: kr_protocol::scalars::Nullable::null(),
+            profile_id: kr_protocol::scalars::Nullable::null(),
+            mode: IntegrationMode::NativeBridge,
+            bypass: kr_protocol::scalars::Nullable::null(),
+            started_at: kr_protocol::scalars::TimestampMs::new(1),
+            ended_at: kr_protocol::scalars::Nullable::null(),
+            refusal: kr_protocol::scalars::Nullable::null(),
+        }
+    }
+
+    /// KR-REQ-12.07: an instance's end is final and carries the refusal that stood; a refusal found
+    /// before the start goes out with the start, a reason goes out once, and nothing goes out after
+    /// the end, whichever task finds it.
+    #[test]
+    fn kr_req_12_07_an_instance_s_end_is_final_and_carries_the_refusal_that_stood() {
+        let mut announced = Announced::default();
+        assert!(
+            announced.refuse("first").is_none(),
+            "nothing is announced before the start"
+        );
+        let started = announced.start(summary()).expect("the start");
+        assert_eq!(started.refusal.as_ref().map(String::as_str), Some("first"));
+        assert!(
+            announced.start(summary()).is_none(),
+            "the start goes out once"
+        );
+        let refused = announced.refuse("second").expect("a new reason");
+        assert_eq!(refused.refusal.as_ref().map(String::as_str), Some("second"));
+        assert!(
+            announced.refuse("second").is_none(),
+            "a reason goes out once"
+        );
+        let ended = announced
+            .end(kr_protocol::scalars::TimestampMs::new(9))
+            .expect("the end");
+        assert!(ended.ended_at.is_present());
+        assert_eq!(ended.refusal.as_ref().map(String::as_str), Some("second"));
+        assert!(
+            announced.refuse("third").is_none(),
+            "a refusal found after the end is not announced"
+        );
+        assert!(
+            announced
+                .end(kr_protocol::scalars::TimestampMs::new(10))
+                .is_none(),
+            "the end goes out once"
+        );
+    }
+
+    /// KR-REQ-12.07: an instance whose end was decided before its start was announced, as a session
+    /// that closes before the supervision first runs decides it, is never announced as started.
+    #[test]
+    fn kr_req_12_07_an_end_before_the_start_announces_nothing() {
+        let mut announced = Announced::default();
+        assert!(
+            announced
+                .end(kr_protocol::scalars::TimestampMs::new(9))
+                .is_none()
+        );
+        assert!(
+            announced.start(summary()).is_none(),
+            "a start after the end is not announced"
+        );
+    }
+
+    /// A refusal's reason is cut at a character boundary within its bound.
+    #[test]
+    fn a_long_refusal_is_cut_at_a_character_boundary() {
+        let long = "é".repeat(MAX_REFUSAL_BYTES);
+        let cut = bounded_refusal(&long);
+        assert!(cut.len() <= MAX_REFUSAL_BYTES);
+        assert!(cut.len() >= MAX_REFUSAL_BYTES - 1);
+        assert_eq!(bounded_refusal("short"), "short");
+    }
 
     fn registration() -> Arc<Registration> {
         Arc::new(Registration::new(

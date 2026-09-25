@@ -192,18 +192,16 @@ pub struct AdmittedBridge {
 /// native frame bound. Whatever was read past the hello before the bridge was admitted is held
 /// here and read first, so nothing a bridge pipelined behind its hello is lost or read twice.
 pub struct BridgeStream {
-    reader: Box<dyn AsyncRead + Unpin + Send>,
-    writer: Box<dyn AsyncWrite + Unpin + Send>,
-    held: Vec<u8>,
-    framing: Framing,
+    reader: BridgeReader,
+    writer: BridgeWriter,
 }
 
 impl std::fmt::Debug for BridgeStream {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("BridgeStream")
-            .field("held", &self.held.len())
-            .field("framing", &self.framing)
+            .field("held", &self.reader.held.len())
+            .field("framing", &self.reader.framing)
             .finish_non_exhaustive()
     }
 }
@@ -218,13 +216,74 @@ impl BridgeStream {
         framing: Framing,
     ) -> Self {
         Self {
-            reader,
-            writer,
-            held,
-            framing,
+            reader: BridgeReader {
+                reader,
+                held,
+                framing,
+            },
+            writer: BridgeWriter { writer, framing },
         }
     }
 
+    /// Separates the connection into what reads it and what writes it, so one task can read
+    /// while another writes.
+    #[must_use]
+    pub fn into_halves(self) -> (BridgeReader, BridgeWriter) {
+        (self.reader, self.writer)
+    }
+
+    /// Reads one whole frame, or `None` when the bridge has closed the connection between frames.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`BridgeReader::read_frame`] returns.
+    pub async fn read_frame(&mut self) -> Result<Option<Vec<u8>>> {
+        self.reader.read_frame().await
+    }
+
+    /// Writes one frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`BridgeWriter::write_frame`] returns.
+    pub async fn write_frame(&mut self, body: &[u8]) -> Result<()> {
+        self.writer.write_frame(body).await
+    }
+
+    /// Writes one whole frame now, if the connection takes all of it without waiting, and says
+    /// whether it did.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`BridgeWriter::try_write_frame`] returns.
+    pub fn try_write_frame(&mut self, body: &[u8]) -> Result<bool> {
+        self.writer.try_write_frame(body)
+    }
+
+    /// Closes the host's direction, so the bridge reads the end of what this host sends.
+    pub async fn close(&mut self) {
+        self.writer.close().await;
+    }
+}
+
+/// What reads an admitted bridge's connection, starting with whatever was read past its hello.
+pub struct BridgeReader {
+    reader: Box<dyn AsyncRead + Unpin + Send>,
+    held: Vec<u8>,
+    framing: Framing,
+}
+
+impl std::fmt::Debug for BridgeReader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BridgeReader")
+            .field("held", &self.held.len())
+            .field("framing", &self.framing)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BridgeReader {
     /// Reads one whole frame, or `None` when the bridge has closed the connection between frames.
     ///
     /// # Errors
@@ -253,7 +312,24 @@ impl BridgeStream {
             self.held.extend_from_slice(&chunk[..read]);
         }
     }
+}
 
+/// What writes an admitted bridge's connection.
+pub struct BridgeWriter {
+    writer: Box<dyn AsyncWrite + Unpin + Send>,
+    framing: Framing,
+}
+
+impl std::fmt::Debug for BridgeWriter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BridgeWriter")
+            .field("framing", &self.framing)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BridgeWriter {
     /// Writes one frame.
     ///
     /// # Errors

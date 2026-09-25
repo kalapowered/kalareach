@@ -15,8 +15,8 @@ use kr_client::recovery::{
     parse_kit, qr_payload, render_kit,
 };
 use kr_client::services::{
-    ServiceFuture, SyncBackupService, SyncExchanged, SyncFetched, SyncPosition, SyncRecoveryId,
-    SyncRequestFence, SyncRequestStatus, SyncRevision,
+    ServiceFuture, SyncBackupService, SyncDispatch, SyncExchanged, SyncFetched, SyncPosition,
+    SyncRecoveryId, SyncRequestFence, SyncRequestStatus, SyncRevision,
 };
 use kr_crypto::backup::{
     ArchiveExpectation, ArchivePlan, ArchiveReader, ArchiveRecipients, CheckpointSource,
@@ -135,6 +135,10 @@ struct ScriptedService {
     fence_cannot_say_nothing_ran: Mutex<bool>,
     /// A path the next exchange puts a directory at while it has the call, on the device's disk.
     obstruct_during_the_next_exchange: Mutex<Option<std::path::PathBuf>>,
+    /// The refusal the next exchange meets on the device, before anything is sent.
+    refuse_the_next_exchange_before_sending: Mutex<Option<ClientError>>,
+    /// A directory on the device's disk the next exchange makes read-only while it has the call.
+    lock_during_the_next_exchange: Mutex<Option<std::path::PathBuf>>,
 }
 
 impl ScriptedService {
@@ -209,6 +213,50 @@ impl ScriptedService {
             .obstruct_during_the_next_exchange
             .lock()
             .expect("the script") = Some(path);
+    }
+
+    /// Makes the next exchange refused on the device, as a client refuses a request it will not
+    /// send: nothing reaches this service.
+    fn refuse_the_next_exchange_before_sending(&self, refusal: ClientError) {
+        *self
+            .refuse_the_next_exchange_before_sending
+            .lock()
+            .expect("the script") = Some(refusal);
+    }
+
+    /// Makes `directory` on the device's disk read-only while the next exchange has the call.
+    ///
+    /// A read-only directory keeps its entries only on Unix, which is where the suite asks for it.
+    #[cfg(unix)]
+    fn lock_during_the_next_exchange(&self, directory: std::path::PathBuf) {
+        *self
+            .lock_during_the_next_exchange
+            .lock()
+            .expect("the script") = Some(directory);
+    }
+
+    /// Does to the device's disk what the suite asked for while an exchange has the call.
+    fn meddle_with_the_disk(&self) {
+        if let Some(path) = self
+            .obstruct_during_the_next_exchange
+            .lock()
+            .expect("the script")
+            .take()
+        {
+            std::fs::create_dir(&path).expect("the obstruction");
+        }
+        if let Some(directory) = self
+            .lock_during_the_next_exchange
+            .lock()
+            .expect("the script")
+            .take()
+        {
+            let mut permissions = std::fs::metadata(&directory)
+                .expect("the directory")
+                .permissions();
+            permissions.set_readonly(true);
+            std::fs::set_permissions(&directory, permissions).expect("read-only");
+        }
     }
 
     /// Makes this service keep a copy of every write it refuses, under one name.
@@ -349,14 +397,7 @@ impl SyncBackupService for ScriptedService {
                 .lock()
                 .expect("the attempts")
                 .push(attempt.clone());
-            if let Some(path) = self
-                .obstruct_during_the_next_exchange
-                .lock()
-                .expect("the script")
-                .take()
-            {
-                std::fs::create_dir(&path).expect("the obstruction");
-            }
+            self.meddle_with_the_disk();
             let interruption = std::mem::take(&mut *self.interruption.lock().expect("the script"));
             if interruption == Interruption::LoseTheRequest {
                 return Err(lost("the request never reached the service"));
@@ -369,6 +410,32 @@ impl SyncBackupService for ScriptedService {
                 return Err(lost("the answer never came back"));
             }
             answered
+        })
+    }
+
+    /// A refusal the suite scripted is made on the device, before anything reaches this service,
+    /// and says so; anything else is the exchange.
+    fn compare_exchange_dispatched<'a>(
+        &'a self,
+        collection: &'a str,
+        request_id: Uuid,
+        signed_at_ms: u64,
+        expected: Option<SyncPosition>,
+        ciphertext: &'a [u8],
+    ) -> ServiceFuture<'a, SyncDispatch> {
+        Box::pin(async move {
+            let refusal = self
+                .refuse_the_next_exchange_before_sending
+                .lock()
+                .expect("the script")
+                .take();
+            if let Some(refusal) = refusal {
+                self.meddle_with_the_disk();
+                return Ok(SyncDispatch::NotSent(refusal));
+            }
+            self.compare_exchange(collection, request_id, signed_at_ms, expected, ciphertext)
+                .await
+                .map(SyncDispatch::Answered)
         })
     }
 
@@ -571,6 +638,16 @@ fn moved() -> RecoveryContext {
         service_origin: OTHER_ORIGIN.to_owned(),
         bundle_locator: MOVED_LOCATOR.to_owned(),
     }
+}
+
+/// The collection the bundle at [`LOCATOR`] is kept in, as every store names it.
+fn collection() -> String {
+    bundle_collection(&context(ORIGIN))
+}
+
+/// The collection the migrations in this suite move the bundle into.
+fn moved_collection() -> String {
+    bundle_collection(&moved())
 }
 
 fn kit_of(seed: &RecoverySeed, origins: &[&str]) -> RecoveryKit {
@@ -846,7 +923,7 @@ async fn a_writer_is_declared_recovery_enabled_only_after_its_bundle_has_landed(
     );
 
     assert_eq!(
-        service.position_of(bundle_collection(&context(ORIGIN))),
+        service.position_of(&collection()),
         Some(enabled.bundle_position())
     );
 }
@@ -981,7 +1058,11 @@ async fn every_bundle_write_carries_a_fresh_identity_the_instant_of_the_call_and
 
     let attempts = service.attempts();
     assert_eq!(attempts.len(), 2);
-    assert!(attempts.iter().all(|attempt| attempt.collection == LOCATOR));
+    assert!(
+        attempts
+            .iter()
+            .all(|attempt| attempt.collection == collection())
+    );
     assert_ne!(
         attempts[0].request_id, attempts[1].request_id,
         "nothing is ever resent here, so each attempt is its own request"
@@ -1095,7 +1176,7 @@ async fn a_lost_answer_to_a_write_that_landed_is_this_devices_own_bundle_on_the_
     assert_eq!(store.lost_write(), None);
     assert_eq!(enabled.bundle_revision(), 2, "one bundle, moved on once");
     assert_eq!(
-        service.position_of(LOCATOR),
+        service.position_of(&collection()),
         Some(enabled.bundle_position())
     );
     let settled = store.fetch(&seed).await.expect("the bundle");
@@ -1176,7 +1257,7 @@ async fn a_write_still_on_its_way_is_ended_before_another_goes_out() {
     );
     let fences = service.fences();
     assert_eq!(fences.len(), 1);
-    assert_eq!(fences[0].collection, LOCATOR);
+    assert_eq!(fences[0].collection, collection());
     assert_eq!(fences[0].request_id, delayed.request_id);
     assert_eq!(
         (fences[0].first_signed_at_ms, fences[0].last_signed_at_ms),
@@ -1191,7 +1272,7 @@ async fn a_write_still_on_its_way_is_ended_before_another_goes_out() {
         .expect_err("a fenced identity executes nothing");
     assert_eq!(delivered.code(), ErrorCode::PermissionDenied);
     assert_eq!(
-        service.position_of(LOCATOR),
+        service.position_of(&collection()),
         Some(at(1)),
         "and the bundle at the locator is untouched by it"
     );
@@ -1306,7 +1387,7 @@ async fn a_fence_that_cannot_say_nothing_ran_reads_before_the_store_writes_again
         Some(LostWrite::Applied),
         "the read that follows the fence recognises this device's own bundle"
     );
-    assert_eq!(store.position(), service.position_of(LOCATOR));
+    assert_eq!(store.position(), service.position_of(&collection()));
 
     let mut carried = store.fetch(&seed).await.expect("the bundle");
     store
@@ -1352,7 +1433,7 @@ async fn a_receipt_and_a_read_that_disagree_under_one_place_in_the_order_are_two
         .bundle_key_for(&context(ORIGIN))
         .expect("the bundle key");
     service.substitute(
-        LOCATOR,
+        &collection(),
         kr_crypto::archive::encrypt_recovery_bundle(&key, &theirs).expect("the ciphertext"),
     );
     let read = store.fetch(&seed).await.expect("the bundle");
@@ -1408,7 +1489,7 @@ async fn an_applied_receipt_is_held_to_the_bundle_read_back_at_its_place() {
         .bundle_key_for(&context(ORIGIN))
         .expect("the bundle key");
     service.substitute(
-        LOCATOR,
+        &collection(),
         kr_crypto::archive::encrypt_recovery_bundle(&key, &theirs).expect("the ciphertext"),
     );
 
@@ -1427,7 +1508,7 @@ async fn an_applied_receipt_is_held_to_the_bundle_read_back_at_its_place() {
 
     // Where the place holds what the write carried, the same receipt settles it, and the store's
     // baseline is that write's own content.
-    service.substitute(LOCATOR, sent.ciphertext.clone());
+    service.substitute(&collection(), sent.ciphertext.clone());
     assert_eq!(
         store
             .end_lost_write(&seed)
@@ -1608,7 +1689,7 @@ async fn ending_a_write_the_service_had_already_applied_says_so() {
             .expect("the fence is made"),
         Some(LostWrite::Applied)
     );
-    assert_eq!(store.position(), service.position_of(LOCATOR));
+    assert_eq!(store.position(), service.position_of(&collection()));
     assert_eq!(
         store
             .writer_enabled(writer.key_id())
@@ -2002,10 +2083,10 @@ async fn a_second_reading_of_one_place_with_other_content_is_a_fork_rather_than_
         .bundle_key_for(&context(ORIGIN))
         .expect("the bundle key");
     service.substitute(
-        LOCATOR,
+        &collection(),
         kr_crypto::archive::encrypt_recovery_bundle(&key, &other_content).expect("the ciphertext"),
     );
-    assert_eq!(service.position_of(LOCATOR), Some(place));
+    assert_eq!(service.position_of(&collection()), Some(place));
 
     // One place names one content, so the second reading is a fork the reader is told about.
     assert!(matches!(
@@ -2113,7 +2194,7 @@ async fn a_bundle_write_dropped_while_the_service_holds_it_leaves_its_record_beh
         .enable_writer(&seed, &mut fresh, trusted(&second), TimestampMs::new(2_000))
         .await
         .expect("the next write lands");
-    assert_eq!(service.position_of(LOCATOR), Some(at(1)));
+    assert_eq!(service.position_of(&collection()), Some(at(1)));
 }
 
 #[tokio::test]
@@ -2180,7 +2261,7 @@ async fn a_lost_write_that_landed_is_recognised_by_the_store_opened_after_a_rest
         .await
         .expect("the next write lands");
     assert_eq!(carried.revision.get(), 3);
-    assert_eq!(service.position_of(LOCATOR), Some(at(3)));
+    assert_eq!(service.position_of(&collection()), Some(at(3)));
     assert!(
         service.fences().is_empty(),
         "a write recognised by reading needs nothing ended"
@@ -2240,7 +2321,7 @@ async fn a_store_opened_after_a_restart_holds_reads_to_the_place_its_lost_write_
         .ciphertext
         .clone();
     let lost = attempts.last().expect("the lost write").ciphertext.clone();
-    service.substitute(LOCATOR, first);
+    service.substitute(&collection(), first);
     service.next_fetch_answers(at(1));
     assert!(matches!(
         store.fetch(&seed).await,
@@ -2250,7 +2331,7 @@ async fn a_store_opened_after_a_restart_holds_reads_to_the_place_its_lost_write_
         })
     ));
     assert_eq!(store.position(), None);
-    service.substitute(LOCATOR, lost);
+    service.substitute(&collection(), lost);
 
     // The lost write's own bytes at the place it compared against are something no write of it
     // can be: it lands past that place. The read is refused, and the write stays outstanding.
@@ -3012,13 +3093,14 @@ async fn a_restore_with_only_the_kit_reaches_the_archive_and_trusts_only_the_bun
 
     let mut restore = FreshRestore::new(kit, RetrievalPolicy::Account);
     restore
-        .obtained_access(ServiceAccess {
-            policy: RetrievalPolicy::Account,
-            service_origin: ORIGIN.to_owned(),
-        })
+        .obtained_access(ServiceAccess::new(
+            RetrievalPolicy::Account,
+            ORIGIN,
+            Arc::clone(&service) as Arc<_>,
+        ))
         .expect("the configured policy granted access");
     let material = restore
-        .open_bundle(Arc::clone(&service) as Arc<_>, ORIGIN)
+        .open_bundle(ORIGIN)
         .await
         .expect("the bundle authenticates under the kit");
     assert_eq!(material.trusted_writers.len(), 1);
@@ -3110,24 +3192,23 @@ async fn service_access_alone_does_not_decrypt_the_bundle() {
     // A restore that has not been through the retrieval policy has nothing.
     let restore = FreshRestore::new(kit_of(&seed, &[ORIGIN]), RetrievalPolicy::Account);
     assert!(matches!(
-        restore
-            .open_bundle(Arc::clone(&service) as Arc<_>, ORIGIN)
-            .await,
+        restore.open_bundle(ORIGIN).await,
         Err(RecoveryError::NoServiceAccess)
     ));
 
     // Access granted under another policy than the configured one is not the configured policy.
     let mut restore = FreshRestore::new(kit_of(&seed, &[ORIGIN]), RetrievalPolicy::Account);
     assert!(matches!(
-        restore.obtained_access(ServiceAccess {
-            policy: RetrievalPolicy::SelfHosted,
-            service_origin: ORIGIN.to_owned(),
-        }),
+        restore.obtained_access(ServiceAccess::new(
+            RetrievalPolicy::SelfHosted,
+            ORIGIN,
+            Arc::clone(&service) as Arc<_>,
+        )),
         Err(RecoveryError::NoServiceAccess)
     ));
 
     // And the ciphertext itself, which access does reach, is nothing without the seed.
-    let ciphertext = held_bytes(&service, LOCATOR).await;
+    let ciphertext = held_bytes(&service, &collection()).await;
     assert!(!ciphertext.is_empty());
     let another_owner = RecoverySeed::generate().expect("a seed");
     let key = another_owner
@@ -3164,10 +3245,11 @@ async fn substituting_the_origin_or_the_locator_fails_authentication() {
     // A kit that names only one origin will not even build a context for another.
     let mut restore = FreshRestore::new(kit_of(&seed, &[ORIGIN]), RetrievalPolicy::Account);
     assert!(matches!(
-        restore.obtained_access(ServiceAccess {
-            policy: RetrievalPolicy::Account,
-            service_origin: OTHER_ORIGIN.to_owned(),
-        }),
+        restore.obtained_access(ServiceAccess::new(
+            RetrievalPolicy::Account,
+            OTHER_ORIGIN,
+            Arc::clone(&service) as Arc<_>,
+        )),
         Err(RecoveryError::UnknownServiceOrigin)
     ));
 
@@ -3176,25 +3258,24 @@ async fn substituting_the_origin_or_the_locator_fails_authentication() {
     let both = kit_of(&seed, &[ORIGIN, OTHER_ORIGIN]);
     let mut restore = FreshRestore::new(both, RetrievalPolicy::Account);
     restore
-        .obtained_access(ServiceAccess {
-            policy: RetrievalPolicy::Account,
-            service_origin: OTHER_ORIGIN.to_owned(),
-        })
+        .obtained_access(ServiceAccess::new(
+            RetrievalPolicy::Account,
+            OTHER_ORIGIN,
+            Arc::clone(&service) as Arc<_>,
+        ))
         .expect("access to the second origin");
     assert!(matches!(
-        restore
-            .open_bundle(Arc::clone(&service) as Arc<_>, OTHER_ORIGIN)
-            .await,
+        restore.open_bundle(OTHER_ORIGIN).await,
         Err(RecoveryError::BundleNotAuthentic)
     ));
 
     // And a locator substitution: the service serves this bundle under another name.
-    let ciphertext = held_bytes(&service, LOCATOR).await;
-    service.substitute("another-locator", ciphertext);
+    let ciphertext = held_bytes(&service, &collection()).await;
     let elsewhere = RecoveryContext {
         service_origin: ORIGIN.to_owned(),
         bundle_locator: "another-locator".to_owned(),
     };
+    service.substitute(&bundle_collection(&elsewhere), ciphertext);
     let mut moved = device(Arc::clone(&service) as Arc<_>, elsewhere);
     assert!(matches!(
         moved.fetch(&seed).await,
@@ -3291,7 +3372,7 @@ async fn a_destination_write_whose_answer_was_lost_is_ended_before_the_migration
         .expect("the migration lands and reads back");
     assert_eq!(migrated.record.to, elsewhere);
     assert_eq!(
-        destination_service.position_of("moved-bundle-locator"),
+        destination_service.position_of(&moved_collection()),
         Some(migrated.record.bundle_position)
     );
 
@@ -3309,7 +3390,7 @@ async fn a_destination_write_whose_answer_was_lost_is_ended_before_the_migration
         .await
         .expect("the destination store is the one that writes there now");
     assert_eq!(
-        destination_service.position_of("moved-bundle-locator"),
+        destination_service.position_of(&moved_collection()),
         destination.position()
     );
 }
@@ -3346,7 +3427,7 @@ async fn a_migration_into_a_destination_that_already_holds_a_bundle_writes_nothi
     theirs.trusted_writers = [trusted(&other)].into_iter().collect();
     let key = seed.bundle_key_for(&elsewhere).expect("the bundle key");
     destination_service.substitute(
-        "moved-bundle-locator",
+        &moved_collection(),
         kr_crypto::archive::encrypt_recovery_bundle(&key, &theirs).expect("the ciphertext"),
     );
     let mut destination = device(
@@ -3358,7 +3439,7 @@ async fn a_migration_into_a_destination_that_already_holds_a_bundle_writes_nothi
         .await
         .expect("the bundle that is there");
     assert_eq!(read.revision, bundle.revision);
-    let occupied_at = destination_service.position_of("moved-bundle-locator");
+    let occupied_at = destination_service.position_of(&moved_collection());
 
     // The source holds the bundle the caller holds, so the migration reaches the destination
     // rather than stopping at a comparison of the old location.
@@ -3386,7 +3467,7 @@ async fn a_migration_into_a_destination_that_already_holds_a_bundle_writes_nothi
         theirs
     );
     assert_eq!(
-        destination_service.position_of("moved-bundle-locator"),
+        destination_service.position_of(&moved_collection()),
         occupied_at
     );
 }
@@ -3430,7 +3511,7 @@ async fn a_destination_that_holds_a_bundle_is_refused_before_a_source_that_has_m
     occupant.trusted_writers = [trusted(&other)].into_iter().collect();
     let key = seed.bundle_key_for(&moved()).expect("the bundle key");
     destination_service.substitute(
-        MOVED_LOCATOR,
+        &moved_collection(),
         kr_crypto::archive::encrypt_recovery_bundle(&key, &occupant).expect("the ciphertext"),
     );
     let mut destination = device(Arc::clone(&destination_service) as Arc<_>, moved());
@@ -3514,7 +3595,7 @@ async fn a_migration_whose_answer_was_lost_after_its_write_landed_is_completed_f
     ));
     assert_eq!(bundle, moving, "the caller still holds what it was moving");
     let landed_at = destination_service
-        .position_of(MOVED_LOCATOR)
+        .position_of(&moved_collection())
         .expect("the write landed");
     let sent = destination_service.attempts().pop().expect("the write");
 
@@ -3572,13 +3653,14 @@ async fn a_migration_whose_answer_was_lost_after_its_write_landed_is_completed_f
     // A restore with the updated kit opens the bundle at its new home.
     let mut restore = FreshRestore::new(migrated.updated_kit.clone(), RetrievalPolicy::SelfHosted);
     restore
-        .obtained_access(ServiceAccess {
-            policy: RetrievalPolicy::SelfHosted,
-            service_origin: OTHER_ORIGIN.to_owned(),
-        })
+        .obtained_access(ServiceAccess::new(
+            RetrievalPolicy::SelfHosted,
+            OTHER_ORIGIN,
+            Arc::clone(&destination_service) as Arc<_>,
+        ))
         .expect("access to the new origin");
     let material = restore
-        .open_bundle(Arc::clone(&destination_service) as Arc<_>, OTHER_ORIGIN)
+        .open_bundle(OTHER_ORIGIN)
         .await
         .expect("the bundle authenticates at its new home");
     assert_eq!(material.bundle_revision, migrated.record.bundle_revision);
@@ -3652,7 +3734,7 @@ async fn completing_a_migration_without_a_receipt_goes_by_the_bytes_its_write_se
         .expect("the migration completes from the bytes its write sent");
     assert_eq!(
         Some(migrated.record.bundle_position),
-        destination_service.position_of(MOVED_LOCATOR)
+        destination_service.position_of(&moved_collection())
     );
     assert_eq!(destination.lost_write(), Some(LostWrite::Applied));
     assert_eq!(destination_service.attempts().len(), 1);
@@ -3715,7 +3797,7 @@ async fn completing_a_migration_without_a_receipt_refuses_another_writers_equal_
         .collections
         .lock()
         .expect("the store")
-        .get(MOVED_LOCATOR)
+        .get(&moved_collection())
         .expect("their bundle")
         .ciphertext
         .clone();
@@ -3725,7 +3807,10 @@ async fn completing_a_migration_without_a_receipt_refuses_another_writers_equal_
         "the two writes carry equal bundles"
     );
     assert_ne!(held.ciphertext, stored, "and different bytes");
-    assert_eq!(destination_service.position_of(MOVED_LOCATOR), Some(at(1)));
+    assert_eq!(
+        destination_service.position_of(&moved_collection()),
+        Some(at(1))
+    );
 
     // Long afterwards the service holds no receipts from then, so it cannot say that this
     // migration's write never ran. Nothing it answers names the writer, and the bundle there is
@@ -3814,7 +3899,7 @@ async fn a_migration_whose_answer_was_lost_is_completed_after_a_restart() {
     assert_eq!(migrated.record.to, moved());
     assert_eq!(
         Some(migrated.record.bundle_position),
-        destination_service.position_of(MOVED_LOCATOR)
+        destination_service.position_of(&moved_collection())
     );
     assert_eq!(migrated.updated_kit.bundle_locator, MOVED_LOCATOR);
     assert_eq!(
@@ -3901,7 +3986,7 @@ async fn a_migration_whose_read_back_failed_is_completed_after_a_restart_from_it
         .expect("the migration completes from its answered write");
     assert_eq!(
         Some(migrated.record.bundle_position),
-        destination_service.position_of(MOVED_LOCATOR)
+        destination_service.position_of(&moved_collection())
     );
     assert_eq!(bundle.revision.get(), 2);
     assert_eq!(
@@ -4017,7 +4102,7 @@ async fn completing_a_migration_is_idempotent() {
     assert_eq!(destination_service.attempts().len(), 1);
     assert_eq!(service.attempts().len(), 1);
     assert_eq!(
-        destination_service.position_of(MOVED_LOCATOR),
+        destination_service.position_of(&moved_collection()),
         Some(first.record.bundle_position)
     );
     assert_eq!(bundle.revision.get(), first.record.bundle_revision);
@@ -4080,7 +4165,10 @@ async fn completing_a_migration_refuses_another_writers_bundle_at_the_place_its_
         .await
         .expect("their migration lands");
     assert_eq!(held.expected, None);
-    assert_eq!(destination_service.position_of(MOVED_LOCATOR), Some(at(1)));
+    assert_eq!(
+        destination_service.position_of(&moved_collection()),
+        Some(at(1))
+    );
     assert_eq!(theirs.revision.get(), bundle.revision.get() + 1);
 
     // The service says this migration's write never ran, so the bundle there is not its own,
@@ -4146,7 +4234,7 @@ async fn completing_a_migration_refuses_another_writers_bundle_at_the_place_its_
     // The content alone does not decide it either. The service now serves the very bytes this
     // migration's write carried, as a write of their own, while it says that write never ran.
     // The digest matches and the identity does not, and it takes both.
-    destination_service.republish(MOVED_LOCATOR, held.ciphertext.clone());
+    destination_service.republish(&moved_collection(), held.ciphertext.clone());
     assert!(matches!(
         store
             .complete_migration(
@@ -4332,7 +4420,7 @@ async fn completing_a_migration_whose_write_never_landed_leaves_the_move_to_be_m
         .await
         .expect("the migration lands");
     assert_eq!(
-        destination_service.position_of(MOVED_LOCATOR),
+        destination_service.position_of(&moved_collection()),
         Some(migrated.record.bundle_position)
     );
 }
@@ -4393,13 +4481,14 @@ async fn a_migration_produces_an_updated_kit_and_a_verified_record() {
     // A restore with the updated kit reads the bundle at the new location.
     let mut restore = FreshRestore::new(migrated.updated_kit.clone(), RetrievalPolicy::SelfHosted);
     restore
-        .obtained_access(ServiceAccess {
-            policy: RetrievalPolicy::SelfHosted,
-            service_origin: OTHER_ORIGIN.to_owned(),
-        })
+        .obtained_access(ServiceAccess::new(
+            RetrievalPolicy::SelfHosted,
+            OTHER_ORIGIN,
+            Arc::clone(&destination_service) as Arc<_>,
+        ))
         .expect("access to the new origin");
     let material = restore
-        .open_bundle(Arc::clone(&destination_service) as Arc<_>, OTHER_ORIGIN)
+        .open_bundle(OTHER_ORIGIN)
         .await
         .expect("the bundle authenticates at its new home");
     assert_eq!(material.trusted_writers.len(), 1);
@@ -4410,20 +4499,21 @@ async fn a_migration_produces_an_updated_kit_and_a_verified_record() {
     // owner is told to destroy the old kit rather than left to find out.
     let mut stale = FreshRestore::new(kit, RetrievalPolicy::SelfHosted);
     stale
-        .obtained_access(ServiceAccess {
-            policy: RetrievalPolicy::SelfHosted,
-            service_origin: ORIGIN.to_owned(),
-        })
+        .obtained_access(ServiceAccess::new(
+            RetrievalPolicy::SelfHosted,
+            ORIGIN,
+            Arc::clone(&service) as Arc<_>,
+        ))
         .expect("access to the old origin");
     let superseded = stale
-        .open_bundle(Arc::clone(&service) as Arc<_>, ORIGIN)
+        .open_bundle(ORIGIN)
         .await
         .expect("the copy left behind still opens under the old kit");
     assert!(
         superseded.bundle_revision < material.bundle_revision,
         "what the old kit opens is the bundle as it was before the move"
     );
-    let sentence = migrated.record.describe();
+    let sentence = migrated.record.describe().into_string();
     assert!(sentence.contains("destroy the old one"));
     assert!(sentence.contains(ORIGIN));
     assert!(sentence.contains(OTHER_ORIGIN));
@@ -4596,13 +4686,14 @@ async fn one_kit_serves_several_services() {
     ] {
         let mut restore = FreshRestore::new(kit.clone(), RetrievalPolicy::Account);
         restore
-            .obtained_access(ServiceAccess {
-                policy: RetrievalPolicy::Account,
-                service_origin: origin.to_owned(),
-            })
+            .obtained_access(ServiceAccess::new(
+                RetrievalPolicy::Account,
+                origin,
+                service as Arc<_>,
+            ))
             .expect("access");
         let material = restore
-            .open_bundle(service as Arc<_>, origin)
+            .open_bundle(origin)
             .await
             .expect("the kit opens the bundle at each service it names");
         assert_eq!(material.context.service_origin, origin);
@@ -4612,10 +4703,11 @@ async fn one_kit_serves_several_services() {
     // A third origin the kit does not name is refused before anything is fetched.
     let mut restore = FreshRestore::new(kit, RetrievalPolicy::Account);
     assert!(matches!(
-        restore.obtained_access(ServiceAccess {
-            policy: RetrievalPolicy::Account,
-            service_origin: "https://not-in-the-kit.example".to_owned(),
-        }),
+        restore.obtained_access(ServiceAccess::new(
+            RetrievalPolicy::Account,
+            "https://not-in-the-kit.example",
+            Arc::clone(&first) as Arc<_>,
+        )),
         Err(RecoveryError::UnknownServiceOrigin)
     ));
 }
@@ -4677,7 +4769,7 @@ async fn the_encrypted_bundle_and_selected_archives_export_offline() {
 
     // The export is ciphertext and nothing else: the encrypted bundle as the service holds it, and
     // the selected archive's own bytes.
-    let encrypted_bundle = held_bytes(&service, LOCATOR).await;
+    let encrypted_bundle = held_bytes(&service, &collection()).await;
     let export = OfflineExport::new(
         encrypted_bundle,
         sealed.descriptor_bytes.clone(),
@@ -5156,7 +5248,7 @@ async fn migrating_a_bundle_the_service_serves_older_than_this_device_knows_is_r
         .collections
         .lock()
         .expect("store")
-        .get(LOCATOR)
+        .get(&collection())
         .expect("the bundle is there")
         .ciphertext
         .clone();
@@ -5176,7 +5268,7 @@ async fn migrating_a_bundle_the_service_serves_older_than_this_device_knows_is_r
     // next place. It authenticates, because the owner wrote it; authentication says who could have
     // written it and never how long ago, and the place moving on says nothing either. The revision
     // inside is what gives it away.
-    service.republish(LOCATOR, replayed);
+    service.republish(&collection(), replayed);
     let destination_service = ScriptedService::shared();
     let mut stale = superseded;
     let err = store
@@ -5285,5 +5377,294 @@ async fn migrating_to_a_destination_whose_kit_cannot_be_kept_is_refused_before_t
                 .is_empty(),
             "nothing is written at the destination"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-20.18: a write that never left, and the bound a bundle is sealed within.
+// ---------------------------------------------------------------------------------------------
+
+/// A refusal made before a request is sent, as a client makes one: nothing left this device.
+fn refused_here(what: &'static str) -> ClientError {
+    ClientError::Host(ProtocolError::new(ErrorCode::InvalidArgument, what))
+}
+
+/// A write refused on the device before anything left it is reported as not sent, and leaves the
+/// store as the call found it: the same record on the disk, or none, the same baseline, and nothing
+/// outstanding, so the next write goes out. Over no record, and over the record of an answered write.
+#[tokio::test]
+async fn a_write_refused_before_it_was_sent_is_reported_so_and_leaves_the_store_as_it_was() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+
+    service.refuse_the_next_exchange_before_sending(refused_here("no account token"));
+    match store
+        .commit(&seed, &mut bundle, TimestampMs::new(1_000))
+        .await
+    {
+        Err(RecoveryError::BundleNotSent { source }) => {
+            assert_eq!(source.code(), ErrorCode::InvalidArgument);
+            assert!(source.to_string().contains("no account token"), "{source}");
+        }
+        other => panic!("not sent: {other:?}"),
+    }
+    assert!(service.attempts().is_empty(), "nothing reached the service");
+    assert_eq!(store.lost_write(), None);
+    assert!(
+        !store
+            .stored()
+            .iter()
+            .any(|(name, _)| name.ends_with(".bundle-write")),
+        "no record of a write that never left"
+    );
+    assert_eq!(bundle.revision.get(), 0, "the caller's bundle is as it was");
+
+    let first = store
+        .commit(&seed, &mut bundle, TimestampMs::new(2_000))
+        .await
+        .expect("the next write goes out");
+    let answered = store.record();
+
+    service.refuse_the_next_exchange_before_sending(refused_here("a signing instant out of time"));
+    assert!(matches!(
+        store
+            .commit(&seed, &mut bundle, TimestampMs::new(3_000))
+            .await,
+        Err(RecoveryError::BundleNotSent { .. })
+    ));
+    assert_eq!(store.record(), answered, "the record as the call found it");
+    assert_eq!(store.lost_write(), None);
+    assert_eq!(store.position(), Some(first));
+    assert_eq!(service.attempts().len(), 1);
+
+    let second = store
+        .commit(&seed, &mut bundle, TimestampMs::new(4_000))
+        .await
+        .expect("the next write goes out");
+    assert_eq!(second.write_sequence, 2);
+    assert_eq!(service.position_of(&collection()), Some(second));
+}
+
+/// A service implementation that cannot tell whether a failed request left counts every failure as
+/// possibly sent, which is the safe direction: the write stays outstanding until it is ended, even
+/// when the failure reads like a refusal made on the device.
+#[tokio::test]
+async fn a_service_that_cannot_tell_counts_every_failure_as_possibly_sent() {
+    /// Refuses every exchange, and does not say whether the refusal left the device.
+    #[derive(Debug)]
+    struct CannotTell(Arc<ScriptedService>);
+
+    impl SyncBackupService for CannotTell {
+        fn compare_exchange<'a>(
+            &'a self,
+            _collection: &'a str,
+            _request_id: Uuid,
+            _signed_at_ms: u64,
+            _expected: Option<SyncPosition>,
+            _ciphertext: &'a [u8],
+        ) -> ServiceFuture<'a, SyncExchanged> {
+            Box::pin(async move { Err(refused_here("a request this client would not send")) })
+        }
+
+        fn request_status<'a>(
+            &'a self,
+            collection: &'a str,
+            request_id: Uuid,
+        ) -> ServiceFuture<'a, SyncRequestStatus> {
+            self.0.request_status(collection, request_id)
+        }
+
+        fn fence_request<'a>(
+            &'a self,
+            collection: &'a str,
+            request_id: Uuid,
+            first_signed_at_ms: u64,
+            last_signed_at_ms: u64,
+        ) -> ServiceFuture<'a, SyncRequestFence> {
+            self.0.fence_request(
+                collection,
+                request_id,
+                first_signed_at_ms,
+                last_signed_at_ms,
+            )
+        }
+
+        fn fetch<'a>(&'a self, collection: &'a str) -> ServiceFuture<'a, SyncFetched> {
+            self.0.fetch(collection)
+        }
+
+        fn resolve<'a>(
+            &'a self,
+            collection: &'a str,
+            retained: SyncConflictId,
+        ) -> ServiceFuture<'a, bool> {
+            self.0.resolve(collection, retained)
+        }
+    }
+
+    let seed = RecoverySeed::generate().expect("a seed");
+    let cannot_tell = Arc::new(CannotTell(ScriptedService::shared()));
+    let mut store = device(cannot_tell as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    assert!(matches!(
+        store
+            .commit(&seed, &mut bundle, TimestampMs::new(1_000))
+            .await,
+        Err(RecoveryError::BundleOutcomeUnknown { .. })
+    ));
+    assert!(matches!(
+        store.lost_write(),
+        Some(LostWrite::Unsettled { .. })
+    ));
+    assert!(matches!(
+        store
+            .commit(&seed, &mut bundle, TimestampMs::new(2_000))
+            .await,
+        Err(RecoveryError::BundleWriteUnsettled { .. })
+    ));
+}
+
+/// Where the disk will not take the record back, the record of the write that never left stays on
+/// it, saying the write is outstanding. The store in this process goes on from the record the call
+/// found, and a store opened after a restart ends the write with one fence, which the service
+/// answers as never having run. Over the record of an answered write, and over none.
+#[tokio::test]
+async fn a_record_the_disk_would_not_take_back_leaves_an_unsent_write_a_restart_ends() {
+    let seed = RecoverySeed::generate().expect("a seed");
+
+    // Over the record of an answered write: the disk refuses the file the record is written through.
+    let service = ScriptedService::shared();
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    store
+        .commit(&seed, &mut bundle, TimestampMs::new(1_000))
+        .await
+        .expect("an answered write");
+    let answered = store.record();
+    let obstruction = store.partial();
+    service.obstruct_during_the_next_exchange(obstruction.clone());
+    service.refuse_the_next_exchange_before_sending(refused_here("no account token"));
+    assert!(matches!(
+        store
+            .commit(&seed, &mut bundle, TimestampMs::new(2_000))
+            .await,
+        Err(RecoveryError::BundleNotSent { .. })
+    ));
+    assert_eq!(
+        store.lost_write(),
+        None,
+        "this process goes on from the record it had"
+    );
+    assert_ne!(
+        store.record(),
+        answered,
+        "the unsent write's record is still on the disk"
+    );
+    std::fs::remove_dir(&obstruction).expect("the obstruction goes");
+    let mut store = store.restart(Arc::clone(&service) as Arc<_>);
+    assert!(matches!(
+        store.lost_write(),
+        Some(LostWrite::Unsettled { .. })
+    ));
+    assert_eq!(
+        store.end_lost_write(&seed).await.expect("ended"),
+        Some(LostWrite::Ended { retained: None })
+    );
+    assert_eq!(service.fences().len(), 1, "one fence ends it");
+    let mut bundle = store.fetch(&seed).await.expect("the bundle");
+    store
+        .commit(&seed, &mut bundle, TimestampMs::new(3_000))
+        .await
+        .expect("the next write goes out");
+
+    // Over none: the disk is read-only while the write is refused, so the record cannot be removed.
+    #[cfg(unix)]
+    {
+        let service = ScriptedService::shared();
+        let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+        let mut bundle = BundleStore::empty(TimestampMs::new(1));
+        let disk = store.disk.path().to_path_buf();
+        service.lock_during_the_next_exchange(disk.clone());
+        service.refuse_the_next_exchange_before_sending(refused_here("no account token"));
+        let refused = store
+            .commit(&seed, &mut bundle, TimestampMs::new(1_000))
+            .await;
+        let mut permissions = std::fs::metadata(&disk).expect("the disk").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o700);
+        std::fs::set_permissions(&disk, permissions).expect("writable again");
+        assert!(
+            matches!(refused, Err(RecoveryError::BundleNotSent { .. })),
+            "{refused:?}"
+        );
+        assert_eq!(store.lost_write(), None);
+        let _ = store.record();
+        let mut store = store.restart(Arc::clone(&service) as Arc<_>);
+        assert!(matches!(
+            store.lost_write(),
+            Some(LostWrite::Unsettled { .. })
+        ));
+        assert_eq!(
+            store.end_lost_write(&seed).await.expect("ended"),
+            Some(LostWrite::Ended { retained: None })
+        );
+        store
+            .commit(&seed, &mut bundle, TimestampMs::new(2_000))
+            .await
+            .expect("the next write goes out");
+    }
+}
+
+/// A bundle sealed past the bound a service keeps is refused before anything is recorded or sent,
+/// and says how large it was.
+#[tokio::test]
+async fn a_bundle_sealed_past_its_bound_is_refused_before_anything_is_recorded() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    bundle.collections.push(CollectionLocator {
+        service_origin: ORIGIN.to_owned(),
+        locator: "x".repeat(
+            usize::try_from(kr_protocol::sync::MAX_SEALED_RECOVERY_BUNDLE_BYTES).expect("a length"),
+        ),
+        archive_id: archive_id(),
+    });
+    match store
+        .commit(&seed, &mut bundle, TimestampMs::new(1_000))
+        .await
+    {
+        Err(RecoveryError::BundleTooLarge { len, limit }) => {
+            assert_eq!(limit, kr_protocol::sync::MAX_SEALED_RECOVERY_BUNDLE_BYTES);
+            assert!(len as u64 > limit);
+        }
+        other => panic!("too large to send: {other:?}"),
+    }
+    assert!(service.attempts().is_empty());
+    assert!(
+        !store
+            .stored()
+            .iter()
+            .any(|(name, _)| name.ends_with(".bundle-write"))
+    );
+    assert_eq!(store.lost_write(), None);
+}
+
+/// The bundle is kept in the collection its kind and locator name, as every synchronised object's
+/// collection is named, and a locator drawn for a new kit is a canonical identifier drawn fresh.
+#[test]
+fn a_bundle_is_kept_in_the_collection_its_kind_and_locator_name() {
+    assert_eq!(
+        bundle_collection(&context(ORIGIN)),
+        format!("recovery_bundle/{LOCATOR}")
+    );
+    let first = kr_client::recovery::fresh_locator().expect("a locator");
+    let second = kr_client::recovery::fresh_locator().expect("a locator");
+    assert_ne!(first, second);
+    for locator in [&first, &second] {
+        let parsed: Uuid = locator.parse().expect("a canonical identifier");
+        assert_eq!(&parsed.to_string(), locator, "in its one spelling");
+        assert_eq!(parsed.as_bytes()[6] >> 4, 4, "drawn at random");
     }
 }

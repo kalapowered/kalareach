@@ -69,19 +69,110 @@ the identifier again, and inventing a new one would submit the same intent twice
 
 A connection that a relay stood in the way of is not reported as a host that did not answer.
 `NetworkTransport::connect` returns `ClientError::Transport` holding
-`TransportError::RelayRefused` when the attempt timed out without a connection while a relay on the
-route had turned this device away, or when the device had nothing but refusing relays to try: it
-names the relay, carries what the relay said, and lists the kinds of path that may still work. Its code comes from the kind token the relay's reason starts with: a spent
+`TransportError::RelayRefused` when the attempt timed out without a connection while the relay
+status showed a relay on the route turning this device away, or when the device had nothing but
+refusing relays to try: it names the relay, carries what the relay said, and lists the kinds of path
+that may still work. Its code comes from the kind token the relay's reason starts with: a spent
 allowance is `QUOTA_EXCEEDED`, a relay that is stopping is `SERVICE_CAPACITY`, and a reason with no
 known token is `RESOURCE_UNAVAILABLE`, like any other connection that could not be made. A device
 whose only path is the relay learns this as soon as the relay refuses it; one that can take a direct
-path learns it when its attempt ends without one. The transport reference has the token grammar and
-the alternatives.
+path learns it when its attempt ends without one, if the status still shows the refusal then. A
+refusal counts only while the status shows it, because a relay that is being dialled again may have
+admitted the device since. The transport reference has the rule, the token grammar and the
+alternatives.
 
 Two refusers know more than a code can carry. A managed service answers `PERMISSION_DENIED` both for
 a caller that is not signed in and for an account that may not do this, so it classifies its own
 refusal and `ClientError::Refused` carries the action. This device's draft store has its own answers
 too: a draft that will not fit is not a reason to update the application.
+
+## What a diagnostic may show
+
+A failure, a line on standard error and a panic, from this library and from the command line, say
+only a `shown::Shown`. A `Shown` is built from this program's own words (a `&'static str` written
+in its source), from values with nothing in them to hide (`Plain`: numbers, identifiers that are
+UUIDs or counters, and codes and states from a fixed vocabulary), and from what a reducer or a door
+decided may be said. There is no way to make one from a `String`, so text that arrived from a
+person, a file, a host or a service reaches a diagnostic only through one of those.
+
+A reducer keeps what somebody diagnosing a fault needs and drops the rest. Where it says text that
+arrived, the text is one of a closed list this build holds, or has a shape that cannot carry chosen
+words: a UUID, eight or more hexadecimal digits, or decimal digits. A test of the characters alone is
+not enough, because anything can be written in a shape made of letters. Three say more, each by a
+contract of its own: `address` says a host's name, because which service or relay failed is what a
+person acts on; `root` and `within` say a directory the program was configured with or derived,
+which the caller vouches for; and the command line's `named` says a path the person typed, back to
+them.
+
+| Reducer | What it says |
+| --- | --- |
+| `address` | The scheme, the host and the port. An address with a user name or a password in it is not printed at all, and no path, query or fragment ever is |
+| `cbor` | The KR-CBOR-1 rule the bytes broke and the offset where they broke it, never a key, a value or a decoder's message |
+| `json` | The kind of fault, with its line and column |
+| `io` | The kind of failure and the operating system's error number; a message a caller attached is dropped |
+| `frame`, `ipc`, `transport`, `crypto` | Their own fixed words, with CBOR and input or output failures said as above |
+| `pairing` | A pairing failure's own fixed words and numbers; what a rendezvous service, a store or a peer wrote is named by its kind, and a refusal by its code |
+| `qr_payload` | The rule an invitation's QR payload broke, a member that failed by its name, and its size or version, never a mode it named or why a member failed |
+| `task` | Whether a task panicked or was cancelled, never what a panic said |
+| `route` | Each segment of a request path that is a word of the service adapters' own paths or an identifier, and a placeholder for any other |
+| `collection` | A sync collection's kind, one of the protocol's, and its object's identifier |
+| `terminfo` | A terminal type that is one of the terminfo names this build lists |
+| `root`, `within` | A directory this program was configured with or derived, and a fixed name under one |
+| `stored` | A file in a store, whose name is said only when it is one of the store's fixed names or an identifier with the store's own extensions |
+| `host_path` | A path in this installation's tree: the configured runtime or state root whole, and below it only identifiers and the names the tree writes; outside it, a drive's letter but never a server's, a share's or a device's name |
+
+A door passes text whole, because the value it takes was written to be shown to a person: a host's
+refusal message (section 23 makes that plain text for a person, with no credentials in it), a
+managed service's refusal, and a package's words about its controls. A host sentence goes through a
+door too, and one that arrived from a document rather than being composed here is said by its class
+and its length. The signal a closure record names is said when it is one of the names platforms
+give signals, with the number a platform puts after one.
+
+So an error holds text only as a `Shown`, and an input or output failure as an `IoFault`, which is
+not itself an error and is never a `source()`. A `thiserror` message is one literal whose holes
+name the variant's own fields, `Debug` is the same text as `Display`, and a hand-written `Error`
+names no source, so walking a failure's chain finds nothing its rendering left out. `ClientError`
+and `CliError` still carry the values other crates build and match (a host's `ProtocolError`, a
+`TransportError`, an `IpcError`) and render each through its door or reducer.
+`kr_client::error::refusal` is the one place a `ProtocolError` is made from text, and it takes a
+`Shown`.
+
+The command line reports every failure through one reporter, which writes the line on standard
+error and the `--json` failure document. A usage mistake is said by its kind and by what the
+command declares: the argument, the values it takes, a suggestion and the usage line, which names
+the command `kr` however it was invoked. What was typed is never repeated, because an argument in
+the wrong place can be a secret pasted into it.
+`kr account token show` and `kr account token import` say a stored origin as an address, and the
+stored scopes as the names this build knows, with the others counted. While an owner device
+confirms a pairing, the command says the verification value the new device should show, grouped in
+fours as both devices show it and only when it is eight hexadecimal digits, and names the device by
+its platform: the name a device gave itself is not repeated. When `kr new` starts a daemon that does
+not answer, the failure names the process and the daemon's log, and repeats the log's last line only
+when it is the daemon's own refusal of an environment another daemon holds.
+
+A pairing attempt's failure says its kind and a detail that is a `Shown`, so it carries nothing a
+host, a room or a store wrote and nothing an invitation carried. A room that could not be opened is
+said by its stage, its origin as an address, the status it answered with, and a reason when the
+reason is one this library gives; a failed link to a host is said by the host's own refusal, or by
+its kind.
+
+Two tests hold this. `crates/kr-client/tests/shown_rule.rs` reads both crates' sources as the
+compiler does, with each literal's escapes decoded, each type named by its full path through the
+file's imports, and only code that cannot compile without `test` left out. It names the file and
+line of anything that could put other text in a rendering: a hand-written `Display`, a `Plain`
+claim outside the two `shown.rs` files, an error field a rendering reaches that is none of the
+types above, a formatted panic, an `unwrap` or `expect` in either call form, an assertion that
+prints what it compares, a log line, standard error written outside the reporter, and source it
+cannot follow: a renamed import, a macro, a derive it does not know, an attribute under `cfg_attr`
+that it reads, a `#[path]` or an `include!`. The marker tests plant
+one marker where input goes (each text leaf, map key and other leaf of a stored file, malformed
+bytes, typed arguments, origins) and look for it in every rendering that comes back, as text, as
+decimal and hexadecimal bytes, and in base64; beside each, the same planting of another value is
+held to naming the fault's class and its place. A service's answer that cannot be read is said
+through `json` or `cbor`, whose renderings carry none of the answer by their types.
+
+Standard output, the `--json` answers other than a failure document and the account token's, and
+the derived `Debug` of a type that is not a failure are outside this rule.
 
 ## Drafts
 
@@ -97,10 +188,11 @@ client makes, and an association cannot outlive the connection that produced the
   comparing its revision and replacing it is one step against every other window and every other
   process. A second editor that lost the comparison is told so and overwrites nothing. Reading the
   note beside a draft takes the exclusive lock instead, because a note this build cannot read is
-  removed rather than returned. The contents are flushed before the rename on every platform; on
-  Unix the directory entry is flushed too: every level the store creates has its own name flushed
-  into the level above it, and a replacement or a removal flushes the directory it happened in. On
-  Windows this build flushes none and claims no durability for the names themselves.
+  removed rather than returned. The contents are flushed before the rename, and the directory entry
+  afterwards, on every platform: every level the store creates has its own name flushed into the
+  level above it, and a replacement or a removal flushes the directory it happened in. On Windows
+  the entry is flushed through a handle on the directory that may add a file to it, which is what
+  the operating system asks of a flush there.
 - `Associations::connection_lost` clears every association and touches no draft. A `Session` does
   not own the associations and does not clear them: whoever holds both calls it when a connection
   ends, which is the same caller that binds a draft to a new attachment on reconnect.
@@ -505,12 +597,11 @@ status and fence, sending nothing and moving no head, and only then forgets the 
 a join or a new collection waits for both, so nothing it sent can still run in the membership that
 follows. A change is reported done only at a head fetched after the change was recorded.
 
-The file is replaced whole: written to a temporary name, flushed, renamed over the old one, and on
-Unix the directory entry is flushed too. On Windows nothing flushes the directory entry, so after a
-power loss a Windows device can come back with the file as it stood before its last writes: a
-removal the owner recorded is gone and is shown no longer pending, and a candidate's dispatch mark
-is gone, so the device marks and sends the same record again under the same request identity,
-which the service answers from its receipt. A crash of the process alone loses nothing on either.
+The file is replaced whole: written to a temporary name, flushed, renamed over the old one, and the
+directory entry flushed too, so a write the reconciler has returned from survives a power loss. On
+Windows the entry is flushed through a handle on the directory that may add a file to it, which is
+what the operating system asks of a flush there. A crash of the process alone loses nothing on
+either platform.
 
 Two limits are stated rather than closed:
 
@@ -586,6 +677,94 @@ carrying the control's revision, which is what section 11 requires a host to rec
 against when the invocation reaches it. Rechecking is the host's, so a control this client shows
 that it should not have is a control the host then refuses.
 
+## Pairing
+
+`pairing` is the side of pairing that runs on the device being added, and on an owner device when it
+answers its hosts. kr-pairing holds the state machines and the proofs and no transport; this module
+runs the candidate's half over the transport a host serves. A front end builds one `Pairing` from
+its parts (the device's keys, its attempt budget and clock, how it opens a room, how it reaches a
+host, and its records of paired hosts) and calls `pair_by_code`, `pair_directly` or `resume`.
+Progress arrives on a `watch` channel as `AttemptState`, and an attempt that fails ends as a
+`PairingFailure`. The ending also says how the attempt was made and, for a code, which service it
+went through, so a front end names that service and asks for a direct invitation to be pasted again
+rather than for a code. Neither carries a secret, a key, a transcript, a challenge or a proof, so a
+front end can hand them to a screen as they are.
+
+A code goes through one room socket. The device sends the four locator characters, and nothing else,
+to the rendezvous service it is set to use, at `/api/pair/room/<locator>/candidate`, directly and
+over TLS checked against the platform's trust (see `services::http` below). A host opens its end of
+the room the same way, through the proxy its configuration selects when it selects one: the socket is
+then an HTTP `CONNECT` tunnel with the room's TLS inside it, so the proxy sees where the socket goes
+and nothing that travels on it. kr-pairing charges the attempt budget before that lookup, so a service
+that cannot be reached still costs a try. The exchange then moves to iroh, to the endpoint the
+host's authenticated bundle pinned, and `pair.finish` is sent only once the device has checked that
+the live peer is that endpoint. A direct invitation goes to `pair.redeem` under the same check, and
+no proof leaves the device for any other peer.
+
+Each host is reached through the relay and discovery services its own configuration names, with one
+dialling endpoint for each set of services. A key holds one endpoint on a relay at a time, so two
+configurations that share a relay are never open together, and binding one closes the other. An
+attempt holds its host's endpoint from its first dial to its end, and an owner's review holds its
+host's while it runs. Nothing else the device does closes a held endpoint, and a connection that
+would have to is refused until the hold ends.
+
+The verification value is computed here, from the transcript, and grouped `f3c1 46fd` by the
+function the host and the command line use. The device shows it only once the host's answer to
+`pair.finish` names the same value; an answer naming another ends the attempt as `host_mismatch`,
+and nothing is shown.
+
+`invitation` reads the one invitation text there is: unpadded base64url over the canonical KR-CBOR-1
+payload, the text a QR code carries. The older JSON forms are not invitations. A code payload that
+names a service other than the one the device is set to use says so, and a front end asks the person
+before it opens any connection there.
+
+Every wait has an end. A code attempt may recover an answer it lost until the invitation's five
+minutes and one more have passed; a direct one until the invitation's own expiry and one more
+minute. Each wait for the host inside that is bounded as well, so a host that stops answering ends
+the attempt instead of holding it open: as `timed_out` during the exchange, and as
+`approval_unknown` once the host may already have added the device, because then nothing the device
+can see says whether it did. A refusal is read from what the host sent, never from what the
+transport concluded about the connection. An attempt still waiting for its owner is kept in
+`paired`, and `resume` takes it up after a restart; a device the host committed while it was away
+finds its record and confirms that instead.
+
+While it waits for the owner, the device asks `pair.status` every three seconds. A host answers an
+unpaired connection four times in any ten seconds and sixteen times in all, and ends it a minute
+after it answered the connection's handshake. So the device counts its questions the way the host
+does, counts that minute from before its offer went, which is never later than the host, waits when
+the window is full, and asks nothing on a connection after its last call, ten seconds before the
+host ends it. From four questions before the end, by count or by time, it opens a fresh connection
+before each question, asks there, and changes to it once it has answered. A host that commits the
+device serves it nothing on a new unpaired connection, so the old connection is then the only place
+to learn what the device became. The device keeps its last question there while fresh connections
+fail, and asks it at the last call. A question that would leave the host's window no room at the
+call is kept for the call instead, so the window always has room for the last question when the call
+comes. The device waits at most ten seconds for an answer, so from ten seconds before the call it
+asks nothing there but the kept question. Every other step it takes before the call ends by then,
+its pause after an answer included, and the kept question does not wait for that pause: the device
+is free when the call comes. A look for a fresh connection takes time, so after one that fails the
+device plans its next step again from when the look ended. A device that is late for the call all
+the same, by more than a second, lets the connection go instead of asking a question the host may no
+longer be there to answer. Ten seconds before the attempt's own deadline every answer is final, and
+from then on the device asks the connection it holds at its usual pace and looks for no other. A
+commit made after the last question on the last connection opened before it, while no new connection
+opens, is one the device cannot learn of by itself, and the attempt ends as `approval_unknown`. A
+change of connection is not a lost connection, and the device does not show it as one. A host that
+turns a question away as too soon keeps the connection. It counts the questions it refuses as well,
+so the device waits twice as long after each refusal in a row, however long that grows, up to the
+attempt's own deadline and the connection's last call.
+
+`owner` is the owner device's half. It reads `owner.confirmation.pending` over the device's
+authorised session, checks each challenge against what it would authorise, and describes it in one
+line: what, on which host, and for how long. A challenge whose display does not match its digest is
+marked as one this device cannot check, and nothing is signed for it. The platform's ceremony is a
+trait the application implements; it is asked with that line and the challenge's remaining
+lifetime, and only a confirmation inside that lifetime is signed, on `owner_device_presence`, and
+completed. Only the host's own refusal makes a review "not confirmed". A host that says nothing for
+ten seconds, one that replies that it does not know what came of the answer, or a connection that
+ends after the answer went, may still have taken it: the device asks what the host lists, and the
+review is "confirmed" when the challenge is listed as answered and "unknown" otherwise.
+
 ## Managed services
 
 `services` holds one trait per managed service section 17 names (account login, relay leases, push,
@@ -604,6 +783,28 @@ publishes a signed revocation request and the host that owns the feed acknowledg
 three sign through `services::signed`, which is the one credential every method of the section 23
 `Services` group is proven by: the gateway origin, the method, a fresh nonce, the time and the
 digest of the canonical request body.
+
+A request for something an account owns, rather than the key that asks, carries a second
+authorisation beside that credential. `signed::AccountAuthorisation` names a token source and the
+scope the resource reads; the token the source holds at that moment is taken before the request is
+signed and travels as its `authorization` header, and the signature covers none of it. The same
+call says whether a request that went unanswered ever left this device: `Unanswered::NotSent` for
+everything refused before the transport is given the request (a body it cannot write, a token its
+source will not give, a credential it cannot make or that falls outside the service's clock window,
+a request larger than the method admits), and `Unanswered::Sent` for everything after, an answer it
+cannot read included. An authorisation made for one purpose asks for that purpose alone:
+`AuthorisationRequest::asking` asks the identity and refresh scopes and the resources its caller
+names, so a device restoring from a recovery kit asks for `backup.restore` and nothing else, while
+`AuthorisationRequest::new` is the application's own sign-in and asks for what it always has.
+
+A relay lease request whose answer went missing is `OUTCOME_UNKNOWN`: a success `services::relay`
+cannot read, and a 502 or 504 with no envelope of the service's, because the service may have
+issued and installed the lease before a gateway in front of it lost the answer. Nothing asks again
+by itself. A caller finds out before it asks for anything else, by sending the same request again,
+with the same signer, payer, pair, direction and cumulative ceiling: a pair that already holds a
+lease on a live reservation is answered with that lease and no more bytes held, a first request
+that issued nothing is answered with a new lease, and either can be refused. The caller then uses
+the lease it is given or ends it. A revocation whose answer went missing is asked again as it was.
 
 A mailbox is addressed by the identifier of the recipient's stored-envelope public key, and every
 paired peer of that recipient knows that key, because it is what they seal to. So possession of the
@@ -627,8 +828,26 @@ carries credentials or that uses plain HTTP anywhere but loopback. Certificate a
 verification stay on. Connect, read and total deadlines are finite and the total one covers reading
 the answer, so a call either has an answer or a failure. An answer is read under the bound its
 operation states, measured as the bytes arrive rather than from the length the sender claimed, and
-an answer past it is refused rather than truncated. It follows no redirect, keeps no cookie, asks
-for no compression and finds no proxy of its own.
+an answer past it is refused rather than truncated. It follows no redirect, keeps no cookie and asks
+for no compression. It goes through the proxy its caller names, or directly, and never through one
+the environment names: a host passes the `network.proxy_url` its configuration document selected
+when the daemon started, and a device, which has no such document, passes none. `client_builder`
+starts the other HTTP clients the product builds, such as the host's fetches from plugin
+repositories, on the same two rules, and leaves their deadlines to them.
+
+The certificates these clients trust are the platform's (`platform_tls`), and the room socket and the
+host's mail submission verify with the same configuration. On macOS, Windows, iOS and Android it is
+the operating system's own verifier, whose trust settings a person manages there. On Linux it is the
+distribution's certificate store, read from the places distributions keep it: the first bundle that
+exists among `/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem`
+and the others the platform verifier's own probe looks for, and every file in `/etc/ssl/certs`,
+`/etc/pki/tls/certs` and `/etc/security/certificates`. `SSL_CERT_FILE` and `SSL_CERT_DIR` are not
+read. While either is set, the platform verifier would trust only what it names, and an inherited
+variable would then decide who can answer for a service. So an authority given only through one of
+them is not trusted until it is installed in the system store, with `update-ca-certificates` or
+`update-ca-trust` for example, and `kr doctor` says the same. The network endpoint is not one of
+these clients: it verifies its relays and Pkarr servers against the public anchors and any relay
+trust anchors its configuration names (see the transport guide).
 
 The service sees one request at most for one dispatch, which is what keeps a request identity and
 its receipt simple. The transport never sends again a request that may have reached the service:
@@ -657,6 +876,18 @@ Nothing that travelled is written down. The transport emits no diagnostics of it
 held only in types that write their own `Debug`: what a rendering carries is the operation, the
 class and the length.
 
+`services::json` is the one reader of what a service answers. Every service client here reads an
+answer through it, and so does the host where it reads the gateway's answers itself. It refuses an
+answer in which any object names one member twice, at any depth and whatever the member, before
+anything reads a member of it, and it compares names as the strings they decode to, so `"a"` and
+`"\u0061"` are one name. Such an answer says two things at once: one reader would keep the first
+value and another the last, and neither is an answer the service gave. The envelope that
+`services::signed` reads is closed too: `ok` with `data`, or `ok` with `error`, and no other member
+beside them. A refused answer is treated as any answer its client cannot read. Where the status
+decides that, as it does for the signed calls and relay leases, a refused success is an unknown
+outcome that nothing retries by itself. The failure names the rule the answer broke and where,
+never what the answer held.
+
 `services::SyncBackupService` is the sync and backup trait: a compare-and-exchange over opaque
 bytes where every exchange names the request as well as the object. An exchange is answered with
 `Applied`, carrying the position the service put the write at, or with `Refused`, because a refusal
@@ -670,7 +901,10 @@ The service is what states that, from records only it holds, and the caller does
 its own. Every exchange is signed with the instant its caller states rather than one the
 implementation reads, because those are the instants the fence presents afterwards. `resolve` drops
 the copy the service kept of one refused write once the person has chosen, and answers a copy that
-is already gone the same way, so asking again is safe.
+is already gone the same way, so asking again is safe. `compare_exchange_dispatched` is the exchange
+for a caller that records a write before it sends it: it answers `SyncDispatch::NotSent` for a
+request refused before anything left, which can never run, and an implementation that cannot tell
+counts every failure as possibly sent.
 
 The trait states what an implementation owes. The order is the service's: every applied write takes
 the next place in its collection's order, from a counter the service keeps, because numbers assigned
@@ -708,6 +942,17 @@ shared collections that name this installation.
   sent. Where a shared collection's two refusals reach a caller as errors, `COLLECTION_ABSENT` is
   an unknown object and `KEY_EPOCH_RETIRED` a view to bring up to date. A fetch reads the object
   through a comparison for its kind, and a collection holding none is reported as such.
+- The owner's recovery bundle is the fourth kind, `recovery_bundle`, named by
+  `recovery::bundle_collection` for its kind and the kit's locator. Its four requests, an exchange,
+  a read, the status of a request identity and a fence, name the locator instead of a collection
+  and a home, because the service keeps one collection at each locator for the whole origin. Each
+  carries the account token `ManagedSyncService::presenting` names beside the signature:
+  `backup.write` for a device that writes the bundle, `backup.restore` for one restoring from the
+  kit. A client that presents no account sends none of them. The bundle travels as a
+  `SealedRecoveryBundle`, its stream and nothing else, of at most 128 KiB, which fits the request
+  every member shares. A longer one, a locator that is not a canonical identifier and a resolution
+  (a bundle keeps no copies) are refused before anything is sent, and a bundle named among a
+  collection's objects or copies is an answer about something else.
 - An answer may carry members this client does not read, because the service and this client are
   deployed on their own schedules; every member it does read is required and typed. A sealed object
   and a key record are the exceptions and stay closed schemas. One path carries every member, and a
@@ -864,7 +1109,10 @@ seed behind.
 ### The bundle
 
 `BundleStore` reads and writes the bundle through `services::SyncBackupService`, which is a
-compare-and-swap over opaque bytes at the locator. Three things follow.
+compare-and-swap over opaque bytes at the locator; `bundle_collection` names the collection for the
+bundle's kind and the locator, and a managed service is reached through `services::sync` with the
+account's token beside every request. A new kit's locator is drawn with `fresh_locator`, a random
+identifier in its one spelling. Three things follow.
 
 **A writer is declared recovery-enabled only after its bundle has landed.** `enable_writer` commits
 the updated bundle and then returns `WriterEnabled`, whose fields are private and which this crate
@@ -891,6 +1139,13 @@ read again and apply the change to what is actually there. The conflict names th
 kept of the refused write, where it kept one, because what a service holds is ciphertext this
 device sent and an owner is shown a retained artefact rather than told it does not exist.
 
+**The locator names one collection for the whole origin, owned by the account whose first write
+applied there.** A device holding only the kit reaches it with the locator and its account, and
+another account is answered as if nothing were there. The locator's secrecy covers its first claim
+only: once one service has seen it, a claim at a second service, or at one put back from an archive
+that held no bundle, can be taken by another account that writes there first. That denies the owner
+the bundle at that service. It cannot forge one, because only the seed derives the key.
+
 **The bundle is key material, and it settles itself by reading.** Section 20 says what it holds:
 collection locators, trusted backup-writer signing public keys and generation checkpoints. None of
 that is session content, so it is not one of the content-bearing outboxes privacy mode fences, and a
@@ -910,6 +1165,17 @@ its own request. When an answer does not come back, `commit` says exactly that -
 write made in the meantime would compare against a place the first one may be about to leave, and
 its refusal would be reported as another device's conflict when what it had met was this device's
 own write.
+
+The one exception is a write that never left this device. A bundle sealed past the 128 KiB a
+service keeps is refused before anything is recorded (`BundleTooLarge`). For the rest the service
+client says whether a refused request left (`SyncDispatch::NotSent`): one refused for want of an
+account token, for a signing instant outside the service's window or for a locator the service
+cannot address can never run, so `commit` puts back the record the call found, reports
+`BundleNotSent`, and the next write goes out. A migration whose destination write is refused that
+way leaves both locations and both stores as they were. A record the disk will not take back
+reads, after a restart, as a write outstanding, and `end_lost_write` ends it once the service can
+be asked: a fence, and a read after it where the fence cannot say the write never ran. Everything
+after the request left stays unknown, a fault with no envelope included.
 
 Two things end it. A read that finds the very bytes this device sent, which the record's digest
 establishes, settles the write as applied: it landed, and it cannot land twice, because a service
@@ -1025,9 +1291,13 @@ A restore obtains service access through the configured retrieval policy - a man
 service the owner runs - and then authenticates the bundle with the kit. They are two different
 things, and the cryptography is what makes them different: the ciphertext that access reaches opens
 only under the owner's own seed, so signing in gets a restore to the bytes and no further.
-`FreshRestore::open_bundle` also refuses before the policy has been satisfied, which orders the two
-steps; `ServiceAccess` is the caller's own statement that its policy was met, so that ordering is a
-guard against a caller skipping a step rather than a proof that the service authenticated anybody.
+`ServiceAccess` is what the policy gave the device: the reader it reaches one origin through. Under
+a managed account that is a `ManagedSyncService` presenting a token from an authorisation made for
+the restore alone (`backup.restore`, with the identity and refresh scopes); under a service the
+owner runs it presents the credential the owner's own deployment issued. `FreshRestore::open_bundle`
+reads only through it and refuses before the policy has given access, and the service decides what
+the reader reaches: a reader it does not admit reads nothing, so holding a `ServiceAccess` proves
+nothing by itself.
 
 Substituting the origin or the locator fails authentication. A kit will not even build a context
 for an origin it does not name, and a bundle written at one origin does not open under the key
@@ -1087,21 +1357,29 @@ not one of them, so an account password reset returns an account and nothing els
 | Row | What this library does for it |
 | --- | --- |
 | KR-REQ-04.23 | The local path is a socket and the remote path is iroh, behind one seam, so a caller chooses a host rather than a transport |
+| KR-REQ-04.19 | The JSON representation as this library reads it: every managed-service answer goes through `services::json`, which refuses one that names a member twice at any depth, two spellings of one name included (`a_text_that_names_a_member_twice_is_refused_at_any_depth`), and a walk of the service modules fails when one of them decodes answer text any other way (`nothing_but_this_reader_decodes_the_text_of_an_answer`, both in `crates/kr-client/src/services/json.rs`). Each client is held to it: `a_success_that_names_its_recovery_twice_is_not_one_this_client_reads`, `a_lease_answer_that_names_a_member_twice_is_an_unknown_outcome`, `a_session_answer_that_names_a_member_twice_is_not_a_call_this_client_reads`, `a_refusal_that_names_its_reason_twice_is_not_one_this_client_reads`, `a_token_answer_that_names_its_access_token_twice_is_refused` and `an_id_token_that_names_its_subject_twice_is_refused_and_hands_back_its_refresh_token`. The envelope `services::signed` reads carries nothing beside `ok` and its `data` or `error` (`an_envelope_that_carries_any_other_member_is_not_one_this_client_reads`) |
+| KR-REQ-10.23 | A code pairs through the product client and a room, with the budget on disk, and the committed device reads its own `pair.status` over its authorised connection (`a_device_pairs_by_code_through_the_product_client` in `crates/kr-controller/tests/pairing_client.rs`, and through a room behind TLS in `a_device_pairs_through_a_room_behind_tls`). A host's confirmation tag with one bit flipped ends the attempt ambiguous before anything is trusted (`a_host_tag_that_does_not_verify_ends_the_attempt_before_anything_is_trusted`) |
+| KR-REQ-10.27 | The candidate's room socket, its TLS verification and its frames (`crates/kr-client/tests/pairing_room.rs`), what each way a room can fail is called (`crates/kr-client/tests/pairing_failures.rs`), and `pair.finish` bound to the peer the connection authenticated (`the_finish_is_bound_to_the_endpoint_the_client_authenticated`) |
+| KR-REQ-10.36 | `a_device_pairs_directly_through_the_product_client`: a direct invitation redeemed over iroh and committed. In `a_direct_redemption_proves_nothing_to_the_wrong_host_and_shows_no_wrong_value`, a secret with one bit flipped is refused and locks nothing, and no proof goes to a host the invitation did not pin. `a_device_waits_inside_the_hosts_request_budget_for_an_owner_who_takes_their_time` waits nearly a minute for the owner inside the budget a host serves an unpaired connection by |
+| KR-REQ-10.37 | The value both devices show is computed on the device and shown grouped only when the host's answer agrees (`a_finish_answered_with_another_value_shows_no_value`, `a_direct_redemption_proves_nothing_to_the_wrong_host_and_shows_no_wrong_value`) |
+| KR-REQ-10.38 | One invitation format: what `pair.invite` issues reads back in this reader in both modes (`the_hosts_invitation_reads_back_in_the_companion_reader`), and `crates/kr-client/tests/pairing_invitation.rs` reads the payloads `fixtures/pairing/codes.json` publishes and refuses everything else |
 | KR-REQ-10.46 | `services::authority` carries the durable authority feed, and the seven legs in `tests/integration/sync/tests/authority.rs` hold a live deployment and this client's feed record to the retention, validation, revision, acknowledgement and staleness rules together |
-| KR-REQ-10.47 | `sync::StoredCollectionKeys` keeps a collection key in the operating system's credential store, or in the owner-only directory section 10 offers in its place. The `crates/kr-client/src/sync/keys.rs` tests check that directory on Unix, directory and files both, which is where those modes mean something; the credential store itself is `a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again`, which writes one item named for the run and takes it away again, and does nothing until a run sets `KR_TEST_PLATFORM_SECRET_STORE=1`, because on a person's own machine that store is their login keyring |
+| KR-REQ-10.47 | `sync::StoredCollectionKeys` keeps a collection key in the operating system's credential store, or in the owner-only directory section 10 offers in its place. The `crates/kr-client/src/sync/keys.rs` tests check that directory on Unix, directory and files both, which is where those modes mean something; the credential store itself is `a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again`, which writes one item named for the run and takes it away again. An ordinary run leaves it out as ignored, and a run that includes it with `--ignored` also sets `KR_TEST_PLATFORM_SECRET_STORE=1`, without which it fails before it writes, because on a person's own machine that store is their login keyring |
 | KR-REQ-11.46 | The controls a client offers, and what each one does to a session |
 | KR-PERF-006 | The client's own share of a reconnect: it holds no work of its own between a host's answer and a screen a terminal can draw. What the attach and the host spend is theirs |
 | KR-REQ-17.14 | A session, a draft and a control need no managed service, and none of them changes when one is configured |
 | KR-REQ-17.40 | The report of an exhausted relay: a new connection that a relay on its route turned this device away from fails as that refusal, with the relay's kind of refusal, its words and what may still work, while established and direct connections carry on (`an_exhausted_relay_is_the_reported_reason_a_new_connection_fails` in `crates/kr-controller/tests/network.rs`; each kind, the route and the direct paths in `crates/kr-transport/tests/relay_refusal.rs`) |
 | KR-REQ-23.57 | The retry rules: which classes of request may be retried automatically, and what a person is offered for the rest |
-| KR-REQ-24.13 | A draft outlives its attachment, its connection and another device's write, and is never replaced by remote content. A draft settled after its answer was lost is still never submitted, and neither is a draft whose collection was put back, which is kept beside the restored one (`a_draft_outlives_its_attachment_its_connection_and_another_devices_write` and `a_draft_whose_collection_was_put_back_is_kept_beside_and_never_submitted` in `crates/kr-client/tests/session.rs`) |
-| KR-REQ-20.13 | Per-object revisions and compare-and-swap writes, a lost comparison kept beside rather than resolved by a clock, the person's choice leaving no copy on the device or the service, the settlement of a write whose answer was lost through the request's own identity, for a draft as for a setting, the closed kind set that no restore can reach host authority through, and drafts that stay drafts. Across a restore: a note in one history meets its collection put back in another and follows it, while a service that went back within one history is still refused (`a_note_in_one_history_meets_its_collection_put_back_in_another_and_follows_it`, `a_service_that_went_back_in_its_own_history_is_still_refused`); a fetch from a collection put back keeps both versions and writes nothing away (`a_fetch_from_a_collection_put_back_keeps_both_versions_and_writes_nothing_away`); an answer from a history the collection was put back from moves nothing (`an_answer_from_a_history_the_collection_was_put_back_from_moves_nothing`), all in `crates/kr-client/tests/sync.rs`; and every answer's recovery identity is read and required (`every_answer_names_the_history_its_places_are_in` in `crates/kr-client/src/services/sync/tests.rs`). The legs in `tests/integration/sync/tests/sync.rs` hold a live deployment to the same rules through `services::sync`, with two client stores under one installation, and hold a deployment never put back to naming no history |
+| KR-REQ-26.14 | No inherited variable chooses what this library's clients trust or which proxy they go through. The service client and the room socket refuse a server that only a store named by `SSL_CERT_FILE`, `SSL_CERT_DIR` or both vouches for, as they do with neither set (`no_certificate_variable_chooses_what_a_client_trusts` in `crates/kr-client/tests/trust_store.rs`); a client from `client_builder` reaches its server directly while the proxy variables name another (`no_proxy_variable_moves_a_client_this_product_builds`), and the service client goes through the proxy its caller names and not around it (`crates/kr-client/tests/proxy_selection.rs`); a host's room socket opens through its proxy as a tunnel, and a proxy that refuses or cannot be reached ends the attempt (`crates/kr-client/tests/pairing_room.rs`) |
+| KR-REQ-24.13 | A draft outlives its attachment, its connection and another device's write, and is never replaced by remote content. A draft settled after its answer was lost is still never submitted, and neither is a draft whose collection was put back, which is kept beside the restored one (`a_draft_outlives_its_attachment_its_connection_and_another_devices_write` and `a_draft_whose_collection_was_put_back_is_kept_beside_and_never_submitted` in `crates/kr-client/tests/session.rs`). A draft publication whose collection was put back from an archive that held no draft is never attempted again under its identity (`a_draft_whose_collection_was_put_back_empty_is_never_attempted_again_under_its_identity`), while a collection that holds nothing in the history this device reads moves nothing (`an_empty_collection_in_the_history_this_device_reads_moves_nothing`), both in `crates/kr-client/tests/sync.rs` |
+| KR-REQ-20.13 | Per-object revisions and compare-and-swap writes, a lost comparison kept beside rather than resolved by a clock, the person's choice leaving no copy on the device or the service, the settlement of a write whose answer was lost through the request's own identity, for a draft as for a setting, the closed kind set that no restore can reach host authority through, and drafts that stay drafts. Across a restore: a note in one history meets its collection put back in another and follows it, while a service that went back within one history is still refused (`a_note_in_one_history_meets_its_collection_put_back_in_another_and_follows_it`, `a_service_that_went_back_in_its_own_history_is_still_refused`); a fetch from a collection put back keeps both versions and writes nothing away (`a_fetch_from_a_collection_put_back_keeps_both_versions_and_writes_nothing_away`); an answer from a history the collection was put back from moves nothing (`an_answer_from_a_history_the_collection_was_put_back_from_moves_nothing`), all in `crates/kr-client/tests/sync.rs`; and every answer's recovery identity is read and required, once (`every_answer_names_the_history_its_places_are_in` and `a_success_that_names_its_recovery_twice_is_not_one_this_client_reads` in `crates/kr-client/src/services/sync/tests.rs`). A fetch that finds its collection put back empty follows it into the history the restore began and frees the next publication (`a_fetch_that_finds_its_collection_put_back_empty_follows_it_and_frees_the_next_publication`), and an empty collection moves nothing in a history already put back from or for a fetch made before the device moved on, and takes a note left in the history it replaced (`an_empty_collection_in_a_history_already_put_back_from_moves_nothing`, `an_empty_collection_answering_a_fetch_made_before_the_device_moved_on_moves_nothing` and `an_empty_collection_in_the_history_this_device_reads_takes_a_note_left_in_the_one_it_replaced`), all in `crates/kr-client/tests/sync.rs`; a locator put back without its bundle is refused as a bundle put back (`a_locator_put_back_without_its_bundle_is_refused_as_a_bundle_put_back` in `crates/kr-client/tests/recovery.rs`). The legs in `tests/integration/sync/tests/sync.rs` hold a live deployment to the same rules through `services::sync`, with two client stores under one installation, and hold a deployment never put back to naming no history, a fetch of an object never published included (`kr_req_20_13_a_fetch_of_an_object_never_published_answers_its_absence_under_no_history`) |
 | §24 privacy | The fence, the cancellation, the removal, the pinned-label rule, a publication in flight when privacy mode is enabled, a draft's as well as a setting's, work whose caller walked away staying outstanding, and the settlement of a dispatch whose answer was lost: applied, refused, and a request the service holds no receipt for, which stays counted under the generation in force and is ended at the service once privacy mode has moved past it, keeping the account of what left wherever the service cannot establish that nothing ran. Across a restore, a request attempted before its collection was put back is ended at once with its account kept (`a_request_attempted_before_its_collection_was_put_back_is_ended_at_once_and_keeps_its_account`), and a refusal before the service's cutoff ends the attempt with its account kept and holds the barrier while an attempt signed later could still run (`a_refusal_before_the_cutoff_holds_the_barrier_while_an_attempt_signed_later_is_on_its_way`). A client fenced by privacy mode sends a live deployment nothing (`kr_req_24_28_a_client_fenced_by_privacy_mode_publishes_nothing_and_keeps_its_pinned_labels`). Turning the generation on is the host's, and this client is one subsystem of it |
+| KR-REQ-24.28 | The settings-sync client's part. An empty collection whose answer arrives after privacy mode fenced the generation it was asked under writes nothing, not even the history it names: a setting's fetch and a draft's are told the result is late, and a publication whose refusal was settled before the fence is told its result was discarded (`an_empty_collection_read_after_privacy_mode_moved_on_writes_nothing` in `crates/kr-client/tests/sync.rs`). A draft publication in a collection put back empty is ended with its account kept (`a_draft_whose_collection_was_put_back_empty_is_never_attempted_again_under_its_identity`), and a client fenced by privacy mode sends a live deployment nothing (`kr_req_24_28_a_client_fenced_by_privacy_mode_publishes_nothing_and_keeps_its_pinned_labels`). The rest of the row, the work in flight and what privacy mode reports, is the host's and its workers' |
 | KR-REQ-18.05 | The encrypted settings sync part only: the service holds ciphertext in a declared size bucket and never a setting, against a live deployment as well as the suite's own service (`kr_req_18_05_a_setting_is_stored_sealed_in_a_declared_bucket`), and the feature names its three parts and which of them are optional. A device receives a collection key only through its own wrap in a record it accepted, and only after its hosts committed its pairing and the owner confirmed the addition and the join (`a_production_device_receives_its_key_through_its_own_wrap_and_keeps_it_in_its_store`, `nothing_is_sealed_to_a_device_its_host_has_not_committed` in `crates/kr-client/tests/membership.rs`, against the suite's own service and hosts). Across a restore, a device follows a collection put back only from the head it holds and is otherwise out until the owner confirms a join (`a_collection_put_back_without_the_head_this_device_holds_leaves_it_out_until_a_join`, with its control `an_older_revision_in_the_same_history_leaves_the_head_standing`, in the same file). Nothing here performs a history backup or produces recovery material |
 | KR-REQ-20.11 | The sync-collection half: removing a device gives the members that stay a fresh key at the next epoch that the removed device has no wrap of, and publication stays fenced until that record is installed (`removing_a_device_gives_the_rest_a_key_it_cannot_open`, `every_new_epoch_has_a_freshly_drawn_key`, `publication_stays_fenced_from_a_recorded_removal_until_its_record_is_installed` in `crates/kr-client/tests/membership.rs`, and the reconciler's exhaustive test in `crates/kr-client/src/sync/membership/exhaustive.rs`) |
 | KR-REQ-20.14 | `a_kit_round_trips_through_its_printable_and_scanned_forms`, `the_printed_kit_is_the_document_the_fixture_publishes`, `a_mistyped_kit_fails_on_its_checksum_before_anything_is_derived`, `a_kit_read_by_hand_forgives_the_letters_the_alphabet_leaves_out` and `a_kit_value_whose_spacing_would_change_when_read_is_refused` in `crates/kr-client/tests/recovery.rs`, with `fixtures/crypto/kdf.json` and `fixtures/crypto/recovery-kit.json` |
-| KR-REQ-20.15 | `a_writer_is_declared_recovery_enabled_only_after_its_bundle_has_landed`, `a_writer_whose_bundle_did_not_commit_is_not_declared`, `rotating_a_writers_key_replaces_it_in_one_commit` and `a_verified_generation_never_moves_backwards` in `crates/kr-client/tests/recovery.rs`. They establish the ordering and what the bundle holds; nothing here declares a writer to a *service*, because that declaration belongs to the collection's enrolment record |
-| KR-REQ-20.16 | `a_restore_with_only_the_kit_reaches_the_archive_and_trusts_only_the_bundles_writers` in `crates/kr-client/tests/recovery.rs`, which drops every producer value before the restore and takes the producer key out of the authenticated bundle |
+| KR-REQ-20.15 | `a_writer_is_declared_recovery_enabled_only_after_its_bundle_has_landed`, `a_writer_whose_bundle_did_not_commit_is_not_declared`, `rotating_a_writers_key_replaces_it_in_one_commit` and `a_verified_generation_never_moves_backwards` in `crates/kr-client/tests/recovery.rs`. They establish the ordering and what the bundle holds; nothing here declares a writer to a *service*, because that declaration belongs to the collection's enrolment record. Through the managed client, against a service kept to the managed service's contract, a writer is declared only once its bundle has landed at the locator (`a_bundle_is_written_and_read_at_its_locator_with_the_account_token_beside_every_request` in `crates/kr-client/src/services/sync/tests/bundle.rs`) |
+| KR-REQ-20.16 | `a_restore_with_only_the_kit_reaches_the_archive_and_trusts_only_the_bundles_writers` in `crates/kr-client/tests/recovery.rs`, which drops every producer value before the restore and takes the producer key out of the authenticated bundle; through the managed client, a bundle served under another locator or read as another origin's, or under another seed's kit, trusts no writer (`a_bundle_served_under_another_locator_or_origin_fails_authentication` in `crates/kr-client/src/services/sync/tests/bundle.rs`) |
 | KR-REQ-20.17 | The table's answers: `the_material_table_refuses_a_reusable_key_and_a_revoked_grant` and `the_admitted_set_is_data_and_configuration_and_the_limits_still_require_owner_pairing` in `crates/kr-client/tests/recovery.rs`. The settings part, through the export and import paths that ask the table: `a_collection_key_is_neither_backed_up_nor_restored`, `a_restore_returns_settings_without_a_key_a_membership_or_a_sync_checkpoint` and `a_restored_device_joins_only_after_a_fresh_authorisation` in `crates/kr-client/tests/membership.rs`, which carry the settings through an archive only the recovery recipient opens. Producing and uploading the device's archive is the backup producer's; this library supplies what goes into it and takes back what comes out |
-| KR-REQ-20.18 | `a_migration_produces_an_updated_kit_and_a_verified_record` and `one_kit_serves_several_services` in `crates/kr-client/tests/recovery.rs`. The offline-export half is `the_encrypted_bundle_and_selected_archives_export_offline` in the same file, over the library's own `OfflineExport`: the encrypted bundle and the selected archives' ciphertext in one canonical document, which restores without a service |
-| KR-REQ-20.19 | `service_access_alone_does_not_decrypt_the_bundle` and `substituting_the_origin_or_the_locator_fails_authentication` in `crates/kr-client/tests/recovery.rs` |
+| KR-REQ-20.18 | `a_migration_produces_an_updated_kit_and_a_verified_record` and `one_kit_serves_several_services` in `crates/kr-client/tests/recovery.rs`. The offline-export half is `the_encrypted_bundle_and_selected_archives_export_offline` in the same file, over the library's own `OfflineExport`: the encrypted bundle and the selected archives' ciphertext in one canonical document, which restores without a service. The bundle's path to a managed service: its locator and the claim a first write makes, the race between two writers and a lost write ended under a new token (`two_writers_of_one_account_race_and_one_is_told_the_bundle_moved_on`, `competing_first_claims_leave_one_owner_and_every_other_account_meets_an_absent_bundle`, `a_first_write_that_did_not_apply_claims_nothing`, `a_fence_made_before_the_claim_survives_it`, `a_lost_write_is_ended_under_a_new_token_and_after_a_restart`), and a write that never left (`a_write_refused_before_it_was_sent_leaves_the_store_as_it_was_and_the_next_write_goes_out`, `a_migration_refused_before_it_was_sent_leaves_both_locations_as_they_were`, `a_bundle_over_its_bound_is_refused_before_anything_is_recorded_or_sent`), all in `crates/kr-client/src/services/sync/tests/bundle.rs`, with `a_write_refused_before_it_was_sent_is_reported_so_and_leaves_the_store_as_it_was` and `a_record_the_disk_would_not_take_back_leaves_an_unsent_write_a_restart_ends` in `crates/kr-client/tests/recovery.rs` |
+| KR-REQ-20.19 | `service_access_alone_does_not_decrypt_the_bundle` and `substituting_the_origin_or_the_locator_fails_authentication` in `crates/kr-client/tests/recovery.rs`. Through the managed client: a device with only the kit reads the bundle through the access its policy gave it and reaches nothing without it (`a_device_with_only_the_kit_reads_the_bundle_through_the_access_its_policy_gives_it`), and a service put back without the bundle is refused as a bundle put back (`a_service_put_back_without_the_bundle_is_refused_as_a_bundle_put_back`), in `crates/kr-client/src/services/sync/tests/bundle.rs`; the restore's own authorisation holds a token for `backup.restore` and for no other resource (`a_restore_authorisation_holds_a_token_for_its_scope_and_for_no_other` in `crates/kr-client/src/services/account.rs`) |

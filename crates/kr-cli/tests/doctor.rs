@@ -213,6 +213,30 @@ fn every_path_under(root: &std::path::Path) -> Vec<(std::path::PathBuf, Option<V
     found
 }
 
+/// Puts a program whose text is `text` at `destination`, runnable, without this process ever
+/// holding it open for writing.
+///
+/// This binary's tests run on threads of one process, and a child another test starts is handed a
+/// copy of every descriptor open at that moment, a descriptor this process is writing a program
+/// through included. The child holds its copy until it starts its own program, and until then
+/// Linux refuses to start the program that is still open for writing. The programs placed here are
+/// started by a shell and by `kr`, not by this process, so no retry of this process's own could
+/// cover them. So the text goes to a file nothing starts, and a separate process copies it into
+/// place: no descriptor of this process is ever open on the program for writing, and no child can
+/// inherit one.
+#[cfg(unix)]
+fn place_script(destination: &std::path::Path, text: &str) {
+    let mut name = destination
+        .file_name()
+        .expect("a program has a name")
+        .to_owned();
+    name.push(".text");
+    let text_file = destination.with_file_name(name);
+    std::fs::write(&text_file, text).expect("the program's text is written");
+    kr_ipc::testing::place_program(&text_file, destination);
+    std::fs::remove_file(&text_file).expect("the program's text goes once it is in place");
+}
+
 /// KR-REQ-07.04: `kr new --attach` registers the creating terminal and its size before a shell
 /// exists, and a create whose terminal cannot take part in that exchange goes no further. Run with
 /// no terminal at all, the command fails with the terminal failure's own code and exit status
@@ -294,16 +318,10 @@ fn creating_with_no_host_says_what_to_set_up_and_installs_nothing() {
         "pkexec",
         "runuser",
     ] {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let path = tools.join(tool);
-        std::fs::write(
-            &path,
-            format!("#!/bin/sh\necho \"{tool} $*\" >> '{}'\n", calls.display()),
-        )
-        .expect("writes a recording tool");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .expect("makes it runnable");
+        place_script(
+            &tools.join(tool),
+            &format!("#!/bin/sh\necho \"{tool} $*\" >> '{}'\n", calls.display()),
+        );
     }
     let path = format!("{}:/usr/bin:/bin", tools.display());
     // The recording tools record: one run through the same `PATH` is found, and then forgotten.

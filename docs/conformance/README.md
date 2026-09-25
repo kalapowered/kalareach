@@ -49,7 +49,7 @@ could be read.
 
 | Group | Linux | macOS | Windows |
 | --- | --- | --- | --- |
-| `rust` | `cargo test --locked --workspace --no-fail-fast` | The same, leaving out by name the cases the landing workflow's macOS job leaves out (podman, a second filesystem, the platform credential store, a built shell package), each with its reason, and the two timed cases in a step of their own | The suites qualified on Windows, one command each, as the landing workflow's Windows job runs them. The case that writes the credential store runs where `KR_TEST_PLATFORM_SECRET_STORE=1` is set, as the conformance workflow's runner sets it |
+| `rust` | `cargo test --locked --workspace --no-fail-fast` | The same, leaving out by name the cases the landing workflow's macOS job leaves out (podman, a second filesystem), each with its reason, and the two timed cases in a step of their own | The suites qualified on Windows, one command each, as the landing workflow's Windows job runs them, after building the control daemon and the worker they start; the host tests run once, under Cargo. The case that writes the credential store runs with `--ignored` and needs `KR_TEST_PLATFORM_SECRET_STORE=1`, which the conformance workflow's runner sets; a run without it fails that step, naming the variable |
 | `end-to-end` | The suites `scripts/end-to-end.sh` runs, one test at a time, the network suite with its ignored tests | As on Linux | Not run: these drive Unix pseudo-terminals |
 | `performance` | The measurements `scripts/performance.sh` takes, and the release-build terminal and transport measurements | As on Linux | Not run: these drive Unix pseudo-terminals |
 | `typescript` | Each package's `test` script with vitest's JSON report, and the report's own TypeScript reading test | As on Linux | Not run |
@@ -115,15 +115,148 @@ row that does not exist.
 | A test function whose name spells an identifier in snake case: `kr_req_11_07_...`, `kr_acc_004_...` | That test. A name that spells no accepted form is only a name |
 | A module comment (`//!`) of test code | Every test in that module and the modules inside it |
 | In test code, a comment block with a blank line after it | Every test from there to the next such block, or the end of the module |
-| In test code, a comment on a function | Every test of the same target whose body calls that function, where the report proves from the target's own source that the compiler resolves the call to it: through module definitions, `crate`, `self` and `super`, a `use` that keeps the item's own name, and globs, each judged by who may name what it brings in. A renaming `use`, a name or glob the calling body brings in for itself, a first name the calling body may bind for itself (a local or a nested item), a macro or attribute in or on the test, on a module around it or on the function whose expansion may rewrite them (any but the standard library's and `tokio::test`, and those only while the target neither defines nor imports their names nor brings in names through `#[macro_use]`, `extern crate`, a macro among its items or a glob from outside the crate), a module whose macros make items, a glob it cannot follow and a visibility it cannot work out all stop it, and a call it cannot prove keys nothing, so the function's identifiers stay references rather than become a key the compiler would not make |
+| In test code, a comment on a function | Every test of the same target whose body calls that function, inside the boundary below and where the report proves from the target's own source that the compiler resolves the call to it |
 | A `covers` field of a `const` or `static` case table | Every test of the same package whose body names the table |
 
 Test code is a test or bench target, or a module compiled under `cfg(test)`. A comment on product
 code (a module's documentation, a function, a constant) is a reference: it is listed with the
 identifier and it is never a test.
 
+A test is keyed by its name, so a target defines each test name once. Two definitions of one name,
+each under its own `cfg`, are a problem that names both: a build has at most one of them, and the
+report does not work out `cfg`, so it cannot say which one ran. The report stops before it runs
+anything.
+
+#### Helper keys and their boundary
+
+A function of test code whose comment names identifiers is a helper: the tests that call it are
+keyed to them. The report reads those calls from the source, not from the compiler, so it keys a
+helper only inside a boundary that it checks. A target outside the boundary stops the report; it
+never earns a key.
+
+These conventions hold in every file of a target that has a helper, which is every file the target
+compiles:
+
+- A helper's name is written only as a function's name among a module's items, as a call
+  (`helper(...)` or `path::helper(...)`, with or without a turbofish), or as the last name of a
+  plain `use` among a module's items that the report follows to a function of that name. Anywhere
+  else is a problem: a binding or a parameter, a field, a method or a value, a rename with `as` to
+  or from the name, a type, trait, module, constant, static, macro or enum variant of that name, a
+  function of that name inside a function, a block, an implementation, a trait or a macro, a path
+  through the name (`helper::...`), a `use` of it anywhere but among a module's items or one the
+  report does not follow (`use ::name::helper` names another crate), or the name after `dyn`,
+  `impl` or `?`.
+- No helper is named like a keyword or like one of the traits a type writes like a call (`Fn`,
+  `FnMut`, `FnOnce`, `AsyncFn`, `AsyncFnMut`, `AsyncFnOnce`).
+- The names the report trusts keep their meaning: `std`, `core` and `alloc`; `serde`, `tokio`,
+  `rustfmt` and `clippy`; the standard library's macros the report reads through (`assert`,
+  `assert_eq`, `assert_ne`, `dbg`, `debug_assert`, `debug_assert_eq`, `debug_assert_ne`, `eprint`,
+  `eprintln`, `format`, `format_args`, `matches`, `panic`, `print`, `println`, `todo`,
+  `unimplemented`, `unreachable`, `vec`, `write`, `writeln`) or passes over (`cfg`, `column`,
+  `compile_error`, `concat`, `env`, `file`, `include_bytes`, `include_str`, `line`, `module_path`,
+  `option_env`, `stringify`); the attributes `test` and `derive`; the standard library's derives
+  (`Clone`, `Copy`, `Debug`, `Default`, `Eq`, `Hash`, `Ord`, `PartialEq`, `PartialOrd`) and serde's
+  (`Serialize`, `Deserialize`). No file declares one of them: no `mod`, `macro_rules!` or `macro`
+  of that name, no `as` that gives the name to something else, and no `use` that brings in
+  anything else by it. A `use` of the standard library's own item (`use std::fmt::Debug`), of
+  serde's derive from `serde`, or of one of the crates by itself (`use tokio;`) is fine. No item,
+  `use`, `extern crate ... as` or generic parameter declares a crate root (`std`, `core`, `alloc`,
+  `serde`, `tokio`, `rustfmt`, `clippy`): a path starting at that name would find it instead. A
+  value, a field or a later name of a path declares nothing such a path could start at. The
+  package names no dependency `std`, `core` or `alloc`.
+- Everything outside comments, literals and lifetimes is ASCII, identifiers included: the compiler
+  compares identifiers once it has normalised them, and the report compares them as written.
+- The report reads every file the target compiles, as the compiler does: no module file is
+  declared anywhere but among a module's items (inside a function, say, where the report does not
+  follow it), no module's files are chosen by a `cfg_attr`, no module's own file carries a `path`
+  attribute (or a `cfg_attr` that may set one) among its inner attributes, which moves where the
+  compiler looks for its modules, every `path` attribute's value is a string of printable ASCII
+  written without an escape, no file's first line starts `#!` without `[` right after it (the
+  compiler reads such a line as a shebang or as an attribute by rules on whitespace and comments),
+  and every declared module has its file.
+- The target is of the 2018 edition or later.
+
+The report checks the names on tokens, with no regard to what the compiler would make of them, so
+it errs towards a problem: text inside `stringify!` counts, as does a macro's definition; only a
+plain `use` of a helper's name is followed further, through the report's reading of the modules.
+Each problem names the file and the line. A target with one keys no test through a helper, and the
+report stops before it runs anything.
+
+A macro's body is read like any other code, but where a macro's definition or arguments hold a
+metavariable or a repetition (`$name`, `$( ... )*`), its tokens do not show the code it writes: a
+metavariable stands for whatever the macro is handed, a keyword or a `.` included, and a repetition
+for any number of copies of what it holds, none included. So inside such a macro, on top of the
+conventions above, a keyed helper's name is a problem however it is written, and a name the report
+trusts is one unless it names a metavariable (`$core`) or is written where the macro cannot make a
+declaration of it: invoked (`assert!`), before `::` and a name other than `self`, `super`, `crate`
+or `Self` (`std::mem`, but not `core::self`, which brings `core` in inside a use tree's braces),
+after a `.`, or inside an attribute (`#[derive(Debug)]`). What another macro makes of the tokens it
+is handed falls under the rules on where that macro is invoked, below.
+
+A repetition that opens or ends inside an item's header is a problem, because the report could not
+tell where the item's name, generic parameters or body are. A header runs from a keyword written in
+the tokens (`fn`, but for a function's type `fn(...)`; `struct`; `enum`; `union`; `trait`; `type`;
+`impl`, in a type as well as an item; or `mod`) to its body, its `;` or the end of the group it
+stands in, and the groups it holds, a macro's braces (`ty!{}`) among them, are no part of it. A
+repetition that holds whole items (`$( #[test] fn $name() { ... } )*`) splits no header.
+
+What a macro makes, the macros it invokes included, counts as made where it is invoked, and a name
+the macro is handed there (`make!(core)`) is only an argument, which cannot earn a key: a macro
+invoked among a module's items declines every helper key of its target; one invoked in a test's
+body declines that test's calls, unless it is one of the standard library's macros above, named by
+its bare name (a call inside `assert!(...)` is read as the test's own); what a macro invoked in a
+function, an implementation or a trait makes stays inside it; a macro invoked in a foreign block
+(`extern "C" { ... }`), whose items are its module's own, is a problem; and the compiler reports a
+standard macro's name as ambiguous wherever a macro that another macro makes and exports would
+take it.
+
+The report does not model build scripts, `include!`, procedural macros other than the trusted
+derives and `tokio::test`, the expansion of any macro, or `cfg`. None of them earns a key: the
+conventions cover what could let one through unseen, and the rules below decline the rest.
+
+Inside the boundary, a call keys a helper only where the report proves, from the target's own
+source, that the compiler resolves it to that helper in every build. It follows module definitions,
+`crate`, `self` and `super`, a `use` that keeps the item's own name, and globs, each judged by who
+may name what it brings in. Where it cannot prove the call, the call keys nothing, and the helper's
+identifiers stay references that the result lists with the reason. That happens when:
+
+- the calling body may bind the call's first name itself: a local of any kind, a closure's
+  parameter, a nested item, a module the body declares, or a `use` or glob in the body;
+- a macro or attribute in or on the test may rewrite or re-scope the call: a macro in the body other
+  than the standard library's above by their bare names, a `cfg` in the body, which may compile the
+  call out, and an attribute on the test or in its body other than the built-in ones the report
+  knows (`allow`, `cfg`, `cold`, `deny`, `deprecated`, `doc`, `expect`, `forbid`, `ignore`,
+  `inline`, `macro_export`, `macro_use`, `must_use`, `non_exhaustive`, `path`, `recursion_limit`,
+  `repr`, `should_panic`, `track_caller`, `warn`), `#[test]`, a derive of the trusted ones with
+  serde's helper attribute, a `rustfmt` or `clippy` tool attribute and `#[tokio::test]`.
+  `tokio::test` is trusted only where the package takes `tokio` from crates.io under that name, as
+  its lockfile resolves it, and the tool attributes only where no dependency takes the tool's name.
+  Any other attribute, built into the compiler or not (`#![no_std]`, say), counts as one that may
+  rewrite what it is on;
+- an attribute on the helper, on its module or on a module around it or around the test is other
+  than one of those built-in ones: there, a tool's attribute counts as one that may rewrite what it
+  is on too;
+- the target brings in names its source does not list: an item under `#[macro_use]`, an
+  `extern crate`, a macro invoked among a module's items (`include!` among them), an item under an
+  attribute other than the trusted ones, or a glob from outside the crate and the standard library
+  (a glob from the root of the paths, `use ::name::*`, included);
+- the helper is under a `cfg` of its own or of a module around it, other than exactly `cfg(test)`
+  and the crate root's own `cfg`, or its module takes its name twice, or its module is declared
+  twice;
+- a module on the way takes a name the path follows twice or under a `cfg`, or takes the called
+  name for something other than a function or a named `use`;
+- the call goes through a renaming `use`, a glob the report cannot follow or a visibility it cannot
+  work out, starts at the root (`::name`), or comes after a qualifier (`<T>::name`).
+
 The report reads each target's crate root as Cargo describes it and follows every `mod`
-declaration, `#[path]` included, so a test is named exactly as the test harness names it.
+declaration among a module's items as the compiler does, so a test is named exactly as the test
+harness names it. A `path` attribute is read from the directory of the file it is in at the file's
+top level, and from the inline module's directory inside one; on an inline module, written before
+it or at the start of its body, it names the directory of the modules inside; and the file it names
+keeps its own modules beside it, as a `mod.rs` does. A module whose file is not there, whose files a
+`cfg_attr` may choose, whose `path` attribute's value is anything but printable ASCII written
+without an escape (a line break the compiler would normalise included), or whose own file carries a
+`path` attribute among its inner attributes is a warning, and in a target with a helper a problem.
 
 ### Case tables kept as data
 

@@ -1797,10 +1797,11 @@ async fn a_copy_that_arrives_out_of_order_is_kept_rather_than_pruning_itself() {
 #[test]
 fn host_grants_and_revocation_state_are_not_things_a_restore_can_reach() {
     // Section 20 gives host grants and revocation state one host authority, and the closed kind set
-    // is how it says so: there is no kind for them, so a synchronised object cannot be one.
+    // is how it says so: there is no kind for them, so a synchronised object cannot be one. The
+    // recovery bundle is key material a restore reads, and grants nothing.
     assert_eq!(
         SyncObjectKind::ALL.map(SyncObjectKind::as_str),
-        ["settings", "draft", "client_selection"]
+        ["settings", "draft", "client_selection", "recovery_bundle"]
     );
 
     // A settings value is text, a number or a switch. Nothing in that shape carries a key, a

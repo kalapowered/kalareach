@@ -38,8 +38,8 @@ use kr_protocol::error::{ErrorCode, RetryCategory};
 use kr_protocol::ids::{QuestionId, QuestionRevision, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::question::{
-    Question, QuestionAnswer, QuestionAnswerParams, QuestionReadParams, QuestionReadResult,
-    QuestionResolveResult, QuestionState, check_answer,
+    MAX_ANSWER_BYTES, Question, QuestionAnswer, QuestionAnswerParams, QuestionReadParams,
+    QuestionReadResult, QuestionResolveResult, QuestionState, check_answer,
 };
 use kr_protocol::scalars::{DurationMs, Nullable, TimestampMs};
 use kr_protocol::session::{SessionReadParams, SessionReadResult, SessionState};
@@ -47,6 +47,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ClientError;
 use crate::session::Session;
+use crate::shown::{IoFault, Said, Shown};
 
 /// The extension every kept answer carries.
 const EXTENSION: &str = "answer";
@@ -55,7 +56,7 @@ const EXTENSION: &str = "answer";
 const ANSWER_TTL: DurationMs = DurationMs::new(120_000);
 
 /// One answer a person gave that the host has not taken.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AnswerDraft {
     /// Where the answer goes: the environment, the session and its epoch.
@@ -70,6 +71,20 @@ pub struct AnswerDraft {
     pub answer: QuestionAnswer,
     /// When they answered, on this device's clock.
     pub drafted_at_ms: TimestampMs,
+}
+
+impl std::fmt::Debug for AnswerDraft {
+    /// Which question the answer is for and what kind of answer it is, never what it says.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AnswerDraft")
+            .field("session_id", &self.session_id)
+            .field("question_id", &self.question_id)
+            .field("question_revision", &self.question_revision)
+            .field("answer", &self.answer.kind())
+            .field("drafted_at_ms", &self.drafted_at_ms)
+            .finish_non_exhaustive()
+    }
 }
 
 impl AnswerDraft {
@@ -122,6 +137,20 @@ pub enum Retired {
     Gone,
 }
 
+impl Said for Retired {
+    fn said(&self) -> Shown {
+        match self {
+            Self::Ended(state) => crate::shown!("the question was {}", *state),
+            Self::Moved { revision } => {
+                crate::shown!("the question moved to revision {}", *revision)
+            }
+            Self::Gone => Shown::said("its session is gone"),
+        }
+    }
+}
+
+crate::display_as_said!(Retired);
+
 /// What a reconnect made of one kept answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reconciled {
@@ -143,7 +172,7 @@ pub enum Reconciled {
 }
 
 /// What became of one answer a person gave.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Answered {
     /// The host took it. This is the question as it now stands.
     Sent(Box<Question>),
@@ -151,14 +180,37 @@ pub enum Answered {
     Kept(AnswerDraft),
 }
 
+impl std::fmt::Debug for Answered {
+    /// Which question it was and where it stands, never its text.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sent(question) => formatter
+                .debug_struct("Sent")
+                .field("question_id", &question.question_id)
+                .field("revision", &question.revision)
+                .field("state", &question.state)
+                .finish_non_exhaustive(),
+            Self::Kept(draft) => formatter.debug_tuple("Kept").field(draft).finish(),
+        }
+    }
+}
+
+/// A kept answer's file as a failure may name it: whole when this store wrote its name.
+fn stored(path: &std::path::Path) -> Shown {
+    Shown::stored(path, &[], &[EXTENSION, "partial"])
+}
+
 /// A failure of this module.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum AnswerError {
     /// The answer does not fit the question's form.
+    ///
+    /// It says which rule the answer broke and never what the answer said: an answer is what a
+    /// person wrote, and a choice it names is whatever was typed.
     #[error("{0}")]
-    Form(String),
+    Form(Shown),
     /// The draft could not be sent because its question ended or moved.
-    #[error("the question ended or moved while the answer was kept: {0:?}")]
+    #[error("the question ended or moved while the answer was kept: {0}")]
     Retired(Retired),
     /// The draft was not sent because its question is not among those its session lists, and the
     /// host's record of the session does not say the session ended. It is still kept.
@@ -168,20 +220,20 @@ pub enum AnswerError {
     )]
     Unlisted,
     /// The store on this device refused.
-    #[error("the answers kept at {path} cannot be used: {error}")]
+    #[error("the answers kept at {path} cannot be used: {fault}")]
     Store {
         /// The file or directory.
-        path: PathBuf,
+        path: Shown,
         /// What the operating system said.
-        error: std::io::Error,
+        fault: IoFault,
     },
     /// A kept answer could not be read back.
     #[error("the kept answer at {path} cannot be read: {detail}")]
     Unreadable {
-        /// The file.
-        path: PathBuf,
-        /// Why.
-        detail: String,
+        /// The file, named whole only when its name is one this store writes.
+        path: Shown,
+        /// Why: the class and the place of the fault, never what the file held.
+        detail: Shown,
     },
     /// The host refused, or the connection failed in a way that is not a lost connection.
     #[error("{0}")]
@@ -204,6 +256,8 @@ impl AnswerError {
         }
     }
 }
+
+crate::debug_as_display!(AnswerError);
 
 /// The result of this module's operations.
 pub type Result<T> = std::result::Result<T, AnswerError>;
@@ -313,8 +367,8 @@ impl AnswerDrafts {
         let directory = directory.into();
         // Created owner-only, and an existing directory narrowed to its owner rather than accepted.
         crate::drafts::private_directory(&directory).map_err(|error| AnswerError::Store {
-            path: directory.clone(),
-            error,
+            path: Shown::root(&directory),
+            fault: IoFault::from(error),
         })?;
         Ok(Self { directory })
     }
@@ -325,17 +379,21 @@ impl AnswerDrafts {
     ///
     /// Returns [`AnswerError::Store`] when it cannot be written.
     pub fn keep(&self, draft: &AnswerDraft) -> Result<()> {
-        let bytes = kr_cbor::to_canonical_vec(draft)
-            .map_err(|error| AnswerError::Form(format!("the answer cannot be kept: {error}")))?;
+        let bytes = kr_cbor::to_canonical_vec(draft).map_err(|error| {
+            AnswerError::Form(crate::shown!(
+                "the answer cannot be kept: {}",
+                Shown::cbor(&error)
+            ))
+        })?;
         let path = self.path(draft.question_id);
         let store = |error| AnswerError::Store {
-            path: path.clone(),
-            error,
+            path: stored(&path),
+            fault: IoFault::from(error),
         };
         // A name of this write's own, so a second writer of the same question writes a file of its
         // own too, and the last rename is the answer that stays.
         let unique = crate::drafts::fresh_uuid()
-            .map_err(|error| store(std::io::Error::other(error.to_string())))?;
+            .map_err(|error| store(std::io::Error::other(crate::shown!("{}", error))))?;
         let partial = self
             .directory
             .join(format!(".{}.{unique}.partial", draft.question_id));
@@ -344,7 +402,8 @@ impl AnswerDrafts {
             let _ = std::fs::remove_file(&partial);
             return Err(store(error));
         }
-        crate::drafts::sync_directory(&self.directory).map_err(store)
+        kr_ipc::paths::flush_directory(&self.directory, kr_ipc::paths::NameKind::File)
+            .map_err(store)
     }
 
     /// Returns every answer kept on this device, oldest first.
@@ -355,14 +414,14 @@ impl AnswerDrafts {
     /// [`AnswerError::Unreadable`] when a kept answer is not one this build wrote.
     pub fn drafts(&self) -> Result<Vec<AnswerDraft>> {
         let entries = std::fs::read_dir(&self.directory).map_err(|error| AnswerError::Store {
-            path: self.directory.clone(),
-            error,
+            path: Shown::root(&self.directory),
+            fault: IoFault::from(error),
         })?;
         let mut drafts = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|error| AnswerError::Store {
-                path: self.directory.clone(),
-                error,
+                path: Shown::root(&self.directory),
+                fault: IoFault::from(error),
             })?;
             let path = entry.path();
             // A partial write whose process did not live to rename it is not an answer.
@@ -383,10 +442,18 @@ impl AnswerDrafts {
     pub fn discard(&self, question_id: QuestionId) -> Result<()> {
         let path = self.path(question_id);
         match std::fs::remove_file(&path) {
-            Ok(()) => crate::drafts::sync_directory(&self.directory)
-                .map_err(|error| AnswerError::Store { path, error }),
+            Ok(()) => {
+                kr_ipc::paths::flush_directory(&self.directory, kr_ipc::paths::NameKind::File)
+                    .map_err(|error| AnswerError::Store {
+                        path: Shown::root(&self.directory),
+                        fault: IoFault::from(error),
+                    })
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(AnswerError::Store { path, error }),
+            Err(error) => Err(AnswerError::Store {
+                path: stored(&path),
+                fault: IoFault::from(error),
+            }),
         }
     }
 
@@ -395,17 +462,39 @@ impl AnswerDrafts {
     }
 }
 
+/// Reads one kept answer.
+///
+/// The path is one a listing found, so a failure names it whole only when its name is one this
+/// store writes: whatever else is in the directory was put there by something else.
 fn read_draft(path: &Path) -> Result<AnswerDraft> {
     let bytes = std::fs::read(path).map_err(|error| AnswerError::Store {
-        path: path.to_path_buf(),
-        error,
+        path: stored(path),
+        fault: IoFault::from(error),
     })?;
     kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT).map_err(|error| {
         AnswerError::Unreadable {
-            path: path.to_path_buf(),
-            detail: error.to_string(),
+            path: stored(path),
+            detail: Shown::cbor(&error),
         }
     })
+}
+
+/// What an answer that does not fit its question's form breaks, in words that carry none of it.
+///
+/// The two rules about the answer's size are said as they are. Every other one is said as the kind
+/// of question the answer does not fit: the form check's own sentence can name the choice an answer
+/// gave, which is whatever was typed.
+fn form_failure(question: &Question, answer: &QuestionAnswer) -> Shown {
+    match answer.text() {
+        Some(text) if text.len() > MAX_ANSWER_BYTES => {
+            crate::shown!("an answer is at most {} bytes", MAX_ANSWER_BYTES)
+        }
+        Some("") => Shown::said("an answer carries the text the person wrote"),
+        _ => crate::shown!(
+            "the answer does not fit the form of this {} question",
+            question.kind
+        ),
+    }
 }
 
 /// Returns true when a failure leaves the answer untaken or its fate unknown, rather than refused.
@@ -455,7 +544,8 @@ pub async fn answer<H: QuestionHost>(
     answer: QuestionAnswer,
     now: TimestampMs,
 ) -> Result<Answered> {
-    check_answer(question, &answer).map_err(|error| AnswerError::Form(error.to_string()))?;
+    check_answer(question, &answer)
+        .map_err(|_| AnswerError::Form(form_failure(question, &answer)))?;
     let draft = AnswerDraft {
         target,
         session_id: question.session_id,

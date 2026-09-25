@@ -58,6 +58,8 @@ pub use console::{ControllingTerminal, SavedModes};
 mod console {
     use std::fs::File;
 
+    use kr_client::shown::Shown;
+
     use crate::error::{CliError, Result};
     use crate::terminal::{KeyboardState, Probe, RESET_SEQUENCES, ScreenModes, TerminalSize};
 
@@ -141,9 +143,9 @@ mod console {
                 &raw mut info,
             );
             if !ok {
-                return Err(CliError::Terminal(
-                    "read the console's size: the console did not answer".to_owned(),
-                ));
+                return Err(CliError::Terminal(Shown::said(
+                    "read the console's size: the console did not answer",
+                )));
             }
             let columns = info.srWindow.Right.saturating_sub(info.srWindow.Left) + 1;
             let rows = info.srWindow.Bottom.saturating_sub(info.srWindow.Top) + 1;
@@ -285,10 +287,10 @@ mod console {
             let mut parts = text.split(':');
             let mut next = || -> Result<u32> {
                 let part = parts.next().ok_or_else(|| {
-                    CliError::Terminal("the saved console state is incomplete".to_owned())
+                    CliError::Terminal(Shown::said("the saved console state is incomplete"))
                 })?;
                 u32::from_str_radix(part, 16).map_err(|_| {
-                    CliError::Terminal("the saved console state is not hexadecimal".to_owned())
+                    CliError::Terminal(Shown::said("the saved console state is not hexadecimal"))
                 })
             };
             let modes = Self {
@@ -296,9 +298,9 @@ mod console {
                 output: next()?,
             };
             if parts.next().is_some() {
-                return Err(CliError::Terminal(
-                    "the saved console state has more fields than expected".to_owned(),
-                ));
+                return Err(CliError::Terminal(Shown::said(
+                    "the saved console state has more fields than expected",
+                )));
             }
             Ok(modes)
         }
@@ -311,9 +313,9 @@ mod console {
         if unsafe_free_get_console_mode(handle.as_raw_handle(), &raw mut mode) {
             Ok(mode)
         } else {
-            Err(CliError::Terminal(
-                "read the console's mode: the console did not answer".to_owned(),
-            ))
+            Err(CliError::Terminal(Shown::said(
+                "read the console's mode: the console did not answer",
+            )))
         }
     }
 
@@ -323,9 +325,9 @@ mod console {
         if unsafe_free_set_console_mode(handle.as_raw_handle(), mode) {
             Ok(())
         } else {
-            Err(CliError::Terminal(
-                "set the console's mode: the console refused".to_owned(),
-            ))
+            Err(CliError::Terminal(Shown::said(
+                "set the console's mode: the console refused",
+            )))
         }
     }
 

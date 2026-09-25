@@ -128,6 +128,8 @@ use kr_protocol::scalars::{AuthorisationKey, StoredEnvelopeKey, TimestampMs, Uui
 use kr_protocol::service::installation_id;
 use serde::{Deserialize, Serialize};
 
+use crate::shown::{IoFault, Shown};
+
 pub use facts::{Change, Ended, Outcome};
 pub use plans::{PLAN_LIFETIME_MS, Plan, PlanRefusal, PlannedOperation};
 
@@ -570,28 +572,30 @@ pub enum Refreshed {
 }
 
 /// Why a membership operation did not complete.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum MembershipError {
     /// The membership directory, its lock or its file could not be used.
-    #[error("the membership store at {path} could not be used: {source}")]
+    #[error("the membership store at {path} could not be used: {fault}")]
     Storage {
         /// What was being read or written.
-        path: PathBuf,
+        path: Shown,
         /// The underlying failure.
-        source: std::io::Error,
+        fault: IoFault,
     },
     /// The membership file is not something this build can read.
     #[error("the membership file at {path} could not be read: {reason}")]
     Corrupt {
         /// The file.
-        path: PathBuf,
-        /// What was wrong with it.
-        reason: String,
+        path: Shown,
+        /// What was wrong with it: the class and the place of the fault, never what it held.
+        reason: Shown,
     },
     /// A value could not be encoded.
+    ///
+    /// It holds what [`Shown::cbor`] says of the failure.
     #[error("a membership value could not be encoded: {0}")]
-    Encoding(#[from] kr_cbor::CborError),
+    Encoding(Shown),
     /// A service or a host could not be asked.
     #[error("a service could not answer: {0}")]
     Service(#[source] ClientError),
@@ -599,8 +603,10 @@ pub enum MembershipError {
     #[error("this device's collection keys could not be used: {0}")]
     Keys(#[source] ClientError),
     /// A key operation failed.
+    ///
+    /// It holds what [`Shown::crypto`] says of the failure.
     #[error("{0}")]
-    Crypto(#[from] kr_crypto::CryptoError),
+    Crypto(Shown),
     /// The key an epoch this device installed is not in the store.
     #[error("this device does not hold the key of the epoch it installed, epoch {epoch}")]
     KeyMissing {
@@ -672,6 +678,20 @@ impl From<ClientError> for MembershipError {
         Self::Service(error)
     }
 }
+
+impl From<kr_cbor::CborError> for MembershipError {
+    fn from(error: kr_cbor::CborError) -> Self {
+        Self::Encoding(Shown::cbor(&error))
+    }
+}
+
+impl From<kr_crypto::CryptoError> for MembershipError {
+    fn from(error: kr_crypto::CryptoError) -> Self {
+        Self::Crypto(Shown::crypto(&error))
+    }
+}
+
+crate::debug_as_display!(MembershipError);
 
 /// One member as the status screen shows it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

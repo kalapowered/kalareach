@@ -19,6 +19,7 @@
 //! | [`device`] | `kr device`: the paired devices, and revoking one |
 //! | [`plugin`] | `kr plugin`: plugin packages and the repositories they come from |
 //! | [`resolve`] | Finding a session by number or identifier, and reaching its worker |
+//! | [`startup`] | `kr host startup`, and `kr new` starting the control daemon under the standalone start |
 //! | [`contact`] | The contact tools an agent reaches its person through, over the Model Context Protocol |
 //! | [`create`] | The palette a new session starts with |
 //! | [`question`] | Reading and answering an agent's questions from the terminal |
@@ -56,7 +57,9 @@ pub mod report;
 pub mod resolve;
 pub mod session;
 pub mod shell;
+pub mod shown;
 pub mod skill;
+pub mod startup;
 pub mod terminal;
 pub mod windows;
 pub mod workspace;
@@ -74,6 +77,10 @@ pub const RELEASE: &str = env!("CARGO_PKG_VERSION");
 /// rather than a runtime condition.
 #[must_use]
 pub fn build_id() -> kr_protocol::ids::BuildId {
-    kr_protocol::ids::BuildId::new(format!("kr/{RELEASE}"))
-        .expect("the build identifier is well formed")
+    // What the identifier's check refused is not rendered: the panic says which build fault this
+    // is and nothing it read.
+    match kr_protocol::ids::BuildId::new(format!("kr/{RELEASE}")) {
+        Ok(build_id) => build_id,
+        Err(_) => panic!("the build identifier is not well formed"),
+    }
 }

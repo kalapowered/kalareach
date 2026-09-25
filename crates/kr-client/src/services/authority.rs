@@ -450,8 +450,9 @@ impl AuthorityFeedClient {
             RevocationTarget::Devices { device_ids } => device_ids.len(),
         };
         if named > MAX_REVOCATION_TARGETS {
-            return Err(malformed(format!(
-                "a revocation request names at most {MAX_REVOCATION_TARGETS} identifiers"
+            return Err(malformed(crate::shown!(
+                "a revocation request names at most {} identifiers",
+                MAX_REVOCATION_TARGETS
             )));
         }
 
@@ -479,8 +480,9 @@ impl AuthorityFeedClient {
     ) -> Result<AuthorityFeedState> {
         self.host_only("issues its own revisions")?;
         if revision.applied_requests.len() > MAX_APPLIED_REQUESTS {
-            return Err(malformed(format!(
-                "a revision names at most {MAX_APPLIED_REQUESTS} applied requests"
+            return Err(malformed(crate::shown!(
+                "a revision names at most {} applied requests",
+                MAX_APPLIED_REQUESTS
             )));
         }
 
@@ -535,8 +537,9 @@ impl AuthorityFeedClient {
     pub async fn delegate(&self, owner_key_ids: &[KeyId]) -> Result<AuthorityFeedState> {
         self.host_only("names the keys that may remove it")?;
         if owner_key_ids.len() > MAX_REMOVAL_KEYS {
-            return Err(malformed(format!(
-                "a host names at most {MAX_REMOVAL_KEYS} keys that may remove it"
+            return Err(malformed(crate::shown!(
+                "a host names at most {} keys that may remove it",
+                MAX_REMOVAL_KEYS
             )));
         }
         self.send(AuthorityRequest::Delegate(DelegateBody { owner_key_ids }))
@@ -583,10 +586,12 @@ impl AuthorityFeedClient {
     /// The service refuses it as well. Refusing here is what stops a client spending a request to
     /// be told something it already knows: the credential it would sign says which kind of key it
     /// holds.
-    fn host_only(&self, what: &str) -> Result<()> {
+    fn host_only(&self, what: &'static str) -> Result<()> {
         match self.call.signer_kind() {
             ServiceRequestSigner::Host => Ok(()),
-            ServiceRequestSigner::Installation => Err(malformed(format!("only the host {what}"))),
+            ServiceRequestSigner::Installation => {
+                Err(malformed(crate::shown!("only the host {}", what)))
+            }
         }
     }
 
@@ -603,7 +608,7 @@ impl AuthorityFeedClient {
             )
             .await?;
         serde_json::from_value(data)
-            .map_err(|error| unreadable_answer(&format!("what {member} answered"), &error))
+            .map_err(|error| unreadable_answer(crate::shown!("what {} answered", member), &error))
     }
 }
 

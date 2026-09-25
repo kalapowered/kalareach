@@ -20,6 +20,9 @@
 //! * **Pending resources** are what reconnect reconciles against. Their durable state is what
 //!   stops a second response from being emitted for an identifier the host may already have
 //!   answered.
+//! * **Connection packages** name the installed package each connection identifier recorded its
+//!   requests under, written with its first one. An identifier keeps that package for good, so a
+//!   restarted worker still refuses to restore it under another package's tables.
 //! * **Launch profiles** record what was actually resolved and run.
 //! * **Evidence gaps** record each spell of volatile operation, so the gap is committed when
 //!   storage returns rather than quietly forgotten.
@@ -45,12 +48,13 @@ use kr_protocol::scalars::{TimestampMs, Uuid};
 use kr_protocol::session::Durability;
 use rusqlite::{Connection, OptionalExtension as _, params};
 
+use crate::broker::PackageIdentity;
 use crate::broker::error::{BrokerError, Result};
 use crate::persistence::fault::JournalHealth;
 use crate::persistence::stores::ContentClass;
 
 /// The schema version this build reads.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// How long the ledger waits for another connection to finish writing, outside prompt mode.
 pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -405,6 +409,38 @@ fn put_pending_in(
     Ok(())
 }
 
+/// Writes the package one connection identifier recorded its requests under, where no row names
+/// one yet.
+///
+/// An identifier keeps the first package it recorded requests under for good, so a later row never
+/// replaces it.
+fn put_connection_in(
+    faults: &Faults,
+    connection: &Connection,
+    identifier: GatewayConnectionId,
+    application_instance_id: ApplicationInstanceId,
+    package: &PackageIdentity,
+    recorded_at: TimestampMs,
+) -> Result<()> {
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO broker_connections
+                 (connection_id, application_instance_id, plugin_id, publisher_id, package_digest,
+                  recorded_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                i64::try_from(identifier.get()).unwrap_or(i64::MAX),
+                application_instance_id.get().as_bytes().as_slice(),
+                package.plugin_id.as_str(),
+                package.publisher_id.as_str(),
+                package.package_digest.as_bytes().as_slice(),
+                i64::try_from(recorded_at.get()).unwrap_or(i64::MAX),
+            ],
+        )
+        .map_err(|error| faults.of(error))?;
+    Ok(())
+}
+
 /// One event row, as it comes back out of the store.
 struct StoredEvent {
     sequence: i64,
@@ -672,6 +708,14 @@ impl Ledger {
                  );
                  CREATE UNIQUE INDEX IF NOT EXISTS broker_pending_by_request
                      ON broker_pending (connection_id, upstream_request_id);
+                 CREATE TABLE IF NOT EXISTS broker_connections (
+                     connection_id           INTEGER PRIMARY KEY,
+                     application_instance_id BLOB NOT NULL,
+                     plugin_id               TEXT NOT NULL,
+                     publisher_id            TEXT NOT NULL,
+                     package_digest          BLOB NOT NULL,
+                     recorded_at_ms          INTEGER NOT NULL
+                 );
                  CREATE INDEX IF NOT EXISTS broker_pending_by_state ON broker_pending (state);
                  CREATE TABLE IF NOT EXISTS broker_profiles (
                      profile_id              TEXT PRIMARY KEY,
@@ -935,21 +979,38 @@ impl Ledger {
             .transpose()
     }
 
-    /// Records one opaque native request before it is forwarded.
+    /// Records one opaque native request before it is forwarded, with the package of the
+    /// connection that recorded it.
     ///
     /// Section 11: "The broker records opaque native requests before forwarding them and
     /// arbitrates responses by their IDs." It is not an approval yet; a decoder's interpretation
-    /// makes it one, through [`Ledger::admit_resource`].
+    /// makes it one, through [`Ledger::admit_resource`]. The connection's package is written in the
+    /// same transaction, where no earlier request of the connection wrote it.
     ///
     /// # Errors
     ///
     /// Returns [`BrokerError::LedgerUnavailable`] when the write fails.
-    pub fn record_opaque(&self, resource: &PendingResource, event: &TransitionEvent) -> Result<()> {
+    pub fn record_opaque(
+        &self,
+        resource: &PendingResource,
+        package: Option<&PackageIdentity>,
+        event: &TransitionEvent,
+    ) -> Result<()> {
         let transaction = self
             .connection
             .unchecked_transaction()
             .map_err(|error| self.fault(error))?;
         put_pending_in(&self.faults, &transaction, resource, None, false)?;
+        if let Some(package) = package {
+            put_connection_in(
+                &self.faults,
+                &transaction,
+                resource.request.connection,
+                resource.application_instance_id,
+                package,
+                resource.recorded_at,
+            )?;
+        }
         write_event(&self.faults, &transaction, event)?;
         transaction.commit().map_err(|error| self.fault(error))
     }
@@ -1368,6 +1429,7 @@ impl Ledger {
     pub fn commit_recovery(
         &mut self,
         records: &[(PendingResource, Option<BrokerBindingId>, bool)],
+        packages: &[(GatewayConnectionId, ApplicationInstanceId, PackageIdentity)],
         gap: &EvidenceGap,
         row: Option<i64>,
     ) -> Result<i64> {
@@ -1376,6 +1438,16 @@ impl Ledger {
             .connection
             .transaction()
             .map_err(|error| faults.of(error))?;
+        for (identifier, application_instance_id, package) in packages {
+            put_connection_in(
+                &faults,
+                &transaction,
+                *identifier,
+                *application_instance_id,
+                package,
+                gap.opened_at,
+            )?;
+        }
         for (resource, decoder, dispatched) in records {
             transaction
                 .execute(
@@ -1767,13 +1839,71 @@ impl Ledger {
     pub fn highest_connection(&self) -> Result<u64> {
         let highest: Option<i64> = self
             .connection
-            .query_row("SELECT MAX(connection_id) FROM broker_pending", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT MAX(connection_id) FROM
+                     (SELECT connection_id FROM broker_pending
+                      UNION ALL SELECT connection_id FROM broker_connections)",
+                [],
+                |row| row.get(0),
+            )
             .optional()
             .map_err(|error| self.fault(error))?
             .flatten();
         Ok(highest.map_or(0, |value| u64::try_from(value).unwrap_or(0)))
+    }
+
+    /// Reads the package each connection identifier that still holds an unresolved resource
+    /// recorded its requests under.
+    ///
+    /// A restarted worker reads these back, so a restoration under another package's tables is
+    /// refused after a restart as it is before one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the read fails or a stored row cannot be
+    /// read back.
+    pub fn connection_packages(&self) -> Result<Vec<(GatewayConnectionId, PackageIdentity)>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT connection_id, plugin_id, publisher_id, package_digest
+                 FROM broker_connections
+                 WHERE connection_id IN
+                     (SELECT connection_id FROM broker_pending WHERE state IN ('pending', 'claimed'))
+                 ORDER BY connection_id",
+            )
+            .map_err(|error| self.fault(error))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            })
+            .map_err(|error| self.fault(error))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| self.fault(error))?;
+        rows.into_iter()
+            .map(|(identifier, plugin_id, publisher_id, digest)| {
+                let digest: [u8; 32] = digest.as_slice().try_into().map_err(|_| {
+                    BrokerError::ledger("a stored package digest is not thirty-two bytes")
+                })?;
+                Ok((
+                    GatewayConnectionId::new(u64::try_from(identifier).unwrap_or(0)),
+                    PackageIdentity {
+                        plugin_id: kr_protocol::ids::PluginId::new(plugin_id).map_err(|error| {
+                            BrokerError::ledger(format!("a stored package: {error}"))
+                        })?,
+                        publisher_id: kr_protocol::ids::PublisherId::new(publisher_id).map_err(
+                            |error| BrokerError::ledger(format!("a stored publisher: {error}")),
+                        )?,
+                        package_digest: kr_protocol::scalars::Digest256::from_bytes(digest),
+                    },
+                ))
+            })
+            .collect()
     }
 
     /// Reads every recorded gap, oldest first.
@@ -2021,6 +2151,15 @@ mod tests {
         )
     }
 
+    /// The installed package the test tables are pinned with and the test binding runs.
+    fn installed() -> crate::broker::PackageIdentity {
+        crate::broker::PackageIdentity {
+            plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+            publisher_id: PublisherId::new("kalareach").expect("valid"),
+            package_digest: Digest256::from_bytes([5; 32]),
+        }
+    }
+
     fn trust() -> DecodingTrust {
         DecodingTrust {
             plugin_id: PluginId::new("kalareach.codex").expect("valid"),
@@ -2122,7 +2261,7 @@ mod tests {
         let mut ledger = Ledger::open(None, JournalHealth::shared()).expect("the ledger opens");
         let recorded = resource(7, "11", PendingState::Pending);
         ledger
-            .record_opaque(&recorded, &event(90, &recorded))
+            .record_opaque(&recorded, None, &event(90, &recorded))
             .expect("the opaque request is recorded before it is forwarded");
 
         // An interpretation of a request this ledger does not hold. The source consumption is the
@@ -2200,7 +2339,12 @@ mod tests {
             )
             .expect("instance registered");
         broker
-            .pin_table(instance(), test_declarative_table(), test_rich_table())
+            .pin_table(
+                instance(),
+                installed(),
+                test_declarative_table(),
+                test_rich_table(),
+            )
             .expect("table pinned");
         let connection = broker
             .open_native_connection(
@@ -2335,7 +2479,7 @@ mod tests {
         let mut ledger = Ledger::open(None, JournalHealth::shared()).expect("the ledger opens");
         let pending = resource(7, "11", PendingState::Pending);
         ledger
-            .record_opaque(&pending, &event(91, &pending))
+            .record_opaque(&pending, None, &event(91, &pending))
             .expect("recorded");
         ledger
             .admit_resource(
@@ -2406,7 +2550,7 @@ mod tests {
                 Ledger::open(Some(&file), JournalHealth::shared()).expect("the ledger opens");
             let opaque = resource(7, "11", PendingState::Pending);
             ledger
-                .record_opaque(&opaque, &event(92, &opaque))
+                .record_opaque(&opaque, None, &event(92, &opaque))
                 .expect("recorded");
             ledger
                 .admit_resource(
@@ -2451,7 +2595,7 @@ mod tests {
         let mut ledger = Ledger::open(None, JournalHealth::shared()).expect("the ledger opens");
         let pending = resource(7, "11", PendingState::Pending);
         ledger
-            .record_opaque(&pending, &event(91, &pending))
+            .record_opaque(&pending, None, &event(91, &pending))
             .expect("recorded");
         ledger
             .admit_resource(
@@ -2490,7 +2634,7 @@ mod tests {
         let mut gap = EvidenceGap::open("the journal faulted", TimestampMs::new(1), 0);
         gap.closed_at = Nullable::some(TimestampMs::new(2));
         let row = ledger
-            .commit_recovery(&[], &gap, None)
+            .commit_recovery(&[], &[], &gap, None)
             .expect("the gap is committed");
         assert!(
             ledger

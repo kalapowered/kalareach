@@ -6,7 +6,7 @@
 //! storage, relay bandwidth and operation, and a fork can point these traits at its own
 //! infrastructure without changing anything else in the client.
 //!
-//! The traits and one null implementation live here, and eight modules hold the managed
+//! The traits and one null implementation live here, and nine modules hold the managed
 //! implementations this crate carries. [`account`] is the account sign-in: the request a system
 //! browser is handed, the checks on what comes back, and the grant a device keeps under one lock,
 //! with the account service's trait beside them. [`relay`] is the relay-lease client, because a lease is the
@@ -19,10 +19,11 @@
 //! compare-and-exchange service settings, a client's position and drafts are kept on. [`signed`] is
 //! the one signed call those of them that speak the section 23 `Services` group share, and [`http`]
 //! is the exchange underneath all of them: one gateway origin, finite deadlines, bounded answers
-//! and no retry of its own. A
-//! self-hosted deployment supplies its own, and a client with no managed service configured is a
-//! complete client: direct connections, local sessions, plugins, local descriptions and
-//! user-operated alternatives need none of these.
+//! and no retry of its own. [`json`] is the one reader of what any of them is answered, and it
+//! refuses an answer that names a member twice before anything reads it. A self-hosted deployment
+//! supplies its own, and a client with no managed service configured is a complete client: direct
+//! connections, local sessions, plugins, local descriptions and user-operated alternatives need
+//! none of these.
 //!
 //! # What is never rendered
 //!
@@ -81,20 +82,23 @@
 //! because what they render is whatever the redacted type gave them.
 //!
 //! The same rule covers what a failure says. `serde_json`'s own message quotes the value it
-//! rejected — `invalid type: string "..."` — so an error that carried that text would print
+//! rejected (`invalid type: string "..."`), so an error that carried that text would print
 //! through [`std::fmt::Display`] the very thing the Debug rule keeps out of `{:?}`. Nothing here
-//! formats a JSON error into a message: [`json_fault`] is what a caller is told instead, and it
-//! carries the class and the position and nothing that was in the document.
+//! formats a JSON error into a message: [`crate::shown::Shown::json`] is what a caller is told
+//! instead, and [`json::Unreadable`] about an answer, and both carry the class and the position and
+//! nothing that was in the document.
 //!
 //! One thing is deliberately not covered by it. A refusal the service sent carries the service's
 //! own message, which is written to be shown to a person, and that message is in the error this
-//! client returns. What is never in it is anything else of the answer. The one refusal whose words
+//! client returns, through [`crate::shown::Shown::service`], whose one input only this module's
+//! refusal readers can make. What is never in it is anything else of the answer. The one refusal whose words
 //! are this client's is settings sync's `SIGNED_BEFORE_CUTOFF` outside an exchange, because the
 //! service words it for a write and what the person needs is what it means for their request.
 
 pub mod account;
 pub mod authority;
 pub mod http;
+pub mod json;
 pub mod mailbox;
 pub mod relay;
 pub mod signed;
@@ -141,26 +145,6 @@ pub use voice::{
 
 /// A boxed future, so every service client stays usable behind a trait object.
 pub type ServiceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
-
-/// What a JSON failure says, with none of the document it was about.
-///
-/// `serde_json` names the value it rejected in its own message, and that value is a request body,
-/// an answer or a stored token. So this is what every failure of this kind in this module says
-/// instead: which kind of failure it was, and where in the document it happened. Both are useful
-/// to somebody diagnosing a mismatch and neither is anything that travelled.
-pub(crate) fn json_fault(error: &serde_json::Error) -> String {
-    let what = match error.classify() {
-        serde_json::error::Category::Io => "could not be read",
-        serde_json::error::Category::Syntax => "is not JSON",
-        serde_json::error::Category::Data => "is not the shape this client reads",
-        serde_json::error::Category::Eof => "ended early",
-    };
-    format!(
-        "it {what} at line {} column {}",
-        error.line(),
-        error.column()
-    )
-}
 
 /// The bounds a transport carrying this crate's managed-service clients reads answers under.
 ///
@@ -390,11 +374,13 @@ impl SyncRevision {
     }
 }
 
-impl std::fmt::Display for SyncRevision {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.0, formatter)
+impl crate::shown::Said for SyncRevision {
+    fn said(&self) -> crate::shown::Shown {
+        crate::shown!("{}", self.0)
     }
 }
+
+crate::display_as_said!(SyncRevision);
 
 /// The identity of one restore of a synchronisation service: the history a collection answers from.
 ///
@@ -426,11 +412,13 @@ impl SyncRecoveryId {
     }
 }
 
-impl std::fmt::Display for SyncRecoveryId {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.0, formatter)
+impl crate::shown::Said for SyncRecoveryId {
+    fn said(&self) -> crate::shown::Shown {
+        crate::shown!("{}", self.0)
     }
 }
+
+crate::display_as_said!(SyncRecoveryId);
 
 /// Whether a stored record's recovery names none, in which case the record leaves the member out.
 ///
@@ -528,18 +516,20 @@ impl SyncPosition {
     }
 }
 
-impl std::fmt::Display for SyncPosition {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.revision.as_ref() {
-            Some(revision) => write!(formatter, "write {} ({revision})", self.write_sequence)?,
-            None => write!(formatter, "write {} (removed)", self.write_sequence)?,
-        }
+impl crate::shown::Said for SyncPosition {
+    fn said(&self) -> crate::shown::Shown {
+        let place = match self.revision.as_ref() {
+            Some(revision) => crate::shown!("write {} ({})", self.write_sequence, *revision),
+            None => crate::shown!("write {} (removed)", self.write_sequence),
+        };
         match self.recovery() {
-            Some(recovery) => write!(formatter, " after recovery {recovery}"),
-            None => Ok(()),
+            Some(recovery) => crate::shown!("{} after recovery {}", place, recovery),
+            None => place,
         }
     }
 }
+
+crate::display_as_said!(SyncPosition);
 
 /// What a synchronisation service did with one exchange.
 ///
@@ -762,11 +752,25 @@ impl std::fmt::Debug for SyncFetched {
 /// the service. A caller reports it only once it has read the absence against the history of the
 /// collection, because an absence in another history says something else.
 #[must_use]
-pub fn nothing_held(what: &str) -> ClientError {
-    ClientError::Host(kr_protocol::error::ProtocolError::new(
+pub fn nothing_held(what: impl Into<crate::shown::Shown>) -> ClientError {
+    ClientError::refusal(
         kr_protocol::error::ErrorCode::UnknownSession,
-        format!("the service holds no {what} in that collection"),
-    ))
+        crate::shown!("the service holds no {} in that collection", what.into()),
+    )
+}
+
+/// What became of one exchange, for a caller that has to know whether a request that went
+/// unanswered ever left this device.
+///
+/// An error beside it is a request that may have left: its answer never came back, or came back in
+/// a form nobody can read, and the service may have run it.
+#[derive(Debug)]
+pub enum SyncDispatch {
+    /// The service answered.
+    Answered(SyncExchanged),
+    /// Refused on this device before anything was sent, so nothing can run under the request's
+    /// identity.
+    NotSent(ClientError),
 }
 
 /// Where a shared collection's key records stood when a service answered: the newest record's key
@@ -891,6 +895,32 @@ pub trait SyncBackupService: Send + Sync + std::fmt::Debug {
         expected: Option<SyncPosition>,
         ciphertext: &'a [u8],
     ) -> ServiceFuture<'a, SyncExchanged>;
+
+    /// Publishes an encrypted object as [`Self::compare_exchange`] does, and says when the request
+    /// never left this device.
+    ///
+    /// A caller that records a write before it sends it needs one fact more than the answer:
+    /// whether a request that went unanswered was sent at all. One refused on this device before
+    /// anything left cannot run, so its record can be put back as it was; one that may have left
+    /// cannot be taken back, and stays outstanding until the service ends it.
+    ///
+    /// An implementation that can tell answers [`SyncDispatch::NotSent`] for a request it refused
+    /// before anything left. The default cannot tell, so it counts every failure as possibly sent,
+    /// which is the safe direction.
+    fn compare_exchange_dispatched<'a>(
+        &'a self,
+        collection: &'a str,
+        request_id: Uuid,
+        signed_at_ms: u64,
+        expected: Option<SyncPosition>,
+        ciphertext: &'a [u8],
+    ) -> ServiceFuture<'a, SyncDispatch> {
+        Box::pin(async move {
+            self.compare_exchange(collection, request_id, signed_at_ms, expected, ciphertext)
+                .await
+                .map(SyncDispatch::Answered)
+        })
+    }
 
     /// Returns what the service recorded about one request.
     ///
@@ -1200,6 +1230,22 @@ impl SyncBackupService for NullService {
         unconfigured(ManagedService::SyncBackup.as_str())
     }
 
+    /// Nothing is configured, so nothing is sent.
+    fn compare_exchange_dispatched<'a>(
+        &'a self,
+        _collection: &'a str,
+        _request_id: Uuid,
+        _signed_at_ms: u64,
+        _expected: Option<SyncPosition>,
+        _ciphertext: &'a [u8],
+    ) -> ServiceFuture<'a, SyncDispatch> {
+        Box::pin(async move {
+            Ok(SyncDispatch::NotSent(ClientError::ServiceNotConfigured(
+                ManagedService::SyncBackup.as_str(),
+            )))
+        })
+    }
+
     fn request_status<'a>(
         &'a self,
         _collection: &'a str,
@@ -1285,6 +1331,27 @@ mod tests {
         assert!(error.to_string().contains("relay leases"));
     }
 
+    /// A client with no sync service sends nothing, so an exchange it is asked for says it never
+    /// left, and a caller that recorded the write before sending can take the record back.
+    #[tokio::test]
+    async fn the_null_service_sends_no_exchange_and_says_so() {
+        let dispatched = NullService
+            .compare_exchange_dispatched(
+                "settings/00000000-0000-4000-8000-000000000001",
+                Uuid::from_bytes([1; 16]),
+                1,
+                None,
+                b"sealed",
+            )
+            .await
+            .expect("an answer about the request");
+        let SyncDispatch::NotSent(refused) = dispatched else {
+            panic!("nothing is configured, so nothing was sent: {dispatched:?}");
+        };
+        assert_eq!(refused.code(), ErrorCode::HostNotConfigured);
+        assert!(refused.to_string().contains("sync and backup"));
+    }
+
     #[test]
     fn a_client_with_no_managed_service_is_still_a_client() {
         let clients = ServiceClients::none();
@@ -1307,7 +1374,7 @@ mod tests {
         // The control: serde's own message really does quote what it rejected, so the assertion
         // below is about what this module says rather than about a message that never had it.
         assert!(rejected.to_string().contains(NEVER_RENDERED), "{rejected}");
-        let said = json_fault(&rejected);
+        let said = crate::shown::Shown::json(&rejected).into_string();
         assert!(!said.contains(NEVER_RENDERED), "{said}");
         assert!(
             said.contains("is not the shape this client reads"),
@@ -1316,7 +1383,11 @@ mod tests {
         assert!(said.contains("line 1"), "{said}");
 
         let broken = serde_json::from_str::<Shape>("{").expect_err("that is not JSON");
-        assert!(json_fault(&broken).contains("ended early"));
+        assert!(
+            crate::shown::Shown::json(&broken)
+                .as_str()
+                .contains("ended early")
+        );
     }
 
     #[test]

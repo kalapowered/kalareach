@@ -1173,6 +1173,22 @@ pub struct Dispatch {
     method_field: String,
 }
 
+/// Returns the rights the effect class of one prepared operation carries, as the package contract
+/// states them for that class.
+fn class_rights(
+    operation: kr_protocol::broker::PreparedOperation,
+) -> &'static [kr_protocol::rights::ActionRight] {
+    use kr_plugin_sdk::effect::EffectClass;
+    use kr_protocol::broker::PreparedOperation;
+    match operation {
+        PreparedOperation::UpstreamSubmit => EffectClass::UpstreamPrompt,
+        PreparedOperation::UpstreamCancel => EffectClass::UpstreamCancel,
+        PreparedOperation::UpstreamAttachment => EffectClass::UpstreamAttachment,
+        PreparedOperation::TerminalText => EffectClass::TerminalInput,
+    }
+    .required_rights()
+}
+
 impl Dispatch {
     /// Returns the connection this dispatch writes to.
     #[must_use]
@@ -1186,21 +1202,43 @@ impl Dispatch {
     /// turn need one right between them, so choosing by right would send any of the three as
     /// whichever the table happened to list first. A plugin action is named by the action the
     /// package declared: the table still has to list it, so an unknown rich mutation is rejected
-    /// rather than guessed at.
+    /// rather than guessed at, and once a plan names the operation, the right the listed method
+    /// needs has to be one the class of that operation carries.
     ///
     /// Either way the method passes the closed table's own admission, so a method the table lists
     /// as unsupported is refused here rather than written to the socket.
     fn method_for(&self, request: &UpstreamRequest) -> Result<kr_protocol::ids::UpstreamMethod> {
-        if let UpstreamBody::PluginAction { action, .. } = &request.body {
+        if let UpstreamBody::PluginAction {
+            action, operation, ..
+        } = &request.body
+        {
             let method =
                 kr_protocol::ids::UpstreamMethod::new(action.as_str()).map_err(|error| {
                     BrokerError::invalid(format!("this action is not a method name: {error}"))
                 })?;
-            return self
-                .rich
-                .admit(&method)
-                .map(|entry| entry.method.clone())
-                .map_err(BrokerError::from);
+            let entry = self.rich.admit(&method).map_err(BrokerError::from)?;
+            // The entry an action's name selects is the upstream's own method, with the right the
+            // upstream asks of whoever calls it. The action goes as that method only when the
+            // right is one the class of the operation it prepares carries: a prompt named like
+            // the table's cancellation would otherwise cancel the turn. Before a plan names the
+            // operation, the table listing the method is all there is to ask.
+            if let Some(operation) = operation {
+                let carried = class_rights(*operation);
+                if !carried.contains(&entry.required_right) {
+                    return Err(BrokerError::denied(format!(
+                        "{action} would go out as {}, which needs {}, and the {operation} it \
+                         prepares carries {}",
+                        entry.method,
+                        entry.required_right.as_str(),
+                        carried
+                            .iter()
+                            .map(|right| right.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" and ")
+                    )));
+                }
+            }
+            return Ok(entry.method.clone());
         }
         self.rich
             .for_operation(request.operation)
@@ -2975,5 +3013,243 @@ mod tests {
         // Both ends are closed.
         assert!(sink.is_closed());
         assert!(other_sink.is_closed());
+    }
+
+    /// A rich table that lists a prompt and a cancellation under the names a package's actions
+    /// can have.
+    fn named_rich_table() -> kr_protocol::gateway::RichMethodTable {
+        let entry = |name: &str,
+                     required_right: kr_protocol::rights::ActionRight,
+                     operation: kr_protocol::gateway::RichOperation| {
+            kr_protocol::gateway::RichMethodEntry {
+                method: kr_protocol::ids::UpstreamMethod::new(name).expect("valid"),
+                class: kr_protocol::gateway::NativeMethodClass::Mutation,
+                required_right,
+                operation: kr_protocol::scalars::Nullable::some(operation),
+                provenance: ActionProvenance::UpstreamTypedRpc,
+            }
+        };
+        kr_protocol::gateway::RichMethodTable {
+            table_version: kr_protocol::ids::MethodTableVersion::new(1),
+            upstream_protocol_version: "1".to_owned(),
+            entries: vec![
+                entry(
+                    "prompt.send",
+                    kr_protocol::rights::ActionRight::AgentPrompt,
+                    kr_protocol::gateway::RichOperation::PromptSubmit,
+                ),
+                entry(
+                    "turn.cancel",
+                    kr_protocol::rights::ActionRight::AgentCancel,
+                    kr_protocol::gateway::RichOperation::TurnCancel,
+                ),
+            ],
+        }
+    }
+
+    /// The production transport for one connection, over a stream nothing reads, with the named
+    /// rich table. The second value keeps the transport's queue open while it is held.
+    fn named_dispatch() -> (Dispatch, impl std::future::Future<Output = ()> + Send) {
+        let (upstream, _client) = tokio::io::duplex(64 * 1024);
+        let (sink, writes) = sink(
+            Framing::new(kr_protocol::gateway::NativeFraming::JsonLines),
+            upstream,
+            stopping(),
+            no_peer(),
+        );
+        (
+            Dispatch {
+                connection: GatewayConnectionId::new(1),
+                upstream: sink,
+                outstanding: Arc::new(Outstanding::default()),
+                rich: named_rich_table(),
+                params_field: "params".to_owned(),
+                request_id_field: "id".to_owned(),
+                method_field: "method".to_owned(),
+            },
+            writes,
+        )
+    }
+
+    /// One plugin action as an admission hands it to its transport, before a plan names its
+    /// operation or after.
+    fn named_action(
+        action: &str,
+        operation: Option<kr_protocol::broker::PreparedOperation>,
+    ) -> UpstreamRequest {
+        let mut request = plugin_action(None, None);
+        if let UpstreamBody::PluginAction {
+            action: named,
+            operation: prepared,
+            ..
+        } = &mut request.body
+        {
+            *named = kr_protocol::broker::ActionName::new(action).expect("valid");
+            *prepared = operation;
+        }
+        request
+    }
+
+    /// KR-REQ-11.47: an action is carried as the rich method its name selects only when that
+    /// method's right is one the class of the operation it prepares carries. A prompt named like
+    /// the table's cancellation is not sent as a cancellation, where the transport is asked and
+    /// where it builds the bytes; the cancellation and the prompt each go as themselves, and
+    /// before a plan names the operation the table listing the method is what is asked.
+    #[test]
+    fn kr_req_11_47_an_action_named_like_another_class_s_method_is_not_carried_as_it() {
+        use kr_protocol::broker::PreparedOperation;
+        let (dispatch, _writes) = named_dispatch();
+        let refusal = dispatch
+            .admit(&named_action(
+                "turn.cancel",
+                Some(PreparedOperation::UpstreamSubmit),
+            ))
+            .expect_err("a prompt named like the cancellation is not sent as one");
+        assert_eq!(
+            refusal.code(),
+            kr_protocol::error::ErrorCode::PermissionDenied,
+            "{refusal}"
+        );
+        assert!(
+            dispatch
+                .submit(&named_action(
+                    "turn.cancel",
+                    Some(PreparedOperation::UpstreamSubmit),
+                ))
+                .is_err(),
+            "and nothing is written for it"
+        );
+        assert_eq!(dispatch.upstream.queued_bytes(), 0);
+        dispatch
+            .admit(&named_action(
+                "turn.cancel",
+                Some(PreparedOperation::UpstreamCancel),
+            ))
+            .expect("a cancellation goes as the cancellation");
+        dispatch
+            .admit(&named_action(
+                "prompt.send",
+                Some(PreparedOperation::UpstreamSubmit),
+            ))
+            .expect("a prompt goes as the prompt");
+        dispatch
+            .admit(&named_action("turn.cancel", None))
+            .expect("before a plan, the table listing the method is what is asked");
+    }
+
+    /// KR-REQ-11.47: a component's plan for an `upstream.prompt` action whose name selects the
+    /// connection's cancellation is refused when the broker validates it, before anything could
+    /// be marked or carried: the broker asks the transport about the operation the plan names.
+    #[test]
+    fn kr_req_11_47_a_plan_the_transport_would_carry_as_another_class_is_refused_at_validation() {
+        use kr_protocol::broker::{
+            BrokerGrant, BrokerGrants, IntegrationMode, PreparedEffect, PreparedOperation,
+        };
+        let session =
+            kr_protocol::ids::SessionId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16]));
+        let instance = ApplicationInstanceId::new(kr_protocol::scalars::Uuid::from_bytes([2; 16]));
+        let binding =
+            kr_protocol::ids::BrokerBindingId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16]));
+        let broker = Broker::open(
+            None,
+            session,
+            crate::persistence::fault::JournalHealth::shared(),
+        )
+        .expect("the broker opens");
+        broker
+            .register_instance(instance, IntegrationMode::Gateway, None, None)
+            .expect("the instance is registered");
+        broker
+            .bind(
+                binding,
+                instance,
+                kr_protocol::ids::PluginId::new("kalareach.codex").expect("valid"),
+                kr_protocol::ids::PublisherId::new("kalareach").expect("valid"),
+                kr_protocol::scalars::Digest256::from_bytes([5; 32]),
+                BrokerGrants::granted([BrokerGrant::UpstreamAction]),
+                None,
+                TimestampMs::new(1),
+            )
+            .expect("the package is bound");
+        broker
+            .record_capability(kr_protocol::broker::InstanceCapabilityRecord {
+                capability_id: kr_protocol::ids::CapabilityId::new("agent.prompt").expect("valid"),
+                capability_version: "1".to_owned(),
+                application_instance_id: instance,
+                identity: kr_protocol::broker::InstanceCapabilityIdentity::default(),
+                revision: kr_protocol::ids::CapabilityRevision::new(1),
+                state: kr_protocol::broker::InstanceCapabilityState::QualifiedAvailable,
+                source: kr_protocol::broker::InstanceEvidenceSource::HostProbe,
+                invalidated_by: [kr_protocol::broker::InstanceInvalidation::BindingChanged]
+                    .into_iter()
+                    .collect(),
+                disabled_reason: kr_protocol::scalars::Nullable::null(),
+                observed_at: TimestampMs::new(1),
+            })
+            .expect("the evidence is recorded");
+        let (dispatch, _writes) = named_dispatch();
+        let dispatch = Arc::new(dispatch);
+        broker
+            .bind_dispatch(instance, Arc::clone(&dispatch) as Arc<dyn UpstreamDispatch>)
+            .expect("the transport is bound");
+        let declared: kr_plugin_sdk::effect::ActionDeclaration =
+            serde_json::from_value(serde_json::json!({
+                "id": "turn.cancel",
+                "label": "Send",
+                "effect": "upstream.prompt",
+                "implementation": { "type": "component" },
+                "parameters": { "parameters": [] },
+                "description": "A prompt its component prepares",
+                "confirmation_required": false,
+            }))
+            .expect("a declaration the manifest format reads");
+        broker
+            .register_actions(binding, &[declared])
+            .expect("the action is registered");
+        let admitted = broker
+            .admit_plugin_action(
+                &crate::broker::methods::Caller {
+                    actor_id: kr_protocol::ids::ActorId::new("device-1").expect("valid"),
+                    grant_id: None,
+                },
+                binding,
+                &kr_protocol::agent::PluginActionInvokeParams {
+                    target: kr_protocol::agent::AgentMutationTarget {
+                        subject: crate::broker::methods::subject(session, instance),
+                        binding_revision: kr_protocol::ids::AgentBindingRevision::new(1),
+                    },
+                    plugin_id: kr_protocol::ids::PluginId::new("kalareach.codex").expect("valid"),
+                    action: kr_protocol::broker::ActionName::new("turn.cancel").expect("valid"),
+                    draft_id: kr_protocol::scalars::Nullable::null(),
+                    resource_id: kr_protocol::scalars::Nullable::null(),
+                    parameters: kr_protocol::scalars::Bytes::from(b"{}".to_vec()),
+                },
+                TimestampMs::new(2),
+            )
+            .expect("the invocation is admitted: the connection's table lists the method");
+        let refusal = broker
+            .validate_effect(
+                &admitted,
+                &PreparedEffect {
+                    action: kr_protocol::broker::ActionName::new("turn.cancel").expect("valid"),
+                    class: kr_protocol::authority::EffectClass::Write,
+                    operation: PreparedOperation::UpstreamSubmit,
+                    draft_id: kr_protocol::scalars::Nullable::null(),
+                    argument_hash: kr_protocol::scalars::Digest256::from_bytes(kr_cbor::sha256(
+                        b"{}",
+                    )),
+                },
+            )
+            .expect_err("the plan would go out as the cancellation");
+        assert_eq!(
+            refusal.code(),
+            kr_protocol::error::ErrorCode::PermissionDenied,
+            "{refusal}"
+        );
+        assert!(
+            !admitted.carries_a_validated_plan(),
+            "and there is no validated plan to carry"
+        );
+        assert_eq!(dispatch.upstream.queued_bytes(), 0, "nothing was written");
     }
 }

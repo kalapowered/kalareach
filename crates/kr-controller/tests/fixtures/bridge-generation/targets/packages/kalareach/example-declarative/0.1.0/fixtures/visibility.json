@@ -1,0 +1,67 @@
+{
+  "fixture_version": 1,
+  "visibility": [
+    {
+      "name": "bound and idle",
+      "context": {
+        "rights": [
+          "session.view"
+        ],
+        "binding_state": "bound",
+        "flags": [],
+        "capabilities": [],
+        "present_nodes": [
+          "intro",
+          "status",
+          "controls"
+        ]
+      },
+      "visible_controls": [
+        "refresh"
+      ],
+      "enabled_controls": [
+        "refresh"
+      ]
+    },
+    {
+      "name": "upload in progress",
+      "context": {
+        "rights": [
+          "session.view"
+        ],
+        "binding_state": "bound",
+        "flags": [
+          "transfer_in_progress"
+        ],
+        "capabilities": [],
+        "present_nodes": [
+          "intro",
+          "status",
+          "controls"
+        ]
+      },
+      "visible_controls": [
+        "refresh"
+      ],
+      "enabled_controls": []
+    },
+    {
+      "name": "binding disabled after repeated faults",
+      "context": {
+        "rights": [
+          "session.view"
+        ],
+        "binding_state": "disabled",
+        "flags": [],
+        "capabilities": [],
+        "present_nodes": [
+          "intro",
+          "status",
+          "controls"
+        ]
+      },
+      "visible_controls": [],
+      "enabled_controls": []
+    }
+  ]
+}

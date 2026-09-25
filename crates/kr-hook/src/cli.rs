@@ -1,26 +1,29 @@
 //! What `kr-hook` accepts on its command line, and the exit codes it answers with.
 //!
-//! The command line is fixed by the files that register the forwarder and by the shell that runs an
-//! integrated invocation. A plugin package installs the files into an application's own
-//! configuration, and they name exactly one invocation each: `kr-hook claude-code channel` for the
-//! Channels server and `kr-hook claude-code hook` for every lifecycle and tool hook. The shell runs
-//! `kr-hook launch -- <executable> <arguments...>` for an invocation the worker gave a backend.
-//! Nothing else is accepted. An unknown application, an unknown surface, an
-//! extra argument or a flag this forwarder does not declare is refused with a usage error on
-//! standard error, before anything is read or connected.
+//! The command line is fixed by the registrations that start the forwarder and by the shell that
+//! runs an integrated invocation. Each registration names exactly one invocation: `kr-hook
+//! claude-code channel` for Claude Code's Channels server, and `kr-hook claude-code hook`,
+//! `kr-hook gemini-cli hook` and `kr-hook qoder-cli hook` for every hook of Claude Code, Gemini
+//! CLI and Qoder CLI. The shell runs `kr-hook launch -- <executable> <arguments...>` for an
+//! invocation the worker gave a backend. Nothing else is accepted. An unknown application, an
+//! unknown surface, an extra argument or a flag this forwarder does not declare is refused with a
+//! usage error on standard error, before anything is read or connected.
 //!
 //! The usage error's exit code is [`EXIT_USAGE`], 64, and not the 2 an argument parser uses by
-//! default. Claude Code reads a hook's exit code: 2 is the one code that blocks an action on the
-//! events that can be blocked, and on the events this bridge registers it hands the hook's standard
-//! error to the model. A forwarder invoked wrongly must not be able to do either, so its usage error
-//! is a code every application treats as an ordinary failure.
+//! default. Claude Code and Qoder CLI read a hook's exit code: 2 is the one code that blocks an
+//! action on the events that can be blocked, and Claude Code hands the hook's standard error to
+//! the model on some of the events its bridge registers. Both treat 64 as an ordinary failure.
+//! Gemini CLI reads a hook's standard error as its output when standard output is empty, and turns
+//! plain text with any exit code other than 0 and 1 into a refusal, so there a usage error is
+//! read as a refusal of the event it ran for; the Gemini CLI registration names only events whose
+//! refusals Gemini CLI ignores.
 
 use clap::{Parser, Subcommand};
 
 /// The exit code of a command line this forwarder does not accept.
 ///
-/// `EX_USAGE` from the BSD `sysexits` convention. It is deliberately not 2, which Claude Code reads
-/// as a hook's request to block the action it observed.
+/// `EX_USAGE` from the BSD `sysexits` convention. It is deliberately not 2, which Claude Code and
+/// Qoder CLI read as a hook's request to block the action it observed.
 pub const EXIT_USAGE: u8 = 64;
 
 /// The exit code of a forwarder that was invoked correctly and could not do its work.
@@ -52,6 +55,20 @@ pub enum Command {
         #[command(subcommand)]
         surface: ClaudeCode,
     },
+    /// Gemini CLI's native bridge: its session and notification hooks.
+    #[command(name = "gemini-cli")]
+    GeminiCli {
+        /// The registration that started this process.
+        #[command(subcommand)]
+        surface: Hooks,
+    },
+    /// Qoder CLI's native bridge: its session, tool and notification hooks.
+    #[command(name = "qoder-cli")]
+    QoderCli {
+        /// The registration that started this process.
+        #[command(subcommand)]
+        surface: Hooks,
+    },
     /// Runs an integrated invocation's program, after presenting it to the backend the worker gave
     /// it: the executable, then its argument vector, command name first, after `--`.
     Launch {
@@ -61,6 +78,13 @@ pub enum Command {
         /// it is named by nothing a shell runs.
         #[arg(long, hide = true, value_name = "MILLISECONDS")]
         hold_after_admission: Option<u64>,
+        /// Waits, before the program is executed on any route, until this file exists.
+        ///
+        /// It exists for the host's own tests, which change the executable while a launch waits
+        /// to be told it is committed, and must not have the program executed before the change
+        /// is complete; it is named by nothing a shell runs.
+        #[arg(long, hide = true, value_name = "PATH")]
+        hold_before_exec: Option<std::path::PathBuf>,
         /// The executable and its argument vector.
         #[arg(last = true, required = true, num_args = 2.., value_name = "INVOCATION")]
         invocation: Vec<std::ffi::OsString>,
@@ -83,6 +107,13 @@ pub enum ClaudeCode {
     /// The Channels server Claude Code starts over this process's standard input and output.
     Channel,
     /// One lifecycle or tool hook: reads the event on standard input and answers `{}`.
+    Hook,
+}
+
+/// The one registration of a bridge that has hooks and nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Subcommand)]
+pub enum Hooks {
+    /// One hook: reads the event on standard input and answers `{}`.
     Hook,
 }
 
@@ -117,6 +148,18 @@ mod tests {
             }
         );
         assert_eq!(
+            parse(&["gemini-cli", "hook"]).expect("Gemini CLI's hook registration"),
+            Command::GeminiCli {
+                surface: Hooks::Hook
+            }
+        );
+        assert_eq!(
+            parse(&["qoder-cli", "hook"]).expect("Qoder CLI's hook registration"),
+            Command::QoderCli {
+                surface: Hooks::Hook
+            }
+        );
+        assert_eq!(
             parse(&["relay"]).expect("the relay"),
             Command::Relay {
                 close_after_hello: false
@@ -133,6 +176,7 @@ mod tests {
             .expect("the launcher"),
             Command::Launch {
                 hold_after_admission: None,
+                hold_before_exec: None,
                 invocation: ["/usr/local/bin/claude", "claude", "--resume"]
                     .into_iter()
                     .map(std::ffi::OsString::from)
@@ -151,6 +195,7 @@ mod tests {
             .expect("a separator in the invocation is the invocation's"),
             Command::Launch {
                 hold_after_admission: None,
+                hold_before_exec: None,
                 invocation: ["/usr/local/bin/claude", "claude", "--", "--help"]
                     .into_iter()
                     .map(std::ffi::OsString::from)
@@ -172,6 +217,15 @@ mod tests {
             &["claude-code", "channel", "--session", "abc"][..],
             &["claude-code", "--close-after-hello", "hook"][..],
             &["codex", "hook"][..],
+            &["gemini-cli"][..],
+            &["gemini-cli", "channel"][..],
+            &["gemini-cli", "hook", "extra"][..],
+            &["gemini", "hook"][..],
+            &["qoder-cli"][..],
+            &["qoder-cli", "channel"][..],
+            &["qoder-cli", "Hook"][..],
+            &["qoder-cli", "hook", "--close-after-hello"][..],
+            &["qoder", "hook"][..],
             &["relay", "extra"][..],
             &["--session=abc", "claude-code", "hook"][..],
             &["launch"][..],

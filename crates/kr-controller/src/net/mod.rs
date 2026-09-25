@@ -165,10 +165,12 @@ impl NetworkSetup {
             ),
         };
         // A host whose platform cannot verify a service's certificate offers no code invitation,
-        // and says so when one is asked for.
-        let rendezvous = rendezvous_https::HttpsRendezvous::new()
-            .ok()
-            .map(|service| Arc::new(service) as Arc<dyn rendezvous::Rendezvous>);
+        // and says so when one is asked for. The rendezvous goes through the proxy the endpoint
+        // goes through, the one this document selects, or none.
+        let rendezvous =
+            rendezvous_https::HttpsRendezvous::new(settings.endpoint.proxy_url.clone())
+                .ok()
+                .map(|service| Arc::new(service) as Arc<dyn rendezvous::Rendezvous>);
         Ok(Some(Self {
             settings,
             secrets,
@@ -206,8 +208,9 @@ impl NetworkGuard {
 
     /// Returns the configuration a pairing invitation carries, with this endpoint's current hints.
     ///
-    /// The selected services are this host's own configuration; the direct addresses are hints
-    /// taken as they stand now, because that is all a hint ever is.
+    /// The selected services are this host's own configuration. The direct addresses are the ones
+    /// this endpoint reports for itself now ([`Self::direct_addresses`]), taken as they stand,
+    /// because that is all a hint ever is.
     ///
     /// # Errors
     ///
@@ -219,12 +222,30 @@ impl NetworkGuard {
             .to_network_config()
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         config.direct_addresses = self
-            .bound_sockets()
+            .direct_addresses()
             .into_iter()
             .filter_map(|socket| kr_protocol::pairing::NetworkHint::new(socket.to_string()).ok())
             .take(kr_protocol::pairing::MAX_NETWORK_HINTS)
             .collect();
         Ok(config)
+    }
+
+    /// Returns the direct addresses this endpoint reports for itself, which are where a peer dials
+    /// it.
+    ///
+    /// They are not the sockets it bound. A socket bound to the unspecified address answers on the
+    /// machine's own addresses, so the endpoint names those, on the port it bound, and never the
+    /// unspecified address itself: `0.0.0.0` and `[::]` name no machine a peer could reach. The
+    /// endpoint finds its interface addresses when it binds, before it accepts anything, and adds
+    /// an address a relay observed or a gateway mapped once it learns one. An endpoint with no IP
+    /// transport, one that only relays, has none.
+    pub(crate) fn direct_addresses(&self) -> Vec<std::net::SocketAddr> {
+        self.listener
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|listener| listener.endpoint().addr().ip_addrs().copied().collect())
+            .unwrap_or_default()
     }
 
     /// Returns the configuration this host's endpoint was built from: its relay map and the
@@ -233,7 +254,10 @@ impl NetworkGuard {
         &self.host.endpoint
     }
 
-    /// Returns the addresses this endpoint is bound to, which are the hints a peer dials.
+    /// Returns the sockets this endpoint is bound to, one per IP transport.
+    ///
+    /// A peer dials [`Self::direct_addresses`] instead: a socket bound to the unspecified address
+    /// is not an address anyone can reach.
     pub(crate) fn bound_sockets(&self) -> Vec<std::net::SocketAddr> {
         self.listener
             .lock()
@@ -292,8 +316,9 @@ impl Network {
 
     /// Returns the configuration a pairing invitation carries, with this endpoint's current hints.
     ///
-    /// The selected services are this host's own configuration; the direct addresses are hints
-    /// taken as they stand now, because that is all a hint ever is.
+    /// The selected services are this host's own configuration. The direct addresses are the ones
+    /// this endpoint reports for itself now ([`Self::direct_addresses`]), taken as they stand,
+    /// because that is all a hint ever is.
     ///
     /// # Errors
     ///
@@ -302,7 +327,17 @@ impl Network {
         self.guard.network_config()
     }
 
-    /// Returns the addresses this endpoint is bound to, which are the hints a peer dials.
+    /// Returns the direct addresses this endpoint reports for itself, which are where a peer dials
+    /// it and what a pairing invitation hints.
+    ///
+    /// They are not the sockets it bound: a socket bound to the unspecified address answers on the
+    /// machine's own addresses, and the endpoint names those rather than the unspecified address.
+    #[must_use]
+    pub fn direct_addresses(&self) -> Vec<std::net::SocketAddr> {
+        self.guard.direct_addresses()
+    }
+
+    /// Returns the sockets this endpoint is bound to, one per IP transport.
     #[must_use]
     pub fn bound_sockets(&self) -> Vec<std::net::SocketAddr> {
         self.guard.bound_sockets()
@@ -322,11 +357,10 @@ impl Network {
 
     /// Revokes one device, and reports which workers have not yet acknowledged it.
     ///
-    /// The record and the authority revision move in one critical section, in the lock order the
-    /// daemon's own revocation takes. That is what closes the window a revocation would otherwise
-    /// have: a connection cannot be admitted between the moment the record is withdrawn and the
-    /// moment the revision that fences the live ones is in force, because both happen before the
-    /// registry lock is released.
+    /// A restrictive change in the order every one takes: its debt is written, its restriction
+    /// (the record) takes effect, and the daemon's one barrier retires the debt. The device cannot
+    /// be admitted once its record is withdrawn, and the barrier fences whatever was admitted under
+    /// it before.
     ///
     /// A revocation is not complete when it is recorded. It is complete for a worker once that
     /// worker has acknowledged the revision and said what its fence did, or has been confirmed
@@ -563,54 +597,35 @@ impl NetworkHost {
 
     /// Revokes one device and fences whatever it was doing.
     ///
-    /// The order is the contract. The live fence goes first, because it is the only step that
-    /// cannot fail and the only one whose absence would leave a revoked device being served: the
-    /// registration is withdrawn, the connection's write boundary is closed, and what it owned at
-    /// its worker is released. Only then is the record written and the revision advanced, both
-    /// inside the same critical section, so nothing can be admitted between a withdrawn record and
-    /// the revision that fences the connections already admitted. A failure after the fence is
-    /// reported with the fence standing rather than silently leaving it undone.
+    /// The order is the contract: the debt, then the live fence, the record and the barrier. A
+    /// failure after the fence is reported with the fence standing rather than silently leaving it
+    /// undone.
     async fn revoke_device(
         &self,
         device_id: DeviceId,
     ) -> Result<kr_protocol::action::RevocationBarrier> {
         let controller = self.daemon()?;
-        let revision = {
-            let mut registry = controller.registry.lock().await;
-            let revoked = kr_transport::listener::device_principal(&device_id);
-            // The connections this fences are this device's. Nobody else's authority was
-            // withdrawn, and a local terminal losing its connection because a phone was revoked
-            // would be a fence on the wrong thing.
-            let mut admitted = controller.admitted_table();
-            admitted.retain(|_, connection| connection.actor_id != revoked);
-            drop(admitted);
-            self.withdraw_device(device_id);
-            self.devices.revoke(device_id, kr_ipc::now_ms())?;
-            registry.advance_authority_revision()?;
-            let revision = registry.authority_revision()?;
-            // The connections that were *not* withdrawn hold authority this revocation did not
-            // touch, so they are admitted at the revision now in force. Leaving them at the
-            // previous one would refuse their next mutation as revoked and make one device's
-            // revocation everybody's reconnection. What the revision still fences is work already
-            // admitted: a mutation carries the revision it was admitted under, and one admitted
-            // before this point is refused inside its own transaction as it was before.
-            let mut admitted = controller.admitted_table();
-            for connection in admitted.values_mut() {
-                connection.admitted_revision = revision;
-            }
-            drop(admitted);
-            revision
-        };
-        controller.leases.revoke(revision);
-        // The host policy decides a paired device's request against the revision in force, and a
-        // device paired after this revocation is issued a grant at this revision.
-        controller
-            .policy
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .advance_authority_revision(revision);
+        // The debt first, pending, so a stop after the record changes still owes a barrier.
+        let debt = controller.owe_debt(
+            &format!("the revocation of device {device_id}"),
+            crate::service::Reach::Device(device_id),
+        )?;
+        // The live fence, because it is the only step that cannot fail and the only one whose
+        // absence would leave a revoked device being served: its connections' write boundaries are
+        // closed and what they owned at their workers is released.
+        self.withdraw_device(device_id);
+        // The restriction. The debt is published whether or not it landed: a barrier for a
+        // revocation whose record did not change withdraws nothing more, and a failure is reported
+        // with the fence standing rather than silently leaving it undone.
+        let recorded = self.devices.revoke(device_id, kr_ipc::now_ms());
+        controller.publish_debts(&[(debt, crate::service::Reach::Device(device_id))]);
+        // The barrier withdraws this device's registrations and admits every other connection at
+        // the revision it advances to: nobody else's authority was withdrawn, and a local terminal
+        // losing its connection because a phone was revoked would be a fence on the wrong thing.
+        let barrier = controller.barrier().await;
+        recorded?;
         controller.unbind_device(device_id);
-        controller.announce_authority_revision().await
+        barrier
     }
 
     /// Establishes this host's clock again, on an owner's authority.
@@ -626,7 +641,10 @@ impl NetworkHost {
     /// answered, and an error when the record cannot be written.
     async fn establish_clock(&self) -> Result<()> {
         self.pairing.accept_clock()?;
-        self.lifetimes.clock_trust().establish(&self.devices)
+        let established = self.lifetimes.clock_trust().establish(&self.devices)?;
+        // The same word ends a boot's lost clock continuity, which the registry records for the
+        // boot so a restart of this daemon in it does not lose it again.
+        self.daemon()?.establish_clock_continuity(established).await
     }
 
     /// Returns the records a connection reads and writes, each of which outlives it.
@@ -1366,15 +1384,8 @@ impl Controller {
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         match reply.closure.as_ref() {
             Some(record) => self.retire(record).await?,
-            // The worker has accepted the close and is stopping its processes. Something has to
-            // notice when that finishes, so the tombstone is written and the descriptor removed
-            // rather than left pointing at a process that has gone.
-            None => {
-                tokio::spawn(Arc::clone(self).watch_closure(
-                    session_id,
-                    kr_protocol::session::ClosureReason::CloseRequested,
-                ));
-            }
+            // The worker has accepted the close and is stopping its processes.
+            None => self.close_accepted(session_id).await,
         }
         crate::service::encode(&reply)
     }
@@ -1581,6 +1592,11 @@ impl Controller {
             .policy
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A floor still owed its record is written before anything is decided on it, whoever owed
+        // it: an earlier refusal here, or a worker of this host whose copy's deadline passed at a
+        // reading nothing had written down. The decision then stands on the record rather than
+        // being refused for it.
+        self.write_owed_floor(&policy);
         // The bound a remote caller under a personal grant is held to, which is the policy's own
         // rule for when it applies.
         let offline = (request.ingress != kr_protocol::actor::ActorIngress::LocalIpc
@@ -1646,11 +1662,6 @@ impl Controller {
                     },
                 ));
             }
-        } else {
-            // Before this answer goes out, and whatever it is: a refusal whose record could not be
-            // written earlier is written as soon as storage takes it, rather than waiting for the
-            // clock to refuse something else.
-            self.write_owed_floor(&policy);
         }
         decided
     }
@@ -1767,7 +1778,7 @@ impl Controller {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use kr_protocol::actor::ActorIngress;
@@ -1801,11 +1812,98 @@ mod tests {
     }
 
     /// Starts a daemon on an environment that may already hold an earlier daemon's records.
-    pub(super) async fn daemon(temp: &kr_ipc::testing::TempHost) -> Arc<Controller> {
+    pub(crate) async fn daemon(temp: &kr_ipc::testing::TempHost) -> Arc<Controller> {
+        daemon_in(
+            temp,
+            kr_ipc::identity::boot_identity().expect("a boot identity"),
+        )
+        .await
+    }
+
+    /// Starts a daemon as [`daemon`] does, in the boot `boot_identity` names.
+    async fn daemon_in(
+        temp: &kr_ipc::testing::TempHost,
+        boot_identity: kr_protocol::identity::BootIdentity,
+    ) -> Arc<Controller> {
+        started(|| Controller::start(setup(temp, boot_identity.clone()))).await
+    }
+
+    /// Starts a daemon as [`daemon`] does, on clocks this test moves by hand.
+    pub(super) async fn daemon_on(
+        temp: &kr_ipc::testing::TempHost,
+        clocks: crate::service::Clocks,
+    ) -> Arc<Controller> {
+        started(|| {
+            Controller::start_on_clocks(
+                setup(
+                    temp,
+                    kr_ipc::identity::boot_identity().expect("a boot identity"),
+                ),
+                clocks.clone(),
+            )
+        })
+        .await
+    }
+
+    /// How long a daemon is given to take over an environment a daemon before it held.
+    ///
+    /// A daemon lets go of its environment once nothing of it is left, and its own tasks can still
+    /// hold it for a moment after the test has let it go: one asking its registry a question, or
+    /// reading its clocks. A replacement started at once can therefore find the environment held.
+    /// That is a liveness condition: what these tests assert is that the replacement takes the
+    /// environment over, not how soon the last reference goes.
+    const ENVIRONMENT_HANDOVER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Starts a daemon with `start`, and again while a daemon this test let go still holds the
+    /// environment, until [`ENVIRONMENT_HANDOVER_DEADLINE`]. Any other failure fails the test.
+    pub(crate) async fn started<F, S>(start: F) -> Arc<Controller>
+    where
+        F: Fn() -> S,
+        S: std::future::Future<Output = crate::error::Result<Arc<Controller>>>,
+    {
+        let begun = std::time::Instant::now();
+        loop {
+            match start().await {
+                Ok(controller) => return controller,
+                Err(crate::error::ControllerError::AlreadyRunning { .. })
+                    if begun.elapsed() < ENVIRONMENT_HANDOVER_DEADLINE => {}
+                Err(error) => panic!("the daemon starts: {error}"),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Clocks this test moves by hand: a continuous clock, and a wall clock that reads what the
+    /// test last set, from the machine's reading now. A bound on either passes only when the test
+    /// moves it, however long the runner takes between two steps.
+    pub(super) fn manual_clocks() -> (
+        kr_transport::clock::ManualClock,
+        Arc<std::sync::atomic::AtomicU64>,
+        crate::service::Clocks,
+    ) {
+        let continuous = kr_transport::clock::ManualClock::new();
+        let wall = Arc::new(std::sync::atomic::AtomicU64::new(kr_ipc::now_ms().get()));
+        let clocks = crate::service::Clocks {
+            continuous: Arc::new(continuous.clone()),
+            wall: {
+                let wall = Arc::clone(&wall);
+                crate::service::WallClock::from_fn(move || {
+                    wall.load(std::sync::atomic::Ordering::SeqCst)
+                })
+            },
+        };
+        (continuous, wall, clocks)
+    }
+
+    /// What a test daemon is started with, in the boot `boot_identity` names.
+    pub(crate) fn setup(
+        temp: &kr_ipc::testing::TempHost,
+        boot_identity: kr_protocol::identity::BootIdentity,
+    ) -> ControllerSetup {
         let environment = temp.environment();
         let environment_id = temp.environment_id();
         let secrets = environment.secrets_dir();
-        Controller::start(ControllerSetup {
+        ControllerSetup {
             paths: environment,
             environment_id,
             identity: Box::new(move || {
@@ -1819,16 +1917,14 @@ mod tests {
                 .expect("an identity"))
             }),
             secret_store: kr_crypto::store::StoreSelection::File,
-            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+            boot_identity,
             supervisor: Box::new(NoWorkers),
             worker_program: temp.root().join("kr-worker"),
             build_id: BuildId::new("kr-test/0").expect("a build identifier"),
             release: "0".to_owned(),
             shell_packages: None,
             terminal: Box::new(crate::supervision::NoTerminal),
-        })
-        .await
-        .expect("the daemon starts")
+        }
     }
 
     /// A redeemed grant to one device, carrying viewing.
@@ -1998,6 +2094,374 @@ mod tests {
             matches!(refused, CeilingRefusal::Refused(Refusal::Expired { .. })),
             "{refused:?}"
         );
+        drop(controller);
+    }
+
+    /// The clock floor this environment maps in this boot, mapped again as a worker maps it.
+    fn worker_mapping(temp: &kr_ipc::testing::TempHost) -> kr_ipc::floor::SharedFloor {
+        let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
+        kr_ipc::floor::SharedFloor::open(
+            &temp.environment().utc_floor_file(),
+            temp.environment_id(),
+            kr_ipc::identity::boot_epoch(&boot).expect("a boot epoch"),
+        )
+        .expect("the floor is this environment's, for this boot")
+    }
+
+    /// Stops `controller` once nothing else holds it, so its environment lock is released.
+    pub(in crate::service) async fn stopped(controller: Arc<Controller>) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while Arc::strong_count(&controller) > 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stopped daemon is still held"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        drop(controller);
+    }
+
+    /// Stops `controller` and starts the next daemon on the same environment, in this boot.
+    async fn restarted(
+        controller: Arc<Controller>,
+        temp: &kr_ipc::testing::TempHost,
+    ) -> Arc<Controller> {
+        stopped(controller).await;
+        daemon(temp).await
+    }
+
+    /// The host's floor is one word for the boot. A daemon's floor and a worker's mapping of it
+    /// read and raise the same word; a daemon started again in the same boot keeps the file, its
+    /// identity and its word, and marks nothing lost; a daemon started in another boot replaces a
+    /// file of the earlier one with a new floor that starts at the host's record.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_shared_floor_is_one_word_for_the_boot() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = daemon(&temp).await;
+        let worker = worker_mapping(&temp);
+        let identity = worker.identity().expect("a mapped floor has an identity");
+        assert_eq!(controller.utc_floor().get(), worker.load());
+        let ahead = kr_ipc::now_ms().get() + 60 * 60 * 1000;
+        worker.raise(ahead);
+        assert_eq!(
+            controller.utc_floor().get(),
+            ahead,
+            "a worker's reading is the daemon's floor at once"
+        );
+        let boot = controller.boot_epoch;
+        assert_eq!(
+            controller
+                .registry
+                .lock()
+                .await
+                .floors_of_boot(boot)
+                .expect("readable"),
+            vec![crate::registry::RecordedFloor {
+                identity,
+                in_force: true
+            }]
+        );
+
+        // The control: ordinary reopening keeps the floor as it stands.
+        let controller = restarted(controller, &temp).await;
+        assert!(
+            worker.named(),
+            "the file was opened as it stands, not replaced"
+        );
+        assert_eq!(worker_mapping(&temp).identity(), Some(identity));
+        assert!(controller.utc_floor().get() >= ahead, "the word is kept");
+        assert!(!controller.utc_floor().continuity_lost());
+        assert!(
+            written_floor(&controller) >= ahead,
+            "the start wrote the floor it found down"
+        );
+
+        // Another boot: the earlier boot's file is replaced by a floor that starts at the record.
+        // On Unix only: on Windows a file cannot be replaced while anything maps it, and in another
+        // boot nothing does.
+        stopped(controller).await;
+        #[cfg(unix)]
+        another_boot_replaces_the_floor(&temp, &worker, identity, ahead).await;
+    }
+
+    /// Starts a daemon in another boot on `temp`, whose floor `worker` maps as `identity` with its
+    /// word at `ahead`: the file is replaced by a floor that starts at the host's record.
+    #[cfg(unix)]
+    async fn another_boot_replaces_the_floor(
+        temp: &kr_ipc::testing::TempHost,
+        worker: &kr_ipc::floor::SharedFloor,
+        identity: kr_ipc::floor::FloorIdentity,
+        ahead: u64,
+    ) {
+        let later_boot = kr_protocol::identity::BootIdentity {
+            source: kr_protocol::identity::BootIdentitySource::MacosBootSessionUuid,
+            value: kr_protocol::scalars::Bytes::new(vec![0x5b; 16]),
+        };
+        let later = daemon_in(temp, later_boot.clone()).await;
+        assert!(
+            !worker.named(),
+            "the earlier boot's file no longer has the name"
+        );
+        let replaced = kr_ipc::floor::SharedFloor::open(
+            &temp.environment().utc_floor_file(),
+            temp.environment_id(),
+            kr_ipc::identity::boot_epoch(&later_boot).expect("a boot epoch"),
+        )
+        .expect("the later boot's floor");
+        assert_ne!(replaced.identity(), Some(identity));
+        assert!(
+            replaced.load() >= ahead,
+            "a new floor starts at the host's record"
+        );
+        assert!(replaced.recorded() >= ahead);
+        assert!(
+            !later.utc_floor().continuity_lost(),
+            "a boot's first floor loses nothing"
+        );
+        drop(later);
+    }
+
+    /// A daemon with an expiring grant whose expiry lies an hour ahead, and a worker of the host
+    /// whose own wall clock reads past that expiry: the worker publishes its reading in the floor and
+    /// refuses a copy of the grant as unrecorded, since nothing written down covers the expiry. That
+    /// is the order a lost floor must not undo: the durable floor below the expiry, a worker's
+    /// reading past it, and nothing recorded since. Returns the daemon, the expiring grant and one
+    /// that never expires, the wall clock reading the daemon decides at, and the expiry.
+    async fn a_worker_passed_an_expiry(
+        temp: &kr_ipc::testing::TempHost,
+    ) -> (
+        Arc<Controller>,
+        (Grant, GrantRecord),
+        (Grant, GrantRecord),
+        u64,
+        u64,
+    ) {
+        use kr_worker::action::time::{ManualWallClock, TimeContract, TimeSources, UtcDeadline};
+
+        let controller = daemon(temp).await;
+        let revision = controller.policy().authority_revision();
+        let now = kr_ipc::now_ms().get();
+        let expires = now + 60 * 60 * 1000;
+        let expiring = granted(
+            GrantExpiry::At {
+                expires_at_ms: TimestampMs::new(expires),
+            },
+            revision,
+        );
+        let lasting = granted(GrantExpiry::Never, revision);
+        controller
+            .decide_for_device(&expiring.0, &expiring.1, listing(temp, now))
+            .expect("the control: the grant stands at the daemon's own reading");
+        assert!(
+            written_floor(&controller) < expires,
+            "the durable floor is below the expiry"
+        );
+
+        let worker = TimeContract::new(
+            kr_ipc::identity::boot_identity().expect("a boot identity"),
+            "",
+            TimeSources {
+                wall: Arc::new(ManualWallClock::new(expires + 1_000)),
+                ..TimeSources::system().with_floor(Arc::new(worker_mapping(temp)))
+            },
+        );
+        assert_eq!(
+            worker.check_utc_deadline(expires),
+            UtcDeadline::Unrecorded,
+            "the worker refuses the copy and names no expiry"
+        );
+        assert!(controller.utc_floor().get() > expires);
+        assert!(controller.utc_floor().is_owed());
+        (controller, expiring, lasting, now, expires)
+    }
+
+    /// A floor whose file lost its name in a boot is a lost floor, not a first start. A worker had
+    /// published a reading past a grant's expiry in it and refused a copy as unrecorded, and nothing
+    /// written down covers that expiry. The next daemon creates a new floor at the durable floor,
+    /// below the expiry, and records the boot's clock continuity as lost, so the grant is not decided
+    /// again from a floor that lost that reading: every bound that can pass is refused as unproven,
+    /// whatever its continuous deadline, until the owner establishes the clock, and no copy under it
+    /// is cut. Authority that reads no clock is untouched. A restart in the boot keeps that state, and
+    /// a lost floor moved back into place is never adopted.
+    ///
+    /// Unix only: on Windows every mapping holds the file open without delete sharing, so a floor
+    /// loses its name only once every process of the boot has let it go, which one test process
+    /// that keeps its daemon's tasks cannot arrange.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lost_floor_leaves_every_bound_unproven_until_the_owner_establishes_the_clock() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (controller, (expiring, expiring_record), (lasting, lasting_record), now, expires) =
+            a_worker_passed_an_expiry(&temp).await;
+
+        let path = temp.environment().utc_floor_file();
+        let lost = worker_mapping(&temp);
+        let kept = temp.environment().runtime_dir().join("kept");
+        std::fs::hard_link(&path, &kept).expect("a link elsewhere");
+        std::fs::remove_file(&path).expect("the floor's name is removed");
+        assert!(!lost.named());
+
+        let controller = restarted(controller, &temp).await;
+        assert!(controller.utc_floor().continuity_lost());
+        assert_ne!(worker_mapping(&temp).identity(), lost.identity());
+        assert!(
+            controller.utc_floor().get() < expires,
+            "the new floor starts at the durable floor, below the expiry"
+        );
+        let refused = controller
+            .decide_for_device(&expiring, &expiring_record, listing(&temp, now))
+            .expect_err("nothing proves the bound, whatever the daemon's clock says");
+        assert!(
+            matches!(refused, CeilingRefusal::Refused(Refusal::ClockUnproven)),
+            "{refused:?}"
+        );
+        assert_eq!(
+            refused.to_protocol_error().code,
+            kr_protocol::error::ErrorCode::ClockUntrusted
+        );
+        controller
+            .decide_for_device(&lasting, &lasting_record, listing(&temp, now))
+            .expect("a grant that reads no clock is served");
+
+        // A restart in the same boot keeps the state, and so does moving the lost file back.
+        let controller = restarted(controller, &temp).await;
+        assert!(controller.utc_floor().continuity_lost());
+        let current = worker_mapping(&temp).identity();
+        stopped(controller).await;
+        std::fs::rename(&kept, &path).expect("the lost file is moved back");
+        let controller = daemon(&temp).await;
+        let adopted = worker_mapping(&temp).identity();
+        assert_ne!(adopted, lost.identity(), "a lost floor is never adopted");
+        assert_ne!(adopted, current, "it is replaced by a new one");
+        assert!(controller.utc_floor().continuity_lost());
+
+        // The owner establishes the clock: the bound is decided again, and a restart in the boot
+        // keeps it established.
+        controller
+            .establish_clock_continuity(TimestampMs::new(now))
+            .await
+            .expect("recorded");
+        controller
+            .decide_for_device(&expiring, &expiring_record, listing(&temp, now))
+            .expect("the grant stands once the clock is established");
+        let controller = restarted(controller, &temp).await;
+        assert!(!controller.utc_floor().continuity_lost());
+        controller
+            .decide_for_device(&expiring, &expiring_record, listing(&temp, now))
+            .expect("and it stays established in this boot");
+        drop(controller);
+    }
+
+    /// The control for the lost floor: ordinary reopening. The same worker's reading past the
+    /// expiry, the same unrecorded refusal, then a restart that finds the file in place. The new
+    /// daemon keeps the word, writes it down as it starts, which covers what the worker owed, and
+    /// refuses the grant as expired with its own clock below the expiry: nothing was lost, so
+    /// nothing is unproven.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lapse_a_worker_owed_is_recorded_across_an_ordinary_restart() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (controller, (expiring, expiring_record), _, now, expires) =
+            a_worker_passed_an_expiry(&temp).await;
+        let controller = restarted(controller, &temp).await;
+        assert!(!controller.utc_floor().continuity_lost());
+        assert!(controller.utc_floor().get() > expires, "the word is kept");
+        assert!(
+            written_floor(&controller) > expires,
+            "the start writes down the floor it found, which covers what the worker owed"
+        );
+        assert!(!controller.utc_floor().is_owed());
+        let refused = controller
+            .decide_for_device(&expiring, &expiring_record, listing(&temp, now))
+            .expect_err("the worker's reading passed the expiry");
+        assert!(
+            matches!(refused, CeilingRefusal::Refused(Refusal::Expired { .. })),
+            "{refused:?}"
+        );
+        assert!(
+            written_floor(&controller) > expires,
+            "the lapse is on record"
+        );
+        assert!(!controller.utc_floor().is_owed());
+        drop(controller);
+    }
+
+    /// The daemon's floor keeps its record rule over the shared word. A worker's reading past an
+    /// expiry is the daemon's floor, so the daemon refuses the grant whatever its own clock says,
+    /// and answers the lapse only once the floor is written down, which it does before its next
+    /// decision; a worker's owed lapse is owed here too; the file's record word says what is
+    /// written; and a raise that decides no lapse owes and writes nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_shared_floor_keeps_the_record_rule_at_the_device_door() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = daemon(&temp).await;
+        let worker = worker_mapping(&temp);
+        let revision = controller.policy().authority_revision();
+        let now = kr_ipc::now_ms().get();
+        let expires = now + 60 * 60 * 1000;
+        let expiry = GrantExpiry::At {
+            expires_at_ms: TimestampMs::new(expires),
+        };
+        let (expiring, expiring_record) = granted(expiry, revision);
+        let (lasting, lasting_record) = granted(GrantExpiry::Never, revision);
+
+        // The control: a worker's raise that stays below every expiry decides no lapse, owes
+        // nothing and writes nothing.
+        worker.raise(now + 10 * 60 * 1000);
+        controller
+            .decide_for_device(&expiring, &expiring_record, listing(&temp, now))
+            .expect("the grant stands");
+        assert!(!controller.utc_floor().is_owed());
+        assert!(written_floor(&controller) < now + 10 * 60 * 1000);
+
+        let registry = refuse_policy_writes(&temp);
+        worker.raise(expires + 1);
+        assert_eq!(controller.utc_floor().get(), worker.load(), "one floor");
+        let refused = controller
+            .decide_for_device(&expiring, &expiring_record, listing(&temp, now))
+            .expect_err("the worker's reading passed the expiry");
+        assert!(
+            matches!(
+                refused,
+                CeilingRefusal::Refused(Refusal::ExpiryUnrecorded { .. })
+            ),
+            "{refused:?}"
+        );
+        assert!(written_floor(&controller) < expires);
+        let effect = controller
+            .sharing()
+            .grants()
+            .bound_passed(expiry, now)
+            .expect_err("an effect under the grant is not decided either");
+        assert_eq!(
+            effect.to_protocol_error().code,
+            kr_protocol::error::ErrorCode::StorageUnavailable
+        );
+
+        // A worker that refused a copy on that reading owes it its record.
+        worker.owe(worker.load());
+        assert!(controller.utc_floor().is_owed());
+
+        // Storage takes the write: the next decision writes the floor before it decides, and the
+        // file's record word covers the expiry.
+        allow_policy_writes(&registry);
+        controller
+            .decide_for_device(&lasting, &lasting_record, listing(&temp, now))
+            .expect("a grant that does not expire is served");
+        assert!(written_floor(&controller) > expires);
+        assert!(worker.recorded() > expires);
+        assert!(!controller.utc_floor().is_owed());
+        let refused = controller
+            .decide_for_device(&expiring, &expiring_record, listing(&temp, now))
+            .expect_err("the grant stays expired");
+        assert!(
+            matches!(refused, CeilingRefusal::Refused(Refusal::Expired { .. })),
+            "{refused:?}"
+        );
+        assert_eq!(
+            controller.sharing().grants().bound_passed(expiry, now).ok(),
+            Some(true)
+        );
+        assert_eq!(controller.utc_floor().get(), worker.load(), "one floor");
         drop(controller);
     }
 
@@ -2217,21 +2681,16 @@ mod tests {
 
     /// The offline bound runs out on the continuous clock it was anchored on. A decision taken
     /// after the wall clock was wound back reads UTC inside the bound again, and is refused all the
-    /// same; a synchronisation of the authority feed anchors the bound afresh.
+    /// same; a synchronisation of the authority feed anchors the bound afresh. On clocks the test
+    /// moves by hand, so no step depends on how much real time passes between two others.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_offline_bound_runs_out_on_the_clock_it_was_anchored_on() {
         let temp = kr_ipc::testing::TempHost::create();
-        let controller = daemon(&temp).await;
+        let (continuous, wall, clocks) = manual_clocks();
+        let synchronised = wall.load(std::sync::atomic::Ordering::SeqCst);
+        let controller = daemon_on(&temp, clocks).await;
         let revision = controller.policy().authority_revision();
-        let synchronised = kr_ipc::now_ms().get();
-        controller
-            .update_policy(|policy| {
-                policy.set_offline_validity(Some(kr_protocol::sharing::OfflineValidityPolicy {
-                    maximum_offline_ms: kr_protocol::scalars::DurationMs::new(200),
-                    last_synchronised_at_ms: Nullable::some(TimestampMs::new(synchronised)),
-                }));
-            })
-            .expect("the owner chooses an offline bound of a fifth of a second");
+        choose_offline_bound(&controller, synchronised, 200);
         let (lasting, lasting_record) = granted(GrantExpiry::Never, revision);
         let decision = controller
             .decide_for_device(&lasting, &lasting_record, listing(&temp, synchronised))
@@ -2241,25 +2700,26 @@ mod tests {
             "and the bound is anchored"
         );
 
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        // The wall clock has been wound back five seconds. With the floor this host holds, UTC is
-        // still inside the bound.
-        let refused = controller
-            .decide_for_device(
+        // The continuous clock passes the bound, and the wall clock is wound back five seconds.
+        // With the floor this host holds, UTC is still inside the bound.
+        continuous.advance(std::time::Duration::from_millis(300));
+        wall.store(synchronised - 5_000, std::sync::atomic::Ordering::SeqCst);
+        offline_lapsed(
+            controller.decide_for_device(
                 &lasting,
                 &lasting_record,
                 listing(&temp, synchronised - 5_000),
-            )
-            .expect_err("the bound ran out on the continuous clock");
-        assert!(
-            matches!(
-                refused,
-                CeilingRefusal::Refused(Refusal::OfflineValidityLapsed { .. })
             ),
-            "{refused:?}"
+            "the bound ran out on the continuous clock",
         );
 
+        // The control: a later reading alone anchors nothing, so the bound stays run out.
         let again = synchronised + 1_000;
+        wall.store(again, std::sync::atomic::Ordering::SeqCst);
+        offline_lapsed(
+            controller.decide_for_device(&lasting, &lasting_record, listing(&temp, again)),
+            "nothing anchored the bound afresh",
+        );
         controller
             .update_policy(|policy| policy.note_feed_synchronised(again))
             .expect("the authority feed synchronises");
@@ -2370,16 +2830,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_shorter_offline_bound_after_a_rollback_never_ends_later() {
         let temp = kr_ipc::testing::TempHost::create();
-        let controller = daemon(&temp).await;
+        let (continuous, wall, clocks) = manual_clocks();
+        let controller = daemon_on(&temp, clocks).await;
         let revision = controller.policy().authority_revision();
-        let synchronised = kr_ipc::now_ms().get();
+        let synchronised = wall.load(std::sync::atomic::Ordering::SeqCst);
         choose_offline_bound(&controller, synchronised, 400);
         let (lasting, lasting_record) = granted(GrantExpiry::Never, revision);
         controller
             .decide_for_device(&lasting, &lasting_record, listing(&temp, synchronised))
             .expect("inside the bound");
 
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        continuous.advance(std::time::Duration::from_millis(300));
         // The request's reading is wound back two hundred milliseconds, and the owner shortens the
         // bound to a quarter of a second without a synchronisation. Three hundred milliseconds
         // have passed, which is more than the shorter bound allows.
@@ -2402,16 +2863,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_offline_lapse_the_continuous_clock_found_is_written_down_once_storage_takes_it() {
         let temp = kr_ipc::testing::TempHost::create();
-        let controller = daemon(&temp).await;
+        let (continuous, wall, clocks) = manual_clocks();
+        let controller = daemon_on(&temp, clocks).await;
         let revision = controller.policy().authority_revision();
-        let synchronised = kr_ipc::now_ms().get();
+        let synchronised = wall.load(std::sync::atomic::Ordering::SeqCst);
         choose_offline_bound(&controller, synchronised, 200);
         let (lasting, lasting_record) = granted(GrantExpiry::Never, revision);
         controller
             .decide_for_device(&lasting, &lasting_record, listing(&temp, synchronised))
             .expect("inside the bound");
 
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        continuous.advance(std::time::Duration::from_millis(300));
         let registry = refuse_offline_time_writes(&temp);
         let floor = controller.policy().utc_floor_ms();
         offline_lapsed(
@@ -2439,8 +2901,8 @@ mod tests {
             "the time spent is written down once storage takes it"
         );
 
-        drop(controller);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // A daemon on the machine's own clocks reads the time spent from the record.
+        stopped(controller).await;
         let controller = daemon(&temp).await;
         offline_lapsed(
             controller.decide_for_device(

@@ -13,6 +13,7 @@
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use kr_cbor::CborError;
 
@@ -540,21 +541,58 @@ pub const MAILBOX_CLAIM_LIFETIME_MS: u64 = 5 * 60 * 1000;
 /// shared secret is the X25519 agreement of the two keys. Both public keys are inside the hash, so
 /// an answer derived for one challenge cannot answer another, and the domain keeps the value from
 /// meaning anything anywhere else.
+///
+/// The agreement is a secret for as long as the challenge can be answered, so the bytes that are
+/// hashed are one buffer that is wiped once the digest is taken: [`claim_input`] builds it by
+/// hand. A value tree would hold copies of the agreement of its own, and dropping the tree would
+/// release them without wiping them. The hash function's own working state is outside this crate.
 #[must_use]
 pub fn mailbox_claim_value(
     ephemeral_key: &StoredEnvelopeKey,
     recipient_key: &StoredEnvelopeKey,
     shared_secret: &[u8; 32],
 ) -> Digest256 {
-    let value = kr_cbor::signing_value(
-        MAILBOX_CLAIM_DOMAIN,
-        vec![
-            kr_cbor::CanonicalValue::bytes(ephemeral_key.as_bytes().as_slice()),
-            kr_cbor::CanonicalValue::bytes(recipient_key.as_bytes().as_slice()),
-            kr_cbor::CanonicalValue::bytes(shared_secret.as_slice()),
-        ],
+    let input = claim_input(ephemeral_key, recipient_key, shared_secret);
+    Digest256::from_bytes(kr_cbor::sha256(input.as_slice()))
+}
+
+/// `CBOR(["kr-mailbox-claim/1", ephemeral_key, recipient_key, shared_secret])`, in one buffer that
+/// wipes itself when it is dropped.
+///
+/// The domain and the two keys are public, so they are encoded through the value tree. The
+/// agreement is written after them by hand: `0x84` opens a four-element array, and `0x58 0x20` is
+/// the head of a 32-byte string. The capacity is exact, so the buffer never grows once the
+/// agreement is in it. `the_claim_input_is_the_canonical_encoding` holds these bytes to the
+/// value-tree encoder.
+fn claim_input(
+    ephemeral_key: &StoredEnvelopeKey,
+    recipient_key: &StoredEnvelopeKey,
+    shared_secret: &[u8; 32],
+) -> Zeroizing<Vec<u8>> {
+    let public = [
+        kr_cbor::encode(&kr_cbor::CanonicalValue::text(MAILBOX_CLAIM_DOMAIN)),
+        kr_cbor::encode(&kr_cbor::CanonicalValue::bytes(
+            ephemeral_key.as_bytes().as_slice(),
+        )),
+        kr_cbor::encode(&kr_cbor::CanonicalValue::bytes(
+            recipient_key.as_bytes().as_slice(),
+        )),
+    ];
+    let length = 1 + public.iter().map(Vec::len).sum::<usize>() + 2 + shared_secret.len();
+    let mut input = Zeroizing::new(Vec::with_capacity(length));
+    input.push(0x84);
+    for encoded in &public {
+        input.extend_from_slice(encoded);
+    }
+    input.push(0x58);
+    input.push(0x20);
+    input.extend_from_slice(shared_secret);
+    debug_assert_eq!(
+        input.len(),
+        length,
+        "the buffer is sized to exactly what it holds"
     );
-    Digest256::from_bytes(kr_cbor::sha256(&kr_cbor::encode(&value)))
+    input
 }
 
 /// One kibibyte.
@@ -716,6 +754,58 @@ mod tests {
             mailbox_claim_value(&ephemeral, &StoredEnvelopeKey::from_bytes([9; 32]), &secret)
         );
         assert_ne!(value, mailbox_claim_value(&ephemeral, &recipient, &[9; 32]));
+    }
+
+    /// KR-REQ-20.02: the bytes that are hashed are the ones the value-tree encoder writes, so
+    /// building them by hand, in one buffer that wipes itself, changes no answer.
+    #[test]
+    fn the_claim_input_is_the_canonical_encoding() {
+        for (ephemeral, recipient, secret) in [
+            ([1u8; 32], [2u8; 32], [3u8; 32]),
+            ([0x55; 32], [0x66; 32], [0x77; 32]),
+            (
+                [0; 32],
+                [0xff; 32],
+                core::array::from_fn(|index| index as u8),
+            ),
+        ] {
+            let ephemeral = StoredEnvelopeKey::from_bytes(ephemeral);
+            let recipient = StoredEnvelopeKey::from_bytes(recipient);
+            let through_the_tree = kr_cbor::encode(&kr_cbor::signing_value(
+                MAILBOX_CLAIM_DOMAIN,
+                vec![
+                    kr_cbor::CanonicalValue::bytes(ephemeral.as_bytes().as_slice()),
+                    kr_cbor::CanonicalValue::bytes(recipient.as_bytes().as_slice()),
+                    kr_cbor::CanonicalValue::bytes(secret.as_slice()),
+                ],
+            ));
+            let assembled = claim_input(&ephemeral, &recipient, &secret);
+            assert_eq!(assembled.as_slice(), through_the_tree.as_slice());
+            assert_eq!(
+                mailbox_claim_value(&ephemeral, &recipient, &secret),
+                Digest256::from_bytes(kr_cbor::sha256(&through_the_tree))
+            );
+        }
+    }
+
+    /// The value the published vector names, which a service computes on its side from the same
+    /// inputs: building the input by hand leaves it where it was.
+    #[test]
+    fn the_claim_value_is_the_published_vector() {
+        let value = mailbox_claim_value(
+            &StoredEnvelopeKey::from_bytes([0x55; 32]),
+            &StoredEnvelopeKey::from_bytes([0x66; 32]),
+            &[0x77; 32],
+        );
+        let hex = value
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            hex,
+            "8423aebc8cb33464091d17c30a22b1ee0fd55c8c94695b220be680af9fa08435"
+        );
     }
 
     #[test]

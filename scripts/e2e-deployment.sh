@@ -15,10 +15,13 @@
 # closing lines, and it is the deployment's to end: a durable record ends when it is acknowledged,
 # refused or removed, and not by a lapse of time.
 #
-# The origin is checked before anything is printed or built. It must name HTTPS and it must be a
-# host and an optional port and nothing else, because this signs requests to whatever it is given
-# and because an address may carry a user name and a password in front of the host. A refusal says
-# which rule the value broke and never repeats the value, since this report is written to a log.
+# The origin is checked before anything is printed or sent and before the legs are built: here for
+# the characters no origin holds, and then by the product's own parsers, which are the rule, through a
+# small program the cross-boundary checkpoint's package builds from the protocol crate alone. It must
+# name HTTPS and it must be a host and an optional port and nothing else, because this signs requests
+# to whatever it is given and because an address may carry a user name and a password in front of the
+# host. A refusal says which rule the value broke and never repeats the value, since this report is
+# written to a log.
 #
 # Usage: scripts/e2e-deployment.sh https://example.invalid
 #        KR_DEPLOYED_ORIGIN=https://example.invalid scripts/e2e-deployment.sh
@@ -48,9 +51,9 @@ if [ -z "$origin" ]; then
   exit 2
 fi
 
-# The same rules a gateway origin is held to, applied here so that a value which is not one is
-# refused before it reaches a log, a signed request or a directory name. Nothing below repeats the
-# value: whoever typed it has it, and a log that quoted it would publish whatever was in it.
+# The shape every origin has, applied here so that a value which cannot be one is refused before it
+# reaches a build, a log, a signed request or a directory name. Nothing below repeats the value:
+# whoever typed it has it, and a log that quoted it would publish whatever was in it.
 authority="${origin#https://}"
 if [ "$authority" = "$origin" ]; then
   echo "this checks a deployment, and a deployment is reached over https://" >&2
@@ -74,6 +77,21 @@ if [ -n "${authority//[]A-Za-z0-9.:[-]/}" ]; then
   echo "an origin is a host and an optional port in printable ASCII, and nothing else" >&2
   exit 2
 fi
+
+# The product's own reading of the origin, which is the rule: the parser a managed-service request is
+# addressed with and the one a host reserves its invitations with, which read an HTTPS origin by one
+# grammar. It names the rule a refused value broke, never the value.
+checked=0
+cargo run --locked --quiet -p kr-e2e-m1b --no-default-features --bin kr-e2e-m1b-origin -- "$origin" ||
+  checked=$?
+case "$checked" in
+  0) ;;
+  2) exit 2 ;;
+  *)
+    echo "the origin could not be checked, so this deployment was not contacted" >&2
+    exit 1
+    ;;
+esac
 
 for file in tests/integration/sync/tests/*.rs; do
   name="$(basename "$file" .rs)"

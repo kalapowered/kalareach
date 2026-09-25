@@ -12,7 +12,9 @@
 //! | [`paths`] | The owner-only runtime and state directories, endpoint names and atomic file publication |
 //! | [`identity`] | The host's boot identity, its boot epoch and a process's start identity, read from the kernel |
 //! | [`clock`] | The machine's own continuous clock, which two host processes can compare |
+//! | [`floor`] | The host's one reading of UTC in a boot, a word every host process maps |
 //! | [`peer`] | Peer-credential authentication of a local caller |
+//! | [`starter`] | What an environment's starter and the daemon that hands it a launch need from the platform: the launch pipe, a child checked before it runs, the start claim and the recorded login session |
 //! | [`endpoint`] | Binding, connecting and accepting, over Unix sockets or Windows named pipes |
 //! | [`framed`] | The length-delimited KR-CBOR-1 frame codec on a connection |
 //! | [`client`] | Connecting, negotiating, verifying a worker and calling a method |
@@ -61,10 +63,12 @@ pub mod clock;
 pub mod descriptor;
 pub mod endpoint;
 pub mod error;
+pub mod floor;
 pub mod framed;
 pub mod identity;
 pub mod paths;
 pub mod peer;
+pub mod starter;
 #[cfg(feature = "testing")]
 pub mod testing;
 pub mod verify;

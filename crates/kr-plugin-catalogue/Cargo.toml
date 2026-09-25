@@ -18,17 +18,24 @@ cap-std.workspace = true
 futures.workspace = true
 jiff.workspace = true
 kr-crypto.workspace = true
+# The host's shared directory flush, through a handle the store already holds, on every platform.
+kr-ipc.workspace = true
 kr-plugin-sdk.workspace = true
 kr-protocol.workspace = true
 # Reads a delegated role's name back out of the file the update client fetches its document from,
 # so a role past the depth bound is refused before its document is asked for. The same release the
 # client and the URL parser encode with.
 percent-encoding = "=2.3.2"
+# The repository client: one GET per file, read as a stream. The host builds it with its own trust
+# and proxy and hands it in; nothing here chooses either.
+reqwest = { workspace = true, features = ["stream"] }
 # The catalogue's records and receipts: one transactional owner, written with full durability.
 rusqlite = { workspace = true, features = ["bundled"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# The wait between two tries of a fetch that failed before its answer began.
+tokio.workspace = true
 tough.workspace = true
 url.workspace = true
 
@@ -39,9 +46,9 @@ rustix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 aws-lc-rs.workspace = true
-kr-ipc.workspace = true
+# The TLS provider a test's own repository client is built on; a host's comes with its trust.
+rustls.workspace = true
 tempfile.workspace = true
-tokio.workspace = true
 
 [lints]
 workspace = true

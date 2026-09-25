@@ -663,6 +663,7 @@ async fn a_desktop_bound_session_closes_with_desktop_lost_when_its_login_ends() 
         worker_endpoint: None,
         send_queue_bytes: 8 * 1024 * 1024,
         resident_bytes: 1024 * 1024,
+        time: kr_worker::action::time::TimeSources::system(),
         launch_profile: kr_protocol::session::LaunchProfile::default(),
     };
     let mut session = Session::open(config).expect("opens");

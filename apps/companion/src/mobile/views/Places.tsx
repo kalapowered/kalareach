@@ -12,6 +12,7 @@ import type { EnvironmentListResult, SessionListResult } from '@kalareach/protoc
 import { useApp } from '../../app/state'
 import { failureMessage } from '../../host/port'
 import { Banner } from '../../components/ui'
+import { accountName } from '../../views/account-name'
 import { ask } from '../model/call'
 import { minimumTarget, type Surface } from '../platform'
 
@@ -105,7 +106,7 @@ export function MobileHosts({ surface }: { readonly surface: Surface }): ReactNo
           answer.environments.map((environment) => ({
             id: environment.environment_id,
             title: environment.label,
-            where: `${environment.os} · ${environment.arch} · ${environment.os_user}`,
+            where: `${environment.os} · ${environment.arch} · ${accountName(environment)}`,
             // What this device knows is how many sessions the host reported. It knows nothing
             // about a host it has not heard from, and says nothing about one.
             detail: `${environment.live_sessions} live ${environment.live_sessions === '1' ? 'session' : 'sessions'}`,

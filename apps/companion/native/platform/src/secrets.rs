@@ -20,6 +20,9 @@
 
 use std::sync::Arc;
 
+use base64::Engine as _;
+use kr_crypto::CryptoError;
+use kr_crypto::secret::SecretVec;
 use kr_crypto::store::{SecretName, SecretStore};
 use tauri::{AppHandle, Runtime};
 
@@ -112,6 +115,54 @@ pub fn open<R: Runtime>(app: &AppHandle<R>) -> Result<Arc<dyn SecretStore>, Plat
         Ok(Arc::new(android::KeystoreStore {
             handle: platform.handle.clone(),
         }))
+    }
+}
+
+/// Reads one item's value as the Android store hands it back: the secret in base64's standard
+/// alphabet, padded, as the store's `set` wrote it.
+///
+/// It is here rather than in the Android module so that it compiles, and is tested, on every
+/// platform. The secret is decoded into a buffer allocated at its final size, so no copy of it is
+/// left behind by a reallocation, and what a failed decode had written is cleared with the buffer.
+///
+/// # Errors
+///
+/// Refuses a value that is not such an encoding with the rule it broke and where: see
+/// [`stored_fault`].
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn read_stored(value: &str) -> kr_crypto::Result<SecretVec> {
+    let mut decoded = Vec::with_capacity(base64::decoded_len_estimate(value.len()));
+    match base64::engine::general_purpose::STANDARD.decode_vec(value, &mut decoded) {
+        Ok(()) => Ok(SecretVec::new(decoded)),
+        Err(error) => {
+            drop(SecretVec::new(decoded));
+            Err(CryptoError::SecretStore {
+                message: stored_fault(&error),
+            })
+        }
+    }
+}
+
+/// What a stored value that is not base64 says: which rule it broke, and the offset or the length
+/// where it broke it.
+///
+/// Never the symbol the decoder refused. The value is the encoding of a secret, so every symbol of
+/// it is part of the secret, the refused one included, and a message that named it would put that
+/// part in a log. The offset is enough to find the fault in a value somebody holds.
+fn stored_fault(error: &base64::DecodeError) -> String {
+    match *error {
+        base64::DecodeError::InvalidByte(offset, _) => {
+            format!("the symbol at offset {offset} is not a base64 symbol")
+        }
+        base64::DecodeError::InvalidLength(length) => {
+            format!("{length} symbols is not the length of any base64 encoding")
+        }
+        base64::DecodeError::InvalidLastSymbol { offset, .. } => {
+            format!("the last symbol, at offset {offset}, sets bits past the last byte")
+        }
+        base64::DecodeError::InvalidPadding => {
+            "the value does not end in the padding base64 gives its length".to_owned()
+        }
     }
 }
 
@@ -275,12 +326,7 @@ mod android {
                 )
                 .map_err(failed)?;
             read.value
-                .map(|value| {
-                    base64::engine::general_purpose::STANDARD
-                        .decode(value)
-                        .map(SecretVec::new)
-                        .map_err(failed)
-                })
+                .map(|value| super::read_stored(&value))
                 .transpose()
         }
 
@@ -321,6 +367,58 @@ mod tests {
         ] {
             assert!(private_group(refused).is_err(), "{refused:?}");
         }
+    }
+
+    /// The Android store's reader refuses a stored value it cannot decode with the rule the value
+    /// broke and where, and never with a symbol of the value: the value is a secret's encoding, so
+    /// every symbol of it, the refused one included, is part of the secret. Each planted value
+    /// carries a marker where the decoder stops, and no spelling of the marker may be in the
+    /// message.
+    #[test]
+    fn a_stored_value_that_is_not_base64_is_refused_without_a_symbol_of_it() {
+        let secret = base64::engine::general_purpose::STANDARD.encode(b"ABCDEF");
+        assert_eq!(secret, "QUJDREVG");
+        let cases = [
+            // A marker outside the standard alphabet, in place of the fifth symbol.
+            (
+                "QUJD~EVG".to_owned(),
+                '~',
+                "the secret store failed: the symbol at offset 4 is not a base64 symbol",
+            ),
+            // A symbol of the alphabet whose bits run past the last byte: itself part of the secret.
+            (
+                "QR==".to_owned(),
+                'R',
+                "the secret store failed: the last symbol, at offset 1, sets bits past the last byte",
+            ),
+        ];
+        for (planted, marker, expected) in cases {
+            let message = match read_stored(&planted) {
+                Ok(_) => panic!("{planted} is not a base64 encoding"),
+                Err(refusal) => refusal.to_string(),
+            };
+            let code = u32::from(marker);
+            for spelling in [
+                marker.to_string(),
+                code.to_string(),
+                format!("{code:#x}"),
+                format!("{code:#04x}"),
+            ] {
+                assert!(
+                    !message.contains(&spelling),
+                    "the message quotes the refused symbol as {spelling:?}: {message}"
+                );
+            }
+            assert_eq!(message, expected);
+        }
+    }
+
+    /// A stored value that is the encoding it should be decodes to the secret, as before.
+    #[test]
+    fn a_stored_value_decodes_to_the_secret_it_encodes() {
+        let stored = base64::engine::general_purpose::STANDARD.encode(b"a grant");
+        let secret = read_stored(&stored).expect("a base64 encoding");
+        assert_eq!(secret.expose(), b"a grant");
     }
 
     /// Every item is in the private group, readable after first unlock on this device only, and

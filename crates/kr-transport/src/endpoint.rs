@@ -11,13 +11,16 @@
 //! none, the relay connection and the Pkarr requests go directly. The two relay probes are the
 //! exception: iroh builds their client with the environment's proxy settings when it is given no
 //! proxy, and offers no way to turn that off, so they follow `HTTP_PROXY`, `HTTPS_PROXY` and
-//! `ALL_PROXY` when those are set.
+//! `ALL_PROXY` when those are set. Name lookups go directly either way, over plain DNS or DNS over
+//! TLS: the resolver is this module's, and it has no DNS-over-HTTPS client, which would follow
+//! those variables too.
 //!
 //! [`connect`] is the dialling half: it opens a connection and, when a relay the connection needed
 //! turned this endpoint away, or the network refused the relay's WebSocket upgrade, says so rather
 //! than reporting a peer that did not answer.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -111,13 +114,15 @@ async fn bind(
             reason: "an endpoint with no relay and no direct path can reach nothing".to_owned(),
         });
     }
-    if !config.relay_ca_roots.is_empty() {
-        let roots = config
+    let ca_tls = CaTlsConfig::default().with_extra_roots(
+        config
             .relay_ca_roots
             .iter()
-            .map(|der| CertificateDer::from(der.clone()));
-        builder = builder.ca_tls_config(CaTlsConfig::default().with_extra_roots(roots));
-    }
+            .map(|der| CertificateDer::from(der.clone())),
+    );
+    builder = builder
+        .dns_resolver(dns_resolver(&ca_tls)?)
+        .ca_tls_config(ca_tls);
     // The relay client tunnels through the proxy with CONNECT, and the net report sends its relay
     // latency probe and captive-portal check through it. Nothing falls back to a direct connection
     // when the proxy cannot be reached: the owner chose to go through it. `proxy_from_env` is never
@@ -158,19 +163,23 @@ async fn bind(
 /// refused.
 ///
 /// iroh keeps the reason a relay gave for refusing this endpoint, but only for this endpoint's home
-/// relay, and only as the latest thing that relay said. So the relay status is followed for the
-/// whole attempt, and a refusal counts only when it came from a relay on this connection's route: a
-/// relay the address names, or one this endpoint already holds for the peer, both of which iroh
-/// tries. A home relay that refused but is not on the route says nothing about this connection. A
-/// relay on the route that is not this endpoint's home relay leaves no reason to read, so a failure
-/// through it is reported as any other failure is.
+/// relay, and only until it dials that relay again. So the relay status is followed for the whole
+/// attempt, and a refusal counts only while the status shows it, and only when it came from a relay
+/// on this connection's route: a relay the address names, or one this endpoint already holds for
+/// the peer, both of which iroh tries. The status reports the latest state and can pass over the
+/// states between two readings, so a relay seen refusing and then seen being dialled again may have
+/// admitted this endpoint in between; what it said before is not reported. A home relay that
+/// refused but is not on the route says nothing about this connection. A relay on the route that is
+/// not this endpoint's home relay leaves no reason to read, so a failure through it is reported as
+/// any other failure is.
 ///
-/// A refusal is reported only for an attempt that was made and then timed out before any
-/// connection was established. A request this endpoint could not make, a peer that closed, reset
-/// or refused the handshake and an endpoint that was closing are each their own reason, whatever a
-/// relay said at the time. The timeout alone does not prove the refusal caused it: a peer that began
-/// the handshake and fell silent times out the same way. What is reported is that a relay on the
-/// route had turned this endpoint away when the attempt ran out.
+/// A refusal is reported only for an attempt that was made and did not connect: one that timed out
+/// before any connection was established, or one that an endpoint with no IP transport ends early,
+/// as below. A request this endpoint could not make, a peer that closed, reset or refused the
+/// handshake and an endpoint that was closing are each their own reason, whatever a relay said at
+/// the time. The timeout alone does not prove the refusal caused it: a peer that began the
+/// handshake and fell silent times out the same way. What a timeout's failure reports is that the
+/// status showed a relay on the route turning this endpoint away when the attempt ran out.
 ///
 /// A network that blocks WebSocket upgrades lets the relay's HTTPS through and answers the upgrade
 /// the relay connection starts with something other than `101 Switching Protocols`, such as `403`.
@@ -180,12 +189,14 @@ async fn bind(
 /// for the latest attempt to reach the relay, which is the only place iroh reports it. When the
 /// route holds both, a relay's own refusal is reported first, because it says what may still work.
 ///
-/// An endpoint with no IP transport of its own has nothing but relays to try, so once every relay
-/// on its route has refused it, or cannot be upgraded to, the attempt ends there rather than at its
-/// deadline: only a change outside this endpoint can open a path, iroh goes on dialling the relays
-/// on its own, and an attempt made once they admit it succeeds. An endpoint that can take a direct
-/// path lets the attempt run, because an address hint or local discovery can still open one, and
-/// the refusal is the reason only if none does.
+/// An endpoint with no IP transport of its own has nothing but relays to try, so once the status
+/// shows every relay on its route refusing it, or refusing its upgrade, the attempt ends there
+/// rather than at its deadline: only a change outside this endpoint can open a path, iroh goes on
+/// dialling the relays on its own, and an attempt made once they admit it succeeds. An endpoint
+/// that can take a direct path lets the attempt run, because an address hint or local discovery can
+/// still open one, and the refusal is the reason only if none does and the status still shows it
+/// when the attempt ends. At that moment iroh may be dialling the relay again, which shows no
+/// refusal, and the failure is then a timeout.
 ///
 /// # Errors
 ///
@@ -218,10 +229,11 @@ pub async fn connect(
 /// Runs one attempt that has been made while following what this endpoint's relays say, and
 /// decides what a failure of it is.
 ///
-/// Every value the status delivers is taken in as it is delivered, and the status is read afresh
-/// wherever a decision rests on it: before a relay-only endpoint gives up, after the route is read,
-/// because reading it waits, and when the attempt has failed. When a change and the attempt's end
-/// are ready at once, the change is taken in first.
+/// A refusal counts only while the status shows it, so the status is read afresh wherever a
+/// decision rests on it: before a relay-only endpoint gives up, after the route is read, because
+/// reading it waits, and when the attempt has failed. A change in the status wakes a relay-only
+/// endpoint to read it and decide again. An endpoint that can take a direct path decides nothing
+/// until its attempt ends, so it does not watch.
 async fn through_relays<T, S, F, R>(
     attempt: impl Future<Output = std::result::Result<T, ConnectingError>>,
     statuses: S,
@@ -234,10 +246,9 @@ where
     R: Future<Output = BTreeSet<RelayUrl>>,
 {
     let mut followed = Followed::new(statuses);
-    let mut watching = true;
+    let mut watching = !direct;
     tokio::pin!(attempt);
     loop {
-        followed.refresh();
         if !direct {
             let relays = route().await;
             followed.refresh();
@@ -272,8 +283,8 @@ where
 /// Decides what an ended attempt comes to.
 ///
 /// A connection is a connection. A failure is a relay's refusal, or a refused upgrade, only when
-/// the attempt timed out before connecting and a relay on its route, as the status stands now, had
-/// refused this endpoint or could not be upgraded to.
+/// the attempt timed out before connecting and the status, as it stands now, shows a relay on its
+/// route refusing this endpoint or its upgrade.
 async fn decided<T, S, F, R>(
     outcome: std::result::Result<T, ConnectingError>,
     followed: &mut Followed<S>,
@@ -348,30 +359,27 @@ fn refused(relay: &RelayUrl, refusal: &Refusal, direct: bool) -> TransportError 
     }
 }
 
-/// What one relay's status says about whether it can be used.
+/// What one relay's status shows about whether it can be used.
+///
+/// iroh reports a refusal only while the latest attempt to reach the relay is the one that was
+/// refused. A relay it is connected to, one it is dialling again and one it last failed to reach
+/// for another cause show no refusal of either kind.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RelayObservation {
     relay: RelayUrl,
-    /// Whether the endpoint is connected to the relay now.
-    connected: bool,
     /// The reason the relay gave, when it refused the endpoint's latest attempt to reach it.
     refused: Option<String>,
     /// The HTTP status the relay's WebSocket upgrade was refused with, when that is how the latest
     /// attempt to reach it ended.
     upgrade_refused: Option<u16>,
-    /// Whether the latest attempt to reach the relay failed, for either of those reasons or any
-    /// other.
-    failed: bool,
 }
 
 impl RelayObservation {
     fn of(status: &RelayStatus) -> Self {
         Self {
             relay: status.url().clone(),
-            connected: status.is_connected(),
             refused: status.auth_denied_reason().map(ToOwned::to_owned),
             upgrade_refused: status.last_error().and_then(|error| upgrade_refusal(error)),
-            failed: status.last_error().is_some(),
         }
     }
 }
@@ -413,9 +421,9 @@ trait RelayStatuses {
     /// Returns the status as it stands now, which is every relay it reports on.
     fn now(&mut self) -> Vec<RelayObservation>;
 
-    /// Returns the value the status took when it last changed since it was last read, and arranges
-    /// to be woken when it changes. `Ready(None)` means it never will again.
-    fn poll_next(&mut self, context: &mut Context<'_>) -> Poll<Option<Vec<RelayObservation>>>;
+    /// Returns whether the status changed since it was last read, and arranges to be woken when
+    /// it changes. `Ready(false)` means it never will again.
+    fn poll_changed(&mut self, context: &mut Context<'_>) -> Poll<bool>;
 }
 
 /// This endpoint's home relays, as iroh reports them.
@@ -426,22 +434,16 @@ impl<W: Watcher<Value = Vec<RelayStatus>>> RelayStatuses for HomeRelays<W> {
         self.0.get().iter().map(RelayObservation::of).collect()
     }
 
-    fn poll_next(&mut self, context: &mut Context<'_>) -> Poll<Option<Vec<RelayObservation>>> {
-        match self.0.poll_updated(context) {
-            Poll::Ready(Ok(())) => Poll::Ready(Some(
-                self.0.peek().iter().map(RelayObservation::of).collect(),
-            )),
-            Poll::Ready(Err(_)) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
+    fn poll_changed(&mut self, context: &mut Context<'_>) -> Poll<bool> {
+        self.0.poll_updated(context).map(|updated| updated.is_ok())
     }
 }
 
 /// The relay status as one attempt follows it.
 ///
-/// Reading and taking in are one step here, so no value the status delivers can be decided past
-/// without being taken in: the status is read only through this, and everything read is observed
-/// before it is returned or dropped.
+/// The status is read only through this. A refusal counts only while the status shows it, so every
+/// decision is made on a reading taken for it, and what that reading shows replaces what the
+/// reading before it showed. A change in the status only wakes the attempt to read it again.
 struct Followed<S> {
     statuses: S,
     refusals: Refusals,
@@ -461,25 +463,18 @@ impl<S: RelayStatuses> Followed<S> {
         self.refusals.observe(now);
     }
 
-    /// Takes in the next value the status delivers. `Ready(false)` means it never will again.
+    /// Waits for the status to change. `Ready(false)` means it never will again.
     fn poll_changed(&mut self, context: &mut Context<'_>) -> Poll<bool> {
-        match self.statuses.poll_next(context) {
-            Poll::Ready(Some(value)) => {
-                self.refusals.observe(value);
-                Poll::Ready(true)
-            }
-            Poll::Ready(None) => Poll::Ready(false),
-            Poll::Pending => Poll::Pending,
-        }
+        self.statuses.poll_changed(context)
     }
 
-    /// Returns the refusals taken in so far.
+    /// Returns the refusals the latest reading showed.
     fn refusals(&self) -> &Refusals {
         &self.refusals
     }
 }
 
-/// Why a relay cannot be used, as its status last said.
+/// Why a relay cannot be used, as its status shows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Refusal {
     /// The relay turned this endpoint away, giving this reason.
@@ -488,47 +483,33 @@ enum Refusal {
     Upgrade(u16),
 }
 
-/// The refusals this endpoint's relays last met, by relay.
+/// The refusals the relay status showed when it was last read, by relay.
 #[derive(Debug, Default)]
 struct Refusals(BTreeMap<RelayUrl, Refusal>);
 
 impl Refusals {
-    /// Takes in the relay status as it stands now, which is every relay iroh reports on.
+    /// Takes in the relay status as one reading shows it, which is every relay iroh reports on.
     ///
-    /// A relay's refusal stands while the endpoint dials the relay again, because the relay has said
-    /// nothing newer. It ends when the relay admits the endpoint, when the latest attempt failed
-    /// for another cause, since then the refusal is no longer why the relay cannot be reached, and
-    /// when the relay leaves the status, since nothing said about that relay afterwards is reported
-    /// and what was said last can no longer be known to be current. A relay's own refusal is kept
-    /// over a refused upgrade in the same status, because the relay answered.
-    ///
-    /// A refused upgrade counts only while the status shows it. The status reports the latest
-    /// state and can pass over the states between two readings, so a relay seen refusing the
-    /// upgrade and then seen being dialled again may have been reached in between.
+    /// A refusal counts only while the status shows it, whether the relay turned this endpoint away
+    /// or the network refused the upgrade, so what this reading shows replaces whatever an earlier
+    /// one showed. The status reports the latest state and can pass over the states between two
+    /// readings: a relay seen refusing and then seen being dialled again may have admitted the
+    /// endpoint in between, and the network may have let an upgrade through. A relay that is being
+    /// dialled again, is connected, last failed for another cause or has left the status shows no
+    /// refusal. A relay's own refusal is kept over a refused upgrade in the same status, because
+    /// the relay answered.
     fn observe(&mut self, snapshot: impl IntoIterator<Item = RelayObservation>) {
-        let mut reported = BTreeSet::new();
-        for observation in snapshot {
-            reported.insert(observation.relay.clone());
-            let refusal = match (observation.refused, observation.upgrade_refused) {
-                (Some(reason), _) => Some(Refusal::Relay(reason)),
-                (None, Some(status)) => Some(Refusal::Upgrade(status)),
-                (None, None) => None,
-            };
-            match refusal {
-                Some(refusal) => {
-                    self.0.insert(observation.relay, refusal);
-                }
-                None if observation.connected || observation.failed => {
-                    self.0.remove(&observation.relay);
-                }
-                None => {
-                    if matches!(self.0.get(&observation.relay), Some(Refusal::Upgrade(_))) {
-                        self.0.remove(&observation.relay);
-                    }
-                }
-            }
-        }
-        self.0.retain(|relay, _| reported.contains(relay));
+        self.0 = snapshot
+            .into_iter()
+            .filter_map(|observation| {
+                let refusal = match (observation.refused, observation.upgrade_refused) {
+                    (Some(reason), _) => Refusal::Relay(reason),
+                    (None, Some(status)) => Refusal::Upgrade(status),
+                    (None, None) => return None,
+                };
+                Some((observation.relay, refusal))
+            })
+            .collect();
     }
 
     /// Returns the refusal to report for `route`: the first relay on it that turned this endpoint
@@ -547,8 +528,8 @@ impl Refusals {
             .or_else(|| first(|refusal| matches!(refusal, Refusal::Upgrade(_))))
     }
 
-    /// Returns the refusal to report when no relay on `route` can be used, which leaves an endpoint
-    /// with no direct transport nothing else to try.
+    /// Returns the refusal to report when the status shows every relay on `route` refusing, which
+    /// leaves an endpoint with no direct transport nothing else to try.
     fn throughout<'a>(
         &'a self,
         route: &'a BTreeSet<RelayUrl>,
@@ -628,6 +609,81 @@ fn apply_discovery(mut builder: Builder, config: &EndpointConfig) -> Result<Buil
     Ok(builder)
 }
 
+/// The public resolvers this endpoint's lookups fall back to, each as its IPv4 and IPv6 primary
+/// addresses and then its secondary ones.
+///
+/// They are the three iroh falls back to (n0-dns-resolver 0.1.0's `public_resolvers`: Cloudflare,
+/// Google and Quad9), whose certificates name these addresses, so DNS over TLS verifies without a
+/// server name.
+const PUBLIC_RESOLVERS: [[IpAddr; 4]; 3] = [
+    [
+        IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+        IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
+        IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
+        IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1001)),
+    ],
+    [
+        IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888)),
+        IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)),
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8844)),
+    ],
+    [
+        IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
+        IpAddr::V6(Ipv6Addr::new(0x2620, 0x00fe, 0, 0, 0, 0, 0, 0x00fe)),
+        IpAddr::V4(Ipv4Addr::new(149, 112, 112, 112)),
+        IpAddr::V6(Ipv6Addr::new(0x2620, 0x00fe, 0, 0, 0, 0, 0, 0x0009)),
+    ],
+];
+
+/// Returns the resolver this endpoint looks names up with: the system's configuration, and behind
+/// it the public resolvers over plain DNS and DNS over TLS.
+///
+/// iroh's own resolver has the same two tiers, but its fallback also asks over DNS over HTTPS, and
+/// that client follows `HTTPS_PROXY` and `ALL_PROXY` whether or not a proxy is selected. This one
+/// speaks no HTTP, so no proxy variable moves a lookup. (On Windows the system's configuration
+/// includes the hosts file, which the resolver reads under `SystemRoot`.) DNS over TLS verifies
+/// against the same anchors as the relay, and like the rest of the lookup it goes directly.
+fn dns_resolver(ca_tls: &CaTlsConfig) -> Result<iroh::dns::DnsResolver> {
+    let tls = ca_tls
+        .client_config(iroh_relay::tls::default_provider())
+        .map_err(|error| TransportError::Configuration {
+            what: "dns".to_owned(),
+            kind: "DNS resolver",
+            reason: error.to_string(),
+        })?;
+    Ok(iroh::dns::DnsResolver::builder()
+        .with_system_defaults()
+        .fallback_nameserver_configs(fallback_nameservers())
+        .tls_client_config(tls)
+        .build())
+}
+
+/// Returns the fallback tier in iroh's own order, with DNS over TLS where iroh has DNS over HTTPS.
+///
+/// Plain entries go round the providers, primary addresses first, and one encrypted entry per
+/// provider sits after the first two, inside the first wave of queries, so on a network that
+/// filters port 53 the encrypted ones are already racing. A plain entry asks over UDP and asks
+/// again over TCP when an answer is truncated or does not come.
+fn fallback_nameservers() -> Vec<iroh::dns::NameserverConfig> {
+    use iroh::dns::NameserverConfig;
+
+    let mut servers: Vec<NameserverConfig> = (0..4)
+        .flat_map(|index| {
+            PUBLIC_RESOLVERS
+                .iter()
+                .map(move |provider| NameserverConfig::udp(provider[index]))
+        })
+        .collect();
+    servers.splice(
+        2..2,
+        PUBLIC_RESOLVERS
+            .iter()
+            .map(|provider| NameserverConfig::tls(provider[0])),
+    );
+    servers
+}
+
 /// Returns the transport configuration every KalaReach connection uses.
 ///
 /// The keepalive and the idle timeout are the section 23 values. Setting them here rather than per
@@ -649,6 +705,57 @@ fn transport_config() -> QuicTransportConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// KR-REQ-26.14: the endpoint's lookups fall back to the public resolvers over plain DNS and DNS
+    /// over TLS, in iroh's order, and to nothing that speaks HTTP.
+    #[test]
+    fn the_dns_fallback_is_the_public_resolvers_without_http() {
+        use iroh::dns::NameserverConfig;
+
+        let servers = fallback_nameservers();
+        assert_eq!(
+            servers.len(),
+            15,
+            "twelve plain entries and three encrypted"
+        );
+        for server in &servers {
+            let described = format!("{server:?}");
+            assert!(!described.contains("Https"), "{described}");
+        }
+        let v4 = |a, b, c, d| IpAddr::V4(Ipv4Addr::new(a, b, c, d));
+        assert_eq!(
+            servers[..6],
+            [
+                NameserverConfig::udp(v4(1, 1, 1, 1)),
+                NameserverConfig::udp(v4(8, 8, 8, 8)),
+                NameserverConfig::tls(v4(1, 1, 1, 1)),
+                NameserverConfig::tls(v4(8, 8, 8, 8)),
+                NameserverConfig::tls(v4(9, 9, 9, 9)),
+                NameserverConfig::udp(v4(9, 9, 9, 9)),
+            ]
+        );
+    }
+
+    /// KR-REQ-26.14: an endpoint looks names up with that resolver. Its fallback asks the public
+    /// resolvers over DNS over TLS, and never over HTTPS, whose client would follow the
+    /// environment's proxy variables.
+    #[tokio::test]
+    async fn an_endpoint_looks_names_up_with_no_http_client() {
+        let identity = TransportIdentityKeyPair::generate().expect("a transport identity");
+        let endpoint = bind_listener(&EndpointConfig::default(), &identity)
+            .await
+            .expect("an endpoint");
+        let described = format!("{:?}", endpoint.dns_resolver().expect("a resolver"));
+        endpoint.close().await;
+        assert!(
+            described.contains("protocol: Tls"),
+            "the fallback asks the public resolvers over DNS over TLS"
+        );
+        assert!(
+            !described.contains("protocol: Https"),
+            "the fallback asks a resolver over HTTPS"
+        );
+    }
 
     /// KR-REQ-23.09: the transport ALPN is the stable `kalareach`.
     #[test]
@@ -783,13 +890,12 @@ mod tests {
             .expect("a relay URL")
     }
 
+    /// A relay that turned the endpoint away with `reason` on the latest attempt.
     fn refusing(name: &str, reason: &str) -> RelayObservation {
         RelayObservation {
             relay: relay(name),
-            connected: false,
             refused: Some(reason.to_owned()),
             upgrade_refused: None,
-            failed: true,
         }
     }
 
@@ -797,10 +903,8 @@ mod tests {
     fn blocked(name: &str, status: u16) -> RelayObservation {
         RelayObservation {
             relay: relay(name),
-            connected: false,
             refused: None,
             upgrade_refused: Some(status),
-            failed: true,
         }
     }
 
@@ -934,9 +1038,8 @@ mod tests {
 
     /// KR-REQ-10.02: a refused upgrade counts only while the status shows it. It ends when the
     /// relay is dialled again, when the relay admits the endpoint and when the latest attempt
-    /// failed for another cause, where a relay's own refusal stands while the relay is dialled
-    /// again. A relay that cannot be upgraded to is still waited for while another relay on the
-    /// route might carry the attempt.
+    /// failed for another cause. A relay that cannot be upgraded to is still waited for while
+    /// another relay on the route might carry the attempt.
     #[test]
     fn a_refused_upgrade_counts_only_while_the_status_shows_it() {
         let only = relays(&["relay-1"]);
@@ -959,14 +1062,6 @@ mod tests {
         refusals.observe([blocked("relay-1", 403)]);
         refusals.observe([admitted("relay-1")]);
         assert_eq!(refusals.on(&only), None, "the relay was reached");
-
-        refusals.observe([refusing("relay-1", "allowance_spent: spent")]);
-        refusals.observe([redialling("relay-1")]);
-        assert_eq!(
-            refusals.on(&only),
-            Some((&relay("relay-1"), &spent())),
-            "a relay's own refusal stands while it is dialled again"
-        );
     }
 
     /// KR-REQ-10.02: a refused upgrade the status has moved past is not the reason an attempt
@@ -1060,36 +1155,30 @@ mod tests {
         );
     }
 
-    /// KR-REQ-17.40: a refusal stands while the endpoint dials the relay again, and ends when the
-    /// relay admits it or when the latest attempt failed for another cause.
+    /// KR-REQ-17.40: a relay's own refusal counts only while the status shows it, as a refused
+    /// upgrade does. The status reports the latest state and can pass over an admission between two
+    /// readings, so a relay seen refusing and then seen being dialled again may have admitted the
+    /// endpoint in between. The refusal ends when the relay is dialled again, when the latest
+    /// attempt failed for another cause and when the relay admits the endpoint.
     #[test]
-    fn a_refusal_lasts_until_the_relay_says_something_newer() {
+    fn a_refusal_counts_only_while_the_status_shows_it() {
         let only = relays(&["relay-1"]);
-        let redialling = RelayObservation {
-            relay: relay("relay-1"),
-            connected: false,
-            refused: None,
-            upgrade_refused: None,
-            failed: false,
-        };
-        let unreachable = RelayObservation {
-            failed: true,
-            ..redialling.clone()
-        };
-        let admitted = RelayObservation {
-            connected: true,
-            ..redialling.clone()
-        };
-
         let mut refusals = Refusals::default();
         refusals.observe([refusing("relay-1", "allowance_spent: spent")]);
-        refusals.observe([redialling]);
-        assert!(
-            refusals.on(&only).is_some(),
-            "dialling again is not an answer"
+        assert_eq!(refusals.on(&only), Some((&relay("relay-1"), &spent())));
+
+        refusals.observe([redialling("relay-1")]);
+        assert_eq!(
+            refusals.on(&only),
+            None,
+            "a relay being dialled again may have admitted the endpoint since it refused"
         );
 
-        refusals.observe([unreachable]);
+        refusals.observe([refusing("relay-1", "allowance_spent: spent")]);
+        refusals.observe([RelayObservation {
+            refused: None,
+            ..refusing("relay-1", "allowance_spent: spent")
+        }]);
         assert_eq!(
             refusals.on(&only),
             None,
@@ -1097,7 +1186,7 @@ mod tests {
         );
 
         refusals.observe([refusing("relay-1", "allowance_spent: spent")]);
-        refusals.observe([admitted]);
+        refusals.observe([admitted("relay-1")]);
         assert_eq!(
             refusals.on(&only),
             None,
@@ -1105,21 +1194,14 @@ mod tests {
         );
     }
 
-    /// KR-REQ-17.40: a refusal is forgotten once its relay leaves the status. iroh reports on the
-    /// home relays it has now, so once another relay is home nothing the first one says is reported
-    /// again, and what it said last can no longer be known to be current.
+    /// KR-REQ-17.40: a refusal ends once its relay leaves the status. iroh reports on the home
+    /// relays it has now, so once another relay is home nothing the first one says is shown.
     #[test]
     fn a_refusal_is_forgotten_once_its_relay_leaves_the_status() {
         let first = relays(&["relay-1"]);
         let mut refusals = Refusals::default();
         refusals.observe([refusing("relay-1", "allowance_spent: spent")]);
-        refusals.observe([RelayObservation {
-            relay: relay("relay-2"),
-            connected: false,
-            refused: None,
-            upgrade_refused: None,
-            failed: false,
-        }]);
+        refusals.observe([redialling("relay-2")]);
         assert_eq!(refusals.on(&first), None, "another relay became home");
 
         refusals.observe([refusing("relay-1", "allowance_spent: spent")]);
@@ -1127,13 +1209,12 @@ mod tests {
         assert_eq!(refusals.on(&first), None, "no relay is home");
     }
 
+    /// A relay the endpoint is connected to, whose status shows no refusal.
     fn admitted(name: &str) -> RelayObservation {
         RelayObservation {
             relay: relay(name),
-            connected: true,
             refused: None,
             upgrade_refused: None,
-            failed: false,
         }
     }
 
@@ -1141,40 +1222,36 @@ mod tests {
         ConnectingError::from(ConnectionError::TimedOut)
     }
 
+    /// A relay the endpoint is dialling again, whose status shows no refusal whatever the relay
+    /// said before.
     fn redialling(name: &str) -> RelayObservation {
         RelayObservation {
             relay: relay(name),
-            connected: false,
             refused: None,
             upgrade_refused: None,
-            failed: false,
         }
     }
 
     /// A relay status a test changes at the moment it chooses.
     ///
-    /// Each change is the value the status delivers and the value it stands at afterwards, which
-    /// are the same unless the test makes the status change again the moment it is read. A read of
-    /// the status as it stands passes over every change not yet delivered, as iroh's does.
+    /// Each change wakes the reader, as iroh's watcher does. A read of the status as it stands
+    /// passes over every change made since the last one, so a test that changes the status twice
+    /// before it is read makes the first value one no reading sees.
     #[derive(Clone, Default)]
     struct Scripted(std::sync::Arc<std::sync::Mutex<ScriptedState>>);
 
     #[derive(Default)]
     struct ScriptedState {
         current: Vec<RelayObservation>,
-        changes: std::collections::VecDeque<(Vec<RelayObservation>, Vec<RelayObservation>)>,
+        changes: std::collections::VecDeque<Vec<RelayObservation>>,
         waker: Option<std::task::Waker>,
     }
 
     impl Scripted {
+        /// Changes the status to `value`.
         fn set(&self, value: Vec<RelayObservation>) {
-            self.change(value.clone(), value);
-        }
-
-        /// Delivers `delivered` as the next change, after which the status stands at `after`.
-        fn change(&self, delivered: Vec<RelayObservation>, after: Vec<RelayObservation>) {
             let mut state = self.0.lock().expect("the scripted status");
-            state.changes.push_back((delivered, after));
+            state.changes.push_back(value);
             if let Some(waker) = state.waker.take() {
                 waker.wake();
             }
@@ -1191,18 +1268,18 @@ mod tests {
     impl RelayStatuses for ScriptedReader {
         fn now(&mut self) -> Vec<RelayObservation> {
             let mut state = self.0.0.lock().expect("the scripted status");
-            while let Some((_, after)) = state.changes.pop_front() {
-                state.current = after;
+            while let Some(value) = state.changes.pop_front() {
+                state.current = value;
             }
             state.current.clone()
         }
 
-        fn poll_next(&mut self, context: &mut Context<'_>) -> Poll<Option<Vec<RelayObservation>>> {
+        fn poll_changed(&mut self, context: &mut Context<'_>) -> Poll<bool> {
             let mut state = self.0.0.lock().expect("the scripted status");
             match state.changes.pop_front() {
-                Some((delivered, after)) => {
-                    state.current = after;
-                    Poll::Ready(Some(delivered))
+                Some(value) => {
+                    state.current = value;
+                    Poll::Ready(true)
                 }
                 None => {
                     state.waker = Some(context.waker().clone());
@@ -1212,17 +1289,20 @@ mod tests {
         }
     }
 
-    /// KR-REQ-17.40: a value the status delivered is taken in, although the status changed again
-    /// before it was next read. A relay that refused, then admitted the endpoint, then was dialled
-    /// again, is not the reason the attempt failed.
+    /// KR-REQ-17.40: a relay's own refusal the status has moved past is not the reason an attempt
+    /// failed. The status reports only the latest state and can pass over an admission between two
+    /// readings, so a relay seen refusing and then seen being dialled again may have admitted this
+    /// endpoint in between, and its refusal is not reported when the attempt times out.
     #[tokio::test]
-    async fn an_admission_the_status_delivered_is_taken_in_before_it_changes_again() {
+    async fn a_refusal_the_status_moved_past_is_not_the_reason() {
         let status = Scripted::default();
         status.set(vec![refusing("relay-1", "allowance_spent: spent")]);
         let setter = status.clone();
         let error = through_relays(
             async move {
-                setter.change(vec![admitted("relay-1")], vec![redialling("relay-1")]);
+                // The relay admitted the endpoint and the connection ended again, and no reading
+                // saw either: the next one sees the relay being dialled again.
+                setter.set(vec![redialling("relay-1")]);
                 tokio::task::yield_now().await;
                 Err::<(), _>(timed_out())
             },
@@ -1235,30 +1315,39 @@ mod tests {
         assert!(matches!(error, TransportError::Connect(_)), "{error}");
     }
 
-    /// KR-REQ-17.40: a refusal the status delivered is taken in, although the status changed again
-    /// before it was next read, and it stands while the relay is dialled again.
+    /// KR-REQ-17.40: a relay-only endpoint gives up only when one reading shows every relay on its
+    /// route refusing it. The first relay refused and was then seen being dialled again, and the
+    /// second began refusing, so the first one's earlier refusal does not stop the endpoint: its
+    /// attempt runs to its end, and the failure is the refusal the status shows then.
     #[tokio::test]
-    async fn a_refusal_the_status_delivered_is_taken_in_before_it_changes_again() {
+    async fn a_relay_only_endpoint_stops_only_on_refusals_one_reading_shows() {
         let status = Scripted::default();
+        status.set(vec![
+            refusing("relay-1", "allowance_spent: spent"),
+            admitted("relay-2"),
+        ]);
         let setter = status.clone();
         let error = through_relays(
             async move {
-                setter.change(
-                    vec![refusing("relay-1", "allowance_spent: spent")],
-                    vec![redialling("relay-1")],
-                );
+                setter.set(vec![
+                    redialling("relay-1"),
+                    refusing("relay-2", "stopping: this relay is stopping"),
+                ]);
+                // Waiting twice keeps the attempt going while the endpoint reads the status again.
+                tokio::task::yield_now().await;
                 tokio::task::yield_now().await;
                 Err::<(), _>(timed_out())
             },
             status.reader(),
-            true,
-            || async { relays(&["relay-1"]) },
+            false,
+            || async { relays(&["relay-1", "relay-2"]) },
         )
         .await
         .expect_err("the attempt failed");
         assert!(
             matches!(&error, TransportError::RelayRefused(refusal)
-                if refusal.relay == relay("relay-1")),
+                if refusal.relay == relay("relay-2")
+                    && refusal.kind == crate::error::RelayRefusalKind::Stopping),
             "{error}"
         );
     }

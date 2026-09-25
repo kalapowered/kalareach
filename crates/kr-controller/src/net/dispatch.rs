@@ -646,6 +646,76 @@ impl RemoteConnection {
         }
     }
 
+    /// A connection for `device` that writes nothing anywhere, registered at the revision in
+    /// force, for a test that drives this door's own methods.
+    #[cfg(test)]
+    pub(crate) fn for_test(controller: &Arc<Controller>, device: DeviceRecord) -> Self {
+        /// A control stream that takes every frame and sends it nowhere.
+        #[derive(Debug)]
+        struct Nowhere;
+
+        impl FrameSink for Nowhere {
+            fn send_while<'a>(
+                &'a self,
+                _frame: &'a ControlFrame,
+                _admits: &'a (dyn Fn() -> bool + Send + Sync),
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = kr_transport::Result<bool>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(true) })
+            }
+
+            fn close(&self) {}
+        }
+
+        let connection_id = ConnectionId::new(kr_ipc::new_uuid());
+        controller.admitted_table().insert(
+            connection_id,
+            crate::service::AdmittedConnection {
+                actor_id: device.principal(),
+                admitted_revision: controller.policy().authority_revision(),
+            },
+        );
+        let authority = Arc::new(Authorisation {
+            grant_deadline: None,
+            controller: Arc::clone(controller),
+            device_id: device.device_id,
+            devices: Arc::clone(controller.devices()),
+            pending: Arc::new(super::devices::PendingExpiry::default()),
+            clock: Arc::new(super::devices::ClockTrust::default()),
+            connection_id,
+            expired: AtomicBool::new(false),
+            recorded: AtomicBool::new(false),
+        });
+        let (notifications, _) = tokio::sync::mpsc::channel(1);
+        Self {
+            controller: Arc::clone(controller),
+            devices: Arc::clone(controller.devices()),
+            actor: ConnectionActor::network_device(
+                device.principal(),
+                device.device_id,
+                controller.generation,
+                connection_id,
+            ),
+            device,
+            connection_id,
+            output: Arc::new(RemoteOutput::writing_to(
+                Box::new(Nowhere),
+                Arc::clone(&authority),
+            )),
+            authority,
+            proxy: tokio::sync::Mutex::new(None),
+            notifications,
+            budget: Arc::new(RelayBudget::new(RELAY_QUEUED_BYTES)),
+            lost: Arc::new(tokio::sync::Notify::new()),
+            windows: Arc::new(
+                kr_transport::window::ActionWindowIssuer::with_default_validity(Arc::clone(
+                    &controller.clock,
+                )),
+            ),
+        }
+    }
+
     /// Returns what records this device's grant expiry, for work that outlives this connection.
     #[must_use]
     pub fn expiry_observer(&self) -> ExpiryObserver {
@@ -2620,39 +2690,9 @@ impl RemoteConnection {
         Ok(decided)
     }
 
-    /// The grant this device's requests are decided against: the one its pairing committed, with
-    /// one right resolved elsewhere.
-    ///
-    /// `voice.use` lives in the separate voice grant section 15 paragraph 7 intersects with this
-    /// one, not in the grant this connection was admitted under: a person holds their ordinary
-    /// authority and chooses separately how much of it voice may use. So it is taken out of this
-    /// grant and put back only for a method that needs it, when this device holds a live voice
-    /// grant carrying it. The policy and the configured ceiling then apply to it like any other
-    /// right, and the coordinator takes the intersection again at the moment of each decision.
+    /// The grant this device's requests are decided against ([`decided_with_voice`]).
     fn decided_grant(&self, entry: &'static MethodEntry) -> kr_protocol::grant::Grant {
-        let needs_voice = entry.required_rights.iter().any(|required| {
-            matches!(
-                required.authority,
-                RequiredAuthority::Right {
-                    right: ActionRight::VoiceUse
-                }
-            )
-        });
-        let mut actions: CanonicalSet<ActionRight> = self
-            .device
-            .grant
-            .actions
-            .iter()
-            .copied()
-            .filter(|right| *right != ActionRight::VoiceUse)
-            .collect();
-        if needs_voice && self.holds_voice_grant() {
-            actions.insert(ActionRight::VoiceUse);
-        }
-        kr_protocol::grant::Grant {
-            actions,
-            ..self.device.grant.clone()
-        }
+        decided_with_voice(&self.device.grant, entry, || self.holds_voice_grant())
     }
 
     /// Whether this device holds a live voice grant on this host.
@@ -2923,6 +2963,48 @@ const fn window_refusal_detail(refusal: kr_transport::window::WindowRefusal) -> 
     }
 }
 
+/// The grant a paired device's request for `entry` is decided against: the one its pairing
+/// committed (`paired`), with one right resolved elsewhere.
+///
+/// `voice.use` lives in the separate voice grant section 15 paragraph 7 intersects with this one,
+/// not in the grant a connection was admitted under: a person holds their ordinary authority and
+/// chooses separately how much of it voice may use. So it is taken out of the pairing grant and
+/// put back only for a method that needs it, when the device holds a live voice grant carrying it
+/// (`holds_voice_grant`, asked only then). The policy and the configured ceiling then apply to it
+/// like any other right, and the coordinator takes the intersection again at the moment of each
+/// decision.
+///
+/// Every method that needs it is a voice method this daemon serves itself, so the rights a
+/// forwarded mutation carries to a worker, which its decision cut from this grant, never include
+/// it: a worker holds no work under a voice grant, and a voice grant's withdrawal owes no fence.
+fn decided_with_voice(
+    paired: &kr_protocol::grant::Grant,
+    entry: &MethodEntry,
+    holds_voice_grant: impl FnOnce() -> bool,
+) -> kr_protocol::grant::Grant {
+    let needs_voice = entry.required_rights.iter().any(|required| {
+        matches!(
+            required.authority,
+            RequiredAuthority::Right {
+                right: ActionRight::VoiceUse
+            }
+        )
+    });
+    let mut actions: CanonicalSet<ActionRight> = paired
+        .actions
+        .iter()
+        .copied()
+        .filter(|right| *right != ActionRight::VoiceUse)
+        .collect();
+    if needs_voice && holds_voice_grant() {
+        actions.insert(ActionRight::VoiceUse);
+    }
+    kr_protocol::grant::Grant {
+        actions,
+        ..paired.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use kr_protocol::attachment::{AttachMode, AttachmentCapability, SessionAttachParams};
@@ -2987,6 +3069,396 @@ mod tests {
             "and an ordinary observing attachment claims nothing"
         );
     }
+
+    /// No frame a worker receives carries a voice right, whichever way work reaches it, which is
+    /// why a voice grant's withdrawal owes no fence. The device's pairing grant carries every
+    /// right, `voice.use` included, and it holds a live voice grant; its session's worker records
+    /// every frame it is sent and refuses each.
+    ///
+    /// - Every method this door decides for it (`check_grant`, the decision a forwarded mutation's
+    ///   rights are cut from) carries `voice.use` only when the method requires it, and each such
+    ///   method is a voice method the daemon serves itself.
+    /// - Its forwarded mutation and its close, sent through the door's own `mutate`, reach the
+    ///   worker carrying exactly the rights decided for them, and a local close carries none.
+    /// - Both builders of a forwarded mutation, the proxy link and the local client, refuse a set
+    ///   that holds `voice.use` before anything is sent, and a frame built under another name and
+    ///   written straight to a link is not encoded.
+    /// - Every voice effect is performed here or not at all: the one the daemon performs, a
+    ///   session read, succeeds and reaches the worker as the daemon's own request, which carries
+    ///   no rights, and nothing else reaches it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn no_frame_a_worker_receives_carries_a_voice_right() {
+        use std::sync::Arc;
+
+        use kr_protocol::actor::ActorIngress;
+        use kr_protocol::authority::RequiredAuthority;
+        use kr_protocol::envelope::ControlFrame;
+        use kr_protocol::rights::ActionRight;
+        use kr_protocol::voice::VoiceAction;
+
+        use crate::service::a_close_a_worker_never_answers as fake;
+
+        let recorded: fake::Recorded = Arc::default();
+        let world = fake::fake_worker(Some(Arc::clone(&recorded))).await;
+        let controller = &world.controller;
+        fake::acknowledged(controller, world.session_id);
+        let revision = controller.policy().authority_revision();
+
+        // A device paired under `actions`, holding a live voice grant of its own.
+        let pair = |byte: u8, actions: kr_protocol::scalars::CanonicalSet<ActionRight>| {
+            let (mut paired, _) = crate::service::net::tests::granted(
+                kr_protocol::grant::GrantExpiry::Never,
+                revision,
+            );
+            paired.actions = actions;
+            let device = crate::service::net::devices::DeviceRecord {
+                device_id: paired.recipient_device_id,
+                endpoint_id: kr_protocol::scalars::EndpointKey::from_bytes([byte; 32]),
+                device_key_revision: kr_protocol::ids::DeviceKeyRevision::new(1),
+                authorisation: kr_protocol::scalars::AuthorisationKey::from_bytes([byte; 32]),
+                stored_envelope: None,
+                notification_preview: None,
+                device_name: kr_protocol::pairing::DeviceName::new("A phone").expect("a name"),
+                platform: kr_protocol::pairing::DevicePlatform::Ios,
+                grant: paired.clone(),
+                paired_at_ms: kr_protocol::scalars::TimestampMs::new(1),
+                revoked_at_ms: None,
+                committed_invitation_id: None,
+                expired_at_ms: None,
+            };
+            controller.devices().commit(&device).expect("paired");
+            let voice_grant = kr_protocol::grant::Grant {
+                grant_id: kr_protocol::ids::GrantId::new(kr_ipc::new_uuid()),
+                issuer_device_id: controller.sharing().host_device_id(),
+                actions: [ActionRight::VoiceUse, ActionRight::SessionView]
+                    .into_iter()
+                    .collect(),
+                ..paired
+            };
+            controller
+                .sharing()
+                .grants()
+                .issue(
+                    &crate::grants::GrantRecord {
+                        grant: voice_grant.clone(),
+                        session_id: None,
+                        issued_at_ms: 1,
+                        activated_at_ms: Some(1),
+                        revoked_at_ms: None,
+                        revoked_by_parent: None,
+                    },
+                    || Ok(()),
+                )
+                .expect("a live voice grant");
+            (device, voice_grant)
+        };
+        // For the door, a pairing grant that carries every right, `voice.use` included.
+        let (device, _) = pair(7, ActionRight::ALL.iter().copied().collect());
+        // For the voice module, whose ordinary authority is a grant that carries no voice right.
+        let (voice_device, voice_grant) = pair(
+            8,
+            ActionRight::ALL
+                .iter()
+                .copied()
+                .filter(|right| *right != ActionRight::VoiceUse)
+                .collect(),
+        );
+        let connection = super::RemoteConnection::for_test(controller, device.clone());
+
+        // Every method, as this door decides it.
+        let mut decided_with_voice = 0;
+        for method in Method::ALL {
+            let entry = method.entry();
+            if !entry.ingress.contains(&ActorIngress::PairedDevice) {
+                continue;
+            }
+            let Ok(decision) = connection.check_grant(Some(world.session_id), entry, false) else {
+                continue;
+            };
+            if decision
+                .decided
+                .permitted
+                .rights
+                .contains(&ActionRight::VoiceUse)
+            {
+                decided_with_voice += 1;
+                assert!(
+                    entry.required_rights.iter().any(|required| matches!(
+                        required.authority,
+                        RequiredAuthority::Right {
+                            right: ActionRight::VoiceUse
+                        }
+                    )),
+                    "{method:?} is decided with voice.use although it does not require it"
+                );
+                assert!(
+                    crate::voice::VoiceModule::serves(*method),
+                    "{method:?} is decided with voice.use and is not served here"
+                );
+            }
+        }
+        assert!(
+            decided_with_voice > 0,
+            "the device holds voice.use for the methods that need it"
+        );
+
+        // A forwarded mutation and a device's close, as the device sends them, through this
+        // door's own path from its window to the worker.
+        let decided = |method: Method| {
+            connection
+                .check_grant(Some(world.session_id), method.entry(), false)
+                .expect("decided")
+                .decided
+                .permitted
+                .rights
+        };
+        let submit_rights = decided(Method::AgentPromptSubmit);
+        let close_rights = decided(Method::SessionClose);
+        let window = connection
+            .windows
+            .issue(connection.connection_id, controller.boot_epoch)
+            .expect("a window");
+        let sent = |method: Method, request_id: u64, params: ParamsValue| MutationRequest {
+            request_id: RequestId::new(request_id),
+            method: method.into(),
+            method_version: MethodVersion::V1,
+            action_id: ActionId::new(kr_ipc::new_uuid()),
+            grant_id: Nullable::some(device.grant.grant_id),
+            target: ActionTarget {
+                environment_id: world.environment_id,
+                session_id: Nullable::some(world.session_id),
+                session_epoch: Nullable::some(SessionEpoch::V1),
+                application_instance_id: Nullable::null(),
+                agent_binding_revision: Nullable::null(),
+            },
+            expected: ParamsValue::empty(),
+            action_window_id: window.action_window_id.clone(),
+            requested_ttl_ms: kr_protocol::scalars::DurationMs::new(30_000),
+            params,
+        };
+        let _ = connection
+            .mutate(&sent(Method::AgentPromptSubmit, 11, ParamsValue::empty()))
+            .await;
+        let _ = connection
+            .mutate(&sent(
+                Method::SessionClose,
+                12,
+                ParamsValue::from_typed(&kr_protocol::session::SessionCloseParams {
+                    session_id: world.session_id,
+                })
+                .expect("encodes"),
+            ))
+            .await;
+
+        // Rights that hold a voice right are refused by both builders of a forwarded mutation,
+        // before anything is sent.
+        let with_voice: kr_protocol::scalars::CanonicalSet<ActionRight> =
+            [ActionRight::VoiceUse, ActionRight::SessionView]
+                .into_iter()
+                .collect();
+        let sent_before = recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        let refused = connection
+            .proxied_mutation(
+                &sent(Method::AgentPromptSubmit, 13, ParamsValue::empty()),
+                world.accepted,
+                revision,
+                with_voice.clone(),
+            )
+            .await;
+        assert!(
+            matches!(
+                &refused,
+                ControlFrame::Response(kr_protocol::envelope::Response {
+                    outcome: kr_protocol::envelope::Outcome::Error(error),
+                    ..
+                }) if error.message.contains("never travels to a worker")
+            ),
+            "the proxy refuses a voice right: {refused:?}"
+        );
+        let mut client = controller
+            .worker_client(&world.worker)
+            .await
+            .expect("the daemon's own link");
+        let link = client.as_mut().expect("the connection is open");
+        let local = link
+            .forward(
+                &fake::close_request(world.environment_id, world.session_id),
+                &world.actor,
+                &with_voice,
+                kr_protocol::scalars::U64::new(u64::MAX),
+            )
+            .await;
+        assert!(
+            matches!(
+                local,
+                Err(kr_ipc::IpcError::RightNotForwarded(ActionRight::VoiceUse))
+            ),
+            "the local client refuses a voice right: {local:?}"
+        );
+        // And a frame built under another name and written straight to the link, past both
+        // builders, is not encoded.
+        {
+            use kr_protocol::local::ForwardedMutation as Built;
+
+            let written = link
+                .writer()
+                .write_message(&ControlFrame::Forwarded(Box::new(Built {
+                    mutation: fake::close_request(world.environment_id, world.session_id),
+                    actor: world.actor.clone(),
+                    grant_rights: with_voice.clone(),
+                    accepted_deadline_boot_ms: kr_protocol::scalars::U64::new(u64::MAX),
+                })))
+                .await;
+            assert!(
+                written.is_err(),
+                "a frame carrying voice.use is not encoded, however it is built and sent"
+            );
+        }
+        drop(client);
+        assert_eq!(
+            recorded
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            sent_before,
+            "nothing reached the worker"
+        );
+
+        // A local close.
+        let carried = fake::admission(controller, world.accepted).await;
+        let _ = controller
+            .session_close(
+                &fake::close_request(world.environment_id, world.session_id),
+                &world.actor,
+                Some(world.accepted),
+                carried,
+            )
+            .await;
+
+        // Every voice effect. What reaches the worker from here on is the voice module's.
+        let before_voice = recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        let voice_session_id = kr_protocol::ids::VoiceSessionId::new(kr_ipc::new_uuid());
+        let delegation_id =
+            kr_protocol::voice::VoiceDelegationId::new("a-delegation").expect("an identifier");
+        for action in VoiceAction::ALL {
+            let Some(method) = crate::voice::method_for(*action) else {
+                continue;
+            };
+            let proposal = kr_voice::Proposal {
+                voice_session_id,
+                device_id: voice_device.device_id,
+                voice_grant_id: voice_grant.grant_id,
+                environment_id: world.environment_id,
+                action: *action,
+                action_id: kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+                session_id: Some(world.session_id),
+                delegation_id: delegation_id.clone(),
+                plan: kr_protocol::voice::VoiceActionPlan {
+                    voice_session_id,
+                    action: *action,
+                    session_id: kr_protocol::scalars::Nullable::some(world.session_id),
+                    delegation_id: kr_protocol::scalars::Nullable::some(delegation_id.clone()),
+                    payload_digest: kr_protocol::scalars::Digest256::from_bytes([3; 32]),
+                },
+                approval: None,
+                turn_id: None,
+                destination: None,
+            };
+            let performed = controller.voice_perform(method, &proposal).await;
+            if method == Method::SessionRead {
+                assert!(
+                    performed.as_ref().is_ok_and(|receipt| receipt.performed),
+                    "the daemon performs the read: {performed:?}"
+                );
+            }
+        }
+
+        let frames = recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let forwarded: Vec<kr_protocol::local::ForwardedMutation> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                ControlFrame::Forwarded(mutation) => Some(mutation.as_ref().clone()),
+                _ => None,
+            })
+            .collect();
+        for mutation in &forwarded {
+            assert!(
+                !mutation.grant_rights.contains(&ActionRight::VoiceUse),
+                "{:?} reached the worker carrying voice.use",
+                mutation.mutation.method
+            );
+        }
+        assert!(
+            !frames
+                .iter()
+                .any(|frame| matches!(frame, ControlFrame::ForwardedRead(_))),
+            "nothing here forwards a read"
+        );
+
+        // The door's paths: exactly the rights decided for each, and none for a local close.
+        let rights_of = |method: Method| {
+            forwarded
+                .iter()
+                .filter(|mutation| mutation.mutation.method == method.into())
+                .map(|mutation| mutation.grant_rights.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            rights_of(Method::AgentPromptSubmit),
+            vec![submit_rights],
+            "the forwarded mutation carries exactly the rights decided for it"
+        );
+        let closes = rights_of(Method::SessionClose);
+        assert_eq!(
+            closes.len(),
+            2,
+            "the device's close and the local one: {closes:?}"
+        );
+        assert!(
+            closes.contains(&close_rights),
+            "the device's close: {closes:?}"
+        );
+        assert!(
+            closes
+                .iter()
+                .any(kr_protocol::scalars::CanonicalSet::is_empty),
+            "the local close carries no rights: {closes:?}"
+        );
+
+        // The voice module's: no forwarded work at all, and its session read as the daemon's own
+        // request.
+        let mut session_reads = 0;
+        for frame in &frames[before_voice..] {
+            match frame {
+                ControlFrame::Forwarded(_) | ControlFrame::ForwardedRead(_) => {
+                    panic!("a voice effect reached the worker as forwarded work: {frame:?}");
+                }
+                ControlFrame::Request(request) => {
+                    assert_eq!(
+                        request.method,
+                        Method::SessionRead.into(),
+                        "the daemon's own request is its session read"
+                    );
+                    session_reads += 1;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            session_reads >= 1,
+            "the voice read reached the worker as the daemon's own request"
+        );
+        world.serving.abort();
+    }
 }
 
 #[cfg(test)]
@@ -3001,6 +3473,10 @@ mod write_boundary {
 
     use super::{Authorisation, FrameSink, RelayGrant, Relaying, RemoteOutput, Written};
     use crate::service::Controller;
+
+    /// How long a test waits for a write to start waiting before it fails. A write that returns
+    /// without waiting would otherwise hold the test, and the job running it, for ever.
+    const WAIT_BOUND: Duration = Duration::from_secs(30);
 
     /// How far one frame got at the peer.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3038,11 +3514,14 @@ mod write_boundary {
             })
         }
 
-        /// Returns once writes have started to wait `times` times.
+        /// Returns once writes have started to wait `times` times, and fails the test when they
+        /// have not within [`WAIT_BOUND`].
         async fn waited(&self, times: u32) {
-            self.waits
-                .acquire_many(times)
+            tokio::time::timeout(WAIT_BOUND, self.waits.acquire_many(times))
                 .await
+                .unwrap_or_else(|_| {
+                    panic!("the write did not start to wait {times} times within {WAIT_BOUND:?}")
+                })
                 .expect("the count stays open")
                 .forget();
         }
@@ -3278,11 +3757,13 @@ mod write_boundary {
         }
     }
 
-    /// A decision bounded in time stops holding when its bound passes while the batch waits.
+    /// A decision bounded in time stops holding when its bound passes while the batch waits. On
+    /// clocks the test moves by hand, so the bound passes only once the batch is waiting.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_batch_held_past_its_decisions_bound_is_not_written() {
         let temp = kr_ipc::testing::TempHost::create();
-        let controller = super::super::tests::daemon(&temp).await;
+        let (continuous, _wall, clocks) = super::super::tests::manual_clocks();
+        let controller = super::super::tests::daemon_on(&temp, clocks).await;
         let stream = HeldStream::new(false);
         let output = output(&controller, &stream);
         let frame = batch();
@@ -3301,7 +3782,7 @@ mod write_boundary {
         };
         let (written, ()) = tokio::join!(output.write(&frame, Some(relaying)), async {
             stream.waited(1).await;
-            tokio::time::sleep(Duration::from_millis(60)).await;
+            continuous.advance(Duration::from_millis(60));
             stream.writer.add_permits(1);
         });
         assert_eq!(written, Written::Undecided);
@@ -3434,14 +3915,18 @@ mod write_boundary {
 
         for peer_stops_reading in [false, true] {
             let temp = kr_ipc::testing::TempHost::create();
-            let controller = super::super::tests::daemon(&temp).await;
+            // On clocks the test moves by hand: the grant runs out only at the reading the
+            // decision below is given, however long the runner takes between two steps.
+            let (_continuous, wall, clocks) = super::super::tests::manual_clocks();
+            let controller = super::super::tests::daemon_on(&temp, clocks).await;
             let stream = HeldStream::new(peer_stops_reading);
             let output = output(&controller, &stream);
             let frame = batch();
             if peer_stops_reading {
                 stream.writer.add_permits(1);
             }
-            let lapses_at_ms = kr_ipc::now_ms().get() + 60 * 60 * 1000;
+            let now = wall.load(Ordering::SeqCst);
+            let lapses_at_ms = now + 60 * 60 * 1000;
             let grant_id = a_paired_device(
                 &controller,
                 kr_protocol::grant::GrantExpiry::At {
@@ -3453,7 +3938,7 @@ mod write_boundary {
             // it is asked here, before storage is held, so the decision below waits only on the
             // floor's write.
             grants
-                .grant(grant_id, kr_ipc::now_ms().get())
+                .grant(grant_id, now)
                 .expect("the grant stands before it runs out");
 
             // Another writer holds storage, so the write that decision owes waits with the lock
@@ -3479,16 +3964,28 @@ mod write_boundary {
                 deciding = Some(std::thread::spawn(move || {
                     grants.grant(grant_id, lapses_at_ms + 1)
                 }));
-                while controller.policy.try_lock().is_ok() {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
+                // What the write decides from is the floor that decision raises, and the decision
+                // holds the policy's lock while its write waits for storage. The batch is released
+                // once both hold; the lock alone can be taken before the floor moves.
+                tokio::time::timeout(WAIT_BOUND, async {
+                    while controller.utc_floor().get() <= lapses_at_ms
+                        || controller.policy.try_lock().is_ok()
+                    {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "the decision did not raise the floor and hold the lock within \
+                         {WAIT_BOUND:?}"
+                    )
+                });
                 if peer_stops_reading {
                     stream.room.as_ref().expect("a slow peer").add_permits(1);
                 } else {
                     stream.writer.add_permits(1);
                 }
-                // Long enough for the write to decide, and well inside what storage waits.
-                tokio::time::sleep(Duration::from_millis(300)).await;
             });
             storage.execute_batch("ROLLBACK;").expect("storage is free");
             let _ = deciding.expect("the workflow's grant was decided").join();
@@ -3512,11 +4009,12 @@ mod write_boundary {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_moment_the_boundary_reads_holds_for_every_later_decision() {
         let temp = kr_ipc::testing::TempHost::create();
-        let controller = super::super::tests::daemon(&temp).await;
+        let (_continuous, wall, clocks) = super::super::tests::manual_clocks();
+        let controller = super::super::tests::daemon_on(&temp, clocks).await;
         let stream = HeldStream::new(false);
         let output = output(&controller, &stream);
         let frame = batch();
-        let lapses_at_ms = kr_ipc::now_ms().get() + 200;
+        let lapses_at_ms = wall.load(Ordering::SeqCst) + 200;
         let (expiring, expiring_record) = super::super::tests::granted(
             kr_protocol::grant::GrantExpiry::At {
                 expires_at_ms: kr_protocol::scalars::TimestampMs::new(lapses_at_ms),
@@ -3535,7 +4033,8 @@ mod write_boundary {
         };
         let (written, ()) = tokio::join!(output.write(&frame, Some(relaying)), async {
             stream.waited(1).await;
-            tokio::time::sleep(Duration::from_millis(400)).await;
+            // Nothing but the boundary reads the wall clock from here.
+            wall.store(lapses_at_ms + 200, Ordering::SeqCst);
             stream.writer.add_permits(1);
         });
         assert_eq!(written, Written::Undecided);
@@ -3577,11 +4076,12 @@ mod write_boundary {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_bound_the_boundary_finds_run_out_is_written_down_outside_the_poll() {
         let temp = kr_ipc::testing::TempHost::create();
-        let controller = super::super::tests::daemon(&temp).await;
+        let (continuous, wall, clocks) = super::super::tests::manual_clocks();
+        let controller = super::super::tests::daemon_on(&temp, clocks).await;
         let stream = HeldStream::new(false);
         let output = output(&controller, &stream);
         let frame = batch();
-        let synchronised = kr_ipc::now_ms().get();
+        let synchronised = wall.load(Ordering::SeqCst);
         controller
             .update_policy(|policy| {
                 policy.set_offline_validity(Some(kr_protocol::sharing::OfflineValidityPolicy {
@@ -3624,7 +4124,7 @@ mod write_boundary {
         };
         let (written, ()) = tokio::join!(output.write(&frame, Some(relaying)), async {
             stream.waited(1).await;
-            tokio::time::sleep(Duration::from_millis(400)).await;
+            continuous.advance(Duration::from_millis(400));
             stream.writer.add_permits(1);
         });
         assert_eq!(written, Written::Undecided);

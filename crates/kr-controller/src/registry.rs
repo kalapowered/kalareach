@@ -29,7 +29,7 @@
 use kr_ipc::identity::CurrentProcess;
 use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource, WorkerProfile};
 use kr_protocol::ids::{
-    ActorId, AuthorityRevision, ControllerGeneration, EnvironmentId, SessionId,
+    ActorId, AuthorityRevision, BootEpoch, ControllerGeneration, EnvironmentId, SessionId,
 };
 use kr_protocol::scalars::{AuthorisationKey, Digest256, TimestampMs, Uuid};
 use kr_protocol::session::{ClosureRecord, DisplayNumber, SessionState};
@@ -39,7 +39,7 @@ use rusqlite::{Connection, OptionalExtension as _, params};
 use crate::error::{ControllerError, Result};
 
 /// The schema version this build reads.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// How far a reservation has progressed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -160,6 +160,16 @@ pub struct WorkerRecord {
     pub acknowledged_revision: AuthorityRevision,
 }
 
+/// One clock floor this environment created in a boot ([`kr_ipc::floor`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecordedFloor {
+    /// The floor's identity, as its file's header names it.
+    pub identity: kr_ipc::floor::FloorIdentity,
+    /// Whether it is the boot's floor in force. A floor that is not was lost: its file lost its
+    /// name, and a later start created another.
+    pub in_force: bool,
+}
+
 /// The environment registry.
 #[derive(Debug)]
 pub struct Registry {
@@ -274,6 +284,17 @@ impl Registry {
                      session_id BLOB PRIMARY KEY,
                      record     BLOB NOT NULL,
                      closed_at_ms INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS utc_floors (
+                     floor_id      BLOB PRIMARY KEY NOT NULL,
+                     boot_epoch    BLOB NOT NULL,
+                     in_force      INTEGER NOT NULL,
+                     created_at_ms INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS clock_continuity (
+                     boot_epoch        BLOB PRIMARY KEY NOT NULL,
+                     lost_at_ms        INTEGER NOT NULL,
+                     established_at_ms INTEGER
                  );",
             )
             .map_err(ControllerError::registry)?;
@@ -296,12 +317,18 @@ impl Registry {
                 self.migrate_1_to_2()?;
                 self.migrate_2_to_3()?;
                 self.migrate_3_to_4()?;
+                self.migrate_4_to_5()?;
             }
             Some(2) => {
                 self.migrate_2_to_3()?;
                 self.migrate_3_to_4()?;
+                self.migrate_4_to_5()?;
             }
-            Some(3) => self.migrate_3_to_4()?,
+            Some(3) => {
+                self.migrate_3_to_4()?;
+                self.migrate_4_to_5()?;
+            }
+            Some(4) => self.migrate_4_to_5()?,
             Some(version) => {
                 return Err(ControllerError::RegistryUnavailable {
                     detail: format!(
@@ -411,6 +438,27 @@ impl Registry {
                  ALTER TABLE workers ADD COLUMN stated_source TEXT NOT NULL DEFAULT '';
                  UPDATE workers SET stated_source = process_source;
                  UPDATE schema_version SET version = 4;
+                 COMMIT;",
+            )
+            .map_err(ControllerError::registry)?;
+        Ok(())
+    }
+
+    /// Brings a version 4 registry forward.
+    ///
+    /// Version 5 records the clock floors this environment created in each boot, and whether a
+    /// boot's clock continuity was lost. A version 4 registry recorded neither, and the two tables
+    /// are created with the rest when it opens: empty, which is what a registry that has created no
+    /// floor holds. The first start after the upgrade finds its boot's floor file absent and records
+    /// the one it creates as the boot's first.
+    ///
+    /// This migration goes when there can no longer be a version 4 registry to read, which is the
+    /// first release: nothing before it is installed anywhere it has to be read from again.
+    fn migrate_4_to_5(&self) -> Result<()> {
+        self.connection
+            .execute_batch(
+                "BEGIN;
+                 UPDATE schema_version SET version = 5;
                  COMMIT;",
             )
             .map_err(ControllerError::registry)?;
@@ -746,6 +794,182 @@ impl Registry {
                 params![
                     self.environment_id.get().as_bytes().as_slice(),
                     i64::try_from(revision.get()).unwrap_or(i64::MAX)
+                ],
+            )
+            .map_err(ControllerError::registry)?;
+        Ok(())
+    }
+
+    /// Forgets the clock floors and the clock continuity of every boot but `boot`.
+    ///
+    /// A floor is the reading of one boot, and a boot that has ended has no process left that maps
+    /// its floor, so nothing about it decides anything again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the write fails.
+    pub fn forget_other_boots(&mut self, boot: BootEpoch) -> Result<()> {
+        let boot = boot.get().to_be_bytes();
+        self.connection
+            .execute(
+                "DELETE FROM utc_floors WHERE boot_epoch != ?1",
+                params![boot.as_slice()],
+            )
+            .map_err(ControllerError::registry)?;
+        self.connection
+            .execute(
+                "DELETE FROM clock_continuity WHERE boot_epoch != ?1",
+                params![boot.as_slice()],
+            )
+            .map_err(ControllerError::registry)?;
+        Ok(())
+    }
+
+    /// Returns every clock floor this environment created in `boot`, and which is in force.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the read fails.
+    pub fn floors_of_boot(&self, boot: BootEpoch) -> Result<Vec<RecordedFloor>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT floor_id, in_force FROM utc_floors WHERE boot_epoch = ?1
+                  ORDER BY created_at_ms",
+            )
+            .map_err(ControllerError::registry)?;
+        let rows = statement
+            .query_map(params![boot.get().to_be_bytes().as_slice()], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(ControllerError::registry)?;
+        let mut floors = Vec::new();
+        for row in rows {
+            let (identity, in_force) = row.map_err(ControllerError::registry)?;
+            let identity: [u8; 16] =
+                identity
+                    .try_into()
+                    .map_err(|_| ControllerError::RegistryUnavailable {
+                        detail: "a recorded clock floor identity is not sixteen bytes".to_owned(),
+                    })?;
+            floors.push(RecordedFloor {
+                identity: kr_ipc::floor::FloorIdentity::from_bytes(identity),
+                in_force: in_force != 0,
+            });
+        }
+        Ok(floors)
+    }
+
+    /// Records `identity` as `boot`'s clock floor in force, and every other floor of the boot as
+    /// not in force, in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the write fails.
+    pub fn record_floor_in_force(
+        &mut self,
+        boot: BootEpoch,
+        identity: kr_ipc::floor::FloorIdentity,
+        at_ms: TimestampMs,
+    ) -> Result<()> {
+        let boot = boot.get().to_be_bytes();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(ControllerError::registry)?;
+        transaction
+            .execute(
+                "UPDATE utc_floors SET in_force = 0 WHERE boot_epoch = ?1",
+                params![boot.as_slice()],
+            )
+            .map_err(ControllerError::registry)?;
+        transaction
+            .execute(
+                "INSERT INTO utc_floors (floor_id, boot_epoch, in_force, created_at_ms)
+                 VALUES (?1, ?2, 1, ?3)
+                 ON CONFLICT (floor_id) DO UPDATE SET in_force = 1",
+                params![
+                    identity.as_bytes().as_slice(),
+                    boot.as_slice(),
+                    i64::try_from(at_ms.get()).unwrap_or(i64::MAX)
+                ],
+            )
+            .map_err(ControllerError::registry)?;
+        transaction.commit().map_err(ControllerError::registry)
+    }
+
+    /// Records that `boot`'s clock continuity is lost: every floor of the boot stops being in
+    /// force, and the boot is marked lost until the owner establishes the clock, in one
+    /// transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the write fails.
+    pub fn lose_clock_continuity(&mut self, boot: BootEpoch, at_ms: TimestampMs) -> Result<()> {
+        let boot = boot.get().to_be_bytes();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(ControllerError::registry)?;
+        transaction
+            .execute(
+                "UPDATE utc_floors SET in_force = 0 WHERE boot_epoch = ?1",
+                params![boot.as_slice()],
+            )
+            .map_err(ControllerError::registry)?;
+        transaction
+            .execute(
+                "INSERT INTO clock_continuity (boot_epoch, lost_at_ms, established_at_ms)
+                 VALUES (?1, ?2, NULL)
+                 ON CONFLICT (boot_epoch) DO UPDATE
+                     SET lost_at_ms = ?2, established_at_ms = NULL",
+                params![
+                    boot.as_slice(),
+                    i64::try_from(at_ms.get()).unwrap_or(i64::MAX)
+                ],
+            )
+            .map_err(ControllerError::registry)?;
+        transaction.commit().map_err(ControllerError::registry)
+    }
+
+    /// Whether `boot`'s clock continuity is lost and the owner has not established the clock
+    /// since.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the read fails.
+    pub fn clock_continuity_lost(&self, boot: BootEpoch) -> Result<bool> {
+        let lost: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT 1 FROM clock_continuity
+                  WHERE boot_epoch = ?1 AND established_at_ms IS NULL",
+                params![boot.get().to_be_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(ControllerError::registry)?;
+        Ok(lost.is_some())
+    }
+
+    /// Records that the owner established the clock at `at_ms`, which ends `boot`'s lost clock
+    /// continuity when it was lost.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the write fails.
+    pub fn establish_clock_continuity(
+        &mut self,
+        boot: BootEpoch,
+        at_ms: TimestampMs,
+    ) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE clock_continuity SET established_at_ms = ?2
+                  WHERE boot_epoch = ?1 AND established_at_ms IS NULL",
+                params![
+                    boot.get().to_be_bytes().as_slice(),
+                    i64::try_from(at_ms.get()).unwrap_or(i64::MAX)
                 ],
             )
             .map_err(ControllerError::registry)?;
@@ -1795,6 +2019,94 @@ mod tests {
             .expect("the reservation is recorded")
             .launcher_identity
             .expect("the launcher is recorded")
+    }
+
+    /// A registry the previous build left at version 4 opens at version 5, with no clock floor
+    /// and no lost continuity recorded: what a registry that created no floor holds.
+    #[test]
+    fn a_version_4_registry_opens_with_no_floor_recorded() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("registry.sqlite3");
+        drop(opened(&path, kernel));
+        let connection = Connection::open(&path).expect("reopened");
+        connection
+            .execute_batch(
+                "DROP TABLE utc_floors;
+                 DROP TABLE clock_continuity;
+                 UPDATE schema_version SET version = 4;",
+            )
+            .expect("the previous schema");
+        drop(connection);
+        let registry = opened(&path, kernel);
+        let version: i64 = registry
+            .connection
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .expect("reads the version");
+        assert_eq!(version, SCHEMA_VERSION);
+        let boot = BootEpoch::new(3);
+        assert!(registry.floors_of_boot(boot).expect("readable").is_empty());
+        assert!(!registry.clock_continuity_lost(boot).expect("readable"));
+    }
+
+    /// Each boot keeps its own floors and its own clock continuity: a later floor of a boot takes
+    /// the place in force, a lost continuity stays lost until the owner establishes the clock, and
+    /// nothing of another boot survives the start that forgets it.
+    #[test]
+    fn each_boot_keeps_its_own_floors_and_its_clock_continuity() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let mut registry = opened(&directory.path().join("registry.sqlite3"), kernel);
+        let boot = BootEpoch::new(7);
+        let other = BootEpoch::new(8);
+        let first = kr_ipc::floor::FloorIdentity::from_bytes([1; 16]);
+        let second = kr_ipc::floor::FloorIdentity::from_bytes([2; 16]);
+        registry
+            .record_floor_in_force(boot, first, TimestampMs::new(1))
+            .expect("recorded");
+        assert_eq!(
+            registry.floors_of_boot(boot).expect("readable"),
+            vec![RecordedFloor {
+                identity: first,
+                in_force: true
+            }]
+        );
+
+        registry
+            .lose_clock_continuity(boot, TimestampMs::new(2))
+            .expect("lost");
+        registry
+            .record_floor_in_force(boot, second, TimestampMs::new(3))
+            .expect("recorded");
+        assert_eq!(
+            registry.floors_of_boot(boot).expect("readable"),
+            vec![
+                RecordedFloor {
+                    identity: first,
+                    in_force: false
+                },
+                RecordedFloor {
+                    identity: second,
+                    in_force: true
+                },
+            ]
+        );
+        assert!(registry.clock_continuity_lost(boot).expect("readable"));
+        assert!(!registry.clock_continuity_lost(other).expect("readable"));
+
+        registry
+            .establish_clock_continuity(boot, TimestampMs::new(4))
+            .expect("established");
+        assert!(!registry.clock_continuity_lost(boot).expect("readable"));
+
+        registry
+            .record_floor_in_force(
+                other,
+                kr_ipc::floor::FloorIdentity::from_bytes([3; 16]),
+                TimestampMs::new(5),
+            )
+            .expect("recorded");
+        registry.forget_other_boots(other).expect("forgotten");
+        assert!(registry.floors_of_boot(boot).expect("readable").is_empty());
+        assert_eq!(registry.floors_of_boot(other).expect("readable").len(), 1);
     }
 
     #[test]

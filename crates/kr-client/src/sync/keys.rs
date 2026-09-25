@@ -43,11 +43,12 @@ use std::sync::{Arc, Mutex};
 use kr_crypto::envelope::{open_sync_object, seal_sync_object};
 use kr_crypto::secret::{Secret, SymmetricKey};
 use kr_crypto::store::{OpenedStore, SecretName, SecretStore, StoreSelection};
-use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::error::ErrorCode;
 use kr_protocol::sync::SealedSyncObject;
 
 use crate::drafts::DraftSealer;
 use crate::error::{ClientError, Result};
+use crate::shown::Shown;
 
 /// Where the key one synchronised collection is sealed under comes from.
 ///
@@ -65,12 +66,14 @@ pub trait CollectionKeys: Send + Sync + std::fmt::Debug {
 
 /// Says that this device does not hold a key, without saying anything about the key.
 fn no_key(collection: &str, epoch: u64) -> ClientError {
-    ClientError::Host(ProtocolError::new(
+    ClientError::refusal(
         ErrorCode::HostNotConfigured,
-        format!(
-            "this device does not hold the key for collection {collection} at epoch {epoch}, so it can neither read nor write it"
+        crate::shown!(
+            "this device does not hold the key for collection {} at epoch {}, so it can neither read nor write it",
+            Shown::collection(collection),
+            epoch
         ),
-    ))
+    )
 }
 
 /// Turns a sealing or opening failure into something a caller can act on.
@@ -86,18 +89,16 @@ fn no_key(collection: &str, epoch: u64) -> ClientError {
 /// * What was passed in. That is what is left, and it is the only thing [`ErrorCode::InvalidArgument`]
 ///   is for here.
 fn sealing_failed(error: &kr_crypto::CryptoError) -> ClientError {
-    use kr_crypto::CryptoError as Failure;
-
     let code = match error {
-        Failure::Authentication { .. } => ErrorCode::PermissionDenied,
-        Failure::SecretStore { .. }
-        | Failure::StoredSecretLength { .. }
-        | Failure::LibraryUnavailable { .. }
-        | Failure::Library { .. }
-        | Failure::LibraryMismatch { .. } => ErrorCode::StorageUnavailable,
+        kr_crypto::CryptoError::Authentication { .. } => ErrorCode::PermissionDenied,
+        kr_crypto::CryptoError::SecretStore { .. }
+        | kr_crypto::CryptoError::StoredSecretLength { .. }
+        | kr_crypto::CryptoError::LibraryUnavailable { .. }
+        | kr_crypto::CryptoError::Library { .. }
+        | kr_crypto::CryptoError::LibraryMismatch { .. } => ErrorCode::StorageUnavailable,
         _ => ErrorCode::InvalidArgument,
     };
-    ClientError::Host(ProtocolError::new(code, error.to_string()))
+    ClientError::refusal(code, Shown::crypto(error))
 }
 
 /// Says that what the store holds under this name is not a key.
@@ -106,12 +107,14 @@ fn sealing_failed(error: &kr_crypto::CryptoError) -> ClientError {
 /// came back, so this is the device's storage rather than the caller's request. The bytes
 /// themselves reach nothing: a stored value that is not a key is still a stored value.
 fn corrupt_stored_key(collection: &str, epoch: u64) -> ClientError {
-    ClientError::Host(ProtocolError::new(
+    ClientError::refusal(
         ErrorCode::StorageUnavailable,
-        format!(
-            "what this device holds for collection {collection} at epoch {epoch} is not a key of the length one has"
+        crate::shown!(
+            "what this device holds for collection {} at epoch {} is not a key of the length one has",
+            Shown::collection(collection),
+            epoch
         ),
-    ))
+    )
 }
 
 /// Collection keys held for the length of a process.
@@ -179,10 +182,10 @@ impl CollectionKeys for MemoryCollectionKeys {
 
 /// Says that the held keys cannot be reached, which is a fault rather than a missing key.
 fn poisoned() -> ClientError {
-    ClientError::Host(ProtocolError::new(
+    ClientError::refusal(
         ErrorCode::StorageUnavailable,
-        "this device's collection keys cannot be reached".to_owned(),
-    ))
+        crate::shown::Shown::said("this device's collection keys cannot be reached"),
+    )
 }
 
 /// Collection keys in the device's own secret store.
@@ -283,10 +286,7 @@ impl StoredCollectionKeys {
     /// two identifiers that mapped to one name would be one key for two collections.
     fn name(&self, collection: &str, epoch: u64) -> Result<SecretName> {
         SecretName::collection_key(&self.scope, collection, epoch).map_err(|error| {
-            ClientError::Host(ProtocolError::new(
-                ErrorCode::InvalidArgument,
-                error.to_string(),
-            ))
+            ClientError::refusal(ErrorCode::InvalidArgument, Shown::crypto(&error))
         })
     }
 }
@@ -405,9 +405,10 @@ impl DraftSealer for CollectionSealer {
 /// The documented directory fallback is a directory the test made and throws away, so every test
 /// here uses it freely. The platform store is the machine's own credential store, which on a
 /// person's machine is their login keychain: a suite that wrote to it would leave items behind on
-/// a machine that is not a fixture. One test reaches it, it does nothing unless
-/// `KR_TEST_PLATFORM_SECRET_STORE=1` says the run is prepared for it, and what it writes is named
-/// for that run alone and removed on the way out. The removal on a path that panics is an attempt
+/// a machine that is not a fixture. One test reaches it. It is ignored in an ordinary run, a run
+/// that includes it must also set `KR_TEST_PLATFORM_SECRET_STORE=1` to say it is prepared for it or
+/// the test fails before it writes, and what it writes is named for that run alone and removed on
+/// the way out. The removal on a path that panics is an attempt
 /// rather than a promise: a destructor that runs while a thread is unwinding cannot report a store
 /// that refused it.
 #[cfg(test)]
@@ -643,7 +644,8 @@ mod tests {
     ///
     /// `StoreSelection::Platform` means the operating system's credential store, which on a person's
     /// own machine is their login keychain. An ordinary test run must leave it alone, so the only
-    /// test that reaches it is this one and it does nothing until a run asks for it.
+    /// test that reaches it is ignored, and a run that includes it must also say with this switch
+    /// that it is prepared for the store to be written to.
     const PLATFORM_STORE_SWITCH: &str = "KR_TEST_PLATFORM_SECRET_STORE";
 
     /// Whether this run asked for the platform store to be exercised.
@@ -684,20 +686,21 @@ mod tests {
     /// KR-REQ-10.47: the platform store is what an installed device takes, and a key put in it is
     /// read back from it.
     ///
-    /// It is the half of the row that only a real credential store can answer, so it runs where a
-    /// run says it may: with `KR_TEST_PLATFORM_SECRET_STORE=1` it writes one item under a service
-    /// and a scope drawn for this run alone and removes it again on the way out, and without it
-    /// the test says why it did nothing. Where the switch is set, a machine with no platform store
+    /// It is the half of the row that only a real credential store can answer, so an ordinary run
+    /// leaves it out as ignored. A run that includes it with `--ignored` also sets
+    /// `KR_TEST_PLATFORM_SECRET_STORE=1` to say it is prepared for this machine's own store to be
+    /// written to, and without the switch the test fails with that reason before it writes
+    /// anything. It writes one item under a service and a scope drawn for this run alone and
+    /// removes it again on the way out. Where the switch is set, a machine with no platform store
     /// is a failure rather than a pass, because the run promised one.
     #[test]
+    #[ignore = "writes one item to this machine's own credential store and removes it again; it runs with --ignored and KR_TEST_PLATFORM_SECRET_STORE=1 where a run is prepared for that, as continuous integration's credential store steps do"]
     fn a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again() {
-        if !platform_store_wanted() {
-            println!(
-                "skipped: this test writes one item to this machine's own credential store and \
-                 removes it again. Set {PLATFORM_STORE_SWITCH}=1 to run it."
-            );
-            return;
-        }
+        assert!(
+            platform_store_wanted(),
+            "this test writes one item to this machine's own credential store and removes it \
+             again, so it runs only where {PLATFORM_STORE_SWITCH}=1 says the run is prepared for that"
+        );
 
         let parent = tempfile::tempdir().expect("a place for one");
         let directory = parent.path().join("secrets");

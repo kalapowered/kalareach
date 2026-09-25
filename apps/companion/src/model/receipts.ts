@@ -143,12 +143,15 @@ export function unresolved(submissions: readonly Submission[]): readonly Submiss
  * What the reconnect banner says.
  *
  * It never says an action succeeded. While anything is unresolved it says so and counts them; when
- * nothing is, it says the connection is back and nothing more.
+ * nothing is, it says the connection is back and nothing more. Before anything has answered
+ * whether the host is in contact, `connected` is null and it says nothing at all: neither contact
+ * nor its loss is known yet.
  */
 export function reconnectBanner(
-  connected: boolean,
+  connected: boolean | null,
   submissions: readonly Submission[]
 ): { readonly tone: 'warning' | 'accent'; readonly title: string; readonly detail: string } | null {
+  if (connected === null) return null
   const pending = unresolved(submissions)
   if (!connected) {
     return {

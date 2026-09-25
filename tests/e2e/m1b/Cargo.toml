@@ -1,0 +1,102 @@
+[package]
+name = "kr-e2e-m1b"
+description = "The cross-boundary checkpoint: the deployed site, pairing through it, the terminal workflow from a paired device, the published catalogue release and a plugin acting in a session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+# The product's own reading of an origin, given as the one argument, which each script that checks a
+# deployment asks before it prints, builds or sends anything else.
+name = "kr-e2e-m1b-origin"
+path = "src/bin/origin.rs"
+
+[[test]]
+name = "checkpoint"
+required-features = ["legs"]
+
+[features]
+# The legs, and everything they drive. Without them the package is the product's own reading of an
+# origin, which then builds the protocol crate and little else: a script asks it before it builds
+# anything, so an origin it refuses costs no build of the legs.
+default = ["legs"]
+legs = [
+  "dep:base64",
+  "dep:futures-util",
+  "dep:iroh",
+  "dep:kr-cbor",
+  "dep:kr-client",
+  "dep:kr-controller",
+  "dep:kr-crypto",
+  "dep:kr-ipc",
+  "dep:kr-pairing",
+  "dep:kr-plugin-catalogue",
+  "dep:kr-plugin-sdk",
+  "dep:kr-term",
+  "dep:kr-transport",
+  "dep:kr-worker",
+  "dep:rustls-platform-verifier",
+  "dep:serde",
+  "dep:serde_json",
+  "dep:tokio",
+  "dep:tokio-rustls",
+  "dep:tokio-websockets",
+  "dep:url",
+  "dep:portable-pty",
+  "dep:rustix",
+]
+
+[dependencies]
+# The trust root a catalogue enrolment carries travels as base64.
+base64 = { workspace = true, optional = true }
+# The room's socket is read as a stream of messages and written as a sink of them.
+futures-util = { workspace = true, optional = true }
+# The paired device's own endpoint, which dials the host over iroh.
+iroh = { workspace = true, optional = true }
+kr-cbor = { workspace = true, optional = true }
+# The paired device is this library, with the projected screen a client draws from.
+kr-client = { workspace = true, features = ["terminal"], optional = true }
+# The owner-confirmation digest of a catalogue enrolment, the pairing clock and the host's worker
+# registry. The host itself is the `kr-controller` binary, never this library.
+kr-controller = { workspace = true, optional = true }
+kr-crypto = { workspace = true, optional = true }
+# Host directories, process identities and placing a binary on the internal disk.
+kr-ipc = { workspace = true, features = ["testing"], optional = true }
+# The client half of short-code and direct pairing, which a paired device runs.
+kr-pairing = { workspace = true, optional = true }
+# The enrolment a device asks the owner to confirm names the root's own key identifiers.
+kr-plugin-catalogue = { workspace = true, optional = true }
+kr-plugin-sdk = { workspace = true, optional = true }
+# The product's own parsers of an origin, and the wire the legs speak.
+kr-protocol.workspace = true
+# What `kr attach` draws is read back through the product's own terminal engine.
+kr-term = { workspace = true, optional = true }
+kr-transport = { workspace = true, optional = true }
+# Where the host's configuration document lives, as the host itself works it out.
+kr-worker = { workspace = true, optional = true }
+rustls-platform-verifier = { workspace = true, optional = true }
+# The bounds a request's parameters are written under.
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["io-util", "net", "process"], optional = true }
+tokio-rustls = { workspace = true, optional = true }
+tokio-websockets = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+# The terminals `kr` runs on, which are real pseudo-terminals as a person's are.
+portable-pty = { workspace = true, optional = true }
+# Signals by recorded process, and the modes of a terminal read from the device itself.
+rustix = { workspace = true, features = ["fs", "process", "termios"], optional = true }
+
+[dev-dependencies]
+# A program a test starts is placed by a process of its own, so that no child another test starts
+# holds it open for writing. Only the tests build it: the checker the scripts build and run
+# without the legs does not.
+kr-ipc = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

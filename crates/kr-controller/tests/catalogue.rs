@@ -183,7 +183,7 @@ fn host() -> Host {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
-    let module = CatalogueModule::open(&environment).expect("an openable catalogue");
+    let module = CatalogueModule::open(&environment, None).expect("an openable catalogue");
     let working_temp = tempfile::tempdir().expect("a temporary directory");
     let working = working_temp.path().join("development");
     copy_tree(&fixture(), &working);
@@ -1185,7 +1185,7 @@ async fn both_groups_reach_the_catalogue_through_the_daemon() {
 
     // What a restarted daemon opens reads the same receipt: the deadline is recorded with the
     // claim, not derived again from whatever admits the next request.
-    let reopened = CatalogueModule::open(&environment).expect("the catalogue reopens");
+    let reopened = CatalogueModule::open(&environment, None).expect("the catalogue reopens");
     let restarted = reopened
         .action_read(&first.receipt.actor_id, sync.action_id)
         .await
@@ -1881,7 +1881,15 @@ async fn kr_req_10_05_and_11_11_a_ceiling_widened_after_the_confirmation_refuses
     let ceiling = listed_ceiling(&host, "development").await;
     let root = host.module.catalogue().lock().await.root().to_path_buf();
     *host.ceremony.after_accept.lock().expect("the step") = Some(Box::new(move || {
-        let mut other = kr_plugin_catalogue::Catalogue::open(&root).expect("a second catalogue");
+        let mut other = kr_plugin_catalogue::Catalogue::open(
+            &root,
+            std::sync::Arc::new(
+                kr_plugin_catalogue::transport::RepositoryTransport::local_only(
+                    "a test reads its repositories from disk",
+                ),
+            ),
+        )
+        .expect("a second catalogue");
         let id = RepositoryId::new("development").expect("a valid identifier");
         let mut enrolment = other.repository(&id).expect("readable").expect("enrolled");
         enrolment.ceiling =
@@ -2435,4 +2443,491 @@ async fn a_confirmation_that_expires_while_the_change_waits_for_the_database_cha
         catalogue.repositories().expect("readable").is_empty(),
         "no root was adopted"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-11.42: a release's native bridge recipe, applied by the catalogue's own methods
+// ---------------------------------------------------------------------------------------------
+
+/// The catalogue's plugin methods and a release that carries a native bridge recipe: the Claude
+/// Code package 0.3.0 from the plugins repository's signed development generation, copied whole
+/// into `tests/fixtures/bridge-generation/`, whose recipe installs three registration files and
+/// one settings key in Claude Code's own directory.
+mod native_bridges {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use kr_controller::catalogue::native_bridge::{
+        ApplicationDirectory, BridgeHost, BridgeSurface, QualifiedExecutable,
+    };
+
+    use super::*;
+
+    /// Somebody's own settings, which the recipe adds one key to.
+    const SETTINGS: &str = "{\n  \"model\": \"opus\"\n}\n";
+
+    /// A stand-in for Claude Code's executable, hashed for its version and never run.
+    const EXECUTABLE: &[u8] = b"\x7fELF a stand-in for Claude Code, hashed and never run";
+
+    /// The capabilities release 0.3.0 asks for beyond a new enrolment's ceiling.
+    const GRANT: [&str; 4] = [
+        "approval.decode",
+        "approval.respond",
+        "native_bridge.install",
+        "upstream.action",
+    ];
+
+    fn claude_code() -> PluginId {
+        PluginId::new("kalareach/claude-code").expect("a plugin identifier")
+    }
+
+    fn generation() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bridge-generation")
+    }
+
+    /// Claude Code's directory, a search path with its executable, and the forwarder.
+    struct Site {
+        _temp: tempfile::TempDir,
+        root: PathBuf,
+        /// The signed qualification record the release would carry for the stand-in executable,
+        /// at a version inside the recipe's range.
+        signed_records: Vec<QualifiedExecutable>,
+    }
+
+    impl Site {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().expect("a temporary directory");
+            let root = temp.path().to_path_buf();
+            let site = Self {
+                _temp: temp,
+                root,
+                signed_records: vec![QualifiedExecutable {
+                    digest: Digest256::from_bytes(kr_cbor::sha256(EXECUTABLE)),
+                    version: "2.1.278".to_owned(),
+                }],
+            };
+            std::fs::create_dir_all(site.application()).expect("Claude Code's directory");
+            std::fs::write(site.application().join("settings.json"), SETTINGS).expect("settings");
+            std::fs::create_dir_all(site.root.join("bin")).expect("a search path");
+            std::fs::write(site.root.join("bin/claude"), EXECUTABLE).expect("an executable");
+            std::fs::write(site.root.join("bin/kr-hook"), b"a stand-in forwarder")
+                .expect("a forwarder");
+            site
+        }
+
+        fn application(&self) -> PathBuf {
+            self.root.join("home/.claude")
+        }
+
+        fn bridges(&self, environment: &kr_ipc::paths::EnvironmentPaths) -> BridgeHost {
+            BridgeHost {
+                journals: environment.state_dir().join("native-bridges"),
+                applications: vec![ApplicationDirectory {
+                    application: "Claude Code".to_owned(),
+                    directory: self.application(),
+                }],
+                search_path: vec![self.root.join("bin")],
+                forwarder: Some(self.root.join("bin/kr-hook")),
+                signed_records: self.signed_records.clone(),
+            }
+        }
+
+        /// Every file under Claude Code's directory, with its bytes, and every directory.
+        fn tree(&self) -> BTreeMap<String, Option<Vec<u8>>> {
+            let mut found = BTreeMap::new();
+            let mut pending = vec![self.application()];
+            while let Some(directory) = pending.pop() {
+                for entry in std::fs::read_dir(&directory).expect("readable") {
+                    let path = entry.expect("an entry").path();
+                    let name = path
+                        .strip_prefix(self.application())
+                        .expect("inside")
+                        .to_string_lossy()
+                        .into_owned();
+                    if path.is_dir() {
+                        found.insert(name, None);
+                        pending.push(path);
+                    } else {
+                        found.insert(name, Some(std::fs::read(&path).expect("a file")));
+                    }
+                }
+            }
+            found
+        }
+    }
+
+    /// A daemon-hosted catalogue over a copy of the bridge generation, applying bridges in the
+    /// site.
+    fn host(site: &Site) -> Host {
+        let temp = kr_ipc::testing::TempHost::create();
+        let environment = temp.environment();
+        let environment_id = temp.environment_id();
+        let module = CatalogueModule::open_with(&environment, None, site.bridges(&environment))
+            .expect("an openable catalogue");
+        let working_temp = tempfile::tempdir().expect("a temporary directory");
+        let working = working_temp.path().join("development");
+        copy_tree(&generation(), &working);
+        Host {
+            _temp: temp,
+            module,
+            environment_id,
+            working,
+            _working_temp: working_temp,
+            ceremony: Ceremony::new(),
+        }
+    }
+
+    /// The daemon started again over the same environment and site.
+    fn restarted(host: &mut Host, site: &Site) {
+        let environment = host._temp.environment();
+        host.module = CatalogueModule::open_with(&environment, None, site.bridges(&environment))
+            .expect("an openable catalogue");
+    }
+
+    /// Enrols and synchronises the bridge generation, and returns release 0.3.0's hash.
+    async fn synchronised(host: &Host) -> String {
+        let _: wire::CatalogueAddResult = ok(host
+            .module
+            .write_frame_admitted(
+                &mutation(Method::CatalogueAdd, host.environment_id, &add_params(host)),
+                Method::CatalogueAdd,
+                Some(host.confirmations()),
+            )
+            .await);
+        let _: wire::CatalogueSyncResult = ok(host
+            .module
+            .write_frame_admitted(
+                &mutation(
+                    Method::CatalogueSync,
+                    host.environment_id,
+                    &wire::CatalogueSyncParams {
+                        environment_id: host.environment_id,
+                        catalogue_id: "development".to_owned(),
+                    },
+                ),
+                Method::CatalogueSync,
+                Some(host.confirmations()),
+            )
+            .await);
+        let catalogue = host.module.catalogue().lock().await;
+        catalogue
+            .index(&RepositoryId::new("development").expect("a valid identifier"))
+            .expect("an activated index")
+            .find(
+                &claude_code(),
+                &kr_plugin_sdk::version::PackageVersion::parse("0.3.0").expect("a version"),
+            )
+            .expect("release 0.3.0")
+            .manifest_digest
+            .to_string()
+    }
+
+    /// The installation of release 0.3.0 with the grant it needs, carrying the owner's
+    /// confirmation of exactly that installation when `confirmed`.
+    async fn install(host: &Host, digest: &str, confirmed: bool) -> ControlFrame {
+        let grant: Vec<String> = GRANT.iter().map(|name| (*name).to_owned()).collect();
+        let owner_confirmation = if confirmed {
+            let ceiling = listed_ceiling(host, "development").await;
+            let plan = PluginInstallPlan {
+                environment_id: host.environment_id,
+                catalogue_id: "development".to_owned(),
+                ceiling: ceiling.into_iter().collect(),
+                plugin_id: claude_code(),
+                version: "0.3.0".to_owned(),
+                package_digest: digest.to_owned(),
+                grant: grant.iter().cloned().collect(),
+            };
+            Nullable::some(host.ceremony.approve(
+                SensitiveAction::GrantExecutableCapability,
+                plan.action_digest().expect("a digest"),
+            ))
+        } else {
+            Nullable::null()
+        };
+        let params = wire::PluginInstallParams {
+            environment_id: host.environment_id,
+            catalogue_id: "development".to_owned(),
+            plugin_id: claude_code(),
+            version: "0.3.0".to_owned(),
+            package_digest: digest.to_owned(),
+            grant,
+            owner_confirmation,
+        };
+        host.module
+            .write_frame_admitted(
+                &mutation(Method::PluginInstall, host.environment_id, &params),
+                Method::PluginInstall,
+                Some(host.confirmations()),
+            )
+            .await
+    }
+
+    /// Serves one plugin mutation that needs no confirmation.
+    async fn plugin_change(host: &Host, method: Method) -> ControlFrame {
+        let params = match method {
+            Method::PluginRemove => ParamsValue::from_typed(&wire::PluginRemoveParams {
+                environment_id: host.environment_id,
+                plugin_id: claude_code(),
+            }),
+            _ => ParamsValue::from_typed(&wire::PluginEnableParams {
+                environment_id: host.environment_id,
+                plugin_id: claude_code(),
+            }),
+        }
+        .expect("serialisable");
+        let mut change = mutation(method, host.environment_id, &serde_json::json!({}));
+        change.params = params;
+        host.module
+            .write_frame_admitted(&change, method, Some(host.confirmations()))
+            .await
+    }
+
+    fn bridge_facts(
+        host: &Host,
+        digest: &str,
+    ) -> Option<kr_controller::catalogue::native_bridge::BridgeFacts> {
+        host.module
+            .native_bridges()
+            .facts(
+                &claude_code(),
+                kr_plugin_sdk::digest::PayloadDigest::parse(digest).expect("a package hash"),
+            )
+            .expect("readable")
+    }
+
+    /// The directory as the recipe leaves it, from what it held before.
+    fn applied(
+        before: &BTreeMap<String, Option<Vec<u8>>>,
+        generation: &Path,
+    ) -> BTreeMap<String, Option<Vec<u8>>> {
+        let bridge = generation.join("targets/packages/kalareach/claude-code/0.3.0/bridge");
+        let mut expected = before.clone();
+        for directory in [
+            "skills",
+            "skills/kalareach-channels",
+            "skills/kalareach-channels/.claude-plugin",
+            "skills/kalareach-channels/hooks",
+        ] {
+            expected.insert(directory.to_owned(), None);
+        }
+        for (path, source) in [
+            (
+                "skills/kalareach-channels/.claude-plugin/plugin.json",
+                "plugin-manifest.json",
+            ),
+            ("skills/kalareach-channels/.mcp.json", "mcp-servers.json"),
+            ("skills/kalareach-channels/hooks/hooks.json", "hooks.json"),
+        ] {
+            expected.insert(
+                path.to_owned(),
+                Some(std::fs::read(bridge.join(source)).expect("a release file")),
+            );
+        }
+        expected.insert(
+            "settings.json".to_owned(),
+            Some(
+                "{\n  \"model\": \"opus\",\n  \"enabledPlugins\": {\"kalareach-channels@skills-dir\": true}\n}\n"
+                    .as_bytes()
+                    .to_vec(),
+            ),
+        );
+        expected
+    }
+
+    /// KR-REQ-11.42: an installation the owner confirmed applies its release's recipe once the
+    /// installation has committed; a refused confirmation installs nothing and writes nothing; a
+    /// disable and an enable leave the registration; a removal restores Claude Code's directory.
+    #[tokio::test]
+    async fn kr_req_11_42_a_confirmed_installation_applies_the_recipe_and_its_removal_undoes_it() {
+        let site = Site::new();
+        let host = host(&site);
+        let digest = synchronised(&host).await;
+        let before = site.tree();
+
+        let refused = refusal(install(&host, &digest, false).await);
+        assert_eq!(
+            refused.code,
+            ErrorCode::OwnerConfirmationRequired,
+            "{refused:?}"
+        );
+        assert_eq!(site.tree(), before, "a refused confirmation writes nothing");
+        assert!(
+            host.module
+                .native_bridges()
+                .reports()
+                .expect("reads")
+                .is_empty()
+        );
+
+        let installed: wire::PluginInstallResult = ok(install(&host, &digest, true).await);
+        assert_eq!(installed.plugin.package_digest, digest);
+        assert_eq!(
+            site.tree(),
+            applied(&before, &host.working),
+            "the recipe's files and key, and nothing else"
+        );
+        let facts = bridge_facts(&host, &digest).expect("applied");
+        assert_eq!(facts.application, "claude-code");
+        assert_eq!(
+            facts.surfaces,
+            [BridgeSurface::Hook, BridgeSurface::Channel]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(facts.forwarder, site.root.join("bin/kr-hook"));
+
+        for method in [Method::PluginDisable, Method::PluginEnable] {
+            let _: wire::PluginEnableResult = ok(plugin_change(&host, method).await);
+            assert_eq!(
+                site.tree(),
+                applied(&before, &host.working),
+                "{}: the registration stays with the installation",
+                method.as_str()
+            );
+        }
+
+        let _: wire::PluginRemoveResult = ok(plugin_change(&host, Method::PluginRemove).await);
+        assert_eq!(
+            site.tree(),
+            before,
+            "Claude Code's directory is what it was"
+        );
+        assert!(bridge_facts(&host, &digest).is_none());
+        assert!(
+            host.module
+                .native_bridges()
+                .reports()
+                .expect("reads")
+                .is_empty()
+        );
+    }
+
+    /// KR-REQ-11.42: a grant that withdraws the bridge's capability takes the registration out,
+    /// and the installation stays.
+    #[tokio::test]
+    async fn kr_req_11_42_withdrawing_the_bridge_grant_takes_the_registration_out() {
+        let site = Site::new();
+        let host = host(&site);
+        let digest = synchronised(&host).await;
+        let before = site.tree();
+        let _: wire::PluginInstallResult = ok(install(&host, &digest, true).await);
+        assert_ne!(site.tree(), before);
+
+        let narrower: Vec<String> = GRANT
+            .iter()
+            .filter(|name| **name != "native_bridge.install")
+            .map(|name| (*name).to_owned())
+            .collect();
+        let plan = PluginGrantPlan {
+            environment_id: host.environment_id,
+            plugin_id: claude_code(),
+            version: "0.3.0".to_owned(),
+            package_digest: digest.clone(),
+            grant: narrower.iter().cloned().collect(),
+        };
+        let params = wire::PluginGrantParams {
+            environment_id: host.environment_id,
+            plugin_id: claude_code(),
+            package_digest: digest.clone(),
+            grant: narrower,
+            owner_confirmation: host.ceremony.approve(
+                SensitiveAction::GrantExecutableCapability,
+                plan.action_digest().expect("a digest"),
+            ),
+        };
+        let _: wire::PluginGrantResult = ok(host
+            .module
+            .write_frame_admitted(
+                &mutation(Method::PluginGrant, host.environment_id, &params),
+                Method::PluginGrant,
+                Some(host.confirmations()),
+            )
+            .await);
+
+        assert_eq!(site.tree(), before, "the registration is taken out");
+        assert!(bridge_facts(&host, &digest).is_none());
+        let catalogue = host.module.catalogue().lock().await;
+        assert!(
+            catalogue
+                .installation(host.environment_id, &claude_code())
+                .expect("readable")
+                .is_some(),
+            "the installation stays"
+        );
+    }
+
+    /// KR-REQ-11.42: a restarted daemon reads the record back, and changes nothing that is already
+    /// in place.
+    #[tokio::test]
+    async fn kr_req_11_42_a_restart_reads_the_record_back() {
+        let site = Site::new();
+        let mut host = host(&site);
+        let digest = synchronised(&host).await;
+        let _: wire::PluginInstallResult = ok(install(&host, &digest, true).await);
+        let after = site.tree();
+        let before_restart = bridge_facts(&host, &digest).expect("applied");
+
+        restarted(&mut host, &site);
+
+        assert_eq!(bridge_facts(&host, &digest), Some(before_restart));
+        assert_eq!(site.tree(), after, "nothing was written again");
+    }
+
+    /// An application that stops part way is not reported as applied, and the daemon's next start
+    /// finishes it.
+    #[tokio::test]
+    async fn an_application_stopped_part_way_is_finished_when_the_daemon_starts_again() {
+        let site = Site::new();
+        let mut host = host(&site);
+        let digest = synchronised(&host).await;
+        let before = site.tree();
+        host.module.native_bridges().stop_before(20);
+
+        let installed: wire::PluginInstallResult = ok(install(&host, &digest, true).await);
+
+        assert_eq!(
+            installed.plugin.package_digest, digest,
+            "the installation's answer stands"
+        );
+        assert!(
+            bridge_facts(&host, &digest).is_none(),
+            "not reported as applied"
+        );
+        restarted(&mut host, &site);
+        assert_eq!(
+            site.tree(),
+            applied(&before, &host.working),
+            "finished at the start"
+        );
+        assert!(bridge_facts(&host, &digest).is_some());
+    }
+
+    /// With no signed record establishing the executable's version, which is what the catalogue's
+    /// signed records give today, a confirmed installation commits and its recipe places nothing,
+    /// and says why.
+    #[tokio::test]
+    async fn a_release_without_signed_version_evidence_places_nothing() {
+        let site = Site {
+            signed_records: Vec::new(),
+            ..Site::new()
+        };
+        let host = host(&site);
+        let digest = synchronised(&host).await;
+        let before = site.tree();
+
+        let installed: wire::PluginInstallResult = ok(install(&host, &digest, true).await);
+
+        assert_eq!(installed.plugin.package_digest, digest);
+        assert_eq!(site.tree(), before, "nothing was placed");
+        let reports = host.module.native_bridges().reports().expect("reads");
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert_eq!(reports[0].state, "refused");
+        assert!(
+            reports[0]
+                .notes
+                .iter()
+                .any(|note| note.contains("no signed qualification record")),
+            "{reports:?}"
+        );
+    }
 }

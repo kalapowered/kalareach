@@ -32,6 +32,8 @@
 //! nothing left to restore.
 
 use crate::error::{CliError, Result};
+use kr_client::shown;
+use kr_client::shown::Shown;
 
 #[cfg(not(unix))]
 pub use crate::platform::{ControllingTerminal, SavedModes};
@@ -280,25 +282,25 @@ impl ScreenModes {
         let mut fields = text.split(',');
         for slot in &mut modes {
             let field = fields.next().ok_or_else(|| {
-                crate::error::CliError::Terminal(
-                    "the saved mode state is missing a mode".to_owned(),
-                )
+                crate::error::CliError::Terminal(Shown::said(
+                    "the saved mode state is missing a mode",
+                ))
             })?;
             *slot = match field {
                 "1" => Some(true),
                 "0" => Some(false),
                 "-" => None,
                 _ => {
-                    return Err(crate::error::CliError::Terminal(
-                        "the saved mode state has a field that is not a mode".to_owned(),
-                    ));
+                    return Err(crate::error::CliError::Terminal(Shown::said(
+                        "the saved mode state has a field that is not a mode",
+                    )));
                 }
             };
         }
         if fields.next().is_some() {
-            return Err(crate::error::CliError::Terminal(
-                "the saved mode state has more fields than expected".to_owned(),
-            ));
+            return Err(crate::error::CliError::Terminal(Shown::said(
+                "the saved mode state has more fields than expected",
+            )));
         }
         Ok(Self { modes })
     }
@@ -345,10 +347,10 @@ impl Probe {
     /// Returns [`CliError::TerminalProbeFailed`] when a probe has already been sent on this stream.
     pub fn unasked(context: kr_term::probe::InputContext) -> Result<Self> {
         if context == kr_term::probe::InputContext::Contaminated {
-            return Err(CliError::TerminalProbeFailed(
-                "a probe has already gone out on this terminal, so --no-probe cannot promise that                  no late reply is still coming; start again in a fresh terminal"
-                    .to_owned(),
-            ));
+            return Err(CliError::TerminalProbeFailed(Shown::said(
+                "a probe has already gone out on this terminal, so --no-probe cannot promise that \
+                 no late reply is still coming; start again in a fresh terminal",
+            )));
         }
         Ok(Self {
             keyboard: KeyboardState::EMPTY,
@@ -498,23 +500,23 @@ impl KeyboardState {
     /// Returns an error when the text is not two fields, each a number or a dash.
     pub fn decode(text: &str) -> crate::error::Result<Self> {
         let mut parts = text.split(':');
-        let mut next = |what: &str| -> crate::error::Result<Option<u64>> {
+        let mut next = |what: &'static str| -> crate::error::Result<Option<u64>> {
             let part = parts.next().ok_or_else(|| {
-                crate::error::CliError::Terminal(format!("the saved {what} state is missing"))
+                crate::error::CliError::Terminal(shown!("the saved {} state is missing", what))
             })?;
             if part == "-" {
                 return Ok(None);
             }
             part.parse::<u64>().map(Some).map_err(|_| {
-                crate::error::CliError::Terminal(format!("the saved {what} state is not a number"))
+                crate::error::CliError::Terminal(shown!("the saved {} state is not a number", what))
             })
         };
         let kitty = next("keyboard")?;
         let modify_other_keys = next("modifyOtherKeys")?;
         if parts.next().is_some() {
-            return Err(crate::error::CliError::Terminal(
-                "the saved keyboard state has more fields than expected".to_owned(),
-            ));
+            return Err(crate::error::CliError::Terminal(Shown::said(
+                "the saved keyboard state has more fields than expected",
+            )));
         }
         Ok(Self {
             kitty: kitty.map(|value| u16::try_from(value).unwrap_or(u16::MAX)),
@@ -598,6 +600,9 @@ pub struct TerminalSize {
 mod unix {
     use std::fs::File;
 
+    use kr_client::shown;
+    use kr_client::shown::Shown;
+
     use rustix::termios::{OptionalActions, SpecialCodeIndex, Termios, Winsize};
 
     use super::{KeyboardState, Probe, RESET_SEQUENCES, TerminalSize};
@@ -667,8 +672,12 @@ mod unix {
         ///
         /// Returns an error when the modes cannot be read.
         pub fn modes(&self) -> Result<Termios> {
-            rustix::termios::tcgetattr(&self.handle)
-                .map_err(|error| CliError::Terminal(format!("read the terminal's modes: {error}")))
+            rustix::termios::tcgetattr(&self.handle).map_err(|error| {
+                CliError::Terminal(shown!(
+                    "read the terminal's modes: {}",
+                    crate::shown::errno(error)
+                ))
+            })
         }
 
         /// Reads the terminal's size.
@@ -678,7 +687,10 @@ mod unix {
         /// Returns an error when the size cannot be read.
         pub fn size(&self) -> Result<TerminalSize> {
             let size: Winsize = rustix::termios::tcgetwinsize(&self.handle).map_err(|error| {
-                CliError::Terminal(format!("read the terminal's size: {error}"))
+                CliError::Terminal(shown!(
+                    "read the terminal's size: {}",
+                    crate::shown::errno(error)
+                ))
             })?;
             Ok(TerminalSize {
                 columns: size.ws_col,
@@ -698,7 +710,12 @@ mod unix {
             // `Now` rather than `Flush`: what the person typed before this moment is theirs, and
             // discarding the terminal's input queue on the way into raw mode would lose it.
             rustix::termios::tcsetattr(&self.handle, OptionalActions::Now, &raw).map_err(
-                |error| CliError::Terminal(format!("set the terminal's modes: {error}")),
+                |error| {
+                    CliError::Terminal(shown!(
+                        "set the terminal's modes: {}",
+                        crate::shown::errno(error)
+                    ))
+                },
             )?;
             Ok(saved)
         }
@@ -728,7 +745,12 @@ mod unix {
             use std::io::Write as _;
 
             rustix::termios::tcsetattr(&self.handle, OptionalActions::Flush, saved).map_err(
-                |error| CliError::Terminal(format!("restore the terminal's modes: {error}")),
+                |error| {
+                    CliError::Terminal(shown!(
+                        "restore the terminal's modes: {}",
+                        crate::shown::errno(error)
+                    ))
+                },
             )?;
             let mut handle = &self.handle;
             let _ = handle.write_all(RESET_SEQUENCES);
@@ -793,7 +815,7 @@ mod unix {
             // of elapsed time whatever the wall clock does while the terminal is being asked.
             let started = std::time::Instant::now();
             let (mut session, request) = ProbeSession::start(0, context, asked)
-                .map_err(|error| CliError::TerminalProbeFailed(error.to_string()))?;
+                .map_err(|error| CliError::TerminalProbeFailed(crate::shown::term(&error)))?;
 
             let saved = self.modes()?;
             // Before the terminal is touched at all, and before a single question goes out. From
@@ -803,12 +825,11 @@ mod unix {
             // than a hope that the last attempt finished. A host that cannot write the record
             // cannot make that promise, so the exchange is refused instead of sent.
             if !super::mark_contaminated(self) {
-                return Err(CliError::TerminalProbeFailed(
+                return Err(CliError::TerminalProbeFailed(Shown::said(
                     "this host cannot record that this terminal has been asked, so a handshake \
                      here could not be retried safely; attach with --no-probe, or make the \
-                     runtime directory writable"
-                        .to_owned(),
-                ));
+                     runtime directory writable",
+                )));
             }
             let mut asking = saved.clone();
             asking.make_raw();
@@ -819,13 +840,23 @@ mod unix {
             asking.special_codes[SpecialCodeIndex::VMIN] = 0;
             asking.special_codes[SpecialCodeIndex::VTIME] = 0;
             rustix::termios::tcsetattr(&self.handle, OptionalActions::Now, &asking).map_err(
-                |error| CliError::Terminal(format!("set the terminal's modes: {error}")),
+                |error| {
+                    CliError::Terminal(shown!(
+                        "set the terminal's modes: {}",
+                        crate::shown::errno(error)
+                    ))
+                },
             )?;
             let read = self.ask(&mut session, &request, started);
             // `Now` again, for the same reason: the exchange ends at the terminator, and anything
             // the person typed after it is still in the terminal's queue and is still theirs.
             rustix::termios::tcsetattr(&self.handle, OptionalActions::Now, &saved).map_err(
-                |error| CliError::Terminal(format!("restore the terminal's modes: {error}")),
+                |error| {
+                    CliError::Terminal(shown!(
+                        "restore the terminal's modes: {}",
+                        crate::shown::errno(error)
+                    ))
+                },
             )?;
             read?;
             let elapsed = elapsed_ms(started);
@@ -853,13 +884,15 @@ mod unix {
                     // arrived and was not an answer, which is usually the person's own typing and
                     // can be the first half of a reply that never finished.
                     let buffered = if discarded == 0 {
-                        String::new()
+                        Shown::said("")
                     } else {
-                        format!("; {discarded} buffered bytes were discarded")
+                        shown!("; {} buffered bytes were discarded", discarded)
                     };
-                    Err(CliError::TerminalProbeFailed(format!(
-                        "{error}; attach again in a fresh terminal, where no reply to this \
-                         exchange can still arrive{buffered}"
+                    Err(CliError::TerminalProbeFailed(shown!(
+                        "{}; attach again in a fresh terminal, where no reply to this exchange \
+                         can still arrive{}",
+                        crate::shown::term(&error),
+                        buffered
                     )))
                 }
             }
@@ -882,11 +915,17 @@ mod unix {
             // left to try again with. Section 8's deadline is for the whole exchange, and this is
             // the half of it a check after the fact cannot enforce.
             let blocking = rustix::fs::fcntl_getfl(&self.handle).map_err(|error| {
-                CliError::Terminal(format!("read the terminal's flags: {error}"))
+                CliError::Terminal(shown!(
+                    "read the terminal's flags: {}",
+                    crate::shown::errno(error)
+                ))
             })?;
             rustix::fs::fcntl_setfl(&self.handle, blocking | rustix::fs::OFlags::NONBLOCK)
                 .map_err(|error| {
-                    CliError::Terminal(format!("stop the terminal blocking: {error}"))
+                    CliError::Terminal(shown!(
+                        "stop the terminal blocking: {}",
+                        crate::shown::errno(error)
+                    ))
                 })?;
             let answer = self.exchange(session, request, started);
             // Back to whatever the terminal was, whatever happened: the person's own shell reads
@@ -917,8 +956,9 @@ mod unix {
                     }
                     Err(rustix::io::Errno::INTR) => {}
                     Err(error) => {
-                        return Err(CliError::Terminal(format!(
-                            "ask the terminal what it is: {error}"
+                        return Err(CliError::Terminal(shown!(
+                            "ask the terminal what it is: {}",
+                            crate::shown::errno(error)
                         )));
                     }
                 }
@@ -1072,10 +1112,10 @@ mod unix {
             let mut parts = text.split(':');
             let mut next = || -> Result<u64> {
                 let part = parts.next().ok_or_else(|| {
-                    CliError::Terminal("the saved terminal state is incomplete".to_owned())
+                    CliError::Terminal(Shown::said("the saved terminal state is incomplete"))
                 })?;
                 u64::from_str_radix(part, 16).map_err(|_| {
-                    CliError::Terminal("the saved terminal state is not hexadecimal".to_owned())
+                    CliError::Terminal(Shown::said("the saved terminal state is not hexadecimal"))
                 })
             };
             let input = next()?;
@@ -1083,28 +1123,30 @@ mod unix {
             let control = next()?;
             let local = next()?;
             let special = parts.next().ok_or_else(|| {
-                CliError::Terminal("the saved terminal state has no control characters".to_owned())
+                CliError::Terminal(Shown::said(
+                    "the saved terminal state has no control characters",
+                ))
             })?;
             if special.len() % 2 != 0 {
-                return Err(CliError::Terminal(
-                    "the saved control characters are not whole bytes".to_owned(),
-                ));
+                return Err(CliError::Terminal(Shown::said(
+                    "the saved control characters are not whole bytes",
+                )));
             }
             let mut codes = Vec::with_capacity(special.len() / 2);
             for index in (0..special.len()).step_by(2) {
                 let byte = special.get(index..index + 2).ok_or_else(|| {
-                    CliError::Terminal("the saved control characters are truncated".to_owned())
+                    CliError::Terminal(Shown::said("the saved control characters are truncated"))
                 })?;
                 codes.push(u8::from_str_radix(byte, 16).map_err(|_| {
-                    CliError::Terminal(
-                        "the saved control characters are not hexadecimal".to_owned(),
-                    )
+                    CliError::Terminal(Shown::said(
+                        "the saved control characters are not hexadecimal",
+                    ))
                 })?);
             }
             if parts.next().is_some() {
-                return Err(CliError::Terminal(
-                    "the saved terminal state has more fields than expected".to_owned(),
-                ));
+                return Err(CliError::Terminal(Shown::said(
+                    "the saved terminal state has more fields than expected",
+                )));
             }
             Ok(Self {
                 input,

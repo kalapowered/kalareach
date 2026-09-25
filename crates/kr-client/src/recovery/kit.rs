@@ -60,7 +60,7 @@ pub const MAX_RECOVERY_KIT_BYTES: usize = 1024;
 /// [`RecoveryError::UnprintableKit`] when an origin or the locator carries a character a
 /// line-oriented document cannot hold, and [`RecoveryError::KitTooLarge`] when the document would
 /// not fit a scannable QR code.
-pub fn render(kit: &RecoveryKit) -> Result<Zeroizing<String>, RecoveryError> {
+pub fn render_kit(kit: &RecoveryKit) -> Result<Zeroizing<String>, RecoveryError> {
     if kit.profile_version.get() != RECOVERY_KIT_PROFILE_VERSION {
         return Err(RecoveryError::UnsupportedProfile {
             version: kit.profile_version.get(),
@@ -116,21 +116,23 @@ pub fn render(kit: &RecoveryKit) -> Result<Zeroizing<String>, RecoveryError> {
         out.push_str(origin);
         out.push('\n');
     }
-    debug_assert_eq!(out.len(), total, "the reserved size is the written size");
-    debug_assert_eq!(out.capacity(), total, "the buffer never grew");
+    // Compared without rendering either side: an assertion that printed what it compared would be
+    // one step from printing what the buffer holds.
+    debug_assert!(out.len() == total, "the reserved size is the written size");
+    debug_assert!(out.capacity() == total, "the buffer never grew");
     Ok(out)
 }
 
 /// Returns the bytes a QR code carries in byte mode.
 ///
-/// They are [`render`]'s bytes. A scanner therefore reads the document a person could have typed,
+/// They are [`render_kit`]'s bytes. A scanner therefore reads the document a person could have typed,
 /// and a kit copied by either route is the same kit.
 ///
 /// # Errors
 ///
-/// See [`render`].
+/// See [`render_kit`].
 pub fn qr_payload(kit: &RecoveryKit) -> Result<Zeroizing<Vec<u8>>, RecoveryError> {
-    Ok(Zeroizing::new(render(kit)?.as_bytes().to_vec()))
+    Ok(Zeroizing::new(render_kit(kit)?.as_bytes().to_vec()))
 }
 
 /// Reads a kit back from the printed or scanned document.
@@ -143,7 +145,7 @@ pub fn qr_payload(kit: &RecoveryKit) -> Result<Zeroizing<Vec<u8>>, RecoveryError
 /// Returns [`RecoveryError::MalformedKit`] when the document is not this format,
 /// [`RecoveryError::UnsupportedProfile`] for another profile, and
 /// [`RecoveryError::MistypedKit`] when the checksum does not match the seed.
-pub fn parse(document: &str) -> Result<RecoveryKit, RecoveryError> {
+pub fn parse_kit(document: &str) -> Result<RecoveryKit, RecoveryError> {
     if document.len() > MAX_RECOVERY_KIT_BYTES {
         return Err(RecoveryError::KitTooLarge {
             len: document.len(),
@@ -208,9 +210,9 @@ pub fn parse(document: &str) -> Result<RecoveryKit, RecoveryError> {
         });
     }
 
-    let bytes: [u8; 32] = payload[..32]
-        .try_into()
-        .expect("the payload is thirty-six bytes");
+    let Ok(bytes) = <[u8; 32]>::try_from(&payload[..32]) else {
+        unreachable!("the payload is thirty-six bytes");
+    };
     let kit = RecoveryKit {
         profile_version: U64::new(RECOVERY_KIT_PROFILE_VERSION),
         seed: SecretBytes32::from_bytes(bytes),
@@ -287,7 +289,9 @@ fn decode_seed(text: &str) -> Result<Zeroizing<Vec<u8>>, RecoveryError> {
         bits += 5;
         if bits >= 8 {
             bits -= 8;
-            let byte = u8::try_from((accumulator >> bits) & 0xff).expect("eight bits");
+            let Ok(byte) = u8::try_from((accumulator >> bits) & 0xff) else {
+                unreachable!("eight bits");
+            };
             if written < PAYLOAD_LEN {
                 payload[written] = byte;
                 written += 1;

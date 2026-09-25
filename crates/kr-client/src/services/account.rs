@@ -9,7 +9,8 @@
 //!
 //! This module is the client's half of that, with no platform code in it:
 //!
-//! * [`AuthorisationRequest`] builds the one address the browser is handed.
+//! * [`AuthorisationRequest`] builds the one address the browser is handed, asking for the scopes
+//!   its caller names.
 //! * [`PendingAuthorisation`] checks what comes back, in a fixed order, and consumes the request so
 //!   that no second answer can use it.
 //! * [`AccountService`] is the service's token, revocation, identity and usage endpoints, and
@@ -52,14 +53,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use base64::Engine as _;
 use kr_crypto::store::{SecretName, SecretStore};
-use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::error::ErrorCode;
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 use subtle::ConstantTimeEq as _;
 use url::Url;
 
+use super::json::Unreadable;
 use super::{ServiceFuture, ServiceHttpAnswer};
 use crate::error::{ClientError, Result};
+use crate::shown::Shown;
 
 /* -------------------------------------------------------------------------- */
 /* What is pinned                                                              */
@@ -95,11 +98,84 @@ pub const LEASE_SCOPE: &str = "organisation.lease";
 /// The scope reading usage needs.
 pub const USAGE_SCOPE: &str = "billing.read";
 
+/// The scope an account token needs to write what the account keeps as backup: its archives, and
+/// the recovery bundle at its locator.
+pub const BACKUP_WRITE_SCOPE: &str = "backup.write";
+
+/// The scope an account token needs to read the recovery bundle and nothing else, which is what a
+/// device restoring from a recovery kit asks for.
+pub const BACKUP_RESTORE_SCOPE: &str = "backup.restore";
+
+/// The scopes every authorisation asks for, whatever resources it asks for beside them.
+///
+/// The identity claims, which the ID token an exchange is checked by carries and the identity read
+/// returns, and a refresh token that survives a restart, which the kept grant is renewed with.
+pub const IDENTITY_SCOPES: [&str; 4] = ["openid", "profile", "email", "offline_access"];
+
+/// The scopes this build knows by name beside the ones an application sign-in asks for: the ones
+/// an authorisation for one purpose asks for.
+const PURPOSE_SCOPES: [&str; 2] = [BACKUP_WRITE_SCOPE, BACKUP_RESTORE_SCOPE];
+
+/// A scope this build knows, as this build's own name for it: one an application sign-in or an
+/// authorisation for one purpose asks for.
+///
+/// A scope is text a service or a stored file supplied, so a diagnostic names one only through
+/// this, and one this build does not know is not repeated: a summary counts it, and a refusal says
+/// that it is one.
+#[must_use]
+pub(crate) fn known_scope(scope: &str) -> Option<&'static str> {
+    REQUESTED_SCOPES
+        .iter()
+        .chain(&PURPOSE_SCOPES)
+        .copied()
+        .find(|known| *known == scope)
+}
+
+/// What a set of stored scopes says: the ones this build knows, by name and in the order they
+/// were stored, and how many others there are.
+///
+/// Every rendering of stored scopes uses this, the command line's as well. The scopes themselves
+/// are kept whole for what they are for: a request presents them and a check reads them.
+#[must_use]
+pub fn scope_summary(scopes: &[String]) -> Shown {
+    let (known, unknown) = scope_names(scopes);
+    scope_words(&known, unknown)
+}
+
+/// The stored scopes this build knows, by their names and in the order they were stored, and how
+/// many others there are: [`scope_summary`] as values, for a document that lists them.
+#[must_use]
+pub fn scope_names(scopes: &[String]) -> (Vec<&'static str>, usize) {
+    let mut known = Vec::new();
+    let mut unknown = 0_usize;
+    for scope in scopes {
+        match known_scope(scope) {
+            Some(name) if !known.contains(&name) => known.push(name),
+            Some(_) => {}
+            None => unknown += 1,
+        }
+    }
+    (known, unknown)
+}
+
+/// What [`scope_names`] says, in the words [`scope_summary`] uses.
+#[must_use]
+pub fn scope_words(known: &[&'static str], unknown: usize) -> Shown {
+    let named = Shown::joined(known.iter().copied().map(Shown::said), ", ");
+    match (known.is_empty(), unknown) {
+        (true, 0) => Shown::said("no scopes"),
+        (false, 0) => named,
+        (true, count) => crate::shown!("{} scope(s) this build does not know", count),
+        (false, count) => {
+            crate::shown!("{} and {} scope(s) this build does not know", named, count)
+        }
+    }
+}
+
 /// Every scope an application sign-in asks for, in the order the request states them.
 ///
-/// The identity claims, a refresh token that survives a restart, the member's lease fetch, the
-/// call this device holds and the answers it asks for, and usage. Not `backup.write`: the
-/// application writes no archives.
+/// The [`IDENTITY_SCOPES`], then the member's lease fetch, the call this device holds and the
+/// answers it asks for, and usage. Not [`BACKUP_WRITE_SCOPE`]: the application writes no archives.
 pub const REQUESTED_SCOPES: [&str; 8] = [
     "openid",
     "profile",
@@ -217,19 +293,20 @@ impl Client {
 /* -------------------------------------------------------------------------- */
 
 /// Checks a bearer value: not empty, at most 8192 bytes, and printable ASCII.
-fn bearer_value(value: &str, what: &str) -> Result<()> {
+fn bearer_value(value: &str, what: &'static str) -> Result<()> {
     if value.is_empty() {
-        return Err(local(&format!("{what} is not empty")));
+        return Err(local(crate::shown!("{} is not empty", what)));
     }
     if value.len() > 8192 {
-        return Err(local(&format!("{what} is at most 8192 bytes")));
+        return Err(local(crate::shown!("{} is at most 8192 bytes", what)));
     }
     if !value
         .bytes()
         .all(|byte| (0x21..=0x7e).contains(&byte) || byte == b' ')
     {
-        return Err(local(&format!(
-            "{what} is printable ASCII, as an authorisation header value is"
+        return Err(local(crate::shown!(
+            "{} is printable ASCII, as an authorisation header value is",
+            what
         )));
     }
     Ok(())
@@ -323,10 +400,13 @@ pub trait AccountTokenSource: Send + Sync + fmt::Debug {
 fn fresh_secret() -> Result<String> {
     let mut bytes = [0_u8; 32];
     kr_crypto::random_bytes(&mut bytes).map_err(|error| {
-        ClientError::Host(ProtocolError::new(
+        ClientError::refusal(
             ErrorCode::ResourceUnavailable,
-            format!("this device could not produce random bytes: {error}"),
-        ))
+            crate::shown!(
+                "this device could not produce random bytes: {}",
+                Shown::crypto(&error)
+            ),
+        )
     })?;
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
@@ -351,10 +431,13 @@ impl AttemptId {
     pub fn fresh() -> Result<Self> {
         let mut bytes = [0_u8; 8];
         kr_crypto::random_bytes(&mut bytes).map_err(|error| {
-            ClientError::Host(ProtocolError::new(
+            ClientError::refusal(
                 ErrorCode::ResourceUnavailable,
-                format!("this device could not produce random bytes: {error}"),
-            ))
+                crate::shown!(
+                    "this device could not produce random bytes: {}",
+                    Shown::crypto(&error)
+                ),
+            )
         })?;
         Ok(Self(u64::from_le_bytes(bytes)))
     }
@@ -372,11 +455,13 @@ impl AttemptId {
     }
 }
 
-impl fmt::Display for AttemptId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{:016x}", self.0)
+impl crate::shown::Said for AttemptId {
+    fn said(&self) -> crate::shown::Shown {
+        crate::shown::Shown::hexadecimal(self.0)
     }
 }
+
+crate::display_as_said!(AttemptId);
 
 impl fmt::Debug for AttemptId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -389,10 +474,16 @@ impl fmt::Debug for AttemptId {
 /// Its state, verifier and nonce are fresh for every attempt, live in this process for as long as
 /// the attempt does, and are never stored; the nonce is kept with the grant once the sign-in
 /// succeeds, because a refresh's ID token is checked against it.
+///
+/// It asks for the scopes its caller names and no others. The application's own sign-in asks for
+/// [`REQUESTED_SCOPES`]; an authorisation made for one purpose asks for the [`IDENTITY_SCOPES`] and
+/// that purpose's resources, so the token that comes of it reaches what it was asked for and
+/// nothing else.
 pub struct AuthorisationRequest {
     client: Client,
     redirect: Redirect,
     attempt: AttemptId,
+    scopes: Vec<String>,
     state: String,
     verifier: String,
     nonce: String,
@@ -410,24 +501,64 @@ impl fmt::Debug for AuthorisationRequest {
 }
 
 impl AuthorisationRequest {
-    /// A request for `client`, answered on `redirect`.
+    /// The application's sign-in for `client`, answered on `redirect`, asking for
+    /// [`REQUESTED_SCOPES`].
     ///
     /// # Errors
     ///
     /// Returns an error when `redirect` is not registered for `client`, or when this device could
     /// not produce random bytes.
     pub fn new(client: Client, redirect: Redirect) -> Result<Self> {
+        Self::asking(client, redirect, &REQUESTED_SCOPES[IDENTITY_SCOPES.len()..])
+    }
+
+    /// A request for `client`, answered on `redirect`, asking for the [`IDENTITY_SCOPES`] and the
+    /// resources `resources` names, and for nothing else.
+    ///
+    /// A caller names what its one purpose reads: a device restoring from a recovery kit asks for
+    /// [`BACKUP_RESTORE_SCOPE`] alone. The identity scopes are asked for whatever the resources are,
+    /// because an exchange is checked by its ID token and a kept grant is renewed with its refresh
+    /// token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `redirect` is not registered for `client`, when a resource is not a
+    /// scope a request can carry or names a scope already asked for, or when this device could not
+    /// produce random bytes.
+    pub fn asking(client: Client, redirect: Redirect, resources: &[&str]) -> Result<Self> {
         if !client.owns(redirect) {
-            return Err(local(&format!(
+            return Err(local(crate::shown!(
                 "{} is not a redirect registered for {}",
                 redirect.uri(),
                 client.id()
             )));
         }
+        let mut scopes: Vec<String> = IDENTITY_SCOPES
+            .iter()
+            .map(|scope| (*scope).to_owned())
+            .collect();
+        for resource in resources {
+            // RFC 6749 section 3.3: a scope is printable ASCII other than a space, a quotation
+            // mark and a backslash, because the request carries the list separated by spaces.
+            let carried = !resource.is_empty()
+                && resource
+                    .bytes()
+                    .all(|byte| matches!(byte, 0x21 | 0x23..=0x5b | 0x5d..=0x7e));
+            if !carried {
+                return Err(local(
+                    "a scope is printable ASCII with no space, quotation mark or backslash",
+                ));
+            }
+            if scopes.iter().any(|asked| asked == resource) {
+                return Err(local("an authorisation asks for each scope once"));
+            }
+            scopes.push((*resource).to_owned());
+        }
         Ok(Self {
             client,
             redirect,
             attempt: AttemptId::fresh()?,
+            scopes,
             state: fresh_secret()?,
             verifier: fresh_secret()?,
             nonce: fresh_secret()?,
@@ -442,14 +573,15 @@ impl AuthorisationRequest {
     /// Panics only when the pinned origin does not parse, which is a build-time mistake.
     #[must_use]
     pub fn url(&self) -> String {
-        let mut url = Url::parse(ACCOUNT_ORIGIN)
-            .and_then(|origin| origin.join(AUTHORIZE_PATH))
-            .expect("the pinned origin and path parse");
+        let Ok(mut url) = Url::parse(ACCOUNT_ORIGIN).and_then(|origin| origin.join(AUTHORIZE_PATH))
+        else {
+            unreachable!("the pinned origin and path parse");
+        };
         url.query_pairs_mut()
             .append_pair("response_type", "code")
             .append_pair("client_id", self.client.id())
             .append_pair("redirect_uri", self.redirect.uri())
-            .append_pair("scope", &REQUESTED_SCOPES.join(" "))
+            .append_pair("scope", &self.scopes.join(" "))
             .append_pair("state", &self.state)
             .append_pair("code_challenge", &code_challenge(&self.verifier))
             .append_pair("code_challenge_method", "S256")
@@ -474,6 +606,12 @@ impl AuthorisationRequest {
     #[must_use]
     pub const fn attempt(&self) -> AttemptId {
         self.attempt
+    }
+
+    /// The scopes this request asks for, in the order it states them.
+    #[must_use]
+    pub fn scopes(&self) -> &[String] {
+        &self.scopes
     }
 }
 
@@ -744,7 +882,7 @@ impl fmt::Debug for IssuedGrant {
         formatter
             .debug_struct("IssuedGrant")
             .field("expires_in_seconds", &self.expires_in_seconds)
-            .field("scopes", &self.scopes)
+            .field("scopes", &scope_summary(&self.scopes))
             .finish_non_exhaustive()
     }
 }
@@ -1079,20 +1217,24 @@ impl ManagedAccountService {
         Some(subject.to_owned())
     }
 
-    /// Reads a JSON answer.
-    fn json(answer: &ServiceHttpAnswer) -> Option<serde_json::Value> {
-        serde_json::from_slice(&answer.body).ok()
+    /// Reads a JSON answer, refusing one that names a member twice ([`super::json::read`]).
+    fn json(answer: &ServiceHttpAnswer) -> std::result::Result<serde_json::Value, Unreadable> {
+        super::json::read(&answer.body)
     }
 
     /// Whether a refused answer names an OAuth error.
     fn names_error(answer: &ServiceHttpAnswer) -> bool {
         Self::json(answer)
+            .ok()
             .and_then(|value| value.get("error").map(serde_json::Value::is_string))
             .unwrap_or(false)
     }
 }
 
 /// The payload of a compact JWT, as a JSON object.
+///
+/// Read like an answer, because it is one: claims that name a member twice could name two
+/// subjects, and a check made against one of them would not cover the other.
 fn id_token_claims(token: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
     let mut parts = token.split('.');
     let (_header, payload, _signature) = (parts.next()?, parts.next()?, parts.next()?);
@@ -1102,10 +1244,7 @@ fn id_token_claims(token: &str) -> Option<serde_json::Map<String, serde_json::Va
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload.trim_end_matches('='))
         .ok()?;
-    match serde_json::from_slice(&bytes).ok()? {
-        serde_json::Value::Object(claims) => Some(claims),
-        _ => None,
-    }
+    super::json::read(&bytes).ok()
 }
 
 /// A form body, encoded.
@@ -1118,11 +1257,27 @@ fn form(pairs: &[(&str, &str)]) -> Vec<u8> {
 }
 
 /// A service that could not be reached or answered in a way this client cannot read.
-fn upstream(what: &str, status: u16) -> ClientError {
-    ClientError::Host(ProtocolError::new(
+fn upstream(what: &'static str, status: u16) -> ClientError {
+    ClientError::refusal(
         ErrorCode::UpstreamUnavailable,
-        format!("the account service answered {what} with status {status}"),
-    ))
+        crate::shown!(
+            "the account service answered {} with status {}",
+            what,
+            status
+        ),
+    )
+}
+
+/// A success this client cannot read, with what was wrong with it and where, and nothing it held.
+fn unreadable(what: &'static str, fault: Unreadable) -> ClientError {
+    ClientError::refusal(
+        ErrorCode::UpstreamUnavailable,
+        crate::shown!(
+            "the account service answered {} with status 200, and {}",
+            what,
+            fault
+        ),
+    )
 }
 
 impl AccountService for ManagedAccountService {
@@ -1142,7 +1297,7 @@ impl AccountService for ManagedAccountService {
                 }
                 return Err(upstream("the exchange", answer.status));
             }
-            let Some(value) = Self::json(&answer) else {
+            let Ok(value) = Self::json(&answer) else {
                 return Ok(Exchanged::Refused { leftover: None });
             };
             let expected = Expected {
@@ -1171,7 +1326,7 @@ impl AccountService for ManagedAccountService {
                 }
                 return Err(upstream("the refresh", answer.status));
             }
-            let Some(value) = Self::json(&answer) else {
+            let Ok(value) = Self::json(&answer) else {
                 return Ok(Refreshed::Refused { leftover: None });
             };
             let expected = Expected {
@@ -1217,7 +1372,8 @@ impl AccountService for ManagedAccountService {
             if answer.status != 200 {
                 return Err(upstream("the identity read", answer.status));
             }
-            let value = Self::json(&answer).ok_or_else(|| upstream("the identity read", 200))?;
+            let value =
+                Self::json(&answer).map_err(|fault| unreadable("the identity read", fault))?;
             let text = |name: &str| {
                 value
                     .get(name)
@@ -1247,7 +1403,7 @@ impl AccountService for ManagedAccountService {
             if answer.status != 200 {
                 return Err(upstream("the usage read", answer.status));
             }
-            let value = Self::json(&answer).ok_or_else(|| upstream("the usage read", 200))?;
+            let value = Self::json(&answer).map_err(|fault| unreadable("the usage read", fault))?;
             // The service answers `{ok, data}` around the summary; a refusal is `ok: false`.
             if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
                 return Err(upstream("the usage read", 200));
@@ -1313,10 +1469,12 @@ impl fmt::Debug for StoredGrant {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("StoredGrant")
-            .field("grant_id", &self.grant_id)
+            // The grant's identifier is drawn like a secret and read back from the file, so it is
+            // counted rather than repeated.
+            .field("grant_id_bytes", &self.grant_id.len())
             .field("revision", &self.revision)
             .field("client", &self.client)
-            .field("scopes", &self.scopes)
+            .field("scopes", &scope_summary(&self.scopes))
             .finish_non_exhaustive()
     }
 }
@@ -1440,11 +1598,16 @@ impl StoredGrant {
         self.scopes.iter().any(|held| held == scope)
     }
 
-    fn read(bytes: &[u8]) -> Result<Self> {
+    /// Reads a stored grant.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage failure when the document is not one this build wrote.
+    pub(crate) fn read(bytes: &[u8]) -> Result<Self> {
         let document: GrantDocument = serde_json::from_slice(bytes).map_err(|error| {
-            storage(&format!(
+            storage(crate::shown!(
                 "the stored sign-in could not be read: {}",
-                super::json_fault(&error)
+                Shown::json(&error)
             ))
         })?;
         if document.issuer != ISSUER {
@@ -1483,9 +1646,9 @@ impl StoredGrant {
             scopes: self.scopes.clone(),
         };
         serde_json::to_vec(&document).map_err(|error| {
-            storage(&format!(
+            storage(crate::shown!(
                 "the sign-in could not be written: {}",
-                super::json_fault(&error)
+                Shown::json(&error)
             ))
         })
     }
@@ -1514,19 +1677,13 @@ struct PendingEntry {
 }
 
 /// A store failure, which a caller reports as this device being unable to keep the sign-in.
-fn storage(message: &str) -> ClientError {
-    ClientError::Host(ProtocolError::new(
-        ErrorCode::StorageUnavailable,
-        message.to_owned(),
-    ))
+fn storage(message: impl Into<Shown>) -> ClientError {
+    ClientError::refusal(ErrorCode::StorageUnavailable, message.into())
 }
 
 /// A request this client would not make.
-fn local(message: &str) -> ClientError {
-    ClientError::Host(ProtocolError::new(
-        ErrorCode::InvalidArgument,
-        message.to_owned(),
-    ))
+fn local(message: impl Into<Shown>) -> ClientError {
+    ClientError::refusal(ErrorCode::InvalidArgument, message.into())
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1569,7 +1726,7 @@ impl fmt::Debug for AccountStatus {
                 .debug_struct("SignedIn")
                 .field("email", &email.as_ref().map(|_| "<present>"))
                 .field("name", &name.as_ref().map(|_| "<present>"))
-                .field("scopes", scopes)
+                .field("scopes", &scope_summary(scopes))
                 .field("generation", generation)
                 .finish(),
         }
@@ -1635,18 +1792,18 @@ impl Drop for Held<'_> {
 
 /// The error a caller gets when no account is signed in.
 fn signed_out() -> ClientError {
-    ClientError::Host(ProtocolError::new(
+    ClientError::refusal(
         ErrorCode::HostNotConfigured,
-        "no account is signed in on this device".to_owned(),
-    ))
+        crate::shown::Shown::said("no account is signed in on this device"),
+    )
 }
 
 /// The error a caller gets when the sign-in has ended.
 fn ended() -> ClientError {
-    ClientError::Host(ProtocolError::new(
+    ClientError::refusal(
         ErrorCode::PermissionDenied,
-        "the sign-in on this device has ended; sign in again".to_owned(),
-    ))
+        crate::shown::Shown::said("the sign-in on this device has ended; sign in again"),
+    )
 }
 
 impl SignedInAccount {
@@ -1747,7 +1904,10 @@ impl SignedInAccount {
                     .await
                     .map_err(|_| storage("the account lock could not be taken"))?
                     .map_err(|error| {
-                        storage(&format!("the account lock could not be taken: {error}"))
+                        storage(crate::shown!(
+                            "the account lock could not be taken: {}",
+                            Shown::io(&error)
+                        ))
                     })?;
                 Some(taken)
             }
@@ -1759,14 +1919,19 @@ impl SignedInAccount {
     }
 
     fn name(item: &str) -> Result<SecretName> {
-        SecretName::new(item).map_err(|error| storage(&error.to_string()))
+        SecretName::new(item).map_err(|error| storage(Shown::crypto(&error)))
     }
 
     fn read_grant(&self) -> Result<Option<StoredGrant>> {
         let bytes = self
             .store
             .get(&Self::name(SESSION_ITEM)?)
-            .map_err(|error| storage(&format!("the sign-in could not be read: {error}")))?;
+            .map_err(|error| {
+                storage(crate::shown!(
+                    "the sign-in could not be read: {}",
+                    Shown::crypto(&error)
+                ))
+            })?;
         bytes
             .map(|bytes| StoredGrant::read(bytes.expose()))
             .transpose()
@@ -1775,13 +1940,23 @@ impl SignedInAccount {
     fn write_grant(&self, grant: &StoredGrant) -> Result<()> {
         self.store
             .set(&Self::name(SESSION_ITEM)?, &grant.write()?)
-            .map_err(|error| storage(&format!("the sign-in could not be kept: {error}")))
+            .map_err(|error| {
+                storage(crate::shown!(
+                    "the sign-in could not be kept: {}",
+                    Shown::crypto(&error)
+                ))
+            })
     }
 
     fn delete_grant(&self) -> Result<()> {
         self.store
             .delete(&Self::name(SESSION_ITEM)?)
-            .map_err(|error| storage(&format!("the sign-in could not be removed: {error}")))
+            .map_err(|error| {
+                storage(crate::shown!(
+                    "the sign-in could not be removed: {}",
+                    Shown::crypto(&error)
+                ))
+            })
     }
 
     fn read_pending(&self) -> Result<Vec<PendingRevocation>> {
@@ -1789,8 +1964,9 @@ impl SignedInAccount {
             .store
             .get(&Self::name(PENDING_ITEM)?)
             .map_err(|error| {
-                storage(&format!(
-                    "the pending revocations could not be read: {error}"
+                storage(crate::shown!(
+                    "the pending revocations could not be read: {}",
+                    Shown::crypto(&error)
                 ))
             })?
         else {
@@ -1798,9 +1974,9 @@ impl SignedInAccount {
         };
         let document: PendingDocument =
             serde_json::from_slice(bytes.expose()).map_err(|error| {
-                storage(&format!(
+                storage(crate::shown!(
                     "the pending revocations could not be read: {}",
-                    super::json_fault(&error)
+                    Shown::json(&error)
                 ))
             })?;
         document
@@ -1820,8 +1996,9 @@ impl SignedInAccount {
         let name = Self::name(PENDING_ITEM)?;
         if entries.is_empty() {
             return self.store.delete(&name).map_err(|error| {
-                storage(&format!(
-                    "the pending revocations could not be removed: {error}"
+                storage(crate::shown!(
+                    "the pending revocations could not be removed: {}",
+                    Shown::crypto(&error)
                 ))
             });
         }
@@ -1836,14 +2013,15 @@ impl SignedInAccount {
                 .collect(),
         };
         let bytes = serde_json::to_vec(&document).map_err(|error| {
-            storage(&format!(
+            storage(crate::shown!(
                 "the pending revocations could not be written: {}",
-                super::json_fault(&error)
+                Shown::json(&error)
             ))
         })?;
         self.store.set(&name, &bytes).map_err(|error| {
-            storage(&format!(
-                "the pending revocations could not be kept: {error}"
+            storage(crate::shown!(
+                "the pending revocations could not be kept: {}",
+                Shown::crypto(&error)
             ))
         })
     }
@@ -2044,10 +2222,12 @@ impl SignedInAccount {
                             generation(&current)
                         }
                         Some(_) | None => {
-                            return Err(ClientError::Host(ProtocolError::new(
+                            return Err(ClientError::refusal(
                                 ErrorCode::OutcomeUnknown,
-                                "the sign-in changed while its usage was being read".to_owned(),
-                            )));
+                                crate::shown::Shown::said(
+                                    "the sign-in changed while its usage was being read",
+                                ),
+                            ));
                         }
                     }
                 };
@@ -2077,12 +2257,15 @@ fn generation(grant: &StoredGrant) -> String {
         .collect()
 }
 
-/// The refusal for a scope this sign-in does not carry.
+/// The refusal for a scope this sign-in does not carry, naming it when this build knows it.
 fn not_granted(scope: &str) -> ClientError {
-    ClientError::Host(ProtocolError::new(
+    ClientError::refusal(
         ErrorCode::PermissionDenied,
-        format!("this sign-in was not granted the {scope} scope"),
-    ))
+        match known_scope(scope) {
+            Some(name) => crate::shown!("this sign-in was not granted the {} scope", name),
+            None => Shown::said("this sign-in was not granted a scope this build does not know"),
+        },
+    )
 }
 
 impl AccountTokenSource for SignedInAccount {
@@ -2204,7 +2387,7 @@ mod tests {
         let tokens = issued(NEVER_RENDERED);
         renders_only(
             &tokens,
-            "IssuedGrant{expires_in_seconds:600,scopes:[\"openid\",\"billing.read\"],..}",
+            "IssuedGrant{expires_in_seconds:600,scopes:\"openid,billing.read\",..}",
         );
 
         let mut stored =
@@ -2215,7 +2398,7 @@ mod tests {
         stored.subject = NEVER_RENDERED.to_owned();
         renders_only(
             &stored,
-            "StoredGrant{grant_id:\"a-grant\",revision:0,client:Mobile,scopes:[\"openid\",\"billing.read\"],..}",
+            "StoredGrant{grant_id_bytes:7,revision:0,client:Mobile,scopes:\"openid,billing.read\",..}",
         );
 
         renders_only(
@@ -2248,5 +2431,309 @@ mod tests {
         let error = StoredGrant::read(&serde_json::to_vec(&document).expect("bytes"))
             .expect_err("another issuer");
         assert_eq!(error.code(), ErrorCode::StorageUnavailable);
+    }
+
+    /* ---------------------------------------------------------------------- */
+    /* What an authorisation asks for                                          */
+    /* ---------------------------------------------------------------------- */
+
+    /// The one `scope` parameter an authorisation's address carries.
+    fn asked(request: &AuthorisationRequest) -> Vec<String> {
+        Url::parse(&request.url())
+            .expect("an address")
+            .query_pairs()
+            .filter(|(name, _)| name == "scope")
+            .map(|(_, value)| value.into_owned())
+            .collect()
+    }
+
+    /// An authorisation asks for the identity scopes and exactly the resources its caller names,
+    /// and the application's own sign-in asks for what it always has: the identity scopes first,
+    /// then its resources, and not `backup.write`.
+    #[test]
+    fn an_authorisation_asks_for_the_identity_scopes_and_the_resources_its_caller_names() {
+        let restore = AuthorisationRequest::asking(
+            Client::Desktop,
+            Redirect::Loopback,
+            &[BACKUP_RESTORE_SCOPE],
+        )
+        .expect("a request");
+        assert_eq!(
+            asked(&restore),
+            ["openid profile email offline_access backup.restore"]
+        );
+        assert_eq!(
+            restore.scopes(),
+            [
+                "openid",
+                "profile",
+                "email",
+                "offline_access",
+                BACKUP_RESTORE_SCOPE
+            ]
+        );
+
+        let identity = AuthorisationRequest::asking(Client::Mobile, Redirect::AppLink, &[])
+            .expect("a request");
+        assert_eq!(identity.scopes(), IDENTITY_SCOPES);
+
+        let application =
+            AuthorisationRequest::new(Client::Desktop, Redirect::Loopback).expect("a request");
+        assert_eq!(asked(&application), [REQUESTED_SCOPES.join(" ")]);
+        assert_eq!(application.scopes(), REQUESTED_SCOPES);
+        assert_eq!(REQUESTED_SCOPES[..IDENTITY_SCOPES.len()], IDENTITY_SCOPES);
+        assert!(!REQUESTED_SCOPES.contains(&BACKUP_WRITE_SCOPE));
+        assert!(!REQUESTED_SCOPES.contains(&BACKUP_RESTORE_SCOPE));
+    }
+
+    /// A scope a request cannot carry, and a scope asked for twice, are refused before an
+    /// address is built; so is a redirect the client did not register, as it always was.
+    #[test]
+    fn a_scope_an_authorisation_cannot_ask_for_is_refused() {
+        for resources in [
+            &[""][..],
+            &["backup restore"],
+            &["backup\"restore"],
+            &["backup\\restore"],
+            &["backup.réstore"],
+            &["openid"],
+            &[BACKUP_RESTORE_SCOPE, BACKUP_RESTORE_SCOPE],
+        ] {
+            let error =
+                AuthorisationRequest::asking(Client::Desktop, Redirect::Loopback, resources)
+                    .expect_err("a scope no request asks for");
+            assert_eq!(error.code(), ErrorCode::InvalidArgument, "{resources:?}");
+        }
+        assert!(
+            AuthorisationRequest::asking(
+                Client::Desktop,
+                Redirect::AppLink,
+                &[BACKUP_RESTORE_SCOPE]
+            )
+            .is_err()
+        );
+    }
+
+    /// The token endpoint, answering every exchange with one answer.
+    #[derive(Debug)]
+    struct TokenEndpoint(serde_json::Value);
+
+    impl AccountHttp for TokenEndpoint {
+        fn post_form<'a>(
+            &'a self,
+            _url: &'a str,
+            _body: &'a [u8],
+        ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+            let body = serde_json::to_vec(&self.0).expect("an answer");
+            Box::pin(async move { Ok(ServiceHttpAnswer { status: 200, body }) })
+        }
+
+        fn get<'a>(
+            &'a self,
+            _url: &'a str,
+            _headers: &'a [(&'a str, &'a str)],
+        ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+            Box::pin(async move { panic!("nothing here reads with a token") })
+        }
+    }
+
+    /// An unsigned compact token with these claims; its signature is not what is checked.
+    fn id_token(claims: &serde_json::Value) -> String {
+        let encode = |value: &serde_json::Value| {
+            base64::Engine::encode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                serde_json::to_vec(value).expect("json"),
+            )
+        };
+        format!(
+            "{}.{}.signature",
+            encode(&serde_json::json!({ "alg": "RS256", "typ": "JWT" })),
+            encode(claims)
+        )
+    }
+
+    /// A device restoring from a recovery kit authorises for the restore alone: the browser's
+    /// answer, the exchange and the kept grant are the ones every sign-in goes through, and the
+    /// token that comes of it is handed out for `backup.restore` and refused for every resource
+    /// scope the application's own sign-in would have carried and for writing a bundle. The
+    /// identity scopes are the grant's own, so they are not among them.
+    #[tokio::test]
+    async fn a_restore_authorisation_holds_a_token_for_its_scope_and_for_no_other() {
+        let request = AuthorisationRequest::asking(
+            Client::Desktop,
+            Redirect::Loopback,
+            &[BACKUP_RESTORE_SCOPE],
+        )
+        .expect("a request");
+        let state = request.state.clone();
+        let mut pending = PendingAuthorisation::new(request);
+        let mut answer = Url::parse(Redirect::Loopback.uri()).expect("the redirect");
+        answer
+            .query_pairs_mut()
+            .append_pair("code", "a-code")
+            .append_pair("state", &state)
+            .append_pair("iss", ISSUER);
+        let Answer::Granted(grant) = pending.answer(answer.as_str(), Carrier::Terminal) else {
+            panic!("the answer grants a code");
+        };
+
+        let now = system_seconds();
+        let endpoint = Arc::new(TokenEndpoint(serde_json::json!({
+            "access_token": "a-restore-token",
+            "token_type": "Bearer",
+            "expires_in": 600,
+            "refresh_token": "a-refresh-token",
+            "scope": "openid profile email offline_access backup.restore",
+            "id_token": id_token(&serde_json::json!({
+                "iss": ISSUER,
+                "sub": "an-account",
+                "aud": Client::Desktop.id(),
+                "nonce": grant.nonce(),
+                "iat": now - 5,
+                "exp": now + 3600,
+            })),
+        })));
+        let service = Arc::new(ManagedAccountService::new(
+            endpoint as Arc<dyn AccountHttp>,
+            Client::Desktop,
+        ));
+        let Exchanged::Issued(issued) = service.exchange(&grant).await.expect("an answer") else {
+            panic!("the exchange is issued");
+        };
+        let account = SignedInAccount::new(
+            service,
+            Arc::new(kr_crypto::store::MemoryStore::new()),
+            Client::Desktop,
+        );
+        account
+            .commit(issued, grant.nonce())
+            .await
+            .expect("the grant is kept");
+
+        assert_eq!(
+            account
+                .token(BACKUP_RESTORE_SCOPE)
+                .await
+                .expect("a token for the restore")
+                .expose(),
+            "a-restore-token"
+        );
+        let resources = &REQUESTED_SCOPES[IDENTITY_SCOPES.len()..];
+        assert_eq!(
+            resources.len(),
+            4,
+            "every resource the application asks for"
+        );
+        for other in resources.iter().chain([&BACKUP_WRITE_SCOPE]) {
+            let refused = account.token(other).await.expect_err("not this grant's");
+            assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{other}");
+        }
+    }
+
+    /* ---------------------------------------------------------------------- */
+    /* What a diagnostic says of a scope                                       */
+    /* ---------------------------------------------------------------------- */
+
+    /// The scopes an authorisation for one purpose asks for are named as the application's own
+    /// are: a restore grant's scopes, and the refusal for a scope a grant was not given, say
+    /// `backup.restore` and `backup.write` by name. A scope this build does not know is counted in
+    /// a summary, said to be one in a refusal, and never repeated; so is a resource an
+    /// authorisation cannot ask for.
+    #[test]
+    fn the_backup_scopes_are_named_and_a_scope_this_build_does_not_know_is_never_repeated() {
+        use crate::shown::marker::{
+            MARKER, NEUTRAL, assert_unmarked, debug_renderings, failure_renderings,
+        };
+
+        // The neutral control: a restore grant's own scopes, every one of them named.
+        let restore: Vec<String> = IDENTITY_SCOPES
+            .iter()
+            .chain([&BACKUP_RESTORE_SCOPE])
+            .map(|scope| (*scope).to_owned())
+            .collect();
+        assert_eq!(
+            scope_summary(&restore).as_str(),
+            "openid, profile, email, offline_access, backup.restore"
+        );
+
+        // The negative control: the stored scopes hold the marker, which the summary counts.
+        let stored: Vec<String> = [
+            MARKER,
+            "openid",
+            BACKUP_RESTORE_SCOPE,
+            BACKUP_WRITE_SCOPE,
+            "openid",
+        ]
+        .iter()
+        .map(|scope| (*scope).to_owned())
+        .collect();
+        assert!(stored.iter().any(|scope| scope == MARKER));
+        assert_eq!(
+            scope_names(&stored),
+            (vec!["openid", BACKUP_RESTORE_SCOPE, BACKUP_WRITE_SCOPE], 1)
+        );
+        let summary = scope_summary(&stored).into_string();
+        assert_eq!(
+            summary,
+            "openid, backup.restore, backup.write and 1 scope(s) this build does not know"
+        );
+        assert_unmarked("stored scopes", &[summary]);
+        let mut grant =
+            StoredGrant::new(issued("a-refresh"), Client::Desktop, "a-nonce", 0).expect("a grant");
+        grant.scopes = stored;
+        assert_unmarked("a stored grant", &debug_renderings(&grant));
+
+        for (scope, said) in [
+            (
+                BACKUP_WRITE_SCOPE,
+                "PERMISSION_DENIED: this sign-in was not granted the backup.write scope",
+            ),
+            (
+                BACKUP_RESTORE_SCOPE,
+                "PERMISSION_DENIED: this sign-in was not granted the backup.restore scope",
+            ),
+            (
+                MARKER,
+                "PERMISSION_DENIED: this sign-in was not granted a scope this build does not know",
+            ),
+            (
+                NEUTRAL,
+                "PERMISSION_DENIED: this sign-in was not granted a scope this build does not know",
+            ),
+        ] {
+            let refused = not_granted(scope);
+            assert_eq!(refused.to_string(), said);
+            assert_unmarked(scope, &failure_renderings(refused));
+        }
+
+        for resource in [
+            format!("{MARKER} {MARKER}"),
+            format!("{MARKER}\"{MARKER}"),
+            format!("{MARKER}\\{MARKER}"),
+            format!("{MARKER}\u{e9}"),
+        ] {
+            let refused = AuthorisationRequest::asking(
+                Client::Desktop,
+                Redirect::Loopback,
+                &[resource.as_str()],
+            )
+            .expect_err("not a scope a request carries");
+            assert_eq!(
+                refused.to_string(),
+                "INVALID_ARGUMENT: a scope is printable ASCII with no space, quotation mark or \
+                 backslash"
+            );
+            assert_unmarked(&resource, &failure_renderings(refused));
+        }
+        let twice =
+            AuthorisationRequest::asking(Client::Desktop, Redirect::Loopback, &[MARKER, MARKER])
+                .expect_err("one scope asked for twice");
+        assert_unmarked("a scope asked for twice", &failure_renderings(twice));
+        // A scope this build does not know is still one a request carries, and the request's
+        // rendering holds none of what it asks for.
+        let request = AuthorisationRequest::asking(Client::Desktop, Redirect::Loopback, &[MARKER])
+            .expect("a scope a request carries");
+        assert_eq!(request.scopes().last().map(String::as_str), Some(MARKER));
+        assert_unmarked("an authorisation request", &debug_renderings(&request));
     }
 }

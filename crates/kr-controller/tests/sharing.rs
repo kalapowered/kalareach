@@ -1849,10 +1849,11 @@ async fn transfer_to_another(
 /// The host's store refuses every write of the floor. The wall clock reads an hour and a minute
 /// ahead, once, which raises the floor past a grant's expiry, and then comes back. A transfer of
 /// that grant is decided while the floor is owed its record, so it is refused as a failure to
-/// record rather than as an expiry: this host has decided nothing about the grant. The daemon stops
-/// before any write lands, the store recovers, and a daemon started again finds the older floor and
-/// the wall clock back where it was. The grant is valid by everything it can read, and it is
-/// admitted, which contradicts no answer this host gave.
+/// record rather than as an expiry: this host has not answered the lapse yet. The daemon stops
+/// before any write lands and the store recovers. The reading outlives the daemon in the boot's
+/// shared floor, so the daemon started again writes it down as it starts and refuses the grant as
+/// expired: the lapse is answered once it is on record, and a grant refused once is never admitted
+/// afterwards.
 #[tokio::test]
 async fn a_refusal_the_clock_decided_is_never_answered_on_a_floor_that_was_not_written() {
     let temp = kr_ipc::testing::TempHost::create();
@@ -1890,7 +1891,22 @@ async fn a_refusal_the_clock_decided_is_never_answered_on_a_floor_that_was_not_w
         kr_protocol::error::ErrorCode::StorageUnavailable,
         "refused as a floor this host could not write down, not decided"
     );
-    second.expect("nothing this host decided stands against the grant");
+    assert_eq!(
+        second
+            .expect_err("the reading past the expiry outlived the daemon")
+            .code(),
+        kr_protocol::error::ErrorCode::PermissionDenied,
+        "and once it is on record the lapse is answered"
+    );
+    let written = controller
+        .sharing()
+        .grants()
+        .stored_policy()
+        .expect("readable")
+        .expect("written")
+        .utc_floor_ms
+        .get();
+    assert!(written >= ahead, "the start wrote the floor it found down");
 }
 
 /// A delegation of one session under `parent`, from the device holding it to another, for half an
@@ -2324,11 +2340,11 @@ enum Effect {
 }
 
 /// Rule C at the grant store's effects: a delegation, a redemption and a transfer, each under a
-/// stored grant with an expiry anchored in this boot. Another writer holds the registry; the
-/// operation passes its early check and waits for the store's transaction; only the continuous
-/// clock moves past the grant's anchor, with the wall clock, and so UTC under the floor, still
-/// before its expiry; the registry is released. The effect is refused inside its transaction, and
-/// nothing it would have written is there. Controls: the same sequence with no clock movement
+/// stored grant with an expiry anchored in this boot. The operation passes its early check and is
+/// stopped before the store's transaction; only the continuous clock moves past the grant's
+/// anchor, with the wall clock, and so UTC under the floor, still before its expiry; the operation
+/// goes on. The effect is refused inside its transaction, and nothing it would have written is
+/// there. Controls: the same sequence with no clock movement
 /// commits the effect; and with the clock distrusted, an expiring grant this boot never anchored is
 /// refused while a grant that does not expire is transferred.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2407,12 +2423,9 @@ async fn an_effect_waiting_for_the_store(effect: Effect, advanced: bool) {
         "the grant stands before either deadline"
     );
 
-    // Another writer holds the registry, so the effect waits for its transaction.
-    let registry = rusqlite::Connection::open(temp.environment().registry_database())
-        .expect("opens the registry");
-    registry
-        .execute_batch("BEGIN IMMEDIATE;")
-        .expect("the registry is held");
+    // The effect stops once it has passed its early check and anchored its grant, before it takes
+    // the store's transaction, so the clock below moves while it waits.
+    let (arrived, go) = controller.sharing().grants().pause_before_effect();
     let operation = {
         let controller = Arc::clone(&controller);
         let grant = grant.clone();
@@ -2427,15 +2440,16 @@ async fn an_effect_waiting_for_the_store(effect: Effect, advanced: bool) {
             }
         })
     };
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::task::spawn_blocking(move || arrived.recv())
+        .await
+        .expect("the wait ends")
+        .expect("the effect reaches the store");
     if advanced {
         // Well past the grant's anchor on the continuous clock, an hour after its issue; UTC stays
         // where it was, before its expiry.
         continuous.advance(Duration::from_secs(2 * 60 * 60));
     }
-    registry
-        .execute_batch("ROLLBACK;")
-        .expect("the registry is released");
+    go.send(()).expect("the effect waits");
     let outcome = operation.await.expect("the operation ends");
 
     let grants = controller.sharing().grants();
@@ -2640,8 +2654,9 @@ async fn an_end_whose_tombstone_could_not_be_written_is_not_answered_as_an_expir
 }
 
 /// A redemption decides only a grant it anchored before its transaction. An invitation this host
-/// does not hold when the redemption begins is refused then, although another writer commits it
-/// while the redemption would have waited for the store, so an expiring grant is never redeemed
+/// does not hold when the redemption begins is refused then, at once and while another writer
+/// still holds the store with the invitation's rows uncommitted, so the redemption never waits for
+/// the store to decide a grant it did not anchor and an expiring grant is never redeemed
 /// unanchored while the clock is distrusted. The invitation stays open, its grant unredeemed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_invitation_written_while_its_redemption_waits_is_not_redeemed_unanchored() {
@@ -2701,13 +2716,26 @@ async fn an_invitation_written_while_its_redemption_waits_is_not_redeemed_unanch
                 .redeem(invitation_id, device_id(0xf1), now + 1)
         })
     };
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Answered while the other writer's transaction is still open. A redemption that went on to its
+    // own transaction would wait there for the store's lock and end refused as busy, or, once the
+    // rows were committed, decide the grant it never anchored; neither is the refusal below.
+    let outcome = tokio::time::timeout(Duration::from_secs(30), redeeming)
+        .await
+        .expect("the redemption answers while the other writer holds the store")
+        .expect("the redemption ends");
+    match outcome {
+        Err(kr_controller::error::ControllerError::InvalidArgument(detail)) => {
+            assert_eq!(detail, "this host holds no such invitation");
+        }
+        other => panic!(
+            "an invitation this host did not hold when the redemption began is refused as \
+             missing, not {other:?}"
+        ),
+    }
     registry
         .execute_batch("COMMIT;")
         .expect("the rows are committed");
-    let outcome = redeeming.await.expect("the redemption ends");
 
-    outcome.expect_err("an invitation this host did not hold when the redemption began");
     let proposal = controller
         .sharing()
         .grants()

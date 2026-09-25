@@ -239,7 +239,7 @@ pub enum PointerOutcome {
 /// cursors. A span of the raw stream advances the output cursor by its length. A rendering of the
 /// canonical screen is *state at* one cursor, however many frames it takes, so it moves the cursor
 /// to that cursor and not past it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Delivery {
     /// A span of the raw output stream, starting at this cursor.
     Bytes {
@@ -255,6 +255,22 @@ pub enum Delivery {
         /// The bytes that draw it.
         bytes: Vec<u8>,
     },
+}
+
+impl std::fmt::Debug for Delivery {
+    /// Where the delivery ends and how long it is, never the bytes: they are what a person typed or
+    /// what a terminal showed.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (name, cursor, bytes) = match self {
+            Self::Bytes { cursor, bytes } => ("Bytes", cursor, bytes),
+            Self::Screen { cursor, bytes } => ("Screen", cursor, bytes),
+        };
+        formatter
+            .debug_struct(name)
+            .field("cursor", cursor)
+            .field("bytes", &bytes.len())
+            .finish()
+    }
 }
 
 impl Delivery {
@@ -673,14 +689,19 @@ impl Display {
 }
 
 /// Returned when a snapshot is installed with no presentation change in progress.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct NotSwitching;
 
-impl std::fmt::Display for NotSwitching {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("this display is not changing presentation, so it installs no snapshot")
+impl crate::shown::Said for NotSwitching {
+    fn said(&self) -> crate::shown::Shown {
+        crate::shown::Shown::said(
+            "this display is not changing presentation, so it installs no snapshot",
+        )
     }
 }
+
+crate::display_as_said!(NotSwitching);
+crate::debug_as_display!(NotSwitching);
 
 impl std::error::Error for NotSwitching {}
 

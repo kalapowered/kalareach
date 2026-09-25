@@ -23,6 +23,10 @@ pub struct GrantAuthority {
     sharing: Arc<SharingService>,
     devices: Arc<DeviceDirectory>,
     host_device_id: DeviceId,
+    /// The daemon that publishes and fences a debt a voice revocation's cascade wrote. Weak,
+    /// because the daemon owns the voice service, and a counted reference the other way would
+    /// keep a daemon, and its environment lock, alive.
+    daemon: std::sync::Weak<crate::service::Controller>,
 }
 
 impl GrantAuthority {
@@ -32,11 +36,13 @@ impl GrantAuthority {
         sharing: Arc<SharingService>,
         devices: Arc<DeviceDirectory>,
         host_device_id: DeviceId,
+        daemon: std::sync::Weak<crate::service::Controller>,
     ) -> Self {
         Self {
             sharing,
             devices,
             host_device_id,
+            daemon,
         }
     }
 
@@ -206,7 +212,16 @@ impl VoiceAuthority for GrantAuthority {
             .grants()
             .revoke(grant_id, now_ms, at_the_write(admission))
             .map_err(store)?;
-        let _ = revocation;
+        // A voice grant's withdrawal owes no fence: no worker holds work under a grant that
+        // carries `voice.use`, so stopping a call or replacing a standing grant writes no debt and
+        // raises no barrier. The store writes one only when the cascade also withdrew a grant
+        // delegated from a voice grant that is not one itself, and that debt is published here,
+        // the moment the transaction that is its restriction has committed, and fenced.
+        if let Some(debt) = revocation.debt
+            && let Some(daemon) = self.daemon.upgrade()
+        {
+            daemon.publish_and_fence(debt);
+        }
         Ok(now_ms)
     }
 

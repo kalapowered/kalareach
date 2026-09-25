@@ -343,8 +343,18 @@ fn a_selected_content_export_is_named_and_listed_in_the_manifest() {
         bytes: br#"{"sessions": []}"#.to_vec(),
     }];
     assert!(
-        content[0].describe().contains("shell command line"),
+        content[0]
+            .describe()
+            .as_str()
+            .contains("shell command line"),
         "the command prints what it will contain before writing"
+    );
+    // A rendering of the entry names it and counts its bytes, and never holds them: they are the
+    // content the person selected to send.
+    assert_eq!(
+        format!("{:?}", content[0]),
+        "Content { entry: \"content/sessions.json\", describes: \"every live and closed session \
+         with its shell command line\", bytes: 16 }"
     );
     let bundle = ComposedBundle::new(
         TimestampMs::new(1),

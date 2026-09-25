@@ -24,6 +24,8 @@
 //! actor envelope the destination builds records that local ingress. Nothing on standard input
 //! can widen it, and no environment variable is read for it.
 
+use kr_client::shown;
+use kr_client::shown::Shown;
 use std::io::{Read, Write};
 
 use kr_ipc::paths::HostPaths;
@@ -82,7 +84,7 @@ impl Refusal {
             Self::RemoteOrigin | Self::AlreadyBridged => ErrorCode::PermissionDenied,
             Self::SessionClosed => ErrorCode::SessionClosed,
         };
-        ProtocolError::new(code, self.message())
+        kr_client::error::refusal(code, Shown::said(self.message()))
     }
 }
 
@@ -152,9 +154,9 @@ pub async fn serve(
         match reading.join() {
             Ok(Ok(()) | Err(PipeError::Closed)) => Ok(()),
             Ok(Err(error)) => Err(transport(&error)),
-            Err(_) => Err(CliError::Other(
-                "the bridge's reading thread stopped unexpectedly".to_owned(),
-            )),
+            Err(_) => Err(CliError::Other(Shown::said(
+                "the bridge's reading thread stopped unexpectedly",
+            ))),
         }
     } else {
         Ok(())
@@ -228,7 +230,7 @@ async fn relay(
                     if is_destination_session_closed(&known.paths, session_id).await {
                         return refuse(output, Refusal::SessionClosed);
                     }
-                    return Err(CliError::UnknownSession(session_id.to_string()));
+                    return Err(CliError::UnknownSession(shown!("{}", session_id)));
                 }
                 Err(other) => return Err(other),
             }
@@ -274,7 +276,10 @@ async fn relay(
                         // local request, so a method that opens a bridge of its own would chain one
                         // behind this helper's back. It is refused here, where the hop is known.
                         if let Some(method) = crosses_again(&carried) {
-                            eprintln!("kr bridge: {} opens a bridge of its own", method.as_str());
+                            crate::report::say(&shown!(
+                                "kr bridge: {} opens a bridge of its own",
+                                method.as_str()
+                            ));
                             return refuse(output, Refusal::AlreadyBridged);
                         }
                         writer.write_message(&*carried).await.map_err(CliError::Ipc)?;
@@ -329,8 +334,9 @@ fn crosses_again(
 /// Decodes one bridge frame from a payload the reader already bounded.
 fn decode_frame(payload: &[u8]) -> Result<BridgeFrame> {
     kr_protocol::wire::decode(payload, &StreamKind::Control.cbor_limits()).map_err(|error| {
-        CliError::Other(format!(
-            "the bridge stream carried a frame this helper cannot read: {error}"
+        CliError::Other(shown!(
+            "the bridge stream carried a frame this helper cannot read: {}",
+            Shown::cbor(&error)
         ))
     })
 }
@@ -345,7 +351,7 @@ fn decode_hello(payload: &[u8]) -> std::result::Result<BridgeHello, Refusal> {
 
 /// Turns a stream failure into the command's own error.
 fn transport(error: &PipeError) -> CliError {
-    CliError::Other(format!("the bridge stream failed: {error}"))
+    CliError::Other(shown!("the bridge stream failed: {}", *error))
 }
 
 /// Writes a refusal and reports it.
@@ -353,7 +359,7 @@ fn refuse(output: &mut impl Write, refusal: Refusal) -> Result<()> {
     let error = refusal.as_error();
     // Standard error stays diagnostic: the refusal a caller acts on is the frame, and this line is
     // for whoever reads the log.
-    eprintln!("kr bridge: {}", refusal.message());
+    crate::report::say(&shown!("kr bridge: {}", refusal.message()));
     pipe::write_frame(output, &BridgeFrame::Refused(error.clone()))
         .map_err(|failure| transport(&failure))?;
     Err(CliError::Refused(error))

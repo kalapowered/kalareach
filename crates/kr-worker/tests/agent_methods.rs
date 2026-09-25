@@ -1,6 +1,7 @@
 //! The method groups: agent state, the five agent mutations, the plugin action call and the
 //! adapter checkpoint.
 
+use kr_plugin_sdk::effect::ActionDeclaration;
 use kr_protocol::actor::ActorIngress;
 use kr_protocol::agent::{
     AgentApprovalRespondParams, AgentCancelParams, AgentCapabilitiesParams, AgentCommandsParams,
@@ -32,8 +33,8 @@ use kr_worker::persistence::JournalHealth;
 mod common;
 use kr_worker::broker::{
     Broker, BrokerError, BrokerTransport, Caller, Credential, GrantLowerBound, ManagedProcess,
-    PendingTransmission, RegisteredAction, TransportHandle, UpstreamBody, UpstreamDispatch,
-    UpstreamOutcome, UpstreamRequest, command, subject,
+    PendingTransmission, TransportHandle, UpstreamBody, UpstreamDispatch, UpstreamOutcome,
+    UpstreamRequest, command, subject,
 };
 
 const CREDENTIAL: [u8; 32] = [9; 32];
@@ -117,6 +118,15 @@ fn projection() -> DecodedProjection {
 
 fn package() -> PluginId {
     PluginId::new("kalareach.codex").expect("valid")
+}
+
+/// The installed package this suite's tables are pinned with and its bindings run.
+fn installed() -> kr_worker::broker::PackageIdentity {
+    kr_worker::broker::PackageIdentity {
+        plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+        publisher_id: PublisherId::new("kalareach").expect("valid"),
+        package_digest: Digest256::from_bytes([5; 32]),
+    }
 }
 
 fn table() -> DeclarativeTable {
@@ -329,7 +339,7 @@ fn agent_broker_on(health: std::sync::Arc<JournalHealth>) -> Broker {
         )
         .expect("the binding is recorded");
     broker
-        .pin_table(instance(), table(), rich())
+        .pin_table(instance(), installed(), table(), rich())
         .expect("the installed tables are pinned");
     broker
         .open_native_connection(
@@ -808,31 +818,10 @@ async fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_prec
     broker
         .register_actions(
             binding(),
-            [
-                RegisteredAction {
-                    name: ActionName::new("prompt.submit").expect("valid"),
-                    grant: BrokerGrant::UpstreamAction,
-                    effect: EffectClass::Write,
-                    capability: Some(capability("agent.prompt")),
-                    needs_draft: false,
-                    operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
-                },
-                RegisteredAction {
-                    name: ActionName::new("draft.attach").expect("valid"),
-                    grant: BrokerGrant::UpstreamAction,
-                    effect: EffectClass::Write,
-                    capability: Some(capability("agent.prompt")),
-                    needs_draft: true,
-                    operation: kr_protocol::broker::PreparedOperation::UpstreamAttachment,
-                },
-                RegisteredAction {
-                    name: ActionName::new("conversation.read").expect("valid"),
-                    grant: BrokerGrant::Observation,
-                    effect: EffectClass::Read,
-                    capability: None,
-                    needs_draft: false,
-                    operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
-                },
+            &[
+                declared("prompt.submit", "upstream.prompt"),
+                declared("draft.attach", "upstream.attachment"),
+                declared("conversation.read", "observe"),
             ],
         )
         .expect("the actions are registered");
@@ -959,17 +948,7 @@ async fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_prec
     // the evidence refuses the action while the read still answers.
     let broker = agent_broker_with(std::sync::Arc::new(RecordingUpstream::default()));
     broker
-        .register_actions(
-            binding(),
-            [RegisteredAction {
-                name: ActionName::new("prompt.submit").expect("valid"),
-                grant: BrokerGrant::UpstreamAction,
-                effect: EffectClass::Write,
-                capability: Some(capability("agent.prompt")),
-                needs_draft: false,
-                operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
-            }],
-        )
+        .register_actions(binding(), &[declared("prompt.submit", "upstream.prompt")])
         .expect("the actions are registered");
     broker.invalidate_capabilities(
         InstanceInvalidation::BindingChanged,
@@ -1224,17 +1203,7 @@ fn kr_req_11_31_a_disabled_provider_refuses_its_own_dispatch_beside_a_working_on
     let upstream = std::sync::Arc::new(RecordingUpstream::default());
     let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
     broker
-        .register_actions(
-            binding(),
-            [RegisteredAction {
-                name: ActionName::new("prompt.submit").expect("valid"),
-                grant: BrokerGrant::UpstreamAction,
-                effect: EffectClass::Write,
-                capability: Some(capability("agent.prompt")),
-                needs_draft: false,
-                operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
-            }],
-        )
+        .register_actions(binding(), &[declared("prompt.submit", "upstream.prompt")])
         .expect("the actions are registered");
     // A second component, bound to the same instance and working perfectly.
     let other = BrokerBindingId::new(Uuid::from_bytes([11; 16]));
@@ -1300,14 +1269,7 @@ fn kr_req_11_28_a_prepared_effect_may_use_only_what_its_invocation_permits() {
     broker
         .register_actions(
             binding(),
-            [RegisteredAction {
-                name: ActionName::new("draft.attach").expect("valid"),
-                grant: BrokerGrant::UpstreamAction,
-                effect: EffectClass::Write,
-                capability: None,
-                needs_draft: true,
-                operation: kr_protocol::broker::PreparedOperation::UpstreamAttachment,
-            }],
+            &[declared("draft.attach", "upstream.attachment")],
         )
         .expect("the actions are registered");
     let admitted = broker
@@ -1501,17 +1463,7 @@ fn kr_req_11_28_an_unvalidated_effect_transmits_on_neither_dispatch_route() {
     let upstream = std::sync::Arc::new(RecordingUpstream::default());
     let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
     broker
-        .register_actions(
-            binding(),
-            [RegisteredAction {
-                name: ActionName::new("prompt.submit").expect("valid"),
-                grant: BrokerGrant::UpstreamAction,
-                effect: EffectClass::Write,
-                capability: Some(capability("agent.prompt")),
-                needs_draft: false,
-                operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
-            }],
-        )
+        .register_actions(binding(), &[declared("prompt.submit", "upstream.prompt")])
         .expect("the actions are registered");
     let invoke = || PluginActionInvokeParams {
         target: target(1),
@@ -1581,17 +1533,7 @@ fn kr_req_23_30_a_replaced_declaration_refuses_the_plan_of_the_invocation_it_rep
     let upstream = std::sync::Arc::new(RecordingUpstream::default());
     let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
     broker
-        .register_actions(
-            binding(),
-            [RegisteredAction {
-                name: ActionName::new("prompt.submit").expect("valid"),
-                grant: BrokerGrant::UpstreamAction,
-                effect: EffectClass::Write,
-                capability: Some(capability("agent.prompt")),
-                needs_draft: false,
-                operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
-            }],
-        )
+        .register_actions(binding(), &[declared("prompt.submit", "upstream.prompt")])
         .expect("the actions are registered");
     let invoke = PluginActionInvokeParams {
         target: target(1),
@@ -1608,17 +1550,7 @@ fn kr_req_23_30_a_replaced_declaration_refuses_the_plan_of_the_invocation_it_rep
     // The package re-registers the same action as a read. The invocation already admitted is not
     // re-decided by it, and the plan it prepares is still checked against a declaration.
     broker
-        .register_actions(
-            binding(),
-            [RegisteredAction {
-                name: ActionName::new("prompt.submit").expect("valid"),
-                grant: BrokerGrant::UpstreamAction,
-                effect: EffectClass::Read,
-                capability: Some(capability("agent.prompt")),
-                needs_draft: false,
-                operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
-            }],
-        )
+        .register_actions(binding(), &[declared("prompt.submit", "observe")])
         .expect("the package registers its actions");
     assert!(
         broker
@@ -1841,17 +1773,7 @@ fn kr_req_11_28_a_plan_is_refused_when_the_invocations_authority_has_moved() {
     let upstream = std::sync::Arc::new(RecordingUpstream::default());
     let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
     broker
-        .register_actions(
-            binding(),
-            [RegisteredAction {
-                name: ActionName::new("prompt.submit").expect("valid"),
-                grant: BrokerGrant::UpstreamAction,
-                effect: EffectClass::Write,
-                capability: Some(capability("agent.prompt")),
-                needs_draft: false,
-                operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
-            }],
-        )
+        .register_actions(binding(), &[declared("prompt.submit", "upstream.prompt")])
         .expect("the actions are registered");
     let invoke = PluginActionInvokeParams {
         target: target(1),
@@ -1990,17 +1912,7 @@ fn a_fence_refuses_a_plan_that_arrives_after_it(recovered: bool) {
     let upstream = std::sync::Arc::new(RecordingUpstream::default());
     let broker = agent_broker_sharing(std::sync::Arc::clone(&upstream), store.health());
     broker
-        .register_actions(
-            binding(),
-            [RegisteredAction {
-                name: ActionName::new("prompt.submit").expect("valid"),
-                grant: BrokerGrant::UpstreamAction,
-                effect: EffectClass::Write,
-                capability: Some(capability("agent.prompt")),
-                needs_draft: false,
-                operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
-            }],
-        )
+        .register_actions(binding(), &[declared("prompt.submit", "upstream.prompt")])
         .expect("the actions are registered");
     let admitted = broker
         .admit_plugin_action(
@@ -2253,14 +2165,7 @@ fn kr_req_23_30_a_draft_that_moved_while_the_plan_was_prepared_transmits_nothing
     broker
         .register_actions(
             binding(),
-            [RegisteredAction {
-                name: ActionName::new("draft.attach").expect("valid"),
-                grant: BrokerGrant::UpstreamAction,
-                effect: EffectClass::Write,
-                capability: Some(capability("agent.prompt")),
-                needs_draft: true,
-                operation: kr_protocol::broker::PreparedOperation::UpstreamAttachment,
-            }],
+            &[declared("draft.attach", "upstream.attachment")],
         )
         .expect("the action is registered");
     let params = PluginActionInvokeParams {
@@ -2310,17 +2215,7 @@ fn kr_req_11_28_arguments_that_name_a_member_twice_are_refused_before_the_marker
     let upstream = std::sync::Arc::new(RecordingUpstream::default());
     let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
     broker
-        .register_actions(
-            binding(),
-            [RegisteredAction {
-                name: ActionName::new("prompt.submit").expect("valid"),
-                grant: BrokerGrant::UpstreamAction,
-                effect: EffectClass::Write,
-                capability: Some(capability("agent.prompt")),
-                needs_draft: false,
-                operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
-            }],
-        )
+        .register_actions(binding(), &[declared("prompt.submit", "upstream.prompt")])
         .expect("the action is registered");
     let invoke = |parameters: &[u8]| {
         broker.admit_plugin_action(
@@ -2471,16 +2366,24 @@ impl kr_worker::broker::DraftResolver for PausingDrafts {
     }
 }
 
-/// The attachment action this suite's draft tests register.
-fn attachment_action(capability: Option<CapabilityId>) -> RegisteredAction {
-    RegisteredAction {
-        name: ActionName::new("draft.attach").expect("valid"),
-        grant: BrokerGrant::UpstreamAction,
-        effect: EffectClass::Write,
-        capability,
-        needs_draft: true,
-        operation: kr_protocol::broker::PreparedOperation::UpstreamAttachment,
-    }
+/// One action as the package's manifest declares it: an `observe` read is the package's own
+/// presentation, and every other class is prepared by its component.
+fn declared(id: &str, effect: &str) -> ActionDeclaration {
+    let implementation = if effect == "observe" {
+        serde_json::json!({ "type": "presentation" })
+    } else {
+        serde_json::json!({ "type": "component" })
+    };
+    serde_json::from_value(serde_json::json!({
+        "id": id,
+        "label": id,
+        "effect": effect,
+        "implementation": implementation,
+        "parameters": { "parameters": [] },
+        "description": format!("{id}, as the package declares it"),
+        "confirmation_required": false,
+    }))
+    .expect("a declaration the manifest format reads")
 }
 
 /// KR-REQ-23.30 and KR-REQ-11.28: authority that moves while a plan is being validated refuses it.
@@ -2506,7 +2409,7 @@ fn kr_req_23_30_authority_that_moves_inside_plan_validation_refuses_the_plan() {
         broker
             .register_actions(
                 binding(),
-                [attachment_action(Some(capability("agent.prompt")))],
+                &[declared("draft.attach", "upstream.attachment")],
             )
             .expect("the action is registered");
         let admitted = broker
@@ -2539,8 +2442,8 @@ fn kr_req_23_30_authority_that_moves_inside_plan_validation_refuses_the_plan() {
             inside.recv().expect("validation reached the draft store");
             if change == "the declaration" {
                 broker
-                    .register_actions(binding(), [attachment_action(None)])
-                    .expect("the package re-registers the action");
+                    .register_actions(binding(), &[declared("draft.attach", "upstream.prompt")])
+                    .expect("the package re-registers the action as another class");
             } else {
                 broker
                     .withdraw_grant(binding(), BrokerGrant::UpstreamAction)

@@ -25,6 +25,8 @@
 //! against an agent starting the ceremony by accident. It is not isolation from other code running
 //! as the same user, which can do anything this command does.
 
+use kr_client::shown;
+use kr_client::shown::Shown;
 use std::fs::File;
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::time::Duration;
@@ -48,7 +50,8 @@ use kr_protocol::invitation::{
 };
 use kr_protocol::method::Method;
 use kr_protocol::pairing::{
-    ConfirmationChannel, PairStatus, PairingConsumedReason, ProposedGrant, RendezvousOrigin,
+    ConfirmationChannel, DevicePlatform, PairStatus, PairingConsumedReason, ProposedGrant,
+    RendezvousOrigin, group_verification_value,
 };
 use kr_protocol::preauth::{PairStatusParams, PairStatusResult};
 use kr_protocol::scalars::{CanonicalSet, Nullable};
@@ -244,7 +247,10 @@ async fn status(
 fn report_status(invitation_id: InvitationId, result: &PairStatusResult, json: bool) -> Result<()> {
     if json {
         let mut document = serde_json::to_value(result).map_err(|error| {
-            CliError::Other(format!("the status could not be written: {error}"))
+            CliError::Other(shown!(
+                "the status could not be written: {}",
+                Shown::json(&error)
+            ))
         })?;
         document["ok"] = serde_json::json!(true);
         document["invitation_id"] = serde_json::json!(invitation_id.to_string());
@@ -282,6 +288,20 @@ impl Ceremony<'_> {
                 "this host has no owner yet: pair its first owner with `kr pair invite --owner`",
             )),
             Self::Issue { owner: true } | Self::Approve { .. } => Ok(()),
+        }
+    }
+
+    /// What the person at this terminal is told while an owner device confirms.
+    ///
+    /// The owner device shows the new device's verification value in its own prompt; saying it
+    /// here too, grouped the same way, lets the person at the host check both screens against it.
+    fn owner_device_note(&self) -> Option<Shown> {
+        match self {
+            Self::Issue { .. } => None,
+            Self::Approve { candidate } => Some(owner_device_note(
+                candidate.platform,
+                &candidate.verification_value,
+            )),
         }
     }
 
@@ -340,15 +360,19 @@ async fn confirmed(
         guard(build_id).await?;
         let mut terminal = Terminal::open()?;
         ceremony.confirm_at(&mut terminal)?;
-        let key = AuthorisationKeyPair::generate()
-            .map_err(|error| CliError::Other(format!("no key could be made: {error}")))?;
+        let key = AuthorisationKeyPair::generate().map_err(|error| {
+            CliError::Other(shown!("no key could be made: {}", Shown::crypto(&error)))
+        })?;
         let proof = sign_confirmation(
             &key,
             &challenge.request,
             ConfirmationChannel::LocalBootstrapTerminal,
         )
         .map_err(|error| {
-            CliError::Other(format!("the confirmation could not be signed: {error}"))
+            CliError::Other(shown!(
+                "the confirmation could not be signed: {}",
+                Shown::pairing(&error)
+            ))
         })?;
         let _: OwnerConfirmationCompleteResult = bind::mutate(
             client,
@@ -365,10 +389,13 @@ async fn confirmed(
             .map_err(CliError::Refused);
     }
     let expires_at_ms = challenge.request.expires_at_ms.get();
-    eprintln!(
+    if let Some(note) = ceremony.owner_device_note() {
+        crate::report::say(&note);
+    }
+    crate::report::say(&shown!(
         "Confirm this on an owner device. Waiting {}.",
         remaining(expires_at_ms, kr_ipc::now_ms().get())
-    );
+    ));
     loop {
         match perform(client, target.clone(), effect).await? {
             Ok(answer) => return Ok(answer),
@@ -414,9 +441,10 @@ async fn guard(build_id: &BuildId) -> Result<()> {
         if std::env::var_os(variable).is_some() {
             return Err(refused(
                 ErrorCode::PermissionDenied,
-                &format!(
-                    "{variable} is set, so this is inside a KalaReach session; a host's first \
-                     owner is confirmed at a terminal outside every session"
+                shown!(
+                    "{} is set, so this is inside a KalaReach session; a host's first owner is \
+                     confirmed at a terminal outside every session",
+                    variable
                 ),
             ));
         }
@@ -425,16 +453,18 @@ async fn guard(build_id: &BuildId) -> Result<()> {
         Membership::Outside => Ok(()),
         Membership::Inside(session_id) => Err(refused(
             ErrorCode::PermissionDenied,
-            &format!(
-                "this process is inside session {session_id}; a host's first owner is confirmed \
-                 at a terminal outside every session"
+            shown!(
+                "this process is inside session {}; a host's first owner is confirmed at a \
+                 terminal outside every session",
+                session_id
             ),
         )),
         Membership::Unknown(why) => Err(refused(
             ErrorCode::PermissionDenied,
-            &format!(
-                "whether this process is inside a KalaReach session cannot be established \
-                 ({why}); a host's first owner is confirmed only where it can"
+            shown!(
+                "whether this process is inside a KalaReach session cannot be established ({}); a \
+                 host's first owner is confirmed only where it can",
+                why
             ),
         )),
     }
@@ -474,7 +504,10 @@ impl Terminal {
             .write_all(text.as_bytes())
             .and_then(|()| self.output.flush())
             .map_err(|error| {
-                CliError::Terminal(format!("the terminal could not be written: {error}"))
+                CliError::Terminal(shown!(
+                    "the terminal could not be written: {}",
+                    Shown::io(&error)
+                ))
             })
     }
 
@@ -486,7 +519,10 @@ impl Terminal {
             .take(MAX_TYPED_LINE)
             .read_line(&mut line)
             .map_err(|error| {
-                CliError::Terminal(format!("the terminal could not be read: {error}"))
+                CliError::Terminal(shown!(
+                    "the terminal could not be read: {}",
+                    Shown::io(&error)
+                ))
             })?;
         Ok(line)
     }
@@ -507,14 +543,15 @@ fn proposal(
                 named_approvals: CanonicalSet::new(),
             };
             let grant = session_invitation_grant(now_ms, minutes.saturating_mul(60_000), history)
-                .map_err(|error| CliError::Usage(format!("--view {minutes}: {error}")))?;
+                .map_err(|error| {
+                CliError::Usage(shown!("--view {}: {}", minutes, Shown::pairing(&error)))
+            })?;
             Ok((InviteGrantKind::SessionInvitation, grant))
         }
-        _ => Err(CliError::Usage(
+        _ => Err(CliError::Usage(Shown::said(
             "say what the new device may do: --owner, or --view with the minutes it may view \
-             sessions for"
-                .to_owned(),
-        )),
+             sessions for",
+        ))),
     }
 }
 
@@ -524,11 +561,10 @@ fn offer(
 ) -> Result<(InviteMode, InviteModeKind, Option<RendezvousOrigin>)> {
     if arguments.direct {
         if arguments.origin.is_some() {
-            return Err(CliError::Usage(
+            return Err(CliError::Usage(Shown::said(
                 "a direct invitation is scanned on this network and contacts no rendezvous \
-                 service, so it takes no --origin"
-                    .to_owned(),
-            ));
+                 service, so it takes no --origin",
+            )));
         }
         return Ok((InviteMode::Direct, InviteModeKind::Direct, None));
     }
@@ -537,8 +573,10 @@ fn offer(
         .as_deref()
         .map(|text| {
             RendezvousOrigin::new(text).map_err(|error| {
-                CliError::Usage(format!(
-                    "--origin {text} is not a rendezvous origin: {error}"
+                CliError::Usage(shown!(
+                    "--origin {} is not a rendezvous origin: {}",
+                    Shown::address(text),
+                    error
                 ))
             })
         })
@@ -553,8 +591,23 @@ fn offer(
 }
 
 fn invitation(text: &str) -> Result<InvitationId> {
-    text.parse()
-        .map_err(|_| CliError::Usage(format!("{text} is not an invitation identifier")))
+    text.parse().map_err(|_| {
+        CliError::Usage(Shown::said(
+            "the text given is not an invitation identifier",
+        ))
+    })
+}
+
+/// Says which value the new device should show, grouped as both devices show it.
+///
+/// The device is named by its platform. The name it gave itself is text it chose, which the owner
+/// device that confirms shows in its own prompt.
+fn owner_device_note(platform: DevicePlatform, verification_value: &str) -> Shown {
+    shown!(
+        "The new device ({}) should show {}. Confirm on an owner device only if it does.",
+        crate::shown::platform(platform),
+        crate::shown::verification_value(verification_value)
+    )
 }
 
 /// Compares a typed verification value with the host's, ignoring case, spaces and hyphens.
@@ -570,15 +623,15 @@ fn same_value(typed: &str, expected: &str) -> bool {
 }
 
 /// Says how long is left until `until_ms`, in words.
-fn remaining(until_ms: u64, now_ms: u64) -> String {
+fn remaining(until_ms: u64, now_ms: u64) -> Shown {
     let seconds = until_ms.saturating_sub(now_ms) / 1000;
     match seconds {
-        0 => "no longer".to_owned(),
-        1..=59 => format!("for {seconds} seconds"),
+        0 => Shown::said("no longer"),
+        1..=59 => shown!("for {} seconds", seconds),
         _ => {
             let minutes = seconds / 60;
             let unit = if minutes == 1 { "minute" } else { "minutes" };
-            format!("for {minutes} {unit}")
+            shown!("for {} {}", minutes, unit)
         }
     }
 }
@@ -688,8 +741,9 @@ fn describe_status(invitation_id: InvitationId, result: &PairStatusResult, now_m
             expires_at_ms,
             ..
         } => format!(
-            "a device is waiting for approval, open {}; its verification value is {verification_value}",
-            remaining(expires_at_ms.get(), now_ms)
+            "a device is waiting for approval, open {}; its verification value is {}",
+            remaining(expires_at_ms.get(), now_ms),
+            group_verification_value(verification_value)
         ),
         PairStatus::Committed {
             device_id,
@@ -738,7 +792,7 @@ const fn ended_because(reason: PairingConsumedReason) -> &'static str {
 /// Returns an error when `text` is too long for a QR code.
 pub fn qr_lines(text: &str) -> Result<Vec<String>> {
     let code = qrcodegen::QrCode::encode_text(text, qrcodegen::QrCodeEcc::Low)
-        .map_err(|_| CliError::Other("the invitation is too long for a QR code".to_owned()))?;
+        .map_err(|_| CliError::Other(Shown::said("the invitation is too long for a QR code")))?;
     let edge = code.size() + 2 * QUIET_ZONE;
     let dark = |x: i32, y: i32| code.get_module(x - QUIET_ZONE, y - QUIET_ZONE);
     Ok((0..edge)
@@ -760,17 +814,20 @@ pub fn qr_lines(text: &str) -> Result<Vec<String>> {
 }
 
 fn decode<T: kr_protocol::wire::WireMessage>(value: &ParamsValue) -> Result<T> {
-    value
-        .to_typed()
-        .map_err(|error| CliError::Other(format!("the host's answer could not be read: {error}")))
+    value.to_typed().map_err(|error| {
+        CliError::Other(shown!(
+            "the host's answer could not be read: {}",
+            Shown::cbor(&error)
+        ))
+    })
 }
 
-fn refused(code: ErrorCode, message: &str) -> CliError {
-    CliError::Refused(ProtocolError::new(code, message.to_owned()))
+fn refused(code: ErrorCode, message: impl Into<Shown>) -> CliError {
+    CliError::Refused(kr_client::error::refusal(code, message.into()))
 }
 
-fn not_confirmed(message: &str) -> CliError {
-    refused(ErrorCode::OwnerConfirmationRequired, message)
+fn not_confirmed(message: &'static str) -> CliError {
+    refused(ErrorCode::OwnerConfirmationRequired, Shown::said(message))
 }
 
 fn print_json(value: &serde_json::Value) {
@@ -919,6 +976,36 @@ mod tests {
         // Module (0, 0) is the finder pattern's corner, at cell row 2 (modules 4 and 5) and
         // column 4: dark above, dark below.
         assert_eq!(cells[2][4], '\u{2588}');
+    }
+
+    /// KR-REQ-10.37: the verification value is printed in the same two groups of four the new
+    /// device shows, never as eight characters run together.
+    #[test]
+    fn a_verification_value_is_printed_grouped() {
+        let now = 1_764_000_000_000;
+        let invitation_id = InvitationId::new(Uuid::from_bytes([9; 16]));
+        let waiting = PairStatusResult {
+            status: PairStatus::AwaitingApproval {
+                attempt_id: kr_protocol::ids::AttemptId::new(Uuid::from_bytes([3; 16])),
+                verification_value: "f3c146fd".to_owned(),
+                expires_at_ms: TimestampMs::new(now + 60_000),
+            },
+            owner: kr_protocol::scalars::Nullable::null(),
+        };
+        let shown = describe_status(invitation_id, &waiting, now);
+        assert!(shown.contains("f3c1 46fd"), "{shown}");
+        assert!(!shown.contains("f3c146fd"), "{shown}");
+        assert_eq!(
+            owner_device_note(DevicePlatform::Android, "f3c146fd").as_str(),
+            "The new device (android) should show f3c1 46fd. Confirm on an owner device only if \
+             it does."
+        );
+        // A value the host sent in any other shape is not repeated.
+        let marked = owner_device_note(DevicePlatform::Android, crate::shown::marker::MARKER);
+        crate::shown::marker::assert_unmarked(
+            "the owner device note",
+            &[marked.as_str().to_owned()],
+        );
     }
 
     /// The value a person types is compared with the host's without regard to case, spaces or

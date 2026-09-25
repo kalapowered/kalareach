@@ -41,14 +41,15 @@
 use std::fmt;
 use std::sync::Arc;
 
-use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::error::ErrorCode;
 use serde::{Deserialize, Serialize};
 
 use super::ServiceFuture;
-use super::account::{AccountToken, AccountTokenSource};
+use super::account::{AccountToken, AccountTokenSource, known_scope, scope_summary};
 pub use super::{ServiceHttp, ServiceHttpAnswer};
 use crate::error::{ClientError, Result};
 use crate::retry::UserAction;
+use crate::shown::{ServiceMessage, Shown};
 
 /// The scope an account token needs before it can start or control a managed call.
 ///
@@ -276,7 +277,7 @@ impl VoiceRateQuote {
         if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
             return None;
         }
-        digits.parse().ok()
+        digits.parse::<u64>().ok()
     }
 
     /// Returns true when every figure is one a person can be shown.
@@ -447,11 +448,13 @@ impl VoiceRefusalReason {
     }
 }
 
-impl fmt::Display for VoiceRefusalReason {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
+impl crate::shown::Said for VoiceRefusalReason {
+    fn said(&self) -> crate::shown::Shown {
+        crate::shown::Shown::said(self.as_str())
     }
 }
+
+crate::display_as_said!(VoiceRefusalReason);
 
 /// A refusal, as this client reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -617,11 +620,13 @@ impl VoiceCommand {
     }
 }
 
-impl fmt::Display for VoiceCommand {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
+impl crate::shown::Said for VoiceCommand {
+    fn said(&self) -> crate::shown::Shown {
+        crate::shown::Shown::said(self.as_str())
     }
 }
+
+crate::display_as_said!(VoiceCommand);
 
 /// One bounded context request, as it travels on the control socket.
 #[derive(Clone, PartialEq, Eq, Serialize)]
@@ -1015,11 +1020,22 @@ mod origin_tests {
 }
 
 /// The managed voice broker client.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ManagedVoiceBroker {
     origin: String,
     http: Arc<dyn ServiceHttp>,
     tokens: Arc<dyn AccountTokenSource>,
+}
+
+impl fmt::Debug for ManagedVoiceBroker {
+    /// The origin as a diagnostic names one: an address may carry a user name and a password in
+    /// front of its host.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ManagedVoiceBroker")
+            .field("origin", &Shown::address(&self.origin))
+            .finish_non_exhaustive()
+    }
 }
 
 impl ManagedVoiceBroker {
@@ -1115,9 +1131,9 @@ impl ManagedVoiceService for ManagedVoiceBroker {
     fn start<'a>(&'a self, request: &'a VoiceSessionRequest) -> ServiceFuture<'a, VoiceStart> {
         Box::pin(async move {
             let body = serde_json::to_vec(&request.body()?).map_err(|error| {
-                local(&format!(
+                local(crate::shown!(
                     "a request could not be written: {}",
-                    super::json_fault(&error)
+                    Shown::json(&error)
                 ))
             })?;
             // Read rather than classified into an error: a creation has three outcomes and two of
@@ -1136,9 +1152,9 @@ impl ManagedVoiceService for ManagedVoiceBroker {
             serde_json::from_value(data).map_err(|error| {
                 unreadable(
                     200,
-                    &format!(
+                    crate::shown!(
                         "this client cannot read its closure answer: {}",
-                        super::json_fault(&error)
+                        Shown::json(&error)
                     ),
                 )
             })
@@ -1155,10 +1171,7 @@ fn read_metadata(data: serde_json::Value) -> Result<VoiceMetadata> {
     let metadata: VoiceMetadata = serde_json::from_value(data).map_err(|error| {
         unreadable(
             200,
-            &format!(
-                "this client cannot read its terms: {}",
-                super::json_fault(&error)
-            ),
+            crate::shown!("this client cannot read its terms: {}", Shown::json(&error)),
         )
     })?;
     if !metadata.rate.readable() {
@@ -1174,7 +1187,8 @@ fn read_metadata(data: serde_json::Value) -> Result<VoiceMetadata> {
 ///
 /// A voice refusal carries the ordinary service code and the voice reason beside it, and the
 /// reason is what a caller acts on: an unknown creation is a state rather than a failure, and an
-/// exhausted allowance comes with the paths that still work.
+/// exhausted allowance comes with the paths that still work. A text that names one member twice
+/// anywhere is neither an answer nor a refusal ([`super::json::read`]).
 fn data_of(answer: &ServiceHttpAnswer) -> Result<serde_json::Value> {
     #[derive(Deserialize)]
     struct Envelope {
@@ -1193,12 +1207,12 @@ fn data_of(answer: &ServiceHttpAnswer) -> Result<serde_json::Value> {
         reason: Option<VoiceRefusalReason>,
     }
 
-    let Ok(envelope) = serde_json::from_slice::<Envelope>(&answer.body) else {
-        return Err(unreadable(
+    let envelope = super::json::read::<Envelope>(&answer.body).map_err(|fault| {
+        unreadable(
             answer.status,
-            "its answer is not one this client reads",
-        ));
-    };
+            crate::shown!("its answer is not one this client reads: {}", fault),
+        )
+    })?;
 
     if envelope.ok {
         return envelope
@@ -1211,9 +1225,9 @@ fn data_of(answer: &ServiceHttpAnswer) -> Result<serde_json::Value> {
     };
 
     Err(ClientError::Refused {
-        error: ProtocolError::new(
+        error: crate::error::refusal(
             classify(&refusal.code, refusal.reason, answer.status),
-            refusal.message,
+            Shown::service(&ServiceMessage::from_refusal(refusal.message)),
         ),
         retry_after_seconds: None,
         action: action_for(refusal.reason),
@@ -1224,8 +1238,12 @@ fn data_of(answer: &ServiceHttpAnswer) -> Result<serde_json::Value> {
 ///
 /// The service reports an unknown creation and an unavailable service as refusals with a voice
 /// reason, and this is where the reason becomes the state a caller branches on. It is separate
-/// from [`ManagedVoiceService::start`] so a caller holding an answer from anywhere — a recorded
-/// exchange, a self-hosted broker — reads it the same way.
+/// from [`ManagedVoiceService::start`] so a caller holding an answer from anywhere, a recorded
+/// exchange or a self-hosted broker, reads it the same way.
+///
+/// An answer this client cannot read is a refusal for a reason it does not know, which nothing
+/// asks again for. A text that names one member twice anywhere is one of those
+/// ([`super::json::read`]): which call is running, or why none is, would depend on the reader.
 #[must_use]
 pub fn read_start_answer(answer: &ServiceHttpAnswer) -> VoiceStart {
     #[derive(Deserialize)]
@@ -1237,7 +1255,7 @@ pub fn read_start_answer(answer: &ServiceHttpAnswer) -> VoiceStart {
         error: Option<serde_json::Value>,
     }
 
-    let Ok(envelope) = serde_json::from_slice::<Envelope>(&answer.body) else {
+    let Ok(envelope) = super::json::read::<Envelope>(&answer.body) else {
         return refused(
             VoiceRefusalReason::Unrecognised,
             "The managed service answered something this client cannot read.".to_owned(),
@@ -1365,7 +1383,7 @@ fn action_for(reason: Option<VoiceRefusalReason>) -> UserAction {
 }
 
 /// An answer this client could not read, classified by the status that carried it.
-fn unreadable(status: u16, what: &str) -> ClientError {
+fn unreadable(status: u16, what: impl Into<Shown>) -> ClientError {
     let code = if (200..300).contains(&status) {
         ErrorCode::OutcomeUnknown
     } else if status >= 500 || status == 408 || status == 429 {
@@ -1373,18 +1391,19 @@ fn unreadable(status: u16, what: &str) -> ClientError {
     } else {
         ErrorCode::HostNotConfigured
     };
-    ClientError::Host(ProtocolError::new(
+    ClientError::refusal(
         code,
-        format!("the managed service answered {status} and {what}"),
-    ))
+        crate::shown!(
+            "the managed service answered {} and {}",
+            status,
+            what.into()
+        ),
+    )
 }
 
 /// A request this client could not build, which is a local fault rather than an answer.
-fn local(message: &str) -> ClientError {
-    ClientError::Host(ProtocolError::new(
-        ErrorCode::InvalidArgument,
-        message.to_owned(),
-    ))
+fn local(message: impl Into<Shown>) -> ClientError {
+    ClientError::refusal(ErrorCode::InvalidArgument, message.into())
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1425,29 +1444,10 @@ impl fmt::Debug for StoredAccountToken {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("StoredAccountToken")
-            .field("origin", &addressed(&self.origin))
-            .field("scopes", &self.scopes)
+            .field("origin", &Shown::address(&self.origin))
+            .field("scopes", &scope_summary(&self.scopes))
             .field("expires_at_ms", &self.expires_at_ms)
             .finish_non_exhaustive()
-    }
-}
-
-/// One address as a rendering may show it: the scheme, the host and the port, and nothing in
-/// front of the host.
-///
-/// An address is allowed to carry a user name and a password before the host, and one that does is
-/// carrying a credential in a field that reads like configuration. An address that cannot be
-/// parsed is not rendered at all, because what cannot be taken apart cannot be shown to be safe.
-fn addressed(origin: &str) -> String {
-    match url::Url::parse(origin) {
-        Ok(address) if address.username().is_empty() && address.password().is_none() => {
-            match (address.host_str(), address.port()) {
-                (Some(host), Some(port)) => format!("{}://{host}:{port}", address.scheme()),
-                (Some(host), None) => format!("{}://{host}", address.scheme()),
-                (None, _) => "<not an address>".to_owned(),
-            }
-        }
-        Ok(_) | Err(_) => "<not printed>".to_owned(),
     }
 }
 
@@ -1474,7 +1474,7 @@ impl StoredAccountToken {
         let document: TokenDocument = serde_json::from_slice(bytes).map_err(|error| {
             // Only the position, never the message: a serde message for a string field can quote
             // what it was reading, and what it was reading may be the token.
-            local(&format!(
+            local(crate::shown!(
                 "that is not an account token document: it stops making sense at line {}, \
                  column {}",
                 error.line(),
@@ -1485,7 +1485,8 @@ impl StoredAccountToken {
             || document.origin.ends_with('/')
         {
             return Err(local(
-                "an account token names the origin it belongs to, as an absolute address with no                  trailing slash",
+                "an account token names the origin it belongs to, as an absolute address with no \
+                 trailing slash",
             ));
         }
         Ok(Self {
@@ -1509,9 +1510,9 @@ impl StoredAccountToken {
             expires_at_ms: self.expires_at_ms,
         };
         let mut bytes = serde_json::to_vec_pretty(&document).map_err(|error| {
-            local(&format!(
+            local(crate::shown!(
                 "the token could not be written: {}",
-                super::json_fault(&error)
+                Shown::json(&error)
             ))
         })?;
         bytes.push(b'\n');
@@ -1529,23 +1530,21 @@ impl StoredAccountToken {
     /// The origin, the scopes and the expiry, which is everything an operator needs to see that
     /// the right thing was imported. The value is not here and cannot be derived from what is.
     #[must_use]
-    pub fn description(&self) -> String {
-        let scopes = if self.scopes.is_empty() {
-            "no scopes".to_owned()
-        } else {
-            self.scopes.join(", ")
-        };
-        // The origin as a rendering names one. A description is written to be shown, and an
-        // address may carry a user name and a password in front of the host.
+    pub fn description(&self) -> Shown {
+        // The origin as a rendering names one, and the scopes as this build knows them. A
+        // description is written to be shown, an address may carry a user name and a password in
+        // front of the host, and a scope is whatever the file said.
         match self.expires_at_ms {
-            Some(expires_at_ms) => format!(
-                "an account token for {} carrying {scopes}, until {expires_at_ms} in UTC \
-                 milliseconds",
-                addressed(&self.origin)
+            Some(expires_at_ms) => crate::shown!(
+                "an account token for {} carrying {}, until {} in UTC milliseconds",
+                Shown::address(&self.origin),
+                scope_summary(&self.scopes),
+                expires_at_ms
             ),
-            None => format!(
-                "an account token for {} carrying {scopes}, with no stated expiry",
-                addressed(&self.origin)
+            None => crate::shown!(
+                "an account token for {} carrying {}, with no stated expiry",
+                Shown::address(&self.origin),
+                scope_summary(&self.scopes)
             ),
         }
     }
@@ -1572,7 +1571,7 @@ impl fmt::Debug for AccountTokenFile {
         formatter
             .debug_struct("AccountTokenFile")
             .field("path", &self.path)
-            .field("origin", &self.origin.as_deref().map(addressed))
+            .field("origin", &self.origin.as_deref().map(Shown::address))
             .finish()
     }
 }
@@ -1612,20 +1611,23 @@ impl AccountTokenFile {
     pub fn stored(&self) -> Result<StoredAccountToken> {
         let bytes = kr_ipc::paths::read_owner_only_file(&self.path, ACCOUNT_TOKEN_FILE_LIMIT)
             .map_err(|error| {
-                ClientError::Host(ProtocolError::new(
+                ClientError::refusal(
                     ErrorCode::HostNotConfigured,
-                    format!("the account token could not be read: {error}"),
-                ))
+                    crate::shown!(
+                        "the account token could not be read: {}",
+                        Shown::ipc(&error)
+                    ),
+                )
             })?
             .ok_or_else(|| {
-                ClientError::Host(ProtocolError::new(
+                ClientError::refusal(
                     ErrorCode::HostNotConfigured,
-                    format!(
+                    crate::shown!(
                         "no account token has been imported. Write one with `kr account token \
                          import <path>`; it is read from {}.",
-                        self.path.display()
+                        Shown::root(&self.path)
                     ),
-                ))
+                )
             })?;
         StoredAccountToken::read(&bytes)
     }
@@ -1642,21 +1644,30 @@ impl AccountTokenSource for AccountTokenFile {
                 // not issued for. Both origins are named the way a rendering names one: an address
                 // may carry a user name and a password in front of the host, and the token is not
                 // the only credential this refusal could otherwise print.
-                return Err(ClientError::Host(ProtocolError::new(
+                return Err(ClientError::refusal(
                     ErrorCode::HostNotConfigured,
-                    format!(
+                    crate::shown!(
                         "the imported account token belongs to {} and this host is configured to \
                          reach {}",
-                        addressed(&stored.origin),
-                        addressed(origin)
+                        Shown::address(&stored.origin),
+                        Shown::address(origin)
                     ),
-                )));
+                ));
             }
             if !stored.carries(scope) {
-                return Err(ClientError::Host(ProtocolError::new(
+                return Err(ClientError::refusal(
                     ErrorCode::PermissionDenied,
-                    format!("the imported account token was not issued with the {scope} scope"),
-                )));
+                    match known_scope(scope) {
+                        Some(name) => crate::shown!(
+                            "the imported account token was not issued with the {} scope",
+                            name
+                        ),
+                        None => Shown::said(
+                            "the imported account token was not issued with a scope this build \
+                             does not know",
+                        ),
+                    },
+                ));
             }
             Ok(stored.access_token)
         })
@@ -1854,6 +1865,110 @@ mod tests {
         assert_eq!(refusal.reason, VoiceRefusalReason::Unrecognised);
     }
 
+    /// A session as the service answers a start with it, in the text it arrives as.
+    fn session_answer() -> String {
+        serde_json::json!({
+            "ok": true,
+            "data": {
+                "callId": "call-1",
+                "attemptId": "attempt-1",
+                "providerSessionId": "provider-1",
+                "answerSdp": "v=0\r\n",
+                "model": "a-model",
+                "closesAt": "2026-09-21T10:00:00Z",
+                "reservationEndsAt": "2026-09-21T10:05:00Z",
+                "controlPath": "/api/voice/control",
+                "heartbeatSeconds": 10,
+                "sidebandReady": true,
+                "hold": {
+                    "reservationId": "res-1", "reserved": "300", "ceiling": "500",
+                    "deadline": "2026-09-21T10:05:00Z"
+                },
+                "reasoningHold": serde_json::Value::Null,
+                "rate": {
+                    "version": "1", "minorUnitsPerSecond": "2", "minimumSeconds": 60,
+                    "currency": "USD"
+                },
+                "latency": { "creationToAnswerMs": 120, "sidebandReadyMs": 40 },
+                "replayed": false,
+                "disclosure": []
+            }
+        })
+        .to_string()
+    }
+
+    /// KR-REQ-04.19: a session answer that names one member twice is not a call this client
+    /// reads. Which call is running would depend on the reader, so no call is running here, and
+    /// nothing asks again with the same offer.
+    #[test]
+    fn a_session_answer_that_names_a_member_twice_is_not_a_call_this_client_reads() {
+        let answer = session_answer();
+        let repeated = answer.replacen(
+            r#""callId":"call-1""#,
+            r#""callId":"call-1","callId":"call-2""#,
+            1,
+        );
+        assert_ne!(
+            repeated, answer,
+            "the session names its call once to begin with"
+        );
+        let start = read_start_answer(&ServiceHttpAnswer {
+            status: 200,
+            body: repeated.into_bytes(),
+        });
+        let VoiceStart::Refused(refusal) = &start else {
+            panic!("not a call this client reads: {start:?}");
+        };
+        assert_eq!(refusal.reason, VoiceRefusalReason::Unrecognised);
+        assert!(!start.may_ask_again());
+
+        // The control: the same answer naming it once is the call.
+        let start = read_start_answer(&ServiceHttpAnswer {
+            status: 200,
+            body: answer.into_bytes(),
+        });
+        assert_eq!(
+            start.session().map(|session| session.call_id.as_str()),
+            Some("call-1")
+        );
+    }
+
+    /// KR-REQ-04.19: a refusal that names its reason twice is not a refusal this client reads. One
+    /// reader would say the capacity is spent and asking again later is safe, another that a call
+    /// may exist and must never be asked for again, and the service said neither once.
+    #[test]
+    fn a_refusal_that_names_its_reason_twice_is_not_one_this_client_reads() {
+        let refusal = |reasons: &str| {
+            ServiceHttpAnswer {
+            status: 503,
+            body: format!(
+                r#"{{"ok":false,"error":{{"code":"INTERNAL",{reasons},"message":"Not now.","attemptId":"attempt-1"}}}}"#
+            )
+            .into_bytes(),
+        }
+        };
+        let start = read_start_answer(&refusal(
+            r#""reason":"service_capacity","reason":"creation_unknown""#,
+        ));
+        let VoiceStart::Refused(refused) = &start else {
+            panic!("not a refusal this client reads: {start:?}");
+        };
+        assert_eq!(refused.reason, VoiceRefusalReason::Unrecognised);
+        assert!(!start.may_ask_again());
+
+        // The controls: each reason named once is read as itself.
+        let VoiceStart::Refused(capacity) =
+            read_start_answer(&refusal(r#""reason":"service_capacity""#))
+        else {
+            panic!("a capacity refusal");
+        };
+        assert_eq!(capacity.reason, VoiceRefusalReason::ServiceCapacity);
+        assert!(matches!(
+            read_start_answer(&refusal(r#""reason":"creation_unknown""#)),
+            VoiceStart::CreationUnknown { .. }
+        ));
+    }
+
     #[test]
     fn an_unknown_control_event_is_recorded_by_type_and_carries_nothing() {
         let value: serde_json::Value = serde_json::from_str(
@@ -1934,7 +2049,7 @@ mod tests {
         )
         .expect("a token document");
         assert!(stored.carries(VOICE_SCOPE));
-        let described = stored.description();
+        let described = stored.description().into_string();
         assert!(!described.contains("a-secret-value"), "{described}");
         assert!(described.contains("reach.example"));
         assert!(!format!("{stored:?}").contains("a-secret-value"));

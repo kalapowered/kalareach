@@ -17,6 +17,21 @@
 //! What this module owns is everything between: the exact bytes the credential covers, the exact
 //! bytes the body digest covers, the request shape and what each answer means.
 //!
+//! # An answer that went missing
+//!
+//! A lease request that reached the service may have reserved bytes, issued a lease and installed
+//! it on a relay, whatever came back. When this client cannot tell, it reports `OUTCOME_UNKNOWN`:
+//! for a success status whose body it cannot read, and for a 502 or 504 with no envelope of the
+//! service's, which is a gateway in front of it saying the service's answer never reached it.
+//! Nothing asks again by itself. A caller finds out before it asks for anything else, by sending
+//! the same request again: the same signer, payer, pair, direction and cumulative ceiling. A pair
+//! that already holds a lease on a live reservation is answered with that lease, holding no more
+//! bytes than the ceiling names, although its deadline can move later. When the first request
+//! issued nothing, or the reservation it issued from has since ended, the answer is a new lease;
+//! and either answer can be a refusal. The caller then uses the lease it is given or ends it with a
+//! revocation. A revocation whose answer went missing is simply asked again, because a repeated
+//! revocation finishes whatever the first did not and answers with the settlement as it stands.
+//!
 //! # One body, two representations
 //!
 //! The request travels as JSON and its digest is taken over canonical KR-CBOR-1, so both come from
@@ -40,7 +55,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use kr_cbor::{CborError, sha256, signing_value};
-use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{RelayInstanceId, RelayLeaseId, RelayRegion, RelayReservationId};
 use kr_protocol::relay::{RelayLeaseAck, SignedRelayLease};
 use kr_protocol::scalars::{
@@ -53,6 +68,7 @@ use super::ServiceFuture;
 use super::{LeaseEndReason, LeasePayer, LeaseRequest, RelayDirection, RelayLeaseService};
 use crate::error::{ClientError, Result};
 use crate::retry::UserAction;
+use crate::shown::{ServiceMessage, Shown};
 
 /// The domain a lease request's body digest covers.
 pub const RELAY_LEASE_REQUEST_DOMAIN: &str = "kr-relay-lease-request/1";
@@ -88,17 +104,18 @@ pub const RELAY_LEASE_REVOKE_PATH: &str = "/api/relay/lease/revoke";
 /// - never send again a request that may have reached the service. Asking again for a pair that
 ///   already holds a lease revises that lease, and a request that was delivered and not answered
 ///   may have issued one, so whether to ask again is the caller's decision. An exchange that failed
-///   after the request left is an error; this client reports an answer it cannot read as an unknown
-///   outcome for the same reason. Carrying a request of which no byte was written on another
-///   connection is not sending it again: nothing arrived to be repeated.
+///   after the request left is an error; this client reports a success it cannot read, and a
+///   gateway's 502 or 504, as an unknown outcome for the same reason. Carrying a request of which
+///   no byte was written on another connection is not sending it again: nothing arrived to be
+///   repeated.
 pub trait ServiceHttp: Send + Sync + std::fmt::Debug {
     /// Posts a JSON body and returns what came back.
     ///
     /// `headers` are the request headers beside `content-type`, lower-cased, in the order this
-    /// client built them. A signed managed-service request carries none, because its credential is
-    /// inside the body; a request authorised by an account token carries that token's
-    /// `authorization` header, and an implementation sends the values it is given without
-    /// recording them.
+    /// client built them. A signed managed-service request's credential is inside the body, so the
+    /// credential needs no header. A request for something an account owns also carries that
+    /// account's token as its `authorization` header, beside the credential when the request is
+    /// signed, and an implementation sends the values it is given without recording them.
     fn post_json<'a>(
         &'a self,
         url: &'a str,
@@ -644,9 +661,9 @@ impl ManagedRelayLeaseService {
 
         let request =
             serde_json::to_vec(&SignedRelayRequest { body, signature }).map_err(|error| {
-                malformed(format!(
+                malformed(crate::shown!(
                     "a request could not be written: {}",
-                    super::json_fault(&error)
+                    Shown::json(&error)
                 ))
             })?;
         let url = format!("{}{path}", self.origin.as_str());
@@ -674,9 +691,9 @@ impl RelayLeaseService for ManagedRelayLeaseService {
                 // client cannot do is say which answer it was, and a caller must not retry blindly.
                 unreadable(
                     200,
-                    &format!(
+                    crate::shown!(
                         "this client cannot read its lease answer: {}",
-                        super::json_fault(&error)
+                        Shown::json(&error)
                     ),
                 )
             })?;
@@ -705,9 +722,9 @@ impl RelayLeaseService for ManagedRelayLeaseService {
                 // is why a revocation is idempotent, but this client cannot say what happened.
                 unreadable(
                     200,
-                    &format!(
+                    crate::shown!(
                         "this client cannot read its revocation answer: {}",
-                        super::json_fault(&error)
+                        Shown::json(&error)
                     ),
                 )
             })
@@ -724,7 +741,8 @@ impl RelayLeaseService for ManagedRelayLeaseService {
 ///
 /// A body that is not this service's envelope is not a refusal at all, and it is not this caller's
 /// mistake either: it is a proxy's error page, a truncated answer, or something that is not this
-/// service. [`unreadable`] is what those become, classified by the status that carried them.
+/// service. [`unreadable`] is what those become, classified by the status that carried them, and a
+/// text that names one member twice anywhere is one of them ([`super::json::read`]).
 fn data_of(answer: &ServiceHttpAnswer) -> Result<serde_json::Value> {
     #[derive(Deserialize)]
     struct Envelope {
@@ -744,12 +762,12 @@ fn data_of(answer: &ServiceHttpAnswer) -> Result<serde_json::Value> {
         retry_after_seconds: Option<u64>,
     }
 
-    let Ok(envelope) = serde_json::from_slice::<Envelope>(&answer.body) else {
-        return Err(unreadable(
+    let envelope = super::json::read::<Envelope>(&answer.body).map_err(|fault| {
+        unreadable(
             answer.status,
-            "its answer is not one this client reads",
-        ));
-    };
+            crate::shown!("its answer is not one this client reads: {}", fault),
+        )
+    })?;
 
     if envelope.ok {
         return envelope
@@ -762,7 +780,10 @@ fn data_of(answer: &ServiceHttpAnswer) -> Result<serde_json::Value> {
     };
 
     let (code, action) = classify(&refusal.code, answer.status);
-    let error = ProtocolError::new(code, refusal.message);
+    let error = crate::error::refusal(
+        code,
+        Shown::service(&ServiceMessage::from_refusal(refusal.message)),
+    );
 
     // Always the service's own variant, with or without a delay. What a person is told about a
     // refusal turns on who refused and why, and the service's own code says more than the protocol
@@ -810,13 +831,15 @@ fn classify(code: &str, status: u16) -> (ErrorCode, UserAction) {
 /// An answer this client could not read, classified by the status that carried it.
 ///
 /// What a caller may do about it turns on one question: whether the request may have been carried
-/// out. A success status with an unreadable body is the dangerous case, because a lease may now
-/// exist, a reservation may be held and a relay may be carrying it, so it is reported as an unknown
-/// outcome and never retried automatically. A fault or a rate limit is transient. Anything else
-/// without an envelope never reached this service's own routes, which is a configuration between
-/// here and it rather than a value this caller chose.
-fn unreadable(status: u16, what: &str) -> ClientError {
-    let code = if (200..300).contains(&status) {
+/// out. Two answers say it may, and both are reported as an unknown outcome and never retried
+/// automatically, because a lease may now exist, a reservation may be held and a relay may be
+/// carrying it. One is a success status with an unreadable body. The other is a 502 or 504 with no
+/// envelope: a gateway in front of the service saying that the service's answer did not reach it,
+/// which it can say after passing the request on. Any other fault or a rate limit is transient.
+/// Anything else without an envelope never reached this service's own routes, which is a
+/// configuration between here and it rather than a value this caller chose.
+fn unreadable(status: u16, what: impl Into<Shown>) -> ClientError {
+    let code = if (200..300).contains(&status) || status == 502 || status == 504 {
         ErrorCode::OutcomeUnknown
     } else if status >= 500 || status == 408 || status == 429 {
         ErrorCode::UpstreamUnavailable
@@ -824,15 +847,15 @@ fn unreadable(status: u16, what: &str) -> ClientError {
         ErrorCode::HostNotConfigured
     };
 
-    ClientError::Host(ProtocolError::new(
+    ClientError::refusal(
         code,
-        format!("the service answered {status} and {what}"),
-    ))
+        crate::shown!("the service answered {} and {}", status, what.into()),
+    )
 }
 
 /// A request this client could not build, which is a local fault rather than an answer.
-fn malformed(message: String) -> ClientError {
-    ClientError::Host(ProtocolError::new(ErrorCode::InvalidArgument, message))
+fn malformed(message: impl Into<Shown>) -> ClientError {
+    ClientError::refusal(ErrorCode::InvalidArgument, message.into())
 }
 
 /// This machine's clock, in UTC milliseconds.
@@ -847,8 +870,12 @@ fn now_ms() -> u64 {
 /// A fresh nonce from the operating system's generator.
 fn fresh_nonce() -> Result<[u8; 32]> {
     let mut nonce = [0u8; 32];
-    kr_crypto::random_bytes(&mut nonce)
-        .map_err(|error| malformed(format!("a nonce could not be drawn: {error}")))?;
+    kr_crypto::random_bytes(&mut nonce).map_err(|error| {
+        malformed(crate::shown!(
+            "a nonce could not be drawn: {}",
+            Shown::crypto(&error)
+        ))
+    })?;
     Ok(nonce)
 }
 

@@ -44,6 +44,22 @@ struct Arguments {
     /// bench or a demonstration run, whose keys belong to the run and go with it.
     #[arg(long, value_enum, default_value_t = SecretStoreChoice::Platform)]
     secret_store: SecretStoreChoice,
+    /// Start in a session and a process group of its own, with no controlling terminal.
+    ///
+    /// For a command that starts this daemon on demand, as `kr new` does under the standalone
+    /// start: the daemon outlives that command, and nothing the terminal the command ran in does, a
+    /// hangup, an interrupt or the end of a login, reaches it. The process it is given must not
+    /// already lead a process group, which a process a program starts directly never does.
+    #[cfg(unix)]
+    #[arg(long)]
+    own_session: bool,
+    /// Run as the environment's starter rather than as its daemon.
+    ///
+    /// Windows only, where the environment's scheduled task runs this: it takes the one launch
+    /// the daemon has handed over, or a request to start the daemon, creates that process outside
+    /// this one's job, and exits. The environment is the one the two roots hold.
+    #[arg(long, requires_all = ["runtime_dir", "state_dir"])]
+    starter: bool,
 }
 
 /// The store a daemon was told to keep its device keys in, as the command line spells it.
@@ -66,6 +82,18 @@ impl From<SecretStoreChoice> for StoreSelection {
 
 fn main() -> ExitCode {
     let arguments = Arguments::parse();
+    // First, before any thread exists: a session is the calling process's to leave, and nothing
+    // the terminal does may reach the daemon from here on.
+    #[cfg(unix)]
+    if arguments.own_session
+        && let Err(error) = rustix::process::setsid()
+    {
+        eprintln!("kr-controller: could not start a session of its own: {error}");
+        return ExitCode::FAILURE;
+    }
+    if arguments.starter {
+        return starter(&arguments);
+    }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -158,9 +186,10 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     // Every delivery exchange goes to an origin it already knows: a notification, a status
     // question and a renewal to the gateway its credential names, and a webhook message to the
-    // address its owner configured. Each goes through the managed transport of that origin.
+    // address its owner configured. Each goes through the managed transport of that origin, and
+    // through the proxy this daemon started with, the one its network endpoint uses.
     controller.attach_delivery_transport(std::sync::Arc::new(
-        kr_controller::push::transport::ManagedTransports::new(),
+        kr_controller::push::transport::ManagedTransports::new(controller.started_proxy()?),
     ));
 
     let rendezvous = Listener::bind(&environment.rendezvous_endpoint()?)?;
@@ -187,6 +216,25 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         result = tokio::signal::ctrl_c() => result?,
     }
     Ok(())
+}
+
+/// Runs this process as the environment's starter.
+#[cfg(windows)]
+fn starter(arguments: &Arguments) -> ExitCode {
+    let (Some(runtime), Some(state)) = (&arguments.runtime_dir, &arguments.state_dir) else {
+        return ExitCode::FAILURE;
+    };
+    ExitCode::from(kr_controller::supervision::windows::run_starter(runtime, state) as u8)
+}
+
+/// A starter exists only where a scheduled task starts each worker.
+#[cfg(not(windows))]
+fn starter(_arguments: &Arguments) -> ExitCode {
+    eprintln!(
+        "kr-controller: --starter runs only on Windows, where the environment's scheduled task \
+         starts it"
+    );
+    ExitCode::FAILURE
 }
 
 fn default_worker_program() -> PathBuf {

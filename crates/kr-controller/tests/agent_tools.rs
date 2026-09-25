@@ -55,9 +55,9 @@ impl WorkerSupervisor for NoWorkers {
 /// What this platform refuses such a removal with.
 ///
 /// Everywhere the skill can be installed, the request is what is wrong with it. On Windows nothing
-/// gets as far as the request: this host cannot make a change there it could account for after a
-/// crash, so it makes none. Either way the refusal comes before the dispatch marker, which is what
-/// this test is about.
+/// gets as far as the request: this host does not read access-control lists there, so it cannot
+/// tell whether replacing a file would change who can read it, and it makes no change at all.
+/// Either way the refusal comes before the dispatch marker, which is what this test is about.
 fn refusal() -> ErrorCode {
     if cfg!(windows) {
         ErrorCode::PermissionDenied
@@ -145,6 +145,14 @@ async fn a_removal_the_daemon_will_not_do_leaves_no_dispatch_marker() {
         .expect_err("and is refused");
 
     assert_eq!(refused.code, refusal(), "{refused:?}");
+    if cfg!(windows) {
+        assert!(
+            refused
+                .message
+                .contains("does not read access-control lists"),
+            "the refusal gives this platform's reason: {refused:?}"
+        );
+    }
     let actions = host.state_dir.join("agent-tools/actions");
     assert!(
         !actions.exists()

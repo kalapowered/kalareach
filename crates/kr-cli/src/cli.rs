@@ -4,6 +4,7 @@
 //! the definitions here: a literal `--` ends KalaReach option parsing, and no shell command or path
 //! is ever assembled by interpolating text.
 
+use kr_client::shown::Shown;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -12,6 +13,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 #[derive(Debug, Parser)]
 #[command(
     name = "kr",
+    // The usage a failure prints names the command by this, never by how it was invoked: the
+    // invocation's first argument is whatever the caller put there.
+    bin_name = "kr",
     version,
     about = "KalaReach: persistent terminal sessions",
     disable_help_subcommand = true
@@ -642,7 +646,7 @@ pub enum PairCommand {
 }
 
 /// `kr pair invite`.
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct PairInviteArguments {
     /// Pair an owner device: every right over this host, until it is revoked.
     #[arg(long, conflicts_with = "view")]
@@ -659,6 +663,27 @@ pub struct PairInviteArguments {
     /// The environment to act in. Without it, this installation's own.
     #[arg(long)]
     pub environment: Option<String>,
+}
+
+impl std::fmt::Debug for PairInviteArguments {
+    /// The origin as a diagnostic names one: an origin typed with a user name or a password in it
+    /// is not printed at all.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PairInviteArguments")
+            .field("owner", &self.owner)
+            .field("view", &self.view)
+            .field("direct", &self.direct)
+            .field("origin", &self.origin.as_deref().map(Shown::address))
+            .field(
+                "environment",
+                &self
+                    .environment
+                    .as_deref()
+                    .map(crate::shown::parsed_identifier::<kr_protocol::ids::EnvironmentId>),
+            )
+            .finish()
+    }
 }
 
 /// `kr pair confirm` and `kr pair status`.
@@ -827,6 +852,20 @@ pub enum HostCommand {
     Power(PowerArguments),
     /// Show the terminal applications this host has, and which one a new window opens in.
     Terminal(TerminalArguments),
+    /// Show or choose how `kr new` starts this environment's control daemon when none is running.
+    Startup(StartupArguments),
+}
+
+/// `kr host startup`.
+#[derive(Debug, Args)]
+pub struct StartupArguments {
+    /// The way to choose: `standalone`, which has `kr new` start the daemon itself, detached from
+    /// the command. Without it, what is chosen is shown and nothing changes.
+    #[arg(long)]
+    pub set: Option<String>,
+    /// Choose none, so that `kr new` finds no daemon and says what to set up.
+    #[arg(long, conflicts_with = "set")]
+    pub clear: bool,
 }
 
 /// `kr host terminal`.
@@ -954,7 +993,7 @@ pub struct QuestionShowArguments {
 }
 
 /// How one question is answered. Exactly one of these is required.
-#[derive(Debug, Args)]
+#[derive(Args)]
 #[group(required = true, multiple = false)]
 pub struct AnswerForm {
     /// Free text, for an `input` question.
@@ -973,6 +1012,21 @@ pub struct AnswerForm {
     /// never folded into a choice or into yes.
     #[arg(long)]
     pub other: Option<String>,
+}
+
+impl std::fmt::Debug for AnswerForm {
+    /// Which answer was given and how long it is, never what it says: an answer is what a person
+    /// wrote, and a choice is whatever was typed.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AnswerForm")
+            .field("text_bytes", &self.text.as_ref().map(String::len))
+            .field("choice_bytes", &self.choice.as_ref().map(String::len))
+            .field("yes", &self.yes)
+            .field("no", &self.no)
+            .field("other_bytes", &self.other.as_ref().map(String::len))
+            .finish()
+    }
 }
 
 /// `kr question answer`.
@@ -1095,9 +1149,9 @@ impl NewArguments {
             "host-default" | "host_default" => kr_protocol::session::ShellStartup::HostDefault,
             "interactive" => kr_protocol::session::ShellStartup::Interactive,
             "login" => kr_protocol::session::ShellStartup::Login,
-            other => {
-                return Err(crate::CliError::Usage(format!(
-                    "{other} is not a startup selection; use host-default, interactive or login"
+            _ => {
+                return Err(crate::CliError::Usage(Shown::said(
+                    "--startup takes host-default, interactive or login",
                 )));
             }
         };
@@ -1233,9 +1287,9 @@ impl Presentation {
         if stdio_is_terminal {
             Ok(kr_protocol::session::Presentation::Attach)
         } else {
-            Err(crate::error::CliError::Usage(
-                "choose --attach, --terminal or --invisible: standard input and output are not terminals".to_owned(),
-            ))
+            Err(crate::error::CliError::Usage(Shown::said(
+                "choose --attach, --terminal or --invisible: standard input and output are not terminals",
+            )))
         }
     }
 }
@@ -1249,6 +1303,70 @@ mod tests {
     #[test]
     fn the_definitions_are_consistent() {
         Cli::command().debug_assert();
+    }
+
+    /// The arguments a person typed an origin or an answer into render as what they are, never
+    /// what was typed.
+    #[test]
+    fn typed_origins_and_answers_render_without_what_was_typed() {
+        use crate::shown::marker::{MARKER, assert_unmarked};
+
+        let parsed = |line: &[&str]| Cli::try_parse_from(line).expect("the line parses").command;
+        let with_credentials = format!("https://{MARKER}:{MARKER}@reach.example/{MARKER}");
+        let without = format!("https://reach.example:8443/{MARKER}?{MARKER}");
+        for (origin, expected) in [
+            (with_credentials.as_str(), "Some(\"<not printed>\")"),
+            (without.as_str(), "Some(\"https://reach.example:8443\")"),
+        ] {
+            let Command::Pair(PairCommand::Invite(arguments)) =
+                parsed(&["kr", "pair", "invite", "--owner", "--origin", origin])
+            else {
+                unreachable!("the line is kr pair invite");
+            };
+            // The negative control: the field holds what was typed, which the derived form
+            // printed whole.
+            assert_eq!(arguments.origin.as_deref(), Some(origin));
+            assert_eq!(
+                format!("{arguments:?}"),
+                format!(
+                    "PairInviteArguments {{ owner: true, view: None, direct: false, origin: \
+                     {expected}, environment: None }}"
+                )
+            );
+            assert_unmarked(
+                "the pairing arguments",
+                &[format!("{arguments:?}"), format!("{arguments:#?}")],
+            );
+        }
+
+        for (flag, expected) in [
+            (
+                "--text",
+                "AnswerForm { text_bytes: Some(14), choice_bytes: None, yes: false, no: false, \
+                 other_bytes: None }",
+            ),
+            (
+                "--choice",
+                "AnswerForm { text_bytes: None, choice_bytes: Some(14), yes: false, no: false, \
+                 other_bytes: None }",
+            ),
+            (
+                "--other",
+                "AnswerForm { text_bytes: None, choice_bytes: None, yes: false, no: false, \
+                 other_bytes: Some(14) }",
+            ),
+        ] {
+            let Command::Question(QuestionCommand::Answer(arguments)) =
+                parsed(&["kr", "question", "answer", "question-id", flag, MARKER])
+            else {
+                unreachable!("the line is kr question answer");
+            };
+            assert_eq!(format!("{:?}", arguments.form), expected);
+            assert_unmarked(
+                "the answer arguments",
+                &[format!("{arguments:?}"), format!("{arguments:#?}")],
+            );
+        }
     }
 
     /// KR-REQ-07.50: the standard `--help` is answered by the command and by every subcommand at
@@ -1430,6 +1548,35 @@ mod tests {
             panic!("power");
         };
         assert_eq!(power.set.as_deref(), Some("mains_only"));
+    }
+
+    /// KR-REQ-07.12: how the control daemon is started is shown with no argument, chosen with
+    /// `--set` and cleared with `--clear`, and the last two are not one request.
+    #[test]
+    fn the_startup_is_shown_set_and_cleared() {
+        let startup = |arguments: &[&str]| {
+            let parsed = Cli::try_parse_from(arguments).expect("parses");
+            let Command::Host(arguments) = parsed.command else {
+                panic!("host");
+            };
+            let HostCommand::Startup(startup) = arguments.command else {
+                panic!("startup");
+            };
+            startup
+        };
+        let shown = startup(&["kr", "host", "startup"]);
+        assert!(
+            shown.set.is_none() && !shown.clear,
+            "showing it changes nothing"
+        );
+        let chosen = startup(&["kr", "host", "startup", "--set", "standalone"]);
+        assert_eq!(chosen.set.as_deref(), Some("standalone"));
+        assert!(startup(&["kr", "host", "startup", "--clear"]).clear);
+        assert!(
+            Cli::try_parse_from(["kr", "host", "startup", "--set", "standalone", "--clear"])
+                .is_err(),
+            "choosing one and clearing it are not one request"
+        );
     }
 
     /// KR-REQ-07.31: the saved preference is the middle step of the selection order.

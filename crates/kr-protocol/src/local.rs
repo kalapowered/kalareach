@@ -117,6 +117,82 @@ pub struct LocalHelloAck {
     pub max_receive: ReceiveLimits,
 }
 
+/// The capability a worker states when it reads the UTC deadline beside each forwarded copy's
+/// continuous one, and a control daemon offers when it writes it.
+///
+/// A worker survives an upgrade of the daemon, and the forwarded frames are closed schemas, so a
+/// worker of an earlier build refuses a frame with a field it does not know. The daemon reads this
+/// in the worker's answer to its hello before it sends such a frame.
+pub const FORWARDED_UTC_DEADLINE: &str = "forwarded.utc-deadline/1";
+
+/// What a worker's statement of the clock floor it maps starts with. The rest is the floor's
+/// identity, as 32 lowercase hexadecimal digits.
+pub const UTC_FLOOR_PREFIX: &str = "utc-floor/";
+
+/// The capability that states the clock floor a worker maps, by the floor's identity.
+///
+/// # Panics
+///
+/// Never: the statement is 42 characters, well inside what a capability identifier holds.
+#[must_use]
+pub fn utc_floor_capability(identity: &[u8; 16]) -> CapabilityId {
+    let mut text = String::with_capacity(UTC_FLOOR_PREFIX.len() + 32);
+    text.push_str(UTC_FLOOR_PREFIX);
+    for byte in identity {
+        text.push_str(&format!("{byte:02x}"));
+    }
+    CapabilityId::new(text).expect("a clock floor statement fits a capability identifier")
+}
+
+/// The identity of the clock floor a set of capabilities states, when it states exactly one.
+///
+/// A statement that is not 32 lowercase hexadecimal digits states nothing, and neither do two.
+#[must_use]
+pub fn stated_utc_floor(capabilities: &CanonicalSet<CapabilityId>) -> Option<[u8; 16]> {
+    let mut stated = capabilities
+        .iter()
+        .filter_map(|capability| capability.as_str().strip_prefix(UTC_FLOOR_PREFIX));
+    let digits = stated.next()?;
+    if stated.next().is_some() || digits.len() != 32 {
+        return None;
+    }
+    let mut identity = [0_u8; 16];
+    for (index, pair) in digits.as_bytes().chunks_exact(2).enumerate() {
+        let value = |digit: u8| match digit {
+            b'0'..=b'9' => Some(digit - b'0'),
+            b'a'..=b'f' => Some(digit - b'a' + 10),
+            _ => None,
+        };
+        identity[index] = (value(pair[0])? << 4) | value(pair[1])?;
+    }
+    Some(identity)
+}
+
+/// Whether a set of capabilities states the forwarded frames' UTC deadlines
+/// ([`FORWARDED_UTC_DEADLINE`]).
+#[must_use]
+pub fn states_utc_deadlines(capabilities: &CanonicalSet<CapabilityId>) -> bool {
+    capabilities
+        .iter()
+        .any(|capability| capability.as_str() == FORWARDED_UTC_DEADLINE)
+}
+
+/// Whether a set of rights may travel to a worker beside a [`ForwardedMutation`]: never with
+/// `voice.use` in it.
+///
+/// A voice grant is decided only inside the control daemon. The device door decides a forwarded
+/// method under the pairing grant with `voice.use` taken out, the methods that need it are the
+/// daemon's own voice methods, and the voice module performs its one effect as the daemon's own
+/// request, which carries no rights. So no worker holds work under a voice grant, and withdrawing
+/// one owes no fence. A forwarded mutation whose rights this answers false for is neither encoded
+/// nor decoded, and both builders of one refuse such a set before anything is sent.
+#[must_use]
+pub fn may_travel_to_a_worker(
+    rights: &crate::scalars::CanonicalSet<crate::rights::ActionRight>,
+) -> bool {
+    !rights.contains(&crate::rights::ActionRight::VoiceUse)
+}
+
 /// A mutation the host admitted for a caller, passed to the component that owns its subject.
 ///
 /// The control daemon owns admission: it authenticates the caller, stamps the freshness window,
@@ -144,6 +220,8 @@ pub struct ForwardedMutation {
     /// Empty when the envelope names no grant, which is what a locally authenticated caller's
     /// operating-system identity is. The worker narrows nothing for such a caller: there is no
     /// grant to narrow by, and its peer credentials already proved it is this user.
+    #[serde(with = "worker_rights")]
+    #[schemars(with = "CanonicalSet<crate::rights::ActionRight>")]
     pub grant_rights: CanonicalSet<crate::rights::ActionRight>,
     /// The deadline the host derived at first admission, on the machine's own continuous clock.
     ///
@@ -158,6 +236,39 @@ pub struct ForwardedMutation {
     /// long past, because the clock restarts at the boot, so a stale one expires rather than being
     /// honoured.
     pub accepted_deadline_boot_ms: U64,
+}
+
+/// The rights beside a forwarded mutation, as they are encoded and decoded: a set that holds
+/// `voice.use` is refused both ways ([`may_travel_to_a_worker`]), so no frame carries it, whoever
+/// builds it and however it is sent.
+mod worker_rights {
+    use serde::{Deserialize as _, Serialize as _};
+
+    use crate::rights::ActionRight;
+    use crate::scalars::CanonicalSet;
+
+    /// Why a set is refused.
+    const REFUSED: &str = "voice.use never travels to a worker";
+
+    pub fn serialize<S: serde::Serializer>(
+        rights: &CanonicalSet<ActionRight>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        if !super::may_travel_to_a_worker(rights) {
+            return Err(serde::ser::Error::custom(REFUSED));
+        }
+        rights.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<CanonicalSet<ActionRight>, D::Error> {
+        let rights = CanonicalSet::<ActionRight>::deserialize(deserializer)?;
+        if !super::may_travel_to_a_worker(&rights) {
+            return Err(serde::de::Error::custom(REFUSED));
+        }
+        Ok(rights)
+    }
 }
 
 /// What one of the control daemon's connections to a worker is for.
@@ -249,6 +360,119 @@ mod tests {
     use crate::envelope::{ControlFrame, ParamsValue, Request};
     use crate::ids::RequestId;
     use crate::method::{Method, MethodVersion};
+
+    #[test]
+    fn a_worker_states_the_clock_floor_it_maps_by_its_identity() {
+        use crate::ids::CapabilityId;
+        use crate::scalars::CanonicalSet;
+
+        let identity = [0xa5_u8; 16];
+        let stated = super::utc_floor_capability(&identity);
+        assert_eq!(
+            stated.as_str(),
+            "utc-floor/a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5"
+        );
+        let frame_shape =
+            CapabilityId::new(super::FORWARDED_UTC_DEADLINE).expect("a capability identifier");
+        let capabilities: CanonicalSet<CapabilityId> =
+            [stated.clone(), frame_shape].into_iter().collect();
+        assert_eq!(super::stated_utc_floor(&capabilities), Some(identity));
+        assert!(super::states_utc_deadlines(&capabilities));
+
+        // A worker of an earlier build states nothing, and a statement this build cannot read
+        // states no floor.
+        assert_eq!(super::stated_utc_floor(&CanonicalSet::new()), None);
+        assert!(!super::states_utc_deadlines(&CanonicalSet::new()));
+        let upper: CanonicalSet<CapabilityId> =
+            [CapabilityId::new("utc-floor/A5A5A5A5A5A5A5A5A5A5A5A5A5A5A5A5").expect("text")]
+                .into_iter()
+                .collect();
+        assert_eq!(super::stated_utc_floor(&upper), None);
+        let two: CanonicalSet<CapabilityId> = [stated, super::utc_floor_capability(&[1_u8; 16])]
+            .into_iter()
+            .collect();
+        assert_eq!(super::stated_utc_floor(&two), None, "two floors state none");
+    }
+
+    /// A forwarded mutation that carries `voice.use` is neither encoded nor decoded, however it is
+    /// built; one that does not round-trips.
+    #[test]
+    fn a_forwarded_mutation_never_carries_a_voice_right_in_either_direction() {
+        use crate::actor::{ActorEnvelope, ActorIngress};
+        use crate::envelope::{ActionTarget, MutationRequest};
+        use crate::ids::{
+            ActionId, ActionWindowId, ActorId, ConnectionId, ControllerGeneration, EnvironmentId,
+        };
+        use crate::local::ForwardedMutation as Built;
+        use crate::rights::ActionRight;
+        use crate::scalars::{DurationMs, Nullable, U64, Uuid};
+
+        let frame = |rights: &[ActionRight]| {
+            ControlFrame::Forwarded(Box::new(Built {
+                mutation: MutationRequest {
+                    request_id: RequestId::new(1),
+                    method: Method::SessionClose.into(),
+                    method_version: MethodVersion::V1,
+                    action_id: ActionId::new(Uuid::from_bytes([1; 16])),
+                    grant_id: Nullable::null(),
+                    target: ActionTarget {
+                        environment_id: EnvironmentId::new(Uuid::from_bytes([2; 16])),
+                        session_id: Nullable::null(),
+                        session_epoch: Nullable::null(),
+                        application_instance_id: Nullable::null(),
+                        agent_binding_revision: Nullable::null(),
+                    },
+                    expected: ParamsValue::empty(),
+                    action_window_id: ActionWindowId::new("device:test").expect("a window"),
+                    requested_ttl_ms: DurationMs::new(30_000),
+                    params: ParamsValue::empty(),
+                },
+                actor: ActorEnvelope {
+                    actor_id: ActorId::new("device:test").expect("a principal"),
+                    ingress: ActorIngress::PairedDevice,
+                    device_id: Nullable::null(),
+                    grant_id: Nullable::null(),
+                    grant_revision: Nullable::null(),
+                    controller_generation: ControllerGeneration::new(1),
+                    connection_id: ConnectionId::new(Uuid::from_bytes([3; 16])),
+                },
+                grant_rights: rights.iter().copied().collect(),
+                accepted_deadline_boot_ms: U64::new(5),
+            }))
+        };
+
+        let allowed = frame(&[ActionRight::SessionView]);
+        let bytes = kr_cbor::to_canonical_vec(&allowed).expect("encodes");
+        let decoded: ControlFrame =
+            kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT).expect("decodes");
+        assert_eq!(decoded, allowed);
+
+        let refused =
+            kr_cbor::to_canonical_vec(&frame(&[ActionRight::SessionView, ActionRight::VoiceUse]))
+                .expect_err("a frame carrying voice.use is not encoded");
+        assert!(
+            refused.to_string().contains("never travels to a worker"),
+            "{refused}"
+        );
+
+        // Decoding refuses it too, whatever wrote it.
+        let read = |rights: &[&'static str]| {
+            super::worker_rights::deserialize(serde::de::value::SeqDeserializer::<
+                _,
+                serde::de::value::Error,
+            >::new(rights.iter().copied()))
+        };
+        assert_eq!(
+            read(&["session.view"]).expect("decodes"),
+            [ActionRight::SessionView].into_iter().collect()
+        );
+        let undecoded = read(&["session.view", "voice.use"])
+            .expect_err("a set carrying voice.use is not decoded");
+        assert!(
+            undecoded.to_string().contains("never travels to a worker"),
+            "{undecoded}"
+        );
+    }
 
     #[test]
     fn a_local_control_frame_round_trips_through_the_canonical_encoding() {

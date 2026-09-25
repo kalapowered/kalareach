@@ -119,6 +119,33 @@ async fn host_on(temp: kr_ipc::testing::TempHost) -> Host {
     }
 }
 
+/// What a daemon in this suite is started with.
+fn setup(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+    environment_id: EnvironmentId,
+) -> ControllerSetup {
+    let secrets = environment.secrets_dir();
+    ControllerSetup {
+        paths: environment.clone(),
+        environment_id,
+        identity: Box::new(move || {
+            let store = open_store_in(&secrets).expect("a secret store for the test environment");
+            Ok(
+                ControllerIdentity::open(store.store.as_ref(), environment_id, false)
+                    .expect("an identity"),
+            )
+        }),
+        secret_store: StoreSelection::File,
+        boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+        supervisor: Box::new(RefusingSupervisor),
+        worker_program: std::path::PathBuf::from("/nonexistent/kr-worker"),
+        build_id: build(),
+        release: "0".to_owned(),
+        shell_packages: None,
+        terminal: Box::new(kr_controller::supervision::NoTerminal),
+    }
+}
+
 /// Starts the controller, waiting for a daemon this one replaces to let go of the environment.
 ///
 /// Anything other than the environment still being held fails at once, with what it said and how
@@ -129,28 +156,7 @@ async fn start_controller(
 ) -> Arc<Controller> {
     let started = std::time::Instant::now();
     loop {
-        let secrets = environment.secrets_dir();
-        let outcome = Controller::start(ControllerSetup {
-            paths: environment.clone(),
-            environment_id,
-            identity: Box::new(move || {
-                let store =
-                    open_store_in(&secrets).expect("a secret store for the test environment");
-                Ok(
-                    ControllerIdentity::open(store.store.as_ref(), environment_id, false)
-                        .expect("an identity"),
-                )
-            }),
-            secret_store: StoreSelection::File,
-            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-            supervisor: Box::new(RefusingSupervisor),
-            worker_program: std::path::PathBuf::from("/nonexistent/kr-worker"),
-            build_id: build(),
-            release: "0".to_owned(),
-            shell_packages: None,
-            terminal: Box::new(kr_controller::supervision::NoTerminal),
-        })
-        .await;
+        let outcome = Controller::start(setup(environment, environment_id)).await;
         match outcome {
             Ok(controller) => return controller,
             Err(kr_controller::error::ControllerError::AlreadyRunning { .. })
@@ -733,12 +739,71 @@ async fn the_daemon_sweeps_under_its_registrys_view_of_its_sessions() {
     let sweep = host
         .controller
         .transfer()
-        .sweep(&host.controller)
+        .sweep(&Arc::downgrade(&host.controller))
         .await
         .expect("the sweep runs");
     assert_eq!(sweep.expired_uploads, 0);
     assert_eq!(sweep.expired_attachments, 0);
     assert_eq!(sweep.expired_snapshots, 0);
+}
+
+/// A sweep waiting for its blocking thread keeps nothing of the daemon, and with it the
+/// environment's lock, once the daemon's owner has let it go; when its turn comes, it finds the
+/// daemon gone and does nothing.
+///
+/// The runtime here has one blocking thread, which this test takes. A sweep is queued as it is
+/// asked for, so from then on it waits for that thread.
+#[test]
+fn a_sweep_waiting_to_run_does_not_keep_its_daemon() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    runtime.block_on(async {
+        let temp = kr_ipc::testing::TempHost::create();
+        let environment = temp.environment();
+        let environment_id = temp.environment_id();
+        let controller = start_controller(&environment, environment_id).await;
+
+        // The runtime's one blocking thread, taken until this test lets it go.
+        let (taken, taking) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let occupied = tokio::task::spawn_blocking(move || {
+            let _ = taken.send(());
+            let _ = held.recv();
+        });
+        taking.await.expect("the blocking thread is taken");
+
+        // Queued as it is asked for: from here the sweep waits for the thread.
+        let daemon = Arc::downgrade(&controller);
+        let swept = controller.transfer().sweep(&daemon);
+
+        drop(controller);
+        let dropped = std::time::Instant::now();
+        while daemon.strong_count() > 0 && dropped.elapsed() < std::time::Duration::from_secs(5) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            daemon.strong_count(),
+            0,
+            "a sweep waiting for its thread keeps nothing of the daemon"
+        );
+
+        // Its turn comes after the daemon has gone: it does nothing, and says why.
+        let _ = release.send(());
+        occupied.await.expect("the blocking thread is let go");
+        let refused = swept
+            .await
+            .expect_err("a sweep whose daemon has gone does nothing");
+        assert_eq!(refused.code, ErrorCode::ResourceUnavailable);
+
+        // Another daemon takes the environment. The daemon's last reference may have gone on
+        // another thread, which lets the environment go only once it has closed the daemon's
+        // stores, so the start waits for that, within a bound.
+        drop(start_controller(&environment, environment_id).await);
+    });
 }
 
 fn failure(outcome: std::result::Result<ParamsValue, ProtocolError>) -> ProtocolError {

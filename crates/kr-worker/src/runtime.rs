@@ -1123,11 +1123,13 @@ impl SessionRuntime {
         self.send_input(pending);
     }
 
-    /// Writes batches an operation produced while the session was already locked.
+    /// Hands batches the session's queue let go of to the terminal's writer.
     ///
-    /// A mutation runs inside the session's serial boundary, so it cannot take the lock again to
-    /// flush. It hands the batches out instead, and this sends them once the boundary is over.
-    pub fn send_input(&self, batches: Vec<InputBatch>) {
+    /// Only the two flushes above call it, with what [`Session::take_pending_input`] returned, so
+    /// every batch the writer is handed has come through the session's queue. That queue is where a
+    /// published fence holds back the input behind it, and a batch handed over any other way could
+    /// reach the terminal ahead of its fence.
+    fn send_input(&self, batches: Vec<InputBatch>) {
         let sent = !batches.is_empty();
         for batch in batches {
             let _ = self.input.send(batch);

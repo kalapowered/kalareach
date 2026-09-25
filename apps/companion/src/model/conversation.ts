@@ -69,6 +69,28 @@ export function applyNodes(
 }
 
 /**
+ * Installs a snapshot of the document, and the nodes the stream delivered while it was being read.
+ *
+ * The view reads a snapshot only once its stream listener is registered, and holds what the stream
+ * delivers until the snapshot answers. The order that follows is one rule:
+ *
+ * - The snapshot's presentation order stands: its nodes take their places in the order it gives.
+ * - A held node replaces the copy of the same node already in place, and only when its revision
+ *   is newer. An older revision changes nothing.
+ * - A held node the snapshot lacks was published after the snapshot was taken, so it follows the
+ *   snapshot's nodes, in the order the stream delivered it.
+ * - Nodes the conversation already held keep their places, so a document read again under a
+ *   person reading it does not move what they are reading. The same revision rule applies to them.
+ */
+export function installSnapshot(
+  state: ConversationState,
+  snapshot: readonly DocumentNode[],
+  held: readonly DocumentNode[]
+): ConversationState {
+  return applyNodes(applyNodes(state, snapshot), held)
+}
+
+/**
  * Prepends a page of older nodes and keeps the reader's anchor.
  *
  * The window moves by exactly the number of nodes that were added, so the node the person was

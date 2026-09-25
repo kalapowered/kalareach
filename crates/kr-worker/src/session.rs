@@ -100,6 +100,12 @@ pub struct SessionConfig {
     pub send_queue_bytes: usize,
     /// The resident output cache.
     pub resident_bytes: usize,
+    /// The clocks the session's time contract reads, and the host's clock floor it publishes its
+    /// readings in and decides every copy of authority's UTC deadline from.
+    ///
+    /// The worker binary maps the environment's floor here; a session with none refuses every
+    /// copy that carries a UTC deadline ([`crate::action::time::TimeContract::check_utc_deadline`]).
+    pub time: crate::action::time::TimeSources,
 }
 
 /// What a close request produced.
@@ -209,7 +215,11 @@ pub struct Session {
     application_state: Option<ApplicationState>,
     closing_reason: Option<ClosureReason>,
     created_at_ms: TimestampMs,
-    pending_input: Vec<InputBatch>,
+    /// What is queued for the pseudo-terminal and not yet handed to its writer, in order.
+    ///
+    /// Only [`Session::take_pending_input`] takes from it, and it stops at a published fence the
+    /// bridge's writer has not written yet.
+    pending_input: std::collections::VecDeque<Queued>,
     owned: Option<OwnedProcesses>,
     root_exit: Option<ShellExit>,
     /// The desktop this session is bound to, where it is bound to one.
@@ -250,6 +260,14 @@ pub struct Session {
     /// ran in memory. What a reader of this needs is what happened recently, and the durable
     /// record of a command is its own.
     command_blocks: std::collections::VecDeque<kr_protocol::root::RootCommandBlockParams>,
+    /// The bypass each executable was answered with in the latest prompt generation that asked.
+    ///
+    /// A program the integrated route did not launch is adopted with the reason the shell ran it
+    /// as typed, where the session gave one. Only the latest generation is kept: a program running
+    /// now was started by the line being run now.
+    answered: Answered,
+    /// The session's live agent instances, and how many announcements it has made about them.
+    agent_instances: AgentInstances,
     /// Why the last interrupt this session tried did not reach the foreground group.
     interrupt_failed: Option<String>,
     /// Accepted bytes the root editor's machine is holding for a reader transition.
@@ -282,9 +300,8 @@ pub struct Session {
     /// The host's own answers that have been queued for the application and not yet written.
     ///
     /// The response lane bounds what it holds; this bounds what has left the lane. Counting only
-    /// what is in `pending_input` would count nothing, because every flush hands that vector to
-    /// the writer, so the counter is shared with the writer and comes down as each batch is
-    /// written.
+    /// what is in `pending_input` would miss everything a flush has handed to the writer, so the
+    /// counter is shared with the writer and comes down as each batch is written.
     /// Every byte queued for the pseudo-terminal, across every producer, released by the writer.
     queued_input_bytes: Arc<std::sync::atomic::AtomicUsize>,
     /// The part of that which belongs to the **current** lease, and which a lease change discards.
@@ -403,7 +420,7 @@ impl Session {
         let time = Arc::new(crate::action::time::TimeContract::restore(
             boot_identity,
             String::new(),
-            crate::action::time::TimeSources::system(),
+            config.time.clone(),
             recorded,
         ));
         if let Some(journal) = journal.as_mut() {
@@ -516,7 +533,7 @@ impl Session {
             application_state: None,
             closing_reason: None,
             created_at_ms: kr_ipc::now_ms(),
-            pending_input: Vec::new(),
+            pending_input: std::collections::VecDeque::new(),
             owned: None,
             root_exit: None,
             content_scopes: std::collections::BTreeMap::new(),
@@ -533,6 +550,8 @@ impl Session {
             launches: BTreeMap::new(),
             late_installations: Vec::new(),
             command_blocks: std::collections::VecDeque::new(),
+            answered: Answered::default(),
+            agent_instances: AgentInstances::default(),
             interrupt_failed: None,
             held_input_bytes: 0,
             restoration_losses: crate::render::Carried::default(),
@@ -669,9 +688,11 @@ impl Session {
     /// Carries out what one fence stimulus left for the session to do.
     ///
     /// One pass over the machine's own action list, front to back, carrying out each step where the
-    /// machine put it. Nothing is grouped and nothing is reordered: released input reaches the
-    /// writer before the fence that explains why it waited, a launch is revoked before the
-    /// interrupt that revoked it, and a detach is acknowledged only after its attachment is gone.
+    /// machine put it. Nothing is grouped and nothing is reordered: a fence goes to the bridge
+    /// before the input it lets go of is queued, a launch is revoked before the interrupt that
+    /// revoked it, and a detach is acknowledged only after its attachment is gone. The fence and
+    /// the input travel on two writers, so the queue also records where the fence was published,
+    /// and nothing behind that point leaves it until the bridge's writer has written the fence.
     pub fn apply_fence_effects(&mut self, effects: crate::fence::Effects) -> FenceOutcome {
         use crate::fence::Step;
 
@@ -697,6 +718,15 @@ impl Session {
         for step in effects.steps {
             match step {
                 Step::Write(batch) => self.queue_input(batch),
+                Step::Publish(fence) => {
+                    if let Some(frame) = self
+                        .fence
+                        .as_mut()
+                        .and_then(|driver| driver.publish(*fence))
+                    {
+                        self.pending_input.push_back(Queued::Fence(frame));
+                    }
+                }
                 Step::EditorBusy(event) => self.hub.publish_event(
                     event.attachment_id,
                     crate::output::OutputDelivery::EditorBusy(event),
@@ -757,7 +787,13 @@ impl Session {
 
         match hook {
             crate::fence::CommandHook::Resolve(params) => {
-                EventOutcome::CommandResolved(Box::new(self.resolve_invocation(&params)))
+                let answer = self.resolve_invocation(&params);
+                self.answered.record(
+                    params.prompt_generation,
+                    &params.executable,
+                    answer.bypass.as_ref().copied(),
+                );
+                EventOutcome::CommandResolved(Box::new(answer))
             }
             crate::fence::CommandHook::Block(block) => {
                 let prompt_generation = block.prompt_generation;
@@ -1303,7 +1339,8 @@ impl Session {
             .lease_change_queued
             .swap(true, std::sync::atomic::Ordering::AcqRel)
         {
-            self.pending_input.push(InputBatch::LeaseChanged);
+            self.pending_input
+                .push_back(Queued::Batch(InputBatch::LeaseChanged));
         }
     }
 
@@ -2368,9 +2405,62 @@ impl Session {
         self.interrupt_foreground()
     }
 
-    /// Takes the batches waiting to be written to the pseudo-terminal.
+    /// Takes the batches that may be written to the pseudo-terminal now, in the order they were
+    /// queued.
+    ///
+    /// It stops at a published fence the bridge's writer has not written yet, while the machine
+    /// still holds that fence, and leaves it and everything behind it queued. A reader takes what is
+    /// on its endpoint before it acts on a key, and only what is already there, so a key that
+    /// reached the shell ahead of the fence it was released under would be accepted without it: the
+    /// line it made would run without the capability the fence exists to mint. This is the only way
+    /// out of the queue, and every batch for the terminal, the host's own replies included, goes
+    /// through the queue, so no batch reaches the terminal around a fence. The one thing the
+    /// terminal's writer writes of its own accord is the terminator that closes a paste a lease
+    /// that has ended left open; it belongs to input queued before that lease ended, and it goes
+    /// ahead of the batch whose taking showed the writer the change.
+    ///
+    /// When the writer reports the fence written, its connection ends and the loss has been
+    /// recorded, or the machine drops the fence, the next flush takes what was waiting.
     pub fn take_pending_input(&mut self) -> Vec<InputBatch> {
-        std::mem::take(&mut self.pending_input)
+        let mut taken = Vec::new();
+        while let Some(queued) = self.pending_input.pop_front() {
+            match queued {
+                Queued::Batch(batch) => taken.push(batch),
+                Queued::Fence(frame)
+                    if self
+                        .fence
+                        .as_ref()
+                        .is_some_and(|driver| driver.holds_back(frame)) =>
+                {
+                    self.pending_input.push_front(Queued::Fence(frame));
+                    break;
+                }
+                // Written, gone with the connection it was handed to, or no longer the machine's.
+                Queued::Fence(_) => {}
+            }
+        }
+        taken
+    }
+
+    /// Returns how many batches wait in the queue for the terminal behind a published fence that
+    /// still holds them back, for this host's own tests.
+    ///
+    /// It is what a test reads to know, on the step itself rather than by watching the terminal,
+    /// whether keys have gone to the writer.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn waiting_for_fence(&self) -> usize {
+        self.pending_input
+            .iter()
+            .skip_while(|queued| match queued {
+                Queued::Batch(_) => true,
+                Queued::Fence(frame) => !self
+                    .fence
+                    .as_ref()
+                    .is_some_and(|driver| driver.holds_back(*frame)),
+            })
+            .filter(|queued| matches!(queued, Queued::Batch(_)))
+            .count()
     }
 
     /// Returns the epoch a batch must carry to still be written.
@@ -2696,7 +2786,7 @@ impl Session {
         if let InputBatch::Lease { epoch, .. } = batch {
             self.queued_lease_bytes.add(epoch, batch.len());
         }
-        self.pending_input.push(batch);
+        self.pending_input.push_back(Queued::Batch(batch));
     }
 
     /// Returns the counter the writer releases as the application takes its input.
@@ -2991,7 +3081,78 @@ impl Session {
             oldest_retained_cursor: U64::new(self.history.oldest_retained_cursor()),
             taken_at_ms: kr_ipc::now_ms(),
             agent_resources,
+            agent_instances: self.agent_instances(),
         }
+    }
+
+    /// Announces what one agent instance is now to every attached view, and keeps it.
+    ///
+    /// The announcement is counted, kept and published under this session's lock, so a list read
+    /// under the same lock either includes it or comes before it, and [`Self::agent_instances`]
+    /// carries the sequence of the last announcement it includes. An instance that ended leaves the
+    /// list. Each view is charged the event against its queue bound, like an agent resource.
+    pub fn announce_instance(&mut self, instance: kr_protocol::projection::AgentInstanceSummary) {
+        self.agent_instances.sequence = self.agent_instances.sequence.saturating_add(1);
+        if instance.ended_at.is_present() {
+            self.agent_instances
+                .live
+                .remove(&instance.application_instance_id);
+        } else {
+            self.agent_instances
+                .live
+                .insert(instance.application_instance_id, instance.clone());
+        }
+        let event = kr_protocol::projection::AgentInstanceEvent {
+            session_id: self.config.session_id,
+            sequence: U64::new(self.agent_instances.sequence),
+            instance,
+        };
+        let cost = crate::snapshot::wire::measure(&event).map_or(256, |cost| cost.bytes);
+        let oldest = self.history.oldest_retained_cursor();
+        let cursor = self.history.next_cursor();
+        for attachment_id in self.hub.subscribers() {
+            if self
+                .hub
+                .publish_agent_instance(attachment_id, cursor, event.clone(), cost, oldest)
+            {
+                self.projections.forget(attachment_id);
+            }
+        }
+    }
+
+    /// Returns the session's live agent instances, with the sequence of the last announcement the
+    /// list includes.
+    #[must_use]
+    pub fn agent_instances(&self) -> kr_protocol::projection::AgentInstanceList {
+        kr_protocol::projection::AgentInstanceList {
+            sequence: U64::new(self.agent_instances.sequence),
+            instances: self.agent_instances.live.values().cloned().collect(),
+        }
+    }
+
+    /// Returns what the terminal has in the foreground, for the adoption watch: its process group,
+    /// the root shell, and what the latest prompt generation's resolves were answered with.
+    ///
+    /// None once the session no longer accepts input, before its shell runs, and where the
+    /// platform reports no foreground group.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn foreground(&self) -> Option<crate::broker::adoption::Foreground> {
+        if !self.state.accepts_input() {
+            return None;
+        }
+        let root_shell = self.root_identity()?;
+        // The line running now is the one whose block started last; answers another line was
+        // given describe another invocation.
+        let line = self
+            .command_blocks
+            .back()
+            .map(|block| block.prompt_generation);
+        Some(crate::broker::adoption::Foreground {
+            group: self.pty.foreground_group()?,
+            root_shell,
+            answered: self.answered.for_line(line),
+        })
     }
 
     /// Returns the oldest output cursor this session can still replay.
@@ -3650,8 +3811,15 @@ impl Session {
                 self.state = SessionState::Closing;
                 self.closing_reason = Some(reason);
                 // Nothing new is started inside a closing session, so no backend waits for one.
-                if let Some(backends) = self.command_backends.as_ref() {
-                    backends.close();
+                // The instances it is ending are announced as ended now, while every view is still
+                // attached, so no list this session keeps names a program it is ending.
+                let ended = self
+                    .command_backends
+                    .as_ref()
+                    .map(|backends| backends.close())
+                    .unwrap_or_default();
+                for instance in ended {
+                    self.announce_instance(instance);
                 }
                 // Input is rejected from here, and that has to reach bytes already handed to the
                 // writer as well as the ones not yet accepted. Releasing the lease moves the fence,
@@ -3977,6 +4145,18 @@ pub struct FenceOutcome {
     pub close_session: Option<kr_shell_integration::contract::qualification::IntegrationLoss>,
 }
 
+/// One entry in a session's queue for the pseudo-terminal.
+#[derive(Debug)]
+enum Queued {
+    /// A batch for the writer.
+    Batch(InputBatch),
+    /// A fence published to the bridge at this point.
+    ///
+    /// What is queued behind it waits until the bridge's writer has written the fence, or until the
+    /// connection it was handed to has ended and the session has recorded the loss.
+    Fence(crate::fence::FenceFrame),
+}
+
 /// One ordered batch of input on its way to the pseudo-terminal.
 ///
 /// The variants are fenced differently, which is the whole reason the distinction exists. A
@@ -4222,4 +4402,100 @@ fn retained_bytes_under(root: &std::path::Path) -> u64 {
         }
     }
     total
+}
+
+/// A session's live agent instances, and how many announcements it has made about them.
+#[derive(Debug, Default)]
+struct AgentInstances {
+    /// The sequence of the latest announcement.
+    sequence: u64,
+    /// Every instance that has not ended.
+    live: BTreeMap<
+        kr_protocol::ids::ApplicationInstanceId,
+        kr_protocol::projection::AgentInstanceSummary,
+    >,
+}
+
+/// What the latest prompt generation's resolves were answered with.
+#[derive(Debug, Default)]
+struct Answered {
+    /// The generation the answers belong to.
+    generation: Option<kr_protocol::root::PromptGeneration>,
+    /// Each executable the shell named in it, with the bypass it was given or none.
+    executables: Vec<(String, Option<kr_protocol::root::CommandBypassReason>)>,
+}
+
+impl Answered {
+    /// The most answers one generation keeps: a line runs a bounded number of commands, and a line
+    /// that runs more than this is a loop whose early answers no adoption needs.
+    const RETAINED: usize = 16;
+
+    /// Returns the answers the line of `line`'s generation was given, and none for any other line:
+    /// a line that asked nothing, a pipeline for one, has no answer of an earlier line's.
+    #[cfg(any(unix, test))]
+    fn for_line(
+        &self,
+        line: Option<kr_protocol::root::PromptGeneration>,
+    ) -> Vec<(String, Option<kr_protocol::root::CommandBypassReason>)> {
+        if line.is_some() && line == self.generation {
+            self.executables.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Keeps one answer, forgetting the answers of an earlier generation.
+    fn record(
+        &mut self,
+        generation: kr_protocol::root::PromptGeneration,
+        executable: &str,
+        bypass: Option<kr_protocol::root::CommandBypassReason>,
+    ) {
+        if self.generation != Some(generation) {
+            self.generation = Some(generation);
+            self.executables.clear();
+        }
+        self.executables.retain(|(held, _)| held != executable);
+        if self.executables.len() == Self::RETAINED {
+            self.executables.remove(0);
+        }
+        self.executables.push((executable.to_owned(), bypass));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kr_protocol::root::{CommandBypassReason, PromptGeneration};
+
+    use super::Answered;
+
+    /// An adoption is given the bypass its own line was answered with, and none of an earlier
+    /// line's: a later line that asked nothing, such as a pipeline, inherits nothing.
+    #[test]
+    fn a_line_is_given_only_its_own_answers() {
+        let mut answered = Answered::default();
+        answered.record(
+            PromptGeneration::new(1),
+            "/usr/local/bin/claude",
+            Some(CommandBypassReason::AbsolutePath),
+        );
+        assert_eq!(
+            answered.for_line(Some(PromptGeneration::new(1))),
+            vec![(
+                "/usr/local/bin/claude".to_owned(),
+                Some(CommandBypassReason::AbsolutePath)
+            )]
+        );
+        assert!(
+            answered.for_line(Some(PromptGeneration::new(2))).is_empty(),
+            "the next line asked nothing"
+        );
+        assert!(answered.for_line(None).is_empty(), "no line is running");
+        answered.record(PromptGeneration::new(2), "/usr/local/bin/claude", None);
+        assert_eq!(
+            answered.for_line(Some(PromptGeneration::new(2))),
+            vec![("/usr/local/bin/claude".to_owned(), None)],
+            "a line's own answer replaces an earlier line's"
+        );
+    }
 }

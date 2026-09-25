@@ -244,6 +244,24 @@ confirmation obtained for one cannot approve a candidate that arrived by the oth
 The accepted proof is written with the pairing rather than checked and forgotten. Afterwards the
 host can show which challenge, which channel and which signer authorised each device it holds.
 
+An owner device answers from its own ceremony. kr-client's `pairing::owner` reads a host's
+outstanding challenges over the device's authorised connection, describes each in one line, asks
+the platform's ceremony within the challenge's remaining lifetime, and signs on
+`owner_device_presence` only when the person confirmed; the desktop application asks Touch ID, the
+Mac's password or Windows Hello (`docs/companion/README.md`).
+
+Nothing falls back when that owner is gone. A host whose owner devices are all revoked, with no
+enrolled presence signer and no terminal, refuses every confirmation: the terminal bootstrap stays
+over because the host has had an owner, a former owner device's proof no longer answers, the
+enrolled signer's channel is refused, and an answer an owner device gave before its revocation is
+spent on nothing afterwards (`a_headless_host_with_no_owner_device_refuses_every_confirmation` in
+`crates/kr-controller/tests/pairing_methods.rs`). The catalogue's two decisions carry their proof
+inline, and it has to be an owner device's own, on its own channel, for exactly that decision:
+`plugin.grant` refuses a stranger's key, the owner's key on the bootstrap's channel, a proof of
+another capability set and a proof a grant already spent
+(`a_plugin_grant_is_confirmed_by_an_owner_device_and_by_nothing_else` in
+`crates/kr-controller/tests/network_catalogue.rs`).
+
 ## The PAKE profile
 
 This build uses the maintained RustCrypto `spake2` crate's own `Spake2<Ed25519Group>` profile,

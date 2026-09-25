@@ -122,6 +122,7 @@ async fn hosted(script: &str) -> Hosted {
         worker_endpoint: None,
         send_queue_bytes: 1024 * 1024,
         resident_bytes: 1024 * 1024,
+        time: kr_worker::action::time::TimeSources::system(),
         launch_profile: kr_protocol::session::LaunchProfile::default(),
     };
     let mut session = Session::open(config).expect("opens the session");

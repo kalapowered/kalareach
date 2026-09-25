@@ -155,6 +155,19 @@ impl HostPaths {
         })
     }
 
+    /// Reads this installation's environment identity, when it has one, without allocating one.
+    ///
+    /// For a process that serves an environment it did not create, such as the starter the
+    /// environment's scheduled task runs: an installation with no identity has nothing for it to
+    /// serve, and making one would be making an installation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file exists and cannot be read, or does not hold an identity.
+    pub fn recorded_environment_id(&self) -> Result<Option<EnvironmentId>> {
+        read_environment_id(&self.environment_id_file())
+    }
+
     /// Returns the directories one environment uses.
     #[must_use]
     pub fn environment(&self, environment_id: EnvironmentId) -> EnvironmentPaths {
@@ -278,6 +291,15 @@ impl EnvironmentPaths {
         }
     }
 
+    /// Returns the file that holds this environment's clock floor for the current boot.
+    ///
+    /// In the runtime directory, beside the endpoints and the descriptors: it is owner-only, it is
+    /// on the internal disk, and like them it describes this boot and no other ([`crate::floor`]).
+    #[must_use]
+    pub fn utc_floor_file(&self) -> PathBuf {
+        self.runtime_dir.join("utc-floor")
+    }
+
     /// Returns the directory holding published worker descriptors.
     #[must_use]
     pub fn descriptors_dir(&self) -> PathBuf {
@@ -392,6 +414,39 @@ impl EnvironmentPaths {
     #[must_use]
     pub fn secrets_dir(&self) -> PathBuf {
         self.state_dir.join("secrets")
+    }
+
+    /// Returns the endpoint on which this environment's starter takes a launch from the daemon.
+    ///
+    /// Windows only: there the environment's scheduled task runs a starter, and the starter, not
+    /// the daemon, creates each worker ([`crate::starter`]). One instance of this pipe waits for
+    /// each launch the daemon has handed over.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcError::SocketPathTooLong`] when the name does not fit the platform's limit.
+    #[cfg(windows)]
+    pub fn starter_endpoint(&self) -> Result<Endpoint> {
+        self.endpoint("s")
+    }
+
+    /// Returns the directory in which a request to start this environment's daemon waits for the
+    /// starter that takes it.
+    ///
+    /// In the runtime directory: a request belongs to one boot, and its deadline is counted on that
+    /// boot's clock ([`crate::starter`]).
+    #[must_use]
+    pub fn start_claims_dir(&self) -> PathBuf {
+        self.runtime_dir.join("claims")
+    }
+
+    /// Returns the file that records which login session this environment's work runs in.
+    ///
+    /// In the state directory, because it has to outlive the daemon that wrote it: a replacement
+    /// daemon reads it before it takes over anything ([`crate::starter`]).
+    #[must_use]
+    pub fn session_record(&self) -> PathBuf {
+        self.state_dir.join("login-session")
     }
 
     #[cfg(unix)]
@@ -686,8 +741,16 @@ mod windows {
     use std::os::windows::io::{AsRawHandle as _, BorrowedHandle};
     use std::path::Path;
 
+    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtOpenFile,
+    };
     use windows_sys::Win32::Foundation::{
         CloseHandle, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE, LocalFree,
+    };
+    use windows_sys::Win32::Foundation::{
+        OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, STATUS_OBJECT_NAME_NOT_FOUND,
+        STATUS_OBJECT_PATH_NOT_FOUND, STATUS_SUCCESS, UNICODE_STRING,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -699,10 +762,213 @@ mod windows {
         PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES,
         TOKEN_INFORMATION_CLASS, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenOwner, TokenUser,
     };
-    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateDirectoryW, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     use crate::error::{IpcError, Result};
+
+    /// Opens a name directly inside a directory, from the directory's own open handle.
+    ///
+    /// This is the [`openat`] of this platform, which has no Win32 call for it. The name is resolved
+    /// against the handle in one step, so a directory swapped for another since the handle was
+    /// opened is never consulted (its handle still names the directory that was checked), and a file
+    /// replaced by a rename while this runs opens as one whole version or the other and never as
+    /// nothing. The name carries no separator, so it cannot climb out of the directory. The
+    /// reparse-point option opens a link itself rather than following it, so the caller refuses one
+    /// by its attributes rather than being sent wherever it points.
+    ///
+    /// `None` is a name that is not there, which a caller reads as no descriptor rather than a
+    /// failure.
+    ///
+    /// [`openat`]: https://man7.org/linux/man-pages/man2/openat.2.html
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating system's error when the name cannot be opened for a reason other than
+    /// its absence.
+    pub fn open_child(
+        directory: BorrowedHandle<'_>,
+        name: &std::ffi::OsStr,
+    ) -> std::io::Result<Option<std::fs::File>> {
+        use std::os::windows::ffi::OsStrExt as _;
+        use std::os::windows::io::FromRawHandle as _;
+
+        let mut wide: Vec<u16> = name.encode_wide().collect();
+        // A name resolved relative to a directory handle is one component, so a separator in it, or
+        // the whole-path forms the native call would otherwise read, is refused here rather than
+        // resolved. `\` and `/` are both separators to this platform, and a leading `\??\` or `\\`
+        // would leave the directory the handle names.
+        if wide.is_empty()
+            || wide.contains(&(b'\\' as u16))
+            || wide.contains(&(b'/' as u16))
+            || wide.contains(&0)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "a name opened relative to a directory is one component",
+            ));
+        }
+        let length = u16::try_from(wide.len() * 2).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "the name is too long")
+        })?;
+        let object_name = UNICODE_STRING {
+            Length: length,
+            MaximumLength: length,
+            Buffer: wide.as_mut_ptr(),
+        };
+        let attributes = OBJECT_ATTRIBUTES {
+            Length: u32::try_from(std::mem::size_of::<OBJECT_ATTRIBUTES>()).unwrap_or(0),
+            RootDirectory: directory.as_raw_handle(),
+            ObjectName: &raw const object_name,
+            // Case-insensitive, as every path on this platform is by default.
+            Attributes: OBJ_CASE_INSENSITIVE,
+            SecurityDescriptor: std::ptr::null(),
+            SecurityQualityOfService: std::ptr::null(),
+        };
+        let mut handle: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
+        let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+        // SAFETY: `handle` and `status_block` are live out parameters; `attributes` points at
+        // `object_name`, whose buffer is `wide`, and all three are locals that live to the end of
+        // this function, past the call. `directory` is a handle borrowed for this call and used as
+        // the root the name resolves against. The options open an existing name only, so the call
+        // creates nothing.
+        let status = unsafe {
+            NtOpenFile(
+                &raw mut handle,
+                FILE_GENERIC_READ,
+                &raw const attributes,
+                &raw mut status_block,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            )
+        };
+        if status == STATUS_SUCCESS {
+            // SAFETY: the call above filled `handle` with a file handle this owns and closes once.
+            return Ok(Some(unsafe {
+                std::fs::File::from_raw_handle(handle.cast())
+            }));
+        }
+        if status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND {
+            return Ok(None);
+        }
+        // SAFETY: the status is the one the call returned; this only maps it to a Win32 code.
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        Err(std::io::Error::from_raw_os_error(code.cast_signed()))
+    }
+
+    /// Opens the directory an open handle holds a second time, relative to that handle, holding
+    /// `right`.
+    ///
+    /// The name opened is empty, which the kernel reads as the object the handle holds, so no name
+    /// is resolved and the new handle is on that directory wherever its name has gone since. The
+    /// operating system checks `right` against the directory's list as it does for an open by name,
+    /// and asks for the same backup intent [`super::flush_directory`]'s own open carries. The
+    /// Win32 call for a reopen is not used: it refuses a directory whatever right it is asked for.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating system's error when the directory cannot be opened with that right.
+    pub(super) fn reopen_directory(
+        directory: BorrowedHandle<'_>,
+        right: u32,
+    ) -> std::io::Result<std::fs::File> {
+        use std::os::windows::io::FromRawHandle as _;
+        use windows_sys::Wdk::Storage::FileSystem::{
+            FILE_DIRECTORY_FILE, FILE_OPEN_FOR_BACKUP_INTENT,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, SYNCHRONIZE};
+
+        // A name of no characters. The buffer is live and never read, because the length is zero.
+        let mut nothing = [0_u16; 1];
+        let object_name = UNICODE_STRING {
+            Length: 0,
+            MaximumLength: 0,
+            Buffer: nothing.as_mut_ptr(),
+        };
+        let attributes = OBJECT_ATTRIBUTES {
+            Length: u32::try_from(std::mem::size_of::<OBJECT_ATTRIBUTES>()).unwrap_or(0),
+            RootDirectory: directory.as_raw_handle(),
+            ObjectName: &raw const object_name,
+            Attributes: 0,
+            SecurityDescriptor: std::ptr::null(),
+            SecurityQualityOfService: std::ptr::null(),
+        };
+        let mut handle: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
+        let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+        // SAFETY: `handle` and `status_block` are live out parameters; `attributes` points at
+        // `object_name`, whose buffer is `nothing`, and all three are locals that live to the end
+        // of this function, past the call. `directory` is a handle borrowed for this call and used
+        // as the object the empty name resolves to. The options open an existing directory only,
+        // so the call creates nothing.
+        let status = unsafe {
+            NtOpenFile(
+                &raw mut handle,
+                right | SYNCHRONIZE | FILE_READ_ATTRIBUTES,
+                &raw const attributes,
+                &raw mut status_block,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_FOR_BACKUP_INTENT,
+            )
+        };
+        if status == STATUS_SUCCESS {
+            // SAFETY: the call above filled `handle` with a handle this owns and closes once.
+            return Ok(unsafe { std::fs::File::from_raw_handle(handle.cast()) });
+        }
+        // SAFETY: the status is the one the call returned; this only maps it to a Win32 code.
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        Err(std::io::Error::from_raw_os_error(code.cast_signed()))
+    }
+
+    /// The limit flags of the job this process runs in, or `None` when it runs in no job.
+    ///
+    /// A daemon reads this to decide whether a worker it starts must break away from its job: a
+    /// worker outlives the daemon, so it must not be inside a job that kills its members when the
+    /// daemon closes. Where the job does not kill on close, or there is no job, the worker already
+    /// outlives the daemon and no breakaway is needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating system's error when the job cannot be queried.
+    pub fn current_job_limit_flags() -> std::io::Result<Option<u32>> {
+        use windows_sys::Win32::System::JobObjects::{
+            IsProcessInJob, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JobObjectExtendedLimitInformation, QueryInformationJobObject,
+        };
+
+        let mut in_job: windows_sys::core::BOOL = 0;
+        // SAFETY: the process handle is a pseudo-handle that needs no release, the second argument
+        // is null to ask about any job, and `in_job` is a live out parameter.
+        let asked =
+            unsafe { IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &raw mut in_job) };
+        if asked == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if in_job == 0 {
+            return Ok(None);
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        let size =
+            u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()).unwrap_or(0);
+        // SAFETY: a null job handle queries the job this process is in, which the call above
+        // confirmed it has; `info` is a live buffer of the size passed, and the return length is
+        // not wanted.
+        let read = unsafe {
+            QueryInformationJobObject(
+                std::ptr::null_mut(),
+                JobObjectExtendedLimitInformation,
+                (&raw mut info).cast(),
+                size,
+                std::ptr::null_mut(),
+            )
+        };
+        if read == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Some(info.BasicLimitInformation.LimitFlags))
+    }
 
     /// The object's owner only, with inheritance blocked and children covered.
     ///
@@ -756,7 +1022,7 @@ mod windows {
     /// # Errors
     ///
     /// Returns an error when the list cannot be built or the directory cannot be created.
-    pub(super) fn create_directory_with_list(path: &Path, descriptor: &str) -> Result<()> {
+    pub(crate) fn create_directory_with_list(path: &Path, descriptor: &str) -> Result<()> {
         let wide_path = wide(path.as_os_str());
         let wide_descriptor = wide_str(descriptor);
         let mut built: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
@@ -1138,8 +1404,13 @@ mod windows {
     }
 }
 
+/// For this crate's own tests of files a wider list would let another account reach.
+#[cfg(all(windows, test))]
+pub(crate) use self::windows::create_directory_with_list;
 #[cfg(windows)]
-pub use self::windows::{AccessListRefusal, check_access_list};
+pub use self::windows::{
+    AccessListRefusal, check_access_list, current_job_limit_flags, open_child,
+};
 
 /// Returns the current user's identifier.
 #[cfg(unix)]
@@ -1270,18 +1541,46 @@ pub fn read_owner_only_file(path: &Path, limit: u64) -> Result<Option<Vec<u8>>> 
     Ok(Some(bytes))
 }
 
-/// Reads a small file this user owns.
+/// Reads a small file this user owns, checking its access-control list from the handle it opened.
+///
+/// Windows has no mode bits, so the question the Unix reader asks of an owner and a mode is asked of
+/// the file's list, read from the handle rather than from the name: it belongs to this user and
+/// grants no account the machine does not already trust. A symbolic link or a junction under the
+/// file's name is opened as the link itself and refused by its attributes, never followed. This is
+/// what the descriptor reader does for a worker's descriptor; the environment identity is read here.
 ///
 /// # Errors
 ///
 /// Returns an error when the file exists but is not one this host wrote.
 #[cfg(not(unix))]
 pub fn read_owner_only_file(path: &Path, limit: u64) -> Result<Option<Vec<u8>>> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(IpcError::io("inspect", path, error)),
+    use std::io::Read as _;
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use std::os::windows::io::AsHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
     };
+
+    // Opened without following a reparse point, so a link planted under this name opens as the link
+    // and is refused below rather than sending this read wherever it points.
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(IpcError::io("open", path, error)),
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|error| IpcError::io("inspect", path, error))?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(IpcError::UntrustedFile {
+            path: path.to_path_buf(),
+            reason: "this file must not be a symbolic link or a junction",
+        });
+    }
     if !metadata.is_file() {
         return Err(IpcError::UntrustedFile {
             path: path.to_path_buf(),
@@ -1294,9 +1593,31 @@ pub fn read_owner_only_file(path: &Path, limit: u64) -> Result<Option<Vec<u8>>> 
             reason: "this file is larger than anything this host writes here",
         });
     }
-    std::fs::read(path)
-        .map(Some)
-        .map_err(|error| IpcError::io("read", path, error))
+    match check_access_list(file.as_handle(), &path.display().to_string(), false) {
+        Ok(()) => {}
+        Err(AccessListRefusal::Policy(_)) => {
+            return Err(IpcError::UntrustedFile {
+                path: path.to_path_buf(),
+                reason: "this file's access-control list grants an account this host does not trust",
+            });
+        }
+        Err(AccessListRefusal::Unreadable(detail)) => {
+            return Err(IpcError::io("inspect", path, std::io::Error::other(detail)));
+        }
+    }
+    // Bounded by one byte more than the limit, so a file that grew between the check and the read is
+    // refused rather than read.
+    let mut bytes = Vec::new();
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| IpcError::io("read", path, error))?;
+    if bytes.len() as u64 > limit {
+        return Err(IpcError::UntrustedFile {
+            path: path.to_path_buf(),
+            reason: "this file is larger than anything this host writes here",
+        });
+    }
+    Ok(Some(bytes))
 }
 
 /// Writes a file owner-only, replacing any previous contents atomically.
@@ -1387,29 +1708,290 @@ pub fn create_new_owner_only_file(path: &Path, contents: &[u8]) -> Result<()> {
     sync_directory(directory)
 }
 
-/// Flushes a directory entry to disk after a file inside it is created or renamed.
+/// Flushes the directory a file was just published in, so the name survives a crash.
 ///
 /// A failure here is reported, not swallowed. The caller has been told its file is published; if
 /// the directory entry never reached the disk that claim is wrong, and the caller is the only one
 /// that can decide what to do about it.
-#[cfg(unix)]
 fn sync_directory(directory: &Path) -> Result<()> {
-    let handle = std::fs::File::open(directory)
-        .map_err(|error| IpcError::io("open for flushing", directory, error))?;
-    handle
-        .sync_all()
+    flush_directory(directory, NameKind::File)
         .map_err(|error| IpcError::io("flush", directory, error))
 }
 
-/// Flushes a directory entry to disk after a file inside it is created or renamed.
+/// What kind of name a directory flush makes durable.
 ///
-/// Windows has no directory handle a program can synchronise. A directory can be opened, with the
-/// backup semantics that say so, but `FlushFileBuffers` on that handle is not an operation the
-/// platform supports. The ordering the rename needs is the filesystem's own, so there is nothing
-/// here to do and nothing to report.
-#[cfg(not(unix))]
-const fn sync_directory(_directory: &Path) -> Result<()> {
-    Ok(())
+/// Unix flushes a directory the same way whatever changed in it. Windows flushes a directory only
+/// through a handle that may change it, and the handle asks for the one right the change used: an
+/// account can hold the right to add a directory where it may not add a file, as every account
+/// does at the root of the system drive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NameKind {
+    /// The name of a file, created, replaced or removed.
+    File,
+    /// The name of a directory, created.
+    Directory,
+}
+
+/// Flushes a directory to disk after a name inside it was created, replaced or removed, so the
+/// change survives a crash.
+///
+/// A file's contents are flushed through the file itself. Its name is an entry in the directory,
+/// and without this a crash can leave the name missing, or the old name in place, while the
+/// contents are safe. On Windows the directory is opened with the backup semantics that let a
+/// program open one at all, holding only the right `kind` names, and the flush is then asked of the
+/// operating system through that handle, which refuses a handle that may not change the directory.
+///
+/// # Errors
+///
+/// Returns the operating system's error when the directory cannot be opened or flushed.
+pub fn flush_directory(directory: &Path, kind: NameKind) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let _ = kind;
+        std::fs::File::open(directory)?.sync_all()
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Storage::FileSystem::{FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY};
+
+        flush_through(
+            directory,
+            match kind {
+                NameKind::File => FILE_ADD_FILE,
+                NameKind::Directory => FILE_ADD_SUBDIRECTORY,
+            },
+        )
+    }
+}
+
+/// Flushes one directory through a handle that holds `right` and nothing more.
+///
+/// `FlushFileBuffers`, which is what synchronising a handle calls, flushes only through a handle
+/// that may write. The handle asks for the one right the change being flushed used and no more:
+/// more could be refused, and it could collide with another program's handle on the same
+/// directory.
+#[cfg(windows)]
+fn flush_through(directory: &Path, right: u32) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    std::fs::OpenOptions::new()
+        .access_mode(right)
+        .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS)
+        .open(directory)?
+        .sync_all()
+}
+
+/// Flushes a directory this process holds open, after a name inside it was created, replaced or
+/// removed, so the change survives a crash.
+///
+/// [`flush_directory`] for a store that reaches its directories through handles it holds and never
+/// through their names again. The directory is opened a second time relative to the handle, so the
+/// directory flushed is the one the handle holds even where its name has since been renamed or put
+/// somewhere else. On Unix the second descriptor is opened for reading, because the handle may be a
+/// reference to the directory rather than a file description, which is what Linux gives for an
+/// `O_PATH` open and refuses to flush. On Windows the second handle holds only the right `kind`
+/// names, as [`flush_directory`]'s does, and the flush is asked of the operating system through it.
+///
+/// # Errors
+///
+/// Returns the operating system's error when the directory cannot be opened again or flushed.
+#[cfg(unix)]
+pub fn flush_held_directory(
+    directory: &impl std::os::fd::AsFd,
+    kind: NameKind,
+) -> std::io::Result<()> {
+    use rustix::fs::{Mode, OFlags};
+
+    let _ = kind;
+    // `.` is the directory the handle holds, whatever name reaches it by now.
+    let flushable = rustix::fs::openat(
+        directory.as_fd(),
+        ".",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    rustix::fs::fsync(&flushable).map_err(std::io::Error::from)
+}
+
+/// Flushes a directory this process holds open, after a name inside it was created, replaced or
+/// removed, so the change survives a crash.
+///
+/// [`flush_directory`] for a store that reaches its directories through handles it holds and never
+/// through their names again. The directory is opened a second time relative to the handle, so the
+/// directory flushed is the one the handle holds even where its name has since been renamed or put
+/// somewhere else. On Unix the second descriptor is opened for reading, because the handle may be a
+/// reference to the directory rather than a file description, which is what Linux gives for an
+/// `O_PATH` open and refuses to flush. On Windows the second handle holds only the right `kind`
+/// names, as [`flush_directory`]'s does, and the flush is asked of the operating system through it.
+///
+/// # Errors
+///
+/// Returns the operating system's error when the directory cannot be opened again or flushed.
+#[cfg(windows)]
+pub fn flush_held_directory(
+    directory: &impl std::os::windows::io::AsHandle,
+    kind: NameKind,
+) -> std::io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY};
+
+    flush_held_through(
+        directory.as_handle(),
+        match kind {
+            NameKind::File => FILE_ADD_FILE,
+            NameKind::Directory => FILE_ADD_SUBDIRECTORY,
+        },
+    )
+}
+
+/// Flushes the directory a handle holds through a second handle, opened from it, that holds
+/// `right` and nothing more.
+///
+/// [`flush_through`] for a held directory: the flush is asked of the operating system through the
+/// second handle, which it grants only where that handle may write.
+#[cfg(windows)]
+fn flush_held_through(
+    directory: std::os::windows::io::BorrowedHandle<'_>,
+    right: u32,
+) -> std::io::Result<()> {
+    self::windows::reopen_directory(directory, right)?.sync_all()
+}
+
+/// How many links the walk over a path follows before it gives up.
+///
+/// A backstop rather than the rule. Every kernel this runs on applies a limit of its own, usually
+/// lower than this, and refuses to open through a longer chain before the walk ever sees it. What
+/// this is for is the walk itself: a bound it holds to whatever the filesystem underneath it does.
+pub const MAX_PATH_LINKS: usize = 40;
+
+/// Flushes the directory entry of every name a directory's path is made of, and the directory
+/// itself.
+///
+/// A path is a chain of names, and losing any one of them leaves a store nothing reaches.
+/// Creating the levels a caller was missing is not enough: another opener may have created one a
+/// moment ago and not yet flushed it. The chain is also not only the components a caller spelled.
+/// A link is a name in a directory, it leads somewhere, and the rest of the path continues from
+/// there, so this resolves the path the way the kernel does, one component at a time, flushing the
+/// directory each name lives in and continuing from a link's target when it meets a symbolic link
+/// or a junction. Following each link once is what makes [`MAX_PATH_LINKS`] the same kind of bound
+/// the kernel applies rather than a count of repeated work.
+///
+/// A failure is reported: a caller that cannot open the directories its own path is made of cannot
+/// establish that the path survives a crash. One failure is not, on Windows: there a directory is
+/// flushed only through a handle that may add to it, and a directory this account may not add a
+/// directory to, such as `C:\Users` for an account that does not administer the machine, holds no
+/// name any caller running as this account made. So a directory on the way whose flush is refused
+/// for want of that right is passed over. The directory at the end of the path is not: that is
+/// where the caller adds its files.
+///
+/// # Errors
+///
+/// Returns the operating system's error when a directory on the path cannot be inspected or
+/// flushed, and an error when the path follows more than [`MAX_PATH_LINKS`] links.
+pub fn flush_path_names(directory: &Path) -> std::io::Result<()> {
+    let resolved = walk_path_names(directory, &|holder| {
+        flush_directory(holder, NameKind::Directory)
+    })?;
+    flush_directory(&resolved, NameKind::File)
+}
+
+/// The walk behind [`flush_path_names`]: flushes the directory each name on the path lives in with
+/// `flush_holder`, and returns the directory the path resolves to.
+fn walk_path_names(
+    directory: &Path,
+    flush_holder: &dyn Fn(&Path) -> std::io::Result<()>,
+) -> std::io::Result<PathBuf> {
+    use std::collections::VecDeque;
+    use std::path::Component;
+
+    /// One component of a path, owned, so a link's target can be spliced into the walk.
+    enum Part {
+        /// The root a path starts from, and on Windows its drive or share, which is nobody's name.
+        Root(std::ffi::OsString),
+        /// `.`, which names nothing.
+        Current,
+        /// `..`, which leaves the directory reached so far.
+        Parent,
+        /// A name in the directory reached so far.
+        Name(std::ffi::OsString),
+    }
+
+    fn parts(path: &Path) -> Vec<Part> {
+        path.components()
+            .map(|component| match component {
+                Component::Prefix(_) | Component::RootDir => {
+                    Part::Root(component.as_os_str().to_os_string())
+                }
+                Component::CurDir => Part::Current,
+                Component::ParentDir => Part::Parent,
+                Component::Normal(name) => Part::Name(name.to_os_string()),
+            })
+            .collect()
+    }
+
+    // An absolute path keeps its `..` components on Unix, where they are resolved against the
+    // directory actually reached, and loses them on Windows, whose own path rules resolve them
+    // against the spelling before the filesystem sees the path.
+    let mut remaining: VecDeque<Part> = parts(&std::path::absolute(directory)?).into();
+    let mut resolved = PathBuf::new();
+    let mut flushed: Vec<PathBuf> = Vec::new();
+    let mut followed = 0_usize;
+
+    while let Some(part) = remaining.pop_front() {
+        let name = match part {
+            Part::Root(root) => {
+                resolved.push(root);
+                continue;
+            }
+            Part::Current => continue,
+            Part::Parent => {
+                resolved.pop();
+                continue;
+            }
+            Part::Name(name) => name,
+        };
+        // The directory this name lives in, which is what holds it.
+        let holder = resolved.clone();
+        if !flushed.contains(&holder) {
+            let outcome = flush_holder(&holder);
+            #[cfg(windows)]
+            let outcome = match outcome {
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Ok(()),
+                other => other,
+            };
+            outcome?;
+            flushed.push(holder.clone());
+        }
+        resolved.push(&name);
+        // A failure here is reported rather than skipped. It can be the filesystem refusing to say,
+        // or a name something removed while this walk was going through it; either way, what the
+        // walk cannot see it cannot make durable.
+        if !std::fs::symlink_metadata(&resolved)?
+            .file_type()
+            .is_symlink()
+        {
+            continue;
+        }
+        followed += 1;
+        if followed > MAX_PATH_LINKS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{} follows more than {MAX_PATH_LINKS} links",
+                    directory.display()
+                ),
+            ));
+        }
+        // The rest of the path continues from the target, read the way the link names it: an
+        // absolute one starts again at its own root, one that starts at the root of a drive starts
+        // at the root of the link's drive, and a relative one continues from the directory the link
+        // lives in.
+        let target = holder.join(std::fs::read_link(&resolved)?);
+        resolved = PathBuf::new();
+        for part in parts(&target).into_iter().rev() {
+            remaining.push_front(part);
+        }
+    }
+    Ok(resolved)
 }
 
 #[cfg(target_os = "macos")]
@@ -1825,6 +2407,313 @@ mod tests {
         // so it is still a directory this host can use.
         create_private_directory(&path).expect("adopts a directory of this user's own");
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Runs one command-line tool and fails the test when it fails.
+    #[cfg(windows)]
+    fn run(program: &str, arguments: &[&std::ffi::OsStr]) -> String {
+        let output = std::process::Command::new(program)
+            .args(arguments)
+            .output()
+            .unwrap_or_else(|error| panic!("{program} starts: {error}"));
+        let printed = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success(),
+            "{program} failed: {printed}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        printed
+    }
+
+    /// KR-REQ-03.08: the owner-only reader, which reads the environment identity, checks the file's
+    /// access-control list, so a file whose list has been widened is refused rather than read. As
+    /// written the file is owner-only and reads; granting Everyone makes the next read refuse it.
+    #[cfg(windows)]
+    #[test]
+    fn a_widened_owner_only_file_is_refused_by_the_reader() {
+        let root = temporary_root("owner-only-read");
+        let path = root.join("run").join("environment");
+        create_private_tree(&root, path.parent().expect("a directory")).expect("the tree");
+        write_owner_only_file(&path, b"an environment identity").expect("writes");
+        assert_eq!(
+            read_owner_only_file(&path, 128)
+                .expect("reads")
+                .expect("present"),
+            b"an environment identity",
+            "as written it is owner-only and reads"
+        );
+        run(
+            "icacls.exe",
+            &[path.as_os_str(), "/grant".as_ref(), "*S-1-1-0:F".as_ref()],
+        );
+        let error = read_owner_only_file(&path, 128).expect_err("a widened file is refused");
+        assert_eq!(
+            error.code(),
+            kr_protocol::error::ErrorCode::PermissionDenied
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A directory is flushed through a handle of its own for either kind of name. A flush that
+    /// did nothing would pass the first two calls; one that opens the directory it flushes cannot
+    /// open one that is not there.
+    #[cfg(windows)]
+    #[test]
+    fn a_directory_is_flushed_through_a_handle_of_its_own() {
+        let root = temporary_root("flush-own");
+        flush_directory(&root, NameKind::File)
+            .expect("a directory this account adds files to is flushed");
+        flush_directory(&root, NameKind::Directory).expect("and one it adds directories to");
+        let missing = root.join("missing");
+        for kind in [NameKind::File, NameKind::Directory] {
+            assert_eq!(
+                flush_directory(&missing, kind)
+                    .expect_err("nothing to flush")
+                    .kind(),
+                std::io::ErrorKind::NotFound,
+                "{kind:?}"
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The flush is asked of the operating system, which flushes only through a handle that may
+    /// write and says so when it is asked through one that may not.
+    #[cfg(windows)]
+    #[test]
+    fn the_flush_itself_is_asked_of_the_operating_system() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ADD_FILE, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
+        };
+
+        // A directory opened with nothing more than the right to read its attributes opens, as the
+        // first reading shows, so what refuses in the second is the flush: a helper that opened the
+        // directory and never asked for the flush would return success instead.
+        let root = temporary_root("flush-asked");
+        std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&root)
+            .expect("the directory opens with the right to read its attributes");
+        assert_eq!(
+            flush_through(&root, FILE_READ_ATTRIBUTES)
+                .expect_err("a flush through a handle that may not write")
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        flush_through(&root, FILE_ADD_FILE)
+            .expect("and through one that may add a file, the flush is made");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A directory held open is flushed through a descriptor opened from the one held, not through
+    /// its name, and a held reference the kernel refuses to flush is flushed that way too.
+    #[cfg(unix)]
+    #[test]
+    fn a_held_directory_is_flushed_through_a_descriptor_opened_from_it() {
+        let root = temporary_root("flush-held");
+        let named = root.join("held");
+        std::fs::create_dir(&named).expect("a directory to hold");
+        let held = std::fs::File::open(&named).expect("the directory is held open");
+        flush_held_directory(&held, NameKind::File).expect("the held directory is flushed");
+        let moved = root.join("moved");
+        std::fs::rename(&named, &moved).expect("the held directory is renamed");
+        flush_held_directory(&held, NameKind::File)
+            .expect("the directory the handle holds is flushed wherever its name went");
+        // A reference to the directory rather than a file description, which Linux refuses to
+        // flush directly.
+        #[cfg(target_os = "linux")]
+        {
+            use rustix::fs::{Mode, OFlags};
+
+            let reference = rustix::fs::open(
+                &moved,
+                OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .expect("a reference to the directory");
+            assert_eq!(
+                rustix::fs::fsync(&reference).expect_err("a reference is not flushed directly"),
+                rustix::io::Errno::BADF
+            );
+            flush_held_directory(&reference, NameKind::File)
+                .expect("the directory it refers to is flushed");
+        }
+        drop(held);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A directory held open is flushed through a second handle opened from the one held, not
+    /// through its name: after a rename its old name reaches nothing and the flush still goes
+    /// through. A handle that shares no writing stops that second open with a sharing violation,
+    /// where a flush that did nothing would succeed and one made through the held handle itself
+    /// would be refused for want of the right.
+    #[cfg(windows)]
+    #[test]
+    fn a_held_directory_is_flushed_through_a_second_handle_opened_from_it() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        };
+
+        let root = temporary_root("flush-held");
+        let named = root.join("held");
+        std::fs::create_dir(&named).expect("a directory to hold");
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&named)
+            .expect("the directory is held open");
+        flush_held_directory(&held, NameKind::File)
+            .expect("a directory this account adds files to is flushed");
+        flush_held_directory(&held, NameKind::Directory).expect("and one it adds directories to");
+
+        let moved = root.join("moved");
+        std::fs::rename(&named, &moved).expect("the held directory is renamed");
+        assert_eq!(
+            flush_directory(&named, NameKind::File)
+                .expect_err("its old name reaches nothing")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        flush_held_directory(&held, NameKind::File)
+            .expect("the directory the handle holds is flushed wherever its name went");
+
+        let unshared = std::fs::OpenOptions::new()
+            .access_mode(FILE_LIST_DIRECTORY)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&moved)
+            .expect("a handle that shares no writing");
+        for kind in [NameKind::File, NameKind::Directory] {
+            let refused = flush_held_directory(&held, kind)
+                .expect_err("the second handle may add to the directory, which that one forbids");
+            assert_eq!(
+                refused.raw_os_error(),
+                Some(ERROR_SHARING_VIOLATION.cast_signed()),
+                "{kind:?}: {refused}"
+            );
+        }
+        drop(unshared);
+        flush_held_directory(&held, NameKind::File).expect("and with it gone, the flush is made");
+        drop(held);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The flush of a held directory is asked of the operating system through the second handle,
+    /// which refuses a handle that may not write and flushes through one that may add a file.
+    #[cfg(windows)]
+    #[test]
+    fn the_held_flush_is_asked_of_the_operating_system() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use std::os::windows::io::AsHandle as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ADD_FILE, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
+        };
+
+        // The directory opens again with nothing more than the right to read its attributes, as
+        // the first call shows, so what refuses in the second is the flush: a flush that opened
+        // the second handle and never asked for the flush would return success instead.
+        let root = temporary_root("flush-held-asked");
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&root)
+            .expect("the directory is held open");
+        super::windows::reopen_directory(held.as_handle(), FILE_READ_ATTRIBUTES)
+            .expect("the directory opens again with the right to read its attributes");
+        assert_eq!(
+            flush_held_through(held.as_handle(), FILE_READ_ATTRIBUTES)
+                .expect_err("a flush through a handle that may not write")
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        flush_held_through(held.as_handle(), FILE_ADD_FILE)
+            .expect("and through one that may add a file, the flush is made");
+        drop(held);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A path through a junction is flushed to where the junction leads.
+    #[cfg(windows)]
+    #[test]
+    fn a_path_is_flushed_through_a_junction_to_its_end() {
+        let root = temporary_root("flush-junction");
+        let target = root.join("elsewhere");
+        std::fs::create_dir(&target).expect("a directory to link to");
+        let link = root.join("linked");
+        // A junction needs no privilege to make, unlike a symbolic link.
+        run(
+            "cmd.exe",
+            &[
+                "/d".as_ref(),
+                "/c".as_ref(),
+                "mklink".as_ref(),
+                "/J".as_ref(),
+                link.as_os_str(),
+                target.as_os_str(),
+            ],
+        );
+        let store = link.join("store").join("inner");
+        std::fs::create_dir_all(&store).expect("the levels, through the junction");
+        flush_path_names(&store).expect("every name on the way is flushed");
+        assert!(
+            target.join("store").join("inner").is_dir(),
+            "the levels are where the junction leads"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The walk passes over a directory whose flush is refused for want of the right, and reports
+    /// every other failure.
+    #[cfg(windows)]
+    #[test]
+    fn the_walk_passes_over_a_directory_refused_for_want_of_the_right_and_reports_anything_else() {
+        // Whether this account is refused a directory is a matter of the directory's list and of
+        // the privileges the account holds, which override the list for an account that has them
+        // turned on. So the refusal is given to the walk here rather than asked of a list: what is
+        // under test is what the walk makes of it.
+        let root = temporary_root("flush-walk");
+        let refused = std::path::absolute(root.join("refused")).expect("an absolute path");
+        let store = refused.join("store");
+        std::fs::create_dir_all(&store).expect("two levels");
+        let asked = std::cell::RefCell::new(Vec::new());
+        let resolved = walk_path_names(&store, &|holder: &Path| {
+            asked.borrow_mut().push(holder.to_path_buf());
+            if holder == refused {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            } else {
+                Ok(())
+            }
+        })
+        .expect("a directory refused for want of the right is passed over");
+        assert_eq!(resolved, store, "the walk reaches the directory at the end");
+        let asked = asked.into_inner();
+        assert!(
+            asked.contains(&refused),
+            "the refused directory was asked: {asked:?}"
+        );
+        let above = std::path::absolute(&root).expect("an absolute path");
+        assert!(
+            asked.contains(&above),
+            "and the directory above it was flushed: {asked:?}"
+        );
+
+        // Any other failure is reported.
+        let failed = walk_path_names(&store, &|holder: &Path| {
+            if holder == refused {
+                Err(std::io::Error::other("the device did not answer"))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(
+            failed.is_err_and(|error| error.kind() == std::io::ErrorKind::Other),
+            "a failure that is not a refusal is the answer"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 }

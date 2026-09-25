@@ -113,6 +113,7 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
         worker_endpoint: None,
         send_queue_bytes: SEND_QUEUE_BYTES,
         resident_bytes: 4 * 1024 * 1024,
+        time: kr_worker::action::time::TimeSources::system(),
         launch_profile: kr_protocol::session::LaunchProfile::default(),
     };
     let mut session = Session::open(config).expect("opens the session");

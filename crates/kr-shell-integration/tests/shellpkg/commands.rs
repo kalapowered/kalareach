@@ -337,9 +337,7 @@ fn last_run(probes: &Probes) -> ProbeRun {
 /// KR-REQ-12.07, KR-REQ-07.45: an interactive command asks once, before it starts, and a bypass
 /// runs it exactly as it was typed.
 pub fn an_interactive_command_asks_once_and_runs_as_typed(kind: ShellKind) {
-    let Some(package) = Package::found(kind) else {
-        return;
-    };
+    let package = Package::built(kind);
     let probes = Probes::new();
     let mut session = a_session_with_probes(&package, &probes);
 
@@ -424,9 +422,7 @@ pub fn an_interactive_command_asks_once_and_runs_as_typed(kind: ShellKind) {
 /// command substitution, a background job, a sourced script, a function and an eval run as typed
 /// and ask nothing; a script is a process of its own, whose commands ask nothing.
 pub fn forms_the_root_shell_does_not_start_itself_never_ask(kind: ShellKind) {
-    let Some(package) = Package::found(kind) else {
-        return;
-    };
+    let package = Package::built(kind);
     let probes = Probes::new();
     let mut session = a_session_with_probes(&package, &probes);
     let script = probes.script();
@@ -518,9 +514,7 @@ pub fn forms_the_root_shell_does_not_start_itself_never_ask(kind: ShellKind) {
 /// finds. Zsh applies those assignments only in the child it forks, so it does not ask about such
 /// a command at all; `STTY` in front of one runs a command in that child before it starts.
 pub fn assignments_in_front_of_a_command_run_what_they_select(kind: ShellKind) {
-    let Some(package) = Package::found(kind) else {
-        return;
-    };
+    let package = Package::built(kind);
     let probes = Probes::new();
     let mut session = a_session_with_probes(&package, &probes);
     // A backend for whatever is asked about, so a question that named the wrong file would start
@@ -592,9 +586,7 @@ pub fn assignments_in_front_of_a_command_run_what_they_select(kind: ShellKind) {
 /// KR-REQ-07.44: diagnostics the session names a path for never hold a command up, whatever is at
 /// that path.
 pub fn diagnostics_that_cannot_be_written_never_hold_a_command_up(kind: ShellKind) {
-    let Some(package) = Package::found(kind) else {
-        return;
-    };
+    let package = Package::built(kind);
     let probes = Probes::new();
     // A pipe that nothing reads, where an ordinary open for writing would wait for a reader.
     let fifo = probes.path("trace.fifo");
@@ -620,9 +612,7 @@ pub fn diagnostics_that_cannot_be_written_never_hold_a_command_up(kind: ShellKin
 /// KR-REQ-12.07: an absolute-path invocation asks, is answered with the documented bypass, and
 /// runs as it was typed.
 pub fn an_absolute_path_invocation_runs_as_typed(kind: ShellKind) {
-    let Some(package) = Package::found(kind) else {
-        return;
-    };
+    let package = Package::built(kind);
     let probes = Probes::new();
     let mut session = a_session_with_probes(&package, &probes);
     let probe = probes.probe().display().to_string();
@@ -641,9 +631,7 @@ pub fn an_absolute_path_invocation_runs_as_typed(kind: ShellKind) {
 /// KR-REQ-12.07: a worker that does not answer leaves the command running as typed once the
 /// deadline has passed, and a worker that has stopped answering is not asked again.
 pub fn an_unanswered_question_runs_the_command_as_typed_after_the_deadline(kind: ShellKind) {
-    let Some(package) = Package::found(kind) else {
-        return;
-    };
+    let package = Package::built(kind);
     let probes = Probes::new();
     let mut session = a_session_with_probes(&package, &probes);
 
@@ -715,9 +703,7 @@ pub fn an_unanswered_question_runs_the_command_as_typed_after_the_deadline(kind:
 /// launcher it names, with the answer's variables and flags and the executable the shell found;
 /// a launcher that is not an absolute path to a program leaves the command as it was typed.
 pub fn a_backend_runs_the_command_through_the_launcher_it_names(kind: ShellKind) {
-    let Some(package) = Package::found(kind) else {
-        return;
-    };
+    let package = Package::built(kind);
     let probes = Probes::new();
     let mut session = a_session_with_probes(&package, &probes);
     let asked = session.run_asking("kr-probe control | cat", "probe-ran");
@@ -828,9 +814,7 @@ fn reading_through_the_editor(kind: ShellKind) -> &'static str {
 /// finished, with the shell's own status for it, its duration and the directory it ran in. An
 /// empty line and the input a running command reads report none.
 pub fn each_line_reports_its_block_with_status_duration_and_directory(kind: ShellKind) {
-    let Some(package) = Package::found(kind) else {
-        return;
-    };
+    let package = Package::built(kind);
     let probes = Probes::new();
     let mut session = a_session_with_probes(&package, &probes);
 
@@ -947,9 +931,7 @@ pub fn each_line_reports_its_block_with_status_duration_and_directory(kind: Shel
 /// that line and no other, which is what `kr detach` with no attachment presents, and a line the
 /// worker minted none for has none.
 pub fn a_line_exports_the_capability_minted_for_it(kind: ShellKind) {
-    let Some(package) = Package::found(kind) else {
-        return;
-    };
+    let package = Package::built(kind);
     let probes = Probes::new();
     let mut session = a_session_with_probes(&package, &probes);
 
@@ -1011,9 +993,7 @@ pub fn a_line_exports_the_capability_minted_for_it(kind: ShellKind) {
 /// that was lost, applied early, applied twice or taken out of order shows as a probe answered
 /// the other way.
 pub fn frames_that_arrive_while_a_command_waits_reach_the_reader_once(kind: ShellKind) {
-    let Some(package) = Package::found(kind) else {
-        return;
-    };
+    let package = Package::built(kind);
     let probes = Probes::new();
     let mut session = a_session_with_probes(&package, &probes);
 

@@ -544,6 +544,18 @@ pub static STORES: &[StoreDescriptor] = &[
         evictable_under_history_cap: false,
         served_by_archive: false,
     },
+    StoreDescriptor {
+        name: "broker_connections",
+        holds: "the installed package each connection identifier recorded its requests under",
+        durability: Durability::CrashDurable,
+        retention: Retention::UntilSubjectGone,
+        content: ContentClass::Metadata,
+        protection: Protection::OwnerOnlyDirectory,
+        cleanup: Cleanup::WorkerMaintenance,
+        reconciliation: Reconciliation::ReadBack,
+        evictable_under_history_cap: false,
+        served_by_archive: false,
+    },
 ];
 
 /// How long receipts are budgeted for, separately from output history.
@@ -607,6 +619,7 @@ mod tests {
             "broker_stream",
             "broker_client_requests",
             "broker_events",
+            "broker_connections",
         ] {
             let store = store(name).expect("every named store is declared");
             assert!(

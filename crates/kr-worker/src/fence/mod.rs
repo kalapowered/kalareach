@@ -23,11 +23,16 @@
 //!   attributed. Below a qualified session the reader's boundaries are answered and recorded and no
 //!   exchange begins, so a startup profile that asks a question is never held up by one.
 //! * **The bytes.** The machine names batches; the driver holds the actual bytes and hands them to
-//!   the writer in the order the machine releases them.
+//!   the writer in the order the machine releases them. A fence the machine publishes goes to the
+//!   bridge's writer and the input behind it to the terminal's, two writers nothing else orders,
+//!   so the session keeps that input until the bridge's writer has written the fence or the
+//!   machine has dropped it: a reader takes what is on its endpoint before it acts on a key, and a
+//!   key that arrived first would be accepted without the fence.
 
 pub mod bridge;
 pub mod driver;
 
 pub use crate::fence::driver::{
-    CommandHook, Effects, FenceDriver, Outbound, ReaderDiscards, Step, TakeoverReceipt,
+    CommandHook, Effects, FENCE_WRITE_LIMIT, FenceDriver, FenceFrame, Outbound, ReaderDiscards,
+    Step, TakeoverReceipt,
 };

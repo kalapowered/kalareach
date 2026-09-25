@@ -24,8 +24,9 @@ pub enum Tok {
     Ident(String),
     /// A lifetime or a loop label.
     Lifetime,
-    /// A string literal of any kind, with its value where it could be decoded.
-    Str(String),
+    /// A string literal of any kind: its value where it could be decoded, and whether it was
+    /// written with an escape or a line continuation.
+    Str(String, bool),
     /// A character or byte literal.
     Char,
     /// A numeric literal.
@@ -108,6 +109,59 @@ impl Lexer<'_> {
         self.chars.get(self.at + ahead).copied()
     }
 
+    /// Whether the first thing `from` characters ahead that is neither whitespace nor a plain
+    /// (not documentation) comment is `[`.
+    fn bracket_after(&self, from: usize) -> bool {
+        let mut at = from;
+        loop {
+            let third = self.peek(at + 2);
+            let fourth = self.peek(at + 3);
+            match (self.peek(at), self.peek(at + 1)) {
+                (Some('['), _) => return true,
+                // The whitespace the compiler skips between tokens.
+                (
+                    Some(
+                        '\t' | '\n' | '\u{b}' | '\u{c}' | '\r' | ' ' | '\u{85}' | '\u{200e}'
+                        | '\u{200f}' | '\u{2028}' | '\u{2029}',
+                    ),
+                    _,
+                ) => at += 1,
+                // `//`, but not `///` (unless `////`) and not `//!`.
+                (Some('/'), Some('/'))
+                    if !matches!(third, Some('/' | '!'))
+                        || (third == Some('/') && fourth == Some('/')) =>
+                {
+                    while self.peek(at).is_some_and(|c| c != '\n') {
+                        at += 1;
+                    }
+                }
+                // `/*`, but not `/**` (unless `/***` or `/**/`) and not `/*!`.
+                (Some('/'), Some('*'))
+                    if !matches!(third, Some('*' | '!'))
+                        || (third == Some('*') && matches!(fourth, Some('*' | '/'))) =>
+                {
+                    at += 2;
+                    let mut depth = 1_usize;
+                    while depth > 0 {
+                        match (self.peek(at), self.peek(at + 1)) {
+                            (None, _) => return false,
+                            (Some('/'), Some('*')) => {
+                                depth += 1;
+                                at += 2;
+                            }
+                            (Some('*'), Some('/')) => {
+                                depth -= 1;
+                                at += 2;
+                            }
+                            _ => at += 1,
+                        }
+                    }
+                }
+                _ => return false,
+            }
+        }
+    }
+
     fn bump(&mut self) -> Option<char> {
         let c = self.chars.get(self.at).copied()?;
         self.at += 1;
@@ -126,8 +180,10 @@ impl Lexer<'_> {
     }
 
     fn run(&mut self) -> Result<(), LexError> {
-        // A shebang line is not Rust; a `#!` followed by `[` is an inner attribute.
-        if self.peek(0) == Some('#') && self.peek(1) == Some('!') && self.peek(2) != Some('[') {
+        // A shebang line is not Rust. As the compiler reads a file's first line, `#!` opens an inner
+        // attribute instead when the first thing after it that is neither whitespace nor a plain
+        // comment is `[`.
+        if self.peek(0) == Some('#') && self.peek(1) == Some('!') && !self.bracket_after(2) {
             while self.peek(0).is_some_and(|c| c != '\n') {
                 self.bump();
             }
@@ -292,6 +348,7 @@ impl Lexer<'_> {
 
     fn string(&mut self, line: usize, prefix: usize) -> Result<(), LexError> {
         let raw = (0..prefix).any(|i| self.peek(i) == Some('r'));
+        let mut escaped = false;
         self.at += prefix;
         let unterminated = LexError {
             line,
@@ -320,15 +377,20 @@ impl Lexer<'_> {
                 match c {
                     '"' => break,
                     '\\' => {
-                        let escaped = self.bump().ok_or_else(|| unterminated.clone())?;
-                        match escaped {
+                        escaped = true;
+                        let after = self.bump().ok_or_else(|| unterminated.clone())?;
+                        match after {
                             'n' => value.push('\n'),
                             't' => value.push('\t'),
                             'r' => value.push('\r'),
                             '0' => value.push('\0'),
-                            '\n' => {
-                                // A line continuation skips the whitespace that starts the next line.
-                                while self.peek(0).is_some_and(char::is_whitespace) {
+                            // A line continuation, after a line feed or a carriage return and one,
+                            // skips the ASCII whitespace that starts the next line.
+                            '\n' | '\r' if after == '\n' || self.peek(0) == Some('\n') => {
+                                while self
+                                    .peek(0)
+                                    .is_some_and(|c| matches!(c, ' ' | '\t' | '\n' | '\r'))
+                                {
                                     self.bump();
                                 }
                             }
@@ -338,7 +400,7 @@ impl Lexer<'_> {
                                     if d == '}' {
                                         break;
                                     }
-                                    if d != '{' {
+                                    if d != '{' && d != '_' {
                                         digits.push(d);
                                     }
                                 }
@@ -364,7 +426,7 @@ impl Lexer<'_> {
                 }
             }
         }
-        self.push(Tok::Str(value), line);
+        self.push(Tok::Str(value, escaped), line);
         Ok(())
     }
 
@@ -452,8 +514,8 @@ mod tests {
             !tokens.iter().any(|t| matches!(t, Tok::Comment(..))),
             "{tokens:?}"
         );
-        assert!(tokens.contains(&Tok::Str("// not a comment".into())));
-        assert!(tokens.contains(&Tok::Str("/* nor \"this\" */".into())));
+        assert!(tokens.contains(&Tok::Str("// not a comment".into(), false)));
+        assert!(tokens.contains(&Tok::Str("/* nor \"this\" */".into(), false)));
     }
 
     #[test]
@@ -470,7 +532,19 @@ mod tests {
     #[test]
     fn a_string_value_is_decoded_across_a_line_continuation() {
         let tokens = kinds("\"KR-REQ-08.16 \\\n     row text\\u{21}\"");
-        assert_eq!(tokens, [Tok::Str("KR-REQ-08.16 row text!".into())]);
+        assert_eq!(tokens, [Tok::Str("KR-REQ-08.16 row text!".into(), true)]);
+    }
+
+    #[test]
+    fn a_string_is_decoded_as_the_compiler_decodes_it() {
+        // Underscores may stand among a Unicode escape's digits, and a line continuation after a
+        // carriage return and a line feed skips the ASCII whitespace that starts the next line.
+        let decoded = |source: &str| match &lex(source).expect("lexes")[0].tok {
+            Tok::Str(value, _) => value.clone(),
+            other => panic!("a string: {other:?}"),
+        };
+        assert_eq!(decoded("\"ki\\u{6_4}.rs\""), "kid.rs");
+        assert_eq!(decoded("\"a\\\r\n   b\""), "ab");
     }
 
     #[test]
@@ -483,5 +557,41 @@ mod tests {
     #[test]
     fn an_unterminated_comment_is_an_error_naming_its_line() {
         assert_eq!(lex("\n/* open").unwrap_err().line, 2);
+    }
+
+    #[test]
+    fn a_first_line_is_a_shebang_only_where_no_attribute_follows_its_bang() {
+        // `#!` then `[`, past whitespace and plain comments, opens an inner attribute.
+        for source in [
+            "#![path = \"x\"]\nmod m;",
+            "#! [path = \"x\"]\nmod m;",
+            "#! /* a gap */ [path = \"x\"]\nmod m;",
+            "#! // a gap\n[path = \"x\"]\nmod m;",
+        ] {
+            let tokens = kinds(source);
+            let significant: Vec<&Tok> = tokens
+                .iter()
+                .filter(|tok| !matches!(tok, Tok::Comment(..)))
+                .take(3)
+                .collect();
+            assert_eq!(
+                significant,
+                [&Tok::Punct('#'), &Tok::Punct('!'), &Tok::Punct('[')],
+                "{source}"
+            );
+        }
+        // Anything else after it, a documentation comment included, makes the line a shebang,
+        // which is dropped.
+        for source in [
+            "#!/usr/bin/env run\nmod m;",
+            "#! //! a document\n[path = \"x\"]\nmod m;",
+        ] {
+            let tokens = kinds(source);
+            assert!(!tokens.contains(&Tok::Punct('#')), "{source}: {tokens:?}");
+            assert!(
+                tokens.contains(&Tok::Ident("mod".into())),
+                "{source}: {tokens:?}"
+            );
+        }
     }
 }

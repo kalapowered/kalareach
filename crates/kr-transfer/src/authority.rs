@@ -81,6 +81,7 @@ use std::path::{Path, PathBuf};
 
 use cap_fs_ext::{DirExt as _, FollowSymlinks, MetadataExt as _, OpenOptionsFollowExt as _};
 use cap_std::fs::{Dir, File, OpenOptions};
+use kr_ipc::paths::{NameKind, flush_held_directory};
 use kr_protocol::ids::EnvironmentId;
 
 /// Longest accepted relative name, in bytes.
@@ -884,7 +885,7 @@ impl AuthorisedDirectory {
         owner_only(&child, component, Privacy::OwnerOnly)?;
         // The entry that names the new directory is durable before anything inside it is created,
         // so a power loss cannot leave a payload in a directory the parent forgot.
-        self.sync()?;
+        self.sync(NameKind::Directory)?;
         let mut display = self.display.clone();
         display.push(component);
         let child = Self::from_handle(self.environment_id, child, display)?;
@@ -945,7 +946,7 @@ impl AuthorisedDirectory {
             return Err(refusal);
         }
         // The entry that names the new directory is durable before anything inside it is created.
-        self.sync()?;
+        self.sync(NameKind::Directory)?;
         self.confine_like_me(child, component)
     }
 
@@ -1292,13 +1293,16 @@ impl AuthorisedDirectory {
     ///
     /// A payload file that is created, or renamed into the completed area, is not durable until
     /// the directory that names it is. The journal commits after this, so a record that says a
-    /// file exists is never more durable than the name.
+    /// file exists is never more durable than the name. The directory is flushed through a second
+    /// handle opened from the one held, never through its name, and `kind` is the name that was
+    /// created, renamed or removed in it, a file's or a directory's, which is the right that
+    /// handle asks for on Windows.
     ///
     /// # Errors
     ///
     /// Returns [`Escape::Unopenable`] when the flush fails.
-    pub fn sync(&self) -> Result<(), Escape> {
-        sync_directory(&self.directory).map_err(|error| Escape::Unopenable {
+    pub fn sync(&self, kind: NameKind) -> Result<(), Escape> {
+        flush_held_directory(&self.directory, kind).map_err(|error| Escape::Unopenable {
             component: self.display.display().to_string(),
             detail: error.to_string(),
         })
@@ -2329,31 +2333,6 @@ fn owner_only(directory: &Dir, path: &str, privacy: Privacy) -> Result<(), Escap
 #[cfg(unix)]
 fn rustix_uid() -> u32 {
     kr_ipc::paths::current_uid()
-}
-
-/// Flushes a directory's entries to storage.
-#[cfg(unix)]
-fn sync_directory(directory: &Dir) -> std::io::Result<()> {
-    use std::os::fd::AsFd as _;
-
-    // A duplicate of this handle is not enough. `cap-std` opens a directory with `O_PATH` where
-    // the platform has it, which is a reference to the directory rather than a file description,
-    // and Linux refuses to flush one. So the flush opens a descriptor of its own for the same
-    // directory, relative to the handle and never by path, and flushes that.
-    let flushable = rustix::fs::openat(
-        directory.as_fd(),
-        ".",
-        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
-        rustix::fs::Mode::empty(),
-    )?;
-    rustix::fs::fsync(&flushable).map_err(std::io::Error::from)
-}
-
-/// Windows refuses a flush on a directory handle, and a rename inside one volume is the platform's
-/// own ordered metadata operation. The Windows qualification pass records what that leaves open.
-#[cfg(not(unix))]
-fn sync_directory(_directory: &Dir) -> std::io::Result<()> {
-    Ok(())
 }
 
 /// Reads an open failure as a link refusal where it was one, and as an open failure otherwise.

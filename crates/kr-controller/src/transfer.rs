@@ -104,6 +104,26 @@ pub struct TransferModule {
     tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
+/// Where a test stops one sweep: where its store work begins, once the daemon has answered it.
+///
+/// A sweep carries one only when a test asked for that sweep ([`TransferModule::sweep_paused`]),
+/// so the daemon's own sweeps never stop. It exists only in test builds.
+#[cfg(test)]
+#[derive(Debug)]
+struct StorePause {
+    arrived: tokio::sync::oneshot::Sender<()>,
+    go: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+impl StorePause {
+    /// Says the sweep has arrived, and waits on its blocking thread until the test lets it go.
+    fn wait(self) {
+        let _ = self.arrived.send(());
+        let _ = self.go.recv();
+    }
+}
+
 impl Drop for TransferModule {
     fn drop(&mut self) {
         if let Ok(mut tasks) = self.tasks.lock() {
@@ -526,25 +546,82 @@ impl TransferModule {
 
     /// Expires everything whose retention has run out, under the archive's view of its sessions.
     ///
+    /// The sweep is queued on a blocking thread as it is asked for, and the answer returned here
+    /// holds nothing of the daemon or of this module. While the sweep waits for its thread it holds
+    /// the daemon weakly, so a daemon let go meanwhile goes at once, and the sweep, when its turn
+    /// comes, does nothing. Once the sweep runs, it holds the daemon until its store work ends: the
+    /// daemon's hold on its environment is what keeps a daemon started after it from opening the
+    /// store while this sweep still works on it, and two services working on one store at once
+    /// would each act on rows the other is changing.
+    ///
     /// # Errors
     ///
-    /// Returns the refusal the service decided.
-    pub async fn sweep(&self, controller: &Arc<Controller>) -> Answer<Sweep> {
+    /// The answer is the refusal the service decided, [`ErrorCode::ResourceUnavailable`] when the
+    /// daemon had gone before the sweep's turn came, or [`ErrorCode::OutcomeUnknown`] when the
+    /// blocking task could not report.
+    pub fn sweep(
+        &self,
+        daemon: &Weak<Controller>,
+    ) -> impl Future<Output = Answer<Sweep>> + Send + use<> {
+        self.queue_sweep(
+            daemon,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    /// Queues a sweep as [`TransferModule::sweep`] does, one that stops where its store work
+    /// begins until the test lets it go: the receiver hears it arrive there, and the sender lets it
+    /// go on.
+    #[cfg(test)]
+    fn sweep_paused(
+        &self,
+        daemon: &Weak<Controller>,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+        impl Future<Output = Answer<Sweep>> + Send + use<>,
+    ) {
+        let (arrived, arrival) = tokio::sync::oneshot::channel();
+        let (go, going) = std::sync::mpsc::channel();
+        let pause = StorePause { arrived, go: going };
+        (arrival, go, self.queue_sweep(daemon, Some(pause)))
+    }
+
+    /// Queues the sweep [`TransferModule::sweep`] describes. In a test build it carries the
+    /// pause a test asked for, if any, and stops there.
+    fn queue_sweep(
+        &self,
+        daemon: &Weak<Controller>,
+        #[cfg(test)] pause: Option<StorePause>,
+    ) -> impl Future<Output = Answer<Sweep>> + Send + use<> {
         // The registry scan and the sweep are both storage work, so both run on the same blocking
         // task. Reading the registry means holding its lock, and that lock is a task-aware one, so
         // it is taken in its blocking form *inside* the blocking task rather than awaited on the
         // reactor and handed over.
-        let owner = Arc::clone(controller);
+        let daemon = Weak::clone(daemon);
         let service = Arc::clone(&self.service);
-        blocking(move || {
+        answer(tokio::task::spawn_blocking(move || {
+            let owner = daemon.upgrade().ok_or_else(|| {
+                ProtocolError::new(
+                    ErrorCode::ResourceUnavailable,
+                    "the daemon this sweep was for has stopped",
+                )
+            })?;
             // The archive is the authority on what a session keeps. The sweep still asks one
             // question through one interface; what changed is which store answers it.
             let retention = owner
                 .archive_retention()
                 .map_err(|error| error.to_protocol_error())?;
-            service.sweep(&retention).map_err(Into::into)
-        })
-        .await
+            #[cfg(test)]
+            if let Some(pause) = pause {
+                pause.wait();
+            }
+            let swept = service.sweep(&retention).map_err(Into::into);
+            // Only now may the daemon go, and its environment with it.
+            drop(owner);
+            swept
+        }))
     }
 }
 
@@ -604,14 +681,17 @@ impl Controller {
     }
 }
 
-/// Starts the environment's attachment-chunk endpoint and its expiry sweep.
+/// Starts the environment's expiry sweep.
 ///
-/// Both tasks hold a weak reference to the daemon, so neither keeps it alive and both stop when it
-/// goes. The endpoint sits beside the control endpoint in the same owner-only runtime directory.
+/// The sweep holds the daemon weakly between sweeps and while a sweep waits for its thread, and
+/// strongly only while a sweep runs ([`TransferModule::sweep`]). A daemon whose owner lets it go
+/// therefore lives on for one running sweep at most, and the sweep stops once the daemon has gone.
+/// The attachment-chunk endpoint is served by whoever runs the daemon ([`serve_chunks`]).
 ///
 /// # Errors
 ///
-/// Returns [`ControllerError::Ipc`] when the endpoint cannot be bound.
+/// Returns [`ControllerError::NotConfigured`] when the transfer service's task list was left
+/// poisoned by an earlier failure.
 pub fn serve(controller: &Arc<Controller>) -> Result<()> {
     let sweeps = Arc::downgrade(controller);
     let started = tokio::spawn(async move {
@@ -674,14 +754,20 @@ pub async fn serve_chunks(controller: Weak<Controller>, listener: Listener) {
 }
 
 /// Sweeps expired transfers until the daemon goes.
-async fn sweep_forever(controller: Weak<Controller>) {
+///
+/// It holds nothing of the daemon across an await: the upgrade only asks the module for a sweep,
+/// and the answer it then waits for holds neither the daemon nor the module.
+async fn sweep_forever(daemon: Weak<Controller>) {
     let mut interval = tokio::time::interval(SWEEP_INTERVAL);
     loop {
         interval.tick().await;
-        let Some(controller) = controller.upgrade() else {
+        let Some(swept) = daemon
+            .upgrade()
+            .map(|controller| controller.transfer().sweep(&daemon))
+        else {
             return;
         };
-        let _ = controller.transfer().sweep(&controller).await;
+        let _ = swept.await;
     }
 }
 
@@ -693,7 +779,12 @@ where
     T: Send + 'static,
     F: FnOnce() -> Answer<T> + Send + 'static,
 {
-    tokio::task::spawn_blocking(work).await.unwrap_or_else(|_| {
+    answer(tokio::task::spawn_blocking(work)).await
+}
+
+/// What work queued on a blocking task answered, or that it could not say.
+async fn answer<T>(queued: tokio::task::JoinHandle<Answer<T>>) -> Answer<T> {
+    queued.await.unwrap_or_else(|_| {
         Err(ProtocolError::new(
             ErrorCode::OutcomeUnknown,
             "the transfer service could not report what happened to this action",
@@ -758,6 +849,47 @@ fn encode<T: serde::Serialize>(value: &T) -> Answer<ParamsValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sweep that has begun holds its daemon until its store work ends. The daemon's hold on its
+    /// environment is what keeps a daemon started after it from opening the transfer store while
+    /// this sweep still works on it, so for as long as the sweep works, every daemon started on the
+    /// environment is refused; once it ends, one is not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_sweep_that_has_begun_keeps_its_daemon_until_its_store_work_ends() {
+        use crate::service::net::tests::{daemon, setup, started};
+
+        let temp = kr_ipc::testing::TempHost::create();
+        let boot_identity = kr_ipc::identity::boot_identity().expect("a boot identity");
+        let controller = daemon(&temp).await;
+        let held = Arc::downgrade(&controller);
+
+        // A sweep that stops where its store work starts, and says so. The daemon's own sweeps
+        // never stop there, so the sweep that arrives is this one.
+        let (arrived, go, swept) = controller.transfer().sweep_paused(&held);
+        tokio::time::timeout(std::time::Duration::from_secs(30), arrived)
+            .await
+            .expect("the sweep reaches its store work in time")
+            .expect("the sweep says it has arrived");
+
+        // The daemon is let go while that sweep works on the store.
+        drop(controller);
+        for _ in 0..25 {
+            match Controller::start(setup(&temp, boot_identity.clone())).await {
+                Err(ControllerError::AlreadyRunning { .. }) => {}
+                Ok(_) => panic!(
+                    "a daemon took the environment while an earlier daemon's sweep worked on its store"
+                ),
+                Err(error) => panic!("a daemon was refused for another reason: {error}"),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(held.strong_count() > 0, "the sweep still holds its daemon");
+
+        // Once the sweep ends, its daemon goes, and another daemon takes the environment.
+        let _ = go.send(());
+        swept.await.expect("the sweep runs");
+        drop(started(|| Controller::start(setup(&temp, boot_identity.clone()))).await);
+    }
 
     #[test]
     fn the_daemon_serves_the_draft_and_media_group() {

@@ -922,6 +922,67 @@ pub struct AgentResourceSnapshotContinuation {
     pub after_resource_id: crate::ids::PendingResourceId,
 }
 
+/// The event type one agent instance's announcement is published under.
+pub const AGENT_INSTANCE_EVENT: &str = "session.agent.instance";
+
+/// One agent instance of a session, as the session announces it.
+///
+/// Section 12 has a program the integrated route did not launch detected and observed rather than
+/// given a gateway after the fact, and a person watching the session needs to tell the two apart:
+/// a launched instance can have rich bridges, and an adopted one never does. This says which it
+/// is, how it came to run and, where its bridges are refused, why.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentInstanceSummary {
+    /// The instance.
+    pub application_instance_id: crate::ids::ApplicationInstanceId,
+    /// The plugin whose connector recognised the program, where one did.
+    pub plugin_id: Nullable<crate::ids::PluginId>,
+    /// The launch profile recorded for the program, where one was.
+    pub profile_id: Nullable<crate::ids::LaunchProfileId>,
+    /// How the program is integrated: `native_bridge` for a launch the integration made, and
+    /// `native_terminal` for a program that was adopted.
+    pub mode: crate::broker::IntegrationMode,
+    /// Why the shell ran the program as typed, where the session answered it with a bypass.
+    pub bypass: Nullable<crate::root::CommandBypassReason>,
+    /// When the session learned the instance was running.
+    pub started_at: crate::scalars::TimestampMs,
+    /// When the instance ended. A view drops an ended instance from its list.
+    pub ended_at: Nullable<crate::scalars::TimestampMs>,
+    /// Why the instance's bridges are refused, where they are.
+    pub refusal: Nullable<String>,
+}
+
+/// One change to a session's agent instances, as an attached view is told about it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentInstanceEvent {
+    /// The session.
+    pub session_id: crate::ids::SessionId,
+    /// This announcement's position in the session's own count of them.
+    ///
+    /// A view that installed an [`AgentInstanceList`] applies the announcements whose sequence is
+    /// above the list's and discards the rest.
+    pub sequence: U64,
+    /// What the instance is now.
+    pub instance: AgentInstanceSummary,
+}
+
+/// A session's live agent instances, as a view installs them.
+///
+/// The session keeps the list and counts its announcements under its own lock, and it announces
+/// under that lock too, so every announcement is either in a list or after it: its sequence says
+/// which. A view installs the list, then applies the announcements above its sequence, and so
+/// holds every live instance once.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentInstanceList {
+    /// The sequence of the last announcement the list includes, or zero before the first.
+    pub sequence: U64,
+    /// Every instance of the session that has not ended, in identifier order.
+    pub instances: Vec<AgentInstanceSummary>,
+}
+
 /// One thing a projected attachment is sent, in the order the session produced it.
 ///
 /// The order is the contract: a reset, then a snapshot, then its pages, then deltas from the

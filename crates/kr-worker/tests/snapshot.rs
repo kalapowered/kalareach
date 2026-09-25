@@ -16,7 +16,8 @@ use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::WorkerIdentity;
 use kr_protocol::attachment::{
-    AttachMode, AttachmentCapability, SessionAttachParams, TerminalPresentationMode,
+    AttachMode, AttachmentCapability, PresentationReason, SessionAttachParams,
+    TerminalPresentationMode,
 };
 use kr_protocol::envelope::{ActionTarget, ControlFrame};
 use kr_protocol::hello::PROTOCOL_VERSION;
@@ -167,6 +168,7 @@ async fn host_with(
         worker_endpoint: None,
         send_queue_bytes,
         resident_bytes: 1024 * 1024,
+        time: kr_worker::action::time::TimeSources::system(),
         launch_profile: kr_protocol::session::LaunchProfile::default(),
     };
     let mut session = Session::open(config).expect("opens the session");
@@ -1841,6 +1843,15 @@ async fn reported_presentation(
     client: &mut LocalClient,
     attachment_id: AttachmentId,
 ) -> Option<TerminalPresentationMode> {
+    reported(host, client, attachment_id).await.0
+}
+
+/// Reads how the session says one attachment is presented right now, and the reason it gives.
+async fn reported(
+    host: &Host,
+    client: &mut LocalClient,
+    attachment_id: AttachmentId,
+) -> (Option<TerminalPresentationMode>, Option<PresentationReason>) {
     let snapshot: kr_protocol::recovery::EventsSnapshotResult = client
         .request(
             Method::EventsSnapshot,
@@ -1858,7 +1869,36 @@ async fn reported_presentation(
         .attachments
         .iter()
         .find(|summary| summary.attachment_id == attachment_id)
-        .and_then(|summary| summary.presentation.as_ref().copied())
+        .map_or((None, None), |summary| {
+            (
+                summary.presentation.as_ref().copied(),
+                summary.presentation_reason,
+            )
+        })
+}
+
+/// Waits until the session gives this reason for how the attachment is presented.
+///
+/// A reason changes when the session next settles what the attachment is served, which is where
+/// output arrives rather than where a test asks, so it is waited for rather than read once.
+async fn reported_as(
+    host: &Host,
+    client: &mut LocalClient,
+    attachment_id: AttachmentId,
+    expected: (Option<TerminalPresentationMode>, Option<PresentationReason>),
+    what: &str,
+) {
+    let started = tokio::time::Instant::now();
+    let waited = tokio::time::timeout_at(started + LIVENESS_DEADLINE, async {
+        loop {
+            if reported(host, client, attachment_id).await == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(waited.is_ok(), "waited {:?} for {what}", started.elapsed());
 }
 
 /// KR-REQ-08.81: asking for a screen is beginning again, and beginning again meets a boundary.
@@ -1972,9 +2012,12 @@ async fn an_attachment_stays_projected_until_a_parser_ground_boundary_arrives() 
         .await
         .expect("connects");
     assert_eq!(
-        reported_presentation(&host, &mut reader, attached.attachment_id).await,
-        Some(TerminalPresentationMode::Viewport),
-        "past the deadline it is still projected, and the session says so"
+        reported(&host, &mut reader, attached.attachment_id).await,
+        (
+            Some(TerminalPresentationMode::Viewport),
+            Some(PresentationReason::AwaitingParserBoundary)
+        ),
+        "past the deadline it is still projected, and the session says so and why"
     );
 
     // The sequence completes. The parser reaches ground, and the attachment may forward from
@@ -2010,6 +2053,11 @@ async fn an_attachment_stays_projected_until_a_parser_ground_boundary_arrives() 
         "once the parser is on ground the terminal takes the stream",
     )
     .await;
+    assert_eq!(
+        reported(&host, &mut reader, attached.attachment_id).await,
+        (Some(TerminalPresentationMode::Direct), None),
+        "and gives no reason, because it needs none"
+    );
     // The boundary can be reached part of the way through the line that completes the sequence, so
     // the whole of that line is waited for before a screen is asked for: a restoration taken
     // between two halves of it would be the state at a cursor this test never named.
@@ -2124,6 +2172,7 @@ async fn a_queue_too_small_for_any_screen_is_refused_when_it_is_asked_for() {
         worker_endpoint: None,
         send_queue_bytes: 8 * 1024 * 1024,
         resident_bytes: 1024 * 1024,
+        time: kr_worker::action::time::TimeSources::system(),
         launch_profile: kr_protocol::session::LaunchProfile::default(),
     };
     let mut session = Session::open(config).expect("opens the session");
@@ -2266,6 +2315,91 @@ fn numbered(lines: u32) -> String {
     format!(
         "i=0; while [ $i -lt {lines} ]; do printf 'line %d\\r\\n' $i; i=$((i+1)); done; read -r _"
     )
+}
+
+/// KR-REQ-08.02: a terminal of the session's own size, on a qualified profile, that looks above the
+/// live page is shown a viewport and says the window is why; back on the live screen it takes the
+/// stream again and gives no reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_window_above_the_live_page_is_the_reason_a_terminal_is_projected() {
+    let canonical = Dimensions::new(CANONICAL.0, CANONICAL.1);
+    let host = host_with(&numbered(400), canonical, None, 1024 * 1024).await;
+    produced(&host.runtime, b"line 399\r\r\n").await;
+    let mut watcher = attach(&host, canonical, Some("xterm-256color")).await;
+    let mut reader = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    reported_as(
+        &host,
+        &mut reader,
+        watcher.attachment_id,
+        (Some(TerminalPresentationMode::Direct), None),
+        "a terminal of the session's size on a settled stream takes it, with no reason to give",
+    )
+    .await;
+
+    let answer = report_viewport(
+        &host,
+        &mut watcher,
+        canonical,
+        Some(kr_protocol::attachment::ViewportPosition::Above(
+            kr_protocol::scalars::U64::new(100),
+        )),
+    )
+    .await;
+    assert_eq!(answer.presentation, TerminalPresentationMode::Viewport);
+    assert_eq!(
+        reported(&host, &mut reader, watcher.attachment_id).await,
+        (
+            Some(TerminalPresentationMode::Viewport),
+            Some(PresentationReason::HistoryWindow)
+        ),
+        "looking above the live page is the reason, whatever its size and profile"
+    );
+
+    report_viewport(&host, &mut watcher, canonical, None).await;
+    reported_as(
+        &host,
+        &mut reader,
+        watcher.attachment_id,
+        (Some(TerminalPresentationMode::Direct), None),
+        "back on the live screen it takes the stream again",
+    )
+    .await;
+}
+
+/// KR-REQ-08.02: a terminal given a screen a restoration could not carry is shown a viewport, and
+/// the session says that is why.
+///
+/// Four columns, and the application has printed exactly four characters, so the canonical grid
+/// holds a pending wrap. No sequence sets one, so no restoration can put a terminal into that state,
+/// and the terminal is painted the screen rather than handed the stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_screen_a_restoration_could_not_carry_is_the_reason_a_terminal_is_projected() {
+    let narrow = Dimensions::new(4, 5);
+    let host = host_with(
+        "stty -echo -echonl || exit 1; printf 'abcd'; read -r _",
+        narrow,
+        None,
+        1024 * 1024,
+    )
+    .await;
+    produced(&host.runtime, b"abcd").await;
+    let attached = attach(&host, narrow, Some("xterm-256color")).await;
+    let mut reader = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    reported_as(
+        &host,
+        &mut reader,
+        attached.attachment_id,
+        (
+            Some(TerminalPresentationMode::Viewport),
+            Some(PresentationReason::RestorationIncomplete),
+        ),
+        "the screen it was given could not carry the pending wrap",
+    )
+    .await;
 }
 
 /// KR-REQ-08.79, KR-REQ-08.83: a window above the live page is installed with the pages that

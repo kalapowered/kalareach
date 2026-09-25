@@ -1,9 +1,9 @@
 //! A launch of a stand-in application by the worker's own gateway, with its bridge installed.
 //!
-//! The application is `/bin/sh` running a loop that stands in for Claude Code: for every request
-//! path a test writes to its input it runs `kr-hook claude-code hook` with that request as the
-//! hook's input, as Claude Code runs a hook for an event, and writes the hook's output,
-//! diagnostics and exit code beside the request.
+//! The application is `/bin/sh` running a loop that stands in for the application the bridge was
+//! installed for: for every request path a test writes to its input it runs
+//! `kr-hook <application> hook` with that request as the hook's input, as the application runs a
+//! hook for an event, and writes the hook's output, diagnostics and exit code beside the request.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,9 +22,14 @@ use kr_worker::broker::{
 
 use super::{LIVENESS, Placed};
 
-/// The package whose bridge these launches were installed with.
+/// The package whose bridge these launches were installed with, unless a test names another.
 pub fn plugin() -> PluginId {
-    PluginId::new("kalareach/claude-code").expect("valid")
+    plugin_of("claude-code")
+}
+
+/// The connector package for an application.
+pub fn plugin_of(application: &str) -> PluginId {
+    PluginId::new(format!("kalareach/{application}")).expect("valid")
 }
 
 pub fn instance() -> ApplicationInstanceId {
@@ -33,20 +38,31 @@ pub fn instance() -> ApplicationInstanceId {
 
 /// The installation: Claude Code's two registrations, pointing at `forwarder`.
 pub fn installed(forwarder: &Path, surfaces: &[BridgeSurface]) -> InstalledBridge {
+    installed_for("claude-code", forwarder, surfaces)
+}
+
+/// The installation of an application's registrations, from its connector package, pointing at
+/// `forwarder`.
+pub fn installed_for(
+    application: &str,
+    forwarder: &Path,
+    surfaces: &[BridgeSurface],
+) -> InstalledBridge {
     InstalledBridge {
-        plugin_id: plugin(),
-        application: "claude-code".to_owned(),
+        plugin_id: plugin_of(application),
+        application: application.to_owned(),
         surfaces: surfaces.iter().copied().collect(),
         forwarder: forwarder.to_path_buf(),
     }
 }
 
 /// The stand-in application: it reads one request path per line and runs a hook for each,
-/// as Claude Code does for each event, with the request as the hook's input and the hook's
-/// output, diagnostics and exit code written beside it.
+/// as the application does for each event, with the request as the hook's input and the hook's
+/// output, diagnostics and exit code written beside it. `$2` is the application name its
+/// registration invokes the forwarder with.
 const APPLICATION: &str = r#"
 while IFS= read -r request; do
-  "$1" claude-code hook < "$request" > "$request.out" 2> "$request.err"
+  "$1" "$2" hook < "$request" > "$request.out" 2> "$request.err"
   echo $? > "$request.tmp"
   mv "$request.tmp" "$request.code"
 done
@@ -73,22 +89,41 @@ pub struct Launch {
 }
 
 impl Launch {
-    /// Launches the stand-in application, whose hooks run `hook_program`, against an
-    /// installation of `installed`.
+    /// Launches the stand-in application, whose hooks run `hook_program` for the application
+    /// the installation names, against an installation of `installed`.
     pub fn start(placed: &Placed, hook_program: &Path, installed: InstalledBridge) -> Self {
-        Self::start_running(placed, APPLICATION, hook_program, installed)
+        let invoked = installed.application.clone();
+        Self::start_as(placed, hook_program, &invoked, installed)
+    }
+
+    /// Launches the stand-in application, whose hooks run `hook_program <invoked> hook`, against
+    /// an installation of `installed`, which may be another application's.
+    pub fn start_as(
+        placed: &Placed,
+        hook_program: &Path,
+        invoked: &str,
+        installed: InstalledBridge,
+    ) -> Self {
+        Self::start_running(placed, APPLICATION, hook_program, invoked, installed)
     }
 
     /// Launches a stand-in application that starts `kr-hook claude-code channel` over its own
     /// standard input and output, as Claude Code starts a channel server, and ends with its code.
     pub fn channel(placed: &Placed, installed: InstalledBridge) -> Self {
-        Self::start_running(placed, CHANNEL_APPLICATION, &placed.forwarder, installed)
+        Self::start_running(
+            placed,
+            CHANNEL_APPLICATION,
+            &placed.forwarder,
+            "claude-code",
+            installed,
+        )
     }
 
     fn start_running(
         placed: &Placed,
         script: &str,
         program: &Path,
+        invoked: &str,
         installed: InstalledBridge,
     ) -> Self {
         use std::os::unix::fs::PermissionsExt as _;
@@ -115,7 +150,7 @@ impl Launch {
                 expected_process: None,
                 native_terminal: None,
                 application_instance_id: instance(),
-                plugin_id: plugin(),
+                plugin_id: installed.plugin_id.clone(),
                 installed_protocol_version: "2.1.278".to_owned(),
                 framing: Framing::new(NativeFraming::JsonLines),
                 site: EnvironmentId::new(Uuid::from_bytes([4; 16])),
@@ -139,6 +174,7 @@ impl Launch {
                 script.to_owned(),
                 "application".to_owned(),
                 program.to_string_lossy().into_owned(),
+                invoked.to_owned(),
             ],
             authentication: AuthenticationState::Authenticated,
             mode: IntegrationMode::NativeBridge,

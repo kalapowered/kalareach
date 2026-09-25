@@ -15,11 +15,14 @@
 
 import type { DocumentNode } from '@kalareach/plugin-sdk'
 import type {
+  AttachmentSummary,
   CapabilityRecord,
   ClosureRecord,
   EnvironmentCapabilitiesResult,
   EnvironmentListResult,
+  EventsSnapshotResult,
   HostInfoResult,
+  PresentationReason,
   Receipt,
   SessionListResult,
   SessionReadResult,
@@ -28,6 +31,7 @@ import type {
   VoiceManagedTerms,
   VoicePrepareResult,
   VoiceRate,
+  TerminalPresentationMode,
   VoiceSessionDescriptor
 } from '@kalareach/protocol'
 
@@ -42,20 +46,24 @@ import type {
 import type { AccountView, UsageView } from '../model/account'
 import type {
   ApprovedLink,
+  ConnectionState,
   DroppedFile,
   HostEvent,
   HostPort,
   ImportedImage,
-  OwnerPresence,
+  OwnerView,
+  PairingView,
+  PasteView,
   ProjectedScreen,
-  RendezvousOrigin,
-  ScannedCode,
+  ReviewOutcome,
   SettingsPane,
   SetupIdentity,
   VoiceCallState,
   VoiceStartRequest,
   Written
 } from './port'
+import { codeComplete } from '../pairing/words'
+import { terminalAttachment } from '../terminal/modes'
 
 const ENVIRONMENT = '3f1a2c40-11aa-4b2c-9d3e-000000000001'
 const VOICE_SESSION = '6c5d4e30-33cc-4d4e-9f5a-000000000201'
@@ -83,11 +91,6 @@ export class FakeHostError extends Error {
   toPayload(): { code: string; message: string; user_action: string } {
     return { code: this.code, message: this.message, user_action: this.user_action }
   }
-}
-
-/** One field of a scanned payload, as text. */
-function asText(value: unknown): string {
-  return typeof value === 'string' ? value : ''
 }
 
 /**
@@ -191,8 +194,14 @@ export interface FakeHostControls {
   appendNode(node: DocumentNode, sessionId?: string): void
   /** Moves the prompt generation on, which disables the launch buttons. */
   changePromptGeneration(): void
-  /** Marks the host as unreachable, or reachable again. */
+  /** Marks the host as unreachable, or reachable again, and says so as native code does. */
   setConnected(connected: boolean): void
+  /**
+   * Holds every answer to `read` from now on, as a slow backend would, until the test answers it.
+   * Each answer is what the host held when the read was made, a refusal included, so a test can
+   * change the host while a read is on its way and answer reads in any order.
+   */
+  hold(read: HeldRead): HeldReads
   /** Hands the window a set of dropped files. */
   dropFiles(files: readonly DroppedFile[]): void
   /** What the interface asked the platform to save, in order. */
@@ -257,6 +266,71 @@ export interface FakeHostControls {
    * where in the call it happened, and the action it named, or none when `action` is null.
    */
   announceVoiceDelegation(delegationId: string, action?: string | null): void
+  /** Changes what the pairing screen shows, as native code would publish it. */
+  setPairing(change: Partial<PairingView>): void
+  /** What the next paste from the clipboard finds. */
+  setPasteboard(result: PasteView): void
+  /** The codes the page started pairing with, in order. */
+  readonly startedCodes: string[]
+  /** Sets the confirmations the hosts ask for, as native code would publish them. */
+  setConfirmations(view: OwnerView): void
+  /** What the next review answers. */
+  setReviewOutcome(outcome: ReviewOutcome): void
+  /** The references the page asked to review, in order. */
+  readonly reviewed: string[]
+  /**
+   * Holds every listener the page registers from now on (the connection, host events, the
+   * account, pairing, confirmations and dropped files), as the desktop shell's registration does
+   * until it completes: nothing published meanwhile reaches it. Returns the function that completes
+   * the registrations.
+   */
+  holdRegistrations(): () => void
+  /**
+   * Sets how the host presents one attachment while its window is on the live screen: directly, as
+   * a viewport for `reason`, as a viewport with no reason (which is how a worker built before
+   * reasons reports every viewport), or with null, not as a terminal at all.
+   */
+  presentAttachment(
+    attachmentId: string,
+    presentation: TerminalPresentationMode | null,
+    reason?: PresentationReason
+  ): void
+  /** Takes one attachment out of what the host reports, as a detach does. */
+  detachAttachment(attachmentId: string): void
+}
+
+/**
+ * A call the fake host can hold, named as the port names it: a read, or a window move, after whose
+ * answer a view reads its screen again.
+ */
+export type HeldRead =
+  | 'connectionState'
+  | 'accountStatus'
+  | 'attentionRead'
+  | 'sessionRead'
+  | 'launchSurface'
+  | 'agentSnapshot'
+  | 'sessionList'
+  | 'hostInfo'
+  | 'environmentList'
+  | 'changesetRead'
+  | 'storageStatus'
+  | 'pluginList'
+  | 'terminalProjection'
+  | 'attachmentViewport'
+  | 'eventsSnapshot'
+
+/** The reads of one kind a test is holding. */
+export interface HeldReads {
+  /** How many reads have been held so far. */
+  readonly count: number
+  /**
+   * Answers the read at `index`, counting from the first one held, with what it read. A read that
+   * has not been made yet, or has been answered, is left alone.
+   */
+  answer(index: number): void
+  /** Answers every read still held, oldest first, and holds no more. */
+  release(): void
 }
 
 /** The fake host, and the controls a test drives it with. */
@@ -264,11 +338,45 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
   let connected = true
   let promptGeneration = 7
   let bufferRevision = 12
-  let rendezvous: RendezvousOrigin = {
-    origin: 'https://rendezvous.kala.to',
-    host: 'rendezvous.kala.to',
-    is_default: true
+  let pairing: PairingView = {
+    origin: { origin: 'https://reach.kala.to', host: 'reach.kala.to', is_default: true },
+    device_name: 'studio-mbp',
+    state: { state: 'idle' },
+    invitation: null,
+    hosts: []
   }
+  const pairingListeners = new Set<(view: PairingView) => void>()
+  const publishPairing = (change: Partial<PairingView>) => {
+    pairing = { ...pairing, ...change }
+    for (const listener of pairingListeners) listener(pairing)
+  }
+  let pasteboard: PasteView = {
+    invitation: null,
+    failure: 'nothing_to_paste',
+    cleared: false,
+    declined: false
+  }
+  const startedCodes: string[] = []
+  let owner: OwnerView = { ceremony: 'touch_id', requests: [] }
+  const ownerListeners = new Set<(view: OwnerView) => void>()
+  const publishOwner = (next: OwnerView) => {
+    owner = next
+    for (const listener of ownerListeners) listener(owner)
+  }
+  let reviewOutcome: ReviewOutcome = 'confirmed'
+  const reviewed: string[] = []
+  let registering: Promise<void> = Promise.resolve()
+  /** Adds `listener` to `set` once registration completes, and resolves then with its stop. */
+  const register = <T,>(
+    set: Set<(value: T) => void>,
+    listener: (value: T) => void
+  ): Promise<() => void> =>
+    registering.then(() => {
+      set.add(listener)
+      return () => {
+        set.delete(listener)
+      }
+    })
   const listeners = new Set<(event: HostEvent) => void>()
   const dropListeners = new Set<(files: readonly DroppedFile[]) => void>()
   const savedExports: Written[] = []
@@ -276,6 +384,17 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
   const importedImages: string[] = []
   const uploaded: string[] = []
   const nodes: DocumentNode[] = startingConversation()
+  /** How far above its live screen each session's view is looking, in rows. */
+  const rowsAbove = new Map<string, number>()
+  /** Each session's attachments, in join order. */
+  const attached = new Map<string, FakeAttachment[]>(
+    [SESSION_MAIN, SESSION_BUILD, SESSION_OFFLINE].map((sessionId) => [
+      sessionId,
+      startingAttachments(sessionId)
+    ])
+  )
+  const attachmentNamed = (attachmentId: string): FakeAttachment | undefined =>
+    [...attached.values()].flat().find((each) => each.attachmentId === attachmentId)
   const acknowledged = new Set<string>()
   const deletedArtefacts = new Set<string>()
   const openedPanes: string[] = []
@@ -327,14 +446,44 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
   const emit = (event: HostEvent) => {
     for (const listener of listeners) listener(event)
   }
+  const connectionNow = (): ConnectionState => ({
+    connected,
+    environment_id: connected ? ENVIRONMENT : null,
+    reason: connected ? null : 'this host cannot be contacted right now'
+  })
+  const connectionListeners = new Set<(state: ConnectionState) => void>()
+
+  /** The answers each held kind of read is waiting to give, in the order the reads were made. */
+  const holds = new Map<HeldRead, (() => void)[]>()
+  /**
+   * Answers a read with what the host holds now: at once, or when the test answers it while it
+   * holds this kind of read. A refusal is kept as the answer too, and arrives as a rejection then,
+   * as a refusal from native code does.
+   */
+  const reading = <T,>(read: HeldRead, answer: () => T): Promise<T> => {
+    const waiting = holds.get(read)
+    if (waiting === undefined) return Promise.resolve(answer())
+    let settle: (resolve: (value: T) => void, reject: (reason: unknown) => void) => void
+    try {
+      const value = answer()
+      settle = (resolve) => {
+        resolve(value)
+      }
+    } catch (refusal: unknown) {
+      settle = (_, reject) => {
+        reject(refusal)
+      }
+    }
+    return new Promise<T>((resolve, reject) => {
+      waiting.push(() => {
+        settle(resolve, reject)
+      })
+    })
+  }
 
   const port: HostPort = {
-    connectionState: () =>
-      Promise.resolve({
-        connected,
-        environment_id: connected ? ENVIRONMENT : null,
-        reason: connected ? null : 'this host cannot be contacted right now'
-      }),
+    connectionState: () => reading('connectionState', connectionNow),
+    onConnection: (listener) => register(connectionListeners, listener),
 
     environmentCapabilities: (params) => {
       requireConnection()
@@ -356,26 +505,30 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       return Promise.resolve(found)
     },
 
-    hostInfo: () => {
-      requireConnection()
-      return Promise.resolve(hostInfo())
-    },
-    environmentList: () => {
-      requireConnection()
-      return Promise.resolve(environments())
-    },
+    hostInfo: () =>
+      reading('hostInfo', () => {
+        requireConnection()
+        return hostInfo()
+      }),
+    environmentList: () =>
+      reading('environmentList', () => {
+        requireConnection()
+        return environments()
+      }),
 
-    sessionList: () => {
-      requireConnection()
-      return Promise.resolve(sessions())
-    },
-    sessionRead: (params) => {
-      requireConnection()
-      const sessionId = (params as { session_id?: string }).session_id ?? SESSION_MAIN
-      const found = sessions().sessions.find((session) => session.session_id === sessionId)
-      if (!found) refuse('UNKNOWN_SESSION', 'That session is not on this host.')
-      return Promise.resolve({ endpoint: null, session: found } as unknown as SessionReadResult)
-    },
+    sessionList: () =>
+      reading('sessionList', () => {
+        requireConnection()
+        return sessions()
+      }),
+    sessionRead: (params) =>
+      reading('sessionRead', () => {
+        requireConnection()
+        const sessionId = (params as { session_id?: string }).session_id ?? SESSION_MAIN
+        const found = sessions().sessions.find((session) => session.session_id === sessionId)
+        if (!found) refuse('UNKNOWN_SESSION', 'That session is not on this host.')
+        return { endpoint: null, session: found } as unknown as SessionReadResult
+      }),
     sessionClose: (params) => {
       requireConnection()
       const sessionId = (params as { session_id?: string }).session_id ?? SESSION_MAIN
@@ -397,10 +550,11 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       })
     },
 
-    launchSurface: () => {
-      requireConnection()
-      return Promise.resolve(fakeLaunchSurface(true, String(promptGeneration)))
-    },
+    launchSurface: () =>
+      reading('launchSurface', () => {
+        requireConnection()
+        return fakeLaunchSurface(true, String(promptGeneration))
+      }),
     shellLaunch: (params) => {
       requireConnection()
       const asked = params as { expected_prompt_generation?: string; expected_buffer_revision?: string }
@@ -420,10 +574,11 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       })
     },
 
-    agentSnapshot: () => {
-      requireConnection()
-      return Promise.resolve({ nodes: [...nodes] })
-    },
+    agentSnapshot: () =>
+      reading('agentSnapshot', () => {
+        requireConnection()
+        return { nodes: [...nodes] }
+      }),
     agentCommands: () =>
       Promise.resolve({
         commands: [
@@ -538,10 +693,11 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
         oldest_retained_row: 0,
         eviction_marker: null
       }),
-    attentionRead: () => {
-      requireConnection()
-      return Promise.resolve(attention(acknowledged))
-    },
+    attentionRead: () =>
+      reading('attentionRead', () => {
+        requireConnection()
+        return attention(acknowledged)
+      }),
     attentionAcknowledge: (params) => {
       const id = (params as { attention_id?: string }).attention_id
       if (id) acknowledged.add(id)
@@ -575,12 +731,24 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       return Promise.resolve(settledAs('grant.create', 'applied'))
     },
 
-    pluginList: () => Promise.resolve(packages() as unknown),
+    pluginList: () =>
+      reading('pluginList', () => {
+        requireConnection()
+        return packages()
+      }),
     catalogueList: () => Promise.resolve(packages() as unknown),
 
-    changesetRead: () => Promise.resolve(changesets() as unknown),
+    changesetRead: () =>
+      reading('changesetRead', () => {
+        requireConnection()
+        return changesets()
+      }),
 
-    storageStatus: () => Promise.resolve(retained(deletedArtefacts) as unknown),
+    storageStatus: () =>
+      reading('storageStatus', () => {
+        requireConnection()
+        return retained(deletedArtefacts)
+      }),
     storageObjectDelete: (params) => {
       const id = (params as { object_id?: string }).object_id
       const artefact = retained(new Set()).artefacts.find((each) => each.object_id === id)
@@ -594,67 +762,87 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       return Promise.resolve(settledAs('storage.object.delete', 'applied'))
     },
 
-    terminalProjection: () => {
-      requireConnection()
-      return Promise.resolve(projection())
-    },
+    eventsSnapshot: (params) =>
+      reading('eventsSnapshot', () => {
+        requireConnection()
+        const found = sessions().sessions.find((each) => each.session_id === params.session_id)
+        if (!found) refuse('UNKNOWN_SESSION', 'That session is not on this host.')
+        const view = terminalAttachment(found.session_id)
+        const above = (rowsAbove.get(found.session_id) ?? 0) > 0
+        return sessionSnapshot(
+          found,
+          (attached.get(found.session_id) ?? []).map((each) =>
+            summaryOf(each, above && each.attachmentId === view)
+          )
+        )
+      }),
+    terminalProjection: (params) =>
+      reading('terminalProjection', () => {
+        requireConnection()
+        const sessionId = (params as { session_id?: string } | null)?.session_id ?? SESSION_MAIN
+        return projection(sessionId, rowsAbove.get(sessionId) ?? 0)
+      }),
     terminalInput: (params) => {
       requireConnection()
       return Promise.resolve({ accepted: true, sequence: '1', echo: params })
     },
-    attachmentViewport: () =>
-      Promise.resolve(settledAs('attachment.viewport', 'applied')),
+    // The window a view asks for is where its screen starts from then on: a number of rows above
+    // the live screen, or the live screen itself.
+    attachmentViewport: (params) =>
+      reading('attachmentViewport', () => {
+        const asked = params as { session_id?: string; viewport?: { rows_above?: number } } | null
+        const sessionId = asked?.session_id ?? SESSION_MAIN
+        rowsAbove.set(sessionId, Math.max(0, asked?.viewport?.rows_above ?? 0))
+        return settledAs('attachment.viewport', 'applied')
+      }),
 
-    pairingOrigin: () => Promise.resolve(rendezvous),
+    pairingView: () => Promise.resolve(pairing),
     pairingSetOrigin: (origin) => {
-      if (!origin.startsWith('https://')) {
-        refuse('INVALID_ARGUMENT', 'A rendezvous origin is an https origin.')
+      const trimmed = origin.trim().replace(/\/$/, '')
+      if (!/^https:\/\/[a-z0-9.-]+(:[0-9]+)?$/.test(trimmed)) {
+        refuse('INVALID_ARGUMENT', 'That is not a service this device can use.')
       }
-      const host = origin.slice('https://'.length).split('/')[0] ?? ''
-      rendezvous = {
-        origin: `https://${host}`,
-        host: host.split(':')[0] ?? host,
-        is_default: `https://${host}` === 'https://rendezvous.kala.to'
-      }
-      return Promise.resolve(rendezvous)
+      const host = trimmed.slice('https://'.length).split(':')[0] ?? trimmed
+      publishPairing({
+        origin: { origin: trimmed, host, is_default: trimmed === 'https://reach.kala.to' }
+      })
+      return Promise.resolve(pairing.origin)
     },
-    pairingScan: (payload) => {
-      let parsed: Record<string, unknown>
-      try {
-        parsed = JSON.parse(payload) as Record<string, unknown>
-      } catch {
-        refuse('INVALID_ARGUMENT', 'That is not a pairing code.')
+    pairingStartCode: (code) => {
+      if (!codeComplete(code)) {
+        refuse('INVALID_ARGUMENT', 'A code has ten characters, and never contains 0, O, I or l.')
       }
-      if (parsed.mode === 'direct') {
-        return Promise.resolve({
-          mode: 'direct',
-          invitation_id: asText(parsed.invitation_id),
-          endpoint_id: asText(parsed.endpoint_id),
-          expires_at_ms: asText(parsed.expires_at_ms)
-        } satisfies ScannedCode)
-      }
-      if (parsed.mode !== 'code') {
-        refuse('INVALID_ARGUMENT', 'A QR without a supported pairing mode is not an invitation.')
-      }
-      const origin = asText(parsed.rendezvous_origin)
-      const host = origin.slice('https://'.length).split('/')[0] ?? ''
-      return Promise.resolve({
-        mode: 'code',
-        origin: {
-          origin,
-          host: host.split(':')[0] ?? host,
-          is_default: origin === 'https://rendezvous.kala.to'
-        },
-        code: asText(parsed.code).replace(/[\s-]/g, ''),
-        needs_origin_confirmation: origin !== rendezvous.origin
-      } satisfies ScannedCode)
+      startedCodes.push(code)
+      publishPairing({ state: { state: 'working', stage: 'reaching_service' } })
+      return Promise.resolve()
     },
-    pairingVerifyOwner: (reason) =>
-      Promise.resolve({
-        verified: true,
-        mechanism: 'test.platform_ceremony',
-        reason
-      } satisfies OwnerPresence),
+    pairingPaste: () => {
+      if (pasteboard.invitation !== null) publishPairing({ invitation: pasteboard.invitation })
+      return Promise.resolve(pasteboard)
+    },
+    pairingStartRead: () => {
+      if (pairing.invitation === null) refuse('PERMISSION_DENIED', 'No invitation is waiting.')
+      publishPairing({ invitation: null, state: { state: 'working', stage: 'reaching_host' } })
+      return Promise.resolve()
+    },
+    pairingStop: () => {
+      publishPairing({ invitation: null, state: { state: 'idle' } })
+      return Promise.resolve()
+    },
+    onPairing: (listener) => register(pairingListeners, listener),
+    ownerConfirmations: () => Promise.resolve(owner),
+    ownerConfirmationReview: (reference) => {
+      reviewed.push(reference)
+      const outcome = reviewOutcome
+      if (outcome === 'confirmed') {
+        publishOwner({
+          ...owner,
+          requests: owner.requests.filter((request) => request.reference !== reference)
+        })
+      }
+      return Promise.resolve(outcome)
+    },
+    onConfirmations: (listener) => register(ownerListeners, listener),
 
     openExternal: (url) => {
       if (!url.startsWith('https://') && !url.startsWith('mailto:')) {
@@ -895,7 +1083,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
 
     voiceCallState: () => Promise.resolve(voiceCallState(voice)),
 
-    accountStatus: () => Promise.resolve(accountView),
+    accountStatus: () => reading('accountStatus', () => accountView),
     accountSignIn: () => {
       signIns += 1
       setAccount({ state: 'browser_open' })
@@ -925,19 +1113,10 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
             heldUsage.push(resolve)
           })
         : Promise.resolve(accountUsage),
-    onAccount(listener) {
-      accountListeners.add(listener)
-      return () => accountListeners.delete(listener)
-    },
+    onAccount: (listener) => register(accountListeners, listener),
 
-    subscribe(listener) {
-      listeners.add(listener)
-      return () => listeners.delete(listener)
-    },
-    onFilesDropped(listener) {
-      dropListeners.add(listener)
-      return () => dropListeners.delete(listener)
-    }
+    subscribe: (listener) => register(listeners, listener),
+    onFilesDropped: (listener) => register(dropListeners, listener)
   }
 
   const controls: FakeHostControls = {
@@ -979,11 +1158,27 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     },
     setConnected(next) {
       connected = next
-      emit({
-        stream_id: 'session_state',
-        sequence: '0',
-        body: { kind: 'connection', connected: next }
-      })
+      for (const listener of connectionListeners) listener(connectionNow())
+    },
+    hold(read) {
+      const waiting: (() => void)[] = []
+      holds.set(read, waiting)
+      const answer = (index: number) => {
+        if (index < 0 || index >= waiting.length) return
+        const settle = waiting[index]
+        waiting[index] = answered
+        settle()
+      }
+      return {
+        get count() {
+          return waiting.length
+        },
+        answer,
+        release() {
+          if (holds.get(read) === waiting) holds.delete(read)
+          for (let index = 0; index < waiting.length; index += 1) answer(index)
+        }
+      }
     },
     dropFiles(files) {
       for (const listener of dropListeners) listener(files)
@@ -1036,10 +1231,79 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
           ...(action === null ? {} : { action })
         }
       })
+    },
+    setPairing(change) {
+      publishPairing(change)
+    },
+    setPasteboard(result) {
+      pasteboard = result
+    },
+    startedCodes,
+    setConfirmations(view) {
+      publishOwner(view)
+    },
+    setReviewOutcome(outcome) {
+      reviewOutcome = outcome
+    },
+    reviewed,
+    holdRegistrations() {
+      let complete = () => {}
+      registering = new Promise((resolve) => {
+        complete = resolve
+      })
+      return () => {
+        complete()
+        registering = Promise.resolve()
+      }
+    },
+    presentAttachment(attachmentId, presentation, reason) {
+      const found = attachmentNamed(attachmentId)
+      if (!found) return
+      found.presentation = presentation
+      found.reason = presentation === 'viewport' ? reason : undefined
+    },
+    detachAttachment(attachmentId) {
+      for (const [sessionId, held] of attached) {
+        attached.set(
+          sessionId,
+          held.filter((each) => each.attachmentId !== attachmentId)
+        )
+      }
     }
   }
 
-  return { port, controls }
+  return { port: answeringAsNativeCodeDoes(port), controls }
+}
+
+/** What a held read's place holds once it has been answered. */
+function answered(): void {
+  // An answer is given once.
+}
+
+/**
+ * The port with every refusal delivered the way native code delivers it.
+ *
+ * A command the desktop shell carries answers with a promise, and a refusal is that promise's
+ * rejection: nothing is ever thrown before the promise exists. The methods above refuse by
+ * throwing, which is the plainest way to write a refusal, so each is called here and a throw
+ * becomes the rejection a page would receive. A scripted host that threw would let a page pass
+ * against a failure shape no real host produces.
+ */
+function answeringAsNativeCodeDoes(port: HostPort): HostPort {
+  const answering: Record<string, unknown> = {}
+  for (const [name, method] of Object.entries(port) as [string, (...args: unknown[]) => unknown][]) {
+    answering[name] = (...args: unknown[]): unknown => {
+      try {
+        return method(...args)
+      } catch (refusal: unknown) {
+        return new Promise((_, reject) => {
+          // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors -- a refusal is the data native code rejects with, never an Error
+          reject(refusal)
+        })
+      }
+    }
+  }
+  return answering as unknown as HostPort
 }
 
 /** The scripted call, held apart from the host's own state because it is this device's. */
@@ -1617,47 +1881,179 @@ function grants(): IssuedGrants {
 /**
  * A projected screen with the two things the raw view has to get right: a cluster the renderer
  * cannot reproduce, and a viewport above the live end.
+ *
+ * Each session has a screen of its own, so a view that shows one session's screen under another's
+ * name is caught by what it draws. A window `rowsAbove` rows above the live screen starts where
+ * that many rows up would, and never above the oldest row the host retains.
  */
-function projection(): ProjectedScreen {
+function projection(sessionId: string, rowsAbove: number): ProjectedScreen {
   const line = (row: number, text: string) => ({
     row,
     cells: [...text].map((character) => ({ text: character, width: 1 }))
   })
+  const screen =
+    sessionId === SESSION_MAIN
+      ? {
+          dimensions: { columns: '80', rows: '8' },
+          rows: [
+            line(101, '$ cargo test -p kr-client'),
+            line(102, '   Compiling kr-client v0.1.0'),
+            line(103, '    Finished test profile in 12.4s'),
+            {
+              row: 104,
+              cells: [
+                { text: 'o', width: 1 },
+                { text: 'k', width: 1 },
+                { text: ' ', width: 1 },
+                // A family emoji: one cluster, two columns, and no font here can draw it.
+                { text: '\u{1F468}‍\u{1F469}‍\u{1F467}', width: 2 },
+                { text: '', width: 0 },
+                { text: ' ', width: 1 },
+                { text: 'd', width: 1 },
+                { text: 'o', width: 1 },
+                { text: 'n', width: 1 },
+                { text: 'e', width: 1 }
+              ]
+            },
+            line(105, 'test result: ok. 143 passed'),
+            line(106, '$ '),
+            line(107, ''),
+            line(108, '')
+          ],
+          cursor: { column: 2, row: 106, visible: true }
+        }
+      : {
+          dimensions: { columns: '100', rows: '4' },
+          rows: [
+            line(201, '$ pnpm -r build'),
+            line(202, 'apps/companion build: done'),
+            line(203, '$ '),
+            line(204, '')
+          ],
+          cursor: { column: 2, row: 203, visible: true }
+        }
+  const oldest = 1
+  const liveTop = screen.rows[0]?.row ?? oldest
   return {
-    dimensions: { columns: '80', rows: '8' },
-    rows: [
-      line(101, '$ cargo test -p kr-client'),
-      line(102, '   Compiling kr-client v0.1.0'),
-      line(103, '    Finished test profile in 12.4s'),
-      {
-        row: 104,
-        cells: [
-          { text: 'o', width: 1 },
-          { text: 'k', width: 1 },
-          { text: ' ', width: 1 },
-          // A family emoji: one cluster, two columns, and no font here can draw it.
-          { text: '\u{1F468}‍\u{1F469}‍\u{1F467}', width: 2 },
-          { text: '', width: 0 },
-          { text: ' ', width: 1 },
-          { text: 'd', width: 1 },
-          { text: 'o', width: 1 },
-          { text: 'n', width: 1 },
-          { text: 'e', width: 1 }
-        ]
-      },
-      line(105, 'test result: ok. 143 passed'),
-      line(106, '$ '),
-      line(107, ''),
-      line(108, '')
-    ],
-    cursor: { column: 2, row: 106, visible: true },
-    viewport_top_row: null,
-    oldest_retained_row: 1,
+    ...screen,
+    viewport_top_row: rowsAbove > 0 ? Math.max(oldest, liveTop - rowsAbove) : null,
+    oldest_retained_row: oldest,
     palette_provenance: 'client_probe',
     palette: [
       '#071217', '#a2352e', '#315e4a', '#7b500d', '#1a57b5', '#6b4d8a', '#2f6f74', '#dcdcda',
       '#585c60', '#faa49c', '#aad2bb', '#e7bf7a', '#8fb8f5', '#c0a6dc', '#8fb4a8', '#ffffff'
     ]
+  }
+}
+
+/** One attachment of a session, as this host holds it. */
+interface FakeAttachment {
+  readonly attachmentId: string
+  readonly ordinal: number
+  readonly mode: 'semantic' | 'terminal'
+  /** How it is presented while its window is on the live screen; null when it is no terminal. */
+  presentation: TerminalPresentationMode | null
+  /** The reason a viewport is given, or none, as a worker built before reasons reports it. */
+  reason: PresentationReason | undefined
+}
+
+/**
+ * A session's attachments when this host starts: `kr` attached from a terminal of another size,
+ * a semantic view, and the raw view this application names as its own, shown directly.
+ */
+function startingAttachments(sessionId: string): FakeAttachment[] {
+  const tail = sessionId.slice(-12)
+  return [
+    {
+      attachmentId: `c1a0c1a0-0000-4000-8000-${tail}`,
+      ordinal: 1,
+      mode: 'terminal',
+      presentation: 'viewport',
+      reason: 'size_mismatch'
+    },
+    {
+      attachmentId: `5e5a5e5a-0000-4000-8000-${tail}`,
+      ordinal: 2,
+      mode: 'semantic',
+      presentation: null,
+      reason: undefined
+    },
+    {
+      attachmentId: terminalAttachment(sessionId),
+      ordinal: 3,
+      mode: 'terminal',
+      presentation: 'direct',
+      reason: undefined
+    }
+  ]
+}
+
+/** Every presentation reason, in the order the first that holds is the one reported. */
+const PRESENTATION_ORDER: readonly PresentationReason[] = [
+  'no_terminal_profile',
+  'unqualified_terminal_profile',
+  'size_mismatch',
+  'history_window',
+  'stream_not_carryable',
+  'restoration_incomplete',
+  'awaiting_parser_boundary'
+]
+
+/**
+ * What the host reports for one attachment, given how it stands and whether its window is above
+ * the live screen: the first reason in the order that holds, a viewport with no reason from a
+ * worker that gives none, or direct when nothing holds.
+ */
+function summaryOf(attachment: FakeAttachment, windowAbove: boolean): AttachmentSummary {
+  const terminal = attachment.mode === 'terminal'
+  let presentation: TerminalPresentationMode | null = attachment.presentation
+  let reason: PresentationReason | undefined
+  if (presentation === 'viewport' && attachment.reason === undefined) {
+    reason = undefined
+  } else if (presentation !== null) {
+    const holding = [
+      ...(attachment.reason === undefined ? [] : [attachment.reason]),
+      ...(windowAbove ? (['history_window'] as const) : [])
+    ]
+    reason = PRESENTATION_ORDER.find((each) => holding.includes(each))
+    presentation = reason === undefined ? 'direct' : 'viewport'
+  }
+  return {
+    attached_at_ms: String(FAKE_NOW_MS - 60_000 * attachment.ordinal),
+    attachment_id: attachment.attachmentId,
+    claim_geometry: false,
+    dimensions: terminal ? { columns: '120', rows: '40' } : null,
+    granted: terminal ? ['observe_terminal', 'input'] : ['observe_semantic'],
+    mode: attachment.mode,
+    ordinal: String(attachment.ordinal),
+    presentation,
+    // Left out when there is none, as the host writes it.
+    ...(reason === undefined ? {} : { presentation_reason: reason }),
+    terminal_profile_id: terminal ? 'xterm-256color' : null
+  }
+}
+
+/** One session's snapshot: its state now, with every attachment's summary. */
+function sessionSnapshot(
+  session: SessionListResult['sessions'][number],
+  attachments: readonly AttachmentSummary[]
+): EventsSnapshotResult {
+  return {
+    agent_instances: { instances: [], sequence: '1' },
+    agent_resources: {
+      continue_after: null,
+      cursor: '40',
+      resources: [],
+      snapshot_id: '1',
+      stream_generation: '1'
+    },
+    attachments: [...attachments],
+    cursor: '40',
+    geometry: { dimensions: { columns: '120', rows: '40' }, epoch: '1', owner: null },
+    lease: { connection_id: null, epoch: '1', holder: null, next_sequence: '1' },
+    oldest_retained_cursor: '1',
+    session,
+    taken_at_ms: String(FAKE_NOW_MS)
   }
 }
 

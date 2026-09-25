@@ -74,6 +74,18 @@ into the address that is dialled; nothing in the configuration advertises them a
 own. Cached hints are not permanent routes either: after a failure or a network change, resolve the
 pinned endpoint identity again rather than reusing an address that worked before.
 
+The host fills an invitation's `direct_addresses` from the addresses its endpoint reports for itself
+(`Endpoint::addr`), never from the sockets it bound. A socket bound to the unspecified address
+answers on the machine's own addresses, so a host with no `bind_addr` hints its interface addresses
+on the bound port; a host bound to one address hints that address; an address a relay observed or a
+gateway mapped is added once the endpoint learns it. `0.0.0.0` and `[::]` never appear, because
+they name no machine a peer could reach. The endpoint finds its interface addresses when it binds,
+before the host can issue anything, so an invitation carries whatever the endpoint reports then.
+When it reports none, the list is empty: for example on a relay-only host, which has no IP
+transport, or on a host that listens on one address family while every usable address it has is of
+the other. A device then reaches the host only through the selected relay and discovery, and only
+when they are configured and reachable.
+
 The publication filter applies to the publisher, not to the endpoint. An endpoint-wide filter would
 also strip the direct addresses that local network discovery exists to advertise, so the public
 record stays relay-only while a selected mDNS service publishes what a local network needs.
@@ -89,6 +101,15 @@ paths and iroh's QUIC address discovery are UDP, the DNS lookup asks the system'
 the port mapper talks to the local gateway, each as it would without a proxy. A network that
 requires a proxy usually blocks the first two, which leaves the relay's HTTPS path; a relay-only
 endpoint has that path alone.
+
+The DNS lookup is this crate's resolver, which `bind` gives iroh in place of its own. It asks the
+system's name servers first, and when they fail or there are none it falls back to the same public
+resolvers iroh falls back to (Cloudflare, Google and Quad9), over plain DNS, which asks again over
+TCP when an answer is truncated or does not come, and over DNS over TLS. iroh's own fallback also
+asks over DNS over HTTPS, and that client follows `HTTPS_PROXY` and `ALL_PROXY` whether or not a
+proxy is selected; this one has no HTTP client, so no proxy variable moves a lookup. On Windows the
+system's configuration includes the hosts file, which the resolver finds under `SystemRoot`. DNS
+over TLS verifies against the relay's anchors: the public ones, and any `relay_ca_roots` add.
 
 The proxy is each machine's own choice. A pairing invitation and a host bundle carry the relays and
 discovery services a device dials with, never the proxy the inviting machine goes through. Nothing
@@ -165,27 +186,33 @@ and its separator is kept whole and shown as it is, with no kind of its own.
 
 A refusal counts only when the relay that gave it is on the route: a relay the dialled address
 names, or one the endpoint already holds for the peer, both of which iroh tries. iroh keeps a
-relay's reason only for the endpoint's own home relay, and only as the latest thing that relay
-said, so the status is followed for the whole attempt: every value it delivers is taken in as it is
-delivered, and it is read again whenever a decision rests on it. A refusal stands while iroh dials
-the relay again, and ends when the relay admits the endpoint, when the latest attempt to reach it
-failed for another cause, or when it is no longer a home relay, since nothing it says afterwards is
-reported. A refusal by a home relay that is not on the route
-says nothing about the connection. A route relay that is not the endpoint's home relay leaves no
-reason to read, and a failure through it is reported as `TransportError::Connect`.
+relay's reason only for the endpoint's own home relay, and only until it dials that relay again,
+so the status is followed for the whole attempt and read again whenever a decision rests on it.
 
-A refusal is reported only for an attempt that was made and then timed out before any connection
-was established. A request that could not be made at all, a peer that answered and refused, and an
-endpoint that was closing are each their own reason and are reported as `TransportError::Connect`,
-whatever a relay said at the time. The timeout alone does not prove the refusal caused it: a peer
-that began the handshake and then fell silent times out the same way. What the failure reports is
-that a relay on the route had turned this endpoint away when the attempt ran out.
+A refusal counts only while the status shows it, which is the rule a refused upgrade follows too.
+The status reports the latest state and can pass over the states between two readings: a relay
+seen refusing and then seen being dialled again may have admitted the endpoint in between, so what
+it said before is not reported as the reason. A refusal ends when iroh dials the relay again, when
+the relay admits the endpoint, when the latest attempt to reach it failed for another cause, and
+when it is no longer a home relay. A refusal by a home relay that is not on the route says nothing
+about the connection. A route relay that is not the endpoint's home relay leaves no reason to read,
+and a failure through it is reported as `TransportError::Connect`.
+
+A refusal is reported only for an attempt that was made and did not connect: one that timed out
+before any connection was established, or one that an endpoint with no IP transport ends early,
+below. A request that could not be made at all, a peer that answered and refused, and an endpoint
+that was closing are each their own reason and are reported as `TransportError::Connect`, whatever
+a relay said at the time. The timeout alone does not prove the refusal caused it: a peer that began
+the handshake and then fell silent times out the same way. What a timeout's failure reports is that
+the status showed a relay on the route turning this endpoint away when the attempt ran out.
 
 An endpoint with no IP transport, one built with `relay_only`, has nothing but relays to try, so
-once every relay on its route has refused it the attempt ends at once rather than at its 30-second
-deadline. An endpoint that can take a direct path lets the attempt run, because an address hint or
-local discovery can still open one; if none does, it fails as the refusal. Connections already
-established on a direct path are not affected by a relay's refusal at all.
+once the status shows every relay on its route refusing it the attempt ends at once rather than at
+its 30-second deadline. An endpoint that can take a direct path lets the attempt run, because an
+address hint or local discovery can still open one; if none does, it fails as the refusal when the
+status still shows it. iroh dials a refusing relay again after a backoff that grows to seconds, and
+an attempt that ends during one of those dials fails as a timeout. Connections already established
+on a direct path are not affected by a relay's refusal at all.
 
 What may still work is named by kind, because which of them a person can use depends on
 configuration the failure does not carry:
@@ -211,6 +238,11 @@ The first bidirectional stream carries four frames, in this order:
    `CBOR(["kr-connect/1", offer, selection, client_endpoint_id, host_endpoint_id])`.
 4. `ConnectReply` — either `Accepted` with the host's proof over the same transcript and this
    connection's first action window, or `Refused`.
+
+A `Refused` reply, and an error answer on the unpaired pairing surface, reach the caller as
+`TransportError::Refused` with the peer's own protocol error, while `TransportError::Handshake` is
+this side's own conclusion, such as a reply that never came, a stream that ended or an answer to
+another request, and says nothing about what the peer decided.
 
 The host verifies the client's proof before sending its own, so a peer that cannot prove its
 authorisation key never obtains the host's signature over a transcript it chose.
@@ -638,6 +670,27 @@ between them: on loopback the receiver keeps up, so the standing backlog a keyst
 is small. The transfer is drained rather than left unread, because a receiver that stops reading
 fills the connection's flow-control window, which no stream priority reaches past, and that is the
 case named at the end of the streams section rather than this one.
+
+## Local frame writer backpressure
+
+The typed-frame writer over a local connection (`crates/kr-ipc/src/framed.rs`) waits for the peer to
+make room between attempts. An attempt never blocks: it writes what the transport takes now and
+reports what it could not, and the waiting happens separately, so the decision to send and the
+sending are one step that never waits.
+
+The wait differs by transport. On the Unix family the writer parks on the socket's own writability
+and wakes when the peer reads. A Windows named pipe has no writability of its own the writer can hold
+while the reader holds the other half, so the wait is a bounded poll: it sleeps a millisecond and
+attempts again. Measured on Windows Server 2025, a writer waiting on a full pipe for thirty seconds
+woke about seventy-four times a second and spent roughly 730 ms of processor time over that span,
+about 2.4% of one core.
+
+Because that poll makes progress only when the peer reads, every caller bounds its own wait rather
+than relying on the pipe to end it: the worker's delivery ends on a withdrawal or a send deadline,
+the controller's attention delivery on its release ticket's own expiry. `FrameWriter::write_frame`,
+which waits with no bound of its own, is used only where the peer reads what it is sent — a control
+reply, a handshake, a request whose answer the peer awaits — and a path whose peer may stop reading
+uses the checked writes under a deadline instead.
 
 ## Wiring a host
 

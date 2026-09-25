@@ -9,7 +9,7 @@
 //! | --- | --- |
 //! | KR-REQ-02.04, KR-REQ-05.02 | A worker's endpoint is a pipe whose protected list names its owner and no account the machine does not already trust; a caller that holds every identity the owner holds but the owner's own is refused when it opens it; and the owner arriving over the network is refused as well |
 //! | KR-REQ-02.07 | The listener names the process at the other end of the pipe as the kernel records it: the process that connected, never the listener |
-//! | KR-REQ-05.03 | A descriptor is published under a list that grants its owner alone, and is replaced whole: a reader holding the old version still reads the old version, and a reader by name reads one version or the other and never part of one |
+//! | KR-REQ-05.03 | A descriptor is published under a list that grants its owner alone, and is replaced whole: a reader holding the old version still reads the old version, and a reader by name reads one version or the other and never part of one. A reader refuses a descriptor whose list grants another account, a directory whose list is widened, one reached through a junction, and a file in a directory swapped since it was checked |
 //! | KR-REQ-11.52 | A process's start identity is the creation time the operating system records for that process, two processes started within one second carry two start values, and a process this account may only ask when it started is identified without its liveness being guessed |
 //!
 //! The environment identity's list and the profile it is kept in, KR-REQ-03.08, are checked by
@@ -886,36 +886,237 @@ fn a_descriptor_is_replaced_whole_and_a_reader_keeps_the_version_it_opened() {
     );
     drop(held);
 
+    // At least this many reads race the republication, so the evidence is a rate over a run long
+    // enough to catch a reader that opens a version mid-replacement: the reader that opened the file
+    // by full path and checked its list afterwards refused a handful of reads in every thousand,
+    // where the reader that opens each entry relative to the directory handle refuses none.
+    const CONCURRENT_READS: u64 = 1_200;
     let versions = [first, second];
+    let reads = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let reader = std::thread::spawn({
         let paths = paths.clone();
+        let reads = std::sync::Arc::clone(&reads);
         let stop = std::sync::Arc::clone(&stop);
         let versions = versions.clone();
         move || {
-            let mut reads = 0_u64;
             let mut wrong = Vec::new();
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 match kr_ipc::descriptor::read(&paths, versions[0].session_id) {
                     Ok(Some(found)) if versions.contains(&found) => {}
                     other => wrong.push(format!("{other:?}")),
                 }
-                reads += 1;
+                reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            (reads, wrong)
+            wrong
         }
     });
-    for round in 0..300 {
+    let mut round = 0_usize;
+    while reads.load(std::sync::atomic::Ordering::Relaxed) < CONCURRENT_READS {
         kr_ipc::descriptor::publish(&paths, &versions[round % 2])
             .unwrap_or_else(|error| panic!("publication {round} failed: {error}"));
+        round += 1;
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let (reads, wrong) = reader.join().expect("the reader finishes");
-    assert!(reads > 0, "the descriptor was read while it was published");
+    let wrong = reader.join().expect("the reader finishes");
+    let reads = reads.load(std::sync::atomic::Ordering::Relaxed);
+    println!("== concurrent reads: {reads}; refused: {}", wrong.len());
+    assert!(
+        reads >= CONCURRENT_READS,
+        "the descriptor was read while it was published"
+    );
     assert!(
         wrong.is_empty(),
         "{} of {reads} reads found something other than a whole version: {:?}",
         wrong.len(),
         wrong.iter().take(3).collect::<Vec<_>>()
     );
+}
+
+/// Runs one command-line tool and fails the test when it fails.
+fn run(program: &str, arguments: &[&std::ffi::OsStr]) -> String {
+    let output = std::process::Command::new(program)
+        .args(arguments)
+        .output()
+        .unwrap_or_else(|error| panic!("{program} starts: {error}"));
+    let printed = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        output.status.success(),
+        "{program} failed: {printed}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    printed
+}
+
+/// Grants an account full control of a path, adding to whatever list it already carries.
+///
+/// Adding an entry is what every account may do to a thing it owns, so it is reliable across hosts
+/// in a way that narrowing a list with `icacls` is not: the same narrowing produced a different
+/// list on a hosted runner than on this machine, which is why these tests widen a list to prove a
+/// refusal rather than narrow one. The grant carries no inheritance flags, which `icacls` applies
+/// to a file and a directory alike; the object's own list is what the reader checks.
+fn grant_full(path: &Path, account: &str) {
+    run(
+        "icacls.exe",
+        &[
+            path.as_os_str(),
+            "/grant".as_ref(),
+            format!("*{account}:F").as_ref(),
+        ],
+    );
+}
+
+/// The security identifier of the Everyone group, which no descriptor's list may name.
+const EVERYONE: &str = "S-1-1-0";
+
+/// KR-REQ-05.03: a descriptor whose access-control list grants an account this host does not trust
+/// is refused, rather than read and acted on. The public key inside a descriptor decides which
+/// worker a client trusts, so a file any account could have written is not one to read a key from.
+#[test]
+fn a_descriptor_whose_list_grants_another_account_is_refused() {
+    let host = TempHost::create();
+    let paths = host.environment();
+    let published = descriptor(&host, 3, "kalareach-descriptor-widened-file");
+    kr_ipc::descriptor::publish(&paths, &published).expect("publishes");
+    // The negative control: as published, it reads.
+    kr_ipc::descriptor::read(&paths, published.session_id)
+        .expect("reads")
+        .expect("present");
+
+    grant_full(&paths.descriptor_file(published.session_id), EVERYONE);
+    let error = kr_ipc::descriptor::read(&paths, published.session_id)
+        .expect_err("a descriptor granting Everyone is refused");
+    assert_eq!(
+        error.code(),
+        kr_protocol::error::ErrorCode::PermissionDenied
+    );
+}
+
+/// KR-REQ-05.03: a descriptor directory whose list has been widened is refused, so nothing inside a
+/// directory another account can write to is read at all.
+#[test]
+fn a_descriptor_directory_whose_list_is_widened_is_refused() {
+    let host = TempHost::create();
+    let paths = host.environment();
+    let published = descriptor(&host, 4, "kalareach-descriptor-widened-dir");
+    kr_ipc::descriptor::publish(&paths, &published).expect("publishes");
+    kr_ipc::descriptor::read(&paths, published.session_id)
+        .expect("reads")
+        .expect("present");
+
+    grant_full(&paths.descriptors_dir(), EVERYONE);
+    let error = kr_ipc::descriptor::read(&paths, published.session_id)
+        .expect_err("a directory granting Everyone is refused");
+    assert_eq!(
+        error.code(),
+        kr_protocol::error::ErrorCode::PermissionDenied
+    );
+    // Enumeration refuses the same directory: a listing is not a warrant to trust it.
+    let listed = kr_ipc::descriptor::read_all(&paths).expect_err("enumeration refuses it too");
+    assert_eq!(
+        listed.code(),
+        kr_protocol::error::ErrorCode::PermissionDenied
+    );
+}
+
+/// KR-REQ-05.03: a descriptor reached through a reparse point - a junction here, which needs no
+/// privilege to make, where a symbolic link to a file needs one this account does not hold - is
+/// refused. The reader opens the link itself rather than following it, and refuses it by its
+/// attributes.
+#[test]
+fn a_descriptor_reached_through_a_junction_is_refused() {
+    let host = TempHost::create();
+    let paths = host.environment();
+    let real = descriptor(&host, 5, "kalareach-descriptor-behind-a-junction");
+    kr_ipc::descriptor::publish(&paths, &real).expect("publishes a real descriptor");
+
+    // A second session's descriptor is a junction, pointing at a directory this account owns. A
+    // junction is a directory reparse point, so its name can stand where a descriptor file would.
+    let elsewhere = host.root().join("elsewhere");
+    std::fs::create_dir(&elsewhere).expect("a directory to point at");
+    let planted = paths.descriptor_file(SessionId::new(Uuid::from_bytes([6; 16])));
+    run(
+        "cmd.exe",
+        &[
+            "/d".as_ref(),
+            "/c".as_ref(),
+            "mklink".as_ref(),
+            "/J".as_ref(),
+            planted.as_os_str(),
+            elsewhere.as_os_str(),
+        ],
+    );
+
+    let error = kr_ipc::descriptor::read(&paths, SessionId::new(Uuid::from_bytes([6; 16])))
+        .expect_err("a descriptor that is a junction is refused");
+    assert_eq!(
+        error.code(),
+        kr_protocol::error::ErrorCode::PermissionDenied
+    );
+    // Enumeration reaches the junction and refuses it, and still reads the real descriptor beside
+    // it, so one planted entry does not hide the rest.
+    let entries = kr_ipc::descriptor::read_all(&paths).expect("the directory lists");
+    let planted_entry = entries
+        .iter()
+        .find(|entry| entry.path == planted)
+        .expect("the junction is among the entries");
+    assert!(
+        planted_entry.descriptor.is_err(),
+        "the junction is not read as a descriptor"
+    );
+    let real_entry = entries
+        .iter()
+        .find(|entry| entry.path == paths.descriptor_file(real.session_id))
+        .expect("the real descriptor is among the entries");
+    assert_eq!(
+        real_entry.descriptor.as_ref().expect("it reads"),
+        &real,
+        "the real descriptor beside it still reads"
+    );
+}
+
+/// KR-REQ-05.03: a descriptor directory swapped for another after it was checked never hands back a
+/// file from the directory that took its name. The reader holds a handle on the directory it checked
+/// and opens every entry relative to it, the way `openat` does on Unix, so an impostor written into
+/// a directory that took the checked one's name since is never the file it reads: it reads the real
+/// descriptor from the directory it checked, or nothing.
+#[test]
+fn a_descriptor_directory_swapped_after_its_check_never_returns_the_impostor() {
+    let host = TempHost::create();
+    let paths = host.environment();
+    let real = descriptor(&host, 7, "kalareach-descriptor-before-the-swap");
+    kr_ipc::descriptor::publish(&paths, &real).expect("publishes");
+
+    let directory = kr_ipc::descriptor::DescriptorDirectory::open(&paths.descriptors_dir())
+        .expect("opens the directory")
+        .expect("the directory is there");
+
+    // The checked directory is moved aside and another put in its place, holding an impostor under
+    // the real descriptor's own name. The handle above still names the directory that was checked,
+    // which still holds the real descriptor.
+    let sessions = paths.descriptors_dir();
+    let moved = host.root().join("sessions-moved");
+    std::fs::rename(&sessions, &moved).expect("the checked directory is moved aside");
+    std::fs::create_dir(&sessions).expect("another directory takes its name");
+    let impostor = descriptor(&host, 9, "kalareach-descriptor-the-impostor");
+    let impostor = kr_protocol::worker::WorkerDescriptor {
+        session_id: real.session_id,
+        ..impostor
+    };
+    std::fs::write(
+        paths.descriptor_file(real.session_id),
+        kr_cbor::to_canonical_vec(&impostor).expect("encodes"),
+    )
+    .expect("the impostor is written into the new directory");
+
+    // Read relative to the checked directory: the real descriptor, never the impostor.
+    let read = directory
+        .read_entry(&paths.descriptor_file(real.session_id))
+        .expect("reads relative to the checked directory")
+        .expect("the real descriptor is still there");
+    assert_eq!(
+        read, real,
+        "the reader reads the real descriptor, not the impostor"
+    );
+    assert_ne!(read, impostor, "the impostor is never returned");
 }

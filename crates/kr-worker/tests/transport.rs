@@ -124,6 +124,15 @@ fn package() -> PluginId {
     PluginId::new("kalareach.codex").expect("valid")
 }
 
+/// The installed package this suite's tables are pinned with and its bindings run.
+fn installed() -> kr_worker::broker::PackageIdentity {
+    kr_worker::broker::PackageIdentity {
+        plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+        publisher_id: PublisherId::new("kalareach").expect("valid"),
+        package_digest: Digest256::from_bytes([5; 32]),
+    }
+}
+
 fn table() -> DeclarativeTable {
     let mut table = DeclarativeTable {
         plugin_id: PluginId::new("kalareach.codex").expect("valid"),
@@ -370,7 +379,7 @@ fn prepare_broker(broker: &Arc<Broker>, rich: RichMethodTable) -> GatewayConnect
         )
         .expect("the binding is recorded");
     broker
-        .pin_table(instance(), table(), rich)
+        .pin_table(instance(), installed(), table(), rich)
         .expect("the installed tables are pinned");
     let connection = broker
         .open_native_connection(
@@ -1984,7 +1993,7 @@ async fn kr_req_12_08_each_operation_encodes_as_the_method_its_table_names_with_
             entry.class = NativeMethodClass::Unsupported;
         }
     }
-    bare.pin_table(instance(), table(), narrowed)
+    bare.pin_table(instance(), installed(), table(), narrowed)
         .expect("the installed tables are pinned");
     bare.open_native_connection(
         instance(),
@@ -2172,7 +2181,7 @@ fn broker_expecting_this_process() -> (Arc<Broker>, ProcessStartIdentity) {
         )
         .expect("the instance is registered");
     broker
-        .pin_table(instance(), table(), rich())
+        .pin_table(instance(), installed(), table(), rich())
         .expect("the installed tables are pinned");
     bind_component(&broker);
     record_capabilities(&broker);
@@ -2642,7 +2651,7 @@ async fn kr_req_12_14_a_bridge_that_reaches_the_endpoint_becomes_a_served_connec
         )
         .expect("the agent is started");
     broker
-        .pin_table(instance(), table(), rich())
+        .pin_table(instance(), installed(), table(), rich())
         .expect("the installed tables are pinned");
     bind_component(&broker);
     record_capabilities(&broker);
@@ -3097,7 +3106,7 @@ async fn kr_req_12_11_every_transition_is_recorded_with_its_event_and_announced_
         )
         .expect("the other instance is registered");
     broker
-        .pin_table(elsewhere, table(), rich())
+        .pin_table(elsewhere, installed(), table(), rich())
         .expect("its tables are pinned");
     broker
         .open_native_connection(elsewhere, &CREDENTIAL, &process_identity(), &package(), "1")
@@ -5216,7 +5225,7 @@ async fn kr_req_07_67_a_terminal_that_exits_stops_the_live_backend_dedicated_to_
         )
         .expect("the agent is started");
     broker
-        .pin_table(instance(), table(), rich())
+        .pin_table(instance(), installed(), table(), rich())
         .expect("the installed tables are pinned");
     bind_component(&broker);
     record_capabilities(&broker);
@@ -5310,7 +5319,7 @@ async fn kr_req_07_67_a_dedicated_backend_that_closes_socket_stops_when_terminal
         )
         .expect("the agent is started");
     broker
-        .pin_table(instance(), table(), rich())
+        .pin_table(instance(), installed(), table(), rich())
         .expect("the installed tables are pinned");
     bind_component(&broker);
     record_capabilities(&broker);
@@ -5430,6 +5439,7 @@ async fn session_runtime_and_stream(
         worker_endpoint: None,
         send_queue_bytes: 8 * 1024 * 1024,
         resident_bytes: 1024 * 1024,
+        time: kr_worker::action::time::TimeSources::system(),
         launch_profile: kr_protocol::session::LaunchProfile::default(),
     };
     let mut session = kr_worker::session::Session::open(config).expect("opens");
@@ -5509,6 +5519,7 @@ async fn service_and_attached_client(
         worker_endpoint: None,
         send_queue_bytes,
         resident_bytes: 1024 * 1024,
+        time: kr_worker::action::time::TimeSources::system(),
         launch_profile: kr_protocol::session::LaunchProfile::default(),
     };
     let mut session = kr_worker::session::Session::open(config).expect("opens");
@@ -5652,12 +5663,13 @@ async fn kr_req_12_11_a_subscription_its_peer_could_not_receive_is_refused_whole
         "and the client is told why rather than given a frame it must discard"
     );
 
-    // What the refusal is about is this peer's frame and not this session's state, so it is the
-    // same answer before the state grows and after it. A connection that is refused was refused on
-    // its first subscription, which is what keeps a refusal from ever taking a stream away: there
-    // is no state of this session in which this connection subscribes and no later state in which
-    // it is refused. The state grows past what one page carries, so the peer served below reads it
-    // in more than one.
+    // What the refusal is about is this peer's frame against the answer's parts other than the
+    // resources, and not the resources this session holds, so it is the same answer before they
+    // grow and after it: however many resources the session holds, a connection that subscribes
+    // is not refused a later subscription for them. The refusal is decided before the subscription
+    // changes anything, which is what keeps a refusal from ever taking a stream away. The
+    // resources grow past what one page carries, so the peer served below reads them in more than
+    // one.
     for index in 0..kr_worker::broker::MAX_SNAPSHOT_RESOURCES {
         owner
             .from_upstream(

@@ -50,6 +50,7 @@ use kr_shell_integration::host::scripted::{
     ReferenceShell, ScriptedBridge, ToBridge, qualified_hello,
 };
 use kr_transport::clock::SystemContinuousClock;
+use kr_worker::fence::bridge::{FenceGate, FenceHold};
 use kr_worker::fence::{FenceDriver, ReaderDiscards};
 use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
@@ -81,6 +82,7 @@ fn configuration(host: &kr_ipc::testing::TempHost, mode: ShellMode) -> SessionCo
         worker_endpoint: None,
         send_queue_bytes: 8 * 1024 * 1024,
         resident_bytes: 1024 * 1024,
+        time: kr_worker::action::time::TimeSources::system(),
         launch_profile: kr_protocol::session::LaunchProfile::default(),
     }
 }
@@ -441,15 +443,55 @@ async fn wired_profiled(
     register: bool,
     launch_profile: kr_protocol::session::LaunchProfile,
 ) -> Wired {
-    wired_built(mode, register, move |config| {
+    wired_built(mode, register, Bridging::ordinary(), move |config| {
         config.launch_profile = launch_profile.clone();
     })
     .await
 }
 
+/// Starts a managed session with its bridge registered, on a clock this test moves, with the bridge
+/// server keeping each published fence from its writer while `gate` is closed.
+///
+/// The machine's own deadlines pass only when the test moves `clock`, and a fence is written only
+/// once the test opens the gate, so neither depends on how quickly anything here is scheduled.
+async fn wired_holding_fences(
+    clock: &Arc<kr_transport::clock::ManualClock>,
+    gate: Option<&FenceGate>,
+) -> Wired {
+    wired_built(
+        ShellMode::Managed,
+        true,
+        Bridging {
+            clock: Arc::clone(clock) as Arc<_>,
+            fence_hold: gate.map(|gate| FenceHold::Gate(gate.clone())),
+        },
+        |_| {},
+    )
+    .await
+}
+
+/// What a session's bridge server is built with.
+struct Bridging {
+    /// The clock the session's fence machine reads.
+    clock: Arc<dyn kr_transport::clock::ContinuousClock>,
+    /// What the server keeps each published fence from its connection's writer for, if anything.
+    fence_hold: Option<FenceHold>,
+}
+
+impl Bridging {
+    /// The ordinary clock, and every fence written as soon as the writer has it.
+    fn ordinary() -> Self {
+        Self {
+            clock: Arc::new(SystemContinuousClock::new()),
+            fence_hold: None,
+        }
+    }
+}
+
 async fn wired_built(
     mode: ShellMode,
     register: bool,
+    bridging: Bridging,
     describe: impl FnOnce(&mut SessionConfig),
 ) -> Wired {
     let temp = kr_ipc::testing::TempHost::create();
@@ -494,7 +536,7 @@ async fn wired_built(
         session.install_fence(FenceDriver::new(
             session_id,
             LeaseView::unheld(InputLeaseEpoch::new(0)),
-            Arc::new(SystemContinuousClock::new()),
+            bridging.clock,
         ));
     }
     let runtime = Arc::new(
@@ -516,14 +558,15 @@ async fn wired_built(
         already_registered: false,
         gesture: EofGesture::default(),
     };
-    let bridge_task = tokio::spawn(
-        kr_worker::fence::bridge::BridgeServer::new(
-            Arc::clone(&runtime),
-            host_endpoint,
-            expectation,
-        )
-        .serve(),
+    let mut server = kr_worker::fence::bridge::BridgeServer::new(
+        Arc::clone(&runtime),
+        host_endpoint,
+        expectation,
     );
+    if let Some(hold) = bridging.fence_hold {
+        server = server.holding_fences(hold);
+    }
+    let bridge_task = tokio::spawn(server.serve());
 
     let hello =
         qualified_hello(&reference(), session_id, &address, process, &secret).expect("a hello");
@@ -679,17 +722,7 @@ async fn fenced(wired: &mut Wired, prompt: u64, revision: u64) -> kr_protocol::r
         .send_event(enter(wired.session_id, prompt, revision))
         .await
         .expect("enters");
-    let fence_id = loop {
-        match wired.next().await {
-            ToBridge::Request { request, .. } => match *request {
-                WorkerRequest::Fence(params) => break params.fence_id,
-                // A cancellation the entry asked for is not the exchange; it is answered by
-                // whichever test needs it.
-                _ => continue,
-            },
-            _ => continue,
-        }
-    };
+    let fence_id = asked_for_a_fence(wired).await;
     wired
         .bridge
         .answer(
@@ -698,6 +731,26 @@ async fn fenced(wired: &mut Wired, prompt: u64, revision: u64) -> kr_protocol::r
         )
         .await
         .expect("acknowledges");
+    published(wired).await
+}
+
+/// Waits for the worker to ask the reader for a fence, and returns the fence it asked for.
+async fn asked_for_a_fence(wired: &mut Wired) -> kr_protocol::root::FenceId {
+    loop {
+        match wired.next().await {
+            ToBridge::Request { request, .. } => match *request {
+                WorkerRequest::Fence(params) => return params.fence_id,
+                // A cancellation the entry asked for is not the exchange; it is answered by
+                // whichever test needs it.
+                _ => continue,
+            },
+            _ => continue,
+        }
+    }
+}
+
+/// Waits for the worker to publish a fence to the reader, and returns it.
+async fn published(wired: &mut Wired) -> kr_protocol::root::EditorFence {
     loop {
         match wired.next().await {
             ToBridge::FencePublished(kr_protocol::root::FencePublication::Published(fence)) => {
@@ -826,6 +879,563 @@ async fn an_unanswered_exchange_releases_the_held_input_and_says_the_editor_was_
         );
         assert!(driver.held().is_empty(), "nothing is still held");
     }
+    wired.close().await;
+}
+
+// --------------------------------------------------------------------------------------------
+// KR-REQ-07.79, KR-REQ-07.84: what a fence lets go of reaches the shell after the fence does.
+// --------------------------------------------------------------------------------------------
+
+/// How long the cases that keep a fence from the writer watch the shell for keys that should be
+/// waiting.
+///
+/// A fence is written only when the case opens its gate, and the case reads the session's queue on
+/// the step that decides, so this decides nothing by itself. It is many times what a key that did
+/// not wait takes to reach the shell and come back as output, which is what the check beside that
+/// read looks for.
+const WHILE_HELD: Duration = Duration::from_millis(300);
+
+/// Types `bytes` through the lease `holder` holds, as its client's `input.write` does, and hands
+/// the session's queue for the terminal to the writer.
+fn type_keys(wired: &Wired, holder: AttachmentId, sequence: u64, bytes: &[u8]) {
+    let mut session = wired.runtime.session();
+    let epoch = session.lease().epoch.get();
+    session
+        .write_input(
+            holder,
+            epoch,
+            sequence,
+            bytes,
+            None,
+            std::time::Instant::now(),
+        )
+        .expect("the keys are accepted");
+    wired.runtime.flush_locked(&mut session);
+}
+
+/// Returns whether the shell has already echoed `keys`.
+///
+/// The shell here is `cat` on a terminal in its ordinary mode, which echoes what it is given the
+/// moment it arrives, so keys in the output are keys that reached the shell.
+fn echoed_now(runtime: &SessionRuntime, keys: &[u8]) -> bool {
+    contains(&retained(&runtime.session()), keys)
+}
+
+/// Waits until the shell has echoed `keys`.
+async fn echoed(runtime: &SessionRuntime, keys: &[u8]) {
+    tokio::time::timeout(SOON, async {
+        while !echoed_now(runtime, keys) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the shell never had {}",
+            String::from_utf8_lossy(keys).escape_debug()
+        )
+    });
+}
+
+/// Waits until the machine has published the fence its reader acknowledged.
+async fn until_fenced(runtime: &SessionRuntime) {
+    tokio::time::timeout(SOON, async {
+        while runtime.session().fence().expect("a driver").state() != FenceState::Fenced {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the acknowledged fence was published");
+}
+
+/// Returns how many batches the session keeps behind a fence its writer has not written.
+fn waiting(runtime: &SessionRuntime) -> usize {
+    runtime.session().waiting_for_fence()
+}
+
+/// Waits until the connection's writer has brought the published fence to `gate`, or fails.
+///
+/// A writer that ended before it got there would never arrive, and the case fails rather than
+/// waiting for it.
+async fn at_the_gate(gate: &FenceGate) {
+    tokio::time::timeout(SOON, gate.arrived(1))
+        .await
+        .expect("the writer brought the published fence to the gate");
+}
+
+/// Takes the session through entry to a published fence, typing `held` while the reader is asked
+/// when there is anything to type, and returns once the machine has published the fence.
+async fn fenced_with(
+    wired: &mut Wired,
+    holder: AttachmentId,
+    held: Option<&[u8]>,
+) -> kr_protocol::root::FenceId {
+    wired
+        .bridge
+        .send_event(enter(wired.session_id, 1, 1))
+        .await
+        .expect("enters");
+    let fence_id = asked_for_a_fence(wired).await;
+    if let Some(keys) = held {
+        type_keys(wired, holder, 0, keys);
+        assert_eq!(
+            wired
+                .runtime
+                .session()
+                .fence()
+                .expect("a driver")
+                .held()
+                .len(),
+            1,
+            "the machine holds what arrives while the reader is asked"
+        );
+    }
+    wired
+        .bridge
+        .answer(kr_protocol::ids::RequestId::new(0), drained(1, 1, fence_id))
+        .await
+        .expect("acknowledges");
+    until_fenced(&wired.runtime).await;
+    fence_id
+}
+
+/// KR-REQ-07.79, KR-REQ-07.84: keys held while the reader is asked reach the shell only once the
+/// fence they were held for has been written to the reader.
+///
+/// A reader takes what is on its endpoint before it acts on a key, and only what is already there.
+/// A key that reaches the shell ahead of the fence it was released under is accepted without it:
+/// the line it makes is one the worker cannot attribute, and it runs without the capability the
+/// fence exists to mint. The connection's writer here keeps the published fence back, as a writer
+/// on a loaded machine sometimes does, until the case lets it go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_keys_reach_the_shell_only_once_their_fence_is_written() {
+    let clock = Arc::new(kr_transport::clock::ManualClock::new());
+    let gate = FenceGate::closed();
+    let mut wired = wired_holding_fences(&clock, Some(&gate)).await;
+    let holder = wired.holder();
+    let fence_id = fenced_with(&mut wired, holder, Some(b"held-keys\n")).await;
+    // The machine published the fence and let the keys go on one step. The writer has the fence
+    // and is keeping it, so the session keeps the keys.
+    at_the_gate(&gate).await;
+    assert_eq!(
+        waiting(&wired.runtime),
+        1,
+        "the keys went to the terminal's writer before the fence they were held for was written"
+    );
+    tokio::time::sleep(WHILE_HELD).await;
+    assert!(
+        !echoed_now(&wired.runtime, b"held-keys"),
+        "the keys reached the shell before the fence they were held for reached the reader"
+    );
+
+    gate.open();
+    let fence = published(&mut wired).await;
+    assert_eq!(fence.fence_id, fence_id);
+    echoed(&wired.runtime, b"held-keys").await;
+    assert_eq!(waiting(&wired.runtime), 0);
+    assert_eq!(
+        gate.kept_as_written(),
+        [1],
+        "the keys were still kept when the fence reached the socket"
+    );
+    wired.close().await;
+}
+
+/// KR-REQ-07.79, KR-REQ-07.84: keys typed once the fence is published, while it is still on its
+/// way to the reader, wait for it as well.
+///
+/// The machine forwards them the moment they arrive, because it is fenced and nothing is being
+/// decided; the reader is not fenced until it has the fence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keys_typed_while_their_fence_is_on_its_way_wait_for_it() {
+    let clock = Arc::new(kr_transport::clock::ManualClock::new());
+    let gate = FenceGate::closed();
+    let mut wired = wired_holding_fences(&clock, Some(&gate)).await;
+    let holder = wired.holder();
+    let _ = fenced_with(&mut wired, holder, None).await;
+    at_the_gate(&gate).await;
+
+    type_keys(&wired, holder, 0, b"typed-keys\n");
+    assert!(
+        wired
+            .runtime
+            .session()
+            .fence()
+            .expect("a driver")
+            .held()
+            .is_empty(),
+        "a fenced machine forwards what arrives rather than holding it"
+    );
+    assert_eq!(
+        waiting(&wired.runtime),
+        1,
+        "the keys went to the terminal's writer before the fence published for them was written"
+    );
+    tokio::time::sleep(WHILE_HELD).await;
+    assert!(
+        !echoed_now(&wired.runtime, b"typed-keys"),
+        "the keys reached the shell before the fence published for them reached the reader"
+    );
+
+    gate.open();
+    published(&mut wired).await;
+    echoed(&wired.runtime, b"typed-keys").await;
+    assert_eq!(
+        gate.kept_as_written(),
+        [1],
+        "the keys were still kept when the fence reached the socket"
+    );
+    wired.close().await;
+}
+
+/// KR-REQ-07.79, KR-REQ-07.84, KR-REQ-07.24: keys waiting for a fence whose connection ends before
+/// the fence is written go to the shell only once the worker has recorded the loss.
+///
+/// They are not fenced input: the fence went with the connection, the session is degraded, and
+/// nothing the reader says about a line can reach the worker any more. So they go to the shell in
+/// their order, as input a degraded session forwards like any application's, which is what the
+/// machine does with what it was holding when a bridge is lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keys_behind_a_fence_never_written_go_once_the_loss_is_recorded() {
+    let clock = Arc::new(kr_transport::clock::ManualClock::new());
+    // Never opened, so the fence is never written.
+    let gate = FenceGate::closed();
+    let mut wired = wired_holding_fences(&clock, Some(&gate)).await;
+    let holder = wired.holder();
+    let _ = fenced_with(&mut wired, holder, Some(b"stranded-keys\n")).await;
+    at_the_gate(&gate).await;
+    assert_eq!(waiting(&wired.runtime), 1, "the keys wait for their fence");
+    tokio::time::sleep(WHILE_HELD).await;
+    assert!(
+        !echoed_now(&wired.runtime, b"stranded-keys"),
+        "the keys reached the shell before the fence they were held for reached the reader"
+    );
+
+    // The reader goes away with the fence still unwritten.
+    let Wired {
+        _temp,
+        _service,
+        _serving,
+        _bridge_task,
+        runtime,
+        bridge,
+        ..
+    } = wired;
+    drop(bridge);
+    echoed(&runtime, b"stranded-keys").await;
+    {
+        let session = runtime.session();
+        let driver = session.fence().expect("a driver");
+        assert!(
+            driver.fence().is_none(),
+            "the fence went with the connection"
+        );
+        assert_ne!(driver.state(), FenceState::Fenced);
+        assert_eq!(
+            driver.phase().phase(),
+            kr_shell_integration::contract::qualification::IntegrationPhase::Degraded,
+            "the loss was recorded before the keys went"
+        );
+        assert_eq!(session.waiting_for_fence(), 0);
+    }
+
+    runtime.close(ClosureReason::CloseRequested).1.release();
+    let _ = tokio::time::timeout(Duration::from_secs(30), runtime.wait_closed()).await;
+    _bridge_task.abort();
+    _serving.abort();
+}
+
+/// KR-REQ-07.79, KR-REQ-07.24: a reader that does not take a published fence within the limit has
+/// its connection ended, and the keys waiting for the fence go once the loss is recorded.
+///
+/// A reader that has stopped reading its own socket must not hold the terminal's input for as long
+/// as it stays away. The writer here never writes the fence, as one stuck behind such a reader
+/// would not, and the limit passes on the session's own clock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_not_written_within_its_limit_ends_the_connection_and_lets_the_keys_go() {
+    let clock = Arc::new(kr_transport::clock::ManualClock::new());
+    let gate = FenceGate::closed();
+    let mut wired = wired_holding_fences(&clock, Some(&gate)).await;
+    let holder = wired.holder();
+    let _ = fenced_with(&mut wired, holder, Some(b"waiting-keys\n")).await;
+    at_the_gate(&gate).await;
+    assert_eq!(waiting(&wired.runtime), 1, "the keys wait for their fence");
+
+    clock.advance(kr_worker::fence::FENCE_WRITE_LIMIT);
+    wired
+        .runtime
+        .session()
+        .fence()
+        .expect("a driver")
+        .waker()
+        .notify_one();
+    echoed(&wired.runtime, b"waiting-keys").await;
+    {
+        let session = wired.runtime.session();
+        let driver = session.fence().expect("a driver");
+        assert!(
+            driver.fence().is_none(),
+            "the fence went with the connection"
+        );
+        assert_eq!(
+            driver.phase().phase(),
+            kr_shell_integration::contract::qualification::IntegrationPhase::Degraded,
+            "the loss was recorded before the keys went"
+        );
+        assert_eq!(session.waiting_for_fence(), 0);
+    }
+    // The bridge finds its connection over.
+    tokio::time::timeout(SOON, async { while wired.bridge.recv().await.is_ok() {} })
+        .await
+        .expect("the connection ended");
+    wired.close().await;
+}
+
+/// KR-REQ-07.79, KR-REQ-07.82: a takeover whose exchange times out lets the new holder's keys go at
+/// the timeout, while the fence the previous holder had is still unwritten.
+///
+/// Input waits for a published fence only while it is the machine's. The takeover drops the first
+/// fence, so nothing waits for its frame any more: an acceptance or a detach made through it is
+/// refused as not the fence this session holds, however late it reaches the reader. The new
+/// exchange's request waits on the writer behind the frame it is keeping, so the reader never
+/// answers, and the 250 ms rule has the held keys released in order, unfenced, with the connection
+/// still up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_takeover_that_times_out_lets_its_keys_go_while_an_earlier_fence_is_unwritten() {
+    let clock = Arc::new(kr_transport::clock::ManualClock::new());
+    let gate = FenceGate::closed();
+    let mut wired = wired_holding_fences(&clock, Some(&gate)).await;
+    let first = wired.holder();
+    let _ = fenced_with(&mut wired, first, None).await;
+    at_the_gate(&gate).await;
+
+    let second = wired.holder();
+    type_keys(&wired, second, 0, b"second-keys\n");
+    assert_eq!(
+        wired
+            .runtime
+            .session()
+            .fence()
+            .expect("a driver")
+            .held()
+            .len(),
+        1,
+        "the machine holds the new holder's keys while it asks for a new fence"
+    );
+    // The exchange's deadline passes on the machine's own clock.
+    clock.advance(Duration::from_millis(250));
+    wired
+        .runtime
+        .session()
+        .fence()
+        .expect("a driver")
+        .waker()
+        .notify_one();
+    echoed(&wired.runtime, b"second-keys").await;
+    {
+        let session = wired.runtime.session();
+        let driver = session.fence().expect("a driver");
+        assert_eq!(
+            driver.state(),
+            FenceState::Unfenced,
+            "the editor stays unfenced"
+        );
+        assert_eq!(
+            driver.phase().phase(),
+            kr_shell_integration::contract::qualification::IntegrationPhase::Qualified,
+            "nothing ended the connection"
+        );
+        assert_eq!(session.waiting_for_fence(), 0);
+    }
+    gate.open();
+    wired.close().await;
+}
+
+/// KR-REQ-07.77, KR-REQ-07.79: keys waiting for a fence go to the terminal the moment the reader
+/// leaves the prompt, while that fence is still unwritten.
+///
+/// Outside a registered root editor input does not wait for a reader. The leave drops the fence,
+/// so nothing waits for its frame, and the keys go to whatever reads the terminal now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keys_waiting_for_a_fence_go_when_the_reader_leaves_the_prompt() {
+    let clock = Arc::new(kr_transport::clock::ManualClock::new());
+    let gate = FenceGate::closed();
+    let mut wired = wired_holding_fences(&clock, Some(&gate)).await;
+    let holder = wired.holder();
+    let _ = fenced_with(&mut wired, holder, None).await;
+    at_the_gate(&gate).await;
+    type_keys(&wired, holder, 0, b"leaving-keys\n");
+    assert_eq!(waiting(&wired.runtime), 1, "the keys wait for their fence");
+
+    // Another reader takes over from the prompt, a pager inside the shell, say.
+    wired
+        .bridge
+        .send_event(BridgeEvent::EditorLeave(RootEditorLeaveParams {
+            session_id: wired.session_id,
+            prompt_generation: PromptGeneration::new(1),
+            reader_revision: ReaderRevision::new(1),
+            reason: kr_protocol::root::EditorLeaveReason::ReaderTakeover,
+        }))
+        .await
+        .expect("leaves");
+    echoed(&wired.runtime, b"leaving-keys").await;
+    {
+        let session = wired.runtime.session();
+        let driver = session.fence().expect("a driver");
+        assert_eq!(driver.state(), FenceState::Outside);
+        assert!(driver.fence().is_none(), "the leave dropped the fence");
+        assert_eq!(session.waiting_for_fence(), 0);
+    }
+    gate.open();
+    wired.close().await;
+}
+
+/// KR-REQ-07.83, KR-REQ-07.79: a launch whose hold ends while the fence it reserved is still
+/// unwritten gives up the connection, and the keys it held go at the end of the hold.
+///
+/// The fence is still the machine's, so the keys may not go ahead of it. A writer that has kept a
+/// frame for a launch's whole hold is not delivering, and the connection is given up at once rather
+/// than at the write limit: the loss drops the fence, the keys go unfenced at the time the 250 ms
+/// rule gives, and the caller is told nothing can say whether a command was installed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_launch_that_times_out_behind_an_unwritten_fence_gives_up_the_connection() {
+    let clock = Arc::new(kr_transport::clock::ManualClock::new());
+    let gate = FenceGate::closed();
+    let mut wired = wired_holding_fences(&clock, Some(&gate)).await;
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let holder = holder_over(&mut client, &wired).await;
+    let _ = fenced_with(&mut wired, holder, None).await;
+    at_the_gate(&gate).await;
+
+    // The launch reserves the fence, and its request waits on the writer behind it.
+    let params = ShellLaunchParams {
+        session_id: wired.session_id,
+        command: LaunchCommand::QuotedCommand("true".to_owned()),
+        expected_prompt_generation: PromptGeneration::new(1),
+        expected_buffer_revision: EditorBufferRevision::new(1),
+    };
+    let target = wired.target();
+    let calling = tokio::spawn(async move {
+        client
+            .mutate(
+                Method::ShellLaunch,
+                ActionId::new(kr_ipc::new_uuid()),
+                target,
+                &params,
+            )
+            .await
+    });
+    tokio::time::timeout(SOON, async {
+        while wired.runtime.session().fence().expect("a driver").state()
+            != FenceState::LaunchReserved
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the launch reserved the fence");
+    type_keys(&wired, holder, 0, b"launch-held-keys\n");
+    assert_eq!(
+        wired
+            .runtime
+            .session()
+            .fence()
+            .expect("a driver")
+            .held()
+            .len(),
+        1,
+        "the machine holds what arrives while a launch is in flight"
+    );
+
+    // The launch's hold ends on the machine's own clock.
+    clock.advance(Duration::from_millis(250));
+    wired
+        .runtime
+        .session()
+        .fence()
+        .expect("a driver")
+        .waker()
+        .notify_one();
+    echoed(&wired.runtime, b"launch-held-keys").await;
+    {
+        let session = wired.runtime.session();
+        let driver = session.fence().expect("a driver");
+        assert!(
+            driver.fence().is_none(),
+            "the fence went with the connection"
+        );
+        assert_eq!(
+            driver.phase().phase(),
+            kr_shell_integration::contract::qualification::IntegrationPhase::Degraded,
+            "the loss was recorded before the keys went"
+        );
+        assert_eq!(session.waiting_for_fence(), 0);
+    }
+    let error = tokio::time::timeout(SOON, calling)
+        .await
+        .expect("the caller was answered")
+        .expect("joins")
+        .expect("reaches the worker")
+        .expect_err("refused");
+    assert_eq!(
+        error.code,
+        ErrorCode::OutcomeUnknown,
+        "nothing can say whether the reader installed the command"
+    );
+    wired.close().await;
+}
+
+/// KR-REQ-07.79: keys typed with no fence on its way to the reader are handed to the terminal's
+/// writer on the step that accepted them.
+///
+/// Only a published fence the writer has not written holds anything back. Once the writer has
+/// written it, a line typed at the prompt waits for nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keys_typed_behind_a_written_fence_are_not_held() {
+    let clock = Arc::new(kr_transport::clock::ManualClock::new());
+    let mut wired = wired_holding_fences(&clock, None).await;
+    let holder = wired.holder();
+    let _fence = fenced(&mut wired, 1, 1).await;
+    // The reader has the fence; the writer says so on its own task, just after.
+    tokio::time::timeout(SOON, async {
+        while wired
+            .runtime
+            .session()
+            .fence()
+            .expect("a driver")
+            .unwritten_fence()
+            .is_some()
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the writer reported the fence written");
+
+    let taken = {
+        let mut session = wired.runtime.session();
+        let epoch = session.lease().epoch.get();
+        session
+            .write_input(
+                holder,
+                epoch,
+                0,
+                b"ordinary-keys\n",
+                None,
+                std::time::Instant::now(),
+            )
+            .expect("the keys are accepted");
+        session.take_pending_input()
+    };
+    assert!(
+        taken.iter().any(|batch| matches!(
+            batch,
+            kr_worker::session::InputBatch::Lease { bytes, .. } if bytes == b"ordinary-keys\n"
+        )),
+        "the keys go to the writer at once: {taken:?}"
+    );
     wired.close().await;
 }
 
@@ -1086,7 +1696,15 @@ async fn asking_whether_the_desktop_has_gone_takes_no_reading() {
 /// blocking thread, and this runtime has one, which this test occupies. The probe is therefore
 /// outstanding for the whole of what follows, and what follows is the fence releasing what it held
 /// at the deadline A-17 gives it.
+///
+/// It needs a graphical login for the session to be bound to: a person logged in at the console,
+/// as on a macOS workstation and continuous integration's macOS job. Where there is none it fails
+/// and says so; elsewhere than macOS it is left out of an ordinary run.
 #[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "needs a graphical login for a desktop-bound session to watch; it runs on macOS with a person logged in at the console, and with --ignored on another desktop with one"
+)]
 fn held_input_reaches_the_writer_while_a_desktop_reading_is_outstanding() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -1116,13 +1734,12 @@ fn held_input_reaches_the_writer_while_a_desktop_reading_is_outstanding() {
         {
             // A host with no graphical login has nothing for a desktop-bound session to watch, so
             // there is no reading for this test to hold outstanding.
-            eprintln!(
-                "skipped: this host has no graphical login, so a desktop-bound session wants no \
-                 reading"
-            );
             holding.abort();
             wired.close().await;
-            return;
+            panic!(
+                "this host has no graphical login, so a desktop-bound session wants no reading and \
+                 this check cannot run here"
+            );
         }
         let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
             .await
@@ -1166,7 +1783,7 @@ fn held_input_reaches_the_writer_while_a_desktop_reading_is_outstanding() {
 
 /// A managed session bound to this host's desktop, with its bridge registered.
 async fn wired_desktop_bound() -> Wired {
-    wired_built(ShellMode::Managed, true, |config| {
+    wired_built(ShellMode::Managed, true, Bridging::ordinary(), |config| {
         // Desktop-bound, so its watch wants a reading of its own rather than reporting none.
         config.worker_profile = WorkerProfile::DesktopBound;
     })
@@ -1390,21 +2007,18 @@ fn wired_ready(runtime: &Arc<SessionRuntime>) -> bool {
 /// Everything this test touches is on the internal disk: the package is the installed build, and
 /// the session's home, runtime directory, endpoint and working directory are all under the
 /// platform temporary directory. Nothing a launched process opens is in the workspace.
+///
+/// It needs a built package, which only a run that built one has, so an ordinary run leaves it
+/// out; see [`package_root`].
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the built shell packages that KR_SHELL_PACKAGES names; it runs with --ignored in a run that has built them, as the build box's verification does"]
 async fn a_real_qualified_package_registers_and_qualifies_on_this_hosts_endpoint() {
-    let Some(package) = installed_package() else {
-        // The machine's package cache is not this suite's to depend on. A run that names
-        // KR_SHELL_PACKAGES has the built packages and drives one; a run that does not, skips.
-        eprintln!(
-            "skipped: {PACKAGE_ROOT_VARIABLE} names no directory with a qualified package, so \
-             there is no built package to launch"
-        );
-        return;
-    };
+    let package = installed_package();
     let shell = RealShell::start(
         &package,
         kr_protocol::session::LaunchProfile::default(),
         Vec::new(),
+        None,
     )
     .await;
     assert_eq!(
@@ -1435,10 +2049,14 @@ impl RealShell {
     /// Launches `package` with the package's guarded entry in the startup file the person would
     /// have, and waits until the entry has reported the hooks live after the startup files, which
     /// is what qualifies the session.
+    ///
+    /// The bridge server keeps each published fence from its writer as `fence_hold` says, when
+    /// there is one.
     async fn start(
         package: &kr_shell_integration::host::package::ShellPackage,
         launch_profile: kr_protocol::session::LaunchProfile,
         extra: Vec<(String, String)>,
+        fence_hold: Option<FenceHold>,
     ) -> Self {
         let temp = kr_ipc::testing::TempHost::create();
         let environment = temp.environment();
@@ -1527,14 +2145,15 @@ impl RealShell {
             already_registered: false,
             gesture: EofGesture::default(),
         };
-        let bridge_task = tokio::spawn(
-            kr_worker::fence::bridge::BridgeServer::new(
-                Arc::clone(&runtime),
-                host_endpoint,
-                expectation,
-            )
-            .serve(),
+        let mut server = kr_worker::fence::bridge::BridgeServer::new(
+            Arc::clone(&runtime),
+            host_endpoint,
+            expectation,
         );
+        if let Some(hold) = fence_hold {
+            server = server.holding_fences(hold);
+        }
+        let bridge_task = tokio::spawn(server.serve());
 
         // The package connects to the endpoint it was given, proves itself over the bootstrap
         // secret and is registered; then its own entry reports that the hooks are live after the
@@ -1677,8 +2296,10 @@ struct RealProbes {
 #[cfg(unix)]
 impl RealProbes {
     fn new() -> Self {
+        // The directory's name holds an apostrophe, so every path below it is one a shell line has
+        // to quote properly, and a line that did not would not survive it.
         let directory = tempfile::Builder::new()
-            .prefix("kr-probes-")
+            .prefix("kr-probes-it's-")
             .tempdir()
             .expect("a directory on the internal disk");
         let root = std::fs::canonicalize(directory.path()).expect("the directory resolves");
@@ -1687,8 +2308,9 @@ impl RealProbes {
         // It records its arguments and every reserved variable it was started with, waits while
         // its first argument is `hold` and no release has been written, and prints a word it puts
         // together from two pieces.
+        let text = root.join("kr-probe.text");
         std::fs::write(
-            &program,
+            &text,
             format!(
                 "#!/bin/sh\n\
                  {{\n\
@@ -1698,45 +2320,22 @@ impl RealProbes {
                  case $line in KR_*) printf 'env %s\\n' \"$line\" ;; esac\n\
                  done\n\
                  printf 'end\\n'\n\
-                 }} >> '{record}'\n\
+                 }} >> {record}\n\
                  if [ \"$1\" = hold ]; then\n\
-                 while [ ! -e '{release}' ]; do sleep 0.05; done\n\
+                 while [ ! -e {release} ]; do sleep 0.05; done\n\
                  fi\n\
                  printf '%s%s\\n' 'probe-' 'ran'\n",
-                record = root.join("record").display(),
-                release = root.join("release").display(),
+                record = shell_quoted(&root.join("record")),
+                release = shell_quoted(&root.join("release")),
             ),
         )
-        .expect("the program");
-        std::fs::set_permissions(
-            &program,
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .expect("an executable program");
-        // Some systems check a program the first time anything starts it, and on a busy machine
-        // that check can outlast a wait. It is paid here, before the shell that is timed starts it.
-        // A process another test starts while the program is being written keeps a copy of its
-        // descriptor until it starts its own program, and until then Linux refuses to start this
-        // one as busy, so the start is tried again; once it has started, every later start is clear.
-        let mut attempted = 0;
-        let status = loop {
-            attempted += 1;
-            match std::process::Command::new(&program)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-            {
-                Ok(status) => break status,
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy
-                        && attempted < 100 =>
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(error) => panic!("the program starts, after {attempted} attempts: {error}"),
-            }
-        };
-        assert!(status.success(), "the program failed its first start");
+        .expect("the program's text");
+        // Placed by another process rather than written by this one, so no child another test
+        // starts can hold it open for writing when a shell starts it; and started once here, where
+        // nothing is timed, because some systems check a program the first time anything starts it
+        // and on a busy machine that check can outlast a wait.
+        kr_ipc::testing::place_and_start_once(&text, &program, &[]);
+        let _ = std::fs::remove_file(&text);
         let _ = std::fs::remove_file(root.join("record"));
         std::fs::write(root.join("script.sh"), "kr-probe from-a-script\n").expect("a script");
         Self {
@@ -1770,6 +2369,15 @@ impl RealProbes {
 
     fn release(&self) {
         std::fs::write(self.root.join("release"), "").expect("the release");
+    }
+
+    /// Takes a release back, so the next start that is told to hold waits again.
+    fn hold(&self) {
+        match std::fs::remove_file(self.root.join("release")) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("the release is taken back: {error}"),
+        }
     }
 
     /// Every start of the program: its arguments after its own name, and its reserved variables.
@@ -1815,6 +2423,102 @@ impl RealProbes {
     }
 }
 
+/// A path as one word of a POSIX shell line, whatever characters it holds.
+///
+/// Inside single quotes every character stands for itself except the quote, which ends them, so a
+/// quote in the path is closed over, given as an escaped quote of its own, and reopened. The line
+/// is text, as the session's environment and the keys typed into it are, so a path that is not
+/// UTF-8 is refused here rather than quoted as some other path that its lossy spelling would name.
+#[cfg(unix)]
+fn shell_quoted(path: &std::path::Path) -> String {
+    let text = path.to_str().unwrap_or_else(|| {
+        panic!(
+            "{} is not UTF-8, and a shell line, the keys typed into a session and its \
+             environment are all text, so this case cannot put it in one",
+            path.display()
+        )
+    });
+    format!("'{}'", text.replace('\'', r"'\''"))
+}
+
+/// A path that is not UTF-8 is refused, rather than quoted as the other path its lossy spelling
+/// would name. The path is only a value here: no file system is asked to hold it.
+#[cfg(unix)]
+#[test]
+#[should_panic(expected = "is not UTF-8")]
+fn a_probe_path_that_is_not_text_is_refused_rather_than_quoted() {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(
+        b"/tmp/kr-probes-\xff/bin/kr-probe".to_vec(),
+    ));
+    let _ = shell_quoted(&path);
+}
+
+/// The recording program works where its directory's name holds an apostrophe: a held start
+/// records its words and variables, waits for its release and then answers, and a script sourced
+/// by its quoted path runs it.
+#[cfg(unix)]
+#[test]
+fn the_recording_program_works_where_its_directory_holds_an_apostrophe() {
+    let probes = RealProbes::new();
+    assert!(
+        probes.root.display().to_string().contains('\''),
+        "the recording program's directory is one whose name holds an apostrophe: {}",
+        probes.root.display()
+    );
+
+    let held = std::process::Command::new(probes.program())
+        .args(["hold", "two words"])
+        .env("KR_PROBE_CHECK", "set")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the recording program starts");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while probes.runs().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the held start recorded nothing"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    probes.release();
+    let answered = held.wait_with_output().expect("the held start ends");
+    assert!(
+        answered.status.success(),
+        "the held start failed: {}",
+        String::from_utf8_lossy(&answered.stderr)
+    );
+    assert_eq!(answered.stdout, b"probe-ran\n");
+    let (arguments, environment) = probes.runs().pop().expect("the held start was recorded");
+    assert_eq!(arguments, ["hold", "two words"]);
+    assert_eq!(
+        environment.get("KR_PROBE_CHECK").map(String::as_str),
+        Some("set")
+    );
+
+    let sourced = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!(". {}", shell_quoted(&probes.script())))
+        .envs(probes.variables())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("a shell starts");
+    assert!(
+        sourced.status.success(),
+        "the script sourced by its quoted path failed: {}",
+        String::from_utf8_lossy(&sourced.stderr)
+    );
+    assert_eq!(sourced.stdout, b"probe-ran\n");
+    let (arguments, _) = probes
+        .runs()
+        .pop()
+        .expect("the sourced script started the program");
+    assert_eq!(arguments, ["from-a-script"]);
+}
+
 /// KR-REQ-12.07, KR-REQ-07.45, KR-REQ-07.84, KR-REQ-25.05: a real package asks the real worker
 /// before each command of a line and runs a bypassed command exactly as it was typed; forms the
 /// root shell does not start itself ask nothing; the line's capability and its block reach the
@@ -1823,33 +2527,42 @@ impl RealProbes {
 /// This host establishes no command backend yet, so every answer here is a bypass: `not_integrated`
 /// for a session created with no integration, and `backend_unavailable` for one created with an
 /// integration for the name.
+///
+/// Each package runs it twice: once as the host runs, and once with every published fence kept
+/// from the bridge's writer for [`PACKAGE_FENCE_HOLD`], as a writer on a loaded machine now and
+/// then keeps one. A line typed at the prompt goes through the fence either way.
+///
+/// It needs the built Zsh and Bash packages, which only a run that built them has, so an ordinary
+/// run leaves it out; see [`package_root`].
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the built shell packages that KR_SHELL_PACKAGES names; it runs with --ignored in a run that has built them, as the build box's verification does"]
 async fn a_real_package_asks_the_real_worker_before_each_command_and_runs_a_bypass_as_typed() {
-    let Some(root) = std::env::var_os(PACKAGE_ROOT_VARIABLE) else {
-        eprintln!(
-            "skipped: {PACKAGE_ROOT_VARIABLE} names no directory with a qualified package, so \
-             there is no built package to launch"
-        );
-        return;
-    };
+    let root = package_root();
     let set =
         kr_shell_integration::host::package::PackageSet::discover(std::path::Path::new(&root))
             .unwrap_or_else(|fault| panic!("{PACKAGE_ROOT_VARIABLE} names {root:?}: {fault}"));
-    for kind in [ShellKind::Zsh, ShellKind::Bash] {
-        let package = set
-            .select(Some(kind.as_str()))
-            .unwrap_or_else(|fault| panic!("{PACKAGE_ROOT_VARIABLE} has no {kind:?}: {fault}"))
-            .clone();
-        asks_the_real_worker_before_each_command(&package).await;
+    for fence_hold in [None, Some(FenceHold::For(PACKAGE_FENCE_HOLD))] {
+        for kind in [ShellKind::Zsh, ShellKind::Bash] {
+            let package = set
+                .select(Some(kind.as_str()))
+                .unwrap_or_else(|fault| panic!("{PACKAGE_ROOT_VARIABLE} has no {kind:?}: {fault}"))
+                .clone();
+            asks_the_real_worker_before_each_command(&package, fence_hold.clone()).await;
+        }
     }
 }
 
+/// How long the real-package case's second run keeps each published fence from the writer.
+#[cfg(unix)]
+const PACKAGE_FENCE_HOLD: Duration = Duration::from_millis(100);
+
 /// What [`a_real_package_asks_the_real_worker_before_each_command_and_runs_a_bypass_as_typed`]
-/// asks of one package.
+/// asks of one package, with each published fence kept from the writer as `fence_hold` says.
 #[cfg(unix)]
 async fn asks_the_real_worker_before_each_command(
     package: &kr_shell_integration::host::package::ShellPackage,
+    fence_hold: Option<FenceHold>,
 ) {
     for (integrations, bypass) in [
         (Vec::new(), "bypass not_integrated"),
@@ -1870,6 +2583,7 @@ async fn asks_the_real_worker_before_each_command(
                 ..kr_protocol::session::LaunchProfile::default()
             },
             probes.variables(),
+            fence_hold.clone(),
         )
         .await;
         let mut keys = shell.keys();
@@ -1922,27 +2636,113 @@ async fn asks_the_real_worker_before_each_command(
         assert!(!environment.contains_key("KR_REGISTRATION"));
 
         // A sourced script and a script of its own ask nothing for what they run.
-        keys.type_line(&shell, &format!(". '{}'", probes.script().display()));
+        let sourced = format!(". {}", shell_quoted(&probes.script()));
+        keys.type_line(&shell, &sourced);
         printed += 1;
         shell.produced(b"probe-ran", printed).await;
         assert_eq!(probes.asked().len(), 1, "{}", probes.trace());
 
         // The line's capability reaches the command, and the worker resolves it to the
-        // attachment that typed the line while the line runs.
-        keys.type_line(&shell, "kr-probe hold");
-        let token = tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                if let Some((arguments, environment)) = probes.runs().last()
-                    && arguments.first().map(String::as_str) == Some("hold")
-                {
-                    return environment.get("KR_DETACH_TOKEN").cloned();
+        // attachment that typed the line while the line runs. A capability is minted only for a
+        // line the reader accepted behind the fence the worker published for its prompt, so the
+        // line is typed at the prompt: keys typed while the sourced script's line is still
+        // finishing are typeahead, which the worker cannot attribute to anyone. A shell that had
+        // no answer within its deadline runs the line without its capability, which is how it
+        // keeps a command from waiting on the worker. What the worker recorded for the line, and
+        // what the shell traced, say which happened. Keys typed at the prompt reach the shell only
+        // behind its fence, so a line the worker did not record as fenced fails at once; a fenced
+        // line the shell had its answer for must carry its capability; and a fenced line the shell
+        // had no answer for in time is let finish and typed again at the next prompt, a bounded
+        // number of times.
+        const ATTEMPTS: usize = 5;
+        let mut previous = sourced;
+        let mut attempt = 0;
+        let token = loop {
+            attempt += 1;
+            back_at_the_prompt(&shell, &probes, &previous).await;
+            probes.hold();
+            let before = probes.runs().len();
+            // The bridge reports a line's acceptance before its block, on one connection, and the
+            // worker takes them in that order. Once the worker holds a running block for this line
+            // at a newer prompt than the line before, what it recorded about the acceptance is
+            // about this line, whether or not the shell had the answer in time.
+            let earlier = shell
+                .runtime
+                .session()
+                .last_command_block()
+                .map(|block| block.prompt_generation.0.get());
+            keys.type_line(&shell, "kr-probe hold");
+            let (token, fenced) = tokio::time::timeout(Duration::from_secs(30), async {
+                let mut started = None;
+                loop {
+                    if started.is_none() {
+                        let runs = probes.runs();
+                        if runs.len() > before
+                            && let Some((arguments, environment)) = runs.last()
+                            && arguments.first().map(String::as_str) == Some("hold")
+                        {
+                            started = Some(environment.get("KR_DETACH_TOKEN").cloned());
+                        }
+                    }
+                    if let Some(token) = &started {
+                        let session = shell.runtime.session();
+                        if let Some(block) = session.last_command_block()
+                            && block.command == "kr-probe hold"
+                            && !block.finished()
+                            && earlier
+                                .is_none_or(|earlier| block.prompt_generation.0.get() > earlier)
+                        {
+                            let fenced = session.fence().expect("a driver").detach_target()
+                                == DetachTarget::Attachment(keys.attachment_id);
+                            return (token.clone(), fenced);
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the held command started and the worker has its block ({:?}, {bypass}, \
+                     each published fence kept from the writer: {fence_hold:?}, attempt \
+                     {attempt}): {}",
+                    package.kind(),
+                    probes.trace()
+                )
+            });
+            // The shell's own word for the line it just accepted, which is its last.
+            let answered = probes
+                .trace()
+                .lines()
+                .rev()
+                .find(|line| line.starts_with("line ") && line.contains(": "))
+                .is_some_and(|line| !line.ends_with("no answer, so no capability"));
+            match token {
+                Some(token) => break token,
+                None if fenced && !answered && attempt < ATTEMPTS => {
+                    eprintln!(
+                        "the {:?} package's held line was answered after the shell's deadline on \
+                         attempt {attempt} (each published fence kept from the writer: \
+                         {fence_hold:?}), so it is typed again at the next prompt",
+                        package.kind()
+                    );
+                    probes.release();
+                    printed += 1;
+                    shell.produced(b"probe-ran", printed).await;
+                    previous = "kr-probe hold".to_owned();
+                }
+                None => panic!(
+                    "the {:?} package started the held command without its line's capability \
+                     ({bypass}, each published fence kept from the writer: {fence_hold:?}, \
+                     attempt {attempt}, the line {} through the fence and the shell {} its \
+                     answer): {}",
+                    package.kind(),
+                    if fenced { "went" } else { "did not go" },
+                    if answered { "had" } else { "did not have" },
+                    probes.trace()
+                ),
             }
-        })
-        .await
-        .expect("the held command started");
-        let token = token.expect("the command was started with its line's capability");
+        };
         assert_eq!(
             shell
                 .runtime
@@ -1980,20 +2780,64 @@ async fn asks_the_real_worker_before_each_command(
     }
 }
 
-/// Returns the qualified package this run may launch, or nothing.
+/// Waits until the line `command` has finished and the reader is back at its prompt behind a valid
+/// fence, which is when a line typed next is typed at that prompt rather than ahead of it.
 ///
-/// Only a run that names [`PACKAGE_ROOT_VARIABLE`] launches one: the machine's own package cache is
-/// not this suite's to depend on, and an ordinary acceptance run must not vary with it.
-fn installed_package() -> Option<kr_shell_integration::host::package::ShellPackage> {
-    let root = std::env::var_os(PACKAGE_ROOT_VARIABLE)?;
+/// The bridge reports a line's block finished when the next reader starts, and the fence that
+/// reader answers is valid only after that, so the two together say the prompt is the next one.
+#[cfg(unix)]
+async fn back_at_the_prompt(shell: &RealShell, probes: &RealProbes, command: &str) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            {
+                let session = shell.runtime.session();
+                let finished = session
+                    .last_command_block()
+                    .is_some_and(|block| block.command == command && block.finished());
+                let fenced = session
+                    .fence()
+                    .is_some_and(|driver| driver.state() == FenceState::Fenced);
+                if finished && fenced {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the shell did not come back to its prompt after {command:?}: {}",
+            probes.trace()
+        )
+    });
+}
+
+/// Returns the root of the built packages this run named.
+///
+/// Only a run that names [`PACKAGE_ROOT_VARIABLE`] launches a package: the machine's own package
+/// cache is not this suite's to depend on, and an ordinary acceptance run must not vary with it. So
+/// the cases that launch one are left out of an ordinary run, and a run that built the packages
+/// names their root and runs them with `--ignored`, as the build box's verification does. Run
+/// without that variable, they fail and say so.
+fn package_root() -> std::ffi::OsString {
+    std::env::var_os(PACKAGE_ROOT_VARIABLE).unwrap_or_else(|| {
+        panic!(
+            "{PACKAGE_ROOT_VARIABLE} names no directory with a qualified package, so there is no \
+             built package for this check to launch; build the packages and name their root in it"
+        )
+    })
+}
+
+/// Returns the qualified package this run named, the first the installation there has.
+fn installed_package() -> kr_shell_integration::host::package::ShellPackage {
+    let root = package_root();
     let set =
         kr_shell_integration::host::package::PackageSet::discover(std::path::Path::new(&root))
             .unwrap_or_else(|fault| panic!("{PACKAGE_ROOT_VARIABLE} names {root:?}: {fault}"));
-    let package = set
-        .select(None)
+    set.select(None)
         .unwrap_or_else(|fault| panic!("{PACKAGE_ROOT_VARIABLE} names {root:?}: {fault}"))
-        .clone();
-    Some(package)
+        .clone()
 }
 
 // --------------------------------------------------------------------------------------------

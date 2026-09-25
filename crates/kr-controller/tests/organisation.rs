@@ -8,6 +8,8 @@ mod organisation_support;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+
+use kr_controller::grants::policy::UtcFloor;
 use std::time::Duration;
 
 use kr_controller::grants::organisation::{
@@ -286,7 +288,11 @@ fn the_anchor_and_lease_records_survive_a_restart_and_no_lease_is_installed() {
         .stored_policy()
         .expect("readable")
         .expect("present");
-    let mut restored = HostPolicy::restore(&stored, AuthorityRevision::new(1));
+    let mut restored = HostPolicy::restore(
+        &stored,
+        AuthorityRevision::new(1),
+        Arc::new(UtcFloor::at(stored.utc_floor_ms.get())),
+    );
     let enrolment = restored
         .enrolment(organisation_id)
         .expect("the enrolment survives");
@@ -812,7 +818,11 @@ fn a_record_is_let_go_only_once_the_floor_shows_its_leases_expired() {
 
     // Restored without the record, the lease is still refused: the floor written beside the
     // pruning has passed its expiry, whatever the wall clock reads.
-    let mut restored = HostPolicy::restore(&snapshot, AuthorityRevision::new(1));
+    let mut restored = HostPolicy::restore(
+        &snapshot,
+        AuthorityRevision::new(1),
+        Arc::new(UtcFloor::at(snapshot.utc_floor_ms.get())),
+    );
     assert_eq!(
         restored.install_lease(presented(
             &lease,
@@ -1344,7 +1354,8 @@ async fn a_device_without_an_organisation_grant_cannot_bind() {
 /// A presentation and a revocation of its device cannot interleave so that the revoked device
 /// ends up bound: the presentation decides the device's standing under the policy's lock and
 /// holds it until the binding is published, so a revocation recorded while the presentation waited
-/// for that lock is seen. The control: the same wait with no revocation binds.
+/// for that lock is seen. The presentation is stopped at the lock, so the order is exact. The
+/// control: the same wait with no revocation binds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_revoked_while_its_presentation_waits_is_not_bound() {
     let temp = kr_ipc::testing::TempHost::create();
@@ -1374,6 +1385,9 @@ async fn a_device_revoked_while_its_presentation_waits_is_not_bound() {
             })
         };
         held_rx.recv().expect("the lock is held");
+        // The presentation stops once it has read the clock, before it waits for the lock, so the
+        // revocation below lands while it waits.
+        let (arrived, go) = controller.pause_presentation_before_lock();
         let presenting = {
             let controller = Arc::clone(&controller);
             tokio::task::spawn_blocking(move || {
@@ -1382,8 +1396,10 @@ async fn a_device_revoked_while_its_presentation_waits_is_not_bound() {
                     .expect("storage")
             })
         };
-        // Long enough for the presentation to reach the lock.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::task::spawn_blocking(move || arrived.recv())
+            .await
+            .expect("the wait ends")
+            .expect("the presentation reaches the lock");
         if revoked {
             assert!(
                 controller
@@ -1393,6 +1409,7 @@ async fn a_device_revoked_while_its_presentation_waits_is_not_bound() {
                 "the device is revoked"
             );
         }
+        go.send(()).expect("the presentation waits");
         release_tx.send(()).expect("the holder waits");
         holder.await.expect("the holder ends");
         let outcome = presenting.await.expect("presented");

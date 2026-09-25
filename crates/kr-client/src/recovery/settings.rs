@@ -36,7 +36,7 @@ use kr_crypto::secret::SecretVec;
 use kr_protocol::ids::SyncObjectId;
 use kr_protocol::sync::SyncObjectKind;
 
-use crate::recovery::{RecoveryError, Result};
+use crate::recovery::{MaterialName, RecoveryError, Result};
 use crate::sync::{SyncObject, SyncStore};
 
 /// The name a recovery-enabled archive carries this device's settings object under.
@@ -185,6 +185,9 @@ pub fn import_settings(
 const fn admitted(material: Material, admission: Admission) -> Result<()> {
     match admission {
         Admission::Allowed => Ok(()),
-        Admission::Refused { because } => Err(RecoveryError::Refused { material, because }),
+        Admission::Refused { because } => Err(RecoveryError::Refused {
+            material: MaterialName(material),
+            because,
+        }),
     }
 }

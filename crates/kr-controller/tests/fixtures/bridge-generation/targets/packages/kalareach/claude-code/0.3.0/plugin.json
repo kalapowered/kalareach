@@ -1,0 +1,284 @@
+{
+  "manifest_version": 1,
+  "publisher_id": "kalareach",
+  "plugin_name": "claude-code",
+  "version": "0.3.0",
+  "display_name": "Claude Code",
+  "description": "Recognises Claude Code, observes it through lifecycle and tool hooks, carries a message into the session and declares how the tool approvals it relays are answered.",
+  "sdk_range": ">=0.1.1, <0.2.0",
+  "wit_range": ">=0.1.0, <0.2.0",
+  "source": {
+    "repository": "https://github.com/kalapowered/kalareach-plugins",
+    "revision": "d93f452dc76e50d8848a35ae2d68d640ee0f17f4"
+  },
+  "match_rules": [
+    {
+      "id": "claude-code-npm",
+      "executable": {
+        "file_stem": "claude",
+        "path_suffix": [],
+        "version_range": null
+      },
+      "distribution": {
+        "registry": "npm",
+        "package": "@anthropic-ai/claude-code"
+      },
+      "confidence": "exact"
+    },
+    {
+      "id": "claude-code-executable",
+      "executable": {
+        "file_stem": "claude",
+        "path_suffix": [],
+        "version_range": null
+      },
+      "distribution": null,
+      "confidence": "inferred"
+    }
+  ],
+  "platforms": [
+    {
+      "os": "linux",
+      "architectures": [
+        "x86_64",
+        "aarch64"
+      ]
+    },
+    {
+      "os": "mac_os",
+      "architectures": [
+        "aarch64"
+      ]
+    },
+    {
+      "os": "windows",
+      "architectures": [
+        "x86_64"
+      ]
+    }
+  ],
+  "payloads": [
+    {
+      "role": "asset",
+      "path": "README.md",
+      "digest": "c3c947141a245fa9b0ecd987838a91e5523bfb9b1412ef9083a1721d4b9ef701",
+      "size_bytes": "10986"
+    },
+    {
+      "role": "native_bridge",
+      "path": "bridge/hooks.json",
+      "digest": "bbf177109cbca2bdcbf995fcf06f9cc434df898c86c0272461de0c10e5baf727",
+      "size_bytes": "1398"
+    },
+    {
+      "role": "native_bridge",
+      "path": "bridge/mcp-servers.json",
+      "digest": "13e39e82aee3be2710c49a6f38f5558e20d18416a0a18e07b72f5dff9de1c4ea",
+      "size_bytes": "167"
+    },
+    {
+      "role": "native_bridge",
+      "path": "bridge/plugin-manifest.json",
+      "digest": "1cb6238953bafc5e2872e8af3a430d94ca8452c11e51dc43946889f7268b126c",
+      "size_bytes": "326"
+    },
+    {
+      "role": "connector",
+      "path": "connector.json",
+      "digest": "f86f2131f523d403c987b5c076b0b5ee973349f6c362bcf894c79797eec45b3a",
+      "size_bytes": "3890"
+    },
+    {
+      "role": "fixture",
+      "path": "fixtures/conformance.json",
+      "digest": "56bbd8764904a0943768e6b8ecebb49b2c23dbed7874442d47bbeab0e16e20a5",
+      "size_bytes": "8929"
+    },
+    {
+      "role": "asset",
+      "path": "fixtures/frames.json",
+      "digest": "9c4247e5863ca03b98541119ca7d28cf271f84585d451b3bb88fa31f42732387",
+      "size_bytes": "3860"
+    },
+    {
+      "role": "presentation",
+      "path": "presentation.json",
+      "digest": "d23e72101d1f4322be2f33a31ed852a5dbd9765c44b79d566a22ac5f8a5bd375",
+      "size_bytes": "7799"
+    }
+  ],
+  "capabilities": [
+    {
+      "capability": "metadata.match",
+      "reason": "Recognise Claude Code from its executable name and its published package"
+    },
+    {
+      "capability": "presentation.declarative",
+      "reason": "Show what the session is doing and the tool call it is waiting on"
+    },
+    {
+      "capability": "broker.semantic_events",
+      "reason": "Read the lifecycle and tool observations the session already produces"
+    },
+    {
+      "capability": "upstream.action",
+      "reason": "Deliver a message you wrote into the session, on its own path and never as an approval"
+    },
+    {
+      "capability": "native_bridge.install",
+      "reason": "Register the forwarder Claude Code starts for its channel and its lifecycle and tool hooks"
+    },
+    {
+      "capability": "approval.decode",
+      "reason": "Recognise a tool approval Claude Code relays to the channel, and the decisions it offers"
+    },
+    {
+      "capability": "approval.respond",
+      "reason": "Answer a tool approval Claude Code is waiting on with Allow or Deny, on the channel that relayed it"
+    }
+  ],
+  "actions": [
+    {
+      "id": "prompt.send",
+      "label": "Send",
+      "effect": "upstream.prompt",
+      "implementation": {
+        "type": "upstream_method",
+        "method": "channel.event",
+        "bindings": [
+          {
+            "parameter": "text",
+            "field": {
+              "segments": [
+                {
+                  "type": "member",
+                  "name": "params"
+                },
+                {
+                  "type": "member",
+                  "name": "content"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "parameters": {
+        "parameters": [
+          {
+            "name": "text",
+            "kind": {
+              "type": "text",
+              "max_length": 8000,
+              "multiline": true
+            },
+            "label": "Message",
+            "required": true
+          }
+        ]
+      },
+      "description": "Deliver a message into the session, which Claude reads on its next turn",
+      "confirmation_required": false
+    },
+    {
+      "id": "status.refresh",
+      "label": "Refresh",
+      "effect": "observe",
+      "implementation": {
+        "type": "presentation"
+      },
+      "parameters": {
+        "parameters": []
+      },
+      "description": "Draw this package's document again from the session state the host already holds",
+      "confirmation_required": false
+    },
+    {
+      "id": "approval.answer",
+      "label": "Answer",
+      "effect": "approval.respond",
+      "implementation": {
+        "type": "decision_destination",
+        "decision": "decision"
+      },
+      "parameters": {
+        "parameters": [
+          {
+            "name": "decision",
+            "kind": {
+              "type": "choice",
+              "choices": [
+                {
+                  "id": "allow",
+                  "label": "Allow"
+                },
+                {
+                  "id": "deny",
+                  "label": "Deny"
+                }
+              ]
+            },
+            "label": "Decision",
+            "required": true
+          }
+        ]
+      },
+      "description": "Answer the tool approval Claude Code is waiting on",
+      "confirmation_required": false
+    }
+  ],
+  "attachments": null,
+  "native_bridge": {
+    "application": "Claude Code",
+    "application_range": ">=2.1.234, <3.0.0",
+    "install": [
+      {
+        "type": "install_file",
+        "source": "bridge/plugin-manifest.json",
+        "destination": "skills/kalareach-channels/.claude-plugin/plugin.json",
+        "digest": "1cb6238953bafc5e2872e8af3a430d94ca8452c11e51dc43946889f7268b126c"
+      },
+      {
+        "type": "install_file",
+        "source": "bridge/mcp-servers.json",
+        "destination": "skills/kalareach-channels/.mcp.json",
+        "digest": "13e39e82aee3be2710c49a6f38f5558e20d18416a0a18e07b72f5dff9de1c4ea"
+      },
+      {
+        "type": "install_file",
+        "source": "bridge/hooks.json",
+        "destination": "skills/kalareach-channels/hooks/hooks.json",
+        "digest": "bbf177109cbca2bdcbf995fcf06f9cc434df898c86c0272461de0c10e5baf727"
+      },
+      {
+        "type": "add_configuration_key",
+        "file": "settings.json",
+        "key": "enabledPlugins.kalareach-channels@skills-dir",
+        "value": "true"
+      }
+    ],
+    "remove": [
+      {
+        "type": "remove_configuration_key",
+        "file": "settings.json",
+        "key": "enabledPlugins.kalareach-channels@skills-dir"
+      },
+      {
+        "type": "remove_file",
+        "destination": "skills/kalareach-channels/hooks/hooks.json",
+        "digest": "bbf177109cbca2bdcbf995fcf06f9cc434df898c86c0272461de0c10e5baf727"
+      },
+      {
+        "type": "remove_file",
+        "destination": "skills/kalareach-channels/.mcp.json",
+        "digest": "13e39e82aee3be2710c49a6f38f5558e20d18416a0a18e07b72f5dff9de1c4ea"
+      },
+      {
+        "type": "remove_file",
+        "destination": "skills/kalareach-channels/.claude-plugin/plugin.json",
+        "digest": "1cb6238953bafc5e2872e8af3a430d94ca8452c11e51dc43946889f7268b126c"
+      }
+    ],
+    "grant_statement": "Installs three registration files under your own Claude Code directory, where they apply to every project and every later session, and adds one settings key that enables them. Claude Code then starts the KalaReach forwarder itself, so the forwarder runs under Claude Code's own permissions and outside the KalaReach plugin sandbox, outside Wasmtime. It sees the session's SessionStart, SessionEnd, PostToolUse, PostToolUseFailure and Notification events, and every Channels tool approval relayed to it. Removal takes the key back out and deletes exactly those three files, each only while it still holds the bytes that were installed."
+  }
+}

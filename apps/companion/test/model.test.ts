@@ -7,11 +7,13 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import type { DocumentNode } from '@kalareach/plugin-sdk'
+import type { AttachmentSummary, PresentationReason } from '@kalareach/protocol'
 
 import {
   applyNode,
   applyNodes,
   emptyConversation,
+  installSnapshot,
   isNewer,
   nodesAbove,
   prependHistory,
@@ -43,8 +45,18 @@ import {
 } from '../src/model/receipts'
 import { emptyControlState, evaluate, isRendered, visibilityOf } from '../src/model/controls'
 import { drawCell, drawRow, REPLACEMENT } from '../src/terminal/clusters'
-import { routeWheel, zoomBy, ZOOM_STEPS } from '../src/terminal/modes'
+import {
+  PRESENTATION_REASONS,
+  presentationOf,
+  routeWheel,
+  terminalAttachment,
+  zoomBy,
+  ZOOM_STEPS
+} from '../src/terminal/modes'
 import { projectEndpoint, rubberband, shouldDismiss, stepSpring } from '../src/motion'
+import { failureMessage } from '../src/host/port'
+// The protocol crate's source, as text: the sentences the host gives each presentation reason.
+import attachmentSource from '../../../crates/kr-protocol/src/attachment.rs?raw'
 
 function node(id: string, revision: string, text = id): DocumentNode {
   return {
@@ -119,6 +131,39 @@ describe('the conversation', () => {
     let state = applyNodes(emptyConversation(), [node('a', '1'), node('b', '1')])
     state = prependHistory(state, [node('a', '1')])
     expect(state.nodes).toHaveLength(2)
+  })
+})
+
+describe('a snapshot and the nodes held while it was read', () => {
+  const ids = (state: ReturnType<typeof emptyConversation>) => state.nodes.map((each) => each.id)
+  const texts = (state: ReturnType<typeof emptyConversation>) =>
+    state.nodes.map((each) => (each.body as { text: string }).text)
+  const snapshot = [node('a', '1'), node('b', '2'), node('c', '1')]
+
+  it('keeps the snapshot in its presentation order', () => {
+    expect(ids(installSnapshot(emptyConversation(), snapshot, []))).toEqual(['a', 'b', 'c'])
+  })
+
+  it('puts a held node the snapshot lacks after it, in the order the stream delivered it', () => {
+    const state = installSnapshot(emptyConversation(), snapshot, [node('e', '1'), node('d', '1')])
+    expect(ids(state)).toEqual(['a', 'b', 'c', 'e', 'd'])
+  })
+
+  it('takes a held node in place of the snapshot’s copy only when its revision is newer', () => {
+    const state = installSnapshot(emptyConversation(), snapshot, [
+      node('b', '3', 'newer b'),
+      node('a', '0', 'older a'),
+      node('c', '1', 'same c')
+    ])
+    expect(ids(state)).toEqual(['a', 'b', 'c'])
+    expect(texts(state)).toEqual(['a', 'newer b', 'c'])
+  })
+
+  it('leaves the nodes already held where they are, and adds the snapshot’s new ones after', () => {
+    const before = applyNodes(emptyConversation(), [node('a', '1'), node('b', '1')])
+    const state = installSnapshot(before, [node('a', '1'), node('b', '2', 'newer b'), node('c', '1')], [])
+    expect(ids(state)).toEqual(['a', 'b', 'c'])
+    expect(texts(state)).toEqual(['a', 'newer b', 'c'])
   })
 })
 
@@ -212,6 +257,12 @@ describe('what the person sent', () => {
     expect(reconnected?.detail).toMatch(/still waiting for a receipt/)
 
     expect(reconnectBanner(true, [])).toBeNull()
+  })
+
+  it('says nothing about contact before anything has answered whether there is any', () => {
+    const pending = [sent(queued('s1', 'hello', 0), 'a1')]
+    expect(reconnectBanner(null, pending)).toBeNull()
+    expect(reconnectBanner(null, [])).toBeNull()
   })
 })
 
@@ -472,3 +523,85 @@ describe('the frame scheduler', () => {
     vi.unstubAllGlobals()
   })
 })
+
+describe('the words for a failure', () => {
+  it('are the failure’s own words, and never none', () => {
+    expect(failureMessage({ code: 'X', message: 'The host said no.', user_action: 'retry' })).toBe(
+      'The host said no.'
+    )
+    expect(failureMessage(new Error('The call failed.'))).toBe('The call failed.')
+    for (const wordless of [
+      { code: 'X', message: '', user_action: 'retry' },
+      { code: 'X', message: '   ', user_action: 'retry' },
+      new Error(''),
+      'not a failure shape',
+      null
+    ]) {
+      expect(failureMessage(wordless)).toBe('Something went wrong.')
+    }
+  })
+})
+
+describe("a raw view's presentation", () => {
+  const view = terminalAttachment('8a7b6c50-22bb-4c3d-8e4f-000000000101')
+
+  /** One attachment's summary, as a session snapshot carries it. */
+  function summary(
+    attachmentId: string,
+    presentation: AttachmentSummary['presentation'],
+    reason?: PresentationReason
+  ): AttachmentSummary {
+    return {
+      attached_at_ms: '1',
+      attachment_id: attachmentId,
+      claim_geometry: false,
+      dimensions: { columns: '120', rows: '40' },
+      granted: ['observe_terminal'],
+      mode: presentation === null ? 'semantic' : 'terminal',
+      ordinal: '1',
+      presentation,
+      ...(reason === undefined ? {} : { presentation_reason: reason }),
+      terminal_profile_id: null
+    }
+  }
+
+  it('gives a viewport the reason in the host words for each of the seven reasons', () => {
+    for (const [reason, words] of Object.entries(PRESENTATION_REASONS) as [PresentationReason, string][]) {
+      const read = presentationOf([summary(view, 'viewport', reason)], view)
+      expect(read).toEqual({
+        state: 'viewport',
+        reason,
+        sentence: `This view is shown a viewport because ${words}.`
+      })
+    }
+  })
+
+  it('reads its own attachment and never another one', () => {
+    const others = [summary('another', 'viewport', 'size_mismatch'), summary('semantic', null)]
+    expect(presentationOf(others, view).state).toBe('unreported')
+    expect(presentationOf([...others, summary(view, 'direct')], view).state).toBe('direct')
+  })
+
+  it('never takes a viewport with no reason for a direct presentation', () => {
+    const read = presentationOf([summary(view, 'viewport')], view)
+    expect(read.state).toBe('viewport')
+    expect(read.reason).toBeNull()
+    expect(read.sentence).not.toContain('directly')
+  })
+
+  it('words each reason exactly as the host does', () => {
+    // The protocol crate's own sentence for each reason, read from its source: the arms of
+    // `PresentationReason::describe`, with each Rust line continuation joined the way Rust joins it.
+    const body = attachmentSource.slice(attachmentSource.indexOf('pub const fn describe(self)'))
+    const described: Record<string, string> = {}
+    for (const arm of body.matchAll(/Self::(\w+) => \{?\s*"((?:[^"\\]|\\.)*)"/gs)) {
+      if (Object.keys(described).length === 7) break
+      const name = arm[1].replace(/[A-Z]/g, (letter: string, at: number) =>
+        (at === 0 ? '' : '_') + letter.toLowerCase()
+      )
+      described[name] = arm[2].replace(/\\\n\s*/g, '')
+    }
+    expect(described).toEqual(PRESENTATION_REASONS)
+  })
+})
+

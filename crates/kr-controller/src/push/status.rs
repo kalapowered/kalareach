@@ -223,50 +223,54 @@ impl DeliveryStatus for GatewayStatus {
                 };
             }
         };
-        let answer = match self.exchange(credential, &body) {
-            Ok(answer) => answer,
-            Err(detail) => {
-                return StatusAnswer::Unanswered {
-                    detail: format!("the gateway did not answer: {detail}"),
-                };
-            }
-        };
-        if answer.body.len() > MAX_ANSWER_BYTES {
-            return StatusAnswer::Unanswered {
-                detail: format!(
-                    "the gateway's answer was {} bytes, past the {MAX_ANSWER_BYTES} this host \
-                     reads",
-                    answer.body.len()
-                ),
-            };
-        }
-        match answer.status {
-            200 => match serde_json::from_slice::<Envelope>(&answer.body) {
-                Ok(Envelope {
-                    ok: true,
-                    data: Some(ack),
-                }) => StatusAnswer::Recorded(Box::new(ack)),
-                // The gateway answered and holds nothing. That is a fact about its records, and
-                // this host draws no conclusion about the notification from it.
-                Ok(Envelope { ok: true, data: _ }) => StatusAnswer::NoRecord {
-                    detail: "the gateway holds no outcome under that identifier".to_owned(),
-                },
-                Ok(_) => StatusAnswer::Unanswered {
-                    detail: "the gateway refused the question".to_owned(),
-                },
-                Err(error) => StatusAnswer::Unanswered {
-                    detail: format!("the gateway's answer could not be read: {error}"),
-                },
+        match self.exchange(credential, &body) {
+            Ok(answer) => read_answer(&answer),
+            Err(detail) => StatusAnswer::Unanswered {
+                detail: format!("the gateway did not answer: {detail}"),
             },
-            404 => StatusAnswer::NoRecord {
+        }
+    }
+}
+
+/// What one answer to a status question says.
+///
+/// The answer is read through the client's one reader, so a text that names a member twice
+/// answers nothing, and what a failure says is where the text failed, never what it held.
+fn read_answer(answer: &ServiceHttpAnswer) -> StatusAnswer {
+    if answer.body.len() > MAX_ANSWER_BYTES {
+        return StatusAnswer::Unanswered {
+            detail: format!(
+                "the gateway's answer was {} bytes, past the {MAX_ANSWER_BYTES} this host reads",
+                answer.body.len()
+            ),
+        };
+    }
+    match answer.status {
+        200 => match kr_client::services::json::read::<Envelope>(&answer.body) {
+            Ok(Envelope {
+                ok: true,
+                data: Some(ack),
+            }) => StatusAnswer::Recorded(Box::new(ack)),
+            // The gateway answered and holds nothing. That is a fact about its records, and this
+            // host draws no conclusion about the notification from it.
+            Ok(Envelope { ok: true, data: _ }) => StatusAnswer::NoRecord {
                 detail: "the gateway holds no outcome under that identifier".to_owned(),
             },
-            // A refused credential is renewed rather than retried, and a question this host may
-            // not ask resolves nothing. Both leave the record where it is.
-            status => StatusAnswer::Unanswered {
-                detail: format!("the gateway answered {status} to the question"),
+            Ok(_) => StatusAnswer::Unanswered {
+                detail: "the gateway refused the question".to_owned(),
             },
-        }
+            Err(fault) => StatusAnswer::Unanswered {
+                detail: format!("the gateway's answer could not be read: {fault}"),
+            },
+        },
+        404 => StatusAnswer::NoRecord {
+            detail: "the gateway holds no outcome under that identifier".to_owned(),
+        },
+        // A refused credential is renewed rather than retried, and a question this host may not
+        // ask resolves nothing. Both leave the record where it is.
+        status => StatusAnswer::Unanswered {
+            detail: format!("the gateway answered {status} to the question"),
+        },
     }
 }
 
@@ -285,7 +289,62 @@ struct Envelope {
 
 #[cfg(test)]
 mod tests {
+    use kr_protocol::push::PushDeliveryState;
+    use kr_protocol::scalars::{Nullable, TimestampMs, Uuid};
+
     use super::*;
+
+    /// KR-REQ-04.19: the gateway's answer is read through the client's one reader. One that names
+    /// a member twice answers nothing, whichever member it is, so the record keeps its unknown
+    /// outcome; and no detail repeats what the answer held.
+    #[test]
+    fn an_answer_that_names_a_member_twice_answers_nothing_and_no_detail_quotes_one() {
+        const MARKER: &str = "a-marker-nobody-should-see";
+        let answer = serde_json::json!({
+            "ok": true,
+            "data": PushDeliveryAck {
+                decided_at_ms: TimestampMs::new(1_800_000_000_000),
+                notification_id: NotificationId::new(Uuid::from_bytes([5; 16])),
+                state: PushDeliveryState::Queued,
+                suppression: Nullable::null(),
+            },
+        })
+        .to_string();
+        let read = |text: String| {
+            read_answer(&ServiceHttpAnswer {
+                status: 200,
+                body: text.into_bytes(),
+            })
+        };
+
+        // A member the outcome is read from, and one nothing reads.
+        for repeated in [
+            answer.replacen(r#""ok":true"#, r#""ok":true,"ok":true"#, 1),
+            answer.replacen(r#""ok":true"#, r#""ok":true,"note":1,"note":2"#, 1),
+        ] {
+            assert_ne!(
+                repeated, answer,
+                "the answer names its members once to begin with"
+            );
+            let StatusAnswer::Unanswered { detail } = read(repeated) else {
+                panic!("nothing answered");
+            };
+            assert!(
+                detail.contains("names one member of an object twice"),
+                "{detail}"
+            );
+        }
+
+        let StatusAnswer::Unanswered { detail } =
+            read(format!(r#"{{"ok":true,"data":"{MARKER}"}}"#))
+        else {
+            panic!("nothing answered");
+        };
+        assert!(!detail.contains(MARKER), "{detail}");
+
+        // The control: the same answer naming its members once is the outcome the gateway holds.
+        assert!(matches!(read(answer), StatusAnswer::Recorded(_)));
+    }
 
     #[test]
     fn a_budget_lets_its_burst_through_and_then_one_question_an_interval() {

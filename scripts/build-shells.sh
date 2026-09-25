@@ -104,6 +104,13 @@ digest() {
     fi
 }
 
+# A flag variable as one line of a package's inputs. Its words are what reach the compiler, where a
+# line break between two words is a space, so the inputs recorded beside the binary read back one
+# input to a line whatever the variable held.
+one_line() {
+    printf '%s' "$1" | tr '\n' ' '
+}
+
 digest_string() {
     if command -v sha256sum >/dev/null 2>&1; then
         printf '%s' "$1" | sha256sum | cut -d' ' -f1
@@ -233,13 +240,21 @@ PYTHON
 }
 
 write_identity_record() {
-    python3 - "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" <<'PYTHON'
+    python3 - "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" <<'PYTHON'
 import json
 import sys
 
-manifest_path, destination, identity, executable, module_directory, inputs, tests, toolchain = (
-    sys.argv[1:9]
-)
+(
+    manifest_path,
+    destination,
+    identity,
+    executable,
+    module_directory,
+    inputs,
+    tests,
+    toolchain,
+    inputs_text,
+) = sys.argv[1:10]
 with open(manifest_path, encoding="utf-8") as handle:
     manifest = json.load(handle)
 
@@ -284,6 +299,9 @@ record = {
         "configure": manifest["configure"],
         "cflags": manifest["cflags"],
         "inputs_sha256": inputs,
+        # The exact text the identity is a digest of, so a reader can tell which of the inputs
+        # were this tree's and which were the machine's, and name the one that differs.
+        "inputs": inputs_text,
         "toolchain": toolchain,
         "upstream_tests": tests,
     },
@@ -336,8 +354,8 @@ manifest=$(digest "$package/manifest.json")
 script=$(digest "$root/scripts/build-shells.sh")
 upstream=$m_sha256 $m_archive
 cc=${CC:-cc} $toolchain
-cppflags=${CPPFLAGS:-}
-ldflags=${LDFLAGS:-}
+cppflags=$(one_line "${CPPFLAGS:-}")
+ldflags=$(one_line "${LDFLAGS:-}")
 "
     if [ "$m_build_system" = "cmake" ]; then
         # A shell whose own source is Rust is the compiler that produced it as much as the C one,
@@ -350,7 +368,7 @@ ldflags=${LDFLAGS:-}
         inputs="$inputs
 rustc=$(rustc --version 2>/dev/null)
 toolchain=$RUSTUP_TOOLCHAIN
-rustflags=${RUSTFLAGS:-}
+rustflags=$(one_line "${RUSTFLAGS:-}")
 env=$m_environment
 "
     fi
@@ -578,7 +596,7 @@ startup=$(digest "$package/$m_startup") $m_startup"
     cp "$package/$m_startup" "$destination/startup/$(basename "$m_startup")"
 
     write_identity_record "$package/manifest.json" "$record" "$identity" "$executable" \
-        "$module_directory" "$inputs_digest" "$tests_result" "${CC:-cc} $toolchain"
+        "$module_directory" "$inputs_digest" "$tests_result" "${CC:-cc} $toolchain" "$inputs"
     printf '%s\n' "$identity" > "$prefix/$shell_name/current"
 
     echo "build-shells: built $shell_name $m_upstream_version as $identity"

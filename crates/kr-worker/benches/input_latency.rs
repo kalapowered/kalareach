@@ -93,6 +93,13 @@ const BACKGROUND_SHELL: &str = "sleep 86400";
 /// How often the recogniser measurement looks for the held byte.
 const POLL: Duration = Duration::from_micros(250);
 
+/// How long an attachment's opening output is given to stop before the latency measurement starts.
+///
+/// What arrives is a drawn screen and the root program's few bytes, which stop within a moment
+/// even on a busy machine. Output still arriving after this long comes from something other than
+/// the root program the measurement started, and the measurement says so rather than waiting on it.
+const OPENING_OUTPUT_BOUND: Duration = Duration::from_secs(30);
+
 /// A root program that echoes what it reads, with the terminal in raw mode.
 const ECHOES: &str = "stty raw -echo; printf 'kr-ready.'; exec cat";
 
@@ -170,6 +177,7 @@ async fn hosted(script: &str) -> Hosted {
         worker_endpoint: None,
         send_queue_bytes: 8 * 1024 * 1024,
         resident_bytes: 1024 * 1024,
+        time: kr_worker::action::time::TimeSources::system(),
         launch_profile: kr_protocol::session::LaunchProfile::default(),
     };
     let mut session = Session::open(config).expect("opens the session");
@@ -561,7 +569,12 @@ async fn latency_samples(hosted: &Hosted) -> Result<Vec<Duration>, String> {
     let (mut client, attachment_id, epoch) = controlling(hosted).await;
     // Everything the attachment was sent while it was joining: the screen it was drawn, and the
     // application's own opening output. The measurement starts once that has stopped arriving.
-    drain(&mut client, Duration::from_millis(500)).await;
+    drain(
+        &mut client,
+        Duration::from_millis(500),
+        OPENING_OUTPUT_BOUND,
+    )
+    .await?;
 
     let mut samples = Vec::with_capacity(SAMPLES);
     for sequence in 0..SAMPLES {
@@ -703,8 +716,31 @@ impl Keystroke {
 }
 
 /// Reads whatever this client has waiting until nothing arrives for `quiet`.
-async fn drain(client: &mut LocalClient, quiet: Duration) {
-    while tokio::time::timeout(quiet, client.recv()).await.is_ok() {}
+///
+/// It ends with the reason in two other cases. A connection the host has closed answers every read
+/// at once, with an error rather than a frame, so an error is the end of the drain rather than one
+/// more thing that arrived. And frames that are still arriving after `within` are output that is
+/// not going to stop, which a measurement that starts once it has stopped cannot wait out. So a
+/// drain takes at most `within` and `quiet`, whatever the host does.
+async fn drain(client: &mut LocalClient, quiet: Duration, within: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + within;
+    loop {
+        match tokio::time::timeout(quiet, client.recv()).await {
+            Err(_) => return Ok(()),
+            Ok(Err(error)) => {
+                return Err(format!(
+                    "the connection ended while what it had waiting was being read: {error}"
+                ));
+            }
+            Ok(Ok(_)) if Instant::now() >= deadline => {
+                return Err(format!(
+                    "frames were still arriving {within:?} after the drain began, with no quiet \
+                     spell of {quiet:?} between them"
+                ));
+            }
+            Ok(Ok(_)) => {}
+        }
+    }
 }
 
 /// KR-PERF-002: the recogniser's deadline, per prefix length, and a split delimiter.
@@ -1089,4 +1125,174 @@ fn both_measurements_use_a_root_program_that_reports_what_it_received() {
     }
     assert!(ECHOES_BRACKETED.contains("2004h"));
     assert!(!ECHOES.contains("2004h"));
+}
+
+/// What a scripted host does once it has answered a client's opening frame.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+enum Afterwards {
+    /// It closes the connection, as a worker that is going away does.
+    Closes,
+    /// It sends a frame every few milliseconds for as long as the connection lasts.
+    NeverGoesQuiet,
+}
+
+/// A client on a real local endpoint whose host answers the opening frame and then does
+/// `afterwards`, with the tree the endpoint lives in and the task that serves it.
+#[cfg(unix)]
+async fn scripted(
+    afterwards: Afterwards,
+) -> (
+    kr_ipc::testing::TempHost,
+    tokio::task::JoinHandle<()>,
+    LocalClient,
+) {
+    use kr_protocol::hello::{ActionWindow, ReceiveLimits};
+    use kr_protocol::ids::{ActionWindowId, BootEpoch, ConnectionId};
+    use kr_protocol::local::{LocalHelloAck, LocalPeer, LocalRole};
+    use kr_protocol::scalars::{DurationMs, TimestampMs, U64};
+
+    let tree = kr_ipc::testing::TempHost::create();
+    let endpoint = tree
+        .environment()
+        .worker_endpoint(DisplayNumber::new(1))
+        .expect("an endpoint");
+    let listener = Listener::bind(&endpoint).expect("binds the endpoint");
+    let environment_id = tree.environment_id();
+    let serving = tokio::spawn(async move {
+        let Ok((connection, peer)) = listener.accept().await else {
+            return;
+        };
+        let (mut reader, mut writer) =
+            kr_ipc::framed::split(connection, kr_protocol::frame::StreamKind::Control);
+        let Ok(ControlFrame::Hello(_)) = reader.read_message::<ControlFrame>().await else {
+            return;
+        };
+        let connection_id = ConnectionId::new(kr_ipc::new_uuid());
+        let acknowledgement = LocalHelloAck {
+            selected_version: PROTOCOL_VERSION,
+            role: LocalRole::Worker,
+            connection_id,
+            environment_id,
+            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+            peer: LocalPeer {
+                uid: U64::new(u64::from(peer.uid)),
+                gid: U64::new(u64::from(peer.gid)),
+                pid: Nullable::null(),
+            },
+            action_window: ActionWindow {
+                action_window_id: ActionWindowId::new("window-1").expect("a window identifier"),
+                connection_id,
+                boot_epoch: BootEpoch::new(1),
+                issued_at_ms: TimestampMs::new(0),
+                valid_for_ms: DurationMs::new(60_000),
+            },
+            capabilities: CanonicalSet::new(),
+            max_receive: ReceiveLimits::default(),
+        };
+        if writer
+            .write_message(&ControlFrame::HelloAck(Box::new(acknowledgement)))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        match afterwards {
+            // Both halves go when this task ends, and the connection with them.
+            Afterwards::Closes => {}
+            Afterwards::NeverGoesQuiet => loop {
+                if writer.write_message(&output_of(b"x")).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            },
+        }
+    });
+    let client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("the host answers the opening frame");
+    (tree, serving, client)
+}
+
+/// Drains a client of a scripted host on a thread of its own, and returns what the drain came to
+/// and how long it took, or `None` when it had not ended within `bound`.
+///
+/// A drain that never ends never gives its thread back either, so it is not run on the thread
+/// that is waiting for it.
+#[cfg(unix)]
+fn drained_within(
+    bound: Duration,
+    afterwards: Afterwards,
+    quiet: Duration,
+    within: Duration,
+) -> Option<(Result<(), String>, Duration)> {
+    let (finished, outcome) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let drained = runtime.block_on(async {
+            let (_tree, serving, mut client) = scripted(afterwards).await;
+            let started = Instant::now();
+            let drained = drain(&mut client, quiet, within).await;
+            let took = started.elapsed();
+            serving.abort();
+            (drained, took)
+        });
+        let _ = finished.send(drained);
+    });
+    outcome.recv_timeout(bound).ok()
+}
+
+/// A drain of a connection the host has closed ends, and says the connection ended, rather than
+/// reading the closed connection's error as one more frame for ever.
+#[cfg(unix)]
+#[test]
+fn draining_a_connection_the_host_closed_ends_and_says_so() {
+    let (drained, _) = drained_within(
+        Duration::from_secs(10),
+        Afterwards::Closes,
+        Duration::from_millis(200),
+        Duration::from_secs(5),
+    )
+    .expect("the drain of a closed connection ends");
+    let failure = drained.expect_err("a closed connection is not a quiet one");
+    assert!(
+        failure.starts_with("the connection ended"),
+        "the drain says why it ended: {failure}"
+    );
+}
+
+/// A drain of a connection whose frames never stop ends at its bound, and says so.
+#[cfg(unix)]
+#[test]
+fn draining_a_connection_that_never_goes_quiet_ends_at_its_bound() {
+    let within = Duration::from_millis(600);
+    let quiet = Duration::from_millis(200);
+    // What the drain may take past its own bound: the last wait for a frame, which is at most
+    // `quiet`, and the scheduler's delay in waking it, which is allowed a generous second here.
+    let allowance = quiet + Duration::from_secs(1);
+    let (drained, took) = drained_within(
+        Duration::from_secs(10),
+        Afterwards::NeverGoesQuiet,
+        quiet,
+        within,
+    )
+    .expect("the drain of a connection that never goes quiet ends");
+    let failure = drained.expect_err("output that never stops is not a quiet connection");
+    assert!(
+        failure.starts_with("frames were still arriving"),
+        "the drain says why it ended: {failure}"
+    );
+    assert!(
+        took >= within,
+        "the drain gave up after {took:?}, before its bound of {within:?}"
+    );
+    assert!(
+        took <= within + allowance,
+        "the drain took {took:?}, past its bound of {within:?} and the {allowance:?} allowed \
+         around it"
+    );
 }

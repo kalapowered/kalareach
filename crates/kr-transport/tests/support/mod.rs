@@ -142,11 +142,15 @@ pub async fn paired_pair() -> (Side, Side) {
     (host, client)
 }
 
-/// The address of a host reachable over loopback, with no relay and no discovery.
+/// The address of a host reachable directly, with no relay and no discovery.
+///
+/// It names the direct addresses the host's endpoint reports for itself, which are what it offers a
+/// peer, rather than the sockets it bound: a socket bound to the unspecified address is not an
+/// address anyone can dial.
 pub fn direct_addr(side: &Side) -> EndpointAddr {
     let mut addr = EndpointAddr::new(side.endpoint.id());
-    for socket in side.endpoint.bound_sockets() {
-        addr = addr.with_ip_addr(socket);
+    for socket in side.endpoint.addr().ip_addrs() {
+        addr = addr.with_ip_addr(*socket);
     }
     addr
 }

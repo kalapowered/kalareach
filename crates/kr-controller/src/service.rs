@@ -311,6 +311,74 @@ impl std::fmt::Debug for Clocks {
     }
 }
 
+/// How far one restrictive change reaches when the barrier that retires it fences connections.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Reach {
+    /// Every connection this daemon has admitted.
+    Host,
+    /// The connections of one revoked device. Every other connection is admitted again at the
+    /// revision the barrier advances to, so one device's revocation is not everybody's reconnect.
+    Device(kr_protocol::ids::DeviceId),
+}
+
+/// The restrictive changes whose fence debt no barrier has retired (section 26).
+///
+/// A change that narrows authority some copy may still hold writes its own debt row before its
+/// restriction takes effect ([`crate::grants::GrantDirectory::owe_fence`]). The row is **pending**
+/// here until the change has tried to take effect, and **published** from then on, whether or not
+/// the restriction landed: a barrier that fences for a restriction that failed is one more than was
+/// needed, which is harmless, and nothing stays pending for ever. A pending debt refuses nothing,
+/// and no barrier captures it, because its restriction is not in force yet. Every debt on disk is
+/// published when a daemon starts.
+///
+/// A barrier moves what it captures to **retiring** until its rows are deleted, so no later
+/// barrier of this run captures them again; rows it could not delete stay retiring, and the next
+/// start raises one more barrier for them.
+#[derive(Debug, Default)]
+struct Debts {
+    pending: BTreeMap<crate::grants::store::DebtId, Reach>,
+    published: BTreeMap<crate::grants::store::DebtId, Reach>,
+    retiring: std::collections::BTreeSet<crate::grants::store::DebtId>,
+}
+
+/// How often the daemon raises a barrier for debts no barrier has retired, and how soon after a
+/// barrier that could not be raised it tries again.
+pub const DEBT_PASS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A point in a read that this host's own tests can stop it at: the read says it has arrived and
+/// waits there until the test lets it go. Armed once, it fires once.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct ReadPause(std::sync::Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>);
+
+#[cfg(test)]
+impl ReadPause {
+    /// Arms the pause. Returns the end that says the read has arrived, and the end that lets it
+    /// go.
+    fn arm(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (arrived, arrival) = oneshot::channel();
+        let (go, going) = oneshot::channel();
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, going));
+        (arrival, go)
+    }
+
+    /// Waits here when the pause is armed.
+    async fn wait(&self) {
+        let armed = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            let _ = go.await;
+        }
+    }
+}
+
 /// The control daemon.
 pub struct Controller {
     /// This daemon, as something a task started from a method that has no counted reference can
@@ -426,25 +494,21 @@ pub struct Controller {
     /// admitted under the wider one. A reading that produced no document leaves it as it is.
     pub(crate) rights_ceiling:
         std::sync::Mutex<Option<CanonicalSet<kr_protocol::rights::ActionRight>>>,
-    /// True while a ceiling this host accepted asked for a fence it could not raise.
+    /// The restrictive changes whose debt no barrier has retired yet ([`Debts`]).
     ///
-    /// Section 26 fences dispatch before a change affecting authority is acknowledged, so a fence
-    /// that could not be raised has to stop dispatch rather than be reported and passed over. The
-    /// revision did not advance, which is exactly why every connection admitted under the old one
-    /// still looks admitted: nothing in the registry says otherwise, so this does, and admission
-    /// refuses while it is set. Every acceptance raises the fence again while it is set, whatever
-    /// its reading moved, and only a fence that was raised clears it.
-    ///
-    /// In this process and no longer, because the connections it stands for end with the process.
-    /// A daemon that starts again accepts any document it has not accepted before it serves.
-    fence_unraised: std::sync::atomic::AtomicBool,
-    /// Held while a revocation's fence debt is read, fenced and cleared
-    /// ([`Self::complete_revocation`]).
-    ///
-    /// Two callers that both read one debt before either had fenced for it would both fence: two
-    /// revisions and every connection withdrawn twice for one withdrawal. The second caller reads
-    /// the debt once the first has fenced for it and cleared it.
-    fence_settlement: tokio::sync::Mutex<()>,
+    /// Section 26 fences dispatch before a change affecting authority is acknowledged, so a
+    /// restriction whose barrier has not run stops every admission and forward rather than being
+    /// reported and passed over ([`Self::check_fence`]).
+    debts: Arc<std::sync::Mutex<Debts>>,
+    /// Where this host's own tests stop a lease presentation that has read the clock, before it
+    /// waits for the policy's lock. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    before_presentation_lock: crate::attention::Pause,
+    /// Where this host's own tests stop a read whose worker has stopped answering, once it has
+    /// asked the kernel and before it looks at what this daemon holds of the session. Compiled
+    /// away in every shipped build.
+    #[cfg(test)]
+    before_the_record: ReadPause,
     /// The environment's transfer service, whose methods this daemon admits and dispatches.
     transfer: Arc<crate::transfer::TransferModule>,
     /// The environment's project service, whose methods this daemon admits and dispatches.
@@ -759,7 +823,11 @@ impl Controller {
         let authority_revision = registry.authority_revision()?;
         let transfer = Arc::new(crate::transfer::TransferModule::open(&setup.paths).await?);
         let project = Arc::new(crate::project::ProjectModule::open(&setup.paths).await?);
-        let catalogue = Arc::new(crate::catalogue::CatalogueModule::open(&setup.paths)?);
+        // The catalogue fetches through the proxy this daemon started with, the endpoint's own.
+        let catalogue = Arc::new(crate::catalogue::CatalogueModule::open(
+            &setup.paths,
+            Self::proxy_of(&started)?.as_ref(),
+        )?);
         // The change-set service reads every repository through the project service's own opened
         // handles and restricted execution profile, so it takes that service rather than opening
         // a second one.
@@ -799,11 +867,29 @@ impl Controller {
         // The policy and the feed are read back from the store rather than rebuilt empty. A host
         // that came back unrestricted after every restart would be the same failure as one that
         // accepted a restored old policy, by a different route.
-        let policy = match sharing.grants().stored_policy()? {
-            Some(stored) => crate::grants::HostPolicy::restore(&stored, authority_revision),
-            None => crate::grants::HostPolicy::personal(authority_revision),
+        let stored = match sharing.grants().stored_policy()? {
+            Some(stored) => stored,
+            None => crate::grants::HostPolicy::personal(authority_revision).snapshot(),
         };
-        let utc_floor = Arc::clone(policy.utc_floor());
+        // The host's one reading of UTC in this boot, which every worker maps too. It is opened,
+        // adopted or created here, before any worker is adopted or spawned, and it starts at least
+        // where this host's record of it stands.
+        let (floor_words, continuity_lost) = open_utc_floor(
+            &mut registry,
+            &setup.paths,
+            setup.environment_id,
+            boot_epoch,
+            stored.utc_floor_ms.get(),
+        )?;
+        let utc_floor = Arc::new(crate::grants::policy::UtcFloor::on(
+            floor_words,
+            stored.utc_floor_ms.get(),
+        ));
+        if continuity_lost {
+            utc_floor.lose_continuity();
+        }
+        let policy =
+            crate::grants::HostPolicy::restore(&stored, authority_revision, Arc::clone(&utc_floor));
         // Written down again with the revision the registry reached. A start that cannot write it
         // still starts, with its floor owed its record: no decision that reads the clock is taken
         // until a write lands, and a personal grant that never expires is used as before. Stopping
@@ -948,8 +1034,11 @@ impl Controller {
             in_force: std::sync::Mutex::new(in_force),
             started,
             rights_ceiling: std::sync::Mutex::new(rights_ceiling),
-            fence_unraised: std::sync::atomic::AtomicBool::new(false),
-            fence_settlement: tokio::sync::Mutex::new(()),
+            debts: Arc::new(std::sync::Mutex::new(Debts::default())),
+            #[cfg(feature = "testing")]
+            before_presentation_lock: crate::attention::Pause::default(),
+            #[cfg(test)]
+            before_the_record: ReadPause::default(),
             boot_identity: setup.boot_identity,
             boot_epoch,
             windows: ActionWindowIssuer::with_default_validity(Arc::clone(&clock) as Arc<_>),
@@ -1028,6 +1117,23 @@ impl Controller {
         if controller.registry.lock().await.fence_owed()?.is_some() {
             controller.announce_authority_revision().await?;
         }
+        // Every fence debt on disk is owed a barrier: its restriction took effect before the stop,
+        // or never will. They are published before anything is served, a barrier is raised for
+        // them now, and the pass raises one again until it lands.
+        {
+            let owed = controller.sharing.grants().fence_owed()?;
+            let mut debts = controller.debts();
+            for debt in owed {
+                debts.published.insert(debt, Reach::Host);
+            }
+        }
+        if let Err(error) = controller.raise_owed_barrier().await {
+            eprintln!(
+                "kr-controller: the barrier this host owes from before it stopped could not be \
+                 raised yet, so nothing is admitted or forwarded until it is: {error}"
+            );
+        }
+        controller.start_debt_pass();
         // A document this environment has not accepted is put through acceptance here rather than
         // left for whoever reads next. What it owes can include fencing dispatch, and work must not
         // be dispatched under an authority that a document already written on this disk withdrew.
@@ -1167,14 +1273,20 @@ impl Controller {
     async fn recover_claim(&self, reservation: &crate::registry::Reservation) -> Result<()> {
         let endpoint = self.paths.worker_endpoint(reservation.display_number)?;
         if let Some(key) = reservation.claimed_key
-            && let Ok(proof) = self
+            && let Ok((proof, described)) = self
                 .challenge(&endpoint, &key, reservation.session_id)
                 .await
         {
             // The worker is alive and is the one this reservation admitted. Its descriptor and its
             // registry row are rebuilt from its own signed answer.
-            self.adopt(reservation.display_number, &key, &proof, &endpoint)
-                .await?;
+            self.adopt(
+                reservation.display_number,
+                &key,
+                &proof,
+                &endpoint,
+                described,
+            )
+            .await?;
             let mut registry = self.registry.lock().await;
             registry.resolve_claim(reservation.reservation_id, LaunchPhase::Live)?;
             return Ok(());
@@ -1350,9 +1462,15 @@ impl Controller {
                 .challenge(&endpoint, &row.public_key, row.session_id)
                 .await
             {
-                Ok(proof) => {
-                    self.adopt(row.display_number, &row.public_key, &proof, &endpoint)
-                        .await?;
+                Ok((proof, described)) => {
+                    self.adopt(
+                        row.display_number,
+                        &row.public_key,
+                        &proof,
+                        &endpoint,
+                        described,
+                    )
+                    .await?;
                 }
                 // A worker that does not answer is not necessarily gone. Reconciliation asks the
                 // kernel; only a confirmed death produces a closure record.
@@ -1364,51 +1482,64 @@ impl Controller {
         Ok(())
     }
 
-    /// Challenges a worker against a key this daemon already holds, and presents its generation.
+    /// Challenges a worker against a key this daemon already holds, presents its generation, and
+    /// then asks the worker to describe its session ([`crate::directory::describe`]), which it may
+    /// not do.
     async fn challenge(
         &self,
         endpoint: &Endpoint,
         worker_public_key: &kr_protocol::scalars::AuthorisationKey,
         session_id: SessionId,
-    ) -> Result<kr_protocol::worker::WorkerVerifyProof> {
+    ) -> Result<(
+        kr_protocol::worker::WorkerVerifyProof,
+        Option<SessionSummary>,
+    )> {
         let identity = &self.identity;
         let generation = self.generation;
         let boot = self.boot_identity.clone();
         let endpoint_text = endpoint.as_text();
-        tokio::time::timeout(crate::directory::RECONNECT_TIMEOUT, async move {
-            let mut client =
-                LocalClient::connect(endpoint, LocalClientKind::Controller, self.build_id.clone())
-                    .await?;
-            let proof = client
-                .challenge_worker(
-                    worker_public_key,
-                    session_id,
-                    SessionEpoch::V1,
-                    &endpoint_text,
+        let (proof, mut client) =
+            tokio::time::timeout(crate::directory::RECONNECT_TIMEOUT, async move {
+                let mut client = LocalClient::connect(
+                    endpoint,
+                    LocalClientKind::Controller,
+                    self.build_id.clone(),
                 )
                 .await?;
-            client
-                .present_generation(move |nonce| {
-                    identity
-                        .generation_token(generation, &boot, nonce)
-                        .map_err(kr_ipc::IpcError::from)
-                })
-                .await?;
-            Ok::<_, ControllerError>(proof)
-        })
-        .await
-        .map_err(|_| {
-            ControllerError::supervision("the worker did not answer its challenge in time")
-        })?
+                let proof = client
+                    .challenge_worker(
+                        worker_public_key,
+                        session_id,
+                        SessionEpoch::V1,
+                        &endpoint_text,
+                    )
+                    .await?;
+                client
+                    .present_generation(move |nonce| {
+                        identity
+                            .generation_token(generation, &boot, nonce)
+                            .map_err(kr_ipc::IpcError::from)
+                    })
+                    .await?;
+                Ok::<_, ControllerError>((proof, client))
+            })
+            .await
+            .map_err(|_| {
+                ControllerError::supervision("the worker did not answer its challenge in time")
+            })??;
+        let described = crate::directory::describe(&mut client, session_id).await;
+        Ok((proof, described))
     }
 
-    /// Records a recovered worker and republishes its descriptor.
+    /// Records a recovered worker and republishes its descriptor, and admits the worker with the
+    /// description of its session it gave after its challenge, where it gave one.
     async fn adopt(
         &self,
         display_number: kr_protocol::session::DisplayNumber,
         worker_public_key: &kr_protocol::scalars::AuthorisationKey,
         proof: &kr_protocol::worker::WorkerVerifyProof,
         endpoint: &Endpoint,
+        described: Option<SessionSummary>,
     ) -> Result<()> {
         let record = WorkerRecord {
             session_id: proof.session_id,
@@ -1440,10 +1571,13 @@ impl Controller {
             published_at_ms: kr_ipc::now_ms(),
         };
         kr_ipc::descriptor::publish(&self.paths, &descriptor)?;
-        self.add_worker(KnownWorker {
-            descriptor,
-            endpoint: endpoint.clone(),
-        })
+        self.add_worker(
+            KnownWorker {
+                descriptor,
+                endpoint: endpoint.clone(),
+            },
+            described,
+        )
         .await;
         Ok(())
     }
@@ -1698,43 +1832,268 @@ impl Controller {
         }
     }
 
-    /// Advances the environment's authority revision and announces it.
+    /// Revokes this host's authority as it stands: one restrictive change of its own, retired by
+    /// the barrier ([`Self::barrier`]) this raises at once.
     ///
-    /// Advancing invalidates every outstanding dispatch lease at once, because a lease carries the
-    /// revision it was issued at, and deregisters every connection admitted under the authority
-    /// that has just been withdrawn. Both happen before the announcement travels, so nothing can
-    /// be admitted under the old revision while the new one is on its way.
+    /// Advancing the revision invalidates every outstanding dispatch lease at once, because a lease
+    /// carries the revision it was issued at, and deregisters every connection admitted under the
+    /// authority that has just been withdrawn. Both happen before the announcement travels, so
+    /// nothing can be admitted under the old revision while the new one is on its way.
+    ///
+    /// The change is its barrier, so a stop before it leaves nothing withdrawn and nothing owed: its
+    /// debt is held in memory alone.
     ///
     /// # Errors
     ///
-    /// Returns an error when the registry cannot be written.
+    /// Returns an error when the registry cannot be written. The debt stays published then, every
+    /// admission and forward is refused, and the next pass raises the barrier.
     pub async fn revoke_authority(&self) -> Result<RevocationBarrier> {
-        // The store's lock order is the registry first, then the connections. Admission takes the
-        // same two in the same order, so a connection cannot be registered against a revision this
-        // has already replaced.
-        let revision = {
+        self.publish_debts(&[(crate::grants::store::DebtId::fresh(), Reach::Host)]);
+        self.barrier().await
+    }
+
+    /// Writes one restrictive change's fence debt before its restriction takes effect, and holds it
+    /// as pending until the change has tried to take effect ([`Debts`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the row cannot be written. The change does not happen then: a
+    /// restriction whose debt is not on disk is one a stop could leave with no barrier after it.
+    pub(crate) fn owe_debt(
+        &self,
+        covers: &str,
+        reach: Reach,
+    ) -> Result<crate::grants::store::DebtId> {
+        let debt = self
+            .sharing
+            .grants()
+            .owe_fence(covers, kr_ipc::now_ms().get())?;
+        self.debts().pending.insert(debt, reach);
+        Ok(debt)
+    }
+
+    /// Publishes the debts of changes that have just tried to take effect ([`Debts`]).
+    ///
+    /// Called at once after the restriction, with nothing awaited in between, so a request that
+    /// stops waiting after its restriction cannot leave a debt its change owes unpublished. From
+    /// here a barrier owes them, and every admission and forward is refused until one retires them.
+    pub(crate) fn publish_debts(&self, debts: &[(crate::grants::store::DebtId, Reach)]) {
+        if debts.is_empty() {
+            return;
+        }
+        let mut held = self.debts();
+        for (debt, reach) in debts {
+            held.pending.remove(debt);
+            held.published.insert(*debt, *reach);
+        }
+    }
+
+    /// Publishes the debt of a change made where nothing can wait, and raises its barrier on a
+    /// task of its own.
+    ///
+    /// A voice revocation runs inside the voice coordinator's lock. A voice grant's withdrawal owes
+    /// no fence, but its cascade can also withdraw a grant delegated from it that is not a voice
+    /// grant, and that debt is published here the moment the store has committed, so every
+    /// admission and forward is refused until the barrier retires it.
+    pub(crate) fn publish_and_fence(self: &Arc<Self>, debt: crate::grants::store::DebtId) {
+        self.publish_debts(&[(debt, Reach::Host)]);
+        let daemon = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(error) = daemon.raise_owed_barrier().await {
+                eprintln!(
+                    "kr-controller: a barrier this host owes could not be raised yet, so nothing \
+                     is admitted or forwarded until it is: {error}"
+                );
+            }
+        });
+    }
+
+    fn debts(&self) -> std::sync::MutexGuard<'_, Debts> {
+        self.debts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Raises the one barrier every restrictive change on this host is retired by.
+    ///
+    /// Inside the registry critical section that advances the revision, the barrier captures every
+    /// published debt, and nothing else: memory is the one record of which debts a barrier may
+    /// take, so no row read from disk can be captured before its restriction, twice, or after an
+    /// earlier barrier captured it. A row on disk that no change of this run holds is published only
+    /// by a start, before anything is served. It advances the revision once for all of them and drops
+    /// them from memory; the connections admitted under what they withdrew are deregistered in the
+    /// same section. Their rows are deleted once the announcement has gone out. With nothing
+    /// captured it advances nothing and reports the barrier as it stands, which is how a debt that
+    /// a concurrent barrier already retired is answered.
+    ///
+    /// A debt is captured only once its restriction was attempted, and only one barrier captures
+    /// it, so the revision that retires it advanced after that restriction. A stop after the
+    /// revision advanced and before the rows were deleted leaves them on disk; the next start
+    /// publishes them, and its first barrier advances one more revision for them. That repeat
+    /// withdraws and grants nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be written or read. Every published debt stays
+    /// published then, so admission and forwarding stay refused until a later pass raises the
+    /// barrier.
+    pub(crate) async fn barrier(&self) -> Result<RevocationBarrier> {
+        match self.raise_barrier(true).await? {
+            Some(barrier) => Ok(barrier),
+            None => self.announce_authority_revision().await,
+        }
+    }
+
+    /// The barrier itself. With nothing captured it advances nothing, and reports the barrier as
+    /// it stands only when `report_when_idle` asks it to: a pass that found nothing to retire
+    /// announces nothing, so it never speaks to a worker beside a barrier that is.
+    async fn raise_barrier(&self, report_when_idle: bool) -> Result<Option<RevocationBarrier>> {
+        let captured = {
             let mut registry = self.registry.lock().await;
-            registry.advance_authority_revision()?;
-            let revision = registry.authority_revision()?;
-            let mut admitted = self.admitted_table();
-            admitted.retain(|_, connection| connection.admitted_revision >= revision);
-            drop(admitted);
-            revision
+            let captured = self.debts().published.clone();
+            if captured.is_empty() {
+                None
+            } else {
+                // The store's lock order is the registry first, then the connections. Admission
+                // takes the same two in the same order, so a connection cannot be registered
+                // against a revision this has already replaced.
+                registry.advance_authority_revision()?;
+                let revision = registry.authority_revision()?;
+                let host_wide = captured.values().any(|reach| *reach == Reach::Host);
+                let mut admitted = self.admitted_table();
+                if host_wide {
+                    admitted.retain(|_, connection| connection.admitted_revision >= revision);
+                } else {
+                    let revoked: std::collections::BTreeSet<ActorId> = captured
+                        .values()
+                        .filter_map(|reach| match reach {
+                            Reach::Device(device_id) => {
+                                Some(kr_transport::listener::device_principal(device_id))
+                            }
+                            Reach::Host => None,
+                        })
+                        .collect();
+                    // The connections that were not withdrawn hold authority these changes did not
+                    // touch, so they are admitted at the revision now in force. Work they had
+                    // already admitted still carries the revision it was admitted under, and is
+                    // refused inside its own transaction as before.
+                    admitted.retain(|_, connection| !revoked.contains(&connection.actor_id));
+                    for connection in admitted.values_mut() {
+                        connection.admitted_revision = revision;
+                    }
+                }
+                drop(admitted);
+                let mut debts = self.debts();
+                for debt in captured.keys() {
+                    debts.published.remove(debt);
+                    debts.retiring.insert(*debt);
+                }
+                Some((revision, captured, host_wide))
+            }
+        };
+        let Some((revision, captured, host_wide)) = captured else {
+            return if report_when_idle {
+                self.announce_authority_revision().await.map(Some)
+            } else {
+                Ok(None)
+            };
         };
         self.leases.revoke(revision);
         // The host policy decides a paired device's request against the revision in force, so it
         // follows this one. A grant issued from now on carries it, and a policy left at the
         // previous revision would refuse that grant as claiming a revision this host never issued.
-        // The registry is the durable record of the revision, and a restored policy takes the
-        // higher of the two, so there is nothing more to write here.
         self.policy
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .advance_authority_revision(revision);
-        // The registrations are gone; the connections that held them are told. A frame already
-        // waiting for its peer is stopped by its connection closing, not by the next check.
-        self.fence_network_connections().await;
-        self.announce_authority_revision().await
+        if host_wide {
+            // The registrations are gone; the connections that held them are told. A frame already
+            // waiting for its peer is stopped by its connection closing, not by the next check.
+            self.fence_network_connections().await;
+        }
+        let barrier = self.announce_authority_revision().await?;
+        self.update_policy(|policy| {
+            policy.advance_authority_revision(barrier.authority_revision);
+        })?;
+        {
+            // The feed numbers its entries from the same sequence the registry does, so a feed
+            // entry cannot later claim a revision a local revocation has already used.
+            let mut feed = self.authority_feed();
+            feed.note_revision(barrier.authority_revision);
+            self.sharing.grants().store_feed(&feed.snapshot())?;
+        }
+        // Last, because it is the record that these changes' barrier finished. A row this cannot
+        // delete stays on disk, and the next start raises one more barrier for it.
+        let retired: Vec<crate::grants::store::DebtId> = captured.keys().copied().collect();
+        match self.sharing.grants().fence_completed(&retired) {
+            Ok(()) => {
+                let mut debts = self.debts();
+                for debt in &retired {
+                    debts.retiring.remove(debt);
+                }
+            }
+            Err(error) => eprintln!(
+                "kr-controller: could not delete the fence debts a completed barrier retired, so \
+                 the next start raises one more barrier for them: {error}"
+            ),
+        }
+        Ok(Some(barrier))
+    }
+
+    /// Raises a barrier when a published debt is still owed one: a barrier that could not be
+    /// raised, or the debts a start found on disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns the barrier's error; the debts stay published.
+    pub(crate) async fn raise_owed_barrier(&self) -> Result<Option<RevocationBarrier>> {
+        if self.debts().published.is_empty() {
+            return Ok(None);
+        }
+        self.raise_barrier(false).await
+    }
+
+    /// Raises a barrier for every debt that stayed published across a whole
+    /// [`DEBT_PASS_INTERVAL`]: one whose own barrier failed, or one a start published.
+    ///
+    /// A change raises its own barrier the moment it publishes, and captures its debt within that
+    /// barrier's first step, so a debt still published an interval later has no barrier coming.
+    /// Waiting that long is what keeps the pass from racing a change to its own debt.
+    fn start_debt_pass(self: &Arc<Self>) {
+        // Weak, and taken only when a debt is owed, so the pass is never what keeps a daemon, and
+        // its environment lock, alive.
+        let daemon = Arc::downgrade(self);
+        let debts = Arc::clone(&self.debts);
+        tokio::spawn(async move {
+            let mut seen = std::collections::BTreeSet::new();
+            loop {
+                tokio::time::sleep(DEBT_PASS_INTERVAL).await;
+                let published: std::collections::BTreeSet<crate::grants::store::DebtId> = debts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .published
+                    .keys()
+                    .copied()
+                    .collect();
+                let stayed = published.intersection(&seen).next().is_some();
+                seen = published;
+                if daemon.strong_count() == 0 {
+                    return;
+                }
+                if !stayed {
+                    continue;
+                }
+                let Some(controller) = daemon.upgrade() else {
+                    return;
+                };
+                if let Err(error) = controller.raise_owed_barrier().await {
+                    eprintln!(
+                        "kr-controller: a barrier this host owes could not be raised yet, so \
+                         nothing is admitted or forwarded until it is: {error}"
+                    );
+                }
+            }
+        });
     }
 
     /// The environment's grants and invitations.
@@ -1825,8 +2184,16 @@ impl Controller {
             }
             None => self.sharing.revoke(grant_id, now_ms, || Ok(()), claim)?,
         };
-        self.complete_revocation(revocation.revoked.iter().copied().collect(), now_ms)
+        self.publish_debts(&Self::host_wide(revocation.debt));
+        self.complete_revocation(revocation.revoked.iter().copied().collect())
             .await
+    }
+
+    /// A revocation's debt, when it wrote one, as one that reaches every connection.
+    fn host_wide(
+        debt: Option<crate::grants::store::DebtId>,
+    ) -> Vec<(crate::grants::store::DebtId, Reach)> {
+        debt.into_iter().map(|debt| (debt, Reach::Host)).collect()
     }
 
     /// Revokes every grant one device holds, then revokes the device itself.
@@ -1862,7 +2229,7 @@ impl Controller {
         // Every write this makes happens while the registry guard is held, and the guard goes
         // before the fence, which takes it again. The block is what drops it: nothing this holds
         // may be alive across the await below.
-        let (revocation, lapsed, owes_fence) = {
+        let (revocation, lapsed, owes) = {
             let registry = match carried {
                 Some(carried) => {
                     let registry = self.registry.lock().await;
@@ -1877,6 +2244,8 @@ impl Controller {
                 || self.still_admitted(registry.as_deref(), carried),
                 claim,
             )?;
+            // The transaction that revoked is the restriction, and it has committed.
+            self.publish_debts(&Self::host_wide(revocation.debt));
             // The device record is marked revoked before the revision advances, so nothing can be
             // authorised against it in between. The directory is a view on this daemon's own
             // registry database, which is the file the network half keeps its device records in.
@@ -1907,14 +2276,17 @@ impl Controller {
                 .devices
                 .record_for_device(device_id)?
                 .is_some_and(|record| record.revoked_at_ms.is_none());
-            if record_is_live {
+            let record_debt = if record_is_live {
                 if !withdrew {
                     self.still_admitted(registry.as_deref(), carried)?;
                 }
-                self.sharing
-                    .grants()
-                    .owe_fence([kr_protocol::ids::GrantId::new(device_id.get())], now_ms)?;
-            }
+                Some(self.owe_debt(
+                    &format!("the revocation of device {device_id}'s record"),
+                    Reach::Host,
+                )?)
+            } else {
+                None
+            };
             // The last wait before the record is marked was the debt. A refusal here withdraws
             // nothing, but it leaves a fence owed, so it is answered *after* that fence rather
             // than in place of it.
@@ -1923,22 +2295,34 @@ impl Controller {
             } else {
                 self.still_admitted(registry.as_deref(), carried).err()
             };
+            let recorded = if lapsed.is_none() {
+                self.devices
+                    .revoke(device_id, TimestampMs::new(now_ms))
+                    .map(|_| ())
+            } else {
+                Ok(())
+            };
+            // The record's debt is published whether or not the record was marked: a barrier for
+            // a restriction that did not land withdraws nothing more, and a debt left pending would
+            // never be retired.
+            self.publish_debts(&Self::host_wide(record_debt));
+            recorded?;
             if lapsed.is_none() {
-                self.devices.revoke(device_id, TimestampMs::new(now_ms))?;
                 self.unbind_device(device_id);
             }
-            (revocation, lapsed, record_is_live)
+            let owes = revocation.debt.is_some() || record_debt.is_some();
+            (revocation, lapsed, owes)
         };
         match lapsed {
             // Nothing was withdrawn and nothing is owed, so there is nothing to finish.
-            Some(error) if !owes_fence => Err(error),
+            Some(error) if !owes => Err(error),
             Some(error) => {
-                self.complete_revocation(revocation.revoked.iter().copied().collect(), now_ms)
+                self.complete_revocation(revocation.revoked.iter().copied().collect())
                     .await?;
                 Err(error)
             }
             None => {
-                self.complete_revocation(revocation.revoked.iter().copied().collect(), now_ms)
+                self.complete_revocation(revocation.revoked.iter().copied().collect())
                     .await
             }
         }
@@ -1972,67 +2356,30 @@ impl Controller {
                 .transfer_control(plan, confirmation, &PairingTime, revision, now_ms);
         self.settle_floor();
         let transfer = transfer?;
+        self.publish_debts(&Self::host_wide(transfer.revoked.debt));
         let completed = self
-            .complete_revocation(transfer.revoked.revoked.iter().copied().collect(), now_ms)
+            .complete_revocation(transfer.revoked.revoked.iter().copied().collect())
             .await?;
         Ok((transfer, completed))
     }
 
-    /// Advances the revision, fences what was admitted under it, and reports the barrier.
+    /// Raises the one barrier after a revocation, and reports it.
     ///
-    /// Shared by both revocation paths so the order cannot drift between them.
-    ///
-    /// "Nothing changed" is not the same as "nothing is owed". A revocation that wrote its rows and
-    /// then failed before the revision advanced leaves revoked authority and no fence, and a retry
-    /// would see an empty set of *newly* revoked rows. So each half of a revocation writes its debt
-    /// down by identity before the fence is attempted, and only a completed fence clears it.
-    ///
-    /// Callers settling one debt at once fence for it once. The debt is read, fenced and cleared by
-    /// one caller at a time ([`Self::fence_settlement`]), so a caller that would have read the debt
-    /// while another was fencing for it reads it afterwards, finds it cleared, and answers with the
-    /// revision that fence advanced to. A fence whose clearing could not be written leaves the
-    /// debt owed, and the next caller fences again: a fence raised twice is safe, and a debt
-    /// dropped unfenced is not.
+    /// Shared by every revocation path so the order cannot drift between them. Each path publishes
+    /// its debts itself, once, the moment its restriction has been attempted; this captures them
+    /// with whatever else is owed. A revocation that found its work already done published none,
+    /// and its barrier captures whatever is still owed, which is how a retry of a revocation whose
+    /// barrier failed fences for it. Nothing newly withdrawn and nothing owed is answered with the
+    /// revision in force and the barrier as it stands.
     async fn complete_revocation(
         &self,
         revoked_grants: kr_protocol::scalars::CanonicalSet<kr_protocol::ids::GrantId>,
-        now_ms: u64,
     ) -> Result<kr_protocol::sharing::RevocationResult> {
-        let _ = now_ms;
-        let settling = self.fence_settlement.lock().await;
-        // Captured before the fence starts. A revocation that arrives while this fence is waiting
-        // on a worker records its own debt, and clearing the whole table afterwards would retire
-        // that one without ever fencing it.
-        let covered = self.sharing.grants().fence_owed()?;
-        if covered.is_empty() {
-            drop(settling);
-            // The work was already done and fenced. The answer is the revision in force and the
-            // barrier as it stands, with nothing newly withdrawn. Both come from the barrier: it
-            // reads the registry, which is where a revision is allocated, and a second reading
-            // taken separately can be a different one — another revocation advances it, and so
-            // does the network half. An answer that named one revision and carried a barrier for
-            // another would be evidence of no single moment.
-            let barrier = self.announce_authority_revision().await?;
-            return Ok(kr_protocol::sharing::RevocationResult {
-                authority_revision: barrier.authority_revision,
-                revoked_grants,
-                barrier,
-            });
-        }
-        let barrier = self.revoke_authority().await?;
-        self.update_policy(|policy| {
-            policy.advance_authority_revision(barrier.authority_revision);
-        })?;
-        {
-            // The feed numbers its entries from the same sequence the registry does, so a feed
-            // entry cannot later claim a revision a local revocation has already used.
-            let mut feed = self.authority_feed();
-            feed.note_revision(barrier.authority_revision);
-            self.sharing.grants().store_feed(&feed.snapshot())?;
-        }
-        // Last, because it is the record that this revocation's fence finished. Writing it before
-        // the fence would let a failure in between look like completed work.
-        self.sharing.grants().fence_completed(&covered)?;
+        // Both come from the barrier: it reads the registry, which is where a revision is
+        // allocated, and a second reading taken separately can be a different one. An answer that
+        // named one revision and carried a barrier for another would be evidence of no single
+        // moment.
+        let barrier = self.barrier().await?;
         Ok(kr_protocol::sharing::RevocationResult {
             authority_revision: barrier.authority_revision,
             revoked_grants,
@@ -2097,6 +2444,19 @@ impl Controller {
         Ok(value)
     }
 
+    /// Arms the pause a lease presentation stops at once it has read the clock, before it waits
+    /// for the policy's lock. Returns the end that says the presentation has arrived, and the end
+    /// that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_presentation_before_lock(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        self.before_presentation_lock.arm()
+    }
+
     /// Decides a membership lease a device presents to this host, and installs it when it is new.
     ///
     /// A paired device presents on its pairing's standing: paired, and its grant in force on both
@@ -2140,6 +2500,8 @@ impl Controller {
 
         let organisation_id = lease.payload.organisation_id;
         let reading = self.lifetimes.clock_trust().sample(&self.devices)?;
+        #[cfg(feature = "testing")]
+        self.before_presentation_lock.wait();
         let mut held = self
             .policy
             .lock()
@@ -2648,6 +3010,32 @@ impl Controller {
         Ok(effect())
     }
 
+    /// Ends this boot's lost clock continuity, now that the owner established the clock at
+    /// `established`.
+    ///
+    /// Recorded for the boot before it takes effect, so a restart of this daemon in the same boot
+    /// keeps the continuity it established rather than losing it again. A write that fails leaves
+    /// the continuity lost, which is the stricter answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be written.
+    pub(crate) async fn establish_clock_continuity(&self, established: TimestampMs) -> Result<()> {
+        self.registry
+            .lock()
+            .await
+            .establish_clock_continuity(self.boot_epoch, established)?;
+        self.utc_floor.establish_continuity();
+        Ok(())
+    }
+
+    /// The host's clock floor: the one reading of UTC every process of this environment decides
+    /// from in this boot.
+    #[must_use]
+    pub fn utc_floor(&self) -> &Arc<crate::grants::policy::UtcFloor> {
+        &self.utc_floor
+    }
+
     /// Returns which workers have not yet acknowledged the environment's authority revision.
     ///
     /// # Errors
@@ -2935,22 +3323,34 @@ impl Controller {
     ///
     /// Returns [`ControllerError::PermissionDenied`] while the fence is owed.
     fn check_fence(&self) -> Result<()> {
-        // A fence this host owes and could not raise stops everything it would have fenced. The
-        // revision did not advance, so the registry still reports every connection as admitted;
-        // refusing here is what keeps work admitted under a withdrawn ceiling from being
-        // dispatched while the withdrawal is still owed.
-        if self
-            .fence_unraised
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
+        // A restriction whose barrier has not retired it stops everything that barrier would have
+        // fenced. The revision did not advance, so the registry still reports every connection as
+        // admitted; refusing here is what keeps work admitted under withdrawn authority from being
+        // dispatched while the withdrawal is still owed. A pending debt refuses nothing: its
+        // restriction is not in force yet.
+        if !self.debts().published.is_empty() {
             return Err(ControllerError::PermissionDenied {
-                detail: "this host's configuration withdrew authority and the fence that \
-                         withdrawal owes could not be raised, so nothing admitted under it is \
-                         dispatched; run kr doctor to see what stopped it"
+                detail: "this host withdrew authority and the fence that withdrawal owes could \
+                         not be raised yet, so nothing admitted under it is dispatched; run kr \
+                         doctor to see what stopped it"
                     .to_owned(),
             });
         }
         Ok(())
+    }
+
+    /// Holds a published debt, or lets every one go, for this host's own tests of what refuses
+    /// while a barrier is owed.
+    #[cfg(test)]
+    fn hold_fence(&self, held: bool) {
+        let mut debts = self.debts();
+        if held {
+            debts
+                .published
+                .insert(crate::grants::store::DebtId::fresh(), Reach::Host);
+        } else {
+            debts.published.clear();
+        }
     }
 
     /// The admission a service asks again from inside the work a mutation has begun.
@@ -3210,6 +3610,42 @@ impl Controller {
         self.delivery_runtime.attach_transport(transports)
     }
 
+    /// The proxy this host's outbound HTTPS goes through: the configuration document's
+    /// `network.proxy_url` as this daemon read it when it started, or `None` when it named none.
+    ///
+    /// It is the reading the network endpoint was built from, so the endpoint, the rendezvous,
+    /// delivery and the plugin catalogue never go through two different proxies, and an edit
+    /// applies to all of them at the next start.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::InvalidArgument`] naming `network.proxy_url` when the address it
+    /// holds is not one this host can use as a proxy.
+    pub fn started_proxy(&self) -> Result<Option<kr_transport::config::ProxyUrl>> {
+        Self::proxy_of(&self.started)
+    }
+
+    /// The proxy `started` selects, read as the network endpoint reads it.
+    fn proxy_of(
+        started: &crate::config::Started,
+    ) -> Result<Option<kr_transport::config::ProxyUrl>> {
+        started
+            .network
+            .proxy_url()
+            .map(|value| {
+                value
+                    .parse()
+                    .map_err(|error: kr_transport::config::ProxyUrlError| {
+                        ControllerError::InvalidArgument(format!(
+                            "network.proxy_url in this host's configuration document ({}) is not \
+                             usable: {error}",
+                            kr_protocol::hostinfo::configuration::FILE_NAME
+                        ))
+                    })
+            })
+            .transpose()
+    }
+
     /// The environment's automation service.
     #[must_use]
     pub const fn automation(&self) -> &Arc<crate::automation::AutomationModule> {
@@ -3228,9 +3664,13 @@ impl Controller {
         Arc::new(AttentionReach(self.me.clone()))
     }
 
-    /// Adds a verified worker to the directory and starts reading its attention sources.
-    async fn add_worker(&self, worker: KnownWorker) {
-        self.directory.lock().await.insert(worker.clone());
+    /// Adds a verified worker to the directory, with its own description of its session where
+    /// this daemon has one (`Directory::insert`), and starts reading its attention sources.
+    async fn add_worker(&self, worker: KnownWorker, described: Option<SessionSummary>) {
+        self.directory
+            .lock()
+            .await
+            .insert(worker.clone(), described);
         self.attention.watch(self.attention_reach(), worker);
     }
 
@@ -3576,10 +4016,14 @@ impl Controller {
         };
         kr_ipc::descriptor::publish(&self.paths, &descriptor)?;
         let endpoint = Endpoint::from_path(&ready.endpoint)?;
-        self.add_worker(KnownWorker {
-            descriptor,
-            endpoint,
-        })
+        // No description yet: the create waiting on this report asks the worker for one at once.
+        self.add_worker(
+            KnownWorker {
+                descriptor,
+                endpoint,
+            },
+            None,
+        )
         .await;
         Ok(())
     }
@@ -3632,6 +4076,7 @@ impl Controller {
             Arc::clone(&self.sharing),
             Arc::clone(&self.devices),
             self.sharing.host_device_id(),
+            self.me.clone(),
         ));
         // Reaching a managed service needs an HTTP exchange, which the client library leaves to
         // the embedder: a desktop build, a mobile build and a test each reach the network
@@ -4003,6 +4448,7 @@ impl Controller {
             Arc::clone(&self.sharing),
             Arc::clone(&self.devices),
             self.sharing.host_device_id(),
+            self.me.clone(),
         );
         let store = |error: kr_voice::VoiceError| ControllerError::Refused {
             code: error.code(),
@@ -5527,10 +5973,9 @@ impl Controller {
         else {
             return Err(unfinished_and_unknown());
         };
-        let now_ms = self.settled_now_ms();
         encode(
             &self
-                .complete_revocation(withdrawn.into_iter().collect(), now_ms)
+                .complete_revocation(withdrawn.into_iter().collect())
                 .await?,
         )
     }
@@ -6776,6 +7221,13 @@ impl Controller {
         // it produced a document and as it was when it did not. Before the fence below, so a
         // narrower ceiling decides every request from here on while the work admitted under the
         // wider one is fenced; a reading that decided nothing lifts nothing.
+        //
+        // A ceiling that moves is a restrictive change: its debt is written before the ceiling
+        // moves, and published once it has. A ceiling whose debt cannot be written does not move:
+        // the acceptance reports that, and is attempted again by the next one, since the record of
+        // what this environment accepted advances only once every effect landed.
+        let mut ceiling_debt = None;
+        let mut ceiling_failure = None;
         let (rights, ceiling_moved) = {
             let mut held = self
                 .rights_ceiling
@@ -6786,15 +7238,36 @@ impl Controller {
             if let Some(document) = decided {
                 let configured = crate::config::ceilings::configured_rights(&document.ceilings);
                 moved = *held != configured;
-                *held = configured;
                 if moved {
-                    self.advance_authority_epoch();
+                    match self.owe_debt("a change of the rights ceiling", Reach::Host) {
+                        Ok(debt) => {
+                            ceiling_debt = Some(debt);
+                            *held = configured;
+                            self.advance_authority_epoch();
+                        }
+                        Err(error) => {
+                            moved = false;
+                            ceiling_failure = Some(
+                                Sentence::new()
+                                    .stated(
+                                        "the rights ceiling did not change, because the fence its \
+                                         change owes could not be written down: ",
+                                    )
+                                    .withheld(ContentClass::Message, &error.to_string()),
+                            );
+                        }
+                    }
                 }
+            }
+            if let Some(debt) = ceiling_debt {
+                self.publish_debts(&[(debt, Reach::Host)]);
             }
             (
                 crate::config::EnforcedRights {
                     ceiling: held.clone(),
-                    from_document: decided.is_some(),
+                    // A ceiling kept because its change could not be written down is not the one
+                    // this document names.
+                    from_document: decided.is_some() && ceiling_failure.is_none(),
                 },
                 moved,
             )
@@ -6810,11 +7283,22 @@ impl Controller {
         // Nothing else settles it: once the ceiling it answered for is in force, no reading moves
         // anything, and a reading that let the debt go would leave the work admitted under the
         // withdrawn ceiling admitted.
-        owed.fences_dispatch |= ceiling_moved
-            || self
-                .fence_unraised
-                .load(std::sync::atomic::Ordering::SeqCst);
+        // A fence this acceptance owes for its own change: its ceiling moved, or the document it
+        // reads withdrew something the ceiling in force already matched. A ceiling that could not
+        // move withdrew nothing, so it owes none. A debt an earlier barrier left published is
+        // raised too, and its own debt is never created for it: if another barrier captures that
+        // debt first, this one captures nothing and reports the barrier as it stands.
+        let owes_own = (owed.fences_dispatch || ceiling_moved) && ceiling_failure.is_none();
+        let owed_elsewhere = !self.debts().published.is_empty();
+        owed.fences_dispatch = owes_own || owed_elsewhere;
+        let fence_now = owed.fences_dispatch;
         let (sessions, mut failure) = self.apply_session_limit(&resolver, &state).await;
+        if let Some(problem) = ceiling_failure {
+            failure = Some(match failure {
+                Some(earlier) => earlier.stated("; ").sentence(&problem),
+                None => problem,
+            });
+        }
         if sessions.from_document {
             // Recorded the moment the registry took it, separately from everything below. A later
             // effect that fails does not put this number back, and a state that said it had would
@@ -6827,7 +7311,7 @@ impl Controller {
         // decided nothing that survived it.
         let (owed_before, mut unreadable) = self.fence_owed().await;
         let mut barrier = None;
-        if owed.fences_dispatch {
+        if fence_now {
             // Attempted whatever else failed, because the values above are already in force: the
             // narrower ceiling decides every request from here on, and the work admitted under the
             // one it replaced is dispatchable until the revision advances. An effect that failed
@@ -6835,21 +7319,22 @@ impl Controller {
             //
             // Before anything is told the ceiling moved. Work admitted under the ceiling this
             // document withdrew has to stop being dispatchable first, whoever wrote the document.
-            // The revision advance writes the debt with it, so the fence is recorded as owed
-            // before the announcement travels and before any effect below runs.
-            match self.revoke_authority().await {
+            // The revision advance writes the worker debt with it, so the fence is recorded as
+            // owed before the announcement travels and before any effect below runs. A fence owed
+            // with no debt of this acceptance's own, for a document whose ceiling the one in force
+            // already matched, is raised under a debt held in memory.
+            if owes_own && ceiling_debt.is_none() {
+                self.publish_debts(&[(crate::grants::store::DebtId::fresh(), Reach::Host)]);
+            }
+            match self.barrier().await {
                 Ok(raised) => {
                     barrier = Some(raised);
-                    self.fence_unraised
-                        .store(false, std::sync::atomic::Ordering::SeqCst);
                 }
                 Err(error) => {
-                    // Before the report, because what this flag stops is dispatch and the report
-                    // is read afterwards. Work admitted under the ceiling this document withdrew
-                    // is still dispatchable until the revision advances, and the revision is
-                    // exactly what did not advance.
-                    self.fence_unraised
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    // The debt stays published, so every admission and forward is refused before
+                    // the report is read: work admitted under the ceiling this document withdrew is
+                    // still dispatchable until the revision advances, and the revision is exactly
+                    // what did not advance. The next pass raises the barrier.
                     let fenced = Sentence::new()
                         .stated("dispatch could not be fenced: ")
                         .withheld(ContentClass::Message, &error.to_string());
@@ -7501,11 +7986,31 @@ impl Controller {
         let mut sessions = Vec::new();
         let workers: Vec<KnownWorker> = self.directory.lock().await.iter().cloned().collect();
         for worker in workers {
-            match self.read_from_worker(&worker).await {
-                Ok(read) => sessions.push(read.session),
+            let session_id = worker.descriptor.session_id;
+            let session = match self.read_from_worker(&worker).await {
+                Ok(read) => Some(read.session),
+                // As for a read, and in the same order: a session whose closure is recorded is
+                // listed with the closed sessions below, and one whose worker is on its way out is
+                // listed as this daemon last knew it.
                 Err(_) => {
-                    let _ = self.reconcile(worker.descriptor.session_id).await;
+                    if matches!(self.reconcile(session_id).await, Ok(None)) {
+                        let ending = self.directory.lock().await.ending(session_id);
+                        let recorded = self.registry.lock().await.closure(session_id);
+                        match (recorded, ending) {
+                            (Ok(None), Some(read)) => Some(read.session),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
                 }
+            };
+            // A session that has closed is listed only where closed sessions were asked for,
+            // whether its worker said so or this daemon's record did.
+            if let Some(session) = session
+                && (params.include_closed || session.state != SessionState::Closed)
+            {
+                sessions.push(session);
             }
         }
         if params.include_closed {
@@ -7549,9 +8054,31 @@ impl Controller {
                 }
                 // A worker that cannot be reached is not necessarily gone. Reconciliation asks the
                 // kernel; only a confirmed death produces a closure record.
+                //
+                // Short of that, the session is answered from this daemon's own record rather than
+                // with the failed connection. A worker that has finished its closure stops
+                // answering before the kernel says it has ended, and a read that meets it on its
+                // way out is owed the session's state: its closure where one was recorded
+                // meanwhile, by the close's watcher or another path, and otherwise the session
+                // closing (`Directory::ending`). Only where this daemon has no word of an end is
+                // there nothing to answer with, and that read is refused as one to try again.
+                //
+                // The directory is asked before the registry. A closure is written to the registry
+                // before its worker leaves the directory, so a worker found gone from the
+                // directory has its closure in the registry by the time the registry is asked, and
+                // the closure is the answer wherever there is one.
                 Err(error) => {
                     if self.reconcile(params.session_id).await?.is_none() {
-                        return Err(error);
+                        #[cfg(test)]
+                        self.before_the_record.wait().await;
+                        let ending = self.directory.lock().await.ending(params.session_id);
+                        let recorded = self.registry.lock().await.closure(params.session_id)?;
+                        if recorded.is_none() {
+                            return match ending {
+                                Some(read) => encode(&read),
+                                None => Err(error),
+                            };
+                        }
                     }
                 }
             }
@@ -8290,20 +8817,27 @@ impl Controller {
                     Some(record) => {
                         self.record_closure_once(record).await?;
                     }
-                    // The worker has accepted the close and is stopping its processes. Something
-                    // has to notice when that finishes, so the tombstone is written and the
-                    // descriptor removed rather than left pointing at a process that has gone.
-                    None => {
-                        tokio::spawn(
-                            Arc::clone(self)
-                                .watch_closure(params.session_id, ClosureReason::CloseRequested),
-                        );
-                    }
+                    // The worker has accepted the close and is stopping its processes.
+                    None => self.close_accepted(params.session_id).await,
                 }
                 encode(&reply)
             }
             Err(error) => Err(ControllerError::InvalidArgument(error.to_string())),
         }
+    }
+
+    /// Settles what follows a worker's acceptance of a close this daemon passed to it.
+    ///
+    /// The session is closing from here until its closure is recorded, which is what a read that
+    /// meets the worker on its way out is answered with (`Directory::ending`). Nothing is asked of
+    /// the worker here: the link the acceptance came over is the one the worker is holding its
+    /// close on until the caller has the acceptance, and an exchange that ended that link would
+    /// start the close early. Something also has to notice when the worker finishes, so the
+    /// tombstone is written and the descriptor removed rather than left pointing at a process that
+    /// has gone.
+    pub(crate) async fn close_accepted(self: &Arc<Self>, session_id: SessionId) {
+        self.directory.lock().await.accepted_close(session_id);
+        tokio::spawn(Arc::clone(self).watch_closure(session_id, ClosureReason::CloseRequested));
     }
 
     /// Waits for a closing worker to end, then records its closure and retires it.
@@ -9006,11 +9540,20 @@ impl Controller {
                 return Err(error.into());
             }
         };
-        match result {
+        let read = match result {
             Ok(value) => reported_read(&value)
-                .map_err(|error| ControllerError::InvalidArgument(error.to_string())),
-            Err(error) => Err(ControllerError::InvalidArgument(error.to_string())),
-        }
+                .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?,
+            Err(error) => return Err(ControllerError::InvalidArgument(error.to_string())),
+        };
+        // Kept for the moment this worker can no longer be asked (`Directory::ending`), while the
+        // link is still held: every exchange with this worker runs over it in turn, so what the
+        // worker said is kept in the order it said it.
+        self.directory
+            .lock()
+            .await
+            .heard(worker.descriptor.session_id, &read.session);
+        drop(held);
+        Ok(read)
     }
 
     /// Returns this daemon's one connection to a worker, opening it if there is none.
@@ -9169,6 +9712,75 @@ pub struct ControllerSetup {
 /// # Errors
 ///
 /// Returns [`ControllerError::ShellIntegrationUnsupported`] naming the shell, never a substitution.
+/// Opens, adopts or creates this environment's clock floor for the boot, and says whether the
+/// boot's clock continuity is lost.
+///
+/// Three cases, told apart by the file and by the registry's record of the floors created in
+/// this boot:
+///
+/// 1. A file of this environment and boot that passes every check, whose identity is not recorded
+///    as lost: opened as it stands, never truncated or replaced, so every worker that outlived a
+///    daemon restart keeps mapping the same word. An identity the registry does not know (a start
+///    that stopped between publishing the file and recording it) is recorded now.
+/// 2. No usable file and no floor recorded for this boot: the boot's first start. A new floor is
+///    created under a fresh identity and recorded as the boot's floor in force.
+/// 3. No usable file and a floor recorded for this boot: the floor was lost, and a worker of this
+///    boot may still map it. The boot's clock continuity is recorded as lost first, then a new
+///    floor is created and recorded in force. A reading published only in the lost floor may have
+///    passed a deadline nothing on record shows as passed, so until the owner establishes the
+///    clock no bound that can pass is decided ([`crate::grants::policy::UtcFloor::bound`]).
+///
+/// A file of another boot, one that fails a check, and one whose identity is recorded as lost
+/// count as no usable file and are replaced: a lost floor moved back into place is never adopted.
+/// A new floor's first value is `durable_ms`, the floor this host last wrote down.
+fn open_utc_floor(
+    registry: &mut Registry,
+    paths: &EnvironmentPaths,
+    environment_id: EnvironmentId,
+    boot_epoch: BootEpoch,
+    durable_ms: u64,
+) -> Result<(Arc<kr_ipc::floor::SharedFloor>, bool)> {
+    use kr_ipc::floor::SharedFloor;
+
+    registry.forget_other_boots(boot_epoch)?;
+    let recorded = registry.floors_of_boot(boot_epoch)?;
+    let path = paths.utc_floor_file();
+    let adopted = SharedFloor::open(&path, environment_id, boot_epoch)
+        .ok()
+        .filter(|floor| {
+            let identity = floor.identity();
+            !recorded
+                .iter()
+                .any(|known| Some(known.identity) == identity && !known.in_force)
+        });
+    let floor = match adopted {
+        Some(floor) => {
+            if let Some(identity) = floor.identity()
+                && !recorded.iter().any(|known| known.identity == identity)
+            {
+                registry.record_floor_in_force(boot_epoch, identity, kr_ipc::now_ms())?;
+            }
+            floor
+        }
+        None => {
+            if !recorded.is_empty() {
+                registry.lose_clock_continuity(boot_epoch, kr_ipc::now_ms())?;
+            }
+            let floor = SharedFloor::create(&path, environment_id, boot_epoch, durable_ms)?;
+            let identity =
+                floor
+                    .identity()
+                    .ok_or_else(|| ControllerError::RegistryUnavailable {
+                        detail: "a clock floor created from a file has no identity".to_owned(),
+                    })?;
+            registry.record_floor_in_force(boot_epoch, identity, kr_ipc::now_ms())?;
+            floor
+        }
+    };
+    let lost = registry.clock_continuity_lost(boot_epoch)?;
+    Ok((Arc::new(floor), lost))
+}
+
 fn qualified_package(root: Option<&Path>, requested: Option<&str>) -> Result<PathBuf> {
     use kr_shell_integration::host::package::{PackageSet, default_package_root};
 
@@ -9198,7 +9810,7 @@ fn qualified_package(root: Option<&Path>, requested: Option<&str>) -> Result<Pat
 /// # Errors
 ///
 /// Returns the decoding failure when the answer is neither shape.
-fn reported_read(value: &ParamsValue) -> std::result::Result<SessionReadResult, String> {
+pub(crate) fn reported_read(value: &ParamsValue) -> std::result::Result<SessionReadResult, String> {
     match value.to_typed::<SessionReadResult>() {
         Ok(read) => Ok(read),
         // The older shape is checked against its own schema before it is decoded, like any
@@ -10086,19 +10698,26 @@ mod a_create_that_launches_nothing {
         (connection_id, actor_id)
     }
 
-    /// Waits until the create under test has written its reservation.
+    /// Waits until the create under test has written its reservation, and fails the test when it
+    /// has not within thirty seconds: a create that stopped before its reservation would otherwise
+    /// hold the test, and the job running it, for ever.
     async fn reserved(controller: &Controller) {
-        loop {
-            let registry = controller.registry.lock().await;
-            let reserved = registry
-                .reservations_in(LaunchPhase::Reserved)
-                .expect("reads the reservations");
-            drop(registry);
-            if !reserved.is_empty() {
-                return;
+        const BOUND: Duration = Duration::from_secs(30);
+        tokio::time::timeout(BOUND, async {
+            loop {
+                let registry = controller.registry.lock().await;
+                let reserved = registry
+                    .reservations_in(LaunchPhase::Reserved)
+                    .expect("reads the reservations");
+                drop(registry);
+                if !reserved.is_empty() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the create wrote no reservation within {BOUND:?}"));
     }
 
     /// KR-REQ-08.44: an invisible session has no terminal, so probed colours are refused.
@@ -11312,9 +11931,7 @@ mod a_create_that_launches_nothing {
             .check_registration(&live)
             .expect("a live admission stands");
 
-        controller
-            .fence_unraised
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        controller.hold_fence(true);
         let refused = controller
             .check_registration(&live)
             .expect_err("a fence this host owes stops it");
@@ -11332,9 +11949,7 @@ mod a_create_that_launches_nothing {
             ErrorCode::PermissionDenied
         );
 
-        controller
-            .fence_unraised
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        controller.hold_fence(false);
         controller
             .check_registration(&live)
             .expect("the admission stands again once the fence is no longer owed");
@@ -11377,9 +11992,7 @@ mod a_create_that_launches_nothing {
         };
 
         // The daemon's first answer was given; the withdrawal's fence fails after it.
-        controller
-            .fence_unraised
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        controller.hold_fence(true);
         let refused = controller
             .project
             .write(
@@ -11447,6 +12060,7 @@ mod a_create_that_launches_nothing {
             Arc::clone(&controller.sharing),
             Arc::clone(&controller.devices),
             controller.sharing.host_device_id(),
+            Arc::downgrade(&controller),
         );
         let plan = voice_plan(&controller);
         let held = |device_id| {
@@ -11462,9 +12076,7 @@ mod a_create_that_launches_nothing {
         // A fence owed after the admission: nothing is written, and the fence is what the caller
         // is told.
         let fenced = admission(live_admission(&controller, connection_id));
-        controller
-            .fence_unraised
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        controller.hold_fence(true);
         let refused = authority
             .issue(&plan, &fenced)
             .expect_err("the fence stops the write");
@@ -11481,9 +12093,7 @@ mod a_create_that_launches_nothing {
         );
 
         // The same admission once the fence is no longer owed.
-        controller
-            .fence_unraised
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        controller.hold_fence(false);
         let written = authority
             .issue(
                 &plan,
@@ -11493,9 +12103,7 @@ mod a_create_that_launches_nothing {
 
         // A withdrawal under a fence owed is refused inside the store's own transaction, and the
         // grant stays as it was.
-        controller
-            .fence_unraised
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        controller.hold_fence(true);
         let withdrawing = admission(live_admission(&controller, connection_id));
         authority
             .revoke(written.grant_id, 5, &withdrawing)
@@ -11508,9 +12116,7 @@ mod a_create_that_launches_nothing {
                 .all(|record| record.revoked_at_ms.is_none()),
             "nothing was withdrawn"
         );
-        controller
-            .fence_unraised
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        controller.hold_fence(false);
 
         // A registration withdrawn after the admission: the deadline still has time on it, and the
         // write is refused all the same.
@@ -11534,6 +12140,139 @@ mod a_create_that_launches_nothing {
             held(other.recipient_device_id).is_empty(),
             "no voice grant was written"
         );
+    }
+
+    /// A voice grant's withdrawal owes no fence. Withdrawing one through the seam, as stopping a
+    /// call or replacing a standing grant does, writes no debt, publishes none and advances no
+    /// revision: no worker holds work under a grant that carries `voice.use`. The control: a grant
+    /// delegated from a voice grant that is not one itself is withdrawn with it, and the debt it
+    /// owes is published the moment the store commits and retired by one barrier.
+    ///
+    /// On one thread, so the spawned barrier cannot run before the publication is checked.
+    #[tokio::test]
+    async fn a_voice_grants_withdrawal_through_the_seam_fences_nothing() {
+        use kr_voice::seams::VoiceAuthority as _;
+
+        let (_temp, controller, _asked) = daemon().await;
+        let (connection_id, _actor_id) = admitted(&controller).await;
+        let authority = crate::voice::GrantAuthority::new(
+            Arc::clone(&controller.sharing),
+            Arc::clone(&controller.devices),
+            controller.sharing.host_device_id(),
+            Arc::downgrade(&controller),
+        );
+        let admission = |carried| super::VoiceAdmission::new(Arc::clone(&controller), carried);
+        let revision = || {
+            let controller = Arc::clone(&controller);
+            async move {
+                controller
+                    .registry
+                    .lock()
+                    .await
+                    .authority_revision()
+                    .expect("readable")
+                    .get()
+            }
+        };
+        let before = revision().await;
+
+        let plan = voice_plan(&controller);
+        let voice = authority
+            .issue(
+                &plan,
+                &admission(live_admission(&controller, connection_id)),
+            )
+            .expect("a voice grant");
+        authority
+            .revoke(
+                voice.grant_id,
+                5,
+                &admission(live_admission(&controller, connection_id)),
+            )
+            .expect("withdrawn");
+        assert!(
+            controller
+                .sharing
+                .grants()
+                .fence_owed()
+                .expect("readable")
+                .is_empty(),
+            "a voice grant's withdrawal writes no debt"
+        );
+        assert!(
+            controller.debts().published.is_empty(),
+            "and publishes none"
+        );
+        controller.check_fence().expect("so nothing is refused");
+        assert_eq!(revision().await, before, "and no barrier advances");
+
+        // The control: a standing voice grant that may share, and a grant delegated from it that
+        // carries no voice right.
+        let mut sharing_plan = voice_plan(&controller);
+        sharing_plan
+            .rights
+            .insert(kr_protocol::rights::ActionRight::SessionShare);
+        let voice = authority
+            .issue(
+                &sharing_plan,
+                &admission(live_admission(&controller, connection_id)),
+            )
+            .expect("a voice grant that may share");
+        let delegated = kr_protocol::grant::Grant {
+            grant_id: kr_protocol::ids::GrantId::new(kr_ipc::new_uuid()),
+            parent_grant_id: Nullable::some(voice.grant_id),
+            issuer_device_id: voice.recipient_device_id,
+            recipient_device_id: kr_protocol::ids::DeviceId::new(kr_ipc::new_uuid()),
+            actions: [kr_protocol::rights::ActionRight::SessionView]
+                .into_iter()
+                .collect(),
+            ..voice.clone()
+        };
+        controller
+            .sharing
+            .grants()
+            .issue(
+                &crate::grants::GrantRecord {
+                    grant: delegated,
+                    session_id: None,
+                    issued_at_ms: 1,
+                    activated_at_ms: Some(1),
+                    revoked_at_ms: None,
+                    revoked_by_parent: None,
+                },
+                || Ok(()),
+            )
+            .expect("a delegated grant");
+        authority
+            .revoke(
+                voice.grant_id,
+                6,
+                &admission(live_admission(&controller, connection_id)),
+            )
+            .expect("withdrawn with what was delegated from it");
+        let owed = controller.sharing.grants().fence_owed().expect("readable");
+        assert_eq!(owed.len(), 1, "the delegated grant owes one debt");
+        assert!(
+            controller.debts().published.contains_key(&owed[0]),
+            "published the moment the store committed"
+        );
+        controller
+            .check_fence()
+            .expect_err("every admission is refused until its barrier");
+        controller
+            .raise_owed_barrier()
+            .await
+            .expect("the barrier is raised");
+        assert_eq!(revision().await, before + 1, "one barrier retires it");
+        assert!(
+            controller
+                .sharing
+                .grants()
+                .fence_owed()
+                .expect("readable")
+                .is_empty()
+        );
+        controller.check_fence().expect("and nothing is refused");
     }
 
     /// The voice admission, asked through a probe that first records whether the grant store held
@@ -11590,6 +12329,7 @@ mod a_create_that_launches_nothing {
             Arc::clone(&controller.sharing),
             Arc::clone(&controller.devices),
             controller.sharing.host_device_id(),
+            Arc::downgrade(&controller),
         );
         let probe = |carried| AskedUnderTheStoreLock {
             admission: super::VoiceAdmission::new(Arc::clone(&controller), carried),
@@ -11619,9 +12359,7 @@ mod a_create_that_launches_nothing {
 
         // A fence owed: asked under the lock all the same, refused with the fence's own refusal,
         // and nothing written.
-        controller
-            .fence_unraised
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        controller.hold_fence(true);
         let fenced = probe(live_admission(&controller, connection_id));
         let other = voice_plan(&controller);
         authority
@@ -11643,9 +12381,7 @@ mod a_create_that_launches_nothing {
                 .is_empty(),
             "no voice grant was written"
         );
-        controller
-            .fence_unraised
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        controller.hold_fence(false);
     }
 
     /// A mutation forwarded to a worker is asked the admission it arrived under at the last point
@@ -11683,9 +12419,7 @@ mod a_create_that_launches_nothing {
             .await
             .expect("a standing admission is forwarded");
 
-        controller
-            .fence_unraised
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        controller.hold_fence(true);
         let refused = controller
             .forwarded_deadline(session_id, &envelope, accepted)
             .await
@@ -11698,9 +12432,7 @@ mod a_create_that_launches_nothing {
             refused.to_string().contains("could not be raised"),
             "{refused}"
         );
-        controller
-            .fence_unraised
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        controller.hold_fence(false);
 
         controller.deregister(connection_id);
         let refused = controller
@@ -11821,7 +12553,6 @@ mod a_close_a_worker_never_answers {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use kr_crypto::store::MemoryStore;
     use kr_ipc::endpoint::Listener;
     use kr_ipc::framed::split;
     use kr_ipc::verify::WorkerIdentity;
@@ -11860,16 +12591,22 @@ mod a_close_a_worker_never_answers {
         }
     }
 
-    /// An endpoint that proves itself as a worker and then answers nothing.
+    /// Every frame a recording worker was sent after its handshake, in arrival order.
+    pub(super) type Recorded = Arc<std::sync::Mutex<Vec<ControlFrame>>>;
+
+    /// An endpoint that proves itself as a worker and then performs nothing.
     ///
     /// It completes the handshake the daemon makes before it will speak to a worker at all (the
-    /// version exchange, the challenge over the descriptor's key and the controller generation)
-    /// and then reads whatever arrives without replying. That is a worker that has stopped
-    /// answering, which is different from one that has gone: the connection stays open.
-    fn serve_silent_worker(
+    /// version exchange, the challenge over the descriptor's key and the controller generation).
+    /// A silent one (`recorded` absent) then reads whatever arrives without replying. That is a
+    /// worker that has stopped answering, which is different from one that has gone: the
+    /// connection stays open. A recording one keeps every frame it is sent and refuses each
+    /// request and forwarded frame at once, so a test can read exactly what reached a worker.
+    fn serve_fake_worker(
         listener: Listener,
         identity: Arc<WorkerIdentity>,
         endpoint_text: String,
+        recorded: Option<Recorded>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             loop {
@@ -11878,52 +12615,40 @@ mod a_close_a_worker_never_answers {
                 };
                 let identity = Arc::clone(&identity);
                 let endpoint_text = endpoint_text.clone();
+                let recorded = recorded.clone();
                 tokio::spawn(async move {
                     let (mut reader, mut writer) = split(connection, StreamKind::Control);
                     let connection_id = ConnectionId::new(kr_ipc::new_uuid());
                     while let Ok(frame) = reader.read_message::<ControlFrame>().await {
-                        let answers = match frame {
-                            ControlFrame::Hello(_) => vec![
-                                ControlFrame::HelloAck(Box::new(LocalHelloAck {
-                                    selected_version: kr_protocol::hello::PROTOCOL_VERSION,
-                                    role: LocalRole::Worker,
-                                    connection_id,
-                                    environment_id: identity_environment(),
-                                    boot_identity: kr_ipc::identity::boot_identity()
-                                        .expect("a boot identity"),
-                                    peer: peer.to_wire(),
-                                    action_window: ActionWindow {
-                                        action_window_id: ActionWindowId::new("worker:test")
-                                            .expect("a window"),
-                                        connection_id,
-                                        boot_epoch: kr_protocol::ids::BootEpoch::new(1),
-                                        issued_at_ms: kr_ipc::now_ms(),
-                                        valid_for_ms: DurationMs::new(60_000),
+                        let handshake =
+                            handshake(&frame, &identity, &endpoint_text, connection_id, &peer);
+                        let answers = match (handshake, frame) {
+                            (Some(answers), _) => answers,
+                            // A recording worker installs the revision announced to it, with
+                            // nothing to fence, so this daemon may dispatch to it.
+                            (None, ControlFrame::AuthorityRevision(notice))
+                                if recorded.is_some() =>
+                            {
+                                vec![ControlFrame::AuthorityRevisionAck(
+                                    kr_protocol::worker::AuthorityRevisionAck {
+                                        session_id: identity.session_id(),
+                                        revision: notice.revision,
+                                        fence: None,
                                     },
-                                    capabilities: CanonicalSet::new(),
-                                    max_receive: ReceiveLimits::default(),
-                                })),
-                                ControlFrame::GenerationChallenge(GenerationChallenge {
-                                    nonce: kr_ipc::verify::fresh_challenge()
-                                        .expect("a challenge")
-                                        .nonce,
-                                }),
-                            ],
-                            ControlFrame::VerifyChallenge(challenge) => {
-                                vec![ControlFrame::VerifyProof(
-                                    identity
-                                        .answer(&challenge, &endpoint_text)
-                                        .expect("answers its own challenge"),
                                 )]
                             }
-                            ControlFrame::GenerationToken(token) => {
-                                vec![ControlFrame::GenerationAccepted(GenerationAccepted {
-                                    generation: token.generation,
-                                    fenced_previous: false,
-                                })]
-                            }
-                            // The close arrives here and is never answered.
-                            _ => Vec::new(),
+                            // A silent worker never answers what arrives here, a close among it.
+                            (None, other) => match &recorded {
+                                None => Vec::new(),
+                                Some(recorded) => {
+                                    let refusal = answer_of(&other, identity.session_id());
+                                    recorded
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .push(other);
+                                    refusal.into_iter().collect()
+                                }
+                            },
                         };
                         for answer in answers {
                             if writer.write_message(&answer).await.is_err() {
@@ -11936,6 +12661,115 @@ mod a_close_a_worker_never_answers {
         })
     }
 
+    /// What a fake worker answers the handshake with that the daemon makes before it will speak
+    /// to a worker at all: the version exchange, the challenge over the descriptor's key, the
+    /// controller generation and the role a link says it is for. Any other frame is `None`, and the
+    /// fake worker answers it in its own way.
+    pub(super) fn handshake(
+        frame: &ControlFrame,
+        identity: &WorkerIdentity,
+        endpoint_text: &str,
+        connection_id: ConnectionId,
+        peer: &kr_ipc::peer::PeerIdentity,
+    ) -> Option<Vec<ControlFrame>> {
+        match frame {
+            ControlFrame::Hello(_) => Some(vec![
+                ControlFrame::HelloAck(Box::new(LocalHelloAck {
+                    selected_version: kr_protocol::hello::PROTOCOL_VERSION,
+                    role: LocalRole::Worker,
+                    connection_id,
+                    environment_id: identity_environment(),
+                    boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+                    peer: peer.to_wire(),
+                    action_window: ActionWindow {
+                        action_window_id: ActionWindowId::new("worker:test").expect("a window"),
+                        connection_id,
+                        boot_epoch: kr_protocol::ids::BootEpoch::new(1),
+                        issued_at_ms: kr_ipc::now_ms(),
+                        valid_for_ms: DurationMs::new(60_000),
+                    },
+                    capabilities: CanonicalSet::new(),
+                    max_receive: ReceiveLimits::default(),
+                })),
+                ControlFrame::GenerationChallenge(GenerationChallenge {
+                    nonce: kr_ipc::verify::fresh_challenge()
+                        .expect("a challenge")
+                        .nonce,
+                }),
+            ]),
+            ControlFrame::VerifyChallenge(challenge) => Some(vec![ControlFrame::VerifyProof(
+                identity
+                    .answer(challenge, endpoint_text)
+                    .expect("answers its own challenge"),
+            )]),
+            ControlFrame::GenerationToken(token) => {
+                Some(vec![ControlFrame::GenerationAccepted(GenerationAccepted {
+                    generation: token.generation,
+                    fenced_previous: false,
+                })])
+            }
+            // A proxy link says what it is for, and the worker agrees.
+            ControlFrame::ControllerRole(role) => Some(vec![ControlFrame::ControllerRole(*role)]),
+            _ => None,
+        }
+    }
+
+    /// What a recording worker answers a request or a forwarded frame with: the daemon's own
+    /// `session.read` is answered with a live session, and everything else is refused.
+    fn answer_of(frame: &ControlFrame, session_id: SessionId) -> Option<ControlFrame> {
+        let request_id = match frame {
+            ControlFrame::Request(request) => {
+                if request.method == Method::SessionRead.into() {
+                    return Some(ControlFrame::Response(kr_protocol::envelope::Response {
+                        request_id: request.request_id,
+                        outcome: kr_protocol::envelope::Outcome::Ok(
+                            ParamsValue::from_typed(&read_result(session_id)).expect("encodes"),
+                        ),
+                    }));
+                }
+                request.request_id
+            }
+            ControlFrame::Forwarded(forwarded) => forwarded.mutation.request_id,
+            ControlFrame::ForwardedRead(forwarded) => forwarded.request.request_id,
+            _ => return None,
+        };
+        Some(ControlFrame::Response(kr_protocol::envelope::Response {
+            request_id,
+            outcome: kr_protocol::envelope::Outcome::Error(kr_protocol::error::ProtocolError::new(
+                ErrorCode::ResourceUnavailable,
+                "this worker records what it is sent and performs none of it",
+            )),
+        }))
+    }
+
+    /// A live session, as a worker answers the daemon's own `session.read`.
+    pub(super) fn read_result(session_id: SessionId) -> kr_protocol::session::SessionReadResult {
+        kr_protocol::session::SessionReadResult {
+            session: kr_protocol::session::SessionSummary {
+                session_id,
+                session_epoch: SessionEpoch::V1,
+                environment_id: identity_environment(),
+                display_number: DisplayNumber::new(1),
+                state: kr_protocol::session::SessionState::Live,
+                shell_mode: kr_protocol::session::ShellMode::Managed,
+                shell_path: "/bin/zsh".to_owned(),
+                cwd: "/work".to_owned(),
+                worker_profile: WorkerProfile::HeadlessUser,
+                desktop: kr_protocol::identity::DesktopBinding::none(),
+                created_at_ms: kr_ipc::now_ms(),
+                dimensions: kr_protocol::session::INVISIBLE_DEFAULT_DIMENSIONS,
+                attachment_count: kr_protocol::scalars::U64::ZERO,
+                application_state: Nullable::null(),
+                root_process: Nullable::null(),
+                closure: Nullable::null(),
+            },
+            endpoint: Nullable::null(),
+            launch_profile: Nullable::null(),
+            last_command_block: Nullable::null(),
+            outstanding_launches: Nullable::null(),
+        }
+    }
+
     /// The environment the fake worker's acknowledgement names.
     ///
     /// The daemon does not compare it with its own, so any identity does; this keeps one value in
@@ -11944,7 +12778,7 @@ mod a_close_a_worker_never_answers {
         kr_protocol::ids::EnvironmentId::new(kr_protocol::scalars::Uuid::NIL)
     }
 
-    fn close_request(
+    pub(super) fn close_request(
         environment_id: kr_protocol::ids::EnvironmentId,
         session_id: SessionId,
     ) -> MutationRequest {
@@ -11971,7 +12805,7 @@ mod a_close_a_worker_never_answers {
     /// A daemon with one silent worker in its directory, and everything a close needs.
     /// Registers one caller and returns the admission its close carries: the connection it
     /// arrived on, the revision in force and the deadline this host accepted.
-    async fn admission(
+    pub(super) async fn admission(
         controller: &Controller,
         accepted: AcceptedDeadline,
     ) -> crate::authority::AdmittedMutation {
@@ -11996,27 +12830,46 @@ mod a_close_a_worker_never_answers {
         }
     }
 
-    struct Silent {
-        _temp: kr_ipc::testing::TempHost,
-        controller: Arc<Controller>,
-        environment_id: kr_protocol::ids::EnvironmentId,
-        session_id: SessionId,
-        worker: KnownWorker,
-        actor: kr_protocol::actor::ActorEnvelope,
-        accepted: AcceptedDeadline,
-        serving: tokio::task::JoinHandle<()>,
+    pub(super) struct Silent {
+        pub(super) _temp: kr_ipc::testing::TempHost,
+        pub(super) controller: Arc<Controller>,
+        pub(super) environment_id: kr_protocol::ids::EnvironmentId,
+        pub(super) session_id: SessionId,
+        pub(super) worker: KnownWorker,
+        pub(super) actor: kr_protocol::actor::ActorEnvelope,
+        pub(super) accepted: AcceptedDeadline,
+        pub(super) serving: tokio::task::JoinHandle<()>,
     }
 
+    /// A daemon with one silent worker in its directory, and everything a close needs.
     async fn silent_worker() -> Silent {
-        let temp = kr_ipc::testing::TempHost::create();
+        fake_worker(None).await
+    }
+
+    /// A daemon with one fake worker in its directory, silent or recording
+    /// ([`serve_fake_worker`]), and everything a close needs.
+    pub(super) async fn fake_worker(recorded: Option<Recorded>) -> Silent {
+        fake_world(move |listener, identity, endpoint_text| {
+            serve_fake_worker(listener, identity, endpoint_text, recorded)
+        })
+        .await
+    }
+
+    /// What a fake world's daemon is started with. The daemon's identity is kept in the
+    /// environment's own secret store, so a daemon started again on the same environment is the
+    /// same controller.
+    pub(super) fn setup(temp: &kr_ipc::testing::TempHost) -> ControllerSetup {
         let environment = temp.environment();
         let environment_id = temp.environment_id();
-        let controller = Controller::start(ControllerSetup {
-            paths: environment.clone(),
+        let secrets = environment.secrets_dir();
+        ControllerSetup {
+            paths: environment,
             environment_id,
             identity: Box::new(move || {
+                let store = kr_crypto::store::open_store_in(&secrets)
+                    .expect("a secret store for the test environment");
                 Ok(kr_ipc::verify::ControllerIdentity::open(
-                    &MemoryStore::new(),
+                    store.store.as_ref(),
                     environment_id,
                     false,
                 )
@@ -12030,9 +12883,21 @@ mod a_close_a_worker_never_answers {
             release: "0".to_owned(),
             shell_packages: None,
             terminal: Box::new(crate::supervision::NoTerminal),
-        })
-        .await
-        .expect("the daemon starts");
+        }
+    }
+
+    /// A daemon with one fake worker in its directory, served by `serve` on the worker's own
+    /// endpoint, and everything a close needs. The worker is admitted as a worker that has just
+    /// reported itself is, with no description of its session yet.
+    pub(super) async fn fake_world(
+        serve: impl FnOnce(Listener, Arc<WorkerIdentity>, String) -> tokio::task::JoinHandle<()>,
+    ) -> Silent {
+        let temp = kr_ipc::testing::TempHost::create();
+        let environment = temp.environment();
+        let environment_id = temp.environment_id();
+        let controller = Controller::start(setup(&temp))
+            .await
+            .expect("the daemon starts");
 
         let session_id = SessionId::new(kr_ipc::new_uuid());
         let worker_endpoint = environment
@@ -12063,8 +12928,7 @@ mod a_close_a_worker_never_answers {
             published_at_ms: kr_ipc::now_ms(),
         };
         let listener = Listener::bind(&worker_endpoint).expect("binds the worker endpoint");
-        let serving =
-            serve_silent_worker(listener, Arc::clone(&identity), worker_endpoint.as_text());
+        let serving = serve(listener, Arc::clone(&identity), worker_endpoint.as_text());
         let worker = KnownWorker {
             descriptor,
             endpoint: worker_endpoint,
@@ -12073,8 +12937,7 @@ mod a_close_a_worker_never_answers {
             .directory
             .lock()
             .await
-            .verified
-            .insert(session_id, worker.clone());
+            .insert(worker.clone(), None);
 
         let actor = crate::service::local_actor(
             kr_protocol::ids::ActorId::new("local:test").expect("a principal"),
@@ -12102,7 +12965,7 @@ mod a_close_a_worker_never_answers {
     }
 
     /// Records that this worker has acknowledged the revision in force, so its leases renew.
-    fn acknowledged(controller: &Controller, session_id: SessionId) {
+    pub(super) fn acknowledged(controller: &Controller, session_id: SessionId) {
         let binding = controller.leases.binding(session_id);
         controller.leases.acknowledge(
             session_id,
@@ -12332,6 +13195,797 @@ mod a_close_a_worker_never_answers {
             "the close fences the path it used, not the one it was queued behind"
         );
         serving.abort();
+    }
+}
+
+#[cfg(test)]
+mod a_read_that_meets_a_worker_on_its_way_out {
+    //! A read of a session whose worker stops answering part way through it.
+    //!
+    //! A worker that has finished its closure stops answering before the kernel says its process
+    //! has ended, so a read that is waiting on it can meet its connection ending while nothing yet
+    //! says the worker has gone. The worker here is a double that goes that way when a test tells
+    //! it to. Its process is this test's own, so the kernel says it is running throughout, and the
+    //! registry names that process as the session's worker, as it names a real one.
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use kr_ipc::endpoint::Listener;
+    use kr_ipc::framed::split;
+    use kr_ipc::verify::WorkerIdentity;
+    use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Response};
+    use kr_protocol::error::{ErrorCode, ProtocolError};
+    use kr_protocol::frame::StreamKind;
+    use kr_protocol::identity::WorkerProfile;
+    use kr_protocol::ids::{AuthorityRevision, ConnectionId, RequestId, SessionEpoch, SessionId};
+    use kr_protocol::method::Method;
+    use kr_protocol::root::{CwdRevision, PromptGeneration, RootCommandBlockParams};
+    use kr_protocol::scalars::{Nullable, U64};
+    use kr_protocol::session::{
+        ClosureReason, ClosureRecord, Dimensions, Durability, INVISIBLE_DEFAULT_DIMENSIONS,
+        OwnershipCoverage, SessionCloseResult, SessionListParams, SessionListResult,
+        SessionReadParams, SessionReadResult, SessionState, SessionSummary,
+    };
+    use tokio::sync::{Notify, oneshot};
+
+    use super::a_close_a_worker_never_answers::{self as fake, Silent};
+    use crate::registry::WorkerRecord;
+    use crate::service::Controller;
+
+    /// A worker whose session a test moves along, and which goes when the test says so.
+    ///
+    /// It answers a read with the state a test has put its session in, live to begin with, and
+    /// accepts a close by saying the session is closing, as a worker does before it stops
+    /// anything. Told to go, it goes the way a worker that has finished its closure goes: at the
+    /// next read it is sent, its endpoint stops accepting, and then the connection that read is
+    /// waiting on ends unanswered.
+    struct Scripted {
+        /// The state its session is in.
+        state: std::sync::Mutex<SessionState>,
+        /// Its session's size.
+        dimensions: std::sync::Mutex<Dimensions>,
+        /// How many reads have reached it.
+        reads: AtomicUsize,
+        /// Whether it refuses to describe its session.
+        refusing: AtomicBool,
+        /// The read it goes at, once a test has set one.
+        end: std::sync::Mutex<Option<End>>,
+        /// Tells the endpoint to stop accepting.
+        going: Notify,
+        /// Says the endpoint has stopped accepting.
+        gone: Notify,
+    }
+
+    /// Where a scripted worker goes: at the next read it is sent.
+    struct End {
+        /// Told that the read has arrived.
+        arrived: oneshot::Sender<()>,
+        /// Waited for before the worker goes; dropping it is the same as sending.
+        go: oneshot::Receiver<()>,
+    }
+
+    impl Scripted {
+        /// A worker whose session is live.
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                state: std::sync::Mutex::new(SessionState::Live),
+                dimensions: std::sync::Mutex::new(INVISIBLE_DEFAULT_DIMENSIONS),
+                reads: AtomicUsize::new(0),
+                refusing: AtomicBool::new(false),
+                end: std::sync::Mutex::new(None),
+                going: Notify::new(),
+                gone: Notify::new(),
+            })
+        }
+
+        /// Puts the session in `state`, which every later answer says.
+        fn set(&self, state: SessionState) {
+            *self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = state;
+        }
+
+        /// Resizes the session, as an attachment's window does.
+        fn resize(&self, dimensions: Dimensions) {
+            *self
+                .dimensions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = dimensions;
+        }
+
+        /// Has this worker refuse to describe its session, or answer again.
+        fn refuse_reads(&self, refusing: bool) {
+            self.refusing.store(refusing, Ordering::Release);
+        }
+
+        /// How many reads have reached this worker.
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::Acquire)
+        }
+
+        /// The state the session is in.
+        fn state(&self) -> SessionState {
+            *self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+
+        /// Has this worker go at the next read it is sent. The first half says when that read has
+        /// arrived, and the worker goes once the second is sent or dropped.
+        fn end_at_next_read(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+            let (arrived, arrival) = oneshot::channel();
+            let (go, going) = oneshot::channel();
+            *self
+                .end
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(End { arrived, go: going });
+            (arrival, go)
+        }
+
+        /// How this worker answers a read: its session in the state it is in, with the worker's
+        /// own closure once it has closed, and the last command the session ran, which is its
+        /// content beside its description.
+        fn answer(&self, session_id: SessionId) -> SessionReadResult {
+            let mut read = fake::read_result(session_id);
+            read.session.state = self.state();
+            read.session.dimensions = *self
+                .dimensions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if read.session.state == SessionState::Closed {
+                read.session.closure = Nullable::some(closure_of(session_id));
+            }
+            read.last_command_block = Nullable::some(RootCommandBlockParams {
+                session_id,
+                prompt_generation: PromptGeneration(U64::new(1)),
+                command: "make test".to_owned(),
+                started_at_ms: kr_ipc::now_ms(),
+                duration_ms: Nullable::null(),
+                exit_status: Nullable::null(),
+                cwd: "/work".to_owned(),
+                cwd_revision: CwdRevision(U64::new(1)),
+            });
+            read
+        }
+    }
+
+    /// A closure of `session_id` that a close requested.
+    fn closure_of(session_id: SessionId) -> ClosureRecord {
+        ClosureRecord {
+            session_id,
+            session_epoch: SessionEpoch::V1,
+            reason: ClosureReason::CloseRequested,
+            root_exit_code: Nullable::null(),
+            root_signal: Nullable::null(),
+            terminated: Vec::new(),
+            surviving: Vec::new(),
+            ownership_coverage: OwnershipCoverage::Complete,
+            durability: Durability::Durable,
+            closed_at_ms: kr_protocol::scalars::TimestampMs::new(1),
+        }
+    }
+
+    /// A worker's answer to request `request_id`.
+    fn respond(request_id: RequestId, value: &impl serde::Serialize) -> ControlFrame {
+        ControlFrame::Response(Response {
+            request_id,
+            outcome: Outcome::Ok(ParamsValue::from_typed(value).expect("encodes")),
+        })
+    }
+
+    /// Serves `script` on a worker's endpoint.
+    fn serve_scripted(
+        listener: Listener,
+        identity: Arc<WorkerIdentity>,
+        endpoint_text: String,
+        script: Arc<Scripted>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                let accepted = tokio::select! {
+                    accepted = listener.accept() => accepted,
+                    () = script.going.notified() => break,
+                };
+                let Ok((connection, peer)) = accepted else {
+                    break;
+                };
+                let identity = Arc::clone(&identity);
+                let endpoint_text = endpoint_text.clone();
+                let script = Arc::clone(&script);
+                tokio::spawn(async move {
+                    let (mut reader, mut writer) = split(connection, StreamKind::Control);
+                    let connection_id = ConnectionId::new(kr_ipc::new_uuid());
+                    while let Ok(frame) = reader.read_message::<ControlFrame>().await {
+                        let handshake = fake::handshake(
+                            &frame,
+                            &identity,
+                            &endpoint_text,
+                            connection_id,
+                            &peer,
+                        );
+                        let answers = match (handshake, frame) {
+                            (Some(answers), _) => answers,
+                            (None, ControlFrame::Request(request))
+                                if request.method == Method::SessionRead.into() =>
+                            {
+                                script.reads.fetch_add(1, Ordering::AcqRel);
+                                let end = script
+                                    .end
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .take();
+                                if let Some(end) = end {
+                                    let _ = end.arrived.send(());
+                                    let _ = end.go.await;
+                                    // The endpoint goes first and this connection after it, as a
+                                    // worker's do when its process exits.
+                                    script.going.notify_one();
+                                    script.gone.notified().await;
+                                    return;
+                                }
+                                if script.refusing.load(Ordering::Acquire) {
+                                    vec![ControlFrame::Response(Response {
+                                        request_id: request.request_id,
+                                        outcome: Outcome::Error(ProtocolError::new(
+                                            ErrorCode::ResourceUnavailable,
+                                            "this worker does not describe its session",
+                                        )),
+                                    })]
+                                } else {
+                                    let answer = script.answer(identity.session_id());
+                                    vec![respond(request.request_id, &answer)]
+                                }
+                            }
+                            (None, ControlFrame::Forwarded(forwarded))
+                                if forwarded.mutation.method == Method::SessionClose.into() =>
+                            {
+                                if script.state() == SessionState::Live {
+                                    script.set(SessionState::Closing);
+                                }
+                                vec![respond(
+                                    forwarded.mutation.request_id,
+                                    &SessionCloseResult {
+                                        session_id: identity.session_id(),
+                                        state: SessionState::Closing,
+                                        durability: Durability::Durable,
+                                        closure: Nullable::null(),
+                                    },
+                                )]
+                            }
+                            _ => Vec::new(),
+                        };
+                        for answer in answers {
+                            if writer.write_message(&answer).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+            drop(listener);
+            script.gone.notify_one();
+        })
+    }
+
+    /// A daemon with a scripted worker in its directory, and the registry's own row for that
+    /// worker. The row names this test's process, which is the process the kernel is asked about.
+    /// The daemon has not heard from the worker yet, as after a start that found it running.
+    async fn scripted(script: &Arc<Scripted>) -> Silent {
+        let script = Arc::clone(script);
+        let world = fake::fake_world(move |listener, identity, endpoint_text| {
+            serve_scripted(listener, identity, endpoint_text, script)
+        })
+        .await;
+        let descriptor = &world.worker.descriptor;
+        world
+            .controller
+            .registry
+            .lock()
+            .await
+            .adopt_worker(&WorkerRecord {
+                session_id: world.session_id,
+                display_number: descriptor.display_number,
+                public_key: descriptor.worker_public_key,
+                process_identity: descriptor.process_start_identity.clone(),
+                endpoint: descriptor.endpoint.clone(),
+                profile: WorkerProfile::HeadlessUser,
+                state: SessionState::Live,
+                acknowledged_revision: AuthorityRevision::new(0),
+            })
+            .expect("the registry records the worker");
+        fake::acknowledged(&world.controller, world.session_id);
+        world
+    }
+
+    /// The same world after its daemon was replaced: the one before it has let go of the
+    /// environment, and another has started on it and found the scripted worker still running, the
+    /// way a daemon that starts finds its workers, by the descriptor, the registry's row and a
+    /// challenge.
+    async fn restarted(world: Silent) -> Silent {
+        let Silent {
+            _temp,
+            controller,
+            environment_id,
+            session_id,
+            worker,
+            serving,
+            ..
+        } = world;
+        kr_ipc::descriptor::publish(&_temp.environment(), &worker.descriptor)
+            .expect("publishes the worker's descriptor");
+        drop(controller);
+        let started = std::time::Instant::now();
+        let controller = loop {
+            match Controller::start(fake::setup(&_temp)).await {
+                Ok(controller) => break controller,
+                Err(crate::error::ControllerError::AlreadyRunning { .. })
+                    if started.elapsed() < Duration::from_secs(60) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => panic!("the daemon does not start again: {error}"),
+            }
+        };
+        fake::acknowledged(&controller, session_id);
+        let actor = crate::service::local_actor(
+            kr_protocol::ids::ActorId::new("local:test").expect("a principal"),
+            ConnectionId::new(kr_ipc::new_uuid()),
+            controller.generation,
+        );
+        let accepted = kr_transport::window::AcceptedDeadline {
+            deadline: controller
+                .clock
+                .now()
+                .checked_add(Duration::from_secs(300))
+                .expect("a deadline five minutes out"),
+            bound: kr_transport::window::DeadlineBound::RequestedTtl,
+        };
+        Silent {
+            _temp,
+            controller,
+            environment_id,
+            session_id,
+            worker,
+            actor,
+            accepted,
+            serving,
+        }
+    }
+
+    /// Reads the session through the daemon, as a client's `session.read` does.
+    async fn read(world: &Silent) -> crate::error::Result<SessionReadResult> {
+        world
+            .controller
+            .session_read(
+                &ParamsValue::from_typed(&SessionReadParams {
+                    session_id: world.session_id,
+                })
+                .expect("encodes"),
+            )
+            .await
+            .map(|value| value.to_typed().expect("decodes"))
+    }
+
+    /// Reads the session through the daemon on a task of its own.
+    fn read_in_turn(
+        world: &Silent,
+    ) -> tokio::task::JoinHandle<crate::error::Result<SessionReadResult>> {
+        let controller = Arc::clone(&world.controller);
+        let params = ParamsValue::from_typed(&SessionReadParams {
+            session_id: world.session_id,
+        })
+        .expect("encodes");
+        tokio::spawn(async move {
+            controller
+                .session_read(&params)
+                .await
+                .map(|value| value.to_typed().expect("decodes"))
+        })
+    }
+
+    /// Lists the sessions through the daemon, as a client's `session.list` does, and returns each
+    /// one's identity and state.
+    async fn list(world: &Silent, include_closed: bool) -> Vec<(SessionId, SessionState)> {
+        let listed: SessionListResult = world
+            .controller
+            .session_list(
+                &ParamsValue::from_typed(&SessionListParams {
+                    environment_id: Nullable::null(),
+                    include_closed,
+                })
+                .expect("encodes"),
+            )
+            .await
+            .expect("the daemon lists its sessions")
+            .to_typed()
+            .expect("decodes");
+        listed
+            .sessions
+            .iter()
+            .map(|session| (session.session_id, session.state))
+            .collect()
+    }
+
+    /// Closes the session through the daemon, and returns what the worker accepted it with.
+    async fn close(world: &Silent) -> SessionCloseResult {
+        world
+            .controller
+            .session_close(
+                &fake::close_request(world.environment_id, world.session_id),
+                &world.actor,
+                Some(world.accepted),
+                fake::admission(&world.controller, world.accepted).await,
+            )
+            .await
+            .expect("the worker accepts the close")
+            .to_typed()
+            .expect("decodes")
+    }
+
+    /// Whether the registry has a closure recorded for the session.
+    async fn recorded(world: &Silent) -> bool {
+        world
+            .controller
+            .registry
+            .lock()
+            .await
+            .closure(world.session_id)
+            .expect("the registry answers")
+            .is_some()
+    }
+
+    /// A read that meets the end of a worker whose close this daemon accepted is answered from
+    /// this daemon's own record: the session is closing, and what is left of its closure is this
+    /// host's to record once the kernel says the worker has ended.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_read_that_meets_the_end_of_a_worker_whose_close_was_accepted_answers_closing() {
+        let script = Scripted::new();
+        let world = scripted(&script).await;
+        let live = read(&world).await.expect("the worker answers");
+        assert_eq!(live.session.state, SessionState::Live);
+        assert!(live.last_command_block.0.is_some());
+        assert_eq!(close(&world).await.state, SessionState::Closing);
+
+        // The worker finishes its closure and goes while a read is waiting on it.
+        let (_arrived, go) = script.end_at_next_read();
+        drop(go);
+        let answer = read(&world)
+            .await
+            .expect("a closing session is answered for from this daemon's own record");
+        assert_eq!(
+            answer.session,
+            SessionSummary {
+                state: SessionState::Closing,
+                ..live.session
+            },
+            "the session as its worker last described it, closing"
+        );
+        assert!(
+            answer.endpoint.0.is_none(),
+            "an endpoint that has stopped answering is not handed out"
+        );
+        assert!(
+            answer.last_command_block.0.is_none(),
+            "and the session's content is its worker's to hand out, not this daemon's"
+        );
+        assert!(
+            !recorded(&world).await,
+            "and nothing is recorded over a worker the kernel says is still running"
+        );
+        world.serving.abort();
+    }
+
+    /// A worker a daemon finds when it starts is admitted with its own description of its session,
+    /// asked for over the connection it proved itself on. A close accepted before anything else
+    /// has read the worker therefore still leaves the session described: a read that meets the
+    /// worker's end answers it closing, as the worker described it at the start, including a size
+    /// the session was given while the daemon before this one ran. Nothing is asked of the worker
+    /// at the close, whose link the worker is holding the close on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_worker_found_at_a_start_is_admitted_with_its_own_description() {
+        let script = Scripted::new();
+        let world = scripted(&script).await;
+        script.resize(Dimensions::new(100, 30));
+        let world = restarted(world).await;
+        assert_eq!(
+            script.reads(),
+            1,
+            "the start asks the worker to describe its session"
+        );
+
+        // The worker goes at the first read it is sent after the close, whoever sends it.
+        let (_arrived, go) = script.end_at_next_read();
+        drop(go);
+        assert_eq!(close(&world).await.state, SessionState::Closing);
+        assert_eq!(script.reads(), 1, "the close asks the worker nothing");
+        let answer = read(&world)
+            .await
+            .expect("a closing session is answered for from this daemon's own record");
+        assert_eq!(
+            answer.session,
+            SessionSummary {
+                state: SessionState::Closing,
+                dimensions: Dimensions::new(100, 30),
+                created_at_ms: answer.session.created_at_ms,
+                ..fake::read_result(world.session_id).session
+            },
+            "the session as its worker described it when this daemon started"
+        );
+        assert!(answer.endpoint.0.is_none());
+        assert!(!recorded(&world).await);
+        world.serving.abort();
+    }
+
+    /// A worker that proves itself when a daemon starts but does not describe its session is
+    /// admitted all the same, because a close has to be able to reach every worker that has proved
+    /// itself; the description it did not give is what it gives when it next answers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_worker_that_does_not_describe_its_session_at_a_start_can_still_be_closed() {
+        let script = Scripted::new();
+        let world = scripted(&script).await;
+        script.refuse_reads(true);
+        let world = restarted(world).await;
+        assert_eq!(script.reads(), 1, "the start asks for the description");
+        assert!(
+            world
+                .controller
+                .directory
+                .lock()
+                .await
+                .get(world.session_id)
+                .is_some(),
+            "the worker that proved itself is admitted"
+        );
+        assert_eq!(
+            close(&world).await.state,
+            SessionState::Closing,
+            "and a close reaches it"
+        );
+
+        script.refuse_reads(false);
+        assert_eq!(
+            read(&world)
+                .await
+                .expect("the worker answers")
+                .session
+                .state,
+            SessionState::Closing
+        );
+        world.serving.abort();
+    }
+
+    /// A session that began closing on its own is answered for the same way: its worker said it
+    /// was closing, and that is what the session still is when the worker stops answering.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_read_that_meets_the_end_of_a_worker_that_said_it_was_closing_answers_closing() {
+        let script = Scripted::new();
+        let world = scripted(&script).await;
+        // The shell exits, and the worker begins the closure itself.
+        script.set(SessionState::Closing);
+        let closing = read(&world).await.expect("the worker answers");
+        assert_eq!(closing.session.state, SessionState::Closing);
+
+        let (_arrived, go) = script.end_at_next_read();
+        drop(go);
+        let answer = read(&world)
+            .await
+            .expect("a closing session is answered for from this daemon's own record");
+        assert_eq!(answer.session, closing.session);
+        assert!(!recorded(&world).await);
+        world.serving.abort();
+    }
+
+    /// An answer that puts the session earlier in its lifecycle than an answer this daemon already
+    /// has does not take it back there: it is one an earlier moment gave, and a later one overtook.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_answer_overtaken_by_a_later_one_does_not_move_the_session_back() {
+        let script = Scripted::new();
+        let world = scripted(&script).await;
+        script.set(SessionState::Closing);
+        assert_eq!(
+            read(&world)
+                .await
+                .expect("the worker answers")
+                .session
+                .state,
+            SessionState::Closing
+        );
+        // An answer from before the closing began, arriving after the one that said it had.
+        script.set(SessionState::Live);
+        assert_eq!(
+            read(&world)
+                .await
+                .expect("the worker answers")
+                .session
+                .state,
+            SessionState::Live,
+            "the worker's own answer is passed on as it stands"
+        );
+
+        let (_arrived, go) = script.end_at_next_read();
+        drop(go);
+        let answer = read(&world)
+            .await
+            .expect("the closing this daemon heard of is still what it answers from");
+        assert_eq!(answer.session.state, SessionState::Closing);
+        world.serving.abort();
+    }
+
+    /// A read that meets the end of a worker after the session's closure was recorded is answered
+    /// with that closure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_read_that_meets_the_end_of_a_worker_whose_closure_was_recorded_answers_it() {
+        let script = Scripted::new();
+        let world = scripted(&script).await;
+        assert_eq!(close(&world).await.state, SessionState::Closing);
+
+        let (arrived, go) = script.end_at_next_read();
+        let reading = read_in_turn(&world);
+        arrived.await.expect("the read reaches the worker");
+        // The closure is recorded while the read waits on the worker.
+        let record = closure_of(world.session_id);
+        world
+            .controller
+            .retire(&record)
+            .await
+            .expect("the closure is recorded");
+        drop(go);
+
+        let answer = reading
+            .await
+            .expect("the read finishes")
+            .expect("a closed session is answered with its closure");
+        assert_eq!(answer.session.state, SessionState::Closed);
+        assert_eq!(answer.session.closure.0, Some(record));
+        world.serving.abort();
+    }
+
+    /// A read whose worker goes while the session's closure is being recorded answers the
+    /// closure, however the recording and the read's look at what this daemon holds interleave.
+    ///
+    /// The read is stopped once it has met the worker's end and asked the kernel, before it looks
+    /// at what this daemon holds of the session. The closure is recorded then, as a closure's
+    /// recording does it, the registry first and the worker out of the directory after, and the
+    /// read goes on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_read_that_meets_the_end_of_a_worker_as_its_closure_is_recorded_answers_it() {
+        let script = Scripted::new();
+        let world = scripted(&script).await;
+        assert_eq!(close(&world).await.state, SessionState::Closing);
+
+        let (_at_the_worker, worker_goes) = script.end_at_next_read();
+        drop(worker_goes);
+        let (at_the_record, read_goes) = world.controller.before_the_record.arm();
+        let reading = read_in_turn(&world);
+        at_the_record
+            .await
+            .expect("the read meets the worker's end and asks the kernel");
+        let record = closure_of(world.session_id);
+        world
+            .controller
+            .registry
+            .lock()
+            .await
+            .record_closure(&record)
+            .expect("the closure is recorded");
+        world
+            .controller
+            .directory
+            .lock()
+            .await
+            .remove(world.session_id);
+        let _ = read_goes.send(());
+
+        let answer = reading
+            .await
+            .expect("the read finishes")
+            .expect("a closed session is answered with its closure");
+        assert_eq!(answer.session.state, SessionState::Closed);
+        assert_eq!(answer.session.closure.0, Some(record));
+        world.serving.abort();
+    }
+
+    /// A list that meets the end of a worker whose close this daemon accepted lists the session as
+    /// closing rather than leaving it out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_list_that_meets_the_end_of_a_worker_whose_close_was_accepted_lists_it_closing() {
+        let script = Scripted::new();
+        let world = scripted(&script).await;
+        assert_eq!(
+            read(&world)
+                .await
+                .expect("the worker answers")
+                .session
+                .state,
+            SessionState::Live
+        );
+        assert_eq!(close(&world).await.state, SessionState::Closing);
+
+        let (_arrived, go) = script.end_at_next_read();
+        drop(go);
+        assert_eq!(
+            list(&world, false).await,
+            vec![(world.session_id, SessionState::Closing)]
+        );
+        world.serving.abort();
+    }
+
+    /// A session whose worker says it has closed is listed only where closed sessions were asked
+    /// for, whether the worker says so itself or this daemon answers for a worker on its way out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_session_its_worker_says_has_closed_is_listed_only_with_the_closed_sessions() {
+        let script = Scripted::new();
+        let world = scripted(&script).await;
+        // The worker has finished its closure and not yet gone.
+        script.set(SessionState::Closed);
+        assert_eq!(list(&world, false).await, Vec::new());
+        assert_eq!(
+            list(&world, true).await,
+            vec![(world.session_id, SessionState::Closed)]
+        );
+
+        // It goes while a list is waiting on it, and its endpoint is gone for the one after.
+        let (_arrived, go) = script.end_at_next_read();
+        drop(go);
+        assert_eq!(list(&world, false).await, Vec::new());
+        assert_eq!(
+            list(&world, true).await,
+            vec![(world.session_id, SessionState::Closed)]
+        );
+        assert!(!recorded(&world).await);
+        world.serving.abort();
+    }
+
+    /// Where this daemon has no word of an end, a worker that stops answering is not taken for
+    /// one: the session was live when its worker last answered, the kernel says the worker is
+    /// still running, and the read is refused as something to try again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_read_that_meets_a_live_workers_connection_ending_is_refused_for_now() {
+        let script = Scripted::new();
+        let world = scripted(&script).await;
+        assert_eq!(
+            read(&world)
+                .await
+                .expect("the worker answers")
+                .session
+                .state,
+            SessionState::Live
+        );
+
+        let (_arrived, go) = script.end_at_next_read();
+        drop(go);
+        let refused = read(&world)
+            .await
+            .expect_err("nothing this daemon holds says what the session is now");
+        assert_eq!(refused.code(), ErrorCode::ResourceUnavailable, "{refused}");
+        assert!(
+            refused.code().retry_category().permits_automatic_retry(),
+            "and a read may be asked again: {refused}"
+        );
+        assert!(!recorded(&world).await);
+        world.serving.abort();
+    }
+
+    /// Nor is a worker this daemon has not heard from at all, and whose close it has not passed
+    /// on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_read_that_meets_the_end_of_a_worker_never_heard_from_is_refused_for_now() {
+        let script = Scripted::new();
+        let world = scripted(&script).await;
+
+        let (_arrived, go) = script.end_at_next_read();
+        drop(go);
+        let refused = read(&world)
+            .await
+            .expect_err("nothing this daemon holds says what the session is now");
+        assert_eq!(refused.code(), ErrorCode::ResourceUnavailable, "{refused}");
+        assert!(!recorded(&world).await);
+        world.serving.abort();
     }
 }
 
@@ -12615,33 +14269,40 @@ mod one_fence_for_one_debt {
 
     use kr_protocol::ids::GrantId;
 
-    /// Two callers settling one withdrawal's debt at once fence the host once. Each reads the debt
-    /// and fences for it; the second does so only once the first has cleared it, so it finds
-    /// nothing owed and answers with the revision the first fence advanced to.
+    /// Two barriers raised at once over one published debt fence the host once: the one that
+    /// takes the registry first captures the debt and advances the revision, and the other finds
+    /// nothing to capture and answers with the revision the first advanced to.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn two_settlements_of_one_debt_fence_once() {
         let temp = kr_ipc::testing::TempHost::create();
         let controller = super::a_floor_owed_its_record::daemon(&temp).await;
         let before = controller.policy().authority_revision();
         let withdrawn = GrantId::new(kr_ipc::new_uuid());
-        controller
-            .sharing()
-            .grants()
-            .owe_fence([withdrawn], kr_ipc::now_ms().get())
+        let debt = controller
+            .owe_debt("a withdrawal", super::Reach::Host)
             .expect("the debt is written");
 
-        // The registry is held, so a fence stops before it advances anything: a caller that has
-        // read the debt by now waits there with it.
+        // The registry is held, so a barrier stops before it captures anything: both wait there.
         let registry = controller.registry.lock().await;
-        let settle = |controller: Arc<super::Controller>| {
+        let first = {
+            let controller = Arc::clone(&controller);
             tokio::spawn(async move {
+                controller.publish_debts(&[(debt, super::Reach::Host)]);
                 controller
-                    .complete_revocation([withdrawn].into_iter().collect(), kr_ipc::now_ms().get())
+                    .complete_revocation([withdrawn].into_iter().collect())
                     .await
+                    .map(|result| result.authority_revision)
             })
         };
-        let first = settle(Arc::clone(&controller));
-        let second = settle(Arc::clone(&controller));
+        let second = {
+            let controller = Arc::clone(&controller);
+            tokio::spawn(async move {
+                controller
+                    .barrier()
+                    .await
+                    .map(|barrier| barrier.authority_revision)
+            })
+        };
         tokio::time::sleep(Duration::from_millis(500)).await;
         drop(registry);
 
@@ -12658,7 +14319,7 @@ mod one_fence_for_one_debt {
             before.get() + 1,
             "one withdrawal, one fence"
         );
-        assert_eq!(first.authority_revision, second.authority_revision);
+        assert_eq!(first, second);
         assert!(
             controller
                 .sharing()
@@ -12668,5 +14329,317 @@ mod one_fence_for_one_debt {
                 .is_empty(),
             "and nothing is owed"
         );
+    }
+}
+
+#[cfg(test)]
+mod one_barrier_for_every_restriction {
+    //! Every restrictive change owes its own debt, and the one barrier retires exactly what it
+    //! captured, once each change has tried to take effect.
+
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::{Controller, Reach};
+
+    async fn revision(controller: &Controller) -> u64 {
+        controller
+            .registry
+            .lock()
+            .await
+            .authority_revision()
+            .expect("readable")
+            .get()
+    }
+
+    fn owed(controller: &Controller) -> Vec<crate::grants::store::DebtId> {
+        controller
+            .sharing()
+            .grants()
+            .fence_owed()
+            .expect("readable")
+    }
+
+    /// Opens the registry beside the daemon, for a fault the test puts in place.
+    fn beside(temp: &kr_ipc::testing::TempHost) -> rusqlite::Connection {
+        let registry = rusqlite::Connection::open(temp.environment().registry_database())
+            .expect("opens the registry");
+        registry
+            .busy_timeout(Duration::from_secs(5))
+            .expect("waits for the daemon's writes");
+        registry
+    }
+
+    async fn restarted(
+        controller: Arc<Controller>,
+        temp: &kr_ipc::testing::TempHost,
+    ) -> Arc<Controller> {
+        super::net::tests::stopped(controller).await;
+        super::a_floor_owed_its_record::daemon(temp).await
+    }
+
+    /// A debt whose change has not tried to take effect refuses nothing and no barrier captures
+    /// it. The control: once published, one barrier retires it, advancing one revision and leaving
+    /// no row and no refusal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pending_debt_is_not_captured_and_one_barrier_retires_a_published_one() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = super::a_floor_owed_its_record::daemon(&temp).await;
+        let before = revision(&controller).await;
+        let pending = controller
+            .owe_debt("a change still to take effect", Reach::Host)
+            .expect("written");
+        controller
+            .check_fence()
+            .expect("a pending debt refuses nothing");
+        controller.barrier().await.expect("a barrier");
+        assert_eq!(
+            revision(&controller).await,
+            before,
+            "a pending debt is not captured"
+        );
+        assert_eq!(owed(&controller), vec![pending]);
+
+        controller.publish_debts(&[(pending, Reach::Host)]);
+        controller.barrier().await.expect("a barrier");
+        assert_eq!(revision(&controller).await, before + 1);
+        assert!(owed(&controller).is_empty(), "the row is retired");
+        controller.check_fence().expect("and nothing refuses");
+
+        // Two restrictions, the second published after the first barrier captured: two rows, two
+        // revisions, and the first barrier left the second one's row owed.
+        let first = controller.owe_debt("one", Reach::Host).expect("written");
+        let second = controller.owe_debt("two", Reach::Host).expect("written");
+        controller.publish_debts(&[(first, Reach::Host)]);
+        controller.barrier().await.expect("a barrier");
+        assert_eq!(owed(&controller), vec![second]);
+        controller.publish_debts(&[(second, Reach::Host)]);
+        controller.barrier().await.expect("a barrier");
+        assert_eq!(revision(&controller).await, before + 3);
+        assert!(owed(&controller).is_empty());
+        drop(controller);
+    }
+
+    /// The barrier captures only what this run holds as published and reads no row from disk, so a
+    /// row no change of this run holds is neither captured before its restriction nor twice: only
+    /// a start publishes it, and that start's barrier retires it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_row_no_change_of_this_run_holds_is_captured_only_by_a_start() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = super::a_floor_owed_its_record::daemon(&temp).await;
+        let before = revision(&controller).await;
+        let row = controller
+            .sharing()
+            .grants()
+            .owe_fence("a change this run does not hold", kr_ipc::now_ms().get())
+            .expect("written");
+        controller.barrier().await.expect("a barrier");
+        assert_eq!(
+            revision(&controller).await,
+            before,
+            "a row read from disk is not captured"
+        );
+        assert_eq!(owed(&controller), vec![row]);
+        controller.check_fence().expect("and it refuses nothing");
+
+        let controller = restarted(controller, &temp).await;
+        assert_eq!(
+            revision(&controller).await,
+            before + 1,
+            "the start publishes it and its barrier retires it"
+        );
+        assert!(owed(&controller).is_empty());
+        drop(controller);
+    }
+
+    /// A barrier that cannot advance the revision leaves its debt published: every admission and
+    /// forward is refused meanwhile, and the next pass raises it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_barrier_that_cannot_be_raised_keeps_its_debt_and_refuses_until_the_next_pass() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = super::a_floor_owed_its_record::daemon(&temp).await;
+        let before = revision(&controller).await;
+        let registry = beside(&temp);
+        registry
+            .execute_batch(
+                "CREATE TRIGGER refuse_revision BEFORE UPDATE OF authority_revision ON environment
+                 BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+            )
+            .expect("the fault is in place");
+        let debt = controller
+            .owe_debt("a narrowed ceiling", Reach::Host)
+            .expect("written");
+        controller.publish_debts(&[(debt, Reach::Host)]);
+        controller
+            .barrier()
+            .await
+            .expect_err("the revision cannot advance");
+        controller
+            .check_fence()
+            .expect_err("every admission is refused while the debt is owed");
+        assert_eq!(owed(&controller), vec![debt]);
+        assert_eq!(revision(&controller).await, before);
+
+        registry
+            .execute_batch("DROP TRIGGER refuse_revision;")
+            .expect("the fault is cleared");
+        controller
+            .raise_owed_barrier()
+            .await
+            .expect("the pass raises it")
+            .expect("a barrier was owed");
+        controller.check_fence().expect("nothing refuses");
+        assert_eq!(revision(&controller).await, before + 1);
+        assert!(owed(&controller).is_empty());
+        drop(controller);
+    }
+
+    /// A stop after a barrier advanced the revision and before it deleted the rows it captured
+    /// leaves them on disk, and the next start raises exactly one more barrier for them. A start
+    /// after the rows were deleted, and one after a barrier that completed, raise none.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_barrier_whose_rows_outlived_it_is_raised_once_more_at_the_next_start() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = super::a_floor_owed_its_record::daemon(&temp).await;
+        let before = revision(&controller).await;
+        let registry = beside(&temp);
+        registry
+            .execute_batch(
+                "CREATE TRIGGER keep_debt BEFORE DELETE ON fence_debt
+                 BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+            )
+            .expect("the fault is in place");
+        let debt = controller
+            .owe_debt("a revocation", Reach::Host)
+            .expect("written");
+        controller.publish_debts(&[(debt, Reach::Host)]);
+        controller
+            .barrier()
+            .await
+            .expect("the barrier completes, its rows undeleted");
+        assert_eq!(revision(&controller).await, before + 1);
+        assert_eq!(
+            owed(&controller),
+            vec![debt],
+            "the row outlived its barrier"
+        );
+        controller
+            .check_fence()
+            .expect("in this run the barrier retired it");
+        registry
+            .execute_batch("DROP TRIGGER keep_debt;")
+            .expect("the fault is cleared");
+
+        let controller = restarted(controller, &temp).await;
+        assert_eq!(
+            revision(&controller).await,
+            before + 2,
+            "the start raised exactly one more barrier"
+        );
+        assert!(owed(&controller).is_empty());
+        controller.check_fence().expect("nothing refuses");
+
+        // A start after the rows were deleted raises none.
+        let controller = restarted(controller, &temp).await;
+        assert_eq!(revision(&controller).await, before + 2);
+
+        // Nor does one after a barrier that completed normally.
+        let normal = controller
+            .owe_debt("another revocation", Reach::Host)
+            .expect("written");
+        controller.publish_debts(&[(normal, Reach::Host)]);
+        controller.barrier().await.expect("a barrier");
+        assert_eq!(revision(&controller).await, before + 3);
+        let controller = restarted(controller, &temp).await;
+        assert_eq!(revision(&controller).await, before + 3);
+        drop(controller);
+    }
+
+    /// A configuration acceptance whose ceiling could not move owes no fence of its own, so it
+    /// never creates a debt for one. It fences because another change's debt is published; when a
+    /// barrier captures that debt while the acceptance waits for the registry, the acceptance
+    /// captures nothing and reports that barrier, and the revision advances once.
+    ///
+    /// On one thread, so the order is exact: the other barrier waits for the registry first, the
+    /// acceptance decides to fence and waits behind it, and only then is the registry let go.
+    #[tokio::test]
+    async fn an_acceptance_whose_ceiling_could_not_move_fences_under_no_debt_of_its_own() {
+        use kr_protocol::hostinfo::configuration::{Change, ConfigurationDocument};
+        use kr_protocol::rights::ActionRight;
+
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = super::a_floor_owed_its_record::daemon(&temp).await;
+        controller
+            .apply_configuration(&Change::GrantRights(Some(vec![
+                ActionRight::SessionView.as_str().to_owned(),
+                ActionRight::SessionRename.as_str().to_owned(),
+            ])))
+            .await
+            .expect("a ceiling this host accepts");
+        let before = revision(&controller).await;
+        let registry = beside(&temp);
+        registry
+            .execute_batch(
+                "CREATE TRIGGER refuse_debt BEFORE INSERT ON fence_debt
+                 BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+            )
+            .expect("no debt can be written");
+        // Another change's debt, published and not yet captured.
+        let other = crate::grants::store::DebtId::fresh();
+        controller.publish_debts(&[(other, Reach::Host)]);
+        let mut narrowed = ConfigurationDocument::empty();
+        narrowed.revision = 3;
+        narrowed.ceilings.grant_rights = kr_protocol::scalars::Nullable::some(vec![
+            ActionRight::SessionView.as_str().to_owned(),
+        ]);
+        let path = kr_worker::config::document_path(&temp.environment());
+        kr_ipc::paths::write_owner_only_file(
+            &path,
+            kr_protocol::hostinfo::configuration::contents(&narrowed).as_bytes(),
+        )
+        .expect("the narrowed document");
+
+        let held = controller.registry.lock().await;
+        let capture = tokio::spawn({
+            let controller = Arc::clone(&controller);
+            async move { controller.raise_owed_barrier().await }
+        });
+        tokio::task::yield_now().await;
+        let acceptance = tokio::spawn({
+            let controller = Arc::clone(&controller);
+            async move { controller.accept_configuration().await }
+        });
+        tokio::task::yield_now().await;
+        drop(held);
+        let captured = capture
+            .await
+            .expect("the barrier runs")
+            .expect("it is raised")
+            .expect("it captured the other change's debt");
+        let accepted = acceptance.await.expect("the acceptance runs");
+
+        assert!(
+            accepted
+                .not_in_force
+                .as_ref()
+                .is_some_and(|problem| problem.as_str().contains("did not change")),
+            "the ceiling could not move: {:?}",
+            accepted.not_in_force
+        );
+        assert_eq!(
+            accepted
+                .barrier
+                .as_ref()
+                .map(|barrier| barrier.authority_revision),
+            Some(captured.authority_revision),
+            "the acceptance fenced, and reports the barrier that captured the published debt"
+        );
+        assert_eq!(
+            revision(&controller).await,
+            before + 1,
+            "one barrier: the acceptance created no debt of its own"
+        );
+        controller.check_fence().expect("and nothing is left owed");
+        drop(controller);
     }
 }

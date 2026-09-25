@@ -57,8 +57,7 @@ fn main() -> ExitCode {
     // Standard error is the readiness pipe, standard input is the release pipe, and standard
     // output is the terminal. Reporting readiness here rather than at startup means the attach
     // process learns that the guard is armed, not merely that it was spawned.
-    let mut ready = std::io::stderr();
-    if ready.write_all(&[GUARD_READY]).is_err() || ready.flush().is_err() {
+    if kr_cli::report::ready(GUARD_READY).is_err() {
         return ExitCode::FAILURE;
     }
 
@@ -107,7 +106,7 @@ fn main() -> ExitCode {
                     // was answering it - restores them.
                     if line.first() == Some(&GUARD_BEGIN) && !began {
                         began = true;
-                        if ready.write_all(&[GUARD_READY]).is_err() || ready.flush().is_err() {
+                        if kr_cli::report::ready(GUARD_READY).is_err() {
                             break;
                         }
                     }

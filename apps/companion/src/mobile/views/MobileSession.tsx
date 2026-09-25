@@ -16,7 +16,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 
 import { useApp } from '../../app/state'
 import { Badge, Banner, Button, Segmented } from '../../components/ui'
-import { failureCode, failureMessage } from '../../host/port'
+import { failureCode, failureMessage, watch, type Watch } from '../../host/port'
 import {
   edit,
   notSubmittableBecause,
@@ -36,7 +36,16 @@ import {
   failed
 } from '../../model/receipts'
 import { renderMarkdown } from '../../markdown/render'
-import { ZOOM_DEFAULT_INDEX, ZOOM_STEPS, zoomBy, type ViewMode } from '../../terminal/modes'
+import {
+  presentationOf,
+  terminalAttachment,
+  unreadPresentation,
+  ZOOM_DEFAULT_INDEX,
+  ZOOM_STEPS,
+  zoomBy,
+  type Presentation,
+  type ViewMode
+} from '../../terminal/modes'
 import { AccessoryRow } from '../components/keys'
 import { AttachmentPicker } from '../components/picker'
 import { sequenceForKeyPress, afterKey, pressModifier, sequenceFor, NO_LATCH, type Latch } from '../model/accessory'
@@ -87,12 +96,33 @@ export function MobileSession({
   readonly sessionId: string
   readonly surface: Surface
   readonly lifecycle: Lifecycle
-  readonly connected: boolean
+  /** Whether the host is in contact, or null before the shell's first answer. */
+  readonly connected: boolean | null
 }): ReactNode {
   const { port, say } = useApp()
   const [pane, setPane] = useState<Pane>('semantic')
-  const [nodes, setNodes] = useState<readonly ReadNode[]>([])
-  const [screen, setScreen] = useState<readonly string[]>([])
+  // What each read answered, kept with the session it was read for and shown only for that
+  // session: from the first render after a change of session, nothing of the last one is shown.
+  // The conversation is a refusal's words, or the nodes read, or nothing before the first answer.
+  const [conversation, setConversation] = useState<{
+    readonly sessionId: string
+    readonly nodes: readonly ReadNode[]
+    readonly refusal: string | null
+  } | null>(null)
+  const [screenRead, setScreenRead] = useState<{
+    readonly sessionId: string
+    readonly rows: readonly string[]
+  } | null>(null)
+  // How the host presents this view's terminal, as the newest snapshot said.
+  const [presentationRead, setPresentationRead] = useState<{
+    readonly sessionId: string
+    readonly presentation: Presentation
+  } | null>(null)
+  const read = conversation?.sessionId === sessionId ? conversation : null
+  const nodes = read?.nodes ?? []
+  const screen = screenRead?.sessionId === sessionId ? screenRead.rows : []
+  const presented =
+    presentationRead?.sessionId === sessionId ? presentationRead.presentation : null
   const [mode, setMode] = useState<ViewMode>('control')
   const [zoom, setZoom] = useState(ZOOM_DEFAULT_INDEX)
   const [pan, setPan] = useState({ x: 0, y: 0 })
@@ -135,27 +165,66 @@ export function MobileSession({
     [lifecycle]
   )
 
+  // The conversation is read under a watch with no listeners that ends with the session: only the
+  // newest read's answer is shown, and what an ended watch read goes with it.
   useEffect(() => {
-    ask(() => port.agentSnapshot({ session_id: sessionId }))
-      .then((answer) => {
-        setNodes(answer.nodes.slice(-80).map(readNode))
-      })
-      .catch(() => {
-        setNodes([])
-      })
+    const reading: Watch = watch([], () => {
+      const current = reading.read()
+      if (current === null) return
+      ask(() => port.agentSnapshot({ session_id: sessionId }))
+        .then((answer) => {
+          if (!current()) return
+          setConversation({ sessionId, nodes: answer.nodes.slice(-80).map(readNode), refusal: null })
+        })
+        .catch((failure: unknown) => {
+          if (!current()) return
+          setConversation({ sessionId, nodes: [], refusal: failureMessage(failure) })
+        })
+    })
+    return () => {
+      reading.stop()
+      setConversation(null)
+    }
   }, [port, sessionId])
 
+  // The terminal's screen and the session's snapshot are read each time the terminal is shown,
+  // under one watch with no listeners that ends when the view leaves the terminal or the session:
+  // only the newest read's answers are shown, and what an ended watch read goes with it.
   useEffect(() => {
     if (pane !== 'terminal') return
-    ask(() => port.terminalProjection({ session_id: sessionId }))
-      .then((projection) => {
-        setScreen(
-          projection.rows.map((row) => row.cells.map((cell) => cell.text || ' ').join(''))
-        )
-      })
-      .catch(() => {
-        setScreen([])
-      })
+    const reading: Watch = watch([], () => {
+      const current = reading.read()
+      if (current === null) return
+      ask(() => port.terminalProjection({ session_id: sessionId }))
+        .then((projection) => {
+          if (!current()) return
+          setScreenRead({
+            sessionId,
+            rows: projection.rows.map((row) => row.cells.map((cell) => cell.text || ' ').join(''))
+          })
+        })
+        .catch(() => {
+          if (!current()) return
+          setScreenRead({ sessionId, rows: [] })
+        })
+      ask(() => port.eventsSnapshot({ session_id: sessionId, agent_resources_from: null }))
+        .then((snapshot) => {
+          if (!current()) return
+          setPresentationRead({
+            sessionId,
+            presentation: presentationOf(snapshot.attachments, terminalAttachment(sessionId))
+          })
+        })
+        .catch((failure: unknown) => {
+          if (!current()) return
+          setPresentationRead({ sessionId, presentation: unreadPresentation(failureMessage(failure)) })
+        })
+    })
+    return () => {
+      reading.stop()
+      setScreenRead(null)
+      setPresentationRead(null)
+    }
   }, [port, sessionId, pane])
 
   // Restoring the position happens after the view has drawn, which is the only moment the element
@@ -289,8 +358,18 @@ export function MobileSession({
       <div className="m-pane" ref={paneRef} onScroll={remember}>
         {pane === 'semantic' ? (
           <div className="m-stream" data-testid="mobile-conversation">
-            {nodes.length === 0 ? (
-              <p className="m-empty">Nothing in this conversation yet.</p>
+            {read !== null && read.refusal !== null ? (
+              <Banner
+                tone="warning"
+                title="This conversation could not be read"
+                detail={read.refusal}
+              />
+            ) : nodes.length === 0 ? (
+              // Before the first answer the conversation is being read, which is not the same as
+              // empty: the view says which it knows.
+              <p className="m-empty">
+                {read ? 'Nothing in this conversation yet.' : 'Reading the conversation…'}
+              </p>
             ) : (
               nodes.map((node) => (
                 <div key={node.id} className="m-node">
@@ -347,6 +426,11 @@ export function MobileSession({
                 {mode === 'control' ? 'Look around' : 'Take control'}
               </Button>
               <span>{`Zoom ${Math.round((ZOOM_STEPS[zoom] ?? 1) * 100)}%`}</span>
+              {presented ? (
+                <span data-testid="terminal-presentation" data-presentation={presented.state}>
+                  {presented.sentence}
+                </span>
+              ) : null}
             </div>
             <AccessoryRow
               surface={surface}

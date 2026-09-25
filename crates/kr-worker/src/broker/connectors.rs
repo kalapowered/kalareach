@@ -31,11 +31,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use kr_plugin_sdk::capability::PluginCapability;
-use kr_plugin_sdk::connector::ConnectorManifest;
+use kr_plugin_sdk::connector::{ConnectorManifest, RouteDirection};
+use kr_plugin_sdk::effect::{ActionImplementation, ParameterKind};
 use kr_plugin_sdk::plugin::PluginManifest;
-use kr_protocol::ids::PluginId;
-use kr_protocol::scalars::Digest256;
+use kr_protocol::broker::{DecodingTrust, OfferedDecision};
+use kr_protocol::ids::{PluginId, PublisherId, UpstreamMethod};
+use kr_protocol::scalars::{CanonicalSet, Digest256, TimestampMs, U64};
 
+use crate::broker::PackageIdentity;
 use crate::broker::bridge::{BridgeSurface, InstalledBridge};
 
 /// The command an integration resolves, and the flags it adds to an invocation of it.
@@ -111,6 +114,7 @@ pub struct InstalledConnector {
     source: ConnectorSource,
     manifest: PluginManifest,
     table: ConnectorManifest,
+    package: PackageIdentity,
 }
 
 impl InstalledConnector {
@@ -121,9 +125,9 @@ impl InstalledConnector {
     /// Returns [`ConnectorRefusal`] naming the first thing that does not hold: the package fails
     /// the SDK's package check (a file that is not the bytes the manifest names, or a table for
     /// another package, among them), its manifest does not hash to the installed hash, it carries
-    /// no table, no match rule of the package recognises the command the integration resolves, or
+    /// no table, no match rule of the package recognises the command the integration resolves,
     /// the installation describes a native bridge the package does not declare or was not
-    /// granted.
+    /// granted, or its publisher is not one this host can record.
     pub fn read(source: ConnectorSource) -> Result<Self, ConnectorRefusal> {
         let validated = kr_plugin_sdk::validate::validate_package_directory(&source.package_dir);
         if !validated.report.is_valid() {
@@ -210,10 +214,22 @@ impl InstalledConnector {
                 )));
             }
         }
+        let publisher_id =
+            PublisherId::new(package.manifest.publisher_id.as_str()).map_err(|error| {
+                ConnectorRefusal::new(format!(
+                    "{plugin_id}'s publisher is not one this host can record: {error}"
+                ))
+            })?;
+        let identity = PackageIdentity {
+            plugin_id,
+            publisher_id,
+            package_digest: source.package_digest,
+        };
         Ok(Self {
             source,
             manifest: package.manifest,
             table,
+            package: identity,
         })
     }
 
@@ -227,6 +243,14 @@ impl InstalledConnector {
     #[must_use]
     pub const fn package_digest(&self) -> Digest256 {
         self.source.package_digest
+    }
+
+    /// Returns the installed package: its identifier, its publisher and its hash.
+    ///
+    /// This is what the package's tables are pinned with, and what a binding of it runs.
+    #[must_use]
+    pub const fn package(&self) -> &PackageIdentity {
+        &self.package
     }
 
     /// Returns the package's manifest, as the installed hash names it.
@@ -283,6 +307,117 @@ impl InstalledConnector {
             .iter()
             .any(|rule| rule.executable.matches_path(path))
     }
+
+    /// Returns the decisions a declarative interpretation offers: the ones the table's decision
+    /// destination maps, in the table's order, each labelled as the package's answer action labels
+    /// that choice, or with its own name where the action names none.
+    #[must_use]
+    pub fn offered_decisions(&self) -> Vec<OfferedDecision> {
+        let Some(destination) = self.table.decision_destination.as_ref() else {
+            return Vec::new();
+        };
+        let choices =
+            self.manifest
+                .actions
+                .iter()
+                .find_map(|action| match &action.implementation {
+                    ActionImplementation::DecisionDestination { decision } => action
+                        .parameters
+                        .parameters
+                        .iter()
+                        .find(|parameter| &parameter.name == decision)
+                        .and_then(|parameter| match &parameter.kind {
+                            ParameterKind::Choice { choices } => Some(choices),
+                            _ => None,
+                        }),
+                    _ => None,
+                });
+        destination
+            .decisions
+            .iter()
+            .map(|mapped| {
+                let label = choices
+                    .and_then(|choices| {
+                        choices
+                            .iter()
+                            .find(|choice| choice.id == mapped.decision)
+                            .map(|choice| choice.label.to_string())
+                    })
+                    .unwrap_or_else(|| mapped.decision.to_string());
+                OfferedDecision {
+                    option_id: mapped.decision.to_string(),
+                    label,
+                }
+            })
+            .collect()
+    }
+}
+
+/// The projection schema a request read from a connector's own decision destination is written
+/// against.
+pub const DECISION_SCHEMA: &str = "kalareach.decision/1";
+
+/// Returns the projection schema a component's decoded request is written against.
+///
+/// It is the plugin contract's own, named for the WIT version this build speaks
+/// (`kalareach.plugin.decoded-request/<WIT version>`): the worker writes it when it converts what a
+/// component decoded, and a component cannot choose it.
+#[must_use]
+pub fn component_schema() -> String {
+    format!(
+        "kalareach.plugin.decoded-request/{}",
+        kr_plugin_sdk::version::WIT_VERSION
+    )
+}
+
+/// Returns the decoding trust an installation's grants give its connector's package, where they
+/// give any.
+///
+/// The trust is derived from what the installation was granted and from the installed package's
+/// own connector table, and never from anything a component reports: none unless `approval.decode`
+/// is granted; the package, publisher and installed hash are the installed package's; the methods
+/// are the wire names of the routes that carry, towards this host, what the table's decision
+/// destination answers; the schemas are [`DECISION_SCHEMA`], and [`component_schema`] as well when
+/// the package ships a component; at most as many decisions as the destination maps; and it may
+/// encode an answer exactly when `approval.respond` is granted.
+///
+/// The decision destination is the one statement of which routed request asks for a decision, so a
+/// package whose table has none, or whose answers are responses to the request rather than a
+/// request of their own, is given no trust here.
+#[must_use]
+pub fn decoding_trust(connector: &InstalledConnector, now: TimestampMs) -> Option<DecodingTrust> {
+    if !connector.granted(PluginCapability::ApprovalDecode) {
+        return None;
+    }
+    let table = connector.table();
+    let destination = table.decision_destination.as_ref()?;
+    let methods: CanonicalSet<UpstreamMethod> = table
+        .routes
+        .iter()
+        .filter(|route| {
+            route.method == destination.answers && route.direction != RouteDirection::HostToUpstream
+        })
+        .filter_map(|route| UpstreamMethod::new(route.wire_name.clone()).ok())
+        .collect();
+    if methods.is_empty() {
+        return None;
+    }
+    let mut schema_versions: CanonicalSet<String> =
+        std::iter::once(DECISION_SCHEMA.to_owned()).collect();
+    if connector.manifest().has_component() {
+        schema_versions.insert(component_schema());
+    }
+    let package = connector.package();
+    Some(DecodingTrust {
+        plugin_id: package.plugin_id.clone(),
+        publisher_id: package.publisher_id.clone(),
+        package_digest: package.package_digest,
+        methods,
+        schema_versions,
+        max_decisions: U64::new(u64::try_from(destination.decisions.len()).unwrap_or(u64::MAX)),
+        may_encode_response: connector.granted(PluginCapability::ApprovalRespond),
+        granted_at: now,
+    })
 }
 
 /// The connectors this worker may launch and serve, by the command each integration resolves.
@@ -296,6 +431,15 @@ impl ConnectorSources {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Returns true while no connector has been handed over.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.by_command
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
     }
 
     /// Replaces the whole set with what the installation handed over now.
@@ -396,7 +540,7 @@ pub mod fixture {
     /// The digest of the Claude Code executable the connector is qualified against, macOS arm64.
     pub const QUALIFIED_DIGEST: [u8; 32] = [
         0xbd, 0x24, 0x56, 0x62, 0xfb, 0x8a, 0x0e, 0x32, 0x1b, 0x3b, 0xf1, 0x33, 0xe9, 0x30, 0x37,
-        0x1d, 0x65, 0x63, 0xc3, 0x87, 0x52, 0x78, 0x85, 0xf3, 0x0b, 0x26, 0x13, 0xae, 0x3a, 0xba,
+        0x1d, 0x65, 0x63, 0xc3, 0x87, 0x52, 0x78, 0x85, 0xf3, 0x0b, 0x26, 0x13, 0xae, 0xf3, 0xba,
         0x14, 0xd6,
     ];
     use crate::broker::bridge::BridgeSurface;
@@ -612,6 +756,20 @@ pub mod fixture {
         serde_json::to_string_pretty(&manifest).expect("a literal manifest encodes")
     }
 
+    /// Returns the same installation, granted to read files too: a connector whose launch is
+    /// granted the directory it was resolved in.
+    #[must_use]
+    pub fn reading(mut source: ConnectorSource) -> ConnectorSource {
+        source.granted.insert(PluginCapability::FilesystemRead);
+        source
+    }
+
+    /// The bytes the fixture ships as its component: a Wasm component's preamble.
+    ///
+    /// Nothing here runs a component, and the package check executes nothing, so the fixture's
+    /// component is the bytes the manifest names by digest and no more.
+    pub const COMPONENT: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00];
+
     /// Writes the package under `root` as the store extracts it, and returns what an installation
     /// hands over for it, with every capability the package declares granted.
     ///
@@ -619,7 +777,28 @@ pub mod fixture {
     ///
     /// Returns what writing a file returned.
     pub fn claude_code_package(root: &Path, forwarder: &Path) -> std::io::Result<ConnectorSource> {
-        let files: Vec<(&str, &str, Vec<u8>)> = vec![
+        write_package(root, forwarder, false)
+    }
+
+    /// Writes the same package with a Wasm component in it too, and returns what an installation
+    /// hands over for it, with every capability the package declares granted.
+    ///
+    /// # Errors
+    ///
+    /// Returns what writing a file returned.
+    pub fn claude_code_package_with_component(
+        root: &Path,
+        forwarder: &Path,
+    ) -> std::io::Result<ConnectorSource> {
+        write_package(root, forwarder, true)
+    }
+
+    fn write_package(
+        root: &Path,
+        forwarder: &Path,
+        component: bool,
+    ) -> std::io::Result<ConnectorSource> {
+        let mut files: Vec<(&str, &str, Vec<u8>)> = vec![
             ("connector", "connector.json", connector_json().into_bytes()),
             (
                 "presentation",
@@ -634,6 +813,13 @@ pub mod fixture {
                 PLUGIN.to_vec(),
             ),
         ];
+        if component {
+            files.push((
+                "component",
+                kr_plugin_sdk::package::COMPONENT_FILE,
+                COMPONENT.to_vec(),
+            ));
+        }
         let manifest = manifest_json(&files);
         let digest = PayloadDigest::of(manifest.as_bytes());
         let directory: PathBuf = root.join("packages").join(digest.to_string());
@@ -672,6 +858,22 @@ pub mod fixture {
             .collect::<BTreeSet<_>>(),
             qualified: Vec::new(),
         })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        /// The digest the connector's qualification record publishes for that executable, in the
+        /// form the record writes it.
+        const PUBLISHED: &str = "bd245662fb8a0e321b3bf133e930371d6563c387527885f30b2613aef3ba14d6";
+
+        #[test]
+        fn the_qualified_digest_is_the_one_the_qualification_record_publishes() {
+            let written: String = super::QUALIFIED_DIGEST
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            assert_eq!(written, PUBLISHED);
+        }
     }
 }
 

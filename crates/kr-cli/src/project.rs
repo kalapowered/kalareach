@@ -11,6 +11,8 @@
 //! repository on this machine, or the identifier of a repository this environment has registered.
 //! The service parses a remote again and refuses one whose form is not the transport named here.
 
+use kr_client::shown;
+use kr_client::shown::Shown;
 use std::path::Path;
 
 use kr_ipc::paths::HostPaths;
@@ -140,22 +142,23 @@ async fn adopt(paths: &HostPaths, arguments: &ProjectAdoptArguments, json: bool)
 /// `..`, and for a path that is not text.
 pub fn destination(environment_id: EnvironmentId, path: &Path) -> Result<DestinationRequest> {
     let absolute = std::path::absolute(path).map_err(|error| {
-        CliError::Usage(format!(
-            "{} cannot be taken from this directory: {error}",
-            path.display()
+        CliError::Usage(shown!(
+            "{} cannot be taken from this directory: {}",
+            crate::shown::named(path),
+            Shown::io(&error)
         ))
     })?;
     let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name()) else {
-        return Err(CliError::Usage(format!(
+        return Err(CliError::Usage(shown!(
             "{} names no directory of its own inside another one",
-            absolute.display()
+            crate::shown::named(&absolute)
         )));
     };
     let as_text = |part: &std::ffi::OsStr| {
         part.to_str().map(str::to_owned).ok_or_else(|| {
-            CliError::Usage(format!(
+            CliError::Usage(shown!(
                 "{} is not a path this host can record, because it is not text",
-                absolute.display()
+                crate::shown::named(&absolute)
             ))
         })
     };
@@ -230,12 +233,11 @@ fn transport_of(text: &str) -> Result<RemoteTransport> {
             return Ok(RemoteTransport::Ssh);
         }
     }
-    Err(CliError::Usage(
+    Err(CliError::Usage(Shown::said(
         "that source is not one this host clones from: name an https:// URL, an ssh remote \
          (ssh://host/path or user@host:path), the absolute path of a repository on this machine, \
-         or a registered repository's identifier"
-            .to_owned(),
-    ))
+         or a registered repository's identifier",
+    )))
 }
 
 /// Prints what a creation made.

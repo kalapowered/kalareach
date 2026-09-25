@@ -404,7 +404,7 @@ impl Read {
 /// waits there until the test lets it go. Armed once, it fires once.
 #[cfg(any(test, feature = "testing"))]
 #[derive(Debug, Default)]
-struct Pause(
+pub(crate) struct Pause(
     std::sync::Mutex<
         Option<(
             std::sync::mpsc::SyncSender<()>,
@@ -416,7 +416,7 @@ struct Pause(
 #[cfg(any(test, feature = "testing"))]
 impl Pause {
     /// Arms the pause. Returns the end that says the work has arrived, and the end that lets it go.
-    fn arm(
+    pub(crate) fn arm(
         &self,
     ) -> (
         std::sync::mpsc::Receiver<()>,
@@ -432,7 +432,7 @@ impl Pause {
     }
 
     /// Waits here when the pause is armed.
-    fn wait(&self) {
+    pub(crate) fn wait(&self) {
         let armed = self
             .0
             .lock()
@@ -4354,6 +4354,7 @@ mod tests {
             active: Arc::new(active.clone()),
             wall: Arc::new(wall.clone()),
             adapter: Arc::new(adapter.clone()),
+            floor: None,
         };
         let written = |module: &AttentionModule| {
             let bytes = std::fs::read(&module.time_file).expect("the record is written");

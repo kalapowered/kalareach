@@ -33,7 +33,7 @@ use kr_pairing::host::{
 };
 use kr_pairing::platform::{InvitationState, LivePeer, PairingClock};
 use kr_protocol::confirmation::{
-    ConfirmationDisplay, ConfirmationSubject, OwnerConfirmationCompleteParams,
+    CLOCK_PURPOSE, ConfirmationDisplay, ConfirmationSubject, OwnerConfirmationCompleteParams,
     OwnerConfirmationCompleteResult, OwnerConfirmationPendingResult,
     OwnerConfirmationRequestParams, OwnerConfirmationRequestResult,
 };
@@ -55,6 +55,7 @@ use kr_protocol::pairing::{
 use kr_protocol::preauth::{
     PairFinishResult, PairRedeemParams, PairRedeemResult, PairStatusParams, PairStatusResult,
 };
+use kr_protocol::rendezvous::{ClientFrame, encode_message};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Bytes, CanonicalSet, Digest256, Nullable};
 use kr_transport::preauth::{ConnectionPeer, PairingMethod, PairingSurface};
@@ -65,9 +66,7 @@ use super::invitations::{
     WriteAdmission, another_subject,
 };
 use super::owner::{Caller, OwnerAuthority, Resolved, refusal};
-use super::rendezvous::{
-    ClientFrame, Rendezvous, RoomOffer, RoomTicket, encode_message, serve_room,
-};
+use super::rendezvous::{Rendezvous, RoomOffer, RoomTicket, serve_room};
 use crate::error::{ControllerError, Result};
 
 /// The clock every pairing deadline on this host is measured on.
@@ -110,11 +109,6 @@ impl PairingClock for HostPairingClock {
         kr_ipc::now_ms().get()
     }
 }
-
-/// What an owner confirms when it establishes this host's clock again.
-///
-/// The digest of this, and of nothing else, is what the confirmation is bound to.
-pub const CLOCK_PURPOSE: &str = "kr-host-clock/1";
 
 /// The invitation this host is offering, and what it was issued as.
 struct Open {

@@ -1424,6 +1424,11 @@ pub mod configuration {
         /// Read when the daemon starts, so a change applies at the next start. No environment
         /// variable reaches it.
         pub voice: VoiceSelection,
+        /// How this environment's control daemon is started when a command finds none running.
+        ///
+        /// Read by `kr new` when it finds no daemon to ask, so a change applies at the next start.
+        /// No environment variable reaches it.
+        pub startup: StartupSelection,
     }
 
     impl Default for ConfigurationDocument {
@@ -1442,6 +1447,7 @@ pub mod configuration {
                 secrets: Vec::new(),
                 network: NetworkSelection::default(),
                 voice: VoiceSelection::default(),
+                startup: StartupSelection::default(),
             }
         }
     }
@@ -1760,11 +1766,13 @@ pub mod configuration {
         /// The public Mainline DHT for discovery. It publishes to a public network and carries no
         /// KalaReach service guarantee, which is why it is never on unless chosen.
         pub mainline_dht: Nullable<bool>,
-        /// The HTTP proxy the endpoint reaches its relays and Pkarr servers through, as an absolute
-        /// `http` or `https` origin such as `http://proxy.example.com:3128`. The DNS lookup does
-        /// not use it. It is this machine's own choice: no invitation or host bundle carries it.
-        /// It names no user and no password, because a proxy that needs credentials is not
-        /// supported.
+        /// The HTTP proxy this host's outbound HTTPS goes through, as an absolute `http` or
+        /// `https` origin such as `http://proxy.example.com:3128`: the network endpoint's relays
+        /// and Pkarr servers, the rendezvous, delivery and webhooks, and plugin repositories.
+        /// Nothing goes around it, so an address it cannot reach fails. Name lookups and mail
+        /// submission do not use it. It is this machine's own choice: no invitation or host bundle
+        /// carries it. It names no user and no password, because a proxy that needs credentials is
+        /// not supported.
         pub proxy_url: Nullable<String>,
     }
 
@@ -1829,8 +1837,7 @@ pub mod configuration {
             self.mainline_dht.0.unwrap_or(false)
         }
 
-        /// The HTTP proxy the endpoint reaches its relays and Pkarr servers through, when one is
-        /// selected.
+        /// The HTTP proxy this host's outbound HTTPS goes through, when one is selected.
         #[must_use]
         pub fn proxy_url(&self) -> Option<&str> {
             self.proxy_url.as_ref().map(String::as_str)
@@ -1856,6 +1863,72 @@ pub mod configuration {
         #[must_use]
         pub fn broker_origin(&self) -> Option<&str> {
             self.broker_origin.as_ref().map(String::as_str)
+        }
+    }
+
+    /// How this environment's control daemon is started when a command finds none running.
+    ///
+    /// Section 7 lets `kr new` start the per-user controller only on a host that was set up for
+    /// it, and makes every other host answer `HOST_NOT_CONFIGURED` with the setup action. This is
+    /// where that setup is recorded: absent unless an owner, or an installer, chose it. No request,
+    /// profile or environment variable reaches it, so a variable exported in one terminal cannot
+    /// make a command start a daemon on a host that was never set up to have one started.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields, default)]
+    pub struct StartupSelection {
+        /// How the control daemon is started. Absent starts none.
+        pub controller: Nullable<ControllerStartup>,
+    }
+
+    impl Default for StartupSelection {
+        /// Nothing chosen, which is what an absent section reads as.
+        fn default() -> Self {
+            Self {
+                controller: Nullable::null(),
+            }
+        }
+    }
+
+    impl StartupSelection {
+        /// How the control daemon is started, when this document chooses it.
+        #[must_use]
+        pub fn controller(&self) -> Option<ControllerStartup> {
+            self.controller.0
+        }
+    }
+
+    /// One way of starting this environment's control daemon.
+    #[derive(
+        Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+    )]
+    #[serde(rename_all = "snake_case")]
+    pub enum ControllerStartup {
+        /// The standalone headless profile, for a host with no service manager to ask: a command
+        /// that finds no daemon running starts `kr-controller` itself, detached from the command,
+        /// in a session of its own and with the environment's own directories. The daemon takes
+        /// the environment's singleton lock and advances its generation as every daemon does, so
+        /// several commands starting one at once leave one daemon.
+        Standalone,
+    }
+
+    impl ControllerStartup {
+        /// Every way, in declaration order.
+        pub const ALL: [Self; 1] = [Self::Standalone];
+
+        /// Returns the stable wire string.
+        #[must_use]
+        pub const fn as_str(self) -> &'static str {
+            match self {
+                Self::Standalone => "standalone",
+            }
+        }
+
+        /// Reads a wire string.
+        #[must_use]
+        pub fn from_wire(value: &str) -> Option<Self> {
+            Self::ALL
+                .into_iter()
+                .find(|startup| startup.as_str() == value)
         }
     }
 
@@ -2393,10 +2466,13 @@ pub mod configuration {
         /// The whole section, not one budget of it: what this names becomes what the document
         /// says, and a budget left out of it goes back to the schema's own number.
         Enrolment(ConfiguredEnrolmentBudgets),
+        /// Choose how this environment's control daemon is started when a command finds none
+        /// running, or clear the choice so that none is started.
+        ControllerStartup(Option<ControllerStartup>),
     }
 
     impl Change {
-        /// Returns the preference or ceiling key this change names.
+        /// Returns the preference, ceiling or selection key this change names.
         #[must_use]
         pub const fn key(&self) -> &'static str {
             match self {
@@ -2405,6 +2481,7 @@ pub mod configuration {
                 Self::SessionLimit(_) => "session_limit",
                 Self::GrantRights(_) => "grant_rights",
                 Self::Enrolment(_) => "enrolment",
+                Self::ControllerStartup(_) => STARTUP_CONTROLLER.key,
             }
         }
 
@@ -2417,6 +2494,7 @@ pub mod configuration {
                 | Self::GrantRights(_)
                 | Self::Enrolment(_) => ValueEffect::Immediately,
                 Self::WorkerProfile(_) => ValueEffect::NewSessionsOnly,
+                Self::ControllerStartup(_) => Selection::EFFECT,
             }
         }
     }
@@ -2578,6 +2656,9 @@ pub mod configuration {
             }
             Change::Enrolment(budgets) => {
                 document.ceilings.enrolment = Nullable::some(*budgets);
+            }
+            Change::ControllerStartup(startup) => {
+                document.startup.controller = Nullable(*startup);
             }
         }
         document.version = VERSION;
@@ -2984,7 +3065,7 @@ pub mod configuration {
 
     impl Selection {
         /// When a new value takes effect. The endpoint and the voice service are built once, when
-        /// the daemon starts.
+        /// the daemon starts, and how the daemon is started is read when one next has to be.
         pub const EFFECT: ValueEffect = ValueEffect::NextStart;
     }
 
@@ -3049,10 +3130,11 @@ pub mod configuration {
         about: "whether this host uses the public Mainline DHT for discovery",
     };
 
-    /// The HTTP proxy the endpoint reaches its relays and Pkarr servers through.
+    /// The HTTP proxy this host's outbound HTTPS goes through.
     pub const NETWORK_PROXY_URL: Selection = Selection {
         key: "network.proxy_url",
-        about: "the HTTP proxy the network endpoint reaches its relays and Pkarr servers through",
+        about: "the HTTP proxy this host's outbound HTTPS goes through: the network endpoint's \
+                relays and Pkarr servers, the rendezvous, delivery and plugin repositories",
     };
 
     /// The managed voice broker this host names to its devices.
@@ -3061,8 +3143,15 @@ pub mod configuration {
         about: "the managed voice broker this host names to its paired devices",
     };
 
+    /// How this environment's control daemon is started when a command finds none running.
+    pub const STARTUP_CONTROLLER: Selection = Selection {
+        key: "startup.controller",
+        about: "how kr new starts this environment's control daemon when none is running; none \
+                starts nothing and answers that the host is not configured",
+    };
+
     /// Every selection this host reads when it starts, in the order `kr doctor` prints them.
-    pub const SELECTIONS: [Selection; 12] = [
+    pub const SELECTIONS: [Selection; 13] = [
         NETWORK_ENABLED,
         NETWORK_BIND_ADDRESS,
         NETWORK_RELAY_URLS,
@@ -3075,6 +3164,7 @@ pub mod configuration {
         NETWORK_MAINLINE_DHT,
         NETWORK_PROXY_URL,
         VOICE_BROKER_ORIGIN,
+        STARTUP_CONTROLLER,
     ];
 
     /// The words a selection's value is reported in when it is not a location or a path: the two
@@ -3468,6 +3558,16 @@ pub mod configuration {
                 document.voice.broker_origin.is_present(),
                 location(document.voice.broker_origin()),
             ),
+            row(
+                STARTUP_CONTROLLER,
+                document.startup.controller.is_present(),
+                Declared::term(
+                    document
+                        .startup
+                        .controller()
+                        .map_or("none", ControllerStartup::as_str),
+                ),
+            ),
         ]
     }
 
@@ -3527,21 +3627,31 @@ pub mod configuration {
     /// exceptions to it are written down: `kr doctor` prints this list, so what a person is told
     /// about this host matches what this host actually does.
     ///
-    /// Two kinds are here, and neither reaches authority or a provider origin. The platform
-    /// directory variables are how the operating system itself names its conventional locations,
-    /// and reading them is what "native OS-appropriate locations" means rather than an exception
-    /// to it. The session variables are how the platform describes the login this host is running
-    /// in, which is a reading of the environment rather than a choice about it. Every network
-    /// selection and the voice broker's origin are this host's configuration document's
-    /// ([`NetworkSelection`], [`VoiceSelection`]), and nothing reads them from the environment. No
-    /// variable names this host's owner: the owner is recorded through local IPC, by the pairing
-    /// that establishes it.
+    /// Three kinds are here, and none reaches authority, a provider origin or whom this host
+    /// trusts to answer for one. The platform directory variables are how the operating system
+    /// itself names its conventional locations, and reading them is what "native OS-appropriate
+    /// locations" means rather than an exception to it. The session variables are how the platform
+    /// describes the login this host is running in, which is a reading of the environment rather
+    /// than a choice about it. The network variables are read by the endpoint's library, which
+    /// offers no way not to: with no proxy selected, iroh's relay latency probe and captive-portal
+    /// check go through the proxy the environment names, and on Windows the endpoint's resolver
+    /// reads the hosts file under `SystemRoot`. They move where those requests go and can mislead
+    /// the captive-portal check; they choose no relay, no service and no trust.
     ///
-    /// The list names what this build reads that decides something: a location or the login this
-    /// host describes. It is not an inventory of every variable a process in this tree ever looks
-    /// at, and it does not claim to be one. A name that is in neither this table nor
-    /// [`ALLOWLIST`] takes no part in the precedence.
-    pub const UNGOVERNED: [UngovernedVariable; 11] = [
+    /// Every network selection, the proxy included, and the voice broker's origin are this host's
+    /// configuration document's ([`NetworkSelection`], [`VoiceSelection`]), and nothing reads them
+    /// from the environment. The managed-service, rendezvous, delivery, plugin repository and mail
+    /// clients verify a server against the platform's own store, the network endpoint verifies its
+    /// relays and discovery servers against the public anchors and the document's relay trust
+    /// anchors, and neither reads the variables other programs take to name a store
+    /// ([`CERTIFICATE_STORE_VARIABLES`]). No variable names this host's owner: the owner is
+    /// recorded through local IPC, by the pairing that establishes it.
+    ///
+    /// The list names what this build reads that decides something: a location, the login this
+    /// host describes, or where the endpoint's relay checks and lookups go. It is not an inventory
+    /// of every variable a process in this tree ever looks at, and it does not claim to be one. A
+    /// name that is in neither this table nor [`ALLOWLIST`] takes no part in the precedence.
+    pub const UNGOVERNED: [UngovernedVariable; 25] = [
         UngovernedVariable {
             variable: "TMPDIR",
             selects: "the platform's per-user temporary directory, which is the macOS runtime root",
@@ -3586,7 +3696,86 @@ pub mod configuration {
             variable: "LOCALAPPDATA",
             selects: "the account's local application data directory on Windows",
         },
+        UngovernedVariable {
+            variable: "USERPROFILE",
+            selects: "the account's home directory where HOME is not set, as Windows names it, \
+                      which an agent's tool configuration is written under",
+        },
+        UngovernedVariable {
+            variable: "USER",
+            selects: "the account name a host, a worker or a bridge helper reports for the login it \
+                      runs in",
+        },
+        UngovernedVariable {
+            variable: "LOGNAME",
+            selects: "the same, for a worker or a bridge helper whose USER is missing, not valid \
+                      Unicode or empty (for a worker, also only whitespace)",
+        },
+        UngovernedVariable {
+            variable: "USERNAME",
+            selects: "the same, as Windows names the account: for a host whose USER is missing or \
+                      not valid Unicode, and for a worker or a bridge helper that passed over USER \
+                      and LOGNAME in that way",
+        },
+        UngovernedVariable {
+            variable: "HTTPS_PROXY",
+            selects: "the proxy iroh's relay latency probe goes through when network.proxy_url \
+                      names none",
+        },
+        UngovernedVariable {
+            variable: "https_proxy",
+            selects: "the same, where HTTPS_PROXY is not set",
+        },
+        UngovernedVariable {
+            variable: "HTTP_PROXY",
+            selects: "the proxy iroh's captive-portal check goes through when network.proxy_url \
+                      names none",
+        },
+        UngovernedVariable {
+            variable: "http_proxy",
+            selects: "the same, where HTTP_PROXY is not set",
+        },
+        UngovernedVariable {
+            variable: "ALL_PROXY",
+            selects: "the proxy either of those relay checks goes through when network.proxy_url \
+                      names none and the check's own variable is not set",
+        },
+        UngovernedVariable {
+            variable: "all_proxy",
+            selects: "the same, where ALL_PROXY is not set",
+        },
+        UngovernedVariable {
+            variable: "NO_PROXY",
+            selects: "the relays those two checks reach without the proxy the variables name",
+        },
+        UngovernedVariable {
+            variable: "no_proxy",
+            selects: "the same, where NO_PROXY is not set",
+        },
+        UngovernedVariable {
+            variable: "REQUEST_METHOD",
+            selects: "whether those two relay checks take a proxy from the environment at all: \
+                      while it is set, as in a CGI program, they take none",
+        },
+        UngovernedVariable {
+            variable: "SystemRoot",
+            selects: "where the network endpoint reads the Windows hosts file, which may name an \
+                      address for a relay or a discovery service",
+        },
     ];
+
+    /// The variables other programs read to choose the certificate authorities they trust, which
+    /// this build never reads.
+    ///
+    /// On Linux the platform verifier trusts only what `SSL_CERT_FILE` or `SSL_CERT_DIR` names while
+    /// either is set, which would let an inherited variable decide who may answer for a service.
+    /// This build's managed-service, rendezvous, delivery, plugin repository and mail clients verify
+    /// against the platform's own store instead, on Linux the distribution's, so an authority given
+    /// only through one of these is not trusted by them until it is installed in the system store.
+    /// The network endpoint verifies its relays and discovery servers against the public anchors and
+    /// `network.relay_trust_anchors`, and reads neither variable. `kr doctor` says so, and says
+    /// which of them is set here.
+    pub const CERTIFICATE_STORE_VARIABLES: [&str; 2] = ["SSL_CERT_FILE", "SSL_CERT_DIR"];
 
     /// Returns the variables in [`UNGOVERNED`] that this process actually has set.
     ///
@@ -3594,10 +3783,39 @@ pub mod configuration {
     /// matters to a person reading a diagnostic is whether this host is running under one.
     #[must_use]
     pub fn ungoverned_here() -> Vec<UngovernedVariable> {
-        UNGOVERNED
-            .iter()
-            .copied()
-            .filter(|entry| std::env::var_os(entry.variable).is_some())
+        ungoverned_among(
+            |variable| std::env::var_os(variable).is_some(),
+            cfg!(windows),
+        )
+    }
+
+    /// Returns the entries of [`UNGOVERNED`] that `set` says are set, each variable once.
+    ///
+    /// Windows names its variables without regard to case, so there `HTTPS_PROXY` and
+    /// `https_proxy` are one variable, and it is reported under the first name the table gives it.
+    pub(super) fn ungoverned_among(
+        set: impl Fn(&str) -> bool,
+        case_blind: bool,
+    ) -> Vec<UngovernedVariable> {
+        let mut here: Vec<UngovernedVariable> = Vec::new();
+        for entry in UNGOVERNED {
+            let repeated = case_blind
+                && here
+                    .iter()
+                    .any(|kept| kept.variable.eq_ignore_ascii_case(entry.variable));
+            if !repeated && set(entry.variable) {
+                here.push(entry);
+            }
+        }
+        here
+    }
+
+    /// Returns the variables in [`CERTIFICATE_STORE_VARIABLES`] that this process has set.
+    #[must_use]
+    pub fn certificate_store_variables_here() -> Vec<&'static str> {
+        CERTIFICATE_STORE_VARIABLES
+            .into_iter()
+            .filter(|variable| std::env::var_os(variable).is_some())
             .collect()
     }
 
@@ -3616,10 +3834,10 @@ pub mod configuration {
     /// comes from a table this module or the protocol already owns: the preference keys, the
     /// selection keys and the words their values are reported in, the ceiling keys, the enrolment
     /// budgets, the documented environment variables, the variables this build reads outside the
-    /// precedence, the wire words of the closed enumerations a report names, and the operating
-    /// system and processor words of the platform this build was compiled for. A string that is
-    /// none of them is something somebody else wrote, and a sentence carries its class and its
-    /// length instead.
+    /// precedence, the certificate store variables it does not read, the wire words of the closed
+    /// enumerations a report names, and the operating system and processor words of the platform
+    /// this build was compiled for. A string that is none of them is something somebody else wrote,
+    /// and a sentence carries its class and its length instead.
     #[must_use]
     pub fn is_known_term(value: &str) -> bool {
         PREFERENCES.iter().any(|preference| preference.key == value)
@@ -3633,12 +3851,14 @@ pub mod configuration {
             || ungoverned_here()
                 .iter()
                 .any(|entry| entry.variable == value)
+            || CERTIFICATE_STORE_VARIABLES.contains(&value)
             || WIRE_WORDS.contains(&value)
             // The platform this build was compiled for, in the words the compiler wrote in.
             || value == std::env::consts::OS
             || value == std::env::consts::ARCH
             || crate::desktop::CAPABILITIES.contains(&value)
             || crate::desktop::SleepInhibitionSetting::from_wire(value).is_some()
+            || ControllerStartup::from_wire(value).is_some()
             || value.parse::<crate::rights::ActionRight>().is_ok()
     }
 
@@ -6642,9 +6862,10 @@ mod tests {
         assert!(configuration::still_current(&prepared, &absent).is_ok());
     }
 
-    /// KR-REQ-26.14: what this build reads outside the precedence is written down, not implied,
-    /// and it is the platform's own naming of its locations and its login: a variable of this
-    /// product's own either takes part in the precedence or is not read at all.
+    /// KR-REQ-26.14: what this build reads outside the precedence is written down, not implied:
+    /// the platform's own naming of its locations and its login, and what the endpoint's library
+    /// reads for its relay checks and lookups. A variable of this product's own either takes part
+    /// in the precedence or is not read at all, and so is a certificate store's.
     #[test]
     fn every_variable_this_build_reads_outside_the_precedence_is_named() {
         for entry in &configuration::UNGOVERNED {
@@ -6672,6 +6893,66 @@ mod tests {
                 .all(|entry| !entry.variable.contains("OWNER")),
             "no variable names this host's owner"
         );
+        // What the endpoint's library still reads is named with why: the proxy variables its two
+        // relay checks follow when no proxy is selected, and the Windows root it reads the hosts
+        // file under.
+        for variable in [
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+            "REQUEST_METHOD",
+            "SystemRoot",
+        ] {
+            assert!(
+                configuration::UNGOVERNED
+                    .iter()
+                    .any(|entry| entry.variable == variable),
+                "{variable} takes part and is named"
+            );
+        }
+        // The account name the host, a worker and a bridge helper report, and the home an agent's
+        // tool configuration goes under on Windows, are read from the login's environment, and
+        // named.
+        for variable in ["USER", "LOGNAME", "USERNAME", "USERPROFILE"] {
+            assert!(
+                configuration::UNGOVERNED
+                    .iter()
+                    .any(|entry| entry.variable == variable),
+                "{variable} is read and is named"
+            );
+        }
+        // A certificate store is never the environment's to choose: those variables are in
+        // neither table, and a report can still name them to say so.
+        for variable in configuration::CERTIFICATE_STORE_VARIABLES {
+            assert!(
+                configuration::allowlisted(variable).is_none()
+                    && configuration::UNGOVERNED
+                        .iter()
+                        .all(|entry| entry.variable != variable),
+                "{variable} is not read"
+            );
+            assert!(configuration::is_known_term(variable), "{variable}");
+        }
+    }
+
+    /// Where a platform names its variables without regard to case, a variable the table lists
+    /// under two spellings is reported once, under the first; elsewhere they are two variables.
+    #[test]
+    fn a_variable_is_reported_once_where_case_does_not_count() {
+        let set = |variable: &str| variable.eq_ignore_ascii_case("HTTPS_PROXY");
+        let reported = |case_blind| {
+            configuration::ungoverned_among(set, case_blind)
+                .into_iter()
+                .map(|entry| entry.variable)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(reported(true), vec!["HTTPS_PROXY"]);
+        assert_eq!(reported(false), vec!["HTTPS_PROXY", "https_proxy"]);
     }
 
     /// The variables that used to select this host's network and its voice broker.
@@ -7192,6 +7473,101 @@ mod tests {
             "false",
             "a switch is a word of this build's own"
         );
+    }
+
+    /// KR-REQ-07.12, KR-REQ-26.13: how the control daemon is started is absent until a validated
+    /// edit chooses it, the one way this build knows is the standalone start, and anything else is
+    /// a document this build does not rewrite. The choice is reported with the document as its
+    /// source and as applying at the next start, it leaves this host as a word of its own, and
+    /// moving it owes no fence and invalidates no evidence. Clearing it is an edit too.
+    #[test]
+    fn the_standalone_start_is_the_documents_choice_and_absent_until_made() {
+        use configuration::{ControllerStartup, STARTUP_CONTROLLER, ValueEffect};
+
+        let origin = "/home/someone/.config/kalareach/config.json";
+        let row = |document: Option<&ConfigurationDocument>| {
+            configuration::selection_rows(document, origin)
+                .into_iter()
+                .find(|row| row.key == STARTUP_CONTROLLER.key)
+                .expect("the startup is reported")
+        };
+        assert_eq!(ConfigurationDocument::empty().startup.controller(), None);
+        let unchosen = row(None);
+        assert_eq!(
+            (unchosen.value(), unchosen.source, unchosen.effect),
+            ("none", ValueSource::Default, ValueEffect::NextStart)
+        );
+        assert!(unchosen.origin.0.is_none());
+
+        let chosen = Change::ControllerStartup(Some(ControllerStartup::Standalone));
+        assert_eq!(chosen.key(), "startup.controller");
+        assert_eq!(chosen.effect(), ValueEffect::NextStart);
+        let absent = configuration::load(None);
+        let edited = configuration::edit(&absent, &chosen).expect("a validated edit");
+        assert_eq!(edited.revision, 1);
+        assert_eq!(
+            edited.document.startup.controller(),
+            Some(ControllerStartup::Standalone)
+        );
+        assert!(
+            edited
+                .contents
+                .contains("\"startup\": {\n    \"controller\": \"standalone\"\n  }"),
+            "{}",
+            edited.contents
+        );
+        let reread = configuration::load(Some(edited.contents.as_bytes()));
+        assert_eq!(reread.status.state, DocumentState::Loaded);
+        assert_eq!(reread.document.as_ref(), Some(&edited.document));
+        let reported = row(reread.document.as_ref());
+        assert_eq!(
+            (
+                reported.value(),
+                reported.source,
+                reported.class(),
+                reported.effect
+            ),
+            (
+                "standalone",
+                ValueSource::HostConfiguration,
+                export::ContentClass::Term,
+                ValueEffect::NextStart
+            )
+        );
+        assert_eq!(reported.origin.0.as_deref(), Some(origin));
+        assert_eq!(
+            configuration::owed(None, reread.document.as_ref()),
+            configuration::Owed::default(),
+            "starting a daemon differently fences nothing and invalidates nothing"
+        );
+
+        // It leaves this host as the word it is.
+        let mut effective = EffectiveConfiguration::unread();
+        effective.values = vec![reported];
+        let exported = export::ForExport::for_export(effective);
+        assert_eq!(exported.get().values[0].value(), "standalone");
+
+        // A way this build does not know is a document it does not rewrite.
+        let unknown = configuration::load(Some(
+            br#"{"version": 1, "revision": 2, "startup": {"controller": "service"}}"#,
+        ));
+        assert_eq!(unknown.status.state, DocumentState::Invalid);
+        assert!(matches!(
+            configuration::edit(&unknown, &chosen),
+            Err(configuration::EditRefused::NotOurs(_))
+        ));
+        assert_eq!(ControllerStartup::from_wire("service"), None);
+        assert_eq!(
+            ControllerStartup::from_wire("standalone"),
+            Some(ControllerStartup::Standalone)
+        );
+
+        // Clearing the choice is an edit of its own, and leaves nothing chosen.
+        let cleared = configuration::edit(&reread, &Change::ControllerStartup(None))
+            .expect("a validated edit");
+        assert_eq!(cleared.revision, 2);
+        assert_eq!(cleared.document.startup.controller(), None);
+        assert_eq!(row(Some(&cleared.document)).source, ValueSource::Default);
     }
 
     /// The wire words a report names are exactly the ones the enumerations spell.

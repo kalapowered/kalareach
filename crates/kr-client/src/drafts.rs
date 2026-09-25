@@ -40,6 +40,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use kr_ipc::paths::{NameKind, flush_directory, flush_path_names};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{
     AgentBindingRevision, ApplicationInstanceId, AttachmentId, DeviceId, DraftId, DraftRevision,
@@ -53,6 +54,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{ClientError, Result};
 use crate::retry::UserAction;
 use crate::services::{SyncExchanged, SyncFetched, SyncPosition, SyncRecoveryId, nothing_held};
+use crate::shown::{IoFault, Said as _, Shown};
 use crate::sync::client::{
     Answer, ask_about, count_settled, diverged, end_fenced, finish_resolutions, forked,
 };
@@ -96,14 +98,6 @@ const CHECKPOINT_EXTENSION: &str = "sync";
 
 /// The extension of a draft being written, which is not yet a draft.
 const PARTIAL_EXTENSION: &str = "partial";
-
-/// How many links the walk over a store's path follows before it gives up.
-///
-/// A backstop rather than the rule. Every kernel this runs on applies a limit of its own, usually
-/// lower than this, and refuses to open through a longer chain before the walk ever sees it. What
-/// this is for is the walk itself: a bound it holds to whatever the filesystem underneath it does.
-#[cfg(unix)]
-const MAX_PATH_LINKS: usize = 40;
 
 /// The name of the store's lock.
 const LOCK_NAME: &str = "store.lock";
@@ -152,7 +146,7 @@ impl DraftTarget {
 /// The record carries no attachment identity. What it carries is the completed transfer handles a
 /// person attached, which are the host's own durable objects and outlive a connection exactly as
 /// the draft does.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Draft {
     /// The draft's durable identity.
     pub draft_id: DraftId,
@@ -191,8 +185,29 @@ pub struct Draft {
     pub updated_at_ms: TimestampMs,
 }
 
+impl std::fmt::Debug for Draft {
+    /// What the draft is and where it stands: never its text, and never its attachments, whose
+    /// handles carry a person's file names.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Draft")
+            .field("draft_id", &self.draft_id)
+            .field("revision", &self.revision)
+            .field("device_id", &self.device_id)
+            .field("target", &self.target)
+            .field("state", &self.state)
+            .field("text_bytes", &self.text.len())
+            .field("attachments", &self.attachments.len())
+            .field("conflict_of", &self.conflict_of)
+            .field("retained", &self.retained)
+            .field("created_at_ms", &self.created_at_ms)
+            .field("updated_at_ms", &self.updated_at_ms)
+            .finish()
+    }
+}
+
 /// Why a draft may not be submitted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum NotSubmittable {
     /// The application or the binding changed under it. The caller retargets it explicitly.
     #[error("the draft's application or binding changed; retarget it before submitting")]
@@ -201,6 +216,8 @@ pub enum NotSubmittable {
     #[error("the draft's target is gone; give it a new one before submitting")]
     Orphaned,
 }
+
+crate::debug_as_display!(NotSubmittable);
 
 impl Draft {
     /// Returns the target a submission would name, or why it may not be submitted.
@@ -327,16 +344,16 @@ impl Associations {
 }
 
 /// Why a draft store refused.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum DraftError {
     /// The directory, the lock or a draft file could not be read or written.
-    #[error("the draft store at {path} could not be used: {source}")]
+    #[error("the draft store at {path} could not be used: {fault}")]
     Storage {
         /// What was being read or written.
-        path: PathBuf,
+        path: Shown,
         /// The underlying failure.
-        source: std::io::Error,
+        fault: IoFault,
     },
     /// No draft with that identity is stored here.
     #[error("no draft {draft_id} is stored")]
@@ -395,12 +412,14 @@ pub enum DraftError {
     /// A stored file is not a draft this build can read.
     #[error("the stored draft at {path} could not be read: {reason}")]
     Corrupt {
-        /// Which file.
-        path: PathBuf,
-        /// What was wrong with it.
-        reason: String,
+        /// Which file, or which collection a served draft came from.
+        path: Shown,
+        /// What was wrong with it: the class and the place of the fault, never what it held.
+        reason: Shown,
     },
 }
+
+crate::debug_as_display!(DraftError);
 
 impl DraftError {
     /// Returns the stable protocol code this refusal is reported under.
@@ -509,7 +528,7 @@ impl DraftStore {
     /// owner-only.
     pub fn open(directory: impl Into<PathBuf>, device_id: DeviceId) -> Result<Self> {
         let directory = directory.into();
-        private_directory(&directory).map_err(|source| storage(&directory, source))?;
+        private_directory(&directory).map_err(|source| storage(Shown::root(&directory), source))?;
         let store = Self {
             directory,
             device_id,
@@ -583,9 +602,9 @@ impl DraftStore {
         let guard = self.shared()?;
         let mut listing = Listing::default();
         let entries = std::fs::read_dir(&self.directory)
-            .map_err(|source| storage(&self.directory, source))?;
+            .map_err(|source| storage(Shown::root(&self.directory), source))?;
         for entry in entries {
-            let entry = entry.map_err(|source| storage(&self.directory, source))?;
+            let entry = entry.map_err(|source| storage(Shown::root(&self.directory), source))?;
             let path = entry.path();
             let Some(draft_id) = path
                 .file_name()
@@ -888,7 +907,8 @@ impl DraftStore {
     /// The caller holds the exclusive lock.
     fn remove_file(&self, path: &Path) -> Result<()> {
         remove_if_present(path)?;
-        sync_directory(&self.directory).map_err(|source| storage(&self.directory, source))?;
+        flush_directory(&self.directory, NameKind::File)
+            .map_err(|source| storage(Shown::root(&self.directory), source))?;
         Ok(())
     }
 
@@ -971,18 +991,21 @@ impl DraftStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(DraftError::Unknown { draft_id }.into());
             }
-            Err(error) => return Err(storage(&path, error).into()),
+            Err(error) => return Err(storage(stored(&path), error).into()),
         };
         let draft = Self::decode(&bytes).map_err(|error| DraftError::Corrupt {
-            path: path.clone(),
-            reason: error.to_string(),
+            path: stored(&path),
+            reason: match error {
+                ClientError::Cbor(fault) => fault,
+                other => other.said(),
+            },
         })?;
         // The name and the record have to agree. A record that names another draft is a file this
         // store cannot act on, whatever put it there.
         if draft.draft_id != draft_id {
             return Err(DraftError::Corrupt {
-                path,
-                reason: format!("it holds draft {}, not {draft_id}", draft.draft_id),
+                path: stored(&path),
+                reason: crate::shown!("it holds draft {}, not {}", draft.draft_id, draft_id),
             }
             .into());
         }
@@ -996,7 +1019,7 @@ impl DraftStore {
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(storage(&path, error).into()),
+            Err(error) => return Err(storage(stored(&path), error).into()),
         };
         match kr_cbor::from_canonical_slice::<SyncCheckpoint>(
             &bytes,
@@ -1031,23 +1054,24 @@ impl DraftStore {
     /// Replaces one file's contents, whole or not at all. The caller holds the exclusive lock.
     fn write_bytes(&self, path: &Path, bytes: &[u8]) -> Result<()> {
         let temporary = self.temporary_path()?;
-        write_whole(&temporary, bytes).map_err(|source| storage(&temporary, source))?;
+        write_whole(&temporary, bytes).map_err(|source| storage(stored(&temporary), source))?;
         // A rename within one directory replaces the name in one step, so a reader sees the old
         // contents or the new ones and never a file half written.
         if let Err(source) = std::fs::rename(&temporary, path) {
             let _ = std::fs::remove_file(&temporary);
-            return Err(storage(path, source).into());
+            return Err(storage(stored(path), source).into());
         }
-        sync_directory(&self.directory).map_err(|source| storage(&self.directory, source))?;
+        flush_directory(&self.directory, NameKind::File)
+            .map_err(|source| storage(Shown::root(&self.directory), source))?;
         Ok(())
     }
 
     /// Removes what an interrupted write left behind. The caller holds the exclusive lock.
     fn sweep_partials(&self) -> Result<()> {
         let entries = std::fs::read_dir(&self.directory)
-            .map_err(|source| storage(&self.directory, source))?;
+            .map_err(|source| storage(Shown::root(&self.directory), source))?;
         for entry in entries {
-            let entry = entry.map_err(|source| storage(&self.directory, source))?;
+            let entry = entry.map_err(|source| storage(Shown::root(&self.directory), source))?;
             let path = entry.path();
             if path.extension().and_then(std::ffi::OsStr::to_str) == Some(PARTIAL_EXTENSION) {
                 // Nothing else can be writing one: every write holds this lock from the moment it
@@ -1101,13 +1125,13 @@ impl Lock {
             .create(true)
             .truncate(false)
             .open(path)
-            .map_err(|source| storage(path, source))?;
+            .map_err(|source| storage(stored(path), source))?;
         let taken = if exclusive {
             file.lock()
         } else {
             file.lock_shared()
         };
-        taken.map_err(|source| storage(path, source))?;
+        taken.map_err(|source| storage(stored(path), source))?;
         Ok(Self { _file: file })
     }
 }
@@ -1142,15 +1166,24 @@ fn remove_if_present(path: &Path) -> Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(storage(path, error).into()),
+        Err(error) => Err(storage(stored(path), error).into()),
     }
 }
 
-fn storage(path: &Path, source: std::io::Error) -> DraftError {
+fn storage(path: Shown, source: std::io::Error) -> DraftError {
     DraftError::Storage {
-        path: path.to_path_buf(),
-        source,
+        path,
+        fault: IoFault::from(source),
     }
+}
+
+/// A file of the store's own, as a failure may name it: whole when the store wrote its name.
+fn stored(path: &Path) -> Shown {
+    Shown::stored(
+        path,
+        &[LOCK_NAME],
+        &[DRAFT_EXTENSION, CHECKPOINT_EXTENSION, PARTIAL_EXTENSION],
+    )
 }
 
 pub(crate) fn fresh_uuid() -> Result<Uuid> {
@@ -1208,12 +1241,12 @@ pub(crate) fn private_directory(directory: &Path) -> std::io::Result<()> {
             }
             Err(error) => return Err(error),
         }
-        sync_directory(holder_of(path))?;
+        flush_directory(holder_of(path), NameKind::Directory)?;
     }
     if !directory.is_dir() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotADirectory,
-            format!("{} is not a directory", directory.display()),
+            crate::shown!("{} is not a directory", Shown::root(directory)),
         ));
     }
     #[cfg(unix)]
@@ -1262,129 +1295,6 @@ pub(crate) fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         let _ = std::fs::remove_file(path);
     }
     written
-}
-
-/// Flushes a directory entry, so a name that was replaced survives a crash.
-///
-/// Unix only. This build flushes no directory on Windows and makes no claim there that a name it
-/// acknowledged survives losing power. What holds on both is that the new contents are written and
-/// flushed before anything renames them into place, so a reader never sees a file half written.
-pub(crate) fn sync_directory(directory: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        std::fs::File::open(directory)?.sync_all()?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = directory;
-    }
-    Ok(())
-}
-
-/// Flushes the directory entry of every name this store's path is made of.
-///
-/// Creating the levels this call was missing is not enough. Another opener may have created one a
-/// moment ago and not yet flushed it, and a store that returned success under such a name would be
-/// a store whose own path a crash could lose. Flushing them all costs a handful of metadata
-/// operations once per store, which is what opening one is.
-///
-/// A path is a chain of names, and losing any one of them leaves a store nothing reaches. The chain
-/// is not only the components a caller spelled: a link is a name in a directory, it leads
-/// somewhere, and the rest of the path continues from there. So this resolves the path the way the
-/// kernel does, one component at a time, flushing the directory each name lives in and continuing
-/// from a link's target when it meets one. Following it once is what makes [`MAX_PATH_LINKS`] the
-/// same bound the kernel applies rather than a count of repeated work.
-///
-/// A failure is reported. A store that cannot open the directories its own path is made of cannot
-/// establish that the path survives a crash, and saying so is better than returning success that
-/// means less than it looks.
-#[cfg(unix)]
-fn flush_path_names(directory: &Path) -> std::io::Result<()> {
-    use std::collections::VecDeque;
-    use std::ffi::OsString;
-
-    /// The components of one path, as owned names, so a link's target can be spliced into the walk.
-    fn parts(path: &Path) -> Vec<OsString> {
-        path.components()
-            .map(|component| component.as_os_str().to_os_string())
-            .collect()
-    }
-
-    let start = if directory.is_absolute() {
-        directory.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(directory)
-    };
-    let mut remaining: VecDeque<OsString> = parts(&start).into();
-    let mut resolved = PathBuf::new();
-    let mut flushed: Vec<PathBuf> = Vec::new();
-    let mut followed = 0_usize;
-
-    while let Some(name) = remaining.pop_front() {
-        // A file cannot be called `.` or `..`, and only the root component is `/`, so what a name
-        // means is not ambiguous.
-        if name == std::path::MAIN_SEPARATOR_STR {
-            resolved.push(&name);
-            continue;
-        }
-        if name == "." {
-            continue;
-        }
-        if name == ".." {
-            resolved.pop();
-            continue;
-        }
-
-        // The directory this name lives in, which is what holds it.
-        let holder = resolved.clone();
-        if !flushed.contains(&holder) {
-            sync_directory(&holder)?;
-            flushed.push(holder.clone());
-        }
-        resolved.push(&name);
-
-        // A failure here is reported rather than skipped. It can be the filesystem refusing to say,
-        // or a name something removed while this walk was going through it; either way, what the
-        // walk cannot see it cannot make durable, and saying so is the answer.
-        if !std::fs::symlink_metadata(&resolved)?
-            .file_type()
-            .is_symlink()
-        {
-            continue;
-        }
-        followed += 1;
-        if followed > MAX_PATH_LINKS {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "{} follows more than {MAX_PATH_LINKS} links",
-                    directory.display()
-                ),
-            ));
-        }
-        // The rest of the path continues from the target: an absolute one starts again at the root,
-        // a relative one from the directory the link itself lives in.
-        let target = std::fs::read_link(&resolved)?;
-        resolved = if target.is_absolute() {
-            PathBuf::new()
-        } else {
-            holder
-        };
-        for part in parts(&target).into_iter().rev() {
-            remaining.push_front(part);
-        }
-    }
-    Ok(())
-}
-
-/// Windows offers no directory handle to flush, so there is nothing to walk.
-#[cfg(not(unix))]
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "the Unix half of this function reports what it could not flush"
-)]
-fn flush_path_names(_directory: &Path) -> std::io::Result<()> {
-    Ok(())
 }
 
 impl From<DraftError> for ClientError {
@@ -2058,8 +1968,8 @@ impl DraftSync {
         // key, not that they belong where they were found.
         if remote.draft_id != draft_id {
             return Err(ClientError::from(DraftError::Corrupt {
-                path: PathBuf::from(draft_collection(draft_id)),
-                reason: format!("it holds draft {}, not {draft_id}", remote.draft_id),
+                path: crate::shown!("the collection of draft {}", draft_id),
+                reason: crate::shown!("it holds draft {}, not {}", remote.draft_id, draft_id),
             })
             .into());
         }
@@ -2301,7 +2211,7 @@ mod tests {
         // first is the kernel's: most refuse a path of this many links themselves, at a figure of
         // their own, and the bound here is what answers on one that does not.
         let mut too_many = base.clone();
-        for _ in 0..(MAX_PATH_LINKS + 1) {
+        for _ in 0..(kr_ipc::paths::MAX_PATH_LINKS + 1) {
             too_many.push("hop");
         }
         too_many.push("drafts");
@@ -3104,8 +3014,8 @@ mod tests {
         );
 
         let unwritable = DraftError::Storage {
-            path: PathBuf::from("/drafts"),
-            source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            path: Shown::root(std::path::Path::new("/drafts")),
+            fault: IoFault::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
         };
         assert_eq!(unwritable.user_action(), UserAction::FixConfiguration);
         assert_eq!(unwritable.code(), ErrorCode::StorageUnavailable);

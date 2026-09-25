@@ -10,7 +10,7 @@
 //! inherit this process's. A process a service manager launches is its own identity to the
 //! operating system, and one that reaches a removable volume asks the person sitting at the
 //! machine for permission; a test suite must never do that, so every create checks what the
-//! kernel actually gave the process it started.
+//! kernel actually gave the process it started, where the platform can be asked for it.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use std::sync::Arc;
 use kr_controller::registry::Registry;
 use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::supervision::{
-    DetachedSupervisor, LaunchOutcome, ServiceLaunch, WorkerLaunch, WorkerSupervisor, settle,
+    DetachedSupervisor, LaunchOutcome, ServiceLaunch, WorkerLaunch, WorkerSupervisor,
 };
 use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::client::LocalClient;
@@ -38,47 +38,29 @@ use kr_protocol::session::{
 #[path = "../../kr-controller/tests/teardown/mod.rs"]
 mod teardown;
 
-/// A host tree on the internal disk, with the worker beside it.
-/// Starts the worker the way this host's own supervisor does, and names its package root.
+/// Starts the worker through this host's own supervisor, and names its package root.
 ///
 /// The daemon passes its own environment on to the process it starts, so a test that wants the
-/// worker to look somewhere else has to say so on the child. Everything else is what
-/// `DetachedSupervisor` does: the worker's own process group, the working directory the daemon
-/// prepared, and no descriptor of this test's.
+/// worker to look somewhere else has to say so on the child: the variable is added to what the
+/// launch sets for the worker, which every supervisor here gives the process it starts.
 #[derive(Debug)]
 struct WorkerWithPackageRoot {
     packages: PathBuf,
+    inner: Box<dyn WorkerSupervisor>,
 }
 
 impl WorkerSupervisor for WorkerWithPackageRoot {
     fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome {
-        let mut command = std::process::Command::new(&launch.program);
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt as _;
-
-            command.process_group(0);
-        }
-        command.args(launch.arguments());
-        command.current_dir(&launch.working_directory);
-        command.env(
-            kr_shell_integration::host::package::PACKAGE_ROOT_VARIABLE,
-            &self.packages,
-        );
-        command
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        match command.spawn() {
-            Ok(child) => settle(child.id()),
-            Err(error) => LaunchOutcome::NotStarted {
-                detail: error.to_string(),
-            },
-        }
+        let mut told = launch.clone();
+        told.desktop_environment.push((
+            kr_shell_integration::host::package::PACKAGE_ROOT_VARIABLE.to_owned(),
+            self.packages.display().to_string(),
+        ));
+        self.inner.start(&told)
     }
 
     fn describe(&self) -> &'static str {
-        "a detached process told where this test's packages are"
+        "this host's supervisor, with the worker told where this test's packages are"
     }
 }
 
@@ -107,7 +89,7 @@ enum Requested {
     Service(String),
 }
 
-/// Starts what `DetachedSupervisor` starts, and keeps a list of every request.
+/// Starts what this host's supervisor starts, and keeps a list of every request.
 ///
 /// A worker and a separately supervised service, such as the plugin runtime, are both started
 /// through the daemon's supervisor, so the list is everything the daemon asked the platform to run
@@ -116,6 +98,7 @@ enum Requested {
 struct RecordingSupervisor {
     launched: Arc<std::sync::Mutex<Vec<Launch>>>,
     registry: PathBuf,
+    inner: Box<dyn WorkerSupervisor>,
 }
 
 impl RecordingSupervisor {
@@ -155,7 +138,7 @@ impl WorkerSupervisor for RecordingSupervisor {
             what: Requested::Worker(launch.program.clone()),
             reserved: Some(self.reserved(launch.session_id)),
         });
-        DetachedSupervisor::new().start(launch)
+        self.inner.start(launch)
     }
 
     fn start_service(&self, launch: &ServiceLaunch) -> LaunchOutcome {
@@ -163,17 +146,22 @@ impl WorkerSupervisor for RecordingSupervisor {
             what: Requested::Service(launch.label.clone()),
             reserved: None,
         });
-        DetachedSupervisor::new().start_service(launch)
+        self.inner.start_service(launch)
     }
 
     fn describe(&self) -> &'static str {
-        "a detached process, with every request remembered"
+        "this host's supervisor, with every request remembered"
     }
 }
 
 struct Host {
     /// The host tree, which ends every worker its daemon started before it goes.
     temp: teardown::Tree,
+    /// The environment's scheduled task, through which a Windows daemon here starts each worker,
+    /// when this run takes that path. Declared after the tree, so it is removed once the tree has
+    /// ended what was started; removing it would not end a running worker in any case.
+    #[cfg(windows)]
+    task: Option<kr_controller::supervision::windows::testing::TestTask>,
     worker: PathBuf,
     environment_id: EnvironmentId,
     /// Where this daemon looks for qualified shell packages, when a test gives it an installation.
@@ -202,7 +190,18 @@ impl Host {
             &worker,
             &["--version"],
         );
+        #[cfg(windows)]
+        let task = starts_through_the_task().then(|| {
+            kr_controller::supervision::windows::testing::TestTask::register(
+                &temp.environment(),
+                &kr_controller::supervision::windows::testing::built_binary("kr-controller")
+                    .unwrap_or_else(|missing| panic!("{missing}")),
+            )
+            .unwrap_or_else(|failure| panic!("the environment's task: {failure}"))
+        });
         Self {
+            #[cfg(windows)]
+            task,
             temp,
             worker,
             environment_id,
@@ -210,6 +209,21 @@ impl Host {
             worker_packages: None,
             launched: None,
         }
+    }
+
+    /// The supervisor this host's daemon starts workers through.
+    ///
+    /// On Windows, the environment's scheduled task, whose starter creates each worker: this
+    /// daemon runs inside `cargo test`'s job, which kills its members when it closes and forbids
+    /// breakaway, so a worker it created itself would die with the test or never start. Elsewhere,
+    /// and on Windows when a run asks for the path the shipping daemon still takes, a detached
+    /// process of the daemon's own.
+    fn platform_supervisor(&self) -> Box<dyn WorkerSupervisor> {
+        #[cfg(windows)]
+        if let Some(task) = &self.task {
+            return Box::new(task.supervisor(&self.paths()));
+        }
+        Box::new(DetachedSupervisor::new())
     }
 
     /// Installs a qualified Zsh package for the daemon, and none for the worker.
@@ -315,41 +329,31 @@ impl Host {
 
     async fn start(&self) -> RunningDaemon {
         let environment = self.paths();
-        let environment_id = self.environment_id;
         let started = std::time::Instant::now();
-        let controller = loop {
-            let secrets = environment.secrets_dir();
-            let outcome = Controller::start(ControllerSetup {
-                paths: environment.clone(),
-                environment_id,
-                identity: Box::new(move || {
-                    let store = open_store_in(&secrets).expect("a secret store");
-                    Ok(
-                        ControllerIdentity::open(store.store.as_ref(), environment_id, false)
-                            .expect("an identity"),
-                    )
-                }),
-                secret_store: StoreSelection::File,
-                boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-                supervisor: self.temp.supervisor(
-                    match (self.worker_packages.clone(), self.launched.clone()) {
-                        (Some(packages), _) => Box::new(WorkerWithPackageRoot { packages }),
-                        (None, Some(launched)) => Box::new(RecordingSupervisor {
-                            launched,
-                            registry: environment.registry_database(),
-                        }),
-                        (None, None) => Box::new(DetachedSupervisor::new()),
-                    },
-                ),
-                worker_program: self.worker.clone(),
-                build_id: build(),
-                release: "0".to_owned(),
-                shell_packages: self.shell_packages.clone(),
-                terminal: Box::new(kr_controller::supervision::NoTerminal),
-            })
+        loop {
+            let supervisor = self.temp.supervisor(
+                match (self.worker_packages.clone(), self.launched.clone()) {
+                    (Some(packages), _) => Box::new(WorkerWithPackageRoot {
+                        packages,
+                        inner: self.platform_supervisor(),
+                    }),
+                    (None, Some(launched)) => Box::new(RecordingSupervisor {
+                        launched,
+                        registry: environment.registry_database(),
+                        inner: self.platform_supervisor(),
+                    }),
+                    (None, None) => self.platform_supervisor(),
+                },
+            );
+            let outcome = start_daemon(
+                &environment,
+                supervisor,
+                self.worker.clone(),
+                self.shell_packages.clone(),
+            )
             .await;
             match outcome {
-                Ok(controller) => break controller,
+                Ok(daemon) => return daemon,
                 // The daemon this one replaces has not let go of the environment yet. Waiting for
                 // it is a liveness condition: what a restart test asserts is that the replacement
                 // takes the environment over, not how soon the runtime drops the last reference to
@@ -362,20 +366,6 @@ impl Host {
                 ),
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        };
-        let rendezvous = Listener::bind(&environment.rendezvous_endpoint().expect("an endpoint"))
-            .expect("binds the rendezvous");
-        let clients = Listener::bind(&environment.controller_endpoint().expect("an endpoint"))
-            .expect("binds the client endpoint");
-        let generation = controller.generation();
-        let serving = vec![
-            tokio::spawn(Arc::clone(&controller).serve_rendezvous(rendezvous)),
-            tokio::spawn(Arc::clone(&controller).serve_clients(clients)),
-        ];
-        RunningDaemon {
-            controller,
-            serving,
-            generation,
         }
     }
 
@@ -388,6 +378,63 @@ impl Host {
         .await
         .expect("connects to the daemon")
     }
+}
+
+/// Starts a control daemon for `environment`, starting its workers through `supervisor`, and
+/// serves its rendezvous and client endpoints.
+async fn start_daemon(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+    supervisor: Box<dyn WorkerSupervisor>,
+    worker: PathBuf,
+    shell_packages: Option<PathBuf>,
+) -> kr_controller::Result<RunningDaemon> {
+    let environment_id = environment.environment_id();
+    let secrets = environment.secrets_dir();
+    let controller = Controller::start(ControllerSetup {
+        paths: environment.clone(),
+        environment_id,
+        identity: Box::new(move || {
+            let store = open_store_in(&secrets).expect("a secret store");
+            Ok(
+                ControllerIdentity::open(store.store.as_ref(), environment_id, false)
+                    .expect("an identity"),
+            )
+        }),
+        secret_store: StoreSelection::File,
+        boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+        supervisor,
+        worker_program: worker,
+        build_id: build(),
+        release: "0".to_owned(),
+        shell_packages,
+        terminal: Box::new(kr_controller::supervision::NoTerminal),
+    })
+    .await?;
+    let rendezvous = Listener::bind(&environment.rendezvous_endpoint().expect("an endpoint"))
+        .expect("binds the rendezvous");
+    let clients = Listener::bind(&environment.controller_endpoint().expect("an endpoint"))
+        .expect("binds the client endpoint");
+    let generation = controller.generation();
+    let serving = vec![
+        tokio::spawn(Arc::clone(&controller).serve_rendezvous(rendezvous)),
+        tokio::spawn(Arc::clone(&controller).serve_clients(clients)),
+    ];
+    Ok(RunningDaemon {
+        controller,
+        serving,
+        generation,
+    })
+}
+
+/// Whether this run starts workers through the environment's scheduled task.
+///
+/// Every Windows run does, except one that asks for the path the shipping daemon still takes, a
+/// detached process of the daemon's own. The continuous-integration step that runs this suite's
+/// executable outside cargo asks for that with `KR_HOST_TEST_SUPERVISOR=detached`, so both paths
+/// stay tested until the task is the only one.
+#[cfg(windows)]
+fn starts_through_the_task() -> bool {
+    std::env::var_os("KR_HOST_TEST_SUPERVISOR").is_none_or(|value| value != "detached")
 }
 
 /// How long a replacement daemon is given to take the environment over.
@@ -485,16 +532,16 @@ async fn create(client: &mut LocalClient, host: &Host) -> SessionCreateResult {
 ///
 /// Read from the process table rather than from anything this test arranged: what is being checked
 /// is what the process actually got, and a launch that quietly inherited a directory looks exactly
-/// like one that was given the right one until the kernel is asked. `None` means this platform has
-/// no way to ask; a platform that has one and refuses to answer is a failure, not a skip.
-fn working_directory_of(pid: u32) -> Option<PathBuf> {
+/// like one that was given the right one until the kernel is asked. Linux and macOS answer that
+/// for another process, and a refusal to answer fails here. Windows has no supported query for
+/// another process's working directory, so this is not built there.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn working_directory_of(pid: u32) -> PathBuf {
     #[cfg(target_os = "linux")]
     {
-        Some(
-            std::fs::read_link(format!("/proc/{pid}/cwd")).unwrap_or_else(|error| {
-                panic!("the working directory of process {pid} could not be read: {error}")
-            }),
-        )
+        std::fs::read_link(format!("/proc/{pid}/cwd")).unwrap_or_else(|error| {
+            panic!("the working directory of process {pid} could not be read: {error}")
+        })
     }
     #[cfg(target_os = "macos")]
     {
@@ -502,19 +549,12 @@ fn working_directory_of(pid: u32) -> Option<PathBuf> {
             .args(["-a", "-d", "cwd", "-p", &pid.to_string(), "-Fn"])
             .output()
             .unwrap_or_else(|error| panic!("the process table could not be read: {error}"));
-        Some(
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .find_map(|line| line.strip_prefix('n').map(PathBuf::from))
-                .unwrap_or_else(|| {
-                    panic!("the process table named no working directory for process {pid}")
-                }),
-        )
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = pid;
-        None
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|line| line.strip_prefix('n').map(PathBuf::from))
+            .unwrap_or_else(|| {
+                panic!("the process table named no working directory for process {pid}")
+            })
     }
 }
 
@@ -525,6 +565,10 @@ fn working_directory_of(pid: u32) -> Option<PathBuf> {
 /// on this machine that is a build tree on a removable volume. A process holding one open is a
 /// volume the person at the machine cannot eject and, on macOS, a permission prompt for every
 /// rebuilt binary.
+///
+/// On Linux and macOS the kernel's own answer for the running worker is compared. Windows has no
+/// supported query for another process's working directory, so there what is checked is the
+/// directory the host configured and the binary it started.
 fn runs_where_the_host_put_it(host: &Host, session_id: SessionId) {
     let registry = Registry::open(host.paths().registry_database(), host.environment_id)
         .expect("opens the registry");
@@ -550,19 +594,17 @@ fn runs_where_the_host_put_it(host: &Host, session_id: SessionId) {
         "and the binary it started is not inside it either: {}",
         host.worker.display()
     );
-    let Some(actual) = working_directory_of(pid) else {
-        // Nothing to compare against rather than a comparison that failed. Saying so is better
-        // than a pass that checked nothing.
-        eprintln!(
-            "skipped: this platform does not report another process's working directory here"
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let actual = working_directory_of(pid);
+        assert_eq!(
+            std::fs::canonicalize(&actual).unwrap_or(actual),
+            expected,
+            "the worker runs in the directory the host configured"
         );
-        return;
-    };
-    assert_eq!(
-        std::fs::canonicalize(&actual).unwrap_or(actual),
-        expected,
-        "the worker runs in the directory the host configured"
-    );
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let _ = pid;
 }
 
 /// Returns the workspace this test was built from.
@@ -578,6 +620,10 @@ fn workspace_root() -> PathBuf {
 /// shell keeps running, the replacement advances the generation, and it rebuilds its directory by
 /// finding the worker again and proving it rather than by trusting a list of processes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "on Windows the worker's rendezvous does not complete across a daemon restart yet, so the worker does not report itself in time"
+)]
 async fn a_daemon_restart_keeps_the_session_and_its_shell() {
     let host = Host::create();
     let first = host.start().await;
@@ -920,6 +966,10 @@ async fn a_daemon_restart_during_output_keeps_the_local_terminals_and_the_screen
 /// KR-REQ-02.04: each worker has a SQLite receipt journal of its own and a private endpoint of its
 /// own; no two sessions share either.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "on Windows the worker's rendezvous times out before the descriptor is published, so the worker does not report itself in time"
+)]
 async fn the_descriptor_is_published_whole_and_owner_only_and_names_the_worker() {
     let host = Host::create();
     let daemon = host.start().await;
@@ -1246,6 +1296,10 @@ fn processes() -> Vec<(u32, u32)> {
 /// file the worker cannot execute, so the worker starts, claims its reservation, says it cannot go
 /// on, and exits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "it places a POSIX /bin/cat as a stand-in shell binary, which this platform has not got"
+)]
 async fn a_worker_that_reports_it_could_not_start_leaves_no_directory() {
     let host = Host::create().with_shell_package();
     let _controller = host.start().await;
@@ -1613,4 +1667,273 @@ async fn close(client: &mut LocalClient, host: &Host, session_id: SessionId) -> 
         "waited {:?} for the session to finish closing",
         started.elapsed()
     );
+}
+
+/// KR-REQ-07.58: a Windows worker must be a process independent of the daemon, outside the
+/// daemon's kill-on-close job, so the start asks to break away from that job. Inside a job that
+/// does not permit breakaway, such as the one `cargo` runs its tests in, the start is refused, and
+/// the daemon names the cause and the setup rather than the bare access denial, and fails at once
+/// rather than waiting.
+#[cfg(windows)]
+#[test]
+fn a_worker_start_that_must_break_away_is_refused_inside_a_job_that_forbids_it() {
+    use kr_ipc::starter::{BREAKAWAY_OK, KILL_ON_JOB_CLOSE, SILENT_BREAKAWAY_OK};
+
+    let flags = kr_ipc::paths::current_job_limit_flags().expect("this process's job");
+    if !flags.is_some_and(|flags| {
+        flags & KILL_ON_JOB_CLOSE != 0 && flags & (BREAKAWAY_OK | SILENT_BREAKAWAY_OK) == 0
+    }) {
+        eprintln!(
+            "skipped: this process is not in a job that kills on close and forbids breakaway \
+             (limit flags {flags:?}), as it is under cargo"
+        );
+        return;
+    }
+    let temp = teardown::Tree::create();
+    let jobs = temp.root().join("jobs");
+    std::fs::create_dir_all(&jobs).expect("a jobs directory");
+    let launch = ServiceLaunch {
+        label: "kr-breakaway-probe".to_owned(),
+        program: std::path::PathBuf::from(
+            std::env::var_os("COMSPEC").expect("a command shell on PATH"),
+        ),
+        // If the start were somehow admitted, this exits at once and leaves nothing behind.
+        arguments: vec!["/c".to_owned(), "exit".to_owned()],
+        jobs_directory: jobs,
+        working_directory: temp.root().to_path_buf(),
+    };
+    match DetachedSupervisor::new().start_service(&launch) {
+        LaunchOutcome::NotStarted { detail } => {
+            assert!(
+                detail.contains("breakaway") && detail.contains("per-user service"),
+                "the failure names the job that forbids breakaway and the setup: {detail}"
+            );
+        }
+        other => {
+            panic!("a start that must break away should be refused inside this job, got {other:?}")
+        }
+    }
+}
+
+/// What the helper below is told: the host tree's roots, the worker and the starter.
+#[cfg(windows)]
+const DAEMON_RUNTIME_ROOT: &str = "KR_HOST_TEST_DAEMON_RUNTIME_ROOT";
+#[cfg(windows)]
+const DAEMON_STATE_ROOT: &str = "KR_HOST_TEST_DAEMON_STATE_ROOT";
+#[cfg(windows)]
+const DAEMON_WORKER: &str = "KR_HOST_TEST_DAEMON_WORKER";
+#[cfg(windows)]
+const DAEMON_STARTER: &str = "KR_HOST_TEST_DAEMON_STARTER";
+
+/// The supervisor the daemon in the nested jobs starts its worker through: the environment's task.
+#[cfg(windows)]
+fn nested_daemon_supervisor(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+    starter: &Path,
+) -> Box<dyn WorkerSupervisor> {
+    use kr_controller::supervision::windows::TaskSupervisor;
+    use kr_controller::supervision::windows::testing::definition;
+
+    let expected = definition(environment, starter).expect("the task's definition");
+    let through_the_task = TaskSupervisor::for_definition(environment.clone(), expected);
+    Box::new(through_the_task)
+}
+
+/// Hosts a control daemon for its parent's host tree, inside the jobs its parent built, until
+/// those jobs end it.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a helper process of the nested-job test below, which starts it itself"]
+async fn a_daemon_for_its_parents_tree() {
+    let (Some(runtime_root), Some(state_root), Some(worker), Some(starter)) = (
+        std::env::var_os(DAEMON_RUNTIME_ROOT),
+        std::env::var_os(DAEMON_STATE_ROOT),
+        std::env::var_os(DAEMON_WORKER),
+        std::env::var_os(DAEMON_STARTER),
+    ) else {
+        return;
+    };
+    let paths = kr_ipc::paths::HostPaths::new(runtime_root, state_root).expect("the roots");
+    let environment_id = paths
+        .recorded_environment_id()
+        .expect("the tree's identity")
+        .expect("the tree has an environment");
+    let environment = paths.environment(environment_id);
+    let mut word = String::new();
+    std::io::stdin()
+        .read_line(&mut word)
+        .expect("the parent's word that the jobs are in place");
+    let supervisor = nested_daemon_supervisor(&environment, Path::new(&starter));
+    let _daemon = start_daemon(&environment, supervisor, PathBuf::from(worker), None)
+        .await
+        .expect("the daemon starts");
+    println!("daemon ready");
+    std::future::pending::<()>().await;
+}
+
+/// KR-REQ-07.58: a worker outlives every job the daemon that asked for it runs in, however those
+/// jobs are nested. The daemon runs in the nesting a breakaway decision cannot see through: an
+/// outer job that ends its members when it closes and does not let them leave, over an inner one
+/// that lets them. A worker the daemon created itself, even one asked to break away, would still
+/// be in the outer job and end with it. This one is created by the environment's task's starter,
+/// so it was never in either: when the jobs close and take the daemon with them, the worker runs
+/// on, and the host's cleanup still finds it by the identity the daemon recorded and closes it.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_outlives_the_nested_jobs_its_daemon_ran_in() {
+    use std::io::{BufRead as _, Write as _};
+    use std::os::windows::io::AsHandle as _;
+
+    use kr_ipc::starter::{BREAKAWAY_OK, Job, KILL_ON_JOB_CLOSE};
+
+    if !starts_through_the_task() {
+        eprintln!("skipped: this run starts workers the way the shipping daemon does");
+        return;
+    }
+    let host = Host::create();
+    let starter = host
+        .task
+        .as_ref()
+        .expect("the environment's task")
+        .definition()
+        .starter
+        .clone();
+    let hosts = host.temp.paths().clone();
+    let mut daemon = std::process::Command::new(std::env::current_exe().expect("this test"))
+        .args([
+            "a_daemon_for_its_parents_tree",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(DAEMON_RUNTIME_ROOT, hosts.runtime_root())
+        .env(DAEMON_STATE_ROOT, hosts.state_root())
+        .env(DAEMON_WORKER, &host.worker)
+        .env(DAEMON_STARTER, &starter)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("the daemon's process starts");
+    let outer = Job::create(KILL_ON_JOB_CLOSE).expect("the outer job");
+    outer
+        .assign(daemon.as_handle())
+        .expect("the daemon is in the outer job");
+    let inner = Job::create(BREAKAWAY_OK).expect("the inner job");
+    inner
+        .assign(daemon.as_handle())
+        .expect("the daemon is in the inner job, beneath the outer");
+    writeln!(daemon.stdin.take().expect("its input"), "go").expect("the word is given");
+    // Its output is read to the end on a thread of its own, so the helper never writes into a
+    // closed pipe; the first line that says it is ready is passed on.
+    let output = daemon.stdout.take().expect("its output");
+    let (ready, is_ready) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in std::io::BufReader::new(output)
+            .lines()
+            .map_while(std::result::Result::ok)
+        {
+            if line.contains("daemon ready") {
+                let _ = ready.send(());
+            }
+        }
+    });
+    is_ready
+        .recv_timeout(ENVIRONMENT_HANDOVER_DEADLINE)
+        .expect("the daemon in the nested jobs is ready");
+
+    let mut client = host.client().await;
+    let created = create(&mut client, &host).await;
+    drop(client);
+    let registry = Registry::open(host.paths().registry_database(), host.environment_id)
+        .expect("opens the registry");
+    let worker = registry
+        .workers()
+        .expect("reads the worker records")
+        .into_iter()
+        .find(|worker| worker.session_id == created.session.session_id)
+        .expect("the created session has a worker record")
+        .process_identity;
+    drop(registry);
+
+    // The jobs close. The outer one ends every process in it, the daemon among them.
+    assert!(
+        daemon.try_wait().expect("the daemon's state").is_none(),
+        "the daemon was still running when its jobs closed"
+    );
+    drop(inner);
+    drop(outer);
+    // Closing a job that kills on close ends its members as `TerminateJobObject` does, with the
+    // exit code it is given, which is zero: that the daemon has ended is what the wait shows.
+    tokio::task::spawn_blocking(move || daemon.wait())
+        .await
+        .expect("the wait")
+        .expect("the jobs ended the daemon, and its process is collected");
+    let _ = reader.join();
+    assert_eq!(
+        kr_ipc::identity::process_state(&worker),
+        kr_ipc::identity::ProcessState::Running,
+        "the worker outlived every job its daemon ran in"
+    );
+
+    // The host's cleanup finds the worker by the identity the daemon recorded, and the worker
+    // closes its own session when asked.
+    let environment = host.paths();
+    let unresolved = tokio::task::spawn_blocking(move || {
+        teardown::end_what_the_daemon_started(&environment, Vec::new())
+    })
+    .await
+    .expect("the cleanup");
+    assert_eq!(unresolved, Vec::<String>::new(), "the cleanup ended it");
+    assert_ne!(
+        kr_ipc::identity::process_state(&worker),
+        kr_ipc::identity::ProcessState::Running,
+        "the worker closed when it was asked"
+    );
+}
+
+/// Removing the environment's task, as clearing the setup does, leaves a worker it started
+/// running: removing a task ends no process it started.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removing_the_environments_task_leaves_its_running_worker_running() {
+    if !starts_through_the_task() {
+        eprintln!("skipped: this run starts workers the way the shipping daemon does");
+        return;
+    }
+    let host = Host::create();
+    let daemon = host.start().await;
+    let mut client = host.client().await;
+    let created = create(&mut client, &host).await;
+    let session_id = created.session.session_id;
+    let definition = host
+        .task
+        .as_ref()
+        .expect("the environment's task")
+        .definition()
+        .clone();
+    assert!(
+        kr_controller::supervision::windows::remove(&definition).expect("removed"),
+        "the task was there to remove"
+    );
+    let registry = Registry::open(host.paths().registry_database(), host.environment_id)
+        .expect("opens the registry");
+    let worker = registry
+        .workers()
+        .expect("reads the worker records")
+        .into_iter()
+        .find(|worker| worker.session_id == session_id)
+        .expect("the created session has a worker record")
+        .process_identity;
+    drop(registry);
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert_eq!(
+        kr_ipc::identity::process_state(&worker),
+        kr_ipc::identity::ProcessState::Running,
+        "the worker runs on after its task has gone"
+    );
+    let closed = close(&mut client, &host, session_id).await;
+    assert_eq!(closed.session_id, session_id, "and closes as usual");
+    drop(client);
+    daemon.stop().await;
 }

@@ -1,0 +1,163 @@
+{
+  "manifest_version": 1,
+  "publisher_id": "kalareach",
+  "plugin_name": "kimi-cli",
+  "version": "0.1.1",
+  "display_name": "Kimi CLI",
+  "description": "Recognises MoonshotAI's kimi-cli, the Kimi distribution published on PyPI, reads its agent protocol through a declarative table and stops the turn it is running.",
+  "sdk_range": ">=0.1.1, <0.2.0",
+  "wit_range": ">=0.1.0, <0.2.0",
+  "source": {
+    "repository": "https://github.com/kalapowered/kalareach-plugins",
+    "revision": "aea3b0db45c5883fc7d110d57b9ae6bcb92f707d"
+  },
+  "match_rules": [
+    {
+      "id": "kimi-cli-pypi",
+      "executable": {
+        "file_stem": "kimi",
+        "path_suffix": [],
+        "version_range": null
+      },
+      "distribution": {
+        "registry": "py_pi",
+        "project": "kimi-cli"
+      },
+      "confidence": "exact"
+    },
+    {
+      "id": "kimi-cli-pypi-command",
+      "executable": {
+        "file_stem": "kimi-cli",
+        "path_suffix": [],
+        "version_range": null
+      },
+      "distribution": {
+        "registry": "py_pi",
+        "project": "kimi-cli"
+      },
+      "confidence": "exact"
+    },
+    {
+      "id": "kimi-cli-executable",
+      "executable": {
+        "file_stem": "kimi",
+        "path_suffix": [],
+        "version_range": null
+      },
+      "distribution": null,
+      "confidence": "inferred"
+    },
+    {
+      "id": "kimi-cli-command",
+      "executable": {
+        "file_stem": "kimi-cli",
+        "path_suffix": [],
+        "version_range": null
+      },
+      "distribution": null,
+      "confidence": "inferred"
+    }
+  ],
+  "platforms": [
+    {
+      "os": "linux",
+      "architectures": [
+        "x86_64",
+        "aarch64"
+      ]
+    },
+    {
+      "os": "mac_os",
+      "architectures": [
+        "aarch64"
+      ]
+    },
+    {
+      "os": "windows",
+      "architectures": [
+        "x86_64"
+      ]
+    }
+  ],
+  "payloads": [
+    {
+      "role": "asset",
+      "path": "README.md",
+      "digest": "5c1b2634dc9b0ba424264c22c52c3d1d7afc2616239db04db3403809d8946824",
+      "size_bytes": "7510"
+    },
+    {
+      "role": "connector",
+      "path": "connector.json",
+      "digest": "445678f98596349fd8712ea85d4bdacb100e9d03ac0bc35c2ddb8740783adae9",
+      "size_bytes": "8574"
+    },
+    {
+      "role": "fixture",
+      "path": "fixtures/conformance.json",
+      "digest": "1b7638f593f260f2416b5a7da3fb6b06c26205750fcb1182708d40b7ff506365",
+      "size_bytes": "4884"
+    },
+    {
+      "role": "asset",
+      "path": "fixtures/frames.json",
+      "digest": "68b188d928a430dc26e7f86a4db1c6049d1cc315cfec65ed74806bedf271faf5",
+      "size_bytes": "10641"
+    },
+    {
+      "role": "presentation",
+      "path": "presentation.json",
+      "digest": "f2f99a89073b7bf9990c8e5bfeb40e0983721712f8cdbd56159ec7fd59477522",
+      "size_bytes": "4097"
+    }
+  ],
+  "capabilities": [
+    {
+      "capability": "metadata.match",
+      "reason": "Recognise MoonshotAI's kimi-cli from its published package, and its executable names as a guess"
+    },
+    {
+      "capability": "presentation.declarative",
+      "reason": "Show what the Kimi CLI session is doing and the controls for its turn"
+    },
+    {
+      "capability": "broker.semantic_events",
+      "reason": "Read the turn and tool updates the selected agent-protocol execution reports"
+    },
+    {
+      "capability": "upstream.action",
+      "reason": "Ask Kimi CLI to stop the turn it is running when you press Stop"
+    }
+  ],
+  "actions": [
+    {
+      "id": "turn.cancel",
+      "label": "Stop the turn",
+      "effect": "upstream.cancel",
+      "implementation": {
+        "type": "upstream_cancel"
+      },
+      "parameters": {
+        "parameters": []
+      },
+      "description": "Cancel the turn the bound Kimi CLI execution is running, which ends it as interrupted",
+      "confirmation_required": false
+    },
+    {
+      "id": "session.refresh",
+      "label": "Refresh",
+      "effect": "observe",
+      "implementation": {
+        "type": "presentation"
+      },
+      "parameters": {
+        "parameters": []
+      },
+      "description": "Draw this package's document again from the session state the host already holds",
+      "confirmation_required": false
+    }
+  ],
+  "attachments": null,
+  "native_bridge": null
+}

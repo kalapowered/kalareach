@@ -166,9 +166,22 @@ impl Readiness {
     ///
     /// There is no readiness of this connection's own to wait on that the writer can hold while the
     /// reader holds the other half: a pipe object is one object, and a second one over the same
-    /// pipe would take bytes the reader needs. So a writer that was refused comes back shortly
-    /// rather than spinning. The attempt itself is the same on both platforms, and it is the
-    /// attempt that never waits.
+    /// pipe would take bytes the reader needs. So a writer that was refused comes back after a short
+    /// sleep and attempts again, rather than parking until the pipe drains the way a socket does on
+    /// the Unix family.
+    ///
+    /// This is a poll, not a park, so a caller that waits here against a pipe whose peer has stopped
+    /// reading makes progress only when the peer reads again. Measured on Windows Server 2025, a
+    /// writer parked on a full pipe for thirty seconds woke about seventy-four times a second and
+    /// spent roughly 730 ms of processor time over that span, about 2.4% of one core; the cost is a
+    /// waker doing nothing seventy-four times a second, not a busy loop. The paths that carry to a
+    /// peer that may stop reading bound their own wait: the worker's delivery ends it on a withdrawal
+    /// or a send deadline, and the controller's attention delivery on the release ticket's own
+    /// expiry, each waiting here inside a `select!` that another arm can end. [`FrameWriter::write_frame`]
+    /// and `write_message` wait with no bound of their own and are used for a control exchange whose
+    /// peer reads what it is sent; a control write to a peer that has stopped reading would poll here
+    /// until the connection errs, which is why a path whose peer may stall uses the checked writes
+    /// under a deadline instead. `docs/transport/README.md` records the figure and this rule.
     async fn ready(&self) -> Result<()> {
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         Ok(())
@@ -360,6 +373,12 @@ impl FrameWriter {
     }
 
     /// Writes an already framed buffer, waiting for the peer as often as it takes.
+    ///
+    /// It waits without a bound of its own, so it is used only where the peer reads what it is sent:
+    /// a control reply, a handshake, a request whose answer the peer is waiting for. On Windows the
+    /// wait between attempts is [`Writable::ready`]'s poll rather than a park, so a caller whose peer
+    /// might stop reading uses [`Self::begin_frame_checked`] and [`Self::resume_frame_checked`] under
+    /// a deadline instead, and does not call this.
     ///
     /// # Errors
     ///
@@ -625,41 +644,112 @@ mod tests {
         let client = Connection::connect(&endpoint).await.expect("connects");
         let (_reader, mut writer) = split(client, StreamKind::Control);
 
-        // One frame after another, without waiting for any of them, until the socket is full.
-        let frame = FrameWriter::encode(StreamKind::Control, &request(1)).expect("encodes");
-        let mut blocked = None;
-        for _ in 0..4096 {
-            match writer.begin_frame(&frame).expect("the peer is still there") {
-                Wrote::Complete => {}
-                Wrote::Blocked => {
-                    blocked = Some(());
-                    break;
+        // On a socket: one frame after another, without waiting for any, until the socket is full.
+        #[cfg(unix)]
+        {
+            let frame = FrameWriter::encode(StreamKind::Control, &request(1)).expect("encodes");
+            let mut blocked = false;
+            for _ in 0..4096 {
+                match writer.begin_frame(&frame).expect("the peer is still there") {
+                    Wrote::Complete => {}
+                    Wrote::Blocked => {
+                        blocked = true;
+                        break;
+                    }
                 }
             }
+            assert!(
+                blocked,
+                "the attempt reports a socket that would take no more rather than waiting for it"
+            );
+            assert!(
+                writer.is_mid_frame(),
+                "and what it could not send is retained rather than lost"
+            );
+            assert!(
+                writer.begin_frame(&frame).is_err(),
+                "a new frame is refused while one is part way to the peer"
+            );
+            // A socket with no room reports no readiness, so a caller that waits parks until the peer
+            // reads.
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(250),
+                    writer.writable().ready()
+                )
+                .await
+                .is_err(),
+                "a full socket keeps the waiter waiting"
+            );
         }
-        assert!(
-            blocked.is_some(),
-            "the attempt reports a socket that would take no more rather than waiting for it"
-        );
-        assert!(
-            writer.is_mid_frame(),
-            "and what it could not send is retained rather than lost"
-        );
-        assert!(
-            writer.begin_frame(&frame).is_err(),
-            "a new frame is refused while one is part way to the peer"
-        );
-        // And the waiting is real: a socket with no room does not report readiness, so a caller
-        // that waits here parks rather than spinning through attempt after attempt.
-        assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(250),
-                writer.writable().ready()
-            )
-            .await
-            .is_err(),
-            "a full socket keeps the waiter waiting"
-        );
+
+        // On a named pipe: this platform's write takes whatever slice it is offered and reports it
+        // sent, completing it in the background, so a whole frame can be reported complete before the
+        // peer reads a byte and there is no "full" a single write reveals. What backpressure there is
+        // shows on the *next* write once a transport write is outstanding: it reports the pipe would
+        // take no more. So this offers a frame far larger than the pipe carries as checked writes of
+        // one piece each, drives them with a wait between blocks, and shows the bytes sent stop
+        // advancing while the peer does not read, and never reach the whole frame - the backpressure
+        // is real - and that the waiter polls rather than parking each time.
+        #[cfg(windows)]
+        {
+            let frame = vec![7_u8; 8 * 1024 * 1024];
+            let started = std::time::Instant::now();
+            let mut outcome = writer
+                .begin_frame_checked(&frame, || true)
+                .expect("the peer is there");
+            let mut last = writer.sent;
+            let mut stalls = 0_u32;
+            loop {
+                assert_ne!(
+                    outcome,
+                    CheckedWrite::Complete,
+                    "a peer that never reads took the whole frame"
+                );
+                if stalls >= 5 && writer.has_sent_any() {
+                    break;
+                }
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(30),
+                    "the pipe stops taking bytes while the peer does not read"
+                );
+                // A named pipe has no writability of its own the writer can hold while the reader
+                // holds the other half, so the wait is a bounded poll rather than a park: it returns
+                // promptly. The cost of that poll and the rule that every caller bounds it are on
+                // `Readiness::ready`.
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(250),
+                    writer.writable().ready(),
+                )
+                .await
+                .expect("a pipe waiter polls rather than parking")
+                .expect("the wait returns");
+                outcome = writer
+                    .resume_frame_checked(|| true)
+                    .expect("the peer is there");
+                // Counted after the attempt: the bytes sent stop advancing once a transport write is
+                // outstanding and the peer does not read, and five attempts without progress is the
+                // backpressure holding.
+                if writer.sent == last {
+                    stalls += 1;
+                } else {
+                    stalls = 0;
+                    last = writer.sent;
+                }
+            }
+            assert!(
+                writer.sent < frame.len(),
+                "the peer that stopped reading did not take the whole frame"
+            );
+            assert!(
+                writer.is_mid_frame(),
+                "and what it could not send is retained rather than lost"
+            );
+            assert!(
+                writer.begin_frame(&frame).is_err(),
+                "a new frame is refused while one is part way to the peer"
+            );
+        }
         server.abort();
     }
 
@@ -810,14 +900,33 @@ mod tests {
         assert!(!writer.has_sent_any());
         assert!(writer.withdraw_unstarted());
 
-        // Allowed once and refused the next time: the second write is never made.
+        // Allowed once and refused the next time: the second transport write is never made. On
+        // Windows a fresh pipe answers the first offer as pending while it registers writability, so
+        // one wait is driven first and the frame is then continued; from the first real transport
+        // write the check governs each write the same way it does on a socket.
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                writer
+                    .begin_frame_checked(&frame, || true)
+                    .expect("the peer is there"),
+                CheckedWrite::Blocked,
+                "the first offer on a fresh pipe registers writability before any byte goes"
+            );
+            assert!(!writer.has_sent_any());
+            writer.writable().ready().await.expect("the wait returns");
+        }
         let mut asked = 0;
-        let outcome = writer
-            .begin_frame_checked(&frame, || {
-                asked += 1;
-                asked == 1
-            })
-            .expect("the peer is there");
+        let mut permission = || {
+            asked += 1;
+            asked == 1
+        };
+        let outcome = if writer.is_mid_frame() {
+            writer.resume_frame_checked(&mut permission)
+        } else {
+            writer.begin_frame_checked(&frame, &mut permission)
+        }
+        .expect("the peer is there");
         assert_eq!(outcome, CheckedWrite::Refused);
         assert_eq!(asked, 2, "asked again before the second transport write");
         assert!(writer.has_sent_any() && writer.is_mid_frame());

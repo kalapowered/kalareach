@@ -76,6 +76,7 @@
 
 use std::path::{Path, PathBuf};
 
+use kr_ipc::paths::{NameKind, flush_directory, flush_path_names};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{DraftId, DraftRevision, SyncConflictId, SyncObjectId, SyncRevisionId};
 use kr_protocol::mailbox::mailbox_size_bucket;
@@ -84,9 +85,10 @@ use kr_protocol::sync::{MAX_SYNC_CONFLICT_COPIES, SyncObjectKind};
 use serde::{Deserialize, Serialize};
 
 use super::SyncObject;
-use crate::drafts::{DraftStore, SyncCheckpoint as DraftCheckpoint};
+use crate::drafts::DraftStore;
 use crate::retry::UserAction;
 use crate::services::{SyncPosition, SyncRecoveryId, names_no_recovery};
+use crate::shown::{IoFault, Shown};
 
 /// The extension of a stored object this device holds.
 const OBJECT_EXTENSION: &str = "object";
@@ -141,13 +143,6 @@ const MAX_CONFLICT_COPY_BYTES: u64 = super::MAX_OBJECT_BYTES + CONFLICT_NOTE_BYT
 /// is refused by the service as outside its window, or it spreads the attempts past this span, and
 /// then nothing is attempted under that identity again.
 const REPLAY_SPAN_MS: u64 = kr_protocol::service::SERVICE_REQUEST_FRESHNESS_MS;
-
-/// How many links the walk over a store's path follows before it gives up.
-///
-/// A backstop rather than the rule. Every kernel this runs on applies a limit of its own, usually
-/// lower, and refuses to open through a longer chain before the walk ever sees it.
-#[cfg(any(unix, windows))]
-const MAX_PATH_LINKS: usize = 40;
 
 /// Where an object has reached on the synchronisation service.
 ///
@@ -367,14 +362,16 @@ impl RequestRevision {
     }
 }
 
-impl std::fmt::Display for RequestRevision {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl crate::shown::Said for RequestRevision {
+    fn said(&self) -> Shown {
         match self {
-            Self::Object(revision) => std::fmt::Display::fmt(revision, formatter),
-            Self::Draft(revision) => std::fmt::Display::fmt(revision, formatter),
+            Self::Object(revision) => crate::shown!("{}", *revision),
+            Self::Draft(revision) => crate::shown!("{}", *revision),
         }
     }
 }
+
+crate::display_as_said!(RequestRevision);
 
 /// Returns the collection one object is published in.
 ///
@@ -383,9 +380,9 @@ impl std::fmt::Display for RequestRevision {
 pub(crate) fn collection_of(kind: SyncObjectKind, object_id: SyncObjectId) -> String {
     match kind {
         SyncObjectKind::Draft => crate::drafts::draft_collection(DraftId::new(object_id.get())),
-        SyncObjectKind::Settings | SyncObjectKind::ClientSelection => {
-            super::sync_collection(kind, object_id)
-        }
+        SyncObjectKind::Settings
+        | SyncObjectKind::ClientSelection
+        | SyncObjectKind::RecoveryBundle => super::sync_collection(kind, object_id),
     }
 }
 
@@ -872,7 +869,7 @@ pub enum Settlement {
 ///
 /// Section 24 retains a pinned label locally unless it is explicitly cleared, and excludes it from
 /// subsequent sync while privacy mode is on.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PinnedLabel {
     /// The label.
@@ -881,17 +878,28 @@ pub struct PinnedLabel {
     pub pinned_at_ms: TimestampMs,
 }
 
+impl std::fmt::Debug for PinnedLabel {
+    /// When it was pinned and how long it is, never the label.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PinnedLabel")
+            .field("label_bytes", &self.label.len())
+            .field("pinned_at_ms", &self.pinned_at_ms)
+            .finish()
+    }
+}
+
 /// Why a synchronisation store refused.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum SyncError {
     /// The directory, the lock or a stored file could not be read or written.
-    #[error("the sync store at {path} could not be used: {source}")]
+    #[error("the sync store at {path} could not be used: {fault}")]
     Storage {
         /// What was being read or written.
-        path: PathBuf,
+        path: Shown,
         /// The underlying failure.
-        source: std::io::Error,
+        fault: IoFault,
     },
     /// No object with that identity is stored here.
     #[error("no synchronised object {object_id} is stored")]
@@ -914,9 +922,9 @@ pub enum SyncError {
     #[error("the stored file at {path} could not be read: {reason}")]
     Corrupt {
         /// Which file.
-        path: PathBuf,
-        /// What was wrong with it.
-        reason: String,
+        path: Shown,
+        /// What was wrong with it: the class and the place of the fault, never what it held.
+        reason: Shown,
     },
     /// The object is larger than the contract carries.
     #[error("the object encodes to {len} bytes; the limit is {limit}")]
@@ -930,7 +938,7 @@ pub enum SyncError {
     #[error("collection {collection} holds object {found}, not {expected}")]
     NotThatObject {
         /// The collection that was read.
-        collection: String,
+        collection: Shown,
         /// The object it turned out to hold.
         found: SyncObjectId,
         /// The object that was asked for.
@@ -974,7 +982,7 @@ pub enum SyncError {
     #[error("collection {collection} holds a draft; drafts are synchronised by the draft store")]
     DraftElsewhere {
         /// The collection that was read.
-        collection: String,
+        collection: Shown,
     },
     /// Sync production is fenced, because privacy mode is on.
     #[error("sync production is fenced at privacy generation {generation}")]
@@ -1080,11 +1088,30 @@ pub enum SyncError {
     #[error("{0}")]
     Client(#[from] Box<crate::ClientError>),
     /// A value could not be encoded or decoded as KR-CBOR-1.
+    ///
+    /// It holds what [`Shown::cbor`] says of the failure: the conversion reduces it, so `?` cannot
+    /// carry a decoder's own words, which quote what it was reading.
     #[error("the stored value was not canonical: {0}")]
-    Encoding(#[from] kr_cbor::CborError),
+    Encoding(Shown),
     /// The sealing or opening of an object failed.
+    ///
+    /// It holds what [`Shown::crypto`] says of the failure.
     #[error("{0}")]
-    Crypto(#[from] kr_crypto::CryptoError),
+    Crypto(Shown),
+}
+
+crate::debug_as_display!(SyncError);
+
+impl From<kr_cbor::CborError> for SyncError {
+    fn from(error: kr_cbor::CborError) -> Self {
+        Self::Encoding(Shown::cbor(&error))
+    }
+}
+
+impl From<kr_crypto::CryptoError> for SyncError {
+    fn from(error: kr_crypto::CryptoError) -> Self {
+        Self::Crypto(Shown::crypto(&error))
+    }
 }
 
 impl From<crate::ClientError> for SyncError {
@@ -1227,13 +1254,13 @@ impl SyncStore {
     /// read.
     pub fn open(directory: impl Into<PathBuf>) -> Result<Self> {
         let directory = directory.into();
-        private_directory(&directory).map_err(|source| storage(&directory, source))?;
+        private_directory(&directory).map_err(|source| storage(Shown::root(&directory), source))?;
         // Every name on the way here, not only the levels this call created. Another opener may
         // have created one a moment ago and not yet flushed it, and a store that returned success
         // under such a name would be a store whose own path a crash could lose. A failure is
         // reported rather than ignored: a store that cannot open the directories its path is made
         // of cannot establish that the path survives a crash.
-        flush_path_names(&directory).map_err(|source| storage(&directory, source))?;
+        flush_path_names(&directory).map_err(|source| storage(Shown::root(&directory), source))?;
         let store = Self { directory };
         let guard = store.lock()?;
         let swept = store.sweep_partials();
@@ -1294,8 +1321,8 @@ impl SyncStore {
         };
         if object.object_id != object_id {
             return Err(SyncError::Corrupt {
-                path,
-                reason: format!("it holds object {}, not {object_id}", object.object_id),
+                path: stored(&path),
+                reason: crate::shown!("it holds object {}, not {}", object.object_id, object_id),
             });
         }
         Ok(Some(object))
@@ -2547,13 +2574,13 @@ impl SyncStore {
             RequestRevision::Draft(revision) => {
                 let Some(drafts) = drafts else {
                     return Err(SyncError::DraftElsewhere {
-                        collection: held.collection(),
+                        collection: shown_collection(held.kind, held.object_id),
                     });
                 };
                 drafts
                     .answered_checkpoint(
                         DraftId::new(held.object_id.get()),
-                        DraftCheckpoint {
+                        crate::drafts::SyncCheckpoint {
                             position,
                             published_revision: Nullable::some(revision),
                         },
@@ -3263,8 +3290,8 @@ impl SyncStore {
     /// Returns a fresh identity for a record this store is about to write.
     fn fresh_id(&self) -> Result<Uuid> {
         kr_transport::random::fresh_uuid_v4().map_err(|error| SyncError::Corrupt {
-            path: self.directory.clone(),
-            reason: error.to_string(),
+            path: Shown::root(&self.directory),
+            reason: Shown::transport(&error),
         })
     }
 
@@ -3410,12 +3437,12 @@ impl SyncStore {
             // scope rather than dropped as an ordinary vector.
             Ok(bytes) => super::Zeroising(bytes),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(storage(path, error)),
+            Err(error) => return Err(storage(stored(path), error)),
         };
         let value = kr_cbor::from_canonical_slice(&bytes.0, &kr_cbor::Limits::DEFAULT).map_err(
             |error| SyncError::Corrupt {
-                path: path.to_path_buf(),
-                reason: super::cbor_fault(&error),
+                path: stored(path),
+                reason: Shown::cbor(&error),
             },
         )?;
         Ok(Some(value))
@@ -3427,10 +3454,10 @@ impl SyncStore {
     fn paths_with(&self, extension: &str) -> Result<Vec<PathBuf>> {
         let suffix = format!(".{extension}");
         let mut paths = Vec::new();
-        for entry in
-            std::fs::read_dir(&self.directory).map_err(|source| storage(&self.directory, source))?
+        for entry in std::fs::read_dir(&self.directory)
+            .map_err(|source| storage(Shown::root(&self.directory), source))?
         {
-            let entry = entry.map_err(|source| storage(&self.directory, source))?;
+            let entry = entry.map_err(|source| storage(Shown::root(&self.directory), source))?;
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             if name.ends_with(&suffix) {
@@ -3487,16 +3514,17 @@ impl SyncStore {
         let partial = self.directory.join(format!(
             "{}.{PARTIAL_EXTENSION}",
             kr_transport::random::fresh_uuid_v4().map_err(|error| SyncError::Corrupt {
-                path: path.to_path_buf(),
-                reason: error.to_string(),
+                path: stored(path),
+                reason: Shown::transport(&error),
             })?
         ));
-        write_whole(&partial, bytes).map_err(|source| storage(&partial, source))?;
+        write_whole(&partial, bytes).map_err(|source| storage(stored(&partial), source))?;
         if let Err(source) = std::fs::rename(&partial, path) {
             let _ = std::fs::remove_file(&partial);
-            return Err(storage(path, source));
+            return Err(storage(stored(path), source));
         }
-        sync_directory(&self.directory).map_err(|source| storage(&self.directory, source))?;
+        flush_directory(&self.directory, NameKind::File)
+            .map_err(|source| storage(Shown::root(&self.directory), source))?;
         Ok(())
     }
 
@@ -3507,9 +3535,10 @@ impl SyncStore {
         match std::fs::remove_file(path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(storage(path, error)),
+            Err(error) => return Err(storage(stored(path), error)),
         }
-        sync_directory(&self.directory).map_err(|source| storage(&self.directory, source))?;
+        flush_directory(&self.directory, NameKind::File)
+            .map_err(|source| storage(Shown::root(&self.directory), source))?;
         Ok(())
     }
 
@@ -3562,7 +3591,8 @@ impl Drop for Lock {
 impl Lock {
     pub(super) fn take(path: &Path) -> Result<Self> {
         let file = Self::open(path)?;
-        file.lock().map_err(|source| storage(path, source))?;
+        file.lock()
+            .map_err(|source| storage(Shown::root(path), source))?;
         Ok(Self { file })
     }
 
@@ -3572,7 +3602,7 @@ impl Lock {
         match file.try_lock() {
             Ok(()) => Ok(Some(Self { file })),
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-            Err(std::fs::TryLockError::Error(source)) => Err(storage(path, source)),
+            Err(std::fs::TryLockError::Error(source)) => Err(storage(Shown::root(path), source)),
         }
     }
 
@@ -3583,7 +3613,7 @@ impl Lock {
             .create(true)
             .truncate(false)
             .open(path)
-            .map_err(|source| storage(path, source))
+            .map_err(|source| storage(Shown::root(path), source))
     }
 }
 
@@ -3812,10 +3842,42 @@ fn not_past(replaced: Option<SyncPosition>, landed: SyncPosition) -> Option<Sync
     })
 }
 
-fn storage(path: &Path, source: std::io::Error) -> SyncError {
+fn storage(path: Shown, source: std::io::Error) -> SyncError {
     SyncError::Storage {
-        path: path.to_path_buf(),
-        source,
+        path,
+        fault: IoFault::from(source),
+    }
+}
+
+/// A file of the store's own, as a failure may name it: whole when the store wrote its name.
+fn stored(path: &Path) -> Shown {
+    Shown::stored(
+        path,
+        &[LOCK_NAME, LABELS_NAME, PRIVACY_NAME],
+        &[
+            OBJECT_EXTENSION,
+            CHECKPOINT_EXTENSION,
+            REQUEST_EXTENSION,
+            CONFLICT_EXTENSION,
+            PUBLICATION_EXTENSION,
+            HISTORY_EXTENSION,
+            CALLOUT_EXTENSION,
+            PARTIAL_EXTENSION,
+        ],
+    )
+}
+
+/// The collection one object is published in, as a failure names it.
+///
+/// The same name [`collection_of`] gives, built from the two values it is built from.
+pub(crate) fn shown_collection(kind: SyncObjectKind, object_id: SyncObjectId) -> Shown {
+    match kind {
+        SyncObjectKind::Draft => {
+            crate::shown!("drafts/{}", DraftId::new(object_id.get()))
+        }
+        SyncObjectKind::Settings
+        | SyncObjectKind::ClientSelection
+        | SyncObjectKind::RecoveryBundle => crate::shown!("{}/{}", kind, object_id),
     }
 }
 
@@ -3857,7 +3919,7 @@ pub(super) fn private_directory(directory: &Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
-            sync_new_level(parent)?;
+            flush_directory(parent, NameKind::Directory)?;
         }
     }
     #[cfg(unix)]
@@ -3869,188 +3931,6 @@ pub(super) fn private_directory(directory: &Path) -> std::io::Result<()> {
             std::fs::set_permissions(directory, permissions)?;
         }
     }
-    Ok(())
-}
-
-/// Flushes the directory entry of every name this store's path is made of.
-///
-/// A path is a chain of names, and losing any one of them leaves a store nothing reaches. The chain
-/// is not only the components a caller spelled: a link is a name in a directory, it leads
-/// somewhere, and the rest of the path continues from there. So this resolves the path the way the
-/// kernel does, one component at a time, flushing the directory each name lives in and continuing
-/// from a link's target when it meets one.
-#[cfg(unix)]
-pub(super) fn flush_path_names(directory: &Path) -> std::io::Result<()> {
-    use std::collections::VecDeque;
-    use std::ffi::OsString;
-
-    let start = if directory.is_absolute() {
-        directory.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(directory)
-    };
-    let mut remaining: VecDeque<OsString> = start
-        .components()
-        .map(|component| component.as_os_str().to_os_string())
-        .collect();
-    let mut resolved = PathBuf::new();
-    let mut flushed: Vec<PathBuf> = Vec::new();
-    let mut followed = 0_usize;
-
-    while let Some(name) = remaining.pop_front() {
-        // A file cannot be called `.` or `..`, and only the root component is `/`, so what a name
-        // means is not ambiguous.
-        if name == std::path::MAIN_SEPARATOR_STR {
-            resolved.push(&name);
-            continue;
-        }
-        if name == "." {
-            continue;
-        }
-        if name == ".." {
-            resolved.pop();
-            continue;
-        }
-        let parent = if resolved.as_os_str().is_empty() {
-            PathBuf::from(".")
-        } else {
-            resolved.clone()
-        };
-        if !flushed.contains(&parent) {
-            sync_directory(&parent)?;
-            flushed.push(parent);
-        }
-        resolved.push(&name);
-        let metadata = std::fs::symlink_metadata(&resolved)?;
-        if metadata.file_type().is_symlink() {
-            followed += 1;
-            if followed > MAX_PATH_LINKS {
-                return Err(std::io::Error::other(
-                    "the store's path passes through too many links to follow",
-                ));
-            }
-            let target = std::fs::read_link(&resolved)?;
-            resolved.pop();
-            if target.is_absolute() {
-                resolved = PathBuf::new();
-            }
-            for component in target.components().rev() {
-                remaining.push_front(component.as_os_str().to_os_string());
-            }
-        }
-    }
-    sync_directory(&resolved)?;
-    Ok(())
-}
-
-/// Flushes the directory entry of every name this store's path is made of that this account could
-/// have made.
-///
-/// The walk is the one Unix takes: one component at a time, continuing from a link's target when
-/// it meets a symbolic link or a junction, flushing the directory each name lives in and, at the
-/// end, the store's own directory. What differs is what a flush asks of a directory. Windows
-/// flushes a directory only through a handle that may change it, and a directory this account may
-/// not add a directory to, such as `C:\Users` for an account that does not administer the machine,
-/// holds no name an opener of this store made: every opener runs as this account. So a directory
-/// whose flush is refused for want of that right is passed over, and every other failure is
-/// reported, as it is on Unix.
-#[cfg(windows)]
-pub(super) fn flush_path_names(directory: &Path) -> std::io::Result<()> {
-    let resolved = walk_path_names(directory, &sync_new_level)?;
-    sync_directory(&resolved)
-}
-
-/// The walk behind [`flush_path_names`]: flushes the directory each name on the path lives in with
-/// `flush_holder`, passing over one it refuses for want of the right, and returns the directory the
-/// path resolves to.
-#[cfg(windows)]
-fn walk_path_names(
-    directory: &Path,
-    flush_holder: &dyn Fn(&Path) -> std::io::Result<()>,
-) -> std::io::Result<PathBuf> {
-    use std::collections::VecDeque;
-    use std::path::Component;
-
-    /// One component of a path, owned, so a link's target can be spliced into the walk.
-    enum Part {
-        /// The drive, share or root a path starts from, which is nobody's name.
-        Root(std::ffi::OsString),
-        /// `.`, which names nothing.
-        Current,
-        /// `..`, which leaves the directory reached so far.
-        Parent,
-        /// A name in the directory reached so far.
-        Name(std::ffi::OsString),
-    }
-
-    fn parts(path: &Path) -> Vec<Part> {
-        path.components()
-            .map(|component| match component {
-                Component::Prefix(_) | Component::RootDir => {
-                    Part::Root(component.as_os_str().to_os_string())
-                }
-                Component::CurDir => Part::Current,
-                Component::ParentDir => Part::Parent,
-                Component::Normal(name) => Part::Name(name.to_os_string()),
-            })
-            .collect()
-    }
-
-    let mut remaining: VecDeque<Part> = parts(&std::path::absolute(directory)?).into();
-    let mut resolved = PathBuf::new();
-    let mut flushed: Vec<PathBuf> = Vec::new();
-    let mut followed = 0_usize;
-
-    while let Some(part) = remaining.pop_front() {
-        let name = match part {
-            Part::Root(root) => {
-                resolved.push(root);
-                continue;
-            }
-            Part::Current => continue,
-            Part::Parent => {
-                resolved.pop();
-                continue;
-            }
-            Part::Name(name) => name,
-        };
-        let holder = resolved.clone();
-        if !flushed.contains(&holder) {
-            match flush_holder(&holder) {
-                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
-                other => other?,
-            }
-            flushed.push(holder.clone());
-        }
-        resolved.push(&name);
-        if !std::fs::symlink_metadata(&resolved)?
-            .file_type()
-            .is_symlink()
-        {
-            continue;
-        }
-        followed += 1;
-        if followed > MAX_PATH_LINKS {
-            return Err(std::io::Error::other(
-                "the store's path passes through too many links to follow",
-            ));
-        }
-        // The target is read the way the link names it: an absolute one starts again at its own
-        // root, one that starts at the root of a drive starts at the root of the link's drive, and
-        // a relative one continues from the directory the link lives in.
-        let target = holder.join(std::fs::read_link(&resolved)?);
-        resolved = PathBuf::new();
-        for part in parts(&target).into_iter().rev() {
-            remaining.push_front(part);
-        }
-    }
-    Ok(resolved)
-}
-
-/// Flushes nothing, because this platform has no directory a program can flush.
-#[cfg(not(any(unix, windows)))]
-pub(super) fn flush_path_names(directory: &Path) -> std::io::Result<()> {
-    let _ = directory;
     Ok(())
 }
 
@@ -4073,75 +3953,6 @@ pub(super) fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         let _ = std::fs::remove_file(path);
     }
     written
-}
-
-/// Flushes a directory entry, so a file name that was created, replaced or removed survives a
-/// crash.
-///
-/// The new contents are written and flushed before anything renames them into place, so a reader
-/// never sees a file half written; this is what makes the name itself durable. On Windows the
-/// handle holds the right to add a file, which this store holds in the directory it writes its
-/// files in.
-pub(super) fn sync_directory(directory: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        std::fs::File::open(directory)?.sync_all()?;
-    }
-    #[cfg(windows)]
-    {
-        flush_directory(directory, FILE_ADD_FILE)?;
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = directory;
-    }
-    Ok(())
-}
-
-/// Flushes the entry of a directory just made inside `holder`, so the new level survives a crash.
-///
-/// On Windows the handle holds the right to add a directory, which is the right that made the
-/// level: an account may hold it without the right to add a file, as every account does at the root
-/// of the system drive.
-fn sync_new_level(holder: &Path) -> std::io::Result<()> {
-    #[cfg(windows)]
-    {
-        flush_directory(holder, FILE_ADD_SUBDIRECTORY)
-    }
-    #[cfg(not(windows))]
-    {
-        sync_directory(holder)
-    }
-}
-
-/// The flag that lets a program open a directory at all, rather than a file.
-#[cfg(windows)]
-const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-
-/// The right to add a file to a directory.
-#[cfg(windows)]
-const FILE_ADD_FILE: u32 = 0x0002;
-
-/// The right to add a directory to a directory.
-#[cfg(windows)]
-const FILE_ADD_SUBDIRECTORY: u32 = 0x0004;
-
-/// Flushes one directory through a handle that holds one right to change it.
-///
-/// A directory opens only with the backup semantics that say it is one, and `FlushFileBuffers`,
-/// which is what synchronising a handle calls, flushes only through a handle that may write. The
-/// handle asks for the one right the change being flushed used and for nothing more: more could be
-/// refused, and it could collide with another program's handle on the same directory, such as the
-/// one a process holds on the directory it is working in.
-#[cfg(windows)]
-fn flush_directory(directory: &Path, right: u32) -> std::io::Result<()> {
-    use std::os::windows::fs::OpenOptionsExt as _;
-
-    std::fs::OpenOptions::new()
-        .access_mode(right)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(directory)?
-        .sync_all()
 }
 
 /// The one test here is about how Unix shares a lock between the descriptors of one open file, so
@@ -4211,154 +4022,5 @@ mod tests {
             "a dispatch that has ended is a request this device may ask about"
         );
         drop(inherited);
-    }
-}
-
-/// On Windows every flush opens the directory it flushes, and these check that it does: nothing
-/// else in this store would notice a flush that did nothing.
-#[cfg(all(test, windows))]
-mod windows_tests {
-    use super::*;
-
-    /// Runs one command-line tool and fails the test when it fails.
-    fn run(program: &str, arguments: &[&std::ffi::OsStr]) -> String {
-        let output = std::process::Command::new(program)
-            .args(arguments)
-            .output()
-            .unwrap_or_else(|error| panic!("{program} starts: {error}"));
-        let printed = String::from_utf8_lossy(&output.stdout).into_owned();
-        assert!(
-            output.status.success(),
-            "{program} failed: {printed}\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        printed
-    }
-
-    #[test]
-    fn a_directory_is_flushed_through_a_handle_of_its_own() {
-        let root = tempfile::tempdir().expect("a directory");
-        sync_directory(root.path()).expect("a directory this account adds files to is flushed");
-        sync_new_level(root.path()).expect("and one it adds directories to");
-        // A flush that did nothing would pass both of the above. One that opens the directory it
-        // flushes cannot open one that is not there.
-        let missing = root.path().join("missing");
-        assert_eq!(
-            sync_directory(&missing)
-                .expect_err("nothing to flush")
-                .kind(),
-            std::io::ErrorKind::NotFound
-        );
-        assert_eq!(
-            sync_new_level(&missing)
-                .expect_err("nothing to flush")
-                .kind(),
-            std::io::ErrorKind::NotFound
-        );
-    }
-
-    #[test]
-    fn the_flush_itself_is_asked_of_the_operating_system() {
-        /// The right to read a file's attributes, which opens a directory and permits no flush.
-        const FILE_READ_ATTRIBUTES: u32 = 0x0080;
-
-        // The operating system flushes only through a handle that may write, and says so when it
-        // is asked through one that may not. A directory opened with nothing more than the right to
-        // read its attributes opens, as the first reading shows, so what refuses in the second is
-        // the flush: a helper that opened the directory and never asked for the flush would return
-        // success instead.
-        let root = tempfile::tempdir().expect("a directory");
-        {
-            use std::os::windows::fs::OpenOptionsExt as _;
-
-            std::fs::OpenOptions::new()
-                .access_mode(FILE_READ_ATTRIBUTES)
-                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-                .open(root.path())
-                .expect("the directory opens with the right to read its attributes");
-        }
-        assert_eq!(
-            flush_directory(root.path(), FILE_READ_ATTRIBUTES)
-                .expect_err("a flush through a handle that may not write")
-                .kind(),
-            std::io::ErrorKind::PermissionDenied
-        );
-        flush_directory(root.path(), FILE_ADD_FILE)
-            .expect("and through one that may add a file, the flush is made");
-    }
-
-    #[test]
-    fn a_store_path_is_flushed_through_a_junction_to_its_end() {
-        let root = tempfile::tempdir().expect("a directory");
-        let target = root.path().join("elsewhere");
-        std::fs::create_dir(&target).expect("a directory to link to");
-        let link = root.path().join("linked");
-        // A junction needs no privilege to make, unlike a symbolic link.
-        run(
-            "cmd.exe",
-            &[
-                "/d".as_ref(),
-                "/c".as_ref(),
-                "mklink".as_ref(),
-                "/J".as_ref(),
-                link.as_os_str(),
-                target.as_os_str(),
-            ],
-        );
-        let store = link.join("store").join("inner");
-        private_directory(&store).expect("the levels are made and flushed through the junction");
-        flush_path_names(&store).expect("every name on the way is flushed");
-        assert!(
-            target.join("store").join("inner").is_dir(),
-            "the levels are where the junction leads"
-        );
-    }
-
-    #[test]
-    fn the_walk_passes_over_a_directory_refused_for_want_of_the_right_and_reports_anything_else() {
-        // Whether this account is refused a directory is a matter of the directory's list and of
-        // the privileges the account holds, which override the list for an account that has them
-        // turned on. So the refusal is given to the walk here rather than asked of a list: what is
-        // under test is what the walk makes of it.
-        let root = tempfile::tempdir().expect("a directory");
-        let refused = std::path::absolute(root.path().join("refused")).expect("an absolute path");
-        let store = refused.join("store");
-        std::fs::create_dir_all(&store).expect("two levels");
-        let asked = std::cell::RefCell::new(Vec::new());
-        let resolved = walk_path_names(&store, &|holder: &Path| {
-            asked.borrow_mut().push(holder.to_path_buf());
-            if holder == refused {
-                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
-            } else {
-                Ok(())
-            }
-        })
-        .expect("a directory refused for want of the right is passed over");
-        assert_eq!(
-            resolved, store,
-            "the walk reaches the store's own directory"
-        );
-        let asked = asked.into_inner();
-        assert!(
-            asked.contains(&refused),
-            "the refused directory was asked: {asked:?}"
-        );
-        assert!(
-            asked.iter().any(|holder| holder.as_path() == root.path()),
-            "and the directory above it was flushed: {asked:?}"
-        );
-
-        // Any other failure is reported, as it is on Unix.
-        let failed = walk_path_names(&store, &|holder: &Path| {
-            if holder == refused {
-                Err(std::io::Error::other("the device did not answer"))
-            } else {
-                Ok(())
-            }
-        });
-        assert!(
-            failed.is_err_and(|error| error.kind() == std::io::ErrorKind::Other),
-            "a failure that is not a refusal is the answer"
-        );
     }
 }

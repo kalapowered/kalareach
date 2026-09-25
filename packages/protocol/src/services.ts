@@ -40,6 +40,7 @@ import type {
   RevocationAcknowledgement,
   RevocationRequest,
   SealedEnvelope,
+  SealedRecoveryBundle,
   SealedSyncObject,
   SyncObjectRecord
 } from './generated/protocol.js'
@@ -109,6 +110,18 @@ export const MAX_SYNC_OBJECTS_PER_COLLECTION = 256
 /** The most conflict copies one object retains. */
 export const MAX_SYNC_CONFLICT_COPIES = 8
 
+/**
+ * The fewest bytes a sealed recovery bundle can be: a `secretstream` header of 24 bytes and one
+ * final record with no message, which is its 17-byte tag.
+ */
+export const MIN_SEALED_RECOVERY_BUNDLE_BYTES = 24 + 17
+
+/**
+ * The most bytes a sealed recovery bundle may be. Base64url-encoded it is 174,763 bytes, well inside
+ * one settings-sync request.
+ */
+export const MAX_SEALED_RECOVERY_BUNDLE_BYTES = 128 * 1024
+
 /** The most recipients a public archive descriptor may name. */
 export const MAX_ARCHIVE_RECIPIENTS = 128
 
@@ -138,6 +151,17 @@ export const AUTHORITY_BEARING_PAYLOAD_TYPES: readonly MailboxPayloadType[] = [
 
 /** Every synchronised object kind, in the order the protocol declares them. */
 export const SYNC_OBJECT_KINDS: readonly SyncObjectKind[] = [
+  'settings',
+  'draft',
+  'client_selection',
+  'recovery_bundle'
+]
+
+/**
+ * The kinds stored as a sealed object. The recovery bundle is the one kind that is not: it is one
+ * `secretstream` object, stored as a {@link SealedRecoveryBundle} with a bound of its own.
+ */
+export const SEALED_SYNC_OBJECT_KINDS: readonly SyncObjectKind[] = [
   'settings',
   'draft',
   'client_selection'
@@ -550,6 +574,23 @@ export function readSealedSyncObject (value: unknown): SealedSyncObject {
   }
 }
 
+const SEALED_RECOVERY_BUNDLE_FIELDS = ['ciphertext'] as const
+
+/**
+ * One sealed recovery bundle, read against its closed schema: the stream, and nothing beside it.
+ *
+ * The stream carries its own header, so a nonce or a declared bucket beside it would be a member
+ * nobody agreed on, stored and counted as something it is not.
+ *
+ * @throws {ServicesSchemaError} naming the rule the bundle breaks.
+ */
+export function readSealedRecoveryBundle (value: unknown): SealedRecoveryBundle {
+  const bundle = closed('a sealed recovery bundle', value, SEALED_RECOVERY_BUNDLE_FIELDS)
+  return {
+    ciphertext: bytesToBase64Url(opaqueBytes('a ciphertext', bundle['ciphertext']))
+  }
+}
+
 /** A 16-byte identifier from its hyphenated text. */
 function identifierBytes (what: string, value: unknown): Uint8Array {
   if (typeof value !== 'string') {
@@ -584,6 +625,12 @@ export type StructureRefusal =
   | { readonly reason: 'lifetime_too_long'; readonly ahead: bigint; readonly limit: number }
   | { readonly reason: 'already_expired'; readonly behind: bigint }
   | { readonly reason: 'authority_coalesced' }
+  | {
+    readonly reason: 'bundle_length'
+    readonly length: number
+    readonly min: number
+    readonly max: number
+  }
 
 /**
  * Everything about a sealed mailbox item a service can check without a key, or null.
@@ -664,6 +711,30 @@ export function checkSealedSyncObject (object: SealedSyncObject): StructureRefus
 /** The bytes one synchronised object occupies: the ciphertext, the nonce and the record. */
 export function syncObjectStoredBytes (object: SealedSyncObject): number {
   return base64UrlToBytes(object.ciphertext).length + ENVELOPE_NONCE_BYTES + SYNC_RECORD_BYTES
+}
+
+/**
+ * Everything about a sealed recovery bundle a service can check without a key, or null: its length.
+ *
+ * The stream's tags are checked only where it is opened. A service holds no key, so it cannot tell
+ * a bundle from other bytes of the same length.
+ */
+export function checkSealedRecoveryBundle (bundle: SealedRecoveryBundle): StructureRefusal | null {
+  const length = base64UrlToBytes(bundle.ciphertext).length
+  if (length < MIN_SEALED_RECOVERY_BUNDLE_BYTES || length > MAX_SEALED_RECOVERY_BUNDLE_BYTES) {
+    return {
+      reason: 'bundle_length',
+      length,
+      min: MIN_SEALED_RECOVERY_BUNDLE_BYTES,
+      max: MAX_SEALED_RECOVERY_BUNDLE_BYTES
+    }
+  }
+  return null
+}
+
+/** The bytes one sealed recovery bundle occupies: the ciphertext and the record. */
+export function recoveryBundleStoredBytes (bundle: SealedRecoveryBundle): number {
+  return base64UrlToBytes(bundle.ciphertext).length + SYNC_RECORD_BYTES
 }
 
 /**

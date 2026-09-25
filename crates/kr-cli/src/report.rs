@@ -8,6 +8,9 @@
 //! reported, because that label is the difference between a session that implements empty-prompt
 //! Ctrl-D and one that does not.
 
+use kr_client::shown;
+use kr_client::shown::{Said, Shown};
+use kr_protocol::attachment::{AttachMode, AttachmentSummary, TerminalPresentationMode};
 use kr_protocol::desktop::{
     CapabilityRecord, DesktopCapabilityReport, DesktopContext, EnvironmentCapabilitiesResult,
     SleepInhibitionState,
@@ -31,14 +34,44 @@ pub enum Completion {
 }
 
 /// Renders a failure as machine-readable output.
+///
+/// The message is what the failure says, which its type holds to a [`Shown`].
 #[must_use]
 pub fn failure(error: &CliError) -> Value {
     json!({
         "ok": false,
         "code": error.code(),
-        "message": error.to_string(),
+        "message": error.said().as_str(),
         "exit_code": error.exit_code(),
     })
+}
+
+/// Writes one line on standard error.
+///
+/// Every failure, warning and notice this program writes there goes through here or through
+/// [`failed`], and each is a [`Shown`]: this program's own words, values with nothing in them to
+/// hide, and what a reducer or a door decided may be said.
+pub fn say(line: &Shown) {
+    eprintln!("{line}");
+}
+
+/// Reports a failure on standard error, as `kr: ` and what the failure says.
+pub fn failed(error: &CliError) {
+    say(&shown!("kr: {}", *error));
+}
+
+/// Writes the one byte that tells the process that started this one that it is ready, on standard
+/// error, which that process reads as a pipe rather than as text.
+///
+/// # Errors
+///
+/// Returns the failure to write or flush the byte.
+pub fn ready(byte: u8) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let mut pipe = std::io::stderr();
+    pipe.write_all(&[byte])?;
+    pipe.flush()
 }
 
 /// Renders a host's answer as machine-readable output: the answer exactly as the host sent it,
@@ -49,7 +82,10 @@ pub fn failure(error: &CliError) -> Value {
 /// Returns [`CliError::Other`] when the answer cannot be written as JSON.
 pub fn answer<T: serde::Serialize>(answer: &T) -> Result<Value, CliError> {
     let mut document = serde_json::to_value(answer).map_err(|error| {
-        CliError::Other(format!("the host's answer could not be written: {error}"))
+        CliError::Other(shown!(
+            "the host's answer could not be written: {}",
+            Shown::json(&error)
+        ))
     })?;
     match document.as_object_mut() {
         Some(object) => {
@@ -389,13 +425,65 @@ pub fn desktop_line(summary: &SessionSummary) -> String {
     }
 }
 
+/// Renders each terminal attachment's presentation and the reason for it.
+///
+/// Section 8 asks `kr status` to report each terminal attachment's mode and its reason. An
+/// attachment that is not a terminal has neither and is left out. A viewport whose worker gave no
+/// reason, which a worker built before reasons existed does, says so with a null.
+#[must_use]
+pub fn terminal_attachments(attachments: &[AttachmentSummary]) -> Value {
+    Value::Array(
+        attachments
+            .iter()
+            .filter(|summary| summary.mode == AttachMode::Terminal)
+            .map(|summary| {
+                json!({
+                    "attachment_id": summary.attachment_id.to_string(),
+                    "presentation": summary.presentation.as_ref().map(|mode| mode.as_str()),
+                    "presentation_reason": summary.presentation_reason.map(|reason| reason.as_str()),
+                    "dimensions": summary.dimensions.as_ref().map(|dimensions| json!({
+                        "columns": dimensions.columns(),
+                        "rows": dimensions.rows(),
+                    })),
+                    "terminal_profile_id": summary.terminal_profile_id.as_ref().cloned(),
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Renders each terminal attachment's presentation and its reason as a line for a person.
+#[must_use]
+pub fn terminal_attachment_lines(attachments: &[AttachmentSummary]) -> Vec<String> {
+    attachments
+        .iter()
+        .filter(|summary| summary.mode == AttachMode::Terminal)
+        .map(|summary| {
+            let presented = match (
+                summary.presentation.as_ref().copied(),
+                summary.presentation_reason,
+            ) {
+                (Some(TerminalPresentationMode::Direct), _) => "direct".to_owned(),
+                (Some(TerminalPresentationMode::Viewport), Some(reason)) => {
+                    format!("viewport ({}): {}", reason.as_str(), reason.describe())
+                }
+                (Some(TerminalPresentationMode::Viewport), None) => {
+                    "viewport, with no reason reported by this session's worker".to_owned()
+                }
+                (None, _) => "no presentation reported".to_owned(),
+            };
+            format!("attachment {}: {presented}", summary.attachment_id)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn a_failure_carries_its_code_and_exit_status() {
-        let value = failure(&CliError::AmbiguousSession("3".to_owned()));
+        let value = failure(&CliError::AmbiguousSession(Shown::said("3")));
         assert_eq!(value["ok"], json!(false));
         assert_eq!(value["code"], json!("AMBIGUOUS_SESSION"));
         assert_eq!(value["exit_code"], json!(5));
@@ -465,6 +553,93 @@ mod tests {
             root_process: kr_protocol::scalars::Nullable::null(),
             closure: kr_protocol::scalars::Nullable::null(),
         }
+    }
+
+    /// A terminal attachment of the kind the session's worker reports.
+    fn attachment(
+        byte: u8,
+        mode: AttachMode,
+        presentation: Option<TerminalPresentationMode>,
+        reason: Option<kr_protocol::attachment::PresentationReason>,
+    ) -> AttachmentSummary {
+        AttachmentSummary {
+            attachment_id: kr_protocol::ids::AttachmentId::new(
+                kr_protocol::scalars::Uuid::from_bytes([byte; 16]),
+            ),
+            ordinal: kr_protocol::ids::AttachmentOrdinal::new(u64::from(byte)),
+            mode,
+            claim_geometry: false,
+            dimensions: kr_protocol::scalars::Nullable::some(
+                kr_protocol::session::Dimensions::new(100, 30),
+            ),
+            presentation: kr_protocol::scalars::Nullable(presentation),
+            presentation_reason: reason,
+            terminal_profile_id: kr_protocol::scalars::Nullable::some("xterm-256color".to_owned()),
+            granted: kr_protocol::scalars::CanonicalSet::new(),
+            attached_at_ms: kr_protocol::scalars::TimestampMs::new(1),
+        }
+    }
+
+    /// KR-REQ-08.02: each terminal attachment is reported with its presentation and the reason for
+    /// it, a direct one with none, one whose worker gave no reason as such, and an attachment that
+    /// is not a terminal not at all.
+    #[test]
+    fn each_terminal_attachment_is_reported_with_its_presentation_and_reason() {
+        use kr_protocol::attachment::PresentationReason;
+
+        let attachments = [
+            attachment(
+                1,
+                AttachMode::Terminal,
+                Some(TerminalPresentationMode::Direct),
+                None,
+            ),
+            attachment(
+                2,
+                AttachMode::Terminal,
+                Some(TerminalPresentationMode::Viewport),
+                Some(PresentationReason::SizeMismatch),
+            ),
+            attachment(
+                3,
+                AttachMode::Terminal,
+                Some(TerminalPresentationMode::Viewport),
+                None,
+            ),
+            attachment(4, AttachMode::Semantic, None, None),
+        ];
+        let rendered = terminal_attachments(&attachments);
+        let entries = rendered.as_array().expect("a list");
+        assert_eq!(
+            entries.len(),
+            3,
+            "the semantic attachment is not a terminal: {rendered}"
+        );
+        assert_eq!(entries[0]["presentation"], "direct");
+        assert_eq!(entries[0]["presentation_reason"], Value::Null);
+        assert_eq!(entries[1]["presentation"], "viewport");
+        assert_eq!(entries[1]["presentation_reason"], "size_mismatch");
+        assert_eq!(
+            entries[1]["dimensions"],
+            json!({ "columns": 100, "rows": 30 })
+        );
+        assert_eq!(entries[1]["terminal_profile_id"], "xterm-256color");
+        assert_eq!(entries[2]["presentation_reason"], Value::Null);
+
+        let lines = terminal_attachment_lines(&attachments);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            lines[0],
+            format!("attachment {}: direct", attachments[0].attachment_id)
+        );
+        assert_eq!(
+            lines[1],
+            format!(
+                "attachment {}: viewport (size_mismatch): its size is not the session's",
+                attachments[1].attachment_id
+            )
+        );
+        assert!(lines[2].ends_with("viewport, with no reason reported by this session's worker"));
     }
 
     #[test]

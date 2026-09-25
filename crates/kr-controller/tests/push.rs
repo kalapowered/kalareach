@@ -2813,32 +2813,51 @@ async fn start_controller() -> (kr_ipc::testing::TempHost, Arc<Controller>) {
     (temp, controller)
 }
 
-/// Starts a daemon over an environment that may already hold what an earlier one left.
+/// How long a daemon is given to take over an environment a daemon before it held.
+///
+/// A daemon lets go of its environment once nothing of it is left, and its own tasks can still hold
+/// it for a moment after the test has let it go. A replacement started at once can therefore find
+/// the environment held. That is a liveness condition: what these tests assert is that the
+/// replacement takes the environment over, not how soon the last reference goes.
+const ENVIRONMENT_HANDOVER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Starts a daemon over an environment that may already hold what an earlier one left, waiting
+/// for a daemon this test let go to let go of the environment.
 async fn start_controller_in(temp: &kr_ipc::testing::TempHost) -> Arc<Controller> {
     let environment = temp.environment();
     let environment_id = temp.environment_id();
-    let secrets = environment.secrets_dir();
-    Controller::start(ControllerSetup {
-        paths: environment.clone(),
-        environment_id,
-        identity: Box::new(move || {
-            let store = open_store_in(&secrets).expect("a secret store for the test environment");
-            Ok(
-                ControllerIdentity::open(store.store.as_ref(), environment_id, false)
-                    .expect("an identity"),
-            )
-        }),
-        secret_store: StoreSelection::File,
-        boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-        supervisor: Box::new(PushTestSupervisor),
-        worker_program: std::path::PathBuf::from("/nonexistent/kr-worker"),
-        build_id: BuildId::new("kr-test/0").expect("a build identifier"),
-        release: "0".to_owned(),
-        shell_packages: None,
-        terminal: Box::new(kr_controller::supervision::NoTerminal),
-    })
-    .await
-    .expect("the daemon starts")
+    let begun = std::time::Instant::now();
+    loop {
+        let secrets = environment.secrets_dir();
+        let outcome = Controller::start(ControllerSetup {
+            paths: environment.clone(),
+            environment_id,
+            identity: Box::new(move || {
+                let store =
+                    open_store_in(&secrets).expect("a secret store for the test environment");
+                Ok(
+                    ControllerIdentity::open(store.store.as_ref(), environment_id, false)
+                        .expect("an identity"),
+                )
+            }),
+            secret_store: StoreSelection::File,
+            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+            supervisor: Box::new(PushTestSupervisor),
+            worker_program: std::path::PathBuf::from("/nonexistent/kr-worker"),
+            build_id: BuildId::new("kr-test/0").expect("a build identifier"),
+            release: "0".to_owned(),
+            shell_packages: None,
+            terminal: Box::new(kr_controller::supervision::NoTerminal),
+        })
+        .await;
+        match outcome {
+            Ok(controller) => return controller,
+            Err(kr_controller::error::ControllerError::AlreadyRunning { .. })
+                if begun.elapsed() < ENVIRONMENT_HANDOVER_DEADLINE => {}
+            Err(error) => panic!("the daemon starts: {error}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 fn dummy_grant(device_id: DeviceId) -> Grant {

@@ -25,6 +25,8 @@
 //! neither is this server stopping because its transport ended: then the question ends with this
 //! process, as expired.
 
+use kr_client::shown;
+use kr_client::shown::{Said, Shown};
 use std::sync::Arc;
 
 use rmcp::handler::server::tool::ToolRouter;
@@ -33,13 +35,13 @@ use rmcp::model::{
     CallToolResult, CancelledNotificationParam, RequestId, ServerCapabilities, ServerConfig,
 };
 use rmcp::service::{MaybeSendFuture, NotificationContext, RequestContext, RoleServer};
-use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
+use rmcp::{ErrorData, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{BuildId, QuestionId};
 use kr_protocol::method::Method;
 use kr_protocol::question::{
@@ -113,15 +115,26 @@ fn poll_within(asked: Option<DurationMs>, declared: Option<DurationMs>) -> Durat
 fn poll_duration(asked: Option<DurationMs>) -> DurationMs {
     poll_within(asked, declared_deadline())
 }
-use crate::error::{CliError, Result as CliResult};
+use crate::error::CliError;
 
 /// One choice an `ask_user` select offers.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, Deserialize, Serialize, JsonSchema)]
 pub struct ChoiceInput {
     /// The stable identifier an answer names. It does not change with the label.
     pub choice_id: String,
     /// What the person reads.
     pub label: String,
+}
+
+impl std::fmt::Debug for ChoiceInput {
+    /// How long its identifier and its label are, never what they say: an agent wrote both.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ChoiceInput")
+            .field("choice_id_bytes", &self.choice_id.len())
+            .field("label_bytes", &self.label.len())
+            .finish()
+    }
 }
 
 /// What kind of answer a question asks for.
@@ -147,7 +160,7 @@ impl From<AskType> for QuestionKind {
 }
 
 /// The parameters of `ask_user`.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, Deserialize, Serialize, JsonSchema)]
 pub struct AskUserParams {
     /// Your own unpredictable identifier for this request. Repeating it with the same payload
     /// returns the same question instead of asking twice.
@@ -177,8 +190,28 @@ pub struct AskUserParams {
     pub wait_seconds: Option<u64>,
 }
 
+impl std::fmt::Debug for AskUserParams {
+    /// The kind of question and how long each text is, never what the agent wrote.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AskUserParams")
+            .field("request_id_bytes", &self.request_id.len())
+            .field(
+                "agent_name_bytes",
+                &self.agent_name.as_ref().map(String::len),
+            )
+            .field("context_bytes", &self.context.len())
+            .field("question_bytes", &self.question.len())
+            .field("kind", &self.kind)
+            .field("choices", &self.choices)
+            .field("expiry_seconds", &self.expiry_seconds)
+            .field("wait_seconds", &self.wait_seconds)
+            .finish()
+    }
+}
+
 /// The parameters of `wait_for_answer`.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, Deserialize, Serialize, JsonSchema)]
 pub struct WaitForAnswerParams {
     /// The question `ask_user` returned.
     pub question_id: String,
@@ -192,13 +225,40 @@ pub struct WaitForAnswerParams {
     pub wait_seconds: Option<u64>,
 }
 
+impl std::fmt::Debug for WaitForAnswerParams {
+    /// The question and the wait, never the caller token, which is what proves the caller asked.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WaitForAnswerParams")
+            .field(
+                "question_id",
+                &crate::shown::parsed_identifier::<QuestionId>(&self.question_id),
+            )
+            .field("wait_seconds", &self.wait_seconds)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The parameters of `cancel_question`.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, Deserialize, Serialize, JsonSchema)]
 pub struct CancelQuestionParams {
     /// The question `ask_user` returned.
     pub question_id: String,
     /// The caller token `ask_user` returned with it.
     pub caller_token: String,
+}
+
+impl std::fmt::Debug for CancelQuestionParams {
+    /// The question, never the caller token.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CancelQuestionParams")
+            .field(
+                "question_id",
+                &crate::shown::parsed_identifier::<QuestionId>(&self.question_id),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 /// How urgent a notification is.
@@ -224,7 +284,7 @@ impl From<NotificationSeverity> for AlertSeverity {
 }
 
 /// The parameters of `send_notification`.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, Deserialize, Serialize, JsonSchema)]
 pub struct SendNotificationParams {
     /// Your own identifier for this alert. Repeating it with the same text raises nothing new.
     pub dedup_id: String,
@@ -238,6 +298,26 @@ pub struct SendNotificationParams {
     /// A link into this host's own session, when there is one.
     #[serde(default)]
     pub safe_session_link: Option<String>,
+}
+
+impl std::fmt::Debug for SendNotificationParams {
+    /// The severity and how long each text is, never what the agent wrote.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SendNotificationParams")
+            .field("dedup_id_bytes", &self.dedup_id.len())
+            .field(
+                "agent_name_bytes",
+                &self.agent_name.as_ref().map(String::len),
+            )
+            .field("text_bytes", &self.text.len())
+            .field("severity", &self.severity)
+            .field(
+                "safe_session_link_bytes",
+                &self.safe_session_link.as_ref().map(String::len),
+            )
+            .finish()
+    }
 }
 
 /// How long the server waits, on its way out, for the calls it is still finishing.
@@ -418,7 +498,7 @@ impl Contact {
         &self,
         Parameters(params): Parameters<AskUserParams>,
         context: RequestContext<RoleServer>,
-    ) -> std::result::Result<CallToolResult, McpError> {
+    ) -> std::result::Result<CallToolResult, ErrorData> {
         let _running = self.calls.enter(context.id.clone());
         Ok(self
             .create(params, &context.ct, &context.id)
@@ -438,7 +518,7 @@ impl Contact {
         &self,
         Parameters(params): Parameters<WaitForAnswerParams>,
         context: RequestContext<RoleServer>,
-    ) -> std::result::Result<CallToolResult, McpError> {
+    ) -> std::result::Result<CallToolResult, ErrorData> {
         let _running = self.calls.enter(context.id.clone());
         Ok(self
             .wait(params, &context.ct, &context.id)
@@ -455,7 +535,7 @@ impl Contact {
     pub async fn cancel_question(
         &self,
         Parameters(params): Parameters<CancelQuestionParams>,
-    ) -> std::result::Result<CallToolResult, McpError> {
+    ) -> std::result::Result<CallToolResult, ErrorData> {
         Ok(self.withdraw(params).await.unwrap_or_else(refusal))
     }
 
@@ -468,7 +548,7 @@ impl Contact {
     pub async fn send_notification(
         &self,
         Parameters(params): Parameters<SendNotificationParams>,
-    ) -> std::result::Result<CallToolResult, McpError> {
+    ) -> std::result::Result<CallToolResult, ErrorData> {
         Ok(self.notify(params).await.unwrap_or_else(refusal))
     }
 
@@ -477,7 +557,7 @@ impl Contact {
         params: AskUserParams,
         cancelled: &CancellationToken,
         call: &RequestId,
-    ) -> CliResult<CallToolResult> {
+    ) -> crate::error::Result<CallToolResult> {
         // A call cancelled before anything was asked asks nothing. Creating the question and
         // cancelling it at once would still put it in front of the person for a moment.
         if cancelled.is_cancelled() {
@@ -569,7 +649,7 @@ impl Contact {
         params: WaitForAnswerParams,
         cancelled: &CancellationToken,
         call: &RequestId,
-    ) -> CliResult<CallToolResult> {
+    ) -> crate::error::Result<CallToolResult> {
         let bound = self.session().await?;
         let question_id = parse_question(&params.question_id)?;
         let token = decode_token(&params.caller_token)?;
@@ -585,7 +665,7 @@ impl Contact {
         Ok(CallToolResult::structured(question_value(&question)))
     }
 
-    async fn withdraw(&self, params: CancelQuestionParams) -> CliResult<CallToolResult> {
+    async fn withdraw(&self, params: CancelQuestionParams) -> crate::error::Result<CallToolResult> {
         let bound = self.session().await?;
         let question_id = parse_question(&params.question_id)?;
         let token = decode_token(&params.caller_token)?;
@@ -604,7 +684,7 @@ impl Contact {
         Ok(CallToolResult::structured(question_value(&result.question)))
     }
 
-    async fn notify(&self, params: SendNotificationParams) -> CliResult<CallToolResult> {
+    async fn notify(&self, params: SendNotificationParams) -> crate::error::Result<CallToolResult> {
         let bound = self.session().await?;
         let mut client = bind::open(&bound, self.build_id.clone()).await?;
         let result: AlertCreateResult = bind::mutate(
@@ -644,7 +724,7 @@ impl Contact {
         token: &CallerToken,
         wait: DurationMs,
         cancelled: &CancellationToken,
-    ) -> CliResult<Polled> {
+    ) -> crate::error::Result<Polled> {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(wait.get());
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -690,14 +770,16 @@ impl Contact {
         bound: &Bound,
         question_id: QuestionId,
         token: &CallerToken,
-    ) -> CliResult<Question> {
+    ) -> crate::error::Result<Question> {
         if self.cancelled_by_the_client(call) {
             return self.cancel_for_the_call(bound, question_id, token).await;
         }
-        Err(CliError::Refused(ProtocolError::new(
+        Err(CliError::Refused(kr_client::error::refusal(
             ErrorCode::ResourceUnavailable,
-            "the tool server is stopping; the question was not cancelled, and it ends when this \
-             process does",
+            Shown::said(
+                "the tool server is stopping; the question was not cancelled, and it ends when \
+                 this process does",
+            ),
         )))
     }
 
@@ -721,9 +803,9 @@ impl Contact {
         bound: &Bound,
         question_id: QuestionId,
         token: &CallerToken,
-    ) -> CliResult<Question> {
+    ) -> crate::error::Result<Question> {
         let mut client = bind::open(bound, self.build_id.clone()).await?;
-        let cancelled: CliResult<QuestionOwnResult> = bind::mutate(
+        let cancelled: crate::error::Result<QuestionOwnResult> = bind::mutate(
             &mut client,
             Method::QuestionCancelOwn,
             bound.target(),
@@ -759,7 +841,7 @@ impl Contact {
         }
     }
 
-    async fn session(&self) -> CliResult<Bound> {
+    async fn session(&self) -> crate::error::Result<Bound> {
         let mut held = self.bound.lock().await;
         if let Some(bound) = held.as_ref() {
             return Ok(bound.clone());
@@ -798,7 +880,7 @@ impl ServerHandler for Contact {
 /// # Errors
 ///
 /// Returns an error when the transport fails.
-pub async fn run_stdio(build_id: BuildId) -> CliResult<()> {
+pub async fn run_stdio(build_id: BuildId) -> crate::error::Result<()> {
     let contact = Contact::new(build_id);
     let calls = Arc::clone(&contact.calls);
     let transport = ServedTransport {
@@ -808,14 +890,15 @@ pub async fn run_stdio(build_id: BuildId) -> CliResult<()> {
         ),
         ended: Arc::clone(&contact.transport_ended),
     };
-    let service = contact
-        .serve(transport)
-        .await
-        .map_err(|error| CliError::Other(format!("the tool server could not start: {error}")))?;
-    let stopped = service
-        .waiting()
-        .await
-        .map_err(|error| CliError::Other(format!("the tool server stopped: {error}")));
+    let service = contact.serve(transport).await.map_err(|error| {
+        CliError::Other(shown!(
+            "the tool server could not start: {}",
+            crate::shown::tool_server(&error)
+        ))
+    })?;
+    let stopped = service.waiting().await.map_err(|error| {
+        CliError::Other(shown!("the tool server stopped: {}", Shown::task(&error)))
+    });
     // A call the client cancelled just before the transport ended may still be cancelling its
     // question. It is given a bounded moment to finish, so the process does not exit under it.
     let _ = tokio::time::timeout(CALLS_FINISH_WITHIN, calls.finished()).await;
@@ -825,9 +908,9 @@ pub async fn run_stdio(build_id: BuildId) -> CliResult<()> {
 
 /// The refusal a call cancelled before its question was asked is answered with.
 fn asked_nothing() -> CliError {
-    CliError::Other(
-        "the call was cancelled before the question was asked; nothing was created".to_owned(),
-    )
+    CliError::Other(Shown::said(
+        "the call was cancelled before the question was asked; nothing was created",
+    ))
 }
 
 /// Renders a refusal as a tool error the agent can read and act on.
@@ -838,9 +921,9 @@ fn asked_nothing() -> CliError {
 fn refusal(error: CliError) -> CallToolResult {
     let protocol = match &error {
         CliError::Refused(refused) => refused.clone(),
-        other => ProtocolError::new(
+        other => kr_client::error::refusal(
             ErrorCode::from_wire(&other.code()).unwrap_or(ErrorCode::ResourceUnavailable),
-            other.to_string(),
+            other.said(),
         ),
     };
     let mut value = json!({
@@ -897,9 +980,9 @@ fn seconds(value: u64) -> DurationMs {
     DurationMs::new(value.saturating_mul(1_000))
 }
 
-fn parse_question(text: &str) -> CliResult<QuestionId> {
+fn parse_question(text: &str) -> crate::error::Result<QuestionId> {
     text.parse()
-        .map_err(|_| CliError::Usage(format!("{text} is not a question identifier")))
+        .map_err(|_| CliError::Usage(Shown::said("the text given is not a question identifier")))
 }
 
 /// Renders a caller token for the agent to hold.
@@ -908,18 +991,18 @@ fn encode_token(token: &CallerToken) -> String {
 }
 
 /// Reads a caller token the agent presented.
-fn decode_token(text: &str) -> CliResult<CallerToken> {
+fn decode_token(text: &str) -> crate::error::Result<CallerToken> {
     let trimmed = text.trim();
     if !trimmed.len().is_multiple_of(2) {
-        return Err(CliError::Usage("that is not a caller token".to_owned()));
+        return Err(CliError::Usage(Shown::said("that is not a caller token")));
     }
     let mut bytes = Vec::with_capacity(trimmed.len() / 2);
     for pair in trimmed.as_bytes().chunks(2) {
         let text = std::str::from_utf8(pair)
-            .map_err(|_| CliError::Usage("that is not a caller token".to_owned()))?;
+            .map_err(|_| CliError::Usage(Shown::said("that is not a caller token")))?;
         bytes.push(
             u8::from_str_radix(text, 16)
-                .map_err(|_| CliError::Usage("that is not a caller token".to_owned()))?,
+                .map_err(|_| CliError::Usage(Shown::said("that is not a caller token")))?,
         );
     }
     Ok(CallerToken::new(bytes))
@@ -936,6 +1019,74 @@ fn hex_of(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tool call's parameters render as their kinds, their numbers and their lengths: never an
+    /// agent's text, and never a caller token.
+    #[test]
+    fn a_tool_calls_parameters_render_without_what_the_agent_sent() {
+        use crate::shown::marker::{MARKER, assert_unmarked};
+
+        let ask = AskUserParams {
+            request_id: MARKER.to_owned(),
+            agent_name: Some(MARKER.to_owned()),
+            context: MARKER.to_owned(),
+            question: MARKER.to_owned(),
+            kind: AskType::Select,
+            choices: Some(vec![ChoiceInput {
+                choice_id: MARKER.to_owned(),
+                label: MARKER.to_owned(),
+            }]),
+            expiry_seconds: Some(60),
+            wait_seconds: None,
+        };
+        let wait = WaitForAnswerParams {
+            question_id: MARKER.to_owned(),
+            caller_token: MARKER.to_owned(),
+            wait_seconds: Some(30),
+        };
+        let cancel = CancelQuestionParams {
+            question_id: MARKER.to_owned(),
+            caller_token: MARKER.to_owned(),
+        };
+        let notify = SendNotificationParams {
+            dedup_id: MARKER.to_owned(),
+            agent_name: None,
+            text: MARKER.to_owned(),
+            severity: NotificationSeverity::Warning,
+            safe_session_link: Some(MARKER.to_owned()),
+        };
+        // The negative control is each field: every one holds the marker, and the derived form
+        // printed them all.
+        assert_eq!(
+            format!("{ask:?}"),
+            "AskUserParams { request_id_bytes: 14, agent_name_bytes: Some(14), context_bytes: 14, \
+             question_bytes: 14, kind: Select, choices: Some([ChoiceInput { choice_id_bytes: 14, \
+             label_bytes: 14 }]), expiry_seconds: Some(60), wait_seconds: None }"
+        );
+        assert_eq!(
+            format!("{wait:?}"),
+            "WaitForAnswerParams { question_id: \"[not an identifier]\", wait_seconds: Some(30), \
+             .. }"
+        );
+        assert_eq!(
+            format!("{cancel:?}"),
+            "CancelQuestionParams { question_id: \"[not an identifier]\", .. }"
+        );
+        assert_eq!(
+            format!("{notify:?}"),
+            "SendNotificationParams { dedup_id_bytes: 14, agent_name_bytes: None, text_bytes: 14, \
+             severity: Warning, safe_session_link_bytes: Some(14) }"
+        );
+        assert_unmarked(
+            "a tool call's parameters",
+            &[
+                format!("{ask:#?}"),
+                format!("{wait:#?}"),
+                format!("{cancel:#?}"),
+                format!("{notify:#?}"),
+            ],
+        );
+    }
 
     #[test]
     fn a_token_survives_the_round_trip_the_agent_holds_it_through() {
@@ -1011,9 +1162,9 @@ mod tests {
     /// instruction.
     #[test]
     fn a_refusal_carries_the_stable_code_and_the_setup_instruction() {
-        let result = refusal(CliError::Refused(ProtocolError::new(
+        let result = refusal(CliError::Refused(kr_client::error::refusal(
             ErrorCode::NotInKrSession,
-            "nowhere",
+            Shown::said("nowhere"),
         )));
         let content = result.structured_content.expect("structured");
         assert_eq!(content["code"], "NOT_IN_KR_SESSION");

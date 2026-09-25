@@ -18,7 +18,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use kr_ipc::paths::EnvironmentPaths;
+use kr_ipc::paths::{EnvironmentPaths, NameKind};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{ActorId, DraftId, DraftRevision, EnvironmentId, GrantId, TransferId};
 use kr_protocol::scalars::{Bytes, Digest256, Nullable, TimestampMs, U64, Uuid};
@@ -588,7 +588,7 @@ impl TransferService {
         let file = self.staging.incomplete().create_new(&incomplete)?;
         let payload_identity = file.identity();
         drop(file);
-        self.staging.incomplete().sync()?;
+        self.staging.incomplete().sync(NameKind::File)?;
         let result = UploadBeginResult {
             transfer_id,
             environment_id: params.environment_id,
@@ -1237,8 +1237,8 @@ impl TransferService {
             }
             // Flushed here too. A first attempt can have renamed and then failed before its own
             // flush, and this is the path that answers for it.
-            self.staging.complete().sync()?;
-            self.staging.incomplete().sync()?;
+            self.staging.complete().sync(NameKind::File)?;
+            self.staging.incomplete().sync(NameKind::File)?;
             self.locked()?
                 .complete_publish(row.transfer_id, now, expires_at_ms)?;
             return Ok(());
@@ -1259,8 +1259,8 @@ impl TransferService {
             )?;
             // The name is durable before the record that depends on it. Without this the journal
             // could say `published` while the rename was still only in the page cache.
-            self.staging.complete().sync()?;
-            self.staging.incomplete().sync()?;
+            self.staging.complete().sync(NameKind::File)?;
+            self.staging.incomplete().sync(NameKind::File)?;
             if self
                 .holds(self.staging.complete(), &published, identity)?
                 .is_none()
@@ -1348,8 +1348,8 @@ impl TransferService {
         self.staging.complete().remove(&storage.published()?)?;
         // The removals are durable before the charge is released. Without this a power loss could
         // bring a name back after SQLite had already forgotten it was spending bytes.
-        self.staging.incomplete().sync()?;
-        self.staging.complete().sync()?;
+        self.staging.incomplete().sync(NameKind::File)?;
+        self.staging.complete().sync(NameKind::File)?;
         self.locked()?.release_payload(row.transfer_id)
     }
 
@@ -2206,7 +2206,7 @@ impl TransferService {
                 }
             }
             if removed_here > 0 {
-                directory.sync()?;
+                directory.sync(NameKind::File)?;
             }
             removed += removed_here;
         }

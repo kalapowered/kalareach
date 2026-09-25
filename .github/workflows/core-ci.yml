@@ -265,9 +265,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes gnome-keyring dbus-x11
 
-      # The one test that writes to this machine's own credential store. It does nothing until a run
-      # says it may, because on a person's machine that store is their login keyring, so the switch
-      # is set here and on no other step.
+      # The one test that writes to this machine's own credential store. An ordinary run leaves it
+      # out as ignored, and it fails before it writes unless the run sets the switch that says it
+      # may, because on a person's machine that store is their login keyring, so it runs here with
+      # --ignored and the switch is set here and on no other step.
       #
       # The store lives for this step and nowhere else. `dbus-run-session` gives the command a
       # session bus of its own and ends it when the command returns; the keyring is made under a
@@ -309,7 +310,7 @@ jobs:
               echo "no credential store answered on this session bus" >&2
               exit 1
             fi
-            cargo test --locked -p kr-client --lib -- --nocapture --exact \
+            cargo test --locked -p kr-client --lib -- --nocapture --ignored --exact \
               sync::keys::tests::a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again
           '
 
@@ -403,23 +404,27 @@ jobs:
       # worker's own library, the suite that drives a real pseudo-console, a real PowerShell and a
       # real job object and hosts a worker on its own pipe, where a launched agent's helper is
       # placed, what a question's caller token reaches, a controller's and the local command
-      # line's authority at a worker's pipe, and the local endpoint, descriptors and process
-      # identity the host rests on. "The attach client" means the part of it that runs here -
-      # `crates/kr-cli/tests/attach.rs` is a Unix file, so what passes is that crate's library and
-      # its path tests rather than a real attachment. The contact tools run in
+      # line's authority at a worker's pipe, the local endpoint, descriptors and process identity
+      # the host rests on (the descriptor reader checks both the directory's and the file's
+      # access-control lists here), every local store's directory flush, the persistence suite, the
+      # decision a worker start makes about breaking away from the daemon's job, the environment's
+      # scheduled task and the starter it runs, the real-worker host tests under cargo through that
+      # task and from the built executable as the shipping daemon starts a worker, and the
+      # first-owner pairing against a real control daemon on loopback. "The attach client" means the part of it that runs
+      # here - `crates/kr-cli/tests/attach.rs` is a Unix file, so what passes is that crate's library
+      # and its path tests rather than a real attachment. The contact tools run in
       # `crates/kr-cli/tests/contact_windows.rs`, beside the Unix suite, with the tool server
       # started by a root shell inside the session's job.
       #
-      # The worker's other integration suites are **not** run here. They drive a session the way a
-      # Unix pseudo-terminal behaves - a process group, a shell that answers a signal, a stream
-      # with no console repainting it - and on Windows a good many of them fail. What each of
-      # those failures means has not been established. What one whole run printed was a
-      # `kr-worker.exe` copied to a temporary directory that Windows refused to start, a POSIX
-      # shell that sometimes would not start, and a console that painted a screen and set a window
-      # title before the shell wrote a byte. Running them here and calling the result a Windows
-      # failure would say something this project has not established; compiling them, which the
-      # step above does with `--all-targets`, is what this job owes them until somebody qualifies
-      # them.
+      # The persistence suite runs with PowerShell 7 as each session's root shell rather than the
+      # `/bin/sh` this platform has not got. The host tests that start a real worker run under
+      # `cargo test`, whose own job kills its members on close and forbids breakaway: their daemon
+      # starts each worker through the environment's scheduled task, whose starter creates it, so the
+      # worker is never in that job. They run a second time from the built test executable, outside
+      # cargo, the way the shipping daemon still starts a worker. Three of those tests are held back
+      # on this platform: two need the worker's rendezvous to complete here, which it does not yet,
+      # and one uses a POSIX shell binary this platform has not got. Each gives its reason in its
+      # ignore attribute in `crates/kr-worker/tests/host.rs`.
       #
       # What this runner cannot do at all is qualify a console interactively. The pseudo-console
       # tests open a console of their own and drive it, which works here; what needs a real machine
@@ -428,7 +433,18 @@ jobs:
       # One command per step. Three in one script would run under a shell that carries on after a
       # native command fails, and the step would then report whatever the last one returned: a
       # failure in the first two could pass.
-      - name: Test the terminal engine, the repository boundary and the attach client
+      # The pairing tests below run `kr` against a real control daemon they find built beside them,
+      # and a test that starts a worker through the environment's scheduled task registers the
+      # daemon's binary as that task's starter, so the daemon and the worker are built before the
+      # suites that use them run.
+      - name: Build the control daemon and the worker the suites run
+        run: cargo build --locked -p kr-controller -p kr-worker
+
+      # kr-cli's suites include the first-owner pairing tests in `crates/kr-cli/tests/pair_windows.rs`,
+      # which start the daemon on loopback (its network listener comes up on this platform), confirm
+      # the first owner at a pseudo-console outside every session, and refuse it with no console,
+      # inside a session, and where session membership cannot be established.
+      - name: Test the terminal engine, the repository boundary, the attach client and pairing
         run: cargo test --locked -p kr-term -p kr-project -p kr-cli
 
       - name: Test the worker's library
@@ -470,15 +486,15 @@ jobs:
         run: cargo test --locked -p kr-ipc --test windows
 
       # The crate's own tests, among them the environment identity's list and the profile it is
-      # kept in. Two of the frame writer's tests are left out: on this platform a named pipe with
-      # no reader takes less of one write than a socket does, and reports room while it is full,
-      # and what that means for the writer's backpressure has not been established.
+      # kept in, and the two frame-writer tests that used to be skipped here: on this platform a
+      # named pipe has no writability of its own the writer can hold while the reader holds the other
+      # half, so a waiter polls rather than parking and a fresh pipe answers the first offer as
+      # pending, and both tests now assert that pipe-granularity behaviour by condition. The cost of
+      # the poll and the rule that every caller bounds it are on `Readiness::ready` and in
+      # `docs/transport/README.md`.
       - name: Test the local IPC library
         if: ${{ !cancelled() }}
-        run: >-
-          cargo test --locked -p kr-ipc --lib --
-          --skip framed::tests::a_checked_write_asks_before_every_transport_write
-          --skip framed::tests::a_peer_that_stops_reading_blocks_the_attempt_rather_than_holding_the_writer
+        run: cargo test --locked -p kr-ipc --lib
 
       # What the originating agent may do with a question on this platform's identities: a caller
       # token works only for the helper it was issued to.
@@ -500,6 +516,29 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-controller --lib registry
 
+      # A Windows worker must be independent of the daemon's kill-on-close job, so the start asks to
+      # break away from that job only when the daemon's own job would kill it on close. This checks
+      # that decision for the four job contexts the product can be started in.
+      - name: Decide a worker's breakaway from the daemon's job
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-controller --lib supervision::tests::a_worker_breaks_away_from_a_kill_on_close_or_a_breakaway_permitting_job
+
+      # The environment's scheduled task: the definition the setup step registers, read back as the
+      # Task Scheduler exports it, whose it is, and registering, repairing, removing and running a
+      # real one. This runner's account is signed in to the console, so the task logs on as the
+      # interactive session the setup step registers.
+      - name: Register, read back and run the environment's scheduled task
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-controller --lib supervision::windows
+
+      # A launch handed to the environment's task: its starter creates the process outside this
+      # test's job and reports the identity it read from the handle; with no task, a task that runs
+      # another program or a launch the starter cannot create, nothing is started; a start claim
+      # that has lapsed is taken and starts nothing.
+      - name: Start through the environment's scheduled task
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-controller --test task_supervisor
+
       # The environment feature store on this platform, among its tests the claim a controller of
       # the previous release wrote on it with its start in whole seconds, which the next owner
       # reads and replaces.
@@ -507,11 +546,14 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-attention
 
-      # The settings-sync store flushes the directory it changes a name in, through a handle of
-      # the directory's own, and passes over a directory on its path this account may not add to.
-      - name: Test the settings-sync store's directory flush
+      # Every local store flushes the directory it changes a name in through one shared handle in
+      # kr-ipc, opened with the right the change used and passing over a directory on the path this
+      # account may not add to. The flush itself is checked in "Test the local IPC library" above;
+      # this runs the client's own stores that call it - the drafts store, the offline-answer store,
+      # the settings-sync store and its membership file, and the recovery-bundle record.
+      - name: Test the client's stores and their directory flush
         if: ${{ !cancelled() }}
-        run: cargo test --locked -p kr-client --lib sync::store
+        run: cargo test --locked -p kr-client --lib
 
       # The root editor's own transport on this platform. The bridge endpoint is a named pipe
       # rather than a socket, so the client keeps one asynchronous read in flight and collects it
@@ -540,8 +582,12 @@ jobs:
           cargo test --locked -p kr-project --test boundary -- --nocapture
 
       # What a change set carries across a replacement, on the platform whose access-control lists
-      # have no counterpart on the others. The cases that need a checkout state that this host runs
-      # no repository tool; what runs here is the rest, and `--nocapture` is what prints both.
+      # have no counterpart on the others. No apply case runs here: the platform-independent cases
+      # are Unix-only, and the three that check what an apply carries across a Windows access-control
+      # list each need a repository tool, which the Windows repository boundary refuses to run, so
+      # they are ignored. `--all-targets` above compiles them; each runs with `--ignored` on a
+      # Windows host whose boundary runs a repository tool, which no host does yet. `--nocapture`
+      # prints that nothing ran rather than hiding it.
       - name: Test what an apply carries across
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-changeset --test apply -- --nocapture
@@ -556,14 +602,56 @@ jobs:
 
       # A collection key belongs in the operating system's own credential store, and on this system
       # that is the Credential Manager, which this runner's account already has. The one test that
-      # writes to it does nothing until a run says it may, because on a person's machine that store
-      # holds their own credentials, so the switch is set here and on no other step. What the test
-      # writes is named for the run and taken away before the test finishes.
+      # writes to it is ignored in an ordinary run and fails before it writes unless the run sets
+      # the switch that says it may, because on a person's machine that store holds their own
+      # credentials, so it runs here with --ignored and the switch is set here and on no other
+      # step. What the test writes is named for the run and taken away before the test finishes.
       - name: A collection key is kept in this runner's credential store
         if: ${{ !cancelled() }}
         env:
           KR_TEST_PLATFORM_SECRET_STORE: "1"
-        run: cargo test --locked -p kr-client --lib -- --nocapture --exact sync::keys::tests::a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again
+        run: cargo test --locked -p kr-client --lib -- --nocapture --ignored --exact sync::keys::tests::a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again
+
+      # Section 24 at the worker: the durability contract, the outbox, retention, the journal-fault
+      # seam, local state and forward-only migration. The root shell each session runs is PowerShell
+      # 7 here rather than the `/bin/sh` this platform has not got, and the owner-only check reads
+      # each state directory's access-control list. One test is Unix-only and absent here: its root
+      # program is a POSIX script that turns off echo, traps the interrupt signal and reads a line at
+      # a time, and its store-side halves run in the tests below it.
+      - name: Test the persistence suite
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-worker --test persistence
+
+      # The real-worker host tests under cargo, whose own job kills on close and forbids breakaway:
+      # each daemon starts its workers through the environment's scheduled task, so a worker is never
+      # in that job, and one started by a daemon inside nested jobs outlives them. The shipping
+      # daemon's own start, which asks to break away, is refused here with its named failure.
+      - name: The real-worker host tests under cargo, through the environment's task
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-worker --test host
+
+      # The real-worker host tests again, run from the built executable directly rather than through
+      # cargo, so they are not inside cargo's kill-on-close job, and with each worker started the
+      # way the shipping daemon still starts one: as the daemon's own detached process. This
+      # runner's own job does not kill on close, so no breakaway is asked for. The three tests held
+      # back on this platform are ignored here too.
+      - name: The real-worker host tests, from the built executable, as the shipping daemon starts a worker
+        if: ${{ !cancelled() }}
+        env:
+          KR_HOST_TEST_SUPERVISOR: detached
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Build without running, and take the executable Cargo says it built rather than the newest
+          # file in the cache, so a failed build cannot fall through to a stale executable.
+          $json = cargo test --locked -p kr-worker --test host --no-run --message-format=json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = $json |
+            ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'host' -and $_.executable } |
+            Select-Object -Last 1 -ExpandProperty executable
+          if (-not $exe) { Write-Error 'cargo reported no host test executable'; exit 1 }
+          & $exe --test-threads=1 --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # The other Windows target the product ships on. Nothing is executed for it here; this is
       # the compile the release baseline asks for.
@@ -677,22 +765,20 @@ jobs:
           path: /tmp/kr-shell-packages
           if-no-files-found: error
 
-      # The build above is a step of this job, so an absent package here is a failure rather than
-      # a skip, which is what KR_REQUIRE_SHELL_PACKAGES says.
+      # The cases that drive a package are left out of a run that has built none, such as the rust
+      # job's. This job built them above, so it runs those cases with --include-ignored, and a
+      # package that is missing, or is not the one this tree gives, fails the case that needed it.
       - name: Drive the built packages through the contract
-        env:
-          KR_REQUIRE_SHELL_PACKAGES: "1"
         run: |
           cargo test --locked -p kr-shell-integration \
-            --test zsh --test bash --test fish --test pwsh -- --test-threads=1
+            --test zsh --test bash --test fish --test pwsh -- --test-threads=1 --include-ignored
 
       # Section 7 qualifies the packages against the startup customisations people run. The
-      # customisations are pinned by digest and fetched once here, and a package or a customisation
-      # that is missing is a failure rather than a skip, because both are steps of this job.
+      # customisations are pinned by digest and fetched once here. The checks that need a package
+      # or a customisation are left out of an ordinary run, and this job has both, so it runs them
+      # with --include-ignored, where a package or a customisation that is missing fails.
       - name: Qualify the packages against the startup customisations
         env:
-          KR_REQUIRE_SHELL_PACKAGES: "1"
-          KR_REQUIRE_SHELL_STACKS: "1"
           KR_TEST_ARTIFACTS_DIR: /tmp/kr-shell-qualification
         run: |
           bash scripts/fetch-shell-stacks.sh
@@ -701,7 +787,8 @@ jobs:
           # a second copy of the first; the pinned build is put back afterwards.
           CPPFLAGS="-DKR_QUALIFICATION_BUILD=1" bash scripts/build-shells.sh --zsh --no-upstream-tests
           bash scripts/build-shells.sh --zsh --no-upstream-tests
-          cargo test --locked -p kr-shell-integration --test qualification -- --test-threads=1
+          cargo test --locked -p kr-shell-integration --test qualification -- \
+            --test-threads=1 --include-ignored
           cat /tmp/kr-shell-qualification/qualification-cases.tsv
 
   typescript:
@@ -799,18 +886,19 @@ jobs:
         run: cargo test --locked -p companion-tauri -p kr-client
 
       # A collection key belongs in the operating system's own credential store, and on this system
-      # that is the login keychain. The one test that writes to it does nothing until a run says it
-      # may, because on a person's machine that keychain is their own, so the switch is set here and
-      # on no other step. What the test writes is named for the run and taken away before the test
-      # finishes. The step above ran the same suite with the switch unset, where this test prints
-      # why it did nothing. The Linux half of this matrix has the Secret Service leg in the job that
-      # starts a bus for it, so this step is this platform's alone.
+      # that is the login keychain. The one test that writes to it is ignored in an ordinary run and
+      # fails before it writes unless the run sets the switch that says it may, because on a
+      # person's machine that keychain is their own, so it runs here with --ignored and the switch
+      # is set here and on no other step. What the test writes is named for the run and taken away
+      # before the test finishes. The step above ran the same suite, where this test is ignored.
+      # The Linux half of this matrix has the Secret Service leg in the job that starts a bus for
+      # it, so this step is this platform's alone.
       - name: A collection key is kept in this runner's credential store
         if: ${{ !cancelled() && runner.os == 'macOS' }}
         env:
           KR_TEST_PLATFORM_SECRET_STORE: "1"
         run: |
-          cargo test --locked -p kr-client --lib -- --nocapture --exact \
+          cargo test --locked -p kr-client --lib -- --nocapture --ignored --exact \
             sync::keys::tests::a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again
 
       - name: Install the browsers the end-to-end run drives
@@ -1035,19 +1123,11 @@ jobs:
       #   nothing without one. The rust job runs each leg against the deployment it names.
       # - The container cases, which need podman, and this runner has none. The rust job's runner
       #   has it, and its test step runs them.
-      # - The case that writes to the platform's credential store, which does nothing without its
-      #   switch. The companion job's macOS leg runs it with the switch set.
-      # - The two cases that launch a built shell package, which do nothing unless
-      #   KR_SHELL_PACKAGES names one, and this job builds none. The shell-packages job builds the
-      #   packages and drives them through the contract and qualification suites; these two cases
-      #   run where KR_SHELL_PACKAGES names a built package.
       # - The cases that need another filesystem, and the cases whose verdicts are timings, which
       #   the two steps after this one run.
       - name: Test
         if: ${{ !cancelled() }}
         timeout-minutes: 70
-        env:
-          KR_REQUIRE_SHELLS: bash,zsh,fish
         run: >-
           cargo test --locked --workspace --exclude kr-sync-integration --no-fail-fast --
           --skip the_helper_inside_a_container_refuses_a_handshake_that_declares_a_network_actor
@@ -1056,9 +1136,6 @@ jobs:
           --skip the_argument_vector_reaches_the_container_exactly_as_it_was_built
           --skip a_helper_path_with_a_space_in_it_is_one_argument_inside_the_container
           --skip a_refresh_that_reached_a_running_environment_without_a_helper_scopes_no_channel
-          --skip a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again
-          --skip the_built_packages_are_qualified_where_this_run_has_them
-          --skip a_real_qualified_package_registers_and_qualifies_on_this_hosts_endpoint
           --skip a_repository_whose_own_data_is_on_another_filesystem_is_captured
           --skip bind_mount_and_cross_device_grafts_are_refused
           --skip recursive_removal_refuses_a_grafted_mount

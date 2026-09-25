@@ -1,0 +1,5 @@
+{
+  "name": "kalareach",
+  "version": "0.3.0",
+  "description": "Carries each Gemini CLI session's start and end, and its tool permission notifications, to the KalaReach worker that owns the terminal."
+}

@@ -787,18 +787,71 @@ fn worker_beside_this_test() -> std::path::PathBuf {
 // The built packages, when this run has them.
 // --------------------------------------------------------------------------------------------
 
-/// KR-REQ-07.16, KR-REQ-07.85: the packages a build produced, when it produced any.
+/// The module the PSReadLine package binds into the person's own editor, which is its reader
+/// bridge.
+const POWERSHELL_BRIDGE_MODULE: &str = "KalaReach.ShellBridge";
+
+/// Says whether a package's record names the reader changes behind it, in the form its kind has
+/// them.
+///
+/// Section 7 makes the reader bridge part of every qualified package, in one of two forms. The
+/// Zsh, Bash and Fish packages rebuild their shell with a published reader patch, so a record of
+/// theirs that names no patch names nothing the managed contract rests on. The PSReadLine package
+/// rebuilds nothing and patches nothing: its bridge is a module of its own that binds into the
+/// editor the person already has. Its record therefore names no patch, and names that module at
+/// the editor ABI it was qualified against; what it was qualified against beyond that, the
+/// PSReadLine range and the version it found, is the package's own record and the package suite
+/// checks it.
+fn reader_changes_recorded(package: &ShellPackage) -> Result<(), String> {
+    let identity = package.identity();
+    match identity.kind {
+        ShellKind::Zsh | ShellKind::Bash | ShellKind::Fish => {
+            if identity.patches.is_empty() {
+                return Err(format!(
+                    "the {} package rebuilds its shell with a reader patch and its record names \
+                     none",
+                    identity.kind.as_str()
+                ));
+            }
+        }
+        ShellKind::PowerShell => {
+            if !identity.patches.is_empty() {
+                return Err(format!(
+                    "the PowerShell package patches nothing and its record names patches: {:?}",
+                    identity.patches
+                ));
+            }
+            if !identity.modules.iter().any(|module| {
+                module.name == POWERSHELL_BRIDGE_MODULE && module.editor_abi == identity.editor_abi
+            }) {
+                return Err(format!(
+                    "the PowerShell package's bridge is the {POWERSHELL_BRIDGE_MODULE} module at \
+                     its editor ABI {}, and its record's module tree is {:?}",
+                    identity.editor_abi, identity.modules
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// KR-REQ-07.16, KR-REQ-07.85: the packages a build produced.
+///
+/// It needs built packages, which only a run that built them has, so an ordinary run leaves it out.
+/// A run that built them names their root in [`PACKAGE_ROOT_VARIABLE`] and runs it with
+/// `--ignored`, as the build box's verification does after it builds this tree's packages; run
+/// without that variable, it fails and says so.
 #[test]
+#[ignore = "needs the built shell packages that KR_SHELL_PACKAGES names; it runs with --ignored in a run that has built them, as the build box's verification does"]
 fn the_built_packages_are_qualified_where_this_run_has_them() {
-    // What this run was told to use, and nothing else. An ordinary acceptance run says nothing
-    // about a package it was not pointed at, because the machine's own installation is not this
-    // suite's to depend on; a run that names one is a run that expects it to be there.
-    let Some(root) = std::env::var_os(PACKAGE_ROOT_VARIABLE) else {
-        eprintln!(
-            "skipped: {PACKAGE_ROOT_VARIABLE} names no directory, so no built package is checked"
-        );
-        return;
-    };
+    // What this run was told to use, and nothing else: the machine's own installation is not this
+    // suite's to depend on.
+    let root = std::env::var_os(PACKAGE_ROOT_VARIABLE).unwrap_or_else(|| {
+        panic!(
+            "{PACKAGE_ROOT_VARIABLE} names no directory, so there are no built packages for this \
+             check to read; build them and name their root in it"
+        )
+    });
     let set = PackageSet::discover(Path::new(&root)).expect("reads the built packages");
     assert!(
         !set.packages().is_empty(),
@@ -813,9 +866,102 @@ fn the_built_packages_are_qualified_where_this_run_has_them() {
         let identity = package.identity();
         assert!(!identity.editor_abi.is_empty());
         assert!(!identity.integration_version.is_empty());
+        reader_changes_recorded(package).unwrap_or_else(|reason| {
+            panic!(
+                "{}: a qualified package records the reader changes behind it: {reason}",
+                package.directory.display()
+            )
+        });
+    }
+}
+
+/// KR-REQ-07.85: a package's record names its reader changes in the form its kind has them.
+///
+/// A patched package whose record names no patch is refused. The PSReadLine package, which patches
+/// nothing, is qualified with no patch and its bridge module at its editor ABI, and refused with a
+/// patch, without that module, or with the module at another ABI.
+#[test]
+fn a_package_that_patches_nothing_is_qualified_only_as_the_psreadline_package() {
+    use kr_shell_integration::contract::transport::{ModuleEntry, PatchRevision};
+
+    let package = |kind: ShellKind,
+                   editor_abi: &str,
+                   patches: Vec<PatchRevision>,
+                   modules: Vec<ModuleEntry>| ShellPackage {
+        manifest: PackageManifest {
+            identity: "identity-1".to_owned(),
+            shell: PackageShell {
+                kind,
+                executable: std::path::PathBuf::from("bin/shell"),
+                upstream_version: "1".to_owned(),
+                editor_abi: editor_abi.to_owned(),
+                integration_version: "1".to_owned(),
+                patches,
+                modules,
+            },
+            startup_entry: PackageStartupEntry {
+                file: "startup/entry".to_owned(),
+            },
+        },
+        directory: std::path::PathBuf::from("/nonexistent/package"),
+    };
+    let patch = || PatchRevision {
+        name: "reader-mailbox".to_owned(),
+        upstream_revision: "upstream-1".to_owned(),
+        revision: "1".to_owned(),
+    };
+    let module = |name: &str, editor_abi: &str| ModuleEntry {
+        name: name.to_owned(),
+        search_path: "modules".to_owned(),
+        editor_abi: editor_abi.to_owned(),
+    };
+
+    for kind in [ShellKind::Zsh, ShellKind::Bash, ShellKind::Fish] {
+        assert_eq!(
+            reader_changes_recorded(&package(kind, "reader-1", vec![patch()], Vec::new())),
+            Ok(()),
+            "a patched {kind:?} package that names its patch"
+        );
         assert!(
-            !identity.patches.is_empty(),
-            "a qualified package records the reader patches behind it"
+            reader_changes_recorded(&package(kind, "reader-1", Vec::new(), Vec::new())).is_err(),
+            "a patched {kind:?} package whose record names no patch"
+        );
+    }
+
+    let bridge = || vec![module(POWERSHELL_BRIDGE_MODULE, "psreadline-2.4")];
+    assert_eq!(
+        reader_changes_recorded(&package(
+            ShellKind::PowerShell,
+            "psreadline-2.4",
+            Vec::new(),
+            bridge()
+        )),
+        Ok(()),
+        "the PSReadLine package is qualified with no patch and its bridge module"
+    );
+    for (what, patches, modules) in [
+        ("with a patch", vec![patch()], bridge()),
+        ("without its bridge module", Vec::new(), Vec::new()),
+        (
+            "with another module only",
+            Vec::new(),
+            vec![module("PSReadLine", "psreadline-2.4")],
+        ),
+        (
+            "with its bridge module at another editor ABI",
+            Vec::new(),
+            vec![module(POWERSHELL_BRIDGE_MODULE, "psreadline-2.3")],
+        ),
+    ] {
+        assert!(
+            reader_changes_recorded(&package(
+                ShellKind::PowerShell,
+                "psreadline-2.4",
+                patches,
+                modules
+            ))
+            .is_err(),
+            "the PSReadLine package {what} is refused"
         );
     }
 }
@@ -928,6 +1074,7 @@ async fn a_worker_that_has_not_qualified_proves_nothing_and_is_found_when_it_doe
         worker_endpoint: None,
         send_queue_bytes: 8 * 1024 * 1024,
         resident_bytes: 1024 * 1024,
+        time: kr_worker::action::time::TimeSources::system(),
         launch_profile: kr_protocol::session::LaunchProfile::default(),
     })
     .expect("opens the session");

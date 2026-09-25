@@ -325,10 +325,20 @@ describe('what setup costs a person', () => {
       expect(screen.getByTestId('setup-recheck').textContent).toBe('Check again')
     })
 
-    // The shell's own connection watch and event subscription are the application's, not setup's,
-    // and so is its read of the account the sidebar names, which reaches no host.
+    // The shell's own connection watch, event subscription and watch for owner confirmations are
+    // the application's, not setup's, and so is its read of the account the sidebar names, which
+    // reaches no host.
     const own = calls.filter(
-      (name) => !['connectionState', 'subscribe', 'accountStatus', 'onAccount'].includes(name)
+      (name) =>
+        ![
+          'connectionState',
+          'onConnection',
+          'subscribe',
+          'accountStatus',
+          'onAccount',
+          'ownerConfirmations',
+          'onConfirmations'
+        ].includes(name)
     )
     expect(new Set(own)).toEqual(
       new Set(['setupIdentity', 'environmentCapabilities'])

@@ -159,6 +159,8 @@ pub struct WorkerService {
     clock: Arc<SystemContinuousClock>,
     /// The machine's own continuous clock, which is the one a forwarded deadline arrives on.
     shared_clock: Arc<dyn kr_ipc::clock::SharedClock>,
+    /// The session's time contract, which reads UTC through the host's clock floor.
+    time: Arc<crate::action::time::TimeContract>,
     /// The action windows of every connection this worker serves.
     windows: ActionWindowIssuer,
     controller_public_key: AuthorisationKey,
@@ -273,7 +275,8 @@ impl WorkerService {
     }
 
     /// Sets up the backends an integrated invocation is given before it runs, on this session's
-    /// broker, and hands them to the session.
+    /// broker, and hands them to the session; on Unix it also starts the watch that adopts a
+    /// program those backends did not launch.
     ///
     /// Returns them, so the installation's connectors can be handed over to their sources. It must
     /// be called from inside the runtime the backends serve their endpoints on.
@@ -281,14 +284,35 @@ impl WorkerService {
         &self,
         config: crate::broker::commands::CommandBackendsConfig,
     ) -> Arc<crate::broker::commands::CommandBackends> {
-        let backends = Arc::new(crate::broker::commands::CommandBackends::new(
+        // A program the integrated route did not launch is adopted from the same connectors, by
+        // a watch of the terminal's foreground, and its adoption ends with the backends when the
+        // session closes.
+        #[cfg(unix)]
+        let adoptions = Arc::new(
+            crate::broker::adoption::Adoptions::new(
+                Arc::clone(&self.broker),
+                Arc::clone(&config.sources),
+                config.environment_id,
+            )
+            .with_views(Arc::downgrade(&self.runtime)),
+        );
+        let backends = crate::broker::commands::CommandBackends::new(
             Arc::clone(&self.broker),
             config,
             tokio::runtime::Handle::current(),
-        ));
+        )
+        .with_views(Arc::downgrade(&self.runtime));
+        #[cfg(unix)]
+        let backends = backends.with_adoptions(Arc::clone(&adoptions));
+        let backends = Arc::new(backends);
         self.runtime
             .session()
             .set_command_backends(Arc::clone(&backends));
+        #[cfg(unix)]
+        tokio::spawn(crate::broker::adoption::watch(
+            adoptions,
+            Arc::downgrade(&self.runtime),
+        ));
         backends
     }
 }
@@ -343,6 +367,7 @@ impl WorkerService {
         // accepted and the fence the writer applies before it is written have to be reading the
         // same clock for the second to be a continuation of the first.
         let shared_clock = runtime.shared_clock();
+        let time = Arc::clone(runtime.session().time());
         let journal_changes = runtime
             .session()
             .journal()
@@ -360,6 +385,7 @@ impl WorkerService {
             windows: ActionWindowIssuer::with_default_validity(Arc::clone(&clock) as Arc<_>),
             clock,
             shared_clock,
+            time,
             controller_public_key: binding.controller_public_key,
             authority: Mutex::new(Authority {
                 accepted_generation: Some(binding.controller_generation),
@@ -1127,6 +1153,19 @@ impl WorkerService {
                                 sequence += 1;
                                 outlet.write(&notification).await
                             }
+                            // An announcement about one of this session's agent instances.
+                            OutputDelivery::AgentInstance { event, .. } => {
+                                let Some(notification) = notification(
+                                    &stream_id,
+                                    sequence,
+                                    kr_protocol::projection::AGENT_INSTANCE_EVENT,
+                                    &*event,
+                                ) else {
+                                    continue;
+                                };
+                                sequence += 1;
+                                outlet.write(&notification).await
+                            }
                             OutputDelivery::EditorBusy(event) => {
                                 let Some(notification) = notification(
                                     &stream_id,
@@ -1556,9 +1595,22 @@ impl WorkerService {
             boot_identity: self.boot_identity.clone(),
             peer: peer.to_wire(),
             action_window,
-            capabilities: CanonicalSet::new(),
+            capabilities: self.stated_capabilities(),
             max_receive: kr_protocol::hello::ReceiveLimits::default(),
         }))
+    }
+
+    /// What this worker states about itself in its answer to a hello.
+    ///
+    /// The clock floor it maps, by the floor's identity, so a control daemon can tell whether this
+    /// worker decides UTC deadlines from the same floor as it does. A worker that maps none states
+    /// none.
+    fn stated_capabilities(&self) -> CanonicalSet<kr_protocol::ids::CapabilityId> {
+        self.time
+            .floor_identity()
+            .map(|identity| kr_protocol::local::utc_floor_capability(identity.as_bytes()))
+            .into_iter()
+            .collect()
     }
 
     /// Issues an action window for one authenticated connection.
@@ -2770,18 +2822,11 @@ impl WorkerService {
     /// answered by then leaves an outcome nobody can establish, which section 9 records as unknown
     /// rather than as a refusal the caller would read as "nothing happened".
     async fn finish_upstream(&self, pending: PendingUpstream) -> ControlFrame {
-        let carried = tokio::time::timeout(UPSTREAM_SUBMIT_DEADLINE, pending.handoff.carry()).await;
-        let outcome = carried.unwrap_or_else(|_| {
-            Err(WorkerError::Broker(
-                crate::broker::BrokerError::UpstreamUnavailable {
-                    detail: format!(
-                        "the upstream did not answer within {} seconds, so whether the operation \
-                         reached it cannot be established",
-                        UPSTREAM_SUBMIT_DEADLINE.as_secs()
-                    ),
-                },
-            ))
-        });
+        // Everything the broker settles happens on this task, and the resource an answer resolves
+        // is settled before the receipt is recorded and before the caller hears: at the deadline,
+        // what `carry` was waiting for is dropped here, and an answer's claim goes with it.
+        let deadline = tokio::time::Instant::now() + UPSTREAM_SUBMIT_DEADLINE;
+        let outcome = pending.handoff.carry(deadline).await;
         self.settle_upstream(&pending.actor_id, pending.action_id, outcome.as_ref());
         match outcome {
             Ok(value) => ControlFrame::Response(Response {
@@ -4103,6 +4148,32 @@ impl WorkerService {
                     &params.plugin_id,
                     params.target.subject.application_instance_id,
                 )?;
+                let registered = self.broker.registered_action(binding_id, &params.action)?;
+                // The rights this call intersects are the action's own: the ones its declared
+                // class needs. A caller acting under a grant holds them, or the call is refused
+                // here, before the marker. An action nobody registered is refused below for that.
+                if let Some(registered) = registered.as_ref() {
+                    Self::check_action_rights(caller, &params.action, &registered.rights)?;
+                }
+                // An action that answers a pending request through the connector table's decision
+                // destination is admitted as that answer: the transaction an approval answer
+                // makes, with the action's own checks inside it, and no component involved.
+                let answers = registered.is_some_and(|registered| registered.decision.is_some());
+                if answers {
+                    self.wait_before_admission();
+                    let admitted = self.broker.admit_plugin_answer(
+                        &Self::broker_caller(caller),
+                        binding_id,
+                        &params,
+                        kr_ipc::now_ms(),
+                    )?;
+                    return Ok(Some(self.handoff(
+                        admitted,
+                        UpstreamKind::PluginAnswer {
+                            action: params.action,
+                        },
+                    )));
+                }
                 self.broker.check_invocable(
                     &Self::broker_caller(caller),
                     binding_id,
@@ -4422,17 +4493,22 @@ impl WorkerService {
 
     /// What a subscription answer costs before a single resource is in it.
     ///
-    /// Every part of it that varies is measured at its widest - the cursors, the gap this
-    /// subscription may have to report, and the recovery's own counters and continuation - because
-    /// none of them is known until the session has been read, and a page cut against a narrower
-    /// measurement would be cut too generously.
-    fn subscription_answer_bytes(state: &ConnectionState) -> usize {
+    /// The session's agent instances are measured as they are, read under the lock that starts
+    /// the subscription's queue. Every other part that varies is measured at its widest - the
+    /// cursors, the gap this subscription may have to report, and the recovery's own counters and
+    /// continuation - because none of them is known until the session has been read further, and
+    /// a page cut against a narrower measurement would be cut too generously.
+    fn subscription_answer_bytes(
+        state: &ConnectionState,
+        agent_instances: &kr_protocol::projection::AgentInstanceList,
+    ) -> usize {
         Self::answer_bytes(&EventsSubscribeResult {
             stream_id: state.stream_id.clone(),
             from_cursor: U64::new(u64::MAX),
             oldest_retained_cursor: U64::new(u64::MAX),
             gap: Nullable::some(Self::widest_gap()),
             agent_resources: Self::no_resources(),
+            agent_instances: agent_instances.clone(),
         })
     }
 
@@ -4556,15 +4632,21 @@ impl WorkerService {
     ) -> Result<ParamsValue> {
         let params: EventsSubscribeParams = parse(params)?;
         Self::check_attachment(state, params.attachment_id)?;
+        let mut session = self.runtime.session();
+        Self::check_session(&session, params.session_id)?;
+        // The session's agent instances, read under the lock that starts the queue below. The
+        // session announces under this lock too, so an announcement is either in this list or
+        // among the events that follow it, and the list's sequence says which.
+        let agent_instances = session.agent_instances();
         // Before anything of this connection changes. A subscription replaces the stream the
         // attachment was being served through, and a refusal after that would leave a client with
         // neither the stream it had nor the one it asked for. What decides the refusal is this
-        // peer's own frame against the answer's fixed parts and the room one resource needs, and
-        // none of that depends on the session, so it is settled first and settled once: a
-        // connection whose subscription is answered is never refused a later one.
-        let bounds = Self::recovery_bounds(state, Self::subscription_answer_bytes(state))?;
-        let mut session = self.runtime.session();
-        Self::check_session(&session, params.session_id)?;
+        // peer's own frame against the answer's fixed parts, this session's instances and the room
+        // one resource needs.
+        let bounds = Self::recovery_bounds(
+            state,
+            Self::subscription_answer_bytes(state, &agent_instances),
+        )?;
         let from = params
             .from_cursor
             .as_ref()
@@ -4605,6 +4687,7 @@ impl WorkerService {
             oldest_retained_cursor: U64::new(oldest),
             gap: Nullable(gap),
             agent_resources: Self::agent_resource_snapshot(agent_resources),
+            agent_instances,
         };
         // Before the subscription is this connection's. A refused answer must leave the client
         // reading what it was reading before it asked: a stream started for an answer that was
@@ -4781,6 +4864,40 @@ impl WorkerService {
     }
 
     /// Returns the broker caller for one verified actor.
+    /// Refuses a plugin action whose declared class needs a right the caller's grant does not
+    /// carry.
+    ///
+    /// The one caller not held to a grant is the local owner, on this worker's own socket and
+    /// naming no grant: its peer credentials proved it is this user, as they do for an
+    /// attachment's capabilities. Every other caller holds exactly the rights its grant was
+    /// checked against, a caller that reached the host some other way and named no grant
+    /// included, which then holds none.
+    fn check_action_rights(
+        caller: &Caller,
+        action: &kr_protocol::broker::ActionName,
+        rights: &CanonicalSet<kr_protocol::rights::ActionRight>,
+    ) -> Result<()> {
+        if caller.ingress == ActorIngress::LocalIpc && !caller.grant_id.is_present() {
+            return Ok(());
+        }
+        let missing: Vec<&str> = rights
+            .iter()
+            .filter(|right| !caller.grant_rights.contains(right))
+            .map(|right| right.as_str())
+            .collect();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(WorkerError::PermissionDenied {
+                detail: format!(
+                    "{action} needs {}, which the grant this call was admitted under does not \
+                     carry",
+                    missing.join(" and ")
+                ),
+            })
+        }
+    }
+
     fn broker_caller(caller: &Caller) -> crate::broker::Caller {
         crate::broker::Caller {
             actor_id: caller.actor_id.clone(),
@@ -5236,10 +5353,17 @@ impl WorkerService {
                 ))
             }
             Method::PluginActionInvoke => {
+                // An answer through the connector table's decision destination was admitted
+                // before the marker, and its admission leaves this boundary as an approval
+                // answer's does. Every other action was refused before the marker, so only a
+                // component's prepared effect, which does not reach this broker, meets the refusal.
+                if let Some(handoff) = prepared {
+                    return Ok((
+                        ParamsValue::empty(),
+                        AfterEffect::Upstream(Box::new(handoff)),
+                    ));
+                }
                 let params: kr_protocol::agent::PluginActionInvokeParams = parse(params)?;
-                // The refusal above is decided before the marker, so nothing reaches this arm.
-                // It stays as the one place that would carry the invocation once the component's
-                // prepared effect reaches this broker.
                 Err(crate::broker::BrokerError::UnsupportedCapability {
                     detail: format!(
                         "{} has no prepared effect this broker validated",
@@ -6409,13 +6533,19 @@ pub struct PendingUpstream {
 /// hope: an upstream that has not answered by now leaves the outcome unknown, which is what it is.
 pub const UPSTREAM_SUBMIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Which of the broker's three recordings one admitted operation ends in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Which of the broker's recordings one admitted operation ends in.
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum UpstreamKind {
     /// A prompt, a steer or a cancellation.
     Mutation,
     /// An approval answer, which also resolves its pending resource.
     Approval,
+    /// A package's action that answers a pending request through the connector table's decision
+    /// destination: carried as an approval answer, and reported as the action that ran.
+    PluginAnswer {
+        /// The action.
+        action: kr_protocol::broker::ActionName,
+    },
 }
 
 /// One admitted operation, waiting for the session boundary to end before it is transmitted.
@@ -6435,26 +6565,113 @@ impl UpstreamHandoff {
         self.broker.abandon(&self.admitted);
     }
 
-    /// Carries the admitted operation to its upstream and encodes what the upstream did.
+    /// Carries the admitted operation to its upstream and encodes what the upstream did, or stops
+    /// waiting at `deadline`.
     ///
     /// Nothing of this worker's is held while this runs. The admission already carries everything
     /// the broker checked and the transport it checked against, so the transmission needs no lock
     /// of its own. What is awaited is the transport's own account of the operation: the bytes
     /// reaching the socket, and then, for a request, the upstream's own answer. A receipt says
     /// `applied` for this and for nothing earlier.
-    async fn carry(self) -> Result<ParamsValue> {
+    ///
+    /// The broker's own steps (the permit, the marker and an answer's settlement) happen on this
+    /// task. Only the transport's call that takes the operation runs on a thread of its own, since
+    /// a transport can block there and on this task the deadline could never fire. At the
+    /// deadline this stops waiting for that call or for the upstream, and an answer's claim, which
+    /// never left this task, leaves its resource uncertain before this returns; whatever the
+    /// transport does afterwards settles nothing.
+    async fn carry(self, deadline: tokio::time::Instant) -> Result<ParamsValue> {
         let now = kr_ipc::now_ms();
         match self.kind {
             UpstreamKind::Mutation => {
-                let flight = self.broker.dispatch_mutation(&self.admitted, now)?;
-                encode(&flight.settled().await?)
+                let taken = self.broker.take_mutation(&self.admitted)?;
+                let pending = submit_within(taken.transmission(), deadline).await?;
+                let flight = taken.submitted(pending);
+                encode(&within(deadline, flight.settled()).await??)
             }
             UpstreamKind::Approval => {
-                let flight = self.broker.record_approval(&self.admitted, now)?;
-                encode(&flight.settled(now).await?)
+                let answered = answer_within(&self.broker, &self.admitted, now, deadline).await?;
+                encode(&answered)
+            }
+            UpstreamKind::PluginAnswer { action } => {
+                let answered = answer_within(&self.broker, &self.admitted, now, deadline).await?;
+                encode(&kr_protocol::agent::PluginActionInvokeResult {
+                    mutation: answered.mutation,
+                    action,
+                })
             }
         }
     }
+}
+
+/// Carries one admitted answer to its upstream, settling its resource with what the transport
+/// says, or as uncertain when `deadline` passes first.
+async fn answer_within(
+    broker: &crate::broker::Broker,
+    admitted: &crate::broker::MutationAdmission,
+    now: kr_protocol::scalars::TimestampMs,
+    deadline: tokio::time::Instant,
+) -> Result<kr_protocol::agent::AgentApprovalRespondResult> {
+    let marked = broker.mark_approval(admitted, now)?;
+    // On a refusal or at the deadline `marked` is dropped here, which leaves the resource
+    // uncertain before the caller is told anything.
+    let pending = match submit_within(marked.transmission(), deadline).await {
+        Ok(pending) => pending,
+        Err(error) => {
+            drop(marked);
+            return Err(error);
+        }
+    };
+    let flight = marked.submitted(pending);
+    // At the deadline the answer in flight is dropped with the timeout, which settles it the
+    // same way.
+    Ok(within(deadline, flight.settled(now)).await??)
+}
+
+/// Makes the transport's own call that takes an operation on a thread of its own, and waits for
+/// it until `deadline`.
+///
+/// A transport that blocks there holds that thread and nothing else. What it returns after the
+/// deadline is dropped: the call's outcome is no longer anybody's to report.
+async fn submit_within(
+    (dispatch, request): (
+        Arc<dyn crate::broker::UpstreamDispatch>,
+        crate::broker::UpstreamRequest,
+    ),
+    deadline: tokio::time::Instant,
+) -> Result<crate::broker::PendingTransmission> {
+    let submitting = tokio::task::spawn_blocking(move || dispatch.submit(&request));
+    match tokio::time::timeout_at(deadline, submitting).await {
+        Ok(Ok(submitted)) => Ok(submitted?),
+        Ok(Err(_)) => Err(WorkerError::Broker(
+            crate::broker::BrokerError::UpstreamUnavailable {
+                detail: "the transport's call ended without saying whether it took the operation"
+                    .to_owned(),
+            },
+        )),
+        Err(_) => Err(unanswered()),
+    }
+}
+
+/// Waits for `waited` until `deadline`, and says the upstream did not answer when it passes.
+async fn within<T>(
+    deadline: tokio::time::Instant,
+    waited: impl core::future::Future<Output = T>,
+) -> Result<T> {
+    tokio::time::timeout_at(deadline, waited)
+        .await
+        .map_err(|_| unanswered())
+}
+
+/// The failure an operation meets when its upstream does not answer within this worker's bound.
+fn unanswered() -> WorkerError {
+    WorkerError::Broker(crate::broker::BrokerError::UpstreamUnavailable {
+        detail: format!(
+            "the upstream did not answer within {} seconds, so whether the operation reached it \
+             cannot be established",
+            UPSTREAM_SUBMIT_DEADLINE.as_secs()
+        ),
+    })
 }
 
 /// What a mutation left for the caller to do once the session boundary is over.

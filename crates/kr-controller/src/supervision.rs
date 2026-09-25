@@ -53,6 +53,8 @@ use kr_shell_integration::host::terminal::{self, Selection, TerminalUnavailable}
 
 use crate::error::{ControllerError, Result};
 
+pub mod windows;
+
 /// What a worker needs to be told through its job definition.
 ///
 /// Every field here is non-secret. The shell, the creator's environment and the controller's
@@ -371,6 +373,12 @@ pub fn detect() -> Box<dyn WorkerSupervisor> {
             return Box::new(SystemdSupervisor::new());
         }
     }
+    // On Windows this is still the daemon's own start, a breakaway from its job, which cannot
+    // leave a job above that forbids breakaway. It stays until the daemon's session creation runs
+    // the synchronous start on a blocking thread and a replacement daemon in another login
+    // session is refused; then Windows returns `windows::TaskSupervisor`, whose starter creates
+    // every worker outside the daemon's jobs, and the breakaway start, `worker_must_break_away`
+    // and its unit test are deleted.
     Box::new(DetachedSupervisor::new())
 }
 
@@ -700,11 +708,11 @@ enum JobState {
 
 /// How long one command put to a service manager is given to answer: a question, a removal, a
 /// load or a start.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 const SERVICE_MANAGER_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How long a command that did not answer is given to be collected once it has been ended.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 const COLLECT_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Runs `launchctl` within [`SERVICE_MANAGER_BOUND`], and returns its answer or why there was none.
@@ -726,7 +734,7 @@ fn launchctl_within(arguments: &[&str]) -> std::result::Result<std::process::Out
 ///
 /// A command that could not be started at all is [`RunFailure::NotRun`]; every failure after it
 /// started is [`RunFailure::Failed`], because it may have reached the service manager first.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn command_within(
     program: &str,
     arguments: &[&str],
@@ -794,7 +802,7 @@ fn command_within(
 /// Ends a command this process started and has not collected, and collects it within
 /// [`COLLECT_BOUND`]. Returns `detail` with whatever of that failed added to it, and whether the
 /// command was collected.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn end_and_collect(child: &mut std::process::Child, mut detail: String) -> (String, bool) {
     if let Err(error) = child.kill() {
         detail.push_str(&format!("; ending it failed: {error}"));
@@ -821,7 +829,7 @@ fn end_and_collect(child: &mut std::process::Child, mut detail: String) -> (Stri
 }
 
 /// Reads a pipe to its end on a thread of its own, or says why no thread could be made for it.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn read_to_the_end_aside(
     mut pipe: impl std::io::Read + Send + 'static,
 ) -> std::io::Result<std::thread::JoinHandle<Vec<u8>>> {
@@ -1097,6 +1105,9 @@ fn detached_command(
     Ok(child.id())
 }
 
+/// The Windows start of a detached worker, which asks to break away from the daemon's job.
+///
+/// Deleted once `detect()` returns the task supervisor on Windows; the condition is written there.
 #[cfg(not(unix))]
 fn detached_command(
     program: &Path,
@@ -1106,15 +1117,27 @@ fn detached_command(
 ) -> Result<u32> {
     use std::os::windows::process::CommandExt as _;
 
-    // A worker must outlive this daemon. A process started by a daemon that is itself inside a
-    // job object with kill-on-close would be killed with it, so the worker breaks away from that
-    // job and is given its own console-free process group.
     const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
 
+    // A worker must outlive this daemon. Section 7 asks for it to be independent of the daemon's
+    // kill-on-close job, not to break away from every job it might be in: where the daemon runs in
+    // no job, or in a job that does not kill its members when it closes, the worker already outlives
+    // the daemon and no breakaway is needed or asked for. Breakaway is asked for only when the
+    // daemon's own job would kill the worker on close, and that is also the one case where a job
+    // that forbids breakaway turns the start into the named failure below.
+    let job_flags = kr_ipc::paths::current_job_limit_flags().map_err(|error| {
+        ControllerError::supervision(format!("read this process's job: {error}"))
+    })?;
+    let break_away = worker_must_break_away(job_flags);
+    let mut flags = CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS;
+    if break_away {
+        flags |= CREATE_BREAKAWAY_FROM_JOB;
+    }
+
     let mut command = std::process::Command::new(program);
-    command.creation_flags(CREATE_BREAKAWAY_FROM_JOB | CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+    command.creation_flags(flags);
     command.args(arguments);
     // Never the daemon's own directory, for the same reason as on Unix: a current directory is a
     // handle on a volume, and this process outlives the one that started it.
@@ -1125,9 +1148,59 @@ fn detached_command(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     let child = command.spawn().map_err(|error| {
+        // A start that asked to break away is refused with access denied when the daemon's
+        // kill-on-close job does not permit breakaway, such as the one a test runner or
+        // `cargo test` places its processes in. A worker must outlive the daemon, so it cannot join
+        // that job; naming the cause and the setup, rather than the bare "access is denied", is what
+        // a person can act on. The start fails here at once and never waits.
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        if break_away && error.raw_os_error() == Some(ERROR_ACCESS_DENIED) {
+            return ControllerError::supervision(format!(
+                "could not start a worker as a process independent of this daemon: this daemon runs \
+                 inside a job object that kills its members when it closes and does not permit \
+                 breakaway, so a worker started here would be killed with the daemon and cannot be \
+                 made to outlive it. Run the control daemon outside such a job, through its per-user \
+                 service, so a worker can start as an independent process ({})",
+                program.display()
+            ));
+        }
         ControllerError::supervision(format!("start {}: {error}", program.display()))
     })?;
     Ok(child.id())
+}
+
+/// Whether a Windows worker this daemon starts must be created outside the daemon's job.
+///
+/// A worker outlives the daemon, so it must not be a member of a job that kills its members when the
+/// daemon closes. `job_flags` is the daemon's own job's limit flags, or `None` when it runs in no
+/// job. Breakaway is asked for when the job kills on close, and also when the job permits breakaway
+/// even without kill-on-close: breaking away out of a permitting job is free and takes the worker out
+/// of the jobs it can leave, which protects it when an outer job kills on close while an inner one
+/// permits breakaway. It does not leave the whole hierarchy in every case: breakaway stops at the
+/// first ancestor that forbids it, the limit stated below. With no job, or a job that neither kills
+/// on close nor permits breakaway (a runner's plain job), no breakaway is asked for: the worker
+/// either already outlives the daemon or could not break away in any case, and asking would be
+/// refused.
+///
+/// The reading is of the immediate job only; the operating system does not report an ancestor job's
+/// flags through this query, and breakaway stops at the first ancestor that forbids it rather than
+/// leaving the whole hierarchy. So where an ancestor forbids breakaway while some ancestor kills on
+/// close, no decision made here can make the worker independent: the start may succeed and the worker
+/// still die when that ancestor closes, and neither the ancestor's flags nor the fact of it is
+/// visible to this query. Making a worker independent of the daemon's job in every such hierarchy is
+/// not a thing breakaway can do; it is what the per-user service supervisor of section 7 is for, and
+/// it is a task of its own. This decision does the most breakaway can: it asks to break away whenever
+/// the immediate job kills on close or permits it.
+#[cfg(not(unix))]
+#[must_use]
+fn worker_must_break_away(job_flags: Option<u32>) -> bool {
+    // `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, `_BREAKAWAY_OK` and `_SILENT_BREAKAWAY_OK`.
+    const KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+    const BREAKAWAY_OK: u32 = 0x0000_0800;
+    const SILENT_BREAKAWAY_OK: u32 = 0x0000_1000;
+    job_flags.is_some_and(|flags| {
+        flags & KILL_ON_JOB_CLOSE != 0 || flags & (BREAKAWAY_OK | SILENT_BREAKAWAY_OK) != 0
+    })
 }
 
 /// How long the launcher's reported process is given to become readable.
@@ -1176,23 +1249,25 @@ pub fn identity_when_available(pid: u32) -> Result<ProcessStartIdentity> {
 
 /// Why a launcher command did not produce an answer.
 ///
-/// Only the service managers use this, and only two platforms have one.
+/// Only the service managers use this: launchd, systemd and the Task Scheduler.
 ///
 /// The two are not the same. A command that never ran started nothing. A command that ran and
 /// failed part way through may have reached the service manager first, and treating that as
 /// "nothing started" would free a slot something may still be occupying.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[derive(Clone, Debug)]
-enum RunFailure {
+pub enum RunFailure {
     /// The command could not be started at all.
     NotRun(String),
     /// The command ran and reported a failure.
     Failed(String),
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 impl RunFailure {
-    fn detail(&self) -> String {
+    /// What went wrong, in words.
+    #[must_use]
+    pub fn detail(&self) -> String {
         match self {
             Self::NotRun(detail) | Self::Failed(detail) => detail.clone(),
         }
@@ -1308,6 +1383,36 @@ impl TerminalPresenter for NoTerminal {
 mod tests {
     use super::*;
     use kr_protocol::scalars::Uuid;
+
+    /// A Windows worker breaks away from the daemon's job only when that job would kill it when the
+    /// daemon closes. The four contexts measured on real machines, each by the limit flags its job
+    /// carries, with the outcome the start then has.
+    #[cfg(not(unix))]
+    #[test]
+    fn a_worker_breaks_away_from_a_kill_on_close_or_a_breakaway_permitting_job() {
+        const KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+        const BREAKAWAY_OK: u32 = 0x0000_0800;
+
+        // A scheduled task, as `win-run.sh` starts one: no job, so the worker already outlives the
+        // daemon and the start is an ordinary create.
+        assert!(!worker_must_break_away(None));
+        // A hosted continuous-integration runner: a job with no kill-on-close and no breakaway
+        // (flags 0x0), so the worker outlives the daemon and the start is an ordinary create; asking
+        // to break away there would only be refused.
+        assert!(!worker_must_break_away(Some(0)));
+        // An interactive or SSH logon: a job that kills on close but permits breakaway, so the start
+        // asks to break away and is admitted.
+        assert!(worker_must_break_away(Some(
+            KILL_ON_JOB_CLOSE | BREAKAWAY_OK
+        )));
+        // `cargo test`: a job that kills on close and forbids breakaway, so the start asks to break
+        // away and is refused, which the daemon reports as its named failure.
+        assert!(worker_must_break_away(Some(KILL_ON_JOB_CLOSE)));
+        // A permitting job that does not itself kill on close, such as the inner of a nested pair
+        // whose outer kills on close: the start still breaks away, which takes the worker out of the
+        // whole hierarchy rather than leaving it for the outer job to kill.
+        assert!(worker_must_break_away(Some(BREAKAWAY_OK)));
+    }
 
     fn launch() -> WorkerLaunch {
         WorkerLaunch {

@@ -1094,6 +1094,61 @@ async fn an_answer_that_leaves_out_its_recovery_is_not_one_this_client_reads() {
     );
 }
 
+/// KR-REQ-04.19 and KR-REQ-20.13: a success whose `data` names its recovery twice is not an
+/// answer this client reads. A reader that kept the last would place the write in the history a
+/// restore began, one that kept the first in no history at all, and neither is the answer the
+/// service gave once. So it is an unknown outcome, as any answer this client cannot read is.
+#[tokio::test]
+async fn a_success_that_names_its_recovery_twice_is_not_one_this_client_reads() {
+    let (client, recorder) = sync_client();
+    let object = identity(7);
+    let request = identity(8);
+    let bytes = published(&sealed(b"theme=dark"));
+    let now = now_ms();
+    let restored = put_back_by(0xb0);
+    let answer = serde_json::to_string(&serde_json::json!({
+        "ok": true,
+        "data": exchanged(
+            "written",
+            summary(object, revision(9), "4"),
+            Some(revision(9)),
+            "4",
+            serde_json::Value::Null,
+        ),
+    }))
+    .expect("an answer");
+    let answered = |recovery: &str| ServiceHttpAnswer {
+        status: 200,
+        body: answer
+            .replacen(r#""recovery_id":null"#, recovery, 1)
+            .into_bytes(),
+    };
+
+    recorder.answering_with(vec![answered(&format!(
+        r#""recovery_id":null,"recovery_id":"{restored}""#
+    ))]);
+    assert_eq!(
+        client
+            .compare_exchange(&settings_of(object), request, now, None, &bytes)
+            .await
+            .expect_err("a recovery named twice")
+            .code(),
+        ErrorCode::OutcomeUnknown
+    );
+
+    // The control: the same answer naming it once is read as the service stated it.
+    recorder.answering_with(vec![answered(&format!(r#""recovery_id":"{restored}""#))]);
+    assert_eq!(
+        client
+            .compare_exchange(&settings_of(object), request, now, None, &bytes)
+            .await
+            .expect("applied"),
+        SyncExchanged::Applied {
+            position: SyncPosition::at(4, revision(9), Some(restored)),
+        }
+    );
+}
+
 #[tokio::test]
 async fn a_fence_answered_unknown_is_an_error_rather_than_an_answer_invented_here() {
     // A fence finds an outcome or makes one, so "unknown" is never its answer, and the client has
@@ -2084,5 +2139,7 @@ fn a_rendering_of_a_request_an_object_or_a_copy_carries_nothing_sealed() {
     }
 }
 
+/// The recovery bundle at its locator, against the contract a real service keeps for it.
+mod bundle;
 /// The calls about collections two or more devices share.
 mod shared;

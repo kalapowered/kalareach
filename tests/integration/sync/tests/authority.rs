@@ -45,7 +45,9 @@ use kr_protocol::pairing::{
     RevocationRequest, RevocationTarget,
 };
 use kr_protocol::scalars::{AuthorisationKey, Bytes, CanonicalSet, KeyId, Nullable, TimestampMs};
-use kr_sync_integration::{Deployment, RunKey, SilentService, fresh_uuid, now_ms, proved};
+use kr_sync_integration::{
+    Deployment, RunKey, SilentService, authority_feed_left, fresh_uuid, now_ms, proved,
+};
 
 /// One run's feed: a host that owns it, and a remote owner that publishes to it.
 ///
@@ -272,6 +274,9 @@ impl Feed {
 /// way, and the failure is raised again afterwards. A leg that panicked without doing both would
 /// leave an outstanding record on the deployment for ever, because the only keys that could reach
 /// them are the ones this run discards.
+///
+/// What the cleanup could not finish is named the same way on both paths, one line for each part,
+/// in the words the deployment checkpoint reads, before the leg passes or fails.
 async fn leg<Body, Work>(body: Body)
 where
     Body: FnOnce(Arc<Feed>) -> Work + Send + 'static,
@@ -285,28 +290,21 @@ where
     // full as well.
     let removed = feed.remove_host().await;
     let emptied = feed.empty_mailbox().await;
+    let left = authority_feed_left(&removed, &emptied);
+    for line in &left {
+        eprintln!("{line}");
+    }
 
     match outcome {
         Ok(what) => {
-            let state = removed.expect("the host removes itself");
-            assert!(state.summary.removed, "the feed reports the host removed");
-            assert_eq!(
-                state.summary.outstanding.get(),
-                0,
-                "a removal ends the retention of what the host had not applied"
+            assert!(
+                left.is_empty(),
+                "the leg passed and its cleanup did not finish: {} part(s), each named above",
+                left.len()
             );
-            emptied.expect("the host acknowledges any announcement this leg placed");
             proved("authority feed", &feed.deployment, &what);
         }
-        Err(failed) => {
-            if let Err(error) = removed {
-                eprintln!("this leg could not give back what it took: {error}");
-            }
-            if let Err(what) = emptied {
-                eprintln!("this leg could not give back what it took: {what}");
-            }
-            std::panic::resume_unwind(failed.into_panic());
-        }
+        Err(failed) => std::panic::resume_unwind(failed.into_panic()),
     }
 }
 

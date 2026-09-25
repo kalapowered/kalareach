@@ -591,6 +591,99 @@ impl Drop for AnswerInFlight<'_> {
     }
 }
 
+/// One admitted answer whose dispatch marker is committed and whose bytes the transport has not
+/// taken yet.
+///
+/// It holds the claim, so it is the settlement authority from the marker on. The transport's own
+/// call is made with [`MarkedAnswer::transmission`], wherever the caller chooses, and its result
+/// comes back through [`MarkedAnswer::submitted`] or [`MarkedAnswer::refused`].
+///
+/// Dropping one leaves the resource **uncertain**, as dropping an [`AnswerInFlight`] does: the
+/// marker says the answer may have gone, and a caller that stops waiting for the transport cannot
+/// establish that it did not.
+#[derive(Debug)]
+pub struct MarkedAnswer<'a> {
+    broker: &'a Broker,
+    claim: Option<Claim>,
+    dispatch: std::sync::Arc<dyn UpstreamDispatch>,
+    request: UpstreamRequest,
+    binding_revision: AgentBindingRevision,
+    upstream_request_id: kr_protocol::ids::UpstreamRequestId,
+    resource_id: kr_protocol::ids::PendingResourceId,
+}
+
+impl<'a> MarkedAnswer<'a> {
+    /// Returns what the transport is handed: the transport chosen at admission and the exact
+    /// request. Neither is authority: the claim stays here.
+    #[must_use]
+    pub fn transmission(&self) -> (std::sync::Arc<dyn UpstreamDispatch>, UpstreamRequest) {
+        (std::sync::Arc::clone(&self.dispatch), self.request.clone())
+    }
+
+    /// The transport took the answer: the claim goes with it to the wait for what it says.
+    #[must_use]
+    pub fn submitted(mut self, pending: PendingTransmission) -> AnswerInFlight<'a> {
+        AnswerInFlight {
+            broker: self.broker,
+            claim: self.claim.take(),
+            pending: Some(pending),
+            binding_revision: self.binding_revision,
+            upstream_request_id: self.upstream_request_id.clone(),
+            resource_id: self.resource_id,
+        }
+    }
+
+    /// The transport refused the answer after its marker: the resource is left uncertain, and the
+    /// refusal is returned for the caller to report.
+    #[must_use]
+    pub fn refused(self, error: BrokerError) -> BrokerError {
+        drop(self);
+        error
+    }
+}
+
+impl Drop for MarkedAnswer<'_> {
+    fn drop(&mut self) {
+        let Some(claim) = self.claim.take() else {
+            return;
+        };
+        // The marker is committed and nothing says what became of the bytes, so nothing can
+        // establish that the answer did not go. The time is now, because that is when this host
+        // stopped waiting.
+        crate::broker::settled(self.broker.uncertain(&claim, kr_ipc::now_ms()));
+    }
+}
+
+/// One admitted mutation whose permit is taken and whose bytes the transport has not taken yet.
+///
+/// A mutation settles no resource, so nothing is owed when one is dropped: its receipt is the
+/// caller's to record.
+#[derive(Debug)]
+pub struct TakenMutation {
+    dispatch: std::sync::Arc<dyn UpstreamDispatch>,
+    request: UpstreamRequest,
+    binding_revision: AgentBindingRevision,
+    turn_id: Option<kr_protocol::ids::AgentTurnId>,
+}
+
+impl TakenMutation {
+    /// Returns what the transport is handed: the transport chosen at admission and the request.
+    #[must_use]
+    pub fn transmission(&self) -> (std::sync::Arc<dyn UpstreamDispatch>, UpstreamRequest) {
+        (std::sync::Arc::clone(&self.dispatch), self.request.clone())
+    }
+
+    /// The transport took the mutation: what follows is the wait for what the upstream did.
+    #[must_use]
+    pub fn submitted(self, pending: PendingTransmission) -> MutationInFlight {
+        MutationInFlight {
+            pending,
+            binding_revision: self.binding_revision,
+            turn_id: self.turn_id,
+        }
+    }
+}
+
 /// One admitted mutation whose bytes are on their way to the upstream.
 #[derive(Debug)]
 pub struct MutationInFlight {
@@ -662,11 +755,121 @@ pub struct RegisteredAction {
     pub capability: Option<CapabilityId>,
     /// True when the action acts on a draft, so a draft must be named.
     pub needs_draft: bool,
-    /// The operation the manifest declares this action performs.
+    /// The operation the manifest declares this action performs, for an action a component
+    /// prepares.
     ///
     /// An effect plan is compared with it, so a component cannot prepare one operation under an
-    /// action declared for another.
-    pub operation: kr_protocol::broker::PreparedOperation,
+    /// action declared for another. An answer has none: no component prepares it.
+    pub operation: Option<kr_protocol::broker::PreparedOperation>,
+    /// The parameter an answer carries its decision in, for an action that answers a pending
+    /// request through the connector table's decision destination.
+    ///
+    /// Such an action is admitted as an answer to the resource the invocation names, and nothing
+    /// else about it reaches a component.
+    pub decision: Option<kr_plugin_sdk::ids::ParameterName>,
+    /// The rights a caller acting under a grant must hold to invoke it: the ones the package
+    /// contract names for its declared class, whatever the action is called.
+    pub rights: kr_protocol::scalars::CanonicalSet<kr_protocol::rights::ActionRight>,
+}
+
+impl RegisteredAction {
+    /// Registers one action the way its package declared it.
+    ///
+    /// The grant, the capability, whether it writes, the operation, the decision parameter and the
+    /// rights a caller needs all follow from the declaration's effect class and implementation,
+    /// so the installation and this host's tests register an action one way. An answer through
+    /// the decision destination holds the approval interpreter grant and the approval
+    /// capability, and carries its decision in the parameter the declaration names.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::InvalidArgument`] for a declaration this host does not register as
+    /// an invocable action: decoding, which is a grant and not an action; terminal input, which
+    /// is the input lease's and no plugin grant's; and an answer a component would prepare, which
+    /// this host does not carry.
+    pub fn from_declaration(
+        declaration: &kr_plugin_sdk::effect::ActionDeclaration,
+    ) -> Result<Self> {
+        use kr_plugin_sdk::effect::{ActionImplementation, EffectClass as Declared};
+        use kr_protocol::broker::PreparedOperation;
+        let name = ActionName::new(declaration.id.as_str())
+            .map_err(|error| BrokerError::invalid(format!("action name: {error}")))?;
+        let capability = |name: &str| {
+            CapabilityId::new(name)
+                .map(Some)
+                .map_err(|error| BrokerError::invalid(format!("capability name: {error}")))
+        };
+        let (grant, effect, capability, operation, decision) = match declaration.effect {
+            Declared::Observe => (
+                BrokerGrant::Observation,
+                EffectClass::Read,
+                None,
+                None,
+                None,
+            ),
+            Declared::UpstreamPrompt => (
+                BrokerGrant::UpstreamAction,
+                EffectClass::Write,
+                capability("agent.prompt")?,
+                Some(PreparedOperation::UpstreamSubmit),
+                None,
+            ),
+            Declared::UpstreamCancel => (
+                BrokerGrant::UpstreamAction,
+                EffectClass::Write,
+                capability("agent.cancel")?,
+                Some(PreparedOperation::UpstreamCancel),
+                None,
+            ),
+            Declared::UpstreamAttachment => (
+                BrokerGrant::UpstreamAction,
+                EffectClass::Write,
+                capability("agent.prompt")?,
+                Some(PreparedOperation::UpstreamAttachment),
+                None,
+            ),
+            Declared::ApprovalRespond => {
+                let ActionImplementation::DecisionDestination { decision } =
+                    &declaration.implementation
+                else {
+                    return Err(BrokerError::invalid(format!(
+                        "{name} answers an approval with a component's plan, and this host \
+                         carries an answer only through the connector table's decision \
+                         destination"
+                    )));
+                };
+                (
+                    BrokerGrant::ApprovalInterpreter,
+                    EffectClass::Write,
+                    capability("agent.approval")?,
+                    None,
+                    Some(decision.clone()),
+                )
+            }
+            Declared::ApprovalDecode => {
+                return Err(BrokerError::invalid(format!(
+                    "{name} declares decoding, which is a grant a binding holds and not an \
+                     action anybody invokes"
+                )));
+            }
+            Declared::TerminalInput => {
+                return Err(BrokerError::invalid(format!(
+                    "{name} writes into the terminal, which is the input lease's to allow and no \
+                     plugin grant's"
+                )));
+            }
+        };
+        Ok(Self {
+            name,
+            grant,
+            effect,
+            capability,
+            needs_draft: operation == Some(PreparedOperation::UpstreamAttachment),
+            operation,
+            decision,
+            rights: declaration.required_rights(),
+        })
+    }
 }
 
 /// What a caller presents for an agent mutation.
@@ -935,98 +1138,8 @@ impl Broker {
         params: &AgentApprovalRespondParams,
         now: TimestampMs,
     ) -> Result<MutationAdmission> {
-        let _ = caller;
         let mut state = self.state();
-        let resource = state.pending_resource(params.resource_id)?.resource.clone();
-        if resource.application_instance_id != params.target.subject.application_instance_id {
-            return Err(BrokerError::denied(format!(
-                "{} belongs to another application instance",
-                params.resource_id
-            )));
-        }
-        // One resolution per pending resource. A resource that has already reached an answer, been
-        // cancelled or been left uncertain is not answerable again, and saying so here is what
-        // keeps the claim from being the thing that discovers it.
-        if resource.state != PendingState::Pending {
-            return Err(BrokerError::Arbitration(
-                kr_protocol::gateway::ArbitrationError::AlreadyResolved {
-                    state: resource.state,
-                },
-            ));
-        }
-        if let Some(deadline) = resource.deadline_ms.as_ref()
-            && deadline.get() <= now.get()
-        {
-            return Err(BrokerError::PreconditionFailed {
-                detail: format!(
-                    "{}'s upstream deadline passed at {}, so this answer would reach nothing",
-                    params.resource_id,
-                    deadline.get()
-                ),
-            });
-        }
-        // The component answerable for an approval is the decoder that interpreted it: it is the
-        // one whose meaning the answer carries, and a fault in it disables this dispatch whatever
-        // else is bound to the instance.
-        let responsible = state
-            .decoder_of(params.resource_id)
-            .map_or(Responsible::Transport, Responsible::Binding);
-        let capability_id = CapabilityId::new("agent.approval")
-            .map_err(|error| BrokerError::invalid(format!("capability name: {error}")))?;
-        // The answer goes out on the connection whose resource it resolves, so the transport is
-        // chosen from the resource here rather than being whichever one the instance last bound.
-        // A connection that has gone is `UPSTREAM_UNAVAILABLE` before anything is claimed, not a
-        // mismatch a writer finds after the marker.
-        let connection = resource.request.connection;
-        let transport = state
-            .connection_dispatch
-            .get(&connection)
-            .cloned()
-            .ok_or_else(|| BrokerError::UpstreamUnavailable {
-                detail: format!(
-                    "{} was asked on {connection} and nothing carries an answer out on it now",
-                    params.resource_id
-                ),
-            })?;
-        let admitted = state.admit_mutation_in(
-            &params.target,
-            Some(capability_id),
-            RichOperation::ApprovalRespond,
-            None,
-            responsible,
-            UpstreamBody::Cancel,
-            Some(transport),
-            now,
-        )?;
-        let claim = state.claim_in(params.resource_id, &caller.actor_id, now)?;
-        // From here the claim is held, so anything that fails before the marker gives it back
-        // rather than leaving the resource stuck behind a claim nobody will spend.
-        let dispatch = match state.admit_dispatch_in(&claim, &params.option_id) {
-            Ok(dispatch) => dispatch,
-            Err(error) => {
-                crate::broker::settled(state.release_claim_in(&claim, now));
-                return Err(error);
-            }
-        };
-        let body = UpstreamBody::Approval {
-            resource_id: params.resource_id,
-            upstream_request_id: dispatch.upstream_request_id.clone(),
-            method: dispatch.method.clone(),
-            option_id: params.option_id.clone(),
-            response: dispatch.response.clone(),
-        };
-        let admitted = admitted
-            .with_body(body)
-            .with_approval(claim.clone(), dispatch);
-        // The transport is asked about the answer it will actually be given, which is the frame
-        // the core just prepared. A transport that cannot carry it gives the resource back, under
-        // the lock this admission already holds: going back to the broker for it here would be a
-        // second acquisition of a lock this frame never let go of.
-        if let Err(error) = admitted.check_transport() {
-            crate::broker::settled(state.release_claim_in(&claim, now));
-            return Err(error);
-        }
-        Ok(admitted)
+        state.admit_answer_in(caller, params, now)
     }
 
     /// Applies `agent.approval.respond`.
@@ -1047,7 +1160,8 @@ impl Broker {
 
     /// Hands an admitted approval to its upstream, and returns the answer in flight.
     ///
-    /// The marker is committed and the bytes are queued here. What settles the resource is
+    /// The marker is committed and the bytes are queued here, on the caller's own thread: it is
+    /// [`Broker::mark_approval`] followed by the transport's call. What settles the resource is
     /// [`AnswerInFlight::settled`], because the resource's state is what the transmission says it
     /// is and that is not known yet: the permit's holder is the only caller that may settle, and
     /// this is the object it holds.
@@ -1061,6 +1175,32 @@ impl Broker {
         admitted: &MutationAdmission,
         now: TimestampMs,
     ) -> Result<AnswerInFlight<'_>> {
+        let marked = self.mark_approval(admitted, now)?;
+        let (dispatch, request) = marked.transmission();
+        match dispatch.submit(&request) {
+            Ok(pending) => Ok(marked.submitted(pending)),
+            Err(error) => Err(marked.refused(error)),
+        }
+    }
+
+    /// Takes an admitted approval's permit and commits its dispatch marker, without handing it to
+    /// the transport yet.
+    ///
+    /// What comes back holds the claim from the marker on, so the caller that waits for the
+    /// transport keeps the settlement: the transport's own call can run anywhere, and however long
+    /// it takes, the caller can stop waiting and leave the resource uncertain there and then, and
+    /// nothing the transport does afterwards settles it again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::InvalidArgument`] for an admission that answers no approval,
+    /// [`BrokerError::AlreadyTransmitted`] for a permit already taken, and the marker's own failure,
+    /// after giving the reservation back so the resource stays answerable.
+    pub fn mark_approval(
+        &self,
+        admitted: &MutationAdmission,
+        now: TimestampMs,
+    ) -> Result<MarkedAnswer<'_>> {
         // The kind is checked before the permit is taken, so an admission handed to the wrong
         // entry point comes back unspent rather than being destroyed by the mistake.
         if admitted.resource_id().is_none() {
@@ -1086,17 +1226,11 @@ impl Broker {
             crate::broker::settled(self.release_claim(&claim, now));
             return Err(error);
         }
-        let pending = match permit.dispatch.submit(&permit.request) {
-            Ok(pending) => pending,
-            Err(error) => {
-                crate::broker::settled(self.uncertain(&claim, now));
-                return Err(error);
-            }
-        };
-        Ok(AnswerInFlight {
+        Ok(MarkedAnswer {
             broker: self,
             claim: Some(claim),
-            pending: Some(pending),
+            dispatch: permit.dispatch,
+            request: permit.request,
             binding_revision: admitted.binding_revision(),
             upstream_request_id: dispatch.upstream_request_id.clone(),
             resource_id: dispatch.resource.resource_id,
@@ -1186,6 +1320,95 @@ impl Broker {
             .with_declaration(registered);
         admitted.check_transport()?;
         Ok(admitted)
+    }
+
+    /// Admits `plugin.action.invoke` for an action that answers a pending request through the
+    /// connector table's decision destination, in one operation under the broker's lock.
+    ///
+    /// The plugin half comes first: the action is registered for this binding as an answer, and
+    /// the binding holds the grant it needs; the call names the resource it answers; this binding
+    /// is the resource's decoder, because the answer carries the decoder's meaning; and the
+    /// decision is read from the call's parameters by the name the declaration gives it. Then the
+    /// transaction `agent.approval.respond` makes: the target's revision, the fence, the
+    /// instance, the resource's owner, state and deadline, the decision against the ones the
+    /// interpretation offered, the claim, the resource's one transmission and the answer the core
+    /// prepares from the connection's own table. No action token is issued: no component prepares
+    /// anything, and the answer is written from the table under the approval's claim.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::InvalidArgument`] for a call that names no resource, an action that
+    /// is not registered as an answer or parameters that carry no decision,
+    /// [`BrokerError::Grant`] when the binding does not hold the grant the action needs,
+    /// [`BrokerError::PermissionDenied`] when another binding interpreted the resource, and
+    /// whatever [`Broker::admit_approval`]'s transaction refuses.
+    pub fn admit_plugin_answer(
+        &self,
+        caller: &Caller,
+        binding_id: BrokerBindingId,
+        params: &PluginActionInvokeParams,
+        now: TimestampMs,
+    ) -> Result<MutationAdmission> {
+        let resource_id = params.resource_id.as_ref().copied().ok_or_else(|| {
+            BrokerError::invalid(format!(
+                "{} answers a pending request, and this call names none",
+                params.action
+            ))
+        })?;
+        let arguments: serde_json::Value =
+            serde_json::from_slice(&Self::executable_arguments(params)?).map_err(|error| {
+                BrokerError::invalid(format!(
+                    "{}'s parameters will not read: {error}",
+                    params.action
+                ))
+            })?;
+        let mut state = self.state();
+        let registered = state.check_action_in(binding_id, params)?;
+        let decision = registered.decision.as_ref().ok_or_else(|| {
+            BrokerError::invalid(format!(
+                "{} is not registered as an answer to a pending request",
+                params.action
+            ))
+        })?;
+        let binding = state
+            .bindings
+            .get(&binding_id)
+            .ok_or_else(|| crate::broker::unknown_binding(binding_id))?;
+        if registered.grant != BrokerGrant::ApprovalInterpreter
+            || !binding.grants.holds(registered.grant)
+        {
+            return Err(BrokerError::Grant(
+                kr_protocol::broker::GrantError::NotHeld {
+                    grant: BrokerGrant::ApprovalInterpreter,
+                },
+            ));
+        }
+        if state.decoder_of(resource_id) != Some(binding_id) {
+            return Err(BrokerError::denied(format!(
+                "{resource_id} was not interpreted by {}, so an answer from it would not carry \
+                 the meaning a person was shown",
+                params.plugin_id
+            )));
+        }
+        let option_id = arguments
+            .get(decision.as_str())
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                BrokerError::invalid(format!(
+                    "{}'s parameters carry no {decision} to answer with",
+                    params.action
+                ))
+            })?
+            .to_owned();
+        state.admit_answer_in(
+            caller,
+            &AgentApprovalRespondParams {
+                target: params.target,
+                resource_id,
+                option_id,
+            },
+            now,
+        )
     }
 
     /// Applies `plugin.action.invoke`.
@@ -1654,10 +1877,16 @@ impl Broker {
                 ),
             });
         }
-        if registered.operation != effect.operation {
+        let Some(declared) = registered.operation else {
             return Err(BrokerError::invalid(format!(
-                "{} is declared as {} and this plan prepares {}",
-                token.action, registered.operation, effect.operation
+                "{} declares no operation a component prepares, and this plan prepares {}",
+                token.action, effect.operation
+            )));
+        };
+        if declared != effect.operation {
+            return Err(BrokerError::invalid(format!(
+                "{} is declared as {declared} and this plan prepares {}",
+                token.action, effect.operation
             )));
         }
         if registered.effect != effect.class {
@@ -1687,9 +1916,15 @@ impl Broker {
         // checked, rather than an operation beside a flag saying a plan was seen.
         let mut held = admitted.held();
         let permit = held.as_mut().ok_or(BrokerError::AlreadyTransmitted)?;
-        if let UpstreamBody::PluginAction { operation, .. } = &mut permit.request.body {
+        let mut prepared = permit.request.clone();
+        if let UpstreamBody::PluginAction { operation, .. } = &mut prepared.body {
             *operation = Some(effect.operation);
         }
+        // The transport is asked about the operation it will be given, now that the plan names
+        // it: what the connection carries for this action has to be what the action's class
+        // declares. A transport that refuses it leaves the permit with no plan to carry.
+        permit.dispatch.admit(&prepared)?;
+        permit.request = prepared;
         permit.plan = Some(effect.clone());
         Ok(())
     }
@@ -1724,6 +1959,20 @@ impl Broker {
         now: TimestampMs,
     ) -> Result<MutationInFlight> {
         let _ = now;
+        let taken = self.take_mutation(admitted)?;
+        let (dispatch, request) = taken.transmission();
+        Ok(taken.submitted(dispatch.submit(&request)?))
+    }
+
+    /// Takes one admitted mutation's permit without handing it to the transport, so the caller
+    /// can make the transport's own call wherever it chooses.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::InvalidArgument`] for an admission that answers a pending resource,
+    /// which is recorded by the route that settles it, and [`BrokerError::AlreadyTransmitted`] for
+    /// a permit already taken.
+    pub fn take_mutation(&self, admitted: &MutationAdmission) -> Result<TakenMutation> {
         // An answer settles its resource, and this route does not settle anything. Refusing it
         // before the permit is taken leaves the approval's own admission intact.
         if admitted.resource_id().is_some() {
@@ -1733,12 +1982,11 @@ impl Broker {
             ));
         }
         let permit = admitted.take()?;
-        let turn_id = permit.request.turn_id.clone();
-        let pending = permit.dispatch.submit(&permit.request)?;
-        Ok(MutationInFlight {
-            pending,
+        Ok(TakenMutation {
+            turn_id: permit.request.turn_id.clone(),
+            dispatch: permit.dispatch,
+            request: permit.request,
             binding_revision: admitted.binding_revision(),
-            turn_id,
         })
     }
 
@@ -1752,6 +2000,108 @@ impl Broker {
                 subject.session_id
             )))
         }
+    }
+}
+
+impl crate::broker::BrokerState {
+    /// The answer transaction, under the broker's lock: the resource, the mutation, the claim and
+    /// the resource's one transmission. See [`Broker::admit_approval`].
+    fn admit_answer_in(
+        &mut self,
+        caller: &Caller,
+        params: &AgentApprovalRespondParams,
+        now: TimestampMs,
+    ) -> Result<MutationAdmission> {
+        let resource = self.pending_resource(params.resource_id)?.resource.clone();
+        if resource.application_instance_id != params.target.subject.application_instance_id {
+            return Err(BrokerError::denied(format!(
+                "{} belongs to another application instance",
+                params.resource_id
+            )));
+        }
+        // One resolution per pending resource. A resource that has already reached an answer, been
+        // cancelled or been left uncertain is not answerable again, and saying so here is what
+        // keeps the claim from being the thing that discovers it.
+        if resource.state != PendingState::Pending {
+            return Err(BrokerError::Arbitration(
+                kr_protocol::gateway::ArbitrationError::AlreadyResolved {
+                    state: resource.state,
+                },
+            ));
+        }
+        if let Some(deadline) = resource.deadline_ms.as_ref()
+            && deadline.get() <= now.get()
+        {
+            return Err(BrokerError::PreconditionFailed {
+                detail: format!(
+                    "{}'s upstream deadline passed at {}, so this answer would reach nothing",
+                    params.resource_id,
+                    deadline.get()
+                ),
+            });
+        }
+        // The component answerable for an approval is the decoder that interpreted it: it is the
+        // one whose meaning the answer carries, and a fault in it disables this dispatch whatever
+        // else is bound to the instance.
+        let responsible = self
+            .decoder_of(params.resource_id)
+            .map_or(Responsible::Transport, Responsible::Binding);
+        let capability_id = CapabilityId::new("agent.approval")
+            .map_err(|error| BrokerError::invalid(format!("capability name: {error}")))?;
+        // The answer goes out on the connection whose resource it resolves, so the transport is
+        // chosen from the resource here rather than being whichever one the instance last bound.
+        // A connection that has gone is `UPSTREAM_UNAVAILABLE` before anything is claimed, not a
+        // mismatch a writer finds after the marker.
+        let connection = resource.request.connection;
+        let transport = self
+            .connection_dispatch
+            .get(&connection)
+            .cloned()
+            .ok_or_else(|| BrokerError::UpstreamUnavailable {
+                detail: format!(
+                    "{} was asked on {connection} and nothing carries an answer out on it now",
+                    params.resource_id
+                ),
+            })?;
+        let admitted = self.admit_mutation_in(
+            &params.target,
+            Some(capability_id),
+            RichOperation::ApprovalRespond,
+            None,
+            responsible,
+            UpstreamBody::Cancel,
+            Some(transport),
+            now,
+        )?;
+        let claim = self.claim_in(params.resource_id, &caller.actor_id, now)?;
+        // From here the claim is held, so anything that fails before the marker gives it back
+        // rather than leaving the resource stuck behind a claim nobody will spend.
+        let dispatch = match self.admit_dispatch_in(&claim, &params.option_id) {
+            Ok(dispatch) => dispatch,
+            Err(error) => {
+                crate::broker::settled(self.release_claim_in(&claim, now));
+                return Err(error);
+            }
+        };
+        let body = UpstreamBody::Approval {
+            resource_id: params.resource_id,
+            upstream_request_id: dispatch.upstream_request_id.clone(),
+            method: dispatch.method.clone(),
+            option_id: params.option_id.clone(),
+            response: dispatch.response.clone(),
+        };
+        let admitted = admitted
+            .with_body(body)
+            .with_approval(claim.clone(), dispatch);
+        // The transport is asked about the answer it will actually be given, which is the frame
+        // the core just prepared. A transport that cannot carry it gives the resource back, under
+        // the lock this admission already holds: going back to the broker for it here would be a
+        // second acquisition of a lock this frame never let go of.
+        if let Err(error) = admitted.check_transport() {
+            crate::broker::settled(self.release_claim_in(&claim, now));
+            return Err(error);
+        }
+        Ok(admitted)
     }
 }
 

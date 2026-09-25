@@ -4,9 +4,10 @@
 //! workspace never builds it: `forms` keys rows in every form the report reads, ignores nothing
 //! and has a documentation test, `outcomes` has a test that passes, one that fails and ones that
 //! are ignored, `known` has a test that records a known difference, `refused` names a row past the
-//! end of section 21's table and a bare section, and `expansions`, which is read and never built,
-//! calls cases through macros and attributes the report cannot see into. The runs build into a
-//! target directory of their own under the platform's temporary directory.
+//! end of section 21's table and a bare section, `expansions`, which is read and never built,
+//! calls cases through macros and attributes the report cannot see into, and `conventions`, read
+//! and never built as well, steps outside the conventions a helper key relies on. The runs build
+//! into a target directory of their own under the platform's temporary directory.
 //!
 //! KR-REQ-29.01.
 
@@ -178,19 +179,29 @@ fn every_comment_form_and_a_case_table_key_their_tests() {
 
 #[test]
 fn a_call_a_macro_or_attribute_may_rewrite_move_or_rename_keys_nothing() {
-    // The tree is read and never built: the macros and crates its tests name are not there.
+    // The tree is read and never built: the macros and crates its tests name are not there. It
+    // keeps to the conventions a helper key relies on, so the reading declines these keys itself.
     let map = map_of("expansions", false);
     assert!(map.refused.is_empty(), "{:?}", map.refused);
     assert!(map.problems.is_empty(), "{:?}", map.problems);
     for (row, context) in [
-        ("KR-REQ-03.11", "which no test calls"),
-        ("KR-REQ-03.12", "which no test calls"),
-        ("KR-REQ-03.13", "which no test calls"),
-        ("KR-REQ-03.15", "which no test calls"),
-        ("KR-REQ-03.16", "which no test calls"),
+        ("KR-REQ-03.11", "which no test is proved to call"),
+        ("KR-REQ-03.16", "which no test is proved to call"),
         ("KR-REQ-03.17", "which an attribute may rewrite"),
         ("KR-REQ-03.18", "which an attribute may rewrite"),
-        ("KR-REQ-03.19", "which no test calls"),
+        ("KR-REQ-03.19", "which no test is proved to call"),
+        ("KR-REQ-03.26", "which an attribute may rewrite"),
+        ("KR-REQ-03.27", "which an attribute may rewrite"),
+        ("KR-REQ-03.29", "which no test is proved to call"),
+        ("KR-REQ-03.30", "which a cfg may leave out of a build"),
+        ("KR-REQ-03.32", "which no test is proved to call"),
+        ("KR-REQ-03.33", "which a cfg may leave out of a build"),
+        ("KR-REQ-03.36", "which a cfg may leave out of a build"),
+        ("KR-REQ-03.38", "which no test is proved to call"),
+        ("KR-REQ-03.42", "which no test is proved to call"),
+        ("KR-REQ-03.43", "which no test is proved to call"),
+        ("KR-REQ-03.44", "which a cfg may leave out of a build"),
+        ("KR-REQ-03.68", "which no test is proved to call"),
     ] {
         let row = identifier(row);
         assert!(
@@ -206,13 +217,346 @@ fn a_call_a_macro_or_attribute_may_rewrite_move_or_rename_keys_nothing() {
             map.references.get(&row)
         );
     }
+    let keyed = keyed(&map);
     assert_eq!(
-        keyed(&map).get("KR-REQ-03.14"),
+        keyed.get("KR-REQ-03.14"),
         Some(&vec![(
             "flow calls_the_case_plainly".to_owned(),
             Binding::CalledFunction
         )])
     );
+    // One name in two modules names two tests, each keyed by its own comment.
+    assert_eq!(
+        keyed.get("KR-REQ-03.57"),
+        Some(&vec![(
+            "samename first::example".to_owned(),
+            Binding::AttachedComment
+        )])
+    );
+    assert_eq!(
+        keyed.get("KR-REQ-03.58"),
+        Some(&vec![(
+            "samename second::example".to_owned(),
+            Binding::AttachedComment
+        )])
+    );
+    // A `use` written as text imports nothing, so it leaves the rest of its target proved.
+    assert_eq!(
+        keyed.get("KR-REQ-03.31"),
+        Some(&vec![
+            (
+                "strings calls_the_case_beside_text".to_owned(),
+                Binding::CalledFunction
+            ),
+            (
+                "strings prints_and_calls_the_case".to_owned(),
+                Binding::CalledFunction
+            ),
+        ])
+    );
+}
+
+/// The problems a map found, each matched to one expected `(file:line, words)`; none is left over.
+fn expect_problems(map: &Map, expected: &[(&str, &str)]) {
+    let mut unmatched: Vec<&String> = map.problems.iter().collect();
+    for (at, words) in expected {
+        let found = unmatched
+            .iter()
+            .position(|problem| problem.starts_with(&format!("{at}: ")) && problem.contains(words));
+        match found {
+            Some(index) => {
+                unmatched.remove(index);
+            }
+            None => panic!(
+                "no problem at {at} saying {words:?} among {:#?}",
+                map.problems
+            ),
+        }
+    }
+    assert!(
+        unmatched.is_empty(),
+        "problems not expected: {unmatched:#?}"
+    );
+}
+
+#[test]
+fn a_source_outside_the_conventions_is_a_problem_and_keys_no_helper() {
+    // The tree is read and never built. Each target steps outside the conventions a helper key
+    // relies on, as the compiler would build it: the report names the file and the line, and the
+    // helpers of that target key nothing.
+    let map = map_of("conventions", false);
+    assert!(map.refused.is_empty(), "{:?}", map.refused);
+    let helper = "a keyed helper's name, is written here as";
+    expect_problems(
+        &map,
+        &[
+            ("tests/absent.rs:3", "module missing has no file"),
+            (
+                "tests/absolute.rs:8",
+                "a `use` of `shared`, a keyed helper's name, that the reading does not follow",
+            ),
+            (
+                "tests/braced.rs:16",
+                "the header of this `fn`, from its keyword to its body or `;`, holds where a macro's repetition opens or ends",
+            ),
+            (
+                "tests/braced.rs:22",
+                "the header of this `fn`, from its keyword to its body or `;`, holds where a macro's repetition opens or ends",
+            ),
+            (
+                "tests/carrier/mod.rs:1",
+                "a `path` attribute inside a module's own file",
+            ),
+            (
+                "tests/aliased.rs:3",
+                "`println` is declared here as the name `as` gives",
+            ),
+            ("tests/chosen.rs:4", "a `cfg_attr` chooses"),
+            (
+                "tests/escaped.rs:4",
+                "a `path` attribute whose value is anything but a string of printable ASCII",
+            ),
+            ("tests/innerchosen.rs:3", "a `cfg_attr` chooses"),
+            (
+                "tests/elsewhere/deep.rs:2",
+                "`assert_eq` is declared here as a macro",
+            ),
+            (
+                "tests/emitcore.rs:13",
+                "`core` is declared here as a module",
+            ),
+            (
+                "tests/emitcore.rs:14",
+                "`println` is declared here as the name `as` gives",
+            ),
+            (
+                "tests/emitted.rs:11",
+                "`println` is declared here as a macro",
+            ),
+            (
+                "tests/emitted.rs:11",
+                "`shared`, a keyed helper's name, is written here as a function inside",
+            ),
+            (
+                "tests/exported.rs:14",
+                "`println` is declared here as a macro",
+            ),
+            (
+                "tests/exported.rs:16",
+                "`case`, a keyed helper's name, is written here as a function inside",
+            ),
+            (
+                "tests/exported.rs:31",
+                "`assert_eq` is declared here as a macro",
+            ),
+            (
+                "tests/exported.rs:33",
+                "`other_case`, a keyed helper's name, is written here as a function inside",
+            ),
+            (
+                "tests/flow.rs:3",
+                "`Clone` is declared here as a `use` of something other",
+            ),
+            ("tests/flow.rs:12", helper),
+            ("tests/flow.rs:26", helper),
+            ("tests/flow.rs:41", helper),
+            ("tests/gapped.rs:3", "`println` is declared here as a macro"),
+            ("tests/gapped.rs:5", helper),
+            (
+                "tests/hidden.rs:6",
+                "a module file declared inside a function",
+            ),
+            (
+                "tests/identity.rs:3",
+                "`assert` is declared here as a macro",
+            ),
+            (
+                "tests/identity.rs:13",
+                "`core` is declared here as a module",
+            ),
+            (
+                "tests/identity.rs:16",
+                "`println` is declared here as a macro",
+            ),
+            ("tests/identity.rs:17", helper),
+            (
+                "tests/imported.rs:4",
+                "a `use` of `shared`, a keyed helper's name, that the reading does not follow",
+            ),
+            ("tests/inner.rs:9", "a function inside a function"),
+            (
+                "tests/inline/declared.rs:2",
+                "`assert_eq` is declared here as a macro",
+            ),
+            (
+                "tests/loaded/neighbour.rs:2",
+                "`assert_eq` is declared here as a macro",
+            ),
+            (
+                "tests/marked/mod.rs:1",
+                "a first line that starts `#!` without `[` right after it",
+            ),
+            (
+                "tests/marked/mod.rs:1",
+                "is a character outside ASCII outside a comment or a literal",
+            ),
+            (
+                "tests/moved/sub.rs:2",
+                "`println` is declared here as a macro",
+            ),
+            (
+                "tests/pages/mod.rs:1",
+                "a `path` attribute inside a module's own file",
+            ),
+            (
+                "tests/pages/mod.rs:1",
+                "a first line that starts `#!` without `[` right after it",
+            ),
+            (
+                "tests/localcore.rs:3",
+                "`core` is declared here as a module",
+            ),
+            ("tests/localcore.rs:6", helper),
+            (
+                "tests/localcore.rs:10",
+                "`println` is declared here as the name `as` gives",
+            ),
+            (
+                "tests/qualified.rs:9",
+                "the keyed helper `Fn` has the name of a trait a type writes like a call",
+            ),
+            ("tests/raw.rs:5", helper),
+            (
+                "tests/renamed.rs:4",
+                "`shared`, a keyed helper's name, is written here as the name `as` gives",
+            ),
+            (
+                "tests/repeated.rs:9",
+                "the header of this `fn`, from its keyword to its body or `;`, holds where a macro's repetition opens or ends",
+            ),
+            (
+                "tests/repeated.rs:9",
+                "`core` is written here in a macro whose metavariables or repetitions may make it a declaration",
+            ),
+            (
+                "tests/repeated.rs:15",
+                "the header of this `enum`, from its keyword to its body or `;`, holds where a macro's repetition opens or ends",
+            ),
+            (
+                "tests/repeated.rs:15",
+                "`shared`, a keyed helper's name, is written here as part of a macro whose metavariables or repetitions",
+            ),
+            (
+                "tests/rewritten.rs:11",
+                "`core` is written here in a macro whose metavariables or repetitions may make it a declaration",
+            ),
+            (
+                "tests/rewritten.rs:17",
+                "`len`, a keyed helper's name, is written here as part of a macro whose metavariables or repetitions",
+            ),
+            (
+                "tests/rewritten.rs:23",
+                "`len`, a keyed helper's name, is written here as part of a macro whose metavariables or repetitions",
+            ),
+            (
+                "tests/rewritten.rs:57",
+                "`core` is written here in a macro whose metavariables or repetitions may make it a declaration",
+            ),
+            (
+                "tests/shadowed.rs:8",
+                "`println` is declared here as a macro",
+            ),
+            ("tests/shadowed.rs:10", helper),
+            (
+                "tests/sugar.rs:5",
+                "the keyed helper `Fn` has the name of a trait a type writes like a call",
+            ),
+            ("tests/taken.rs:8", "a constant or a static"),
+            (
+                "tests/taken.rs:19",
+                "`imported`, a keyed helper's name, is written here as the name `as` gives",
+            ),
+            ("tests/taken.rs:23", "a trait in a type"),
+            ("tests/text.rs:10", "`println` is declared here as a macro"),
+            (
+                "tests/tools.rs:3",
+                "`clippy` is declared here as the name `as` gives",
+            ),
+            ("tests/traits.rs:10", "a type or a trait"),
+            (
+                "tests/twice.rs:6",
+                "defines the test `example` more than once (tests/twice.rs:6, tests/twice.rs:11)",
+            ),
+            ("tests/unicode.rs:12", "is an identifier outside ASCII"),
+            (
+                "tests/variants.rs:8",
+                "defines the test `example` more than once (tests/variants.rs:8, tests/variants.rs:14)",
+            ),
+            ("vintage/tests/old.rs:1", "the 2015 edition"),
+        ],
+    );
+    assert!(
+        map.keys
+            .values()
+            .flat_map(BTreeMap::values)
+            .all(|key| key.binding != Binding::CalledFunction),
+        "{:?}",
+        keyed(&map)
+    );
+    for row in [
+        "KR-REQ-03.12",
+        "KR-REQ-03.13",
+        "KR-REQ-03.15",
+        "KR-REQ-03.20",
+        "KR-REQ-03.21",
+        "KR-REQ-03.22",
+        "KR-REQ-03.23",
+        "KR-REQ-03.24",
+        "KR-REQ-03.25",
+        "KR-REQ-03.28",
+        "KR-REQ-03.34",
+        "KR-REQ-03.35",
+        "KR-REQ-03.37",
+        "KR-REQ-03.39",
+        "KR-REQ-03.40",
+        "KR-REQ-03.41",
+        "KR-REQ-03.45",
+        "KR-REQ-03.46",
+        "KR-REQ-03.47",
+        "KR-REQ-03.48",
+        "KR-REQ-03.49",
+        "KR-REQ-03.50",
+        "KR-REQ-03.51",
+        "KR-REQ-03.52",
+        "KR-REQ-03.53",
+        "KR-REQ-03.54",
+        "KR-REQ-03.59",
+        "KR-REQ-03.60",
+        "KR-REQ-03.61",
+        "KR-REQ-03.62",
+        "KR-REQ-03.63",
+        "KR-REQ-03.64",
+        "KR-REQ-03.65",
+        "KR-REQ-03.66",
+        "KR-REQ-03.67",
+        "KR-REQ-03.69",
+        "KR-REQ-03.70",
+        "KR-REQ-03.71",
+        "KR-REQ-03.72",
+        "KR-REQ-03.73",
+        "KR-REQ-03.74",
+    ] {
+        let row = identifier(row);
+        assert!(
+            map.references
+                .get(&row)
+                .is_some_and(|references| references.iter().all(|reference| reference
+                    .context
+                    .contains("steps outside the conventions a helper key relies on"))),
+            "{row}: {:?}",
+            map.references.get(&row)
+        );
+    }
 }
 
 #[test]
@@ -233,7 +577,7 @@ fn a_tree_with_nothing_ignored_reports_every_identifier_as_run() {
     // The module comment of the test file keys every test in it, each by its own name, and a test
     // its own comment keys as well is recorded once, by that comment.
     let module = &document.identifiers["KR-REQ-03.01"].tests;
-    assert_eq!(module.len(), 25);
+    assert_eq!(module.len(), 15);
     let commented: Vec<_> = module
         .iter()
         .filter(|test| test.test == "forms --test flow commented")
@@ -687,7 +1031,7 @@ fn the_end_to_end_group_runs_what_the_end_to_end_script_runs() {
 
 /// The `cargo test` commands a job of the landing workflow runs, each as one line: a folded value
 /// is joined, and each line of a literal block is its own command.
-fn workflow_tests(job: &str) -> Vec<String> {
+fn workflow_commands(job: &str, program: &str) -> Vec<String> {
     let workflow = std::fs::read_to_string(
         repository()
             .join(".github")
@@ -738,7 +1082,7 @@ fn workflow_tests(job: &str) -> Vec<String> {
         commands.extend(
             found
                 .into_iter()
-                .filter(|command| command.starts_with("cargo test")),
+                .filter(|command| command.starts_with(program)),
         );
     }
     commands
@@ -759,12 +1103,17 @@ fn without_display(command: &str) -> String {
 
 #[test]
 fn the_platform_plans_run_what_the_landing_workflow_runs_there() {
-    // Windows: every `cargo test` of the workflow's Windows job is a step, and every step is one.
-    let mut workflow: Vec<String> = workflow_tests("windows")
+    // Windows: every `cargo test` of the workflow's Windows job is a step, and every test step is
+    // one; what the plan builds first, the Windows job builds too.
+    let mut workflow: Vec<String> = workflow_commands("windows", "cargo test")
         .iter()
         .map(|command| without_display(command))
         .collect();
-    let mut planned: Vec<String> = plan::steps(Platform::Windows, &Group::ALL, "/tmp/e", None)
+    let (builds, tests): (Vec<Step>, Vec<Step>) =
+        plan::steps(Platform::Windows, &Group::ALL, "/tmp/e", None)
+            .into_iter()
+            .partition(|step| step.command.get(1).is_some_and(|word| word == "build"));
+    let mut planned: Vec<String> = tests
         .iter()
         .map(|step| without_display(&step.line()))
         .collect();
@@ -772,9 +1121,18 @@ fn the_platform_plans_run_what_the_landing_workflow_runs_there() {
     workflow.dedup();
     planned.sort();
     assert_eq!(planned, workflow, "the Windows job's tests");
+    let built = workflow_commands("windows", "cargo build");
+    assert!(!builds.is_empty());
+    for step in &builds {
+        assert!(
+            built.contains(&step.line()),
+            "{} among {built:?}",
+            step.line()
+        );
+    }
 
     // macOS: the workspace step leaves out what the workflow's macOS job leaves out, by name.
-    let workspace = workflow_tests("macos")
+    let workspace = workflow_commands("macos", "cargo test")
         .into_iter()
         .find(|command| command.starts_with("cargo test --locked --workspace"))
         .expect("the macOS job's workspace run");

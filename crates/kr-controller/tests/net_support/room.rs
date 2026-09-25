@@ -13,11 +13,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use iroh::EndpointAddr;
+use kr_client::pairing::room::RoomSocket;
 use kr_controller::service::net::pairing::HostPairingClock;
-use kr_controller::service::net::rendezvous::{
-    ClientFrame, CloseReason, Rendezvous, RoomSocket, ServiceFrame, decode_client_frame,
-    decode_message, encode_frame, encode_message,
-};
+use kr_controller::service::net::rendezvous::Rendezvous;
 use kr_crypto::secret::SymmetricKey;
 use kr_pairing::PairingError;
 use kr_pairing::bundles::BundleFrame;
@@ -33,6 +31,10 @@ use kr_protocol::pairing::{
     SignedHostBundle,
 };
 use kr_protocol::preauth::PairFinishResult;
+use kr_protocol::rendezvous::{
+    ClientFrame, CloseReason, ServiceFrame, decode_client_frame, decode_message, encode_frame,
+    encode_message,
+};
 use kr_protocol::scalars::{Bytes, Digest256, EndpointKey, Mac256, TimestampMs};
 use kr_transport::handshake::{self, CandidateConnection};
 use kr_transport::listener::BoxFuture;
@@ -446,6 +448,18 @@ impl RendezvousHost for TestRoom {
             let _ = host.try_send(closed);
         }
         Ok(())
+    }
+}
+
+impl kr_client::pairing::candidate::CandidateRoom for TestRoom {
+    fn open<'a>(
+        &'a self,
+        _origin: &'a RendezvousOrigin,
+        locator: &'a Locator,
+    ) -> kr_client::pairing::BoxFuture<'a, Result<RoomSocket, kr_client::pairing::room::RoomError>>
+    {
+        let socket = self.candidate(locator.as_str());
+        Box::pin(async move { Ok(socket) })
     }
 }
 

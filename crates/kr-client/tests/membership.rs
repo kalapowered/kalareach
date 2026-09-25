@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex};
 
 use kr_client::ClientError;
 use kr_client::recovery::{
-    ExportedSettings, FreshRestore, RecoveryError, SETTINGS_FILENAME, export_settings,
-    import_settings,
+    ExportedSettings, FreshRestore, MaterialName, RecoveryError, SETTINGS_FILENAME,
+    export_settings, import_settings,
 };
 use kr_client::services::{
     KeyHead, MembershipListing, ServiceFuture, SyncPosition, SyncRecoveryId, SyncRevision,
@@ -3588,7 +3588,7 @@ async fn a_collection_key_is_neither_backed_up_nor_restored() {
     for key in &keys {
         match import_settings(&fresh, Material::SyncCollectionKey, key.expose()) {
             Err(RecoveryError::Refused { material, because }) => {
-                assert_eq!(material, Material::SyncCollectionKey);
+                assert_eq!(material, MaterialName(Material::SyncCollectionKey));
                 assert!(because.contains("seed"));
             }
             other => panic!("a collection key is refused, not {other:?}"),

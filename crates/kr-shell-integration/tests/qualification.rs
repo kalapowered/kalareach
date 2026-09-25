@@ -14,9 +14,11 @@
 //! with its reason. Nothing here is substituted: a stack the fetcher could not reach is reported
 //! as one this run did not qualify.
 //!
-//! A run with no built package, or with no stacks fetched, prints why and stops. Continuous
-//! integration builds the packages and fetches the stacks in the same job and sets
-//! `KR_REQUIRE_SHELL_PACKAGES` and `KR_REQUIRE_SHELL_STACKS`, where either absence is a failure.
+//! The checks that drive a package need this tree's built packages, and the ones that install a
+//! customisation need the fetched customisations; an ordinary run has neither, so it leaves those
+//! checks out. A run that built the packages and fetched the customisations runs them with
+//! `--include-ignored`, as continuous integration's shell-packages job and `scripts/e2e-fence.sh`
+//! do, and there a package or a customisation that is not here fails the check that needed it.
 
 // The corpus drives built Unix shells over a Unix socket in a pseudo-terminal. The Windows leg of
 // the PowerShell module — its named pipe and its configured chord — is qualified on Windows.
@@ -42,9 +44,6 @@ use shellpkg::{
     CaseOutcome, CaseSetup, DriveObservation, Package, QualificationCase, Session, StackIndex,
     StackLock, cases, corpus_root, record_outcomes, repository_root, settle, unsupported,
 };
-
-/// The environment variable that turns an unfetched stack into a failure rather than a skip.
-const REQUIRE_STACKS: &str = "KR_REQUIRE_SHELL_STACKS";
 
 /// Every check a case may claim. A name outside this set is a corpus that says something this
 /// runner does not do, which is worse than a check that fails.
@@ -322,11 +321,10 @@ fn every_combination_of_a_shell_and_a_startup_customisation_is_accounted_for() {
 }
 
 #[test]
+#[ignore = "needs the fetched customisations; it runs with --include-ignored where they have been fetched, as continuous integration's shell-packages job and scripts/e2e-fence.sh do"]
 fn the_stacks_installed_here_are_the_ones_the_corpus_pins() {
     let lock = StackLock::read();
-    let Some(index) = installed_stacks() else {
-        return;
-    };
+    let index = installed_stacks();
     let committed = std::fs::read(repository_root().join("fixtures/shells/stacks.lock"))
         .expect("the pinned set is committed");
     let digest = {
@@ -419,6 +417,7 @@ fn the_stacks_installed_here_are_the_ones_the_corpus_pins() {
 }
 
 #[test]
+#[ignore = "needs this tree's built shell packages and the fetched customisations; it runs with --include-ignored where both are there, as continuous integration's shell-packages job and scripts/e2e-fence.sh do"]
 fn every_case_holds_against_the_package_it_names() {
     let corpus = cases();
     let index = installed_stacks();
@@ -426,8 +425,15 @@ fn every_case_holds_against_the_package_it_names() {
     let mut failures = Vec::new();
     let mut ran = 0;
 
-    // One case at a time, for a run that is looking at one of them.
+    // One case at a time, for a run that is looking at one of them. A name that is not a case of
+    // the corpus would select nothing, and a run that selected nothing has qualified nothing.
     let only = std::env::var("KR_QUALIFICATION_CASE").ok();
+    if let Some(wanted) = only.as_deref() {
+        assert!(
+            corpus.iter().any(|case| case.id == wanted),
+            "KR_QUALIFICATION_CASE names {wanted:?}, which is not a case of the corpus"
+        );
+    }
     for case in &corpus {
         if only.as_deref().is_some_and(|wanted| wanted != case.id) {
             continue;
@@ -442,20 +448,14 @@ fn every_case_holds_against_the_package_it_names() {
             ));
             continue;
         }
-        let Some(index) = index.as_ref() else {
-            outcomes.push(CaseOutcome::skipped(case, "no stacks are fetched here"));
-            continue;
-        };
+        // A case this run cannot drive is a case it did not qualify, so it is recorded and it fails
+        // the run, after every other case has had its turn.
         let package = match Package::find(case.shell) {
             Ok(package) => package,
             Err(reason) => {
-                assert!(
-                    std::env::var_os(shellpkg::REQUIRE).is_none(),
-                    "{} is set and {} is missing: {reason}",
-                    shellpkg::REQUIRE,
-                    case.shell.as_str()
-                );
-                outcomes.push(CaseOutcome::skipped(case, &format!("no package: {reason}")));
+                let reason = format!("no package: {reason}");
+                failures.push(format!("{}: {reason}", case.id));
+                outcomes.push(CaseOutcome::skipped(case, &reason));
                 continue;
             }
         };
@@ -476,11 +476,7 @@ fn every_case_holds_against_the_package_it_names() {
         }
         if !missing.is_empty() {
             let reason = missing.join("; ");
-            assert!(
-                std::env::var_os(REQUIRE_STACKS).is_none(),
-                "{REQUIRE_STACKS} is set and {} cannot run: {reason}",
-                case.id
-            );
+            failures.push(format!("{}: {reason}", case.id));
             outcomes.push(CaseOutcome::skipped(case, &reason));
             continue;
         }
@@ -507,19 +503,12 @@ fn every_case_holds_against_the_package_it_names() {
 
     record_outcomes("qualification-cases.tsv", &outcomes);
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
-    // An ordinary workspace run has neither the packages nor the stacks: this suite says so and
-    // stops. A run that asked for them is the one that fails when nothing ran.
-    if std::env::var_os(shellpkg::REQUIRE).is_some() || std::env::var_os(REQUIRE_STACKS).is_some() {
-        assert!(
-            ran > 0,
-            "the packages or the stacks were required and no case ran"
-        );
-    } else if ran == 0 && only.is_none() {
-        println!(
-            "skipped: no package is built here and no stack is fetched here; run \
-             scripts/build-shells.sh --all and scripts/fetch-shell-stacks.sh"
-        );
-    }
+    // A run that drove no case qualified nothing, whatever it selected: a selected case that is
+    // not supported is one this run cannot qualify either.
+    assert!(
+        ran > 0,
+        "no case of the corpus ran, so nothing was qualified"
+    );
 }
 
 /// The platform triple the fetcher records, for the host this run is on.
@@ -541,19 +530,14 @@ fn host_platform() -> String {
     format!("{architecture}-{system}")
 }
 
-/// Reads the index the fetcher wrote, or records why there is none.
-fn installed_stacks() -> Option<StackIndex> {
-    match StackIndex::read() {
-        Ok(index) => Some(index),
-        Err(reason) => {
-            assert!(
-                std::env::var_os(REQUIRE_STACKS).is_none(),
-                "{REQUIRE_STACKS} is set and no stacks are fetched: {reason}"
-            );
-            println!("skipped: {reason}");
-            None
-        }
-    }
+/// Reads the index the fetcher wrote, for a check that needs the fetched customisations.
+///
+/// Such a check is left out of an ordinary run and runs with `--include-ignored` where the
+/// customisations have been fetched, so an index that is not here fails it and says why.
+fn installed_stacks() -> StackIndex {
+    StackIndex::read().unwrap_or_else(|reason| {
+        panic!("this check needs the fetched customisations, and none are here: {reason}")
+    })
 }
 
 /// What a case that held says it qualified.
@@ -2395,9 +2379,12 @@ fn as_date(cell: &str) -> (i64, u32, u32) {
     (year, month, day)
 }
 
-/// KR-REQ-07.88: the register, the pins and what is installed are one thing.
+/// KR-REQ-07.88: the register and the pins are one thing, and the release page carries its target.
+///
+/// What is installed is checked against the same pins by
+/// [`the_packages_built_here_were_built_from_the_registers_pins`], where packages are built.
 #[test]
-fn the_upstream_register_agrees_with_the_pins_and_with_what_is_installed() {
+fn the_upstream_register_agrees_with_the_pins() {
     let path = repository_root().join("docs/shell-integration/upstream.md");
     let body = std::fs::read_to_string(&path).expect("the register is committed");
     let pins = register_rows(&body, "pins");
@@ -2441,8 +2428,7 @@ fn the_upstream_register_agrees_with_the_pins_and_with_what_is_installed() {
         );
     }
 
-    // Every pin the register names is the pin the builder uses, and the identity record the build
-    // wrote beside the binary is read rather than left in the file.
+    // Every pin the register names is the pin the builder uses.
     for row in &pins {
         let [package, _upstream, revision, source, digest, watched] = row.as_slice() else {
             panic!("a pin row has {} cells", row.len());
@@ -2484,71 +2470,6 @@ fn the_upstream_register_agrees_with_the_pins_and_with_what_is_installed() {
             digest,
             upstream["sha256"].as_str().unwrap_or_default(),
             "the register and {package}'s manifest name different archives"
-        );
-
-        let kind = match package.as_str() {
-            "zsh" => ShellKind::Zsh,
-            "bash" => ShellKind::Bash,
-            "fish" => ShellKind::Fish,
-            other => panic!("the register names a package called {other}"),
-        };
-        let Ok(installed) = Package::find(kind) else {
-            continue;
-        };
-        let record = &installed.record;
-        assert_eq!(
-            record["build"]["upstream"]["url"]
-                .as_str()
-                .unwrap_or_default(),
-            source,
-            "the {package} package installed here was built from another source"
-        );
-        assert_eq!(
-            record["build"]["upstream"]["sha256"]
-                .as_str()
-                .unwrap_or_default(),
-            digest,
-            "the {package} package installed here was built from another archive"
-        );
-        assert_eq!(
-            record["shell"]["upstream_version"]
-                .as_str()
-                .unwrap_or_default(),
-            upstream["version"].as_str().unwrap_or_default(),
-            "the {package} package installed here records another upstream version"
-        );
-        let declared: Vec<String> = manifest["patches"]
-            .as_array()
-            .expect("a patch list")
-            .iter()
-            .filter_map(|patch| patch["name"].as_str().map(str::to_owned))
-            .collect();
-        assert_eq!(
-            installed.patch_names(),
-            declared,
-            "the {package} package installed here records another patch set"
-        );
-        let modules: Vec<String> = record["shell"]["modules"]
-            .as_array()
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter_map(|module| module["name"].as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let expected: Vec<String> = manifest["modules"]
-            .as_array()
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter_map(|module| module.as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default();
-        assert_eq!(
-            modules, expected,
-            "the {package} package installed here records another module tree"
         );
     }
 
@@ -2632,6 +2553,90 @@ fn the_upstream_register_agrees_with_the_pins_and_with_what_is_installed() {
     }
 }
 
+/// KR-REQ-07.88: each package built here was built from the pin the register names for it.
+#[test]
+#[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn the_packages_built_here_were_built_from_the_registers_pins() {
+    let path = repository_root().join("docs/shell-integration/upstream.md");
+    let body = std::fs::read_to_string(&path).expect("the register is committed");
+    for row in &register_rows(&body, "pins") {
+        let [package, _upstream, _revision, source, digest, _watched] = row.as_slice() else {
+            panic!("a pin row has {} cells", row.len());
+        };
+        // This package fetches nothing, so there is no archive for a build of it to name.
+        if package == "psreadline" {
+            continue;
+        }
+        let manifest_path = repository_root().join(format!("shells/{package}/manifest.json"));
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).expect("a manifest"))
+                .expect("the manifest decodes");
+        let upstream = &manifest["upstream"];
+        let kind = match package.as_str() {
+            "zsh" => ShellKind::Zsh,
+            "bash" => ShellKind::Bash,
+            "fish" => ShellKind::Fish,
+            other => panic!("the register names a package called {other}"),
+        };
+        let installed = Package::built(kind);
+        let record = &installed.record;
+        assert_eq!(
+            record["build"]["upstream"]["url"]
+                .as_str()
+                .unwrap_or_default(),
+            source,
+            "the {package} package installed here was built from another source"
+        );
+        assert_eq!(
+            record["build"]["upstream"]["sha256"]
+                .as_str()
+                .unwrap_or_default(),
+            digest,
+            "the {package} package installed here was built from another archive"
+        );
+        assert_eq!(
+            record["shell"]["upstream_version"]
+                .as_str()
+                .unwrap_or_default(),
+            upstream["version"].as_str().unwrap_or_default(),
+            "the {package} package installed here records another upstream version"
+        );
+        let declared: Vec<String> = manifest["patches"]
+            .as_array()
+            .expect("a patch list")
+            .iter()
+            .filter_map(|patch| patch["name"].as_str().map(str::to_owned))
+            .collect();
+        assert_eq!(
+            installed.patch_names(),
+            declared,
+            "the {package} package installed here records another patch set"
+        );
+        let modules: Vec<String> = record["shell"]["modules"]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|module| module["name"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let expected: Vec<String> = manifest["modules"]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|module| module.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            modules, expected,
+            "the {package} package installed here records another module tree"
+        );
+    }
+}
+
 /// KR-REQ-07.88: no unqualified binary is hot-swapped into a session that is already running.
 ///
 /// The installation is what a new session resolves its package from, and the product's own
@@ -2641,17 +2646,25 @@ fn the_upstream_register_agrees_with_the_pins_and_with_what_is_installed() {
 /// installation at the second while that session is running. The resolver a new session would use
 /// answers the second, and the session that is running is still executing the first.
 #[test]
+#[ignore = "needs this tree's built Zsh package and a second build of it; it runs with --include-ignored where both are built, as continuous integration's shell-packages job and scripts/e2e-fence.sh do"]
 fn a_live_session_keeps_the_package_it_started_with() {
-    let Some(installed) = Package::found(ShellKind::Zsh) else {
-        return;
-    };
-    let Some(index) = installed_stacks() else {
-        return;
-    };
+    let installed = Package::built(ShellKind::Zsh);
     let case = cases()
         .into_iter()
         .find(|case| case.id == "zsh-plain")
         .expect("the plain Zsh case is committed");
+    // The plain case installs no customisation, so it resolves against an index with none in it,
+    // and it runs whether or not any customisation has been fetched here.
+    assert!(
+        case.requires.is_empty(),
+        "the plain Zsh case requires {:?}, and this check starts it with no customisation",
+        case.requires
+    );
+    let index = StackIndex {
+        platform: host_platform(),
+        lock_sha256: String::new(),
+        stacks: Vec::new(),
+    };
 
     // Two installations of one package is what a person has after an update, so this needs two
     // builds. They cannot be made by copying one under another name: a package declares the build
@@ -2662,14 +2675,8 @@ fn a_live_session_keeps_the_package_it_started_with() {
              over it; build one from different inputs, as scripts/e2e-fence.sh does",
             ShellKind::Zsh.as_str()
         );
-        assert!(
-            std::env::var_os(shellpkg::REQUIRE).is_none(),
-            "{} is set and {reason}",
-            shellpkg::REQUIRE
-        );
-        println!("skipped: {reason}");
         shellpkg::record("no-replacement-to-install.txt", &format!("{reason}\n"));
-        return;
+        panic!("this check cannot run here: {reason}");
     };
     assert_ne!(
         installed.identity, older.identity,
@@ -2774,37 +2781,23 @@ fn a_live_session_keeps_the_package_it_started_with() {
     // An installation is read shell by shell, so a record that cannot be read refuses the shell it
     // belongs to and leaves the packages beside it alone. The Bash package is put into this same
     // installation to check that, rather than to say it.
-    match Package::found(ShellKind::Bash) {
-        Some(beside) => {
-            let directory = beside
-                .executable
-                .parent()
-                .and_then(std::path::Path::parent)
-                .expect("the package directory");
-            let bash = root.path().join(ShellKind::Bash.as_str());
-            std::fs::create_dir_all(&bash).expect("an installation directory");
-            std::os::unix::fs::symlink(directory, bash.join(&beside.identity))
-                .expect("an installed build");
-            std::fs::write(bash.join("current"), &beside.identity).expect("the pointer");
-            assert_eq!(
-                offered(root.path(), ShellKind::Bash)
-                    .as_deref()
-                    .and_then(canonical),
-                canonical(&beside.executable),
-                "a Zsh record that cannot be read took the Bash package beside it with it"
-            );
-        }
-        None => {
-            let reason = "this host holds no Bash package, so what a Zsh record that cannot be \
-                          read leaves beside it is not checked here";
-            assert!(
-                std::env::var_os(shellpkg::REQUIRE).is_none(),
-                "{} is set and {reason}",
-                shellpkg::REQUIRE
-            );
-            println!("skipped: {reason}");
-        }
-    }
+    let beside = Package::built(ShellKind::Bash);
+    let directory = beside
+        .executable
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("the package directory");
+    let bash = root.path().join(ShellKind::Bash.as_str());
+    std::fs::create_dir_all(&bash).expect("an installation directory");
+    std::os::unix::fs::symlink(directory, bash.join(&beside.identity)).expect("an installed build");
+    std::fs::write(bash.join("current"), &beside.identity).expect("the pointer");
+    assert_eq!(
+        offered(root.path(), ShellKind::Bash)
+            .as_deref()
+            .and_then(canonical),
+        canonical(&beside.executable),
+        "a Zsh record that cannot be read took the Bash package beside it with it"
+    );
 }
 
 /// KR-REQ-07.87, KR-REQ-07.88: a package binds into the editor it was qualified against, and says
@@ -2816,10 +2809,9 @@ fn a_live_session_keeps_the_package_it_started_with() {
 /// both be inside one range, and only one of them was qualified. The package records which one,
 /// and this drives that record against the module itself.
 #[test]
+#[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
 fn the_package_binds_into_the_editor_it_was_qualified_against() {
-    let Some(package) = Package::found(ShellKind::PowerShell) else {
-        return;
-    };
+    let package = Package::built(ShellKind::PowerShell);
     let directory = package
         .executable
         .parent()
@@ -4445,26 +4437,12 @@ fn what_this_qualification_cannot_reach_is_recorded_with_its_reason_and_its_owne
 /// that host, the module that binds into that editor, the marked startup entry — is what it
 /// records, and this is the case that says so for a whole installation rather than one package.
 #[test]
+#[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
 fn an_installation_holding_every_package_still_resolves_each_of_them() {
     let installed: Vec<Package> = ShellKind::ALL
         .iter()
-        .filter_map(|kind| Package::find(*kind).ok())
+        .map(|kind| Package::built(*kind))
         .collect();
-    if installed.len() < ShellKind::ALL.len() {
-        let missing: Vec<&str> = ShellKind::ALL
-            .iter()
-            .filter(|kind| !installed.iter().any(|package| package.kind == **kind))
-            .map(|kind| kind.as_str())
-            .collect();
-        let reason = format!("this host holds no {} package", missing.join(", no "));
-        assert!(
-            std::env::var_os(shellpkg::REQUIRE).is_none(),
-            "{} is set and {reason}",
-            shellpkg::REQUIRE
-        );
-        println!("skipped: {reason}");
-        return;
-    }
 
     let set = kr_shell_integration::host::package::PackageSet::discover(&shellpkg::package_root())
         .unwrap_or_else(|fault| {

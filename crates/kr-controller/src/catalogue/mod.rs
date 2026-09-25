@@ -28,8 +28,12 @@
 //!   repository's ceiling permits by itself, and every release that installs a native bridge, is
 //!   refused unless it carries the owner's confirmation of that exact installation.
 
+pub(crate) mod files;
+pub mod native_bridge;
+
 use std::sync::Arc;
 
+use kr_plugin_catalogue::transport::RepositoryTransport;
 use kr_plugin_catalogue::{
     Authority, CapabilityCeiling, Catalogue, CatalogueError, CatalogueResult, Change, Claimed,
     Effect, Enrolment, Installation, InstallationGrant, InstallationView, Owner, ReceiptClaim,
@@ -175,11 +179,29 @@ impl Authority for Confirmed<'_> {
     }
 }
 
+/// How this host's catalogue reaches its repositories.
+///
+/// A directory on this host is read where it is, and an address is fetched with this product's
+/// trust and through `proxy`, or directly when that is `None`. A host whose certificate
+/// verification cannot be set up still reads the repositories on its own disk, and says why
+/// whenever it is asked to fetch one.
+#[must_use]
+pub fn repository_transport(proxy: Option<&kr_transport::config::ProxyUrl>) -> RepositoryTransport {
+    match kr_client::services::http::client_builder(proxy) {
+        Ok(builder) => RepositoryTransport::over(builder),
+        Err(error) => {
+            RepositoryTransport::local_only(format!("this host fetches no repository: {error}"))
+        }
+    }
+}
+
 /// The catalogue, as the daemon holds it.
 #[derive(Debug)]
 pub struct CatalogueModule {
     catalogue: Arc<Mutex<Catalogue>>,
     environment_id: EnvironmentId,
+    /// The native bridges installed packages put in their applications' own directories.
+    bridges: Arc<native_bridge::NativeBridges>,
 }
 
 impl CatalogueModule {
@@ -189,23 +211,65 @@ impl CatalogueModule {
     /// one serves anything: its change may have been made, so it is never performed again and
     /// never reported as refused.
     ///
+    /// Its repositories are fetched with this product's trust and through `proxy`, the one this
+    /// host's configuration document selected when the daemon started, or directly when it
+    /// selected none; a directory on this host is read where it is.
+    ///
     /// # Errors
     ///
     /// Returns [`crate::ControllerError::RegistryUnavailable`] when the catalogue's directory or
     /// its records cannot be opened.
-    pub fn open(paths: &kr_ipc::paths::EnvironmentPaths) -> crate::Result<Self> {
+    pub fn open(
+        paths: &kr_ipc::paths::EnvironmentPaths,
+        proxy: Option<&kr_transport::config::ProxyUrl>,
+    ) -> crate::Result<Self> {
+        Self::open_with(
+            paths,
+            proxy,
+            native_bridge::BridgeHost::discover(paths.state_dir()),
+        )
+    }
+
+    /// Opens the environment's catalogue, applying native bridges where `bridges` says.
+    ///
+    /// Before this daemon serves anything, every package's bridge is brought to what its
+    /// installation wants: a recipe an earlier daemon left part way is finished or undone, and one
+    /// whose package is no longer installed is taken out.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::open`] returns.
+    pub fn open_with(
+        paths: &kr_ipc::paths::EnvironmentPaths,
+        proxy: Option<&kr_transport::config::ProxyUrl>,
+        bridges: native_bridge::BridgeHost,
+    ) -> crate::Result<Self> {
         let root = paths.state_dir().join("catalogue");
         let unavailable = |error: CatalogueError| crate::ControllerError::RegistryUnavailable {
             detail: error.to_string(),
         };
-        let mut catalogue = Catalogue::open(&root).map_err(unavailable)?;
+        let mut catalogue =
+            Catalogue::open(&root, Arc::new(repository_transport(proxy))).map_err(unavailable)?;
         catalogue
             .recover_interrupted(kr_ipc::now_ms().get())
             .map_err(unavailable)?;
+        let bridges = Arc::new(native_bridge::NativeBridges::new(bridges));
+        let environment_id = paths.environment_id();
+        for plugin_id in bridge_subjects(&catalogue, &bridges, environment_id) {
+            follow_bridge(&catalogue, &bridges, environment_id, &plugin_id);
+        }
         Ok(Self {
             catalogue: Arc::new(Mutex::new(catalogue)),
-            environment_id: paths.environment_id(),
+            environment_id,
+            bridges,
         })
+    }
+
+    /// Returns the native bridges installed packages put in place, which say what each applied
+    /// release yields.
+    #[must_use]
+    pub fn native_bridges(&self) -> &native_bridge::NativeBridges {
+        &self.bridges
     }
 
     /// Returns true when this daemon serves the method.
@@ -514,18 +578,36 @@ impl CatalogueModule {
                 key.clone(),
             )
             .await;
-        let Err(error) = outcome else {
-            return outcome;
+        let answer = match outcome {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                // Refused only when nothing of the action committed; anything else is unknown, and
+                // the answer names what the action left behind. The caller is told the same thing
+                // every later resubmission is told.
+                let failure = recording.failure(&error);
+                // A settlement this host cannot record leaves the claim dispatching, and every
+                // later reader is told that is unknown: the action is never performed again, and
+                // nobody is told it had no effect on the strength of a record that was never
+                // written.
+                let _ = catalogue.settle_failure(&key, &failure, kr_ipc::now_ms().get());
+                Err(failure.into_answer())
+            }
         };
-        // Refused only when nothing of the action committed; anything else is unknown, and the
-        // answer names what the action left behind. The caller is told the same thing every later
-        // resubmission is told.
-        let failure = recording.failure(&error);
-        // A settlement this host cannot record leaves the claim dispatching, and every later
-        // reader is told that is unknown: the action is never performed again, and nobody is told
-        // it had no effect on the strength of a record that was never written.
-        let _ = catalogue.settle_failure(&key, &failure, kr_ipc::now_ms().get());
-        Err(failure.into_answer())
+        // The package's native bridge follows what the change left its installation wanting,
+        // under the same lock and after the change's commit. What it does is its own journal's and
+        // never changes the answer the change recorded.
+        if let Some(plugin_id) = plugin_named(method, &mutation.params) {
+            let bridges = Arc::clone(&self.bridges);
+            let wanted = wanted_bridge(&catalogue, self.environment_id, &plugin_id);
+            let followed = tokio::task::spawn_blocking(move || {
+                reconcile_bridge(&bridges, &plugin_id, wanted);
+            })
+            .await;
+            if let Err(error) = followed {
+                eprintln!("kr-controller: a native bridge was not reconciled: {error}");
+            }
+        }
+        answer
     }
 
     async fn perform_write(
@@ -901,6 +983,148 @@ impl CatalogueModule {
             ErrorCode::InvalidArgument,
             format!("this daemon owns environment {}", self.environment_id),
         ))
+    }
+}
+
+/// The package a plugin mutation names, where it names one.
+fn plugin_named(method: Method, params: &ParamsValue) -> Option<PluginId> {
+    match method {
+        Method::PluginInstall => typed::<wire::PluginInstallParams>(params)
+            .ok()
+            .map(|params| params.plugin_id),
+        Method::PluginRemove => typed::<wire::PluginRemoveParams>(params)
+            .ok()
+            .map(|params| params.plugin_id),
+        Method::PluginPin => typed::<wire::PluginPinParams>(params)
+            .ok()
+            .map(|params| params.plugin_id),
+        Method::PluginEnable | Method::PluginDisable => typed::<wire::PluginEnableParams>(params)
+            .ok()
+            .map(|params| params.plugin_id),
+        Method::PluginGrant => typed::<wire::PluginGrantParams>(params)
+            .ok()
+            .map(|params| params.plugin_id),
+        _ => None,
+    }
+}
+
+/// Every package whose bridge may need bringing to what its installation wants: each installed
+/// one whose manifest carries a recipe, and each with a journal.
+fn bridge_subjects(
+    catalogue: &Catalogue,
+    bridges: &native_bridge::NativeBridges,
+    environment_id: EnvironmentId,
+) -> Vec<PluginId> {
+    let mut subjects = std::collections::BTreeSet::new();
+    match catalogue.installations() {
+        Ok(installations) => subjects.extend(
+            installations
+                .into_iter()
+                .filter(|installation| installation.environment_id == environment_id)
+                .map(|installation| installation.plugin_id),
+        ),
+        Err(error) => eprintln!("kr-controller: the installations could not be read: {error}"),
+    }
+    match bridges.journaled() {
+        Ok(journaled) => subjects.extend(journaled),
+        Err(error) => {
+            eprintln!("kr-controller: the native bridge journals could not be read: {error}")
+        }
+    }
+    subjects.into_iter().collect()
+}
+
+/// Brings one package's bridge to what its installation wants, where that can be read.
+fn follow_bridge(
+    catalogue: &Catalogue,
+    bridges: &native_bridge::NativeBridges,
+    environment_id: EnvironmentId,
+    plugin_id: &PluginId,
+) {
+    reconcile_bridge(
+        bridges,
+        plugin_id,
+        wanted_bridge(catalogue, environment_id, plugin_id),
+    );
+}
+
+/// What one package's installation wants of its native bridge.
+enum WantedBridge {
+    /// Nothing: the package is not installed, the grant does not hold, or the release carries no
+    /// recipe.
+    Nothing,
+    /// One release's recipe.
+    Release(Box<native_bridge::BridgeTarget>),
+    /// The installed package is not whole here, so what it wants cannot be read, and its bridge
+    /// is left as it is.
+    Unknown,
+}
+
+/// What one package's installation wants of its bridge.
+fn wanted_bridge(
+    catalogue: &Catalogue,
+    environment_id: EnvironmentId,
+    plugin_id: &PluginId,
+) -> CatalogueResult<WantedBridge> {
+    let Some(installation) = catalogue.installation(environment_id, plugin_id)? else {
+        return Ok(WantedBridge::Nothing);
+    };
+    // The grant is what permits the bridge: a release installed without it, or an installation
+    // that withdrew it, wants none.
+    if !catalogue
+        .effective_capabilities(environment_id, plugin_id)?
+        .contains(&PluginCapability::NativeBridgeInstall)
+    {
+        return Ok(WantedBridge::Nothing);
+    }
+    let store = catalogue.store_of(&installation);
+    let package = match store.check_package(installation.package_digest)? {
+        kr_plugin_catalogue::PackageCheck::Complete(package) => package,
+        kr_plugin_catalogue::PackageCheck::Missing { .. }
+        | kr_plugin_catalogue::PackageCheck::Corrupt { .. } => return Ok(WantedBridge::Unknown),
+    };
+    let manifest = package.manifest();
+    let Some(recipe) = manifest.native_bridge.as_ref().cloned() else {
+        return Ok(WantedBridge::Nothing);
+    };
+    let target = native_bridge::BridgeTarget {
+        plugin_id: plugin_id.clone(),
+        package_digest: installation.package_digest,
+        package_dir: store.package_dir(installation.package_digest),
+        recipe,
+        match_rules: manifest.match_rules.clone(),
+        // A catalogue qualification result names a capability, the subject it was qualified
+        // against and its profile, and no executable's digest, so no signed record here says which
+        // version an executable is. The recipe's version requirement then refuses the recipe
+        // rather than guessing.
+        qualified: Vec::new(),
+    };
+    Ok(WantedBridge::Release(Box::new(target)))
+}
+
+/// Runs one reconciliation and says what went wrong, where something did.
+fn reconcile_bridge(
+    bridges: &native_bridge::NativeBridges,
+    plugin_id: &PluginId,
+    wanted: CatalogueResult<WantedBridge>,
+) {
+    let wanted = match wanted {
+        Ok(WantedBridge::Nothing) => None,
+        Ok(WantedBridge::Release(target)) => Some(target),
+        Ok(WantedBridge::Unknown) => return,
+        Err(error) => {
+            eprintln!(
+                "kr-controller: what the installation of {plugin_id} wants of its native bridge \
+                 could not be read: {error}"
+            );
+            return;
+        }
+    };
+    if let Err(error) = bridges.reconcile(plugin_id, wanted.as_deref()) {
+        eprintln!(
+            "kr-controller: the native bridge of {plugin_id} was not reconciled, and is reconciled \
+             again when this daemon next starts: {error}"
+        );
     }
 }
 
@@ -1521,6 +1745,232 @@ fn encode<T: serde::Serialize>(value: &T) -> Answer<ParamsValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// KR-REQ-26.14: a repository address is fetched through the proxy this host selected. The
+    /// proxy is asked for a tunnel to the repository, and when it refuses, the fetch fails rather
+    /// than going around it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repository_is_fetched_through_the_proxy_this_host_selected() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(std::net::SocketAddr::from((
+            std::net::Ipv4Addr::LOCALHOST,
+            0,
+        )))
+        .await
+        .expect("a loopback port");
+        let proxy_port = listener.local_addr().expect("an address").port();
+        let asked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorded = Arc::clone(&asked);
+        let proxy = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read_u8().await {
+                        Ok(byte) => head.push(byte),
+                        Err(_) => break,
+                    }
+                }
+                let line = String::from_utf8_lossy(&head)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                recorded
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(line);
+                let _ = stream
+                    .write_all(b"HTTP/1.1 403 Refused\r\ncontent-length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+        // Nothing listens at the repository's address: a fetch that went around the proxy would
+        // fail too, so what the proxy was asked is the whole of the evidence.
+        let unused = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let repository = unused.local_addr().expect("an address");
+        drop(unused);
+
+        let transport = repository_transport(Some(
+            &format!("http://127.0.0.1:{proxy_port}")
+                .parse()
+                .expect("a proxy address"),
+        ));
+        let Ok(stream) = tough::Transport::fetch(
+            &transport,
+            format!("https://{repository}/1.root.json")
+                .parse()
+                .expect("an address"),
+        )
+        .await
+        else {
+            panic!("the fetch answered without a stream");
+        };
+        let fetched = futures_util::TryStreamExt::try_collect::<Vec<tough::Bytes>>(stream).await;
+        proxy.abort();
+        assert!(fetched.is_err(), "the proxy refused every tunnel");
+        let asked = asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let tunnel = format!("CONNECT {repository} HTTP/1.1");
+        assert!(
+            !asked.is_empty() && asked.iter().all(|line| *line == tunnel),
+            "{asked:?}"
+        );
+    }
+
+    /// A loopback server that answers every request with `status` and `body`, and counts them.
+    async fn answering(
+        status: u16,
+        body: &'static [u8],
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(std::net::SocketAddr::from((
+            std::net::Ipv4Addr::LOCALHOST,
+            0,
+        )))
+        .await
+        .expect("a loopback port");
+        let origin = format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().expect("an address").port()
+        );
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&asked);
+        let serving = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read_u8().await {
+                        Ok(byte) => head.push(byte),
+                        Err(_) => break,
+                    }
+                }
+                let answer = format!(
+                    "HTTP/1.1 {status} Answer\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(answer.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+            }
+        });
+        (origin, asked, serving)
+    }
+
+    /// Fetches `address` through the transport a host with no proxy selected builds, and reads
+    /// what arrives.
+    ///
+    /// The fetch itself always answers with a stream, and what the request came to arrives
+    /// through it: the update client reads an error from the fetch as the file not being there.
+    async fn fetched(address: &str) -> Result<Vec<u8>, tough::TransportError> {
+        use futures_util::TryStreamExt as _;
+
+        let Ok(stream) = tough::Transport::fetch(
+            &repository_transport(None),
+            address.parse().expect("an address"),
+        )
+        .await
+        else {
+            panic!("the fetch of {address} answered without a stream");
+        };
+        let chunks: Vec<tough::Bytes> = stream.try_collect().await?;
+        Ok(chunks.concat())
+    }
+
+    /// A file a repository's server answers 403, 404 or 410 for is not there, which is how the
+    /// update client finds the newest signed root. It is asked for once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_file_its_server_answers_403_404_or_410_for_is_not_there() {
+        for status in [403, 404, 410] {
+            let (origin, asked, serving) = answering(status, b"").await;
+            let error = fetched(&format!("{origin}/2.root.json"))
+                .await
+                .expect_err("no such file");
+            assert_eq!(
+                error.kind(),
+                tough::TransportErrorKind::FileNotFound,
+                "{status}: {error}"
+            );
+            assert_eq!(
+                asked.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{status}"
+            );
+            serving.abort();
+        }
+    }
+
+    /// A server that fails is asked again, four times in all, and then the fetch fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_server_that_fails_is_asked_again_and_then_the_fetch_fails() {
+        let (origin, asked, serving) = answering(503, b"").await;
+        let error = fetched(&format!("{origin}/timestamp.json"))
+            .await
+            .expect_err("the server keeps failing");
+        assert_eq!(error.kind(), tough::TransportErrorKind::Other, "{error}");
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 4);
+        serving.abort();
+    }
+
+    /// A file the server has is read whole, as it arrives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_file_the_server_has_is_read_whole() {
+        let (origin, asked, serving) = answering(200, b"{\"signed\": {}}").await;
+        let body = fetched(&format!("{origin}/timestamp.json"))
+            .await
+            .expect("the file");
+        assert_eq!(body, b"{\"signed\": {}}");
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+        serving.abort();
+    }
+
+    /// A host whose certificate verification cannot be set up still reads a repository on its
+    /// own disk, and says why whenever it is asked to fetch one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_host_that_cannot_verify_reads_its_disk_and_says_why_it_fetches_nothing() {
+        use futures_util::TryStreamExt as _;
+
+        let transport = RepositoryTransport::local_only("no certificate store");
+        let directory = tempfile::tempdir().expect("a directory");
+        let file = directory.path().join("1.root.json");
+        std::fs::write(&file, b"{}").expect("a file");
+        let read: Vec<tough::Bytes> = tough::Transport::fetch(
+            &transport,
+            url::Url::from_file_path(&file).expect("a file address"),
+        )
+        .await
+        .expect("the file")
+        .try_collect()
+        .await
+        .expect("its bytes");
+        assert_eq!(read.concat(), b"{}");
+        let Ok(stream) = tough::Transport::fetch(
+            &transport,
+            "https://plugins.example/1.root.json"
+                .parse()
+                .expect("an address"),
+        )
+        .await
+        else {
+            panic!("the fetch answered without a stream");
+        };
+        let refused = stream
+            .try_collect::<Vec<tough::Bytes>>()
+            .await
+            .expect_err("nothing is fetched");
+        assert!(
+            std::error::Error::source(&refused)
+                .is_some_and(|cause| cause.to_string() == "no certificate store"),
+            "{refused:?}"
+        );
+    }
 
     #[test]
     fn the_daemon_serves_the_two_plugin_groups() {

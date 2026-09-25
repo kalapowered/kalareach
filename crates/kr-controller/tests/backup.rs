@@ -3247,6 +3247,140 @@ fn a_store_that_stops_accepting_writes_mid_cleanup_keeps_the_obligation_for_the_
     assert!(PrivacyMode::reconcile(&[&service as &dyn PrivacySubsystem]).is_complete());
 }
 
+/// Section 24: a staged copy's removal is reported only once the directory that named it is
+/// flushed. On Windows that flush opens the directory through a handle that may add to it, so while
+/// a handle that shares no writing holds the directory, the names go and their flush is refused:
+/// every removal stays owed, with its reason beside it, until an attempt whose flush succeeds.
+#[cfg(windows)]
+#[test]
+fn a_removal_whose_directory_cannot_be_flushed_keeps_its_obligation_until_it_can() {
+    let root = tempfile::tempdir().expect("a disposable directory on the internal disk");
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).expect("the state directory");
+    let producer = Producer::generate();
+    let objects = [stage(1, "a.cbor", b"one")];
+    let mut service = BackupService::open(&state).expect("a backup service");
+    service
+        .reconcile(TimestampMs::new(4_000))
+        .expect("the startup reconciliation a service opens unready without");
+    service
+        .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+        .expect("the writer is enrolled");
+    service
+        .admit(
+            &producer.seal(1, &objects),
+            &objects,
+            producer.writer.key_id(),
+            TimestampMs::new(5_000),
+        )
+        .expect("the generation is admitted, its staged names flushed");
+    let staged: Vec<std::path::PathBuf> = service
+        .objects(archive_id(), BackupGeneration::new(1))
+        .expect("a read")
+        .into_iter()
+        .map(|row| row.staged_path)
+        .collect();
+    service.fence(PrivacyGeneration::new(1));
+    service.cancel_undispatched(PrivacyGeneration::new(1));
+
+    let directory = staged[0]
+        .parent()
+        .expect("a staging directory")
+        .to_path_buf();
+    let held = hold_without_shared_writing(&directory);
+    let removed = service.remove_retained(PrivacyGeneration::new(1));
+    assert_eq!(
+        removed.bytes, 0,
+        "no removal is reported while its flush is refused"
+    );
+    for path in &staged {
+        assert!(
+            !path.exists(),
+            "the name went; its flush is what was refused"
+        );
+    }
+    let owed = service.obligations().expect("a read");
+    let failed: Vec<&_> = owed
+        .iter()
+        .filter(|obligation| obligation.kind == ObligationKind::UnlinkObject)
+        .collect();
+    assert_eq!(failed.len(), staged.len(), "{owed:?}");
+    for obligation in &failed {
+        assert!(obligation.attempt_count >= 1);
+        assert!(
+            obligation.last_error.is_some(),
+            "the reason is recorded beside the obligation, never instead of it"
+        );
+    }
+    assert!(!PrivacyMode::reconcile(&[&service as &dyn PrivacySubsystem]).is_complete());
+
+    // With the directory free again, a name that is already gone is what the retry expects, and
+    // the flush it makes is what ends each obligation.
+    drop(held);
+    service.remove_retained(PrivacyGeneration::new(1));
+    assert!(service.obligations().expect("a read").is_empty());
+    assert!(PrivacyMode::reconcile(&[&service as &dyn PrivacySubsystem]).is_complete());
+}
+
+/// Section 24: staged ciphertext is flushed into its directory, and each directory up to the
+/// staging root into the one above it, before any row names it. On Windows each flush opens its
+/// directory through a handle that may add to it, the generation's own for a file's name and the
+/// staging root for a directory's, so while either is held by a handle that shares no writing the
+/// admission is refused and no row names what was written. The ciphertext left behind is what a
+/// crash between the file and the row leaves, which the staging walk exists to remove.
+#[cfg(windows)]
+#[test]
+fn a_staged_write_whose_directory_cannot_be_flushed_is_not_admitted() {
+    let environment = Environment::open();
+    let service = environment.service();
+    let producer = Producer::generate();
+    service
+        .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+        .expect("the writer is enrolled");
+    let objects = [stage(1, "a.cbor", b"one")];
+    let staging = service.staging_root();
+    // Generation 1's objects are staged in a directory named after the archive and the generation,
+    // made here so that a handle can hold it before the admission writes into it.
+    let own = staging.join(format!("{}-1", archive_id()));
+    std::fs::create_dir_all(&own).expect("the generation's staging directory");
+
+    for (generation, held) in [(1, own.as_path()), (2, staging.as_path())] {
+        let holding = hold_without_shared_writing(held);
+        let refused = service.admit(
+            &producer.seal(generation, &objects),
+            &objects,
+            producer.writer.key_id(),
+            TimestampMs::new(5_000),
+        );
+        drop(holding);
+        assert!(
+            refused.is_err(),
+            "generation {generation} is admitted while {} cannot be flushed",
+            held.display()
+        );
+        assert!(
+            service
+                .objects(archive_id(), BackupGeneration::new(generation))
+                .expect("a read")
+                .is_empty(),
+            "no row names what generation {generation} wrote"
+        );
+    }
+
+    let admitted = service
+        .admit(
+            &producer.seal(3, &objects),
+            &objects,
+            producer.writer.key_id(),
+            TimestampMs::new(6_000),
+        )
+        .expect("with nothing holding its directories, a generation is admitted");
+    assert_eq!(
+        admitted.staged_objects, 2,
+        "one member and the encrypted manifest"
+    );
+}
+
 #[test]
 fn ciphertext_no_row_names_keeps_cleanup_pending_until_the_walk_finds_and_removes_it() {
     let environment = Environment::open();
@@ -4997,4 +5131,30 @@ fn set_directory_writable(directory: &std::path::Path, writable: bool) {
     let mode = if writable { 0o700 } else { 0o500 };
     std::fs::set_permissions(directory, std::fs::Permissions::from_mode(mode))
         .expect("the staging directory's permissions");
+}
+
+/// Holds a directory open through a handle that shares no writing with any other.
+///
+/// Windows only. A name can still be created or removed in the directory while it is held, since
+/// that opens the name rather than the directory, but nothing can open the directory itself with a
+/// right to add to it, which is what a flush of it has to do there.
+#[cfg(windows)]
+fn hold_without_shared_writing(directory: &std::path::Path) -> std::fs::File {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    /// The right to list a directory, which is all the handle holds.
+    const FILE_LIST_DIRECTORY: u32 = 0x0001;
+    /// Reading is shared with other handles.
+    const FILE_SHARE_READ: u32 = 0x0001;
+    /// Deleting is shared; writing is not.
+    const FILE_SHARE_DELETE: u32 = 0x0004;
+    /// What lets a program open a directory at all.
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+    std::fs::OpenOptions::new()
+        .access_mode(FILE_LIST_DIRECTORY)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(directory)
+        .expect("the directory is held")
 }

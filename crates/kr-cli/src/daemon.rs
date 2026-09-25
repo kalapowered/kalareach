@@ -6,6 +6,7 @@
 //! reach its daemon, and ask it. The daemon decides every refusal and says why; a command adds the
 //! request's shape and a readable answer, and nothing it prints is decided anywhere else.
 
+use kr_client::shown;
 use std::str::FromStr;
 
 use kr_ipc::client::LocalClient;
@@ -78,12 +79,13 @@ impl Daemon {
 
 /// Reads an identifier from the command line.
 ///
-/// `what` names the kind of thing it identifies, with its article: "a workspace".
+/// `what` names the kind of thing it identifies, with its article: "a workspace". The text itself
+/// is not repeated in the failure: it is whatever was typed.
 ///
 /// # Errors
 ///
 /// Returns [`CliError::Usage`] when the text is not such an identifier.
-pub fn identifier<T: FromStr>(text: &str, what: &str) -> Result<T> {
+pub fn identifier<T: FromStr>(text: &str, what: &'static str) -> Result<T> {
     text.parse()
-        .map_err(|_| CliError::Usage(format!("{text} is not {what} identifier")))
+        .map_err(|_| CliError::Usage(shown!("the text given is not {} identifier", what)))
 }

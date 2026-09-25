@@ -78,6 +78,15 @@ pub enum OutputDelivery {
         /// How many bytes this event counts against the subscriber's queue limit.
         bytes: usize,
     },
+    /// One announcement about one of this session's agent instances.
+    ///
+    /// It is charged against the subscriber's queue bound like an agent resource.
+    AgentInstance {
+        /// The announcement.
+        event: Box<kr_protocol::projection::AgentInstanceEvent>,
+        /// How many bytes this event counts against the subscriber's queue limit.
+        bytes: usize,
+    },
     /// The subscriber must discard its partial state and install a fresh snapshot.
     ///
     /// A subscriber is told this once for each time it has to resynchronise, whatever number of
@@ -96,7 +105,9 @@ impl OutputDelivery {
     pub fn len(&self) -> usize {
         match self {
             Self::Bytes { bytes, .. } | Self::Screen { bytes, .. } => bytes.len(),
-            Self::Projection { bytes, .. } | Self::AgentResource { bytes, .. } => *bytes,
+            Self::Projection { bytes, .. }
+            | Self::AgentResource { bytes, .. }
+            | Self::AgentInstance { bytes, .. } => *bytes,
             Self::Resync(_) => RESYNC_MARKER_BYTES,
             Self::EditorBusy(_) | Self::Detached | Self::Closed(_) => 0,
         }
@@ -667,6 +678,49 @@ impl OutputHub {
         if subscriber
             .sender
             .send(OutputDelivery::AgentResource {
+                event: Box::new(event),
+                bytes: cost,
+            })
+            .is_err()
+        {
+            self.subscribers.remove(&attachment_id);
+        }
+        false
+    }
+
+    /// Delivers one agent instance announcement to one subscriber.
+    ///
+    /// The event is charged against the subscriber's send queue limit. Returns whether the
+    /// subscriber was told to resynchronise because its queue exceeded the limit.
+    pub fn publish_agent_instance(
+        &mut self,
+        attachment_id: AttachmentId,
+        cursor: u64,
+        event: kr_protocol::projection::AgentInstanceEvent,
+        cost: usize,
+        oldest_retained_cursor: u64,
+    ) -> bool {
+        let Some(subscriber) = self.subscribers.get_mut(&attachment_id) else {
+            return false;
+        };
+        if subscriber.resynchronising {
+            return false;
+        }
+        let queued = subscriber.queued.load(Ordering::Acquire);
+        if queued.saturating_add(cost) > subscriber.limit {
+            if !subscriber.resynchronise(
+                ResyncReason::SendQueueFull,
+                cursor,
+                oldest_retained_cursor,
+            ) {
+                self.subscribers.remove(&attachment_id);
+            }
+            return true;
+        }
+        subscriber.queued.fetch_add(cost, Ordering::AcqRel);
+        if subscriber
+            .sender
+            .send(OutputDelivery::AgentInstance {
                 event: Box::new(event),
                 bytes: cost,
             })

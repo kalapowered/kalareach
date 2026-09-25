@@ -10,7 +10,8 @@ everything about it.
 
 What follows is the contract between the two: what the forwarder sends, and what the gateway checks
 and does when it serves a launch's endpoint. The gateway serves a launch it made; the section
-"Finding the worker" says what that launch publishes.
+"Finding the worker" says what that launch publishes, and "Launching from the shell" says how a
+`claude` typed at a managed prompt becomes one.
 
 The forwarder runs under Claude Code's own permissions, outside the KalaReach plugin sandbox and
 outside Wasmtime. The package's installation grant says so before anything is installed.
@@ -34,25 +35,41 @@ plugin off. The core repository keeps a copy of the three files in
 accepts, and that every hook is in that form. A package change moves the copies and the digests
 together.
 
+The host applies the recipe in `.claude` in the account's home, the directory Claude Code reads when
+`CLAUDE_CONFIG_DIR` is not set, once the owner's confirmed installation of the release has
+committed, and removes it when the package is removed; `docs/plugins/catalogue.md` says what it
+checks before writing anything and what a removal leaves. One of those checks is Claude Code's
+version, which only a signed record naming its executable by digest establishes; no release carries
+one yet, so the recipe is refused and nothing is written. The settings key is spliced into the
+person's own `settings.json`, so every other byte of it stays as it was. The registration names the
+forwarder as `kr-hook`, a bare command Claude Code finds on its own search path. The installation
+expects the `kr-hook` beside the daemon, and a connection running another copy is refused at
+admission, so the launched Claude Code has to find that one first.
+
 The five hook events are the ones whose exit codes refuse nothing: the action has already happened,
 or the code is ignored. A hook here observes because the forwarder never answers anything but `{}`,
 and on these five events even a wrong exit code could not block anything.
 
 ## The command line
 
-`kr-hook` accepts exactly the invocations the registration names, plus the relay a launched agent
-uses:
+`kr-hook` accepts exactly the invocations the registration names, the relay a launched agent uses,
+and the launcher the shell runs for an integrated command:
 
 ```
 kr-hook claude-code channel
 kr-hook claude-code hook
 kr-hook relay
+kr-hook launch -- <executable> <command name> <arguments...>
 ```
 
 Anything else is refused on standard error before anything is read or connected, with exit code 64.
 That code is deliberate. Claude Code reads a hook's exit code 2 as a request to block the action it
 observed, and on `PostToolUse` it hands the hook's standard error to the model. A forwarder invoked
 wrongly can do neither.
+
+The launcher fails the way a shell does when it cannot run the program: 126 when the file cannot be
+executed and 127 when it is not there. It also exits 126, running nothing, when its registration
+variable names no launch it could have been given.
 
 ## Finding the worker
 
@@ -78,6 +95,85 @@ The forwarder reads the endpoint as a socket path or a loopback address, and ref
 else. It reads the credential only from a file in the registration's own directory, and refuses a
 credential file that another user could read, because the exchange in it would already belong to
 somebody else too.
+
+## Launching from the shell
+
+When the Claude Code connector's command integration is on, a `claude` typed at a managed Zsh or
+Bash prompt starts under a launch the worker made for it. The shell asks the worker about the
+command before it forks, as the shell integration's contract describes, and for an integrated
+command the worker establishes a backend: an endpoint in a fresh owner-only directory, a credential,
+and a launch record, `launch`, that names the two. Nothing is reserved and no registration exists
+yet. The answer adds the integration's flags to the vector and gives the forked child
+`KR_REGISTRATION` and the absolute path of the installation's `kr-hook`, which the child runs as
+`kr-hook launch -- <executable> claude <arguments...>`.
+
+The launcher presents itself on the endpoint with the credential, its process and start, the
+executable and the vector. The worker admits it only when the kernel names the connecting process
+as the root shell's own child, started after the establish; the credential is the backend's; the
+executable is the file the worker identified for the backend and the vector is the one it answered;
+and no other launch holds the backend. It then records the launch profile, registers the instance,
+writes the registration naming the launcher's own process, and answers `admitted`. The launcher
+answers `going`, the worker commits the launch and answers `committed`, and only then does the
+launcher exec Claude Code in place. The process keeps its identifier and its start, so the
+registration names Claude Code before Claude Code runs. A hook that connects while the commit is
+still under way waits for it, within its hello deadline, rather than being refused for arriving
+first.
+
+Anything short of that runs what was typed. On a refusal, on no answer within two seconds (counted
+from the launcher's start for the admission, and from `going` for the commit), or when it cannot
+reach the endpoint or read the launch record, the launcher takes `KR_REGISTRATION` out of its
+environment and execs the vector the person typed, without the integration's flags. It needs
+nothing from the backend for that, because the registration's file name, `registration.<at>.<n>`,
+says that `<n>` added flags start at index `<at>`. A Claude Code started with the flags and nothing
+behind them would be worse off than one started without them. With no `KR_REGISTRATION` at all, the
+launcher execs its vector as given.
+
+One invocation binds a backend. A retry of that same invocation (the same vector, file, directory
+and directory revision) gets the same backend, and a second integrated command in the line, such as
+the `claude b` of `claude a; claude b`, runs as typed. A backend no launch took is retired when its
+line's command block finishes, when a later prompt asks about a command, or when the session closes;
+a committed one ends when Claude Code exits or the session closes. Retiring a backend removes its
+endpoint, credential, launch record and registration.
+
+The worker also checks what Claude Code's process runs. When it establishes the backend it opens
+the executable the shell found, once, reads its identity, hashes it with SHA-256, and takes the
+version a signed qualification record names for that digest. It reads no version from anything
+beside the executable, such as a `package.json`, which can change before or after the binary does.
+A script is refused, because its running image is its interpreter. Then, for every bridge that
+authenticates, it checks that the process runs what was hashed. On Linux that is the file
+`/proc/<pid>/exe` names, compared by its whole identity or, when the identity moved, by its content,
+so an upgrade installed over the running file passes and a rewrite of its code does not. On macOS it
+is the code-directory hash the kernel reports for the process's main executable, which must be one
+of the hashed file's own. A mismatch refuses that bridge and every later bridge of the launch, so a
+Claude Code that execs another program in its own process loses its bridges from then on.
+
+The Claude Code package asks for no file access, so its launch is granted no directory to read.
+
+No package can turn a command integration on yet, and the worker does not yet receive the installed
+connectors it launches from, so today a `claude` typed at a prompt runs as typed.
+
+## A Claude Code the integration did not launch
+
+Claude Code started any other way is adopted rather than launched: by absolute path, with its
+integration off, after a refused or retired launch, in a pipeline or another form the shell does not
+ask about, or from a shell that does not ask. Four times a second, while a command has the terminal,
+the worker looks at the terminal's foreground process group. It adopts a process there that the
+root shell started itself, that no launch holds, and whose executable the connector recognises, and
+records it as a native terminal instance. The record holds the executable and argument vector the
+kernel reports, the executable's digest, and the reason the shell's question about it was answered
+with a bypass, where the line running it asked one.
+
+An adopted Claude Code gets no registration, endpoint or credential. Its environment names no
+registration either, since a bypassed invocation is given no variable, so its hooks answer `{}` with
+nothing to report to and its channel declares nothing. None of its bridges is admitted. The instance
+ends when its process exits. Adoption recognises Claude Code by the installed connector, which the
+worker does not yet receive, so today nothing is adopted.
+
+Every instance, launched or adopted, is announced to the session's attached views when it starts,
+when its bridges are refused and when it ends, with its mode, its plugin and profile, and the reason
+its bridges are refused where they are. An adopted instance's announcement says that none of its
+bridges is admitted. When the session closes, its instances end with it and the views are told
+before they detach.
 
 ## Admission
 
@@ -107,6 +203,9 @@ It refuses the connection, without a word, unless every one of these holds:
    the forwarder executable it points Claude Code at. The hello's declaration must name that
    application and one of those surfaces, and the process must be running that executable.
 5. The credential is the launch's own, compared in constant time where the launch's record keeps it.
+6. For a launch from the shell, the launched process still runs the file the worker hashed for it.
+   Only a bridge that passed the five checks above asks, so only the application's own bridges
+   decide it.
 
 An admitted connection gets one line back, `{"kr_bridge":{"admitted":"hook"}}` or `"channel"`, and
 then carries JSON lines of at most 1,048,576 bytes each, the bound the connector package declares.
@@ -219,10 +318,43 @@ session as a message. A verdict is checked in full before the request it answers
 malformed one leaves the request answerable by a correct one. An approval too large for the exchange
 is not relayed, and the terminal's own dialog answers it.
 
-The gateway hands the admitted channel's connection to its caller, which serves the application's
-Channels traffic on it. Which answer goes is the worker's arbitration; the channel's checks are the
-last ones before the bytes leave KalaReach. When the worker closes the channel, the channel ends its
-session with Claude Code and exits 1. When Claude Code closes its end, the channel exits 0.
+The worker serves the channel of the launch's own Claude Code and no other. The channel's starter,
+read from the kernel's parent link and checked by start identity, must be the process the launch
+registered, and a launch has one channel open at a time. The channel is served only when a signed
+qualification record names a version for the digest of the executable the launch hashed, and the
+connector's table is qualified for that version. Any other channel is closed, and Claude Code's own
+dialog answers.
+
+Each relayed `permission_request` becomes a pending approval, recorded with its frame, and every
+attached view is told of it. The first one is the evidence that the channel is registered, and it
+makes the launch's `agent.approval` capability available until the channel closes. Claude Code
+acknowledges no message into the session and no sender stands behind one, so the channel carries
+none: `agent.prompt` has no evidence, and a steer, a cancellation and any other action of the
+package are refused with their reasons. A frame the table does not route towards the worker closes
+the channel, since the forwarder relays nothing else.
+
+The worker interprets an approval when the session holds a binding of the connector's exact package
+(its identifier, publisher and installed hash) whose installation was granted `approval.decode`. The
+decisions it offers are the ones the table's decision destination maps, labelled with the choices of
+the package's answer action. A client can answer it when the installation was also granted
+`approval.respond`, through `agent.approval.respond` or through the package's action with
+`plugin.action.invoke`. Either way the answer is written once on the channel as the verdict the
+table maps, for Allow:
+
+```
+{"method":"notifications/claude/channel/permission","params":{"request_id":"abcde","behavior":"allow"}}
+```
+
+Without such a binding the approval stays visible and unanswerable, and the terminal's dialog
+answers it. Nothing binds the package yet, so today that is every approval.
+
+Claude Code tells the channel nothing back. An approval answered in the terminal stays pending here
+until the channel closes, and a written verdict is never acknowledged: whichever answer Claude Code
+takes first wins. When the channel closes, however it closes, the worker settles what it relayed. An
+approval never answered is cancelled; one that was answered is uncertain, because nothing says
+whether its verdict reached Claude Code. The channel's checks are the last ones before the bytes
+leave KalaReach. When the worker closes the channel, the channel ends its session with Claude Code
+and exits 1. When Claude Code closes its end, the channel exits 0.
 
 ## Platforms
 
@@ -230,9 +362,10 @@ Where the platform has a private socket, the endpoint is one inside the worker's
 runtime directory, and the kernel names every connecting process. Elsewhere the endpoint is
 loopback, and the credential is the whole authentication. On a platform where the host cannot prove
 that a file is closed to other accounts, it writes neither the credential file nor the registration
-that names it, so no bridge is admitted there. A forwarder whose environment names a registration
-it cannot read answers its hooks with `{}` and ends its channel with a failure before the
-handshake, which Claude Code shows as a failed server.
+that names it, so no bridge is admitted there, and a command the shell asks about gets no backend
+and runs as typed. A forwarder whose environment names a registration it cannot read answers its
+hooks with `{}` and ends its channel with a failure before the handshake, which Claude Code shows as
+a failed server.
 
 ## What admission does not prove
 
@@ -240,3 +373,8 @@ Admission proves that a connection belongs to this launch and this installation.
 the forwarder's reports true. Code running as the same user, a tool command Claude runs included,
 can read the credential file and start the forwarder itself. Section 11 places arbitrary code under
 the account inside the operating system's trust boundary, and this bridge claims nothing beyond it.
+
+The image check proves what the process ran when it was read. A process that execs other code after
+the check and before its bridge is answered has that bridge admitted, and its next bridge refused.
+Holding a bridge to its program for as long as it is open would need the operating system to report
+the exec and revoke the bridge.

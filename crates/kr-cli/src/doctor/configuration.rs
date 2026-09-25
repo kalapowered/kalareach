@@ -11,6 +11,8 @@
 
 use std::path::PathBuf;
 
+use kr_client::shown;
+use kr_client::shown::Shown;
 use kr_ipc::paths::EnvironmentPaths;
 use kr_protocol::hostinfo::configuration::{self, Change};
 
@@ -44,16 +46,25 @@ pub fn load(paths: &EnvironmentPaths) -> configuration::Loaded {
 ///
 /// # Errors
 ///
-/// Returns [`CliError::Usage`] when the edit is refused, and [`CliError::Ipc`] when the document
-/// cannot be written.
+/// Returns [`CliError::Usage`] when the edit is refused, and [`CliError::Ipc`] when the
+/// environment's directories cannot be made or checked, or the document cannot be written.
 pub fn apply(paths: &EnvironmentPaths, change: &Change) -> Result<u64> {
+    // An edit is a first use of the environment as much as a daemon's start is: on a host where no
+    // daemon has run yet, the state directory the lock lives in does not exist. It is made here,
+    // owner-only and checked, exactly as a daemon makes it.
+    paths.create()?;
     // The same lock the host takes, so a setting written here and one written by the daemon are
     // one edit at a time rather than two writers racing for the same revision.
-    let held = configuration::lock(paths.state_dir()).map_err(CliError::Usage)?;
-    let edited = configuration::edit(&load(paths), change)
-        .map_err(|refused| CliError::Usage(refused.to_string()))?;
-    configuration::still_current(&edited, &load(paths))
-        .map_err(|refused| CliError::Usage(refused.to_string()))?;
+    // The lock's own sentence names the directory it could not lock and why; this says the same
+    // of the directory this command was given, without repeating a library's text.
+    let held = configuration::lock(paths.state_dir()).map_err(|_| {
+        CliError::Usage(shown!(
+            "the configuration lock in {} is held by another writer or could not be taken",
+            Shown::root(paths.state_dir())
+        ))
+    })?;
+    let edited = configuration::edit(&load(paths), change).map_err(|refused| refusal(&refused))?;
+    configuration::still_current(&edited, &load(paths)).map_err(|refused| refusal(&refused))?;
     let path = document_path(paths);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -62,4 +73,50 @@ pub fn apply(paths: &EnvironmentPaths, change: &Change) -> Result<u64> {
         .map_err(CliError::Ipc)?;
     drop(held);
     Ok(edited.revision)
+}
+
+/// What a refused edit says: the configuration's own sentences, as its export rule says them.
+fn refusal(refused: &configuration::EditRefused) -> CliError {
+    CliError::Usage(match refused {
+        configuration::EditRefused::NotOurs(sentence) => Shown::sentence(sentence),
+        configuration::EditRefused::Invalid(sentences) => {
+            Shown::joined(sentences.iter().map(Shown::sentence), "; ")
+        }
+        configuration::EditRefused::Busy(_) => {
+            Shown::said("another writer is applying an edit to this configuration")
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use kr_protocol::hostinfo::export::Sentence;
+
+    use super::*;
+    use crate::shown::marker::{MARKER, assert_unmarked, failure_renderings};
+
+    /// A refused edit says the configuration's own sentences, and a sentence that arrived from a
+    /// document rather than being composed here is said by its class and length.
+    #[test]
+    fn a_refused_edit_does_not_repeat_a_sentence_that_arrived() {
+        let arrived: Sentence =
+            serde_json::from_value(serde_json::json!(MARKER)).expect("a sentence on the wire");
+        for refused in [
+            configuration::EditRefused::NotOurs(arrived.clone()),
+            configuration::EditRefused::Invalid(vec![arrived.clone()]),
+            configuration::EditRefused::Busy(MARKER.to_owned()),
+        ] {
+            // The negative control: the refusal's own text, which the command reported whole,
+            // repeats it.
+            assert!(refused.to_string().contains(MARKER), "{refused}");
+            assert_unmarked("a refused edit", &failure_renderings(refusal(&refused)));
+        }
+        let composed = Sentence::new()
+            .stated("this document is at version ")
+            .number(99);
+        assert_eq!(
+            refusal(&configuration::EditRefused::NotOurs(composed)).to_string(),
+            "this document is at version 99"
+        );
+    }
 }

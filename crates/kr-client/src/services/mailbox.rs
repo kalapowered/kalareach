@@ -369,8 +369,10 @@ impl MailboxClient {
         }
         let stored = envelope.stored_bytes();
         if stored > MAX_MAILBOX_ITEM_BYTES {
-            return Err(malformed(format!(
-                "one stored item is at most {MAX_MAILBOX_ITEM_BYTES} bytes and this one is {stored}"
+            return Err(malformed(crate::shown!(
+                "one stored item is at most {} bytes and this one is {}",
+                MAX_MAILBOX_ITEM_BYTES,
+                stored
             )));
         }
 
@@ -475,13 +477,12 @@ impl MailboxClient {
             // this module already gives a managed service that did not answer what the call
             // needed, so `retry` waits and asks again rather than sending a person to their
             // settings.
-            MailboxAnswer::ClaimRequired(_) => {
-                Err(ClientError::Host(kr_protocol::error::ProtocolError::new(
-                    ErrorCode::UpstreamUnavailable,
-                    "this mailbox handed out a newer challenge than the one this read answered"
-                        .to_owned(),
-                )))
-            }
+            MailboxAnswer::ClaimRequired(_) => Err(ClientError::refusal(
+                ErrorCode::UpstreamUnavailable,
+                crate::shown::Shown::said(
+                    "this mailbox handed out a newer challenge than the one this read answered",
+                ),
+            )),
         }
     }
 
@@ -529,8 +530,10 @@ pub const MAX_MAILBOX_POSITION: u64 = (1 << 53) - 1;
 /// Refuses a position no mailbox could have issued, before anything is sent.
 fn a_position(sequence: u64) -> Result<()> {
     if sequence > MAX_MAILBOX_POSITION {
-        return Err(malformed(format!(
-            "a mailbox position is at most {MAX_MAILBOX_POSITION} and this one is {sequence}"
+        return Err(malformed(crate::shown!(
+            "a mailbox position is at most {} and this one is {}",
+            MAX_MAILBOX_POSITION,
+            sequence
         )));
     }
     Ok(())

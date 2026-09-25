@@ -302,12 +302,31 @@ pub enum RestorationStep {
 }
 
 /// A restoration step taken out of order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("the stream is at {step:?} and cannot take that step")]
+#[derive(Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the stream is {step} and cannot take that step")]
 pub struct OutOfOrder {
     /// The step the stream is actually at.
     pub step: RestorationStep,
 }
+
+crate::debug_as_display!(OutOfOrder);
+
+impl crate::shown::Said for RestorationStep {
+    fn said(&self) -> crate::shown::Shown {
+        match self {
+            Self::SubscribeFrom(cursor) => {
+                crate::shown!("waiting to subscribe from cursor {}", *cursor)
+            }
+            Self::SubscribeFromStart => {
+                crate::shown::Shown::said("waiting to subscribe from the start")
+            }
+            Self::InstallSnapshot => crate::shown::Shown::said("installing a snapshot"),
+            Self::Live => crate::shown::Shown::said("live"),
+        }
+    }
+}
+
+crate::display_as_said!(RestorationStep);
 
 /// Drives one stream through the restoration order.
 #[derive(Clone, Debug)]

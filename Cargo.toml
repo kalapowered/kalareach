@@ -30,6 +30,8 @@ members = [
     "crates/kr-voice",
     "crates/kr-worker",
     "tests/conformance",
+    "tests/e2e/m1b",
+    "tests/integration/backup",
     "tests/integration/sync",
 ]
 
@@ -172,10 +174,15 @@ spake2 = "=0.4.0"
 subtle = "=2.6.1"
 sysctl = "=0.6.0"
 sysinfo = "=0.33.1"
+# The windowing library Tauri draws with, for a test that needs a window of its own.
+tao = { version = "=0.35.3", default-features = false }
 # `custom-protocol` is what makes a built application serve its interface from the bundle instead
 # of from a development server. It is not implied by an optimised profile.
 tauri = { version = "=2.11.5", default-features = false, features = ["common-controls-v6", "wry"] }
 tauri-build = { version = "=2.6.3", default-features = false }
+# The companion reads an invitation from the pasteboard in native code, so the text never passes
+# through the page.
+tauri-plugin-clipboard-manager = "=2.3.3"
 tauri-plugin-dialog = "=2.7.3"
 tauri-plugin-opener = "=2.5.5"
 tempfile = "=3.27.0"
@@ -186,8 +193,10 @@ thread-priority = "=3.1.1"
 toml_edit = "=0.25.15"
 tokio-rustls = { version = "=0.26.5", default-features = false, features = ["logging", "ring", "tls12"] }
 # The Update Framework client. The same exact release the catalogue publishing pipeline signs with,
-# so the end that writes a generation and the end that verifies one run the same code.
-tough = { version = "=0.24.0", features = ["http"] }
+# so the end that writes a generation and the end that verifies one run the same code. Its own HTTP
+# client is not built: it follows the environment's proxy variables and the platform verifier's
+# certificate variables, and the catalogue fetches through a transport the host builds instead.
+tough = "=0.24.0"
 tokio-util = "=0.7.18"
 # The rendezvous room's WebSocket. The client opens it on a TLS stream it has already verified, and
 # `ring` is the digest provider every other TLS user here is built on.
@@ -208,7 +217,11 @@ wezterm-escape-parser = { git = "https://github.com/kalapowered/wezterm", rev = 
 wezterm-surface = { git = "https://github.com/kalapowered/wezterm", rev = "9a9015119497fd5803c35a10ea4ffc503f2a7dfb" }
 wezterm-term = { git = "https://github.com/kalapowered/wezterm", rev = "9a9015119497fd5803c35a10ea4ffc503f2a7dfb" }
 widestring = "=1.2.0"
-windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
+# Windows Hello for the companion's owner confirmations: the consent verifier and its window
+# interop, and the asynchronous operation it answers with. Both versions are already in the lock.
+windows = { version = "=0.61.3", default-features = false }
+windows-future = { version = "=0.2.1", default-features = false }
+windows-sys = { version = "=0.61.2", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
 wit-parser = "=0.259.0"
 zeroize = { version = "=1.9.0", features = ["derive"] }
 

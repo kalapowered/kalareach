@@ -178,8 +178,9 @@ against that class, so an action cannot acquire rights by calling itself somethi
 | `approval.respond` | yes | `agent.approval.respond` | `approval.respond` |
 | `terminal.input` | yes | `terminal.input` | `terminal.input` |
 
-`approval.decode` needs no action right because decoding proposes a resource rather than answering
-one. The trust to decode is recorded against the publisher and its methods, separately from the
+A caller acting under a grant needs every right in that column for the action it invokes, whatever
+the action is called. `approval.decode` needs no action right because decoding proposes a resource
+rather than answering one. The trust to decode is recorded against the publisher and its methods, separately from the
 action vocabulary, and answering still needs `agent.approval.respond`.
 
 A control may name only an action the manifest registers, so the class the broker enforces is
@@ -339,7 +340,11 @@ component fault disables rich meaning without stalling or discarding valid nativ
 - **Decision destination:** for a table that answers approvals, the method that carries an answer,
   the method whose requests it answers, where the answer repeats the request's identifier and puts
   the decision, and the application's own value for each decision. A table that answers none says
-  `null`.
+  `null`. The destination is also what an installation's `approval.decode` grant trusts a package
+  to interpret: exactly the requests it answers, whether the table's own reading or the package's
+  component interprets them. A table that answers none gives its package no such trust, so a
+  protocol whose answer is a response to the request itself, rather than a request of its own, is
+  answered by the native client alone.
 - **Protocol pin:** the upstream protocol name, the versions the table was qualified against and
   the exact version the publisher tested.
 

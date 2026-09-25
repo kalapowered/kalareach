@@ -13,6 +13,8 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 
+import type { EventsSnapshotResult } from '@kalareach/protocol'
+
 import type { AccountView, UsageView } from '../model/account'
 
 import type {
@@ -23,10 +25,11 @@ import type {
   HostEvent,
   HostPort,
   ImportedImage,
-  OwnerPresence,
-  ProjectedScreen,
-  RendezvousOrigin,
-  ScannedCode,
+  OwnerView,
+  PairingOrigin,
+  PairingView,
+  PasteView,
+  ReviewOutcome,
   SessionSubject,
   Settled,
   SettingsPane,
@@ -47,6 +50,23 @@ export const DROPPED_EVENT = 'kr://dropped'
 
 /** The event the backend publishes the account's view on when it changes by itself. */
 export const ACCOUNT_EVENT = 'kr://account'
+
+/** The event the backend publishes the pairing screen's state on. */
+export const PAIRING_EVENT = 'kr://pairing'
+
+/** The event the backend publishes the owner confirmations on. */
+export const CONFIRMATIONS_EVENT = 'kr://confirmations'
+
+/**
+ * Listens for one backend event. Resolves, with the function that stops listening, once the
+ * listener is registered: the shell registers it asynchronously, and drops what it publishes
+ * before then.
+ */
+function listening<T>(event: string, listener: (payload: T) => void): Promise<() => void> {
+  return listen<T>(event, (published) => {
+    listener(published.payload)
+  })
+}
 
 /**
  * The refusal for an operation this build has no agreed shape for.
@@ -89,6 +109,7 @@ export function tauriPort(): HostPort {
 
   return {
     connectionState: () => call<ConnectionState>('connection_state', {}),
+    onConnection: (listener) => listening<ConnectionState>(CONNECTION_EVENT, listener),
 
     hostInfo: () => call('host_info', {}),
     environmentList: () => call('environment_list', {}),
@@ -144,7 +165,10 @@ export function tauriPort(): HostPort {
     storageStatus: () => noAgreedShape('what this host retains'),
     storageObjectDelete: () => noAgreedShape('deleting a retained artefact'),
 
-    terminalProjection: (params) => read<ProjectedScreen>('events_snapshot', params),
+    eventsSnapshot: (params) => read<EventsSnapshotResult>('events_snapshot', params),
+    // No command answers a projected screen: `events_snapshot` answers the session's state, which
+    // has no rows, so the screen is refused rather than read from a shape it is not.
+    terminalProjection: () => noAgreedShape('the projected screen'),
     terminalInput: (params) => read('input_write', params),
     attachmentViewport: (params, subject) =>
       mutate<Settled>('attachment_viewport', params, subject),
@@ -169,10 +193,18 @@ export function tauriPort(): HostPort {
     voiceSetMuted: (what, muted) => call<VoiceCallState>('voice_set_muted', { what, muted }),
     voiceCallState: () => call<VoiceCallState>('voice_call_state', {}),
 
-    pairingOrigin: () => call<RendezvousOrigin>('pairing_origin', {}),
-    pairingSetOrigin: (origin) => call<RendezvousOrigin>('pairing_set_origin', { origin }),
-    pairingScan: (payload) => call<ScannedCode>('pairing_scan', { payload }),
-    pairingVerifyOwner: (reason) => call<OwnerPresence>('pairing_verify_owner', { reason }),
+    pairingView: () => call<PairingView>('pairing_view', {}),
+    pairingSetOrigin: (origin) => call<PairingOrigin>('pairing_set_origin', { origin }),
+    pairingStartCode: (code) => call<undefined>('pairing_start_code', { code }),
+    pairingPaste: () => call<PasteView>('pairing_paste', {}),
+    pairingStartRead: () => call<undefined>('pairing_start_read', {}),
+    pairingStop: () => call<undefined>('pairing_stop', {}),
+    onPairing: (listener) => listening<PairingView>(PAIRING_EVENT, listener),
+
+    ownerConfirmations: () => call<OwnerView>('owner_confirmations', {}),
+    ownerConfirmationReview: (reference) =>
+      call<ReviewOutcome>('owner_confirmation_review', { request: { reference } }),
+    onConfirmations: (listener) => listening<OwnerView>(CONFIRMATIONS_EVENT, listener),
 
     openExternal: (url) => call<ApprovedLink>('open_external', { url }),
     importRemoteImage: (url) => call<ImportedImage>('import_remote_image', { url }),
@@ -205,74 +237,30 @@ export function tauriPort(): HostPort {
     accountSignInCancel: () => call<undefined>('account_sign_in_cancel', {}),
     accountSignOut: () => call<AccountView>('account_sign_out', {}),
     accountUsage: () => call<UsageView>('account_usage', {}),
-    onAccount(listener: (view: AccountView) => void) {
-      let stop: (() => void) | null = null
-      let cancelled = false
-      void listen<AccountView>(ACCOUNT_EVENT, (event) => {
-        listener(event.payload)
-      }).then((unlisten) => {
-        if (cancelled) unlisten()
-        else stop = unlisten
-      })
-      return () => {
-        cancelled = true
-        stop?.()
-      }
-    },
+    onAccount: (listener) => listening<AccountView>(ACCOUNT_EVENT, listener),
 
-    subscribe(listener: (event: HostEvent) => void) {
-      const stops: (() => void)[] = []
-      let cancelled = false
-      const keep = (unlisten: () => void) => {
-        if (cancelled) unlisten()
-        else stops.push(unlisten)
-      }
-
-      void listen<PublishedEvent>(HOST_EVENT, (event) => {
+    subscribe: (listener: (event: HostEvent) => void) =>
+      listening<PublishedEvent>(HOST_EVENT, (published) => {
         listener({
-          stream_id: event.payload.stream_id,
-          sequence: event.payload.sequence,
-          body: { kind: event.payload.event_type, payload: event.payload.payload }
+          stream_id: published.stream_id,
+          sequence: published.sequence,
+          body: { kind: published.event_type, payload: published.payload }
         })
-      }).then(keep)
+      }),
 
-      void listen<ConnectionState>(CONNECTION_EVENT, (event) => {
-        listener({
-          stream_id: '',
-          sequence: '',
-          body: { kind: 'connection', connected: event.payload.connected }
-        })
-      }).then(keep)
-
-      return () => {
-        cancelled = true
-        for (const stop of stops) stop()
-      }
-    },
-
-    onFilesDropped(listener: (files: readonly DroppedFile[]) => void) {
-      let stop: (() => void) | null = null
-      let cancelled = false
-      // The backend records the paths first and then publishes them, so a path the page sees here
-      // is one the backend will accept for exactly one upload.
-      void listen<string[]>(DROPPED_EVENT, (event) => {
+    // The backend records the paths first and then publishes them, so a path the page sees here is
+    // one the backend will accept for exactly one upload.
+    onFilesDropped: (listener: (files: readonly DroppedFile[]) => void) =>
+      listening<string[]>(DROPPED_EVENT, (paths) => {
         listener(
-          event.payload.map((path) => ({
+          paths.map((path) => ({
             name: path.split(/[\\/]/).pop() ?? path,
             media_type: 'application/octet-stream',
             byte_len: 0,
             path
           }))
         )
-      }).then((unlisten) => {
-        if (cancelled) unlisten()
-        else stop = unlisten
       })
-      return () => {
-        cancelled = true
-        stop?.()
-      }
-    }
   }
 }
 

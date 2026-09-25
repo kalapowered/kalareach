@@ -2107,15 +2107,130 @@ fn authority_revision(
     .expect("the durable authority revision")
 }
 
+/// KR-REQ-26.16: a ceiling whose fence debt cannot be written down does not change. A narrowing is
+/// a restrictive change, and its debt is written before the ceiling moves; a debt that cannot be
+/// written leaves the ceiling in force as it was, withdraws nothing, owes no fence, and says so.
+/// Once the debt can be written, the next reading narrows the ceiling and raises its fence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ceiling_whose_fence_debt_cannot_be_written_does_not_change() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let environment_id = temp.environment_id();
+    let controller = start_controller(&environment, environment_id).await;
+    controller
+        .apply_configuration(&Change::GrantRights(Some(vec![
+            ActionRight::SessionView.as_str().to_owned(),
+            ActionRight::SessionRename.as_str().to_owned(),
+        ])))
+        .await
+        .expect("a ceiling this host accepts");
+    let fenced_once = authority_revision(&environment);
+    let registry =
+        kr_controller::registry::Registry::open(environment.registry_database(), environment_id)
+            .expect("this environment's registry");
+    let blocker = rusqlite::Connection::open(environment.registry_database())
+        .expect("a second connection to this environment's registry");
+    blocker
+        .execute_batch(
+            "CREATE TRIGGER refuse_debt BEFORE INSERT ON fence_debt
+             BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+        )
+        .expect("no debt can be written");
+
+    let mut narrowed = ConfigurationDocument::empty();
+    narrowed.revision = 2;
+    narrowed.ceilings.grant_rights =
+        Nullable::some(vec![ActionRight::SessionView.as_str().to_owned()]);
+    write_document(&environment, &narrowed);
+    let effective = controller.effective_configuration().await;
+    let problem = effective
+        .not_in_force
+        .as_ref()
+        .expect("the report says the document is not in force")
+        .as_str()
+        .to_owned();
+    assert!(
+        problem.contains("the rights ceiling did not change"),
+        "{problem}"
+    );
+    assert!(!problem.contains("no room"), "{problem}");
+    // The ceiling in force is the one kept, and the report does not name this document as its
+    // source.
+    let rights = effective
+        .ceilings
+        .iter()
+        .find(|ceiling| ceiling.key.contains("grant_rights"))
+        .expect("the rights ceiling is reported");
+    assert!(
+        rights.origin.0.is_none(),
+        "the kept ceiling is not the document's: {rights:?}"
+    );
+    assert!(
+        rights
+            .value
+            .as_str()
+            .contains(ActionRight::SessionRename.as_str()),
+        "the kept ceiling still carries what the document would have removed: {rights:?}"
+    );
+    assert_eq!(
+        registry
+            .authority_revision()
+            .expect("the durable authority revision"),
+        fenced_once,
+        "nothing was withdrawn, so nothing was fenced"
+    );
+    controller
+        .check_admission(
+            &registry,
+            &kr_controller::authority::AdmittedMutation {
+                connection_id: kr_protocol::ids::ConnectionId::new(
+                    kr_protocol::scalars::Uuid::from_bytes([7; 16]),
+                ),
+                admitted_revision: fenced_once,
+                deadline: None,
+            },
+        )
+        .map(|_| ())
+        .or_else(|refused| {
+            // A connection that was never registered is refused for that, and for nothing a
+            // fence owes.
+            if format!("{refused}").contains("could not be raised") {
+                Err(refused)
+            } else {
+                Ok(())
+            }
+        })
+        .expect("no fence is owed for a ceiling that did not move");
+
+    // The control: once the debt can be written, the next reading narrows the ceiling and fences.
+    blocker
+        .execute_batch("DROP TRIGGER refuse_debt;")
+        .expect("debts can be written");
+    drop(blocker);
+    let effective = controller.effective_configuration().await;
+    assert!(
+        effective.not_in_force.0.is_none(),
+        "{:?}",
+        effective.not_in_force
+    );
+    assert!(
+        registry
+            .authority_revision()
+            .expect("the durable authority revision")
+            > fenced_once,
+        "the narrowing raised its fence"
+    );
+}
+
 /// KR-REQ-26.16: a withdrawal whose fence could not be raised stops the dispatch it would have
 /// fenced.
 ///
-/// The failure this covers is the one a startup check cannot see: the registry write fails while
-/// this host is already serving. The revision therefore does not advance, so every connection is
-/// still registered at the revision in force and every admission still stands. What has to stop is
-/// dispatch, because the ceiling the document withdrew is gone and the work admitted under it is
-/// not. The write is made to fail for real - another writer holds the registry's write lock, which
-/// is what a second daemon or a stalled transaction does - rather than by a flag a test sets.
+/// The failure this covers is the one a startup check cannot see: the revision's write fails while
+/// this host is already serving, after the narrower ceiling and its debt are in place. The revision
+/// therefore does not advance, so every connection is still registered at the revision in force and
+/// every admission still stands. What has to stop is dispatch, because the ceiling the document
+/// withdrew is gone and the work admitted under it is not. The write is made to fail for real, by
+/// a trigger on the registry's revision, rather than by a flag a test sets.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fence_that_could_not_be_raised_stops_dispatch_and_says_so() {
     let temp = kr_ipc::testing::TempHost::create();
@@ -2140,14 +2255,16 @@ async fn a_fence_that_could_not_be_raised_stops_dispatch_and_says_so() {
         kr_controller::registry::Registry::open(environment.registry_database(), environment_id)
             .expect("this environment's registry");
 
-    // Another writer takes the registry's write lock and keeps it. Reads go on - this is WAL -
-    // so everything the acceptance has to read still answers, and the one thing that cannot
-    // happen is the revision advancing.
+    // The revision cannot advance from here; everything else the acceptance writes, its debt
+    // among it, still lands.
     let blocker = rusqlite::Connection::open(environment.registry_database())
         .expect("a second connection to this environment's registry");
     blocker
-        .execute_batch("BEGIN EXCLUSIVE")
-        .expect("another writer holds the registry");
+        .execute_batch(
+            "CREATE TRIGGER refuse_revision BEFORE UPDATE OF authority_revision ON environment
+             BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+        )
+        .expect("the revision cannot advance");
 
     // The ceiling is narrowed by an edit made outside this daemon, which is a withdrawal of
     // authority and owes a fence.
@@ -2181,7 +2298,7 @@ async fn a_fence_that_could_not_be_raised_stops_dispatch_and_says_so() {
         "the registry's own message is measured rather than repeated: {problem}"
     );
     assert!(
-        !problem.contains("database is locked"),
+        !problem.contains("no room"),
         "and none of it reaches the report: {problem}"
     );
 
@@ -2236,11 +2353,11 @@ async fn a_fence_that_could_not_be_raised_stops_dispatch_and_says_so() {
     );
     write_document(&environment, &narrowed);
 
-    // The other writer finishes. The next reading raises the fence this host owed, the revision
-    // advances, and dispatch is served again.
+    // The revision can advance again. The next reading raises the fence this host owed, the
+    // revision advances, and dispatch is served again.
     blocker
-        .execute_batch("COMMIT")
-        .expect("the other writer finishes");
+        .execute_batch("DROP TRIGGER refuse_revision;")
+        .expect("the revision can advance");
     drop(blocker);
     let effective = controller.effective_configuration().await;
     assert!(

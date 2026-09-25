@@ -45,6 +45,17 @@
 //!
 //! Until one of the two happens the store writes nothing further, which is what keeps this device
 //! from ever meeting its own earlier write and being told another device wrote.
+//!
+//! A write that never left is the one exception, and the service is what says it never left:
+//! [`SyncBackupService::compare_exchange_dispatched`] answers [`SyncDispatch::NotSent`] for a
+//! request it refused before anything was sent, for want of an account token, for a signing
+//! instant outside the service's window or for any other reason of its own. Nothing can run under
+//! that identity, so the store puts back what the call found, the record on the disk included as
+//! far as the disk allows, reports [`RecoveryError::BundleNotSent`], and the next write goes out. A
+//! record the disk would not take back is a write that never left and still reads as outstanding
+//! after a restart, and [`BundleStore::end_lost_write`] ends it once the service can be asked: a
+//! fence, and a read after it where the fence cannot say the write never ran. Everything after the
+//! request left stays unknown.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -54,28 +65,51 @@ use kr_protocol::archive::{
     ArchiveCheckpoint, RECOVERY_BUNDLE_SCHEMA_VERSION, RecoveryBundle, RecoveryContext,
     RecoveryKit, TrustedProducer, TrustedWriter,
 };
-use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::SyncConflictId;
 use kr_protocol::scalars::{
     Bytes, Digest256, KeyId, Nullable, StoredEnvelopeKey, TimestampMs, U64,
 };
+use kr_protocol::sync::{MAX_SEALED_RECOVERY_BUNDLE_BYTES, SyncObjectKind};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ClientError;
 use crate::recovery::record::{Known, RecordFile, WriteRecord};
 use crate::recovery::{RecoveryError, Result};
 use crate::services::{
-    SyncBackupService, SyncExchanged, SyncFetched, SyncPosition, SyncRequestFence, nothing_held,
+    SyncBackupService, SyncDispatch, SyncExchanged, SyncFetched, SyncPosition, SyncRequestFence,
+    nothing_held,
 };
 
 /// Returns the collection name one bundle is stored under.
 ///
-/// It is the locator itself. The locator is opaque and stable, which is the whole point of it:
+/// It is the bundle's kind and its locator, as every synchronised object's collection is named by
+/// its kind and its identity. The locator is opaque and stable, which is the whole point of it:
 /// bundle updates go to the same name for the life of the kit, so enabling a new writer never
-/// means reprinting the seed.
+/// means reprinting the seed. A managed service addresses the locator for the whole origin, so a
+/// device that holds only the kit reaches the same collection the owner's devices write.
 #[must_use]
-pub fn bundle_collection(context: &RecoveryContext) -> &str {
-    &context.bundle_locator
+pub fn bundle_collection(context: &RecoveryContext) -> String {
+    format!(
+        "{}/{}",
+        SyncObjectKind::RecoveryBundle,
+        context.bundle_locator
+    )
+}
+
+/// Draws a locator for a new recovery kit: a random identifier in its canonical spelling.
+///
+/// It is drawn from the operating system's generator, as every request identity is, so two owners
+/// never draw the same one. It leaves this device first in the bundle's first write, before the kit
+/// that prints it exists, so the service that write reaches is the first to see it.
+///
+/// # Errors
+///
+/// Returns [`RecoveryError::Service`] when this device could not produce random bytes.
+pub fn fresh_locator() -> Result<String> {
+    Ok(kr_transport::random::fresh_uuid_v4()
+        .map_err(ClientError::from)?
+        .to_string())
 }
 
 /// What became of a bundle write whose answer never arrived.
@@ -154,8 +188,10 @@ impl std::fmt::Debug for BundleStore {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("BundleStore")
-            .field("service_origin", &self.context.service_origin)
-            .field("bundle_locator", &self.context.bundle_locator)
+            .field(
+                "service_origin",
+                &crate::shown::Shown::address(&self.context.service_origin),
+            )
             .field("position", &self.position())
             .field("lost_write", &self.lost_write())
             .finish_non_exhaustive()
@@ -311,7 +347,7 @@ impl BundleStore {
     async fn fence(&self, record: &WriteRecord) -> Result<SyncRequestFence> {
         self.service
             .fence_request(
-                bundle_collection(&self.context),
+                &bundle_collection(&self.context),
                 record.request_id,
                 record.signed_at_ms.get(),
                 record.signed_at_ms.get(),
@@ -570,7 +606,10 @@ impl BundleStore {
     ///
     /// Returns [`RecoveryError::BundleConflict`] when the service refused the comparison because
     /// another device wrote first, [`RecoveryError::BundleOutcomeUnknown`] when the answer never
-    /// came back, [`RecoveryError::BundleWriteUnsettled`] when a previous write is still
+    /// came back, [`RecoveryError::BundleNotSent`] when the write was refused before anything
+    /// left this device, which leaves the store as it was, [`RecoveryError::BundleTooLarge`] for
+    /// a bundle sealed past the bound a service keeps, which is refused before anything is
+    /// recorded, [`RecoveryError::BundleWriteUnsettled`] when a previous write is still
     /// outstanding, [`RecoveryError::Storage`] or [`RecoveryError::UnreadableWriteRecord`] when the
     /// record of the write cannot be written, in which case nothing is sent, and
     /// [`RecoveryError::BundleNotAWrite`], [`RecoveryError::BundleWentBack`],
@@ -611,6 +650,14 @@ impl BundleStore {
         candidate.written_at_ms = now_ms;
         let key = seed.bundle_key_for(&self.context)?;
         let ciphertext = kr_crypto::archive::encrypt_recovery_bundle(&key, &candidate)?;
+        // A bundle no service keeps is refused before anything is recorded or sent, so a store
+        // never holds a record of a write that could not have been made.
+        if ciphertext.len() as u64 > MAX_SEALED_RECOVERY_BUNDLE_BYTES {
+            return Err(RecoveryError::BundleTooLarge {
+                len: ciphertext.len(),
+                limit: MAX_SEALED_RECOVERY_BUNDLE_BYTES,
+            });
+        }
         let sent = sealed_digest(&ciphertext);
         let request_id = kr_transport::random::fresh_uuid_v4().map_err(ClientError::from)?;
         // Recorded before the call and not after it, because the case this is for is the one where
@@ -628,11 +675,11 @@ impl BundleStore {
             known: Known::Unsettled,
         };
         self.file.save(&record)?;
-        self.last_write = Some(record);
+        let previous = self.last_write.replace(record);
         match self
             .service
-            .compare_exchange(
-                bundle_collection(&self.context),
+            .compare_exchange_dispatched(
+                &bundle_collection(&self.context),
                 request_id,
                 now_ms.get(),
                 expected,
@@ -640,7 +687,18 @@ impl BundleStore {
             )
             .await
         {
-            Ok(SyncExchanged::Applied { position }) => {
+            // Refused before anything left: nothing can run under the identity, so the store is put
+            // back as the call found it. The record on the disk goes back too, as far as the disk
+            // allows; one it would not take back reads after a restart as a write outstanding,
+            // which ending the lost write settles, and this process goes on from the record it had.
+            Ok(SyncDispatch::NotSent(refused)) => {
+                let _ = self.file.restore(previous.as_ref());
+                self.last_write = previous;
+                Err(RecoveryError::BundleNotSent {
+                    source: Box::new(refused),
+                })
+            }
+            Ok(SyncDispatch::Answered(SyncExchanged::Applied { position })) => {
                 // A position this device cannot read leaves the write outstanding rather than
                 // recorded: the service says it applied the write, and where it says it landed is
                 // somewhere no write of this bundle can be. Ending the request is then what
@@ -655,7 +713,7 @@ impl BundleStore {
                 *bundle = candidate;
                 Ok(position)
             }
-            Ok(SyncExchanged::Refused { retained, .. }) => {
+            Ok(SyncDispatch::Answered(SyncExchanged::Refused { retained, .. })) => {
                 // A refusal is an answer: the service compared, the comparison did not hold, and
                 // the bundle this device sent was not written. Nothing is outstanding.
                 self.answered();
@@ -664,13 +722,17 @@ impl BundleStore {
             // Refused as signed before the service's cutoff: this write ran nothing. This store
             // concludes no more from that than from a write that was never answered, so the write
             // stays outstanding until it is ended, as one would.
-            Ok(SyncExchanged::SignedBeforeCutoff) => Err(RecoveryError::BundleOutcomeUnknown {
-                sent,
-                source: Box::new(ClientError::Host(ProtocolError::new(
-                    ErrorCode::PermissionDenied,
-                    "the service refused the write as signed before its cutoff, and ran nothing",
-                ))),
-            }),
+            Ok(SyncDispatch::Answered(SyncExchanged::SignedBeforeCutoff)) => {
+                Err(RecoveryError::BundleOutcomeUnknown {
+                    sent,
+                    source: Box::new(ClientError::refusal(
+                        ErrorCode::PermissionDenied,
+                        crate::shown::Shown::said(
+                            "the service refused the write as signed before its cutoff, and ran nothing",
+                        ),
+                    )),
+                })
+            }
             // Anything else stopped the exchange from being answered at all, and an exchange that
             // was not answered may still have been executed. This device concludes nothing from it
             // and says so, which is the safe direction.
@@ -896,7 +958,9 @@ impl BundleStore {
     /// [`RecoveryError::DestinationHoldsABundle`] when the destination store has read a bundle
     /// there, [`RecoveryError::BundleConflict`] when the old location has moved on,
     /// [`RecoveryError::BundleNotAuthentic`] when the bundle does not read back at the new
-    /// location, and whatever [`Self::commit`] returns for the write itself.
+    /// location, and whatever [`Self::commit`] returns for the write itself: among it
+    /// [`RecoveryError::BundleNotSent`] for a destination write refused before anything left,
+    /// which leaves both locations and both stores as they were, so the move can be made again.
     pub async fn migrate(
         &mut self,
         seed: &RecoverySeed,
@@ -1157,7 +1221,7 @@ impl BundleStore {
             vec![destination.service_origin.clone()],
             destination.bundle_locator.clone(),
         );
-        drop(crate::recovery::kit::render(&updated_kit)?);
+        drop(crate::recovery::kit::render_kit(&updated_kit)?);
         Ok(updated_kit)
     }
 
@@ -1211,12 +1275,29 @@ impl BundleStore {
 ///
 /// It is returned by [`BundleStore::enable_writer`] and built nowhere else, so holding one is
 /// holding the ordering section 20 requires.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct WriterEnabled {
     writer_key_id: KeyId,
     context: RecoveryContext,
     bundle_revision: u64,
     bundle_position: SyncPosition,
+}
+
+impl std::fmt::Debug for WriterEnabled {
+    /// The writer, the origin as a diagnostic names one, and where the bundle stands; never the
+    /// locator.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WriterEnabled")
+            .field("writer_key_id", &self.writer_key_id)
+            .field(
+                "service_origin",
+                &crate::shown::Shown::address(&self.context.service_origin),
+            )
+            .field("bundle_revision", &self.bundle_revision)
+            .field("bundle_position", &self.bundle_position)
+            .finish_non_exhaustive()
+    }
 }
 
 impl WriterEnabled {
@@ -1253,7 +1334,7 @@ impl WriterEnabled {
 ///
 /// It names both locations, because after a migration both hold bytes: the new one holds the
 /// bundle and the old one holds the copy it superseded, until the service removes it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct MigrationRecord {
     /// Where the bundle was.
     pub from: RecoveryContext,
@@ -1267,26 +1348,58 @@ pub struct MigrationRecord {
     pub verified_at_ms: TimestampMs,
 }
 
+impl std::fmt::Debug for MigrationRecord {
+    /// Both origins as a diagnostic names one and where the bundle stands; never a locator.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MigrationRecord")
+            .field(
+                "from",
+                &crate::shown::Shown::address(&self.from.service_origin),
+            )
+            .field("to", &crate::shown::Shown::address(&self.to.service_origin))
+            .field("bundle_revision", &self.bundle_revision)
+            .field("bundle_position", &self.bundle_position)
+            .field("verified_at_ms", &self.verified_at_ms)
+            .finish_non_exhaustive()
+    }
+}
+
 impl MigrationRecord {
     /// The sentence an owner is shown, which says what to do with the kit they were holding.
     #[must_use]
-    pub fn describe(&self) -> String {
-        format!(
+    pub fn describe(&self) -> crate::shown::Shown {
+        crate::shown!(
             "Your recovery bundle is now at {} under a new locator, and it was read back and \
              authenticated there. Keep the updated kit and destroy the old one: the old kit still \
              opens the copy left at {}, which is the bundle as it was before this move.",
-            self.to.service_origin, self.from.service_origin
+            crate::shown::Shown::address(&self.to.service_origin),
+            crate::shown::Shown::address(&self.from.service_origin)
         )
     }
 }
 
 /// A migration and the kit it obsoletes the old one with.
-#[derive(Debug)]
 pub struct Migrated {
     /// The verified record of the move.
     pub record: MigrationRecord,
     /// The kit a person keeps from now on. The old one points at a location the bundle has left.
     pub updated_kit: RecoveryKit,
+}
+
+impl std::fmt::Debug for Migrated {
+    /// The record, and how many origins the updated kit names; never the kit's origins, locator or
+    /// seed.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Migrated")
+            .field("record", &self.record)
+            .field(
+                "updated_kit_origins",
+                &self.updated_kit.service_origins.len(),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 /// One offline export: the encrypted bundle and the selected archives' own ciphertext.
@@ -1371,7 +1484,7 @@ pub(super) async fn read_bundle(
     seed: &RecoverySeed,
 ) -> Result<Baseline> {
     let (position, ciphertext) = match service
-        .fetch(bundle_collection(context))
+        .fetch(&bundle_collection(context))
         .await
         .map_err(RecoveryError::Service)?
     {
@@ -1492,4 +1605,74 @@ fn diagnose_applied(held: Option<SyncPosition>, found: SyncPosition) -> Result<(
         return Err(RecoveryError::BundleDidNotMoveOn { found });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::rendering::{NEVER_RENDERED, renders_only};
+
+    fn context() -> RecoveryContext {
+        RecoveryContext {
+            service_origin: format!("https://{NEVER_RENDERED}@reach.example/{NEVER_RENDERED}"),
+            bundle_locator: NEVER_RENDERED.to_owned(),
+        }
+    }
+
+    fn position() -> SyncPosition {
+        SyncPosition::at(
+            1,
+            crate::services::SyncRevision::new(kr_protocol::scalars::Uuid::from_bytes([7; 16])),
+            None,
+        )
+    }
+
+    /// A writer's evidence and a finished migration render what they are, exactly: never the
+    /// locator, the origin's credentials, or the updated kit's origins and seed.
+    #[test]
+    fn a_writer_and_a_migration_render_only_what_they_are() {
+        let enabled = WriterEnabled {
+            writer_key_id: kr_protocol::scalars::KeyId::from_bytes([1; 32]),
+            context: context(),
+            bundle_revision: 3,
+            bundle_position: position(),
+        };
+        renders_only(
+            &enabled,
+            "WriterEnabled{writer_key_id:KeyId(AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE),\
+             service_origin:\"<notprinted>\",bundle_revision:3,bundle_position:SyncPosition{\
+             write_sequence:1,revision:Nullable(Some(SyncRevision(Uuid(\
+             07070707-0707-0707-0707-070707070707)))),recovery:Nullable(None)},..}",
+        );
+        let record = MigrationRecord {
+            from: context(),
+            to: RecoveryContext {
+                service_origin: "https://reach.example:8443".to_owned(),
+                bundle_locator: NEVER_RENDERED.to_owned(),
+            },
+            bundle_revision: 4,
+            bundle_position: position(),
+            verified_at_ms: TimestampMs::new(5),
+        };
+        let rendered_record = "MigrationRecord{from:\"<notprinted>\",\
+                               to:\"https://reach.example:8443\",bundle_revision:4,\
+                               bundle_position:SyncPosition{write_sequence:1,revision:Nullable(\
+                               Some(SyncRevision(Uuid(07070707-0707-0707-0707-070707070707)))),\
+                               recovery:Nullable(None)},verified_at_ms:TimestampMs(U64(5)),..}";
+        renders_only(&record, rendered_record);
+        let migrated = Migrated {
+            record,
+            updated_kit: kr_protocol::archive::RecoveryKit {
+                profile_version: kr_protocol::scalars::U64::new(1),
+                seed: kr_protocol::scalars::SecretBytes32::from_bytes([9; 32]),
+                seed_checksum: kr_protocol::scalars::Bytes::new(NEVER_RENDERED.as_bytes().to_vec()),
+                service_origins: vec![NEVER_RENDERED.to_owned()],
+                bundle_locator: NEVER_RENDERED.to_owned(),
+            },
+        };
+        renders_only(
+            &migrated,
+            &format!("Migrated{{record:{rendered_record},updated_kit_origins:1,..}}"),
+        );
+    }
 }
