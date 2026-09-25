@@ -14,11 +14,35 @@
 //! integer. The document that is digested is the document that is sent, so the service recomputes
 //! the digest from the bytes it received and neither half depends on how the other wrote its JSON.
 //!
+//! # A second authorisation
+//!
+//! Some resources belong to an account rather than to the key that asks for them: the storage an
+//! account pays for, and the recovery bundle an account keeps. A request for one carries two
+//! proofs. The credential above says which installation or host is asking and nothing about an
+//! account; an account token says which account is signed in and nothing about the key that holds
+//! it. [`AccountAuthorisation`] is the second proof: where the token comes from, and the scope the
+//! resource reads. The token is taken from its source for each request, before the request is
+//! signed, because a token expires and is replaced, and it travels as the request's
+//! `authorization` header. The signature covers none of it: a service checks the two proofs apart
+//! and binds them to one request itself.
+//!
+//! # Whether a request left
+//!
+//! A caller whose request came back without an answer has one question: can the request have run?
+//! This module answers it exactly, with [`Unanswered`]. Everything it refuses before the transport
+//! is given the request is [`Unanswered::NotSent`]: a body it cannot write, a token its source will
+//! not give, a credential it cannot make or that falls outside the service's clock window, and a
+//! request larger than the method admits. Nothing left this device, so nothing can run. From the
+//! moment the transport is given the request, whatever goes wrong is [`Unanswered::Sent`], an
+//! answer this client cannot read included, because the service may have received the request and
+//! acted on it.
+//!
 //! # What is never rendered
 //!
 //! A request body carries a credential and an answer carries whatever answered, so the types here
 //! write their own [`std::fmt::Debug`] under this module's rule: the method, the signer kind and
-//! the gateway, and nothing that travelled.
+//! the gateway, and nothing that travelled. A second authorisation renders its scope and never its
+//! source or a token.
 
 use std::fmt;
 use std::sync::Arc;
@@ -33,10 +57,68 @@ use kr_protocol::service::{
 };
 use serde::{Deserialize, Serialize};
 
+use super::account::AccountTokenSource;
 use super::json::Unreadable;
 use super::relay::{ServiceHttp, ServiceHttpAnswer, ServiceSigner};
 use crate::error::{ClientError, Result};
 use crate::retry::UserAction;
+
+/// A request's second authorisation: the account token for one scope.
+///
+/// It names where the token comes from and the scope the resource reads, and holds no token itself:
+/// each request takes the one its source holds at that moment. A source that holds none for the
+/// scope refuses, and the request is not sent.
+#[derive(Clone)]
+pub struct AccountAuthorisation {
+    tokens: Arc<dyn AccountTokenSource>,
+    scope: &'static str,
+}
+
+impl fmt::Debug for AccountAuthorisation {
+    /// The scope. Never the source or a token.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AccountAuthorisation")
+            .field("scope", &self.scope)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AccountAuthorisation {
+    /// The token `tokens` holds for `scope`, presented with each request made under this.
+    #[must_use]
+    pub fn new(tokens: Arc<dyn AccountTokenSource>, scope: &'static str) -> Self {
+        Self { tokens, scope }
+    }
+
+    /// The scope the token is asked for.
+    #[must_use]
+    pub const fn scope(&self) -> &'static str {
+        self.scope
+    }
+}
+
+/// Why one signed request came back without an answer, and whether it left this device.
+///
+/// A refusal the service named is an answer, so it is not one of these.
+#[derive(Debug)]
+pub enum Unanswered {
+    /// Refused on this device before the transport was given the request. Nothing left, so
+    /// nothing can run.
+    NotSent(ClientError),
+    /// The transport was given the request, and no answer this client reads came back. The
+    /// service may have received the request and acted on it.
+    Sent(ClientError),
+}
+
+impl From<Unanswered> for ClientError {
+    /// The error either way, for a caller that does not ask whether the request left.
+    fn from(unanswered: Unanswered) -> Self {
+        match unanswered {
+            Unanswered::NotSent(error) | Unanswered::Sent(error) => error,
+        }
+    }
+}
 
 /// The exchange a managed-service adapter makes its calls through.
 ///
@@ -112,8 +194,7 @@ impl SignedService {
         body: &B,
         request_limit: usize,
     ) -> Result<serde_json::Value> {
-        self.call_at(path, method, body, request_limit, now_ms())
-            .await
+        self.answer(path, method, body, request_limit).await?.data()
     }
 
     /// Sends one signed request under the instant its caller states, and returns the `data` of the
@@ -163,8 +244,9 @@ impl SignedService {
         body: &B,
         request_limit: usize,
     ) -> Result<Answer> {
-        self.answer_at(path, method, body, request_limit, now_ms())
-            .await
+        Ok(self
+            .dispatch(path, method, body, request_limit, None, None)
+            .await?)
     }
 
     /// Sends one signed request under the instant its caller states, and returns what the service
@@ -181,22 +263,72 @@ impl SignedService {
         request_limit: usize,
         signed_at_ms: u64,
     ) -> Result<Answer> {
+        Ok(self
+            .dispatch(path, method, body, request_limit, Some(signed_at_ms), None)
+            .await?)
+    }
+
+    /// Sends one signed request, and returns what the service answered, its `data` or the refusal
+    /// it named, or why nothing was answered and whether the request left this device.
+    ///
+    /// `signed_at_ms` is the instant the caller recorded for this attempt, or none to sign it now.
+    /// `account` is the request's second authorisation, for a resource that reads one. Its token is
+    /// taken first, before the request is signed, so the clock window is checked after any wait for
+    /// the token and an attempt that has aged out of it meanwhile is refused here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Unanswered::NotSent`] for a request this client would not send, whatever the
+    /// reason, and [`Unanswered::Sent`] for a transport failure and an answer this client cannot
+    /// read. A refusal is not an error here.
+    pub(crate) async fn dispatch<B: Serialize>(
+        &self,
+        path: &str,
+        method: Method,
+        body: &B,
+        request_limit: usize,
+        signed_at_ms: Option<u64>,
+        account: Option<&AccountAuthorisation>,
+    ) -> std::result::Result<Answer, Unanswered> {
         let document = serde_json::to_value(body).map_err(|error| {
-            malformed(format!(
+            Unanswered::NotSent(malformed(format!(
                 "a request could not be written: {}",
                 super::json_fault(&error)
-            ))
+            )))
         })?;
-        let request = self.signed(method, document, signed_at_ms)?;
+        let authorisation = match account {
+            Some(account) => {
+                let token = account
+                    .tokens
+                    .token(account.scope)
+                    .await
+                    .map_err(Unanswered::NotSent)?;
+                Some(format!("Bearer {}", token.expose()))
+            }
+            None => None,
+        };
+        let request = self
+            .signed(method, document, signed_at_ms.unwrap_or_else(now_ms))
+            .map_err(Unanswered::NotSent)?;
         if request.len() > request_limit {
-            return Err(malformed(format!(
+            return Err(Unanswered::NotSent(malformed(format!(
                 "a {method} request is at most {request_limit} bytes and this one is {}",
                 request.len()
-            )));
+            ))));
         }
+        let headers: Vec<(&str, &str)> = authorisation
+            .iter()
+            .map(|value| ("authorization", value.as_str()))
+            .collect();
         let url = format!("{}{path}", self.origin.as_str());
-        let answer = self.http.post_json(&url, &request, &[]).await?;
-        answer_of(&answer)
+        // From here the transport holds the request, so whatever goes wrong may have happened after
+        // the service received it.
+        let answer = self
+            .http
+            .post_json(&url, &request, &headers)
+            .await
+            .map_err(Unanswered::Sent)?;
+        answer_of(&answer).map_err(Unanswered::Sent)
     }
 
     /// The bytes of one signed request: the document, and the credential over its digest.
@@ -848,5 +980,413 @@ mod tests {
         })
         .expect_err("an envelope with no data");
         assert_eq!(error.code(), ErrorCode::OutcomeUnknown);
+    }
+
+    /* ---------------------------------------------------------------------- */
+    /* A second authorisation, and whether a request left                      */
+    /* ---------------------------------------------------------------------- */
+
+    use std::sync::Mutex;
+
+    use crate::services::ServiceFuture;
+    use crate::services::account::{AccountToken, AccountTokenSource};
+
+    /// The account token the scripted source hands out.
+    const TOKEN: &str = "an-account-token";
+
+    /// One request as the transport was given it.
+    struct Sent {
+        body: Vec<u8>,
+        headers: Vec<(String, String)>,
+    }
+
+    /// A transport that keeps every request it is given, headers included, and answers each one
+    /// alike: with an answer, or with a failure of its own.
+    struct Wire {
+        sent: Mutex<Vec<Sent>>,
+        answer: std::result::Result<ServiceHttpAnswer, ErrorCode>,
+    }
+
+    impl fmt::Debug for Wire {
+        /// How many requests it was given. Never one of them.
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("Wire")
+                .field("requests", &self.requests())
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl Wire {
+        fn answering(answer: std::result::Result<ServiceHttpAnswer, ErrorCode>) -> Arc<Self> {
+            Arc::new(Self {
+                sent: Mutex::new(Vec::new()),
+                answer,
+            })
+        }
+
+        fn data() -> Arc<Self> {
+            Self::answering(Ok(ServiceHttpAnswer {
+                status: 200,
+                body: br#"{"ok":true,"data":{"note":"answered"}}"#.to_vec(),
+            }))
+        }
+
+        fn requests(&self) -> usize {
+            self.sent.lock().expect("the requests").len()
+        }
+
+        fn headers(&self) -> Vec<Vec<(String, String)>> {
+            self.sent
+                .lock()
+                .expect("the requests")
+                .iter()
+                .map(|sent| sent.headers.clone())
+                .collect()
+        }
+
+        fn bodies(&self) -> Vec<Vec<u8>> {
+            self.sent
+                .lock()
+                .expect("the requests")
+                .iter()
+                .map(|sent| sent.body.clone())
+                .collect()
+        }
+    }
+
+    impl ServiceHttp for Wire {
+        fn post_json<'a>(
+            &'a self,
+            _url: &'a str,
+            body: &'a [u8],
+            headers: &'a [(&'a str, &'a str)],
+        ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+            self.sent.lock().expect("the requests").push(Sent {
+                body: body.to_vec(),
+                headers: headers
+                    .iter()
+                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                    .collect(),
+            });
+            let answer = self.answer.clone().map_err(|code| {
+                ClientError::Host(ProtocolError::new(
+                    code,
+                    "the connection dropped".to_owned(),
+                ))
+            });
+            Box::pin(async move { answer })
+        }
+    }
+
+    /// An installation's key, signing as a client signs.
+    #[derive(Debug)]
+    struct Key(kr_crypto::keys::AuthorisationKeyPair);
+
+    impl ServiceSigner for Key {
+        fn signer(&self) -> ServiceRequestSigner {
+            ServiceRequestSigner::Installation
+        }
+
+        fn public_key(&self) -> AuthorisationKey {
+            *self.0.public()
+        }
+
+        fn sign(&self, message: &[u8]) -> Result<kr_protocol::scalars::Signature64> {
+            let transcript = kr_crypto::sign::SigningTranscript::from_canonical_bytes(
+                ServiceRequestSigner::Installation.domain(),
+                message.to_vec(),
+            )
+            .expect("a domain-tagged transcript");
+            Ok(kr_crypto::sign::sign(&self.0, &transcript).expect("a signature"))
+        }
+    }
+
+    /// Where account tokens come from: one token for any scope, or none at all, and a record of
+    /// every scope it was asked for.
+    #[derive(Debug)]
+    struct Tokens {
+        token: Option<&'static str>,
+        asked: Mutex<Vec<String>>,
+    }
+
+    impl Tokens {
+        fn holding(token: Option<&'static str>) -> Arc<Self> {
+            Arc::new(Self {
+                token,
+                asked: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn asked(&self) -> Vec<String> {
+            self.asked.lock().expect("the scopes").clone()
+        }
+    }
+
+    impl AccountTokenSource for Tokens {
+        fn token<'a>(&'a self, scope: &'a str) -> ServiceFuture<'a, AccountToken> {
+            self.asked
+                .lock()
+                .expect("the scopes")
+                .push(scope.to_owned());
+            let token = match self.token {
+                Some(token) => AccountToken::new(token),
+                None => Err(ClientError::Host(ProtocolError::new(
+                    ErrorCode::HostNotConfigured,
+                    "no account is signed in on this device".to_owned(),
+                ))),
+            };
+            Box::pin(async move { token })
+        }
+    }
+
+    fn service(wire: &Arc<Wire>) -> SignedService {
+        SignedService::new(
+            origin(),
+            Arc::clone(wire) as Arc<dyn ServiceHttp>,
+            Arc::new(Key(
+                kr_crypto::keys::AuthorisationKeyPair::generate().expect("a key pair")
+            )),
+        )
+    }
+
+    fn presenting(tokens: &Arc<Tokens>) -> AccountAuthorisation {
+        AccountAuthorisation::new(
+            Arc::clone(tokens) as Arc<dyn AccountTokenSource>,
+            "backup.write",
+        )
+    }
+
+    /// One request, signed now, with or without a second authorisation.
+    async fn send(
+        service: &SignedService,
+        account: Option<&AccountAuthorisation>,
+    ) -> std::result::Result<Answer, Unanswered> {
+        service
+            .dispatch(
+                "/api/sync/exchange",
+                Method::SyncCompareExchange,
+                &serde_json::json!({ "note": "a request" }),
+                256 * 1024,
+                None,
+                account,
+            )
+            .await
+    }
+
+    /// The body digest the credential of one sent request covers.
+    fn digest_of(body: &[u8]) -> kr_protocol::scalars::Digest256 {
+        let request: serde_json::Value = serde_json::from_slice(body).expect("a signed request");
+        let signature: ServiceRequestSignature =
+            serde_json::from_value(request["signature"].clone()).expect("a credential");
+        signature.payload.body_digest
+    }
+
+    /// A second authorisation is the account token for the scope it names, carried as the
+    /// request's `authorization` header and nowhere else: not in the body, and not in what the
+    /// signature covers, which is the same with it as without it.
+    #[tokio::test]
+    async fn a_second_authorisation_travels_as_the_authorization_header_and_nowhere_else() {
+        let wire = Wire::data();
+        let service = service(&wire);
+        let tokens = Tokens::holding(Some(TOKEN));
+        let account = presenting(&tokens);
+
+        let answer = send(&service, Some(&account)).await.expect("an answer");
+        assert!(matches!(answer, Answer::Data(_)), "{answer:?}");
+        send(&service, None).await.expect("an answer");
+
+        assert_eq!(tokens.asked(), ["backup.write"], "one token, for its scope");
+        assert_eq!(
+            wire.headers(),
+            [
+                vec![("authorization".to_owned(), format!("Bearer {TOKEN}"))],
+                Vec::new(),
+            ],
+            "the token beside the request that presents it, and no header beside the one that does not"
+        );
+        let bodies = wire.bodies();
+        assert!(
+            bodies
+                .iter()
+                .all(|body| !String::from_utf8_lossy(body).contains(TOKEN)),
+            "the token is never in a body"
+        );
+        assert_eq!(
+            digest_of(&bodies[0]),
+            digest_of(&bodies[1]),
+            "the signature covers the document, which is the same document either way"
+        );
+    }
+
+    /// A token its source will not give is a request this client does not send: nothing reaches
+    /// the transport, and the refusal is the source's own.
+    #[tokio::test]
+    async fn a_request_whose_token_its_source_will_not_give_is_not_sent() {
+        let wire = Wire::data();
+        let tokens = Tokens::holding(None);
+        let refused = send(&service(&wire), Some(&presenting(&tokens)))
+            .await
+            .expect_err("no token");
+        let Unanswered::NotSent(error) = refused else {
+            panic!("nothing was sent: {refused:?}");
+        };
+        assert_eq!(error.code(), ErrorCode::HostNotConfigured);
+        assert_eq!(wire.requests(), 0);
+        assert_eq!(tokens.asked(), ["backup.write"]);
+    }
+
+    /// Every other refusal this client makes before the transport is given the request is not
+    /// sent either: an attempt outside the service's clock window, a request larger than the
+    /// method admits, and a method no managed service serves.
+    #[tokio::test]
+    async fn a_request_this_client_refuses_is_not_sent_whatever_the_reason() {
+        let wire = Wire::data();
+        let service = service(&wire);
+        let tokens = Tokens::holding(Some(TOKEN));
+        let account = presenting(&tokens);
+        let document = serde_json::json!({ "note": "a request" });
+        let long_ago = now_ms() - 2 * SERVICE_REQUEST_FRESHNESS_MS;
+
+        for (what, refused, code) in [
+            (
+                "an attempt signed outside the window",
+                service
+                    .dispatch(
+                        "/api/sync/exchange",
+                        Method::SyncCompareExchange,
+                        &document,
+                        256 * 1024,
+                        Some(long_ago),
+                        Some(&account),
+                    )
+                    .await,
+                ErrorCode::ClockUntrusted,
+            ),
+            (
+                "a request past its limit",
+                service
+                    .dispatch(
+                        "/api/sync/exchange",
+                        Method::SyncCompareExchange,
+                        &document,
+                        64,
+                        None,
+                        Some(&account),
+                    )
+                    .await,
+                ErrorCode::InvalidArgument,
+            ),
+            (
+                "a method no managed service serves",
+                service
+                    .dispatch(
+                        "/api/sync/exchange",
+                        Method::SessionList,
+                        &document,
+                        256 * 1024,
+                        None,
+                        None,
+                    )
+                    .await,
+                ErrorCode::InvalidArgument,
+            ),
+        ] {
+            match refused {
+                Err(Unanswered::NotSent(error)) => assert_eq!(error.code(), code, "{what}"),
+                other => panic!("{what} is not sent: {other:?}"),
+            }
+        }
+        assert_eq!(wire.requests(), 0, "nothing reached the transport");
+    }
+
+    /// From the moment the transport is given a request, whatever goes wrong may have happened
+    /// after the service received it: a transport that fails, and an answer this client cannot
+    /// read. A refusal the service named is an answer, sent and answered.
+    #[tokio::test]
+    async fn a_request_the_transport_was_given_may_have_run_whatever_comes_back() {
+        let tokens = Tokens::holding(Some(TOKEN));
+        let account = presenting(&tokens);
+        for (what, answer, code) in [
+            (
+                "a transport that failed",
+                Err(ErrorCode::UpstreamUnavailable),
+                ErrorCode::UpstreamUnavailable,
+            ),
+            (
+                "a fault with no envelope",
+                Ok(ServiceHttpAnswer {
+                    status: 502,
+                    body: b"<html>Bad Gateway</html>".to_vec(),
+                }),
+                ErrorCode::UpstreamUnavailable,
+            ),
+            (
+                "a success this client cannot read",
+                Ok(ServiceHttpAnswer {
+                    status: 200,
+                    body: b"not an envelope".to_vec(),
+                }),
+                ErrorCode::OutcomeUnknown,
+            ),
+        ] {
+            let wire = Wire::answering(answer);
+            match send(&service(&wire), Some(&account)).await {
+                Err(Unanswered::Sent(error)) => assert_eq!(error.code(), code, "{what}"),
+                other => panic!("{what} may have run: {other:?}"),
+            }
+            assert_eq!(wire.requests(), 1, "{what}");
+        }
+
+        let wire = Wire::answering(Ok(ServiceHttpAnswer {
+            status: 404,
+            body: br#"{"ok":false,"error":{"code":"COLLECTION_ABSENT","message":"absent"}}"#
+                .to_vec(),
+        }));
+        match send(&service(&wire), Some(&account)).await {
+            Ok(Answer::Refused(refusal)) => assert_eq!(refusal.code(), "COLLECTION_ABSENT"),
+            other => panic!("a refusal is an answer: {other:?}"),
+        }
+    }
+
+    /// Whether a request left is decided by the path each call takes, so two calls made at once
+    /// through one exchange each say their own: the one refused here was not sent, and the one
+    /// the transport was given was.
+    #[tokio::test]
+    async fn two_calls_at_once_each_say_whether_their_own_request_left() {
+        let wire = Wire::answering(Err(ErrorCode::UpstreamUnavailable));
+        let service = service(&wire);
+        let absent = presenting(&Tokens::holding(None));
+        let held = presenting(&Tokens::holding(Some(TOKEN)));
+        let (refused, lost) =
+            tokio::join!(send(&service, Some(&absent)), send(&service, Some(&held)),);
+        assert!(
+            matches!(refused, Err(Unanswered::NotSent(_))),
+            "{refused:?}"
+        );
+        assert!(matches!(lost, Err(Unanswered::Sent(_))), "{lost:?}");
+        assert_eq!(wire.requests(), 1);
+    }
+
+    /// A caller that does not ask whether its request left gets the error it always got.
+    #[test]
+    fn an_unanswered_request_is_the_error_it_carries_to_a_caller_that_does_not_ask() {
+        for unanswered in [
+            Unanswered::NotSent(malformed("refused here")),
+            Unanswered::Sent(malformed("refused there")),
+        ] {
+            let expected = match &unanswered {
+                Unanswered::NotSent(error) | Unanswered::Sent(error) => error.to_string(),
+            };
+            assert_eq!(ClientError::from(unanswered).to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn a_rendering_of_a_second_authorisation_names_its_scope_and_nothing_else() {
+        renders_only(
+            &presenting(&Tokens::holding(Some(NEVER_RENDERED))),
+            r#"AccountAuthorisation{scope:"backup.write",..}"#,
+        );
     }
 }
