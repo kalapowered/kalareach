@@ -1424,6 +1424,11 @@ pub mod configuration {
         /// Read when the daemon starts, so a change applies at the next start. No environment
         /// variable reaches it.
         pub voice: VoiceSelection,
+        /// How this environment's control daemon is started when a command finds none running.
+        ///
+        /// Read by `kr new` when it finds no daemon to ask, so a change applies at the next start.
+        /// No environment variable reaches it.
+        pub startup: StartupSelection,
     }
 
     impl Default for ConfigurationDocument {
@@ -1442,6 +1447,7 @@ pub mod configuration {
                 secrets: Vec::new(),
                 network: NetworkSelection::default(),
                 voice: VoiceSelection::default(),
+                startup: StartupSelection::default(),
             }
         }
     }
@@ -1856,6 +1862,72 @@ pub mod configuration {
         #[must_use]
         pub fn broker_origin(&self) -> Option<&str> {
             self.broker_origin.as_ref().map(String::as_str)
+        }
+    }
+
+    /// How this environment's control daemon is started when a command finds none running.
+    ///
+    /// Section 7 lets `kr new` start the per-user controller only on a host that was set up for
+    /// it, and makes every other host answer `HOST_NOT_CONFIGURED` with the setup action. This is
+    /// where that setup is recorded: absent unless an owner, or an installer, chose it. No request,
+    /// profile or environment variable reaches it, so a variable exported in one terminal cannot
+    /// make a command start a daemon on a host that was never set up to have one started.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields, default)]
+    pub struct StartupSelection {
+        /// How the control daemon is started. Absent starts none.
+        pub controller: Nullable<ControllerStartup>,
+    }
+
+    impl Default for StartupSelection {
+        /// Nothing chosen, which is what an absent section reads as.
+        fn default() -> Self {
+            Self {
+                controller: Nullable::null(),
+            }
+        }
+    }
+
+    impl StartupSelection {
+        /// How the control daemon is started, when this document chooses it.
+        #[must_use]
+        pub fn controller(&self) -> Option<ControllerStartup> {
+            self.controller.0
+        }
+    }
+
+    /// One way of starting this environment's control daemon.
+    #[derive(
+        Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+    )]
+    #[serde(rename_all = "snake_case")]
+    pub enum ControllerStartup {
+        /// The standalone headless profile, for a host with no service manager to ask: a command
+        /// that finds no daemon running starts `kr-controller` itself, detached from the command,
+        /// in a session of its own and with the environment's own directories. The daemon takes
+        /// the environment's singleton lock and advances its generation as every daemon does, so
+        /// several commands starting one at once leave one daemon.
+        Standalone,
+    }
+
+    impl ControllerStartup {
+        /// Every way, in declaration order.
+        pub const ALL: [Self; 1] = [Self::Standalone];
+
+        /// Returns the stable wire string.
+        #[must_use]
+        pub const fn as_str(self) -> &'static str {
+            match self {
+                Self::Standalone => "standalone",
+            }
+        }
+
+        /// Reads a wire string.
+        #[must_use]
+        pub fn from_wire(value: &str) -> Option<Self> {
+            Self::ALL
+                .into_iter()
+                .find(|startup| startup.as_str() == value)
         }
     }
 
@@ -2393,10 +2465,13 @@ pub mod configuration {
         /// The whole section, not one budget of it: what this names becomes what the document
         /// says, and a budget left out of it goes back to the schema's own number.
         Enrolment(ConfiguredEnrolmentBudgets),
+        /// Choose how this environment's control daemon is started when a command finds none
+        /// running, or clear the choice so that none is started.
+        ControllerStartup(Option<ControllerStartup>),
     }
 
     impl Change {
-        /// Returns the preference or ceiling key this change names.
+        /// Returns the preference, ceiling or selection key this change names.
         #[must_use]
         pub const fn key(&self) -> &'static str {
             match self {
@@ -2405,6 +2480,7 @@ pub mod configuration {
                 Self::SessionLimit(_) => "session_limit",
                 Self::GrantRights(_) => "grant_rights",
                 Self::Enrolment(_) => "enrolment",
+                Self::ControllerStartup(_) => STARTUP_CONTROLLER.key,
             }
         }
 
@@ -2417,6 +2493,7 @@ pub mod configuration {
                 | Self::GrantRights(_)
                 | Self::Enrolment(_) => ValueEffect::Immediately,
                 Self::WorkerProfile(_) => ValueEffect::NewSessionsOnly,
+                Self::ControllerStartup(_) => Selection::EFFECT,
             }
         }
     }
@@ -2578,6 +2655,9 @@ pub mod configuration {
             }
             Change::Enrolment(budgets) => {
                 document.ceilings.enrolment = Nullable::some(*budgets);
+            }
+            Change::ControllerStartup(startup) => {
+                document.startup.controller = Nullable(*startup);
             }
         }
         document.version = VERSION;
@@ -2984,7 +3064,7 @@ pub mod configuration {
 
     impl Selection {
         /// When a new value takes effect. The endpoint and the voice service are built once, when
-        /// the daemon starts.
+        /// the daemon starts, and how the daemon is started is read when one next has to be.
         pub const EFFECT: ValueEffect = ValueEffect::NextStart;
     }
 
@@ -3061,8 +3141,15 @@ pub mod configuration {
         about: "the managed voice broker this host names to its paired devices",
     };
 
+    /// How this environment's control daemon is started when a command finds none running.
+    pub const STARTUP_CONTROLLER: Selection = Selection {
+        key: "startup.controller",
+        about: "how kr new starts this environment's control daemon when none is running; none \
+                starts nothing and answers that the host is not configured",
+    };
+
     /// Every selection this host reads when it starts, in the order `kr doctor` prints them.
-    pub const SELECTIONS: [Selection; 12] = [
+    pub const SELECTIONS: [Selection; 13] = [
         NETWORK_ENABLED,
         NETWORK_BIND_ADDRESS,
         NETWORK_RELAY_URLS,
@@ -3075,6 +3162,7 @@ pub mod configuration {
         NETWORK_MAINLINE_DHT,
         NETWORK_PROXY_URL,
         VOICE_BROKER_ORIGIN,
+        STARTUP_CONTROLLER,
     ];
 
     /// The words a selection's value is reported in when it is not a location or a path: the two
@@ -3468,6 +3556,16 @@ pub mod configuration {
                 document.voice.broker_origin.is_present(),
                 location(document.voice.broker_origin()),
             ),
+            row(
+                STARTUP_CONTROLLER,
+                document.startup.controller.is_present(),
+                Declared::term(
+                    document
+                        .startup
+                        .controller()
+                        .map_or("none", ControllerStartup::as_str),
+                ),
+            ),
         ]
     }
 
@@ -3639,6 +3737,7 @@ pub mod configuration {
             || value == std::env::consts::ARCH
             || crate::desktop::CAPABILITIES.contains(&value)
             || crate::desktop::SleepInhibitionSetting::from_wire(value).is_some()
+            || ControllerStartup::from_wire(value).is_some()
             || value.parse::<crate::rights::ActionRight>().is_ok()
     }
 
@@ -7192,6 +7291,101 @@ mod tests {
             "false",
             "a switch is a word of this build's own"
         );
+    }
+
+    /// KR-REQ-07.12, KR-REQ-26.13: how the control daemon is started is absent until a validated
+    /// edit chooses it, the one way this build knows is the standalone start, and anything else is
+    /// a document this build does not rewrite. The choice is reported with the document as its
+    /// source and as applying at the next start, it leaves this host as a word of its own, and
+    /// moving it owes no fence and invalidates no evidence. Clearing it is an edit too.
+    #[test]
+    fn the_standalone_start_is_the_documents_choice_and_absent_until_made() {
+        use configuration::{ControllerStartup, STARTUP_CONTROLLER, ValueEffect};
+
+        let origin = "/home/someone/.config/kalareach/config.json";
+        let row = |document: Option<&ConfigurationDocument>| {
+            configuration::selection_rows(document, origin)
+                .into_iter()
+                .find(|row| row.key == STARTUP_CONTROLLER.key)
+                .expect("the startup is reported")
+        };
+        assert_eq!(ConfigurationDocument::empty().startup.controller(), None);
+        let unchosen = row(None);
+        assert_eq!(
+            (unchosen.value(), unchosen.source, unchosen.effect),
+            ("none", ValueSource::Default, ValueEffect::NextStart)
+        );
+        assert!(unchosen.origin.0.is_none());
+
+        let chosen = Change::ControllerStartup(Some(ControllerStartup::Standalone));
+        assert_eq!(chosen.key(), "startup.controller");
+        assert_eq!(chosen.effect(), ValueEffect::NextStart);
+        let absent = configuration::load(None);
+        let edited = configuration::edit(&absent, &chosen).expect("a validated edit");
+        assert_eq!(edited.revision, 1);
+        assert_eq!(
+            edited.document.startup.controller(),
+            Some(ControllerStartup::Standalone)
+        );
+        assert!(
+            edited
+                .contents
+                .contains("\"startup\": {\n    \"controller\": \"standalone\"\n  }"),
+            "{}",
+            edited.contents
+        );
+        let reread = configuration::load(Some(edited.contents.as_bytes()));
+        assert_eq!(reread.status.state, DocumentState::Loaded);
+        assert_eq!(reread.document.as_ref(), Some(&edited.document));
+        let reported = row(reread.document.as_ref());
+        assert_eq!(
+            (
+                reported.value(),
+                reported.source,
+                reported.class(),
+                reported.effect
+            ),
+            (
+                "standalone",
+                ValueSource::HostConfiguration,
+                export::ContentClass::Term,
+                ValueEffect::NextStart
+            )
+        );
+        assert_eq!(reported.origin.0.as_deref(), Some(origin));
+        assert_eq!(
+            configuration::owed(None, reread.document.as_ref()),
+            configuration::Owed::default(),
+            "starting a daemon differently fences nothing and invalidates nothing"
+        );
+
+        // It leaves this host as the word it is.
+        let mut effective = EffectiveConfiguration::unread();
+        effective.values = vec![reported];
+        let exported = export::ForExport::for_export(effective);
+        assert_eq!(exported.get().values[0].value(), "standalone");
+
+        // A way this build does not know is a document it does not rewrite.
+        let unknown = configuration::load(Some(
+            br#"{"version": 1, "revision": 2, "startup": {"controller": "service"}}"#,
+        ));
+        assert_eq!(unknown.status.state, DocumentState::Invalid);
+        assert!(matches!(
+            configuration::edit(&unknown, &chosen),
+            Err(configuration::EditRefused::NotOurs(_))
+        ));
+        assert_eq!(ControllerStartup::from_wire("service"), None);
+        assert_eq!(
+            ControllerStartup::from_wire("standalone"),
+            Some(ControllerStartup::Standalone)
+        );
+
+        // Clearing the choice is an edit of its own, and leaves nothing chosen.
+        let cleared = configuration::edit(&reread, &Change::ControllerStartup(None))
+            .expect("a validated edit");
+        assert_eq!(cleared.revision, 2);
+        assert_eq!(cleared.document.startup.controller(), None);
+        assert_eq!(row(Some(&cleared.document)).source, ValueSource::Default);
     }
 
     /// The wire words a report names are exactly the ones the enumerations spell.

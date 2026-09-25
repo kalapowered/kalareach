@@ -514,6 +514,10 @@ export type ChangeSetVersion = string
  */
 export type SleepInhibitionSetting = 'off' | 'mains_only' | 'battery_too'
 /**
+ * One way of starting this environment's control daemon.
+ */
+export type ControllerStartup = 'standalone'
+/**
  * The host's answer to a client proof.
  */
 export type ConnectReply =
@@ -8847,6 +8851,7 @@ export interface ConfigurationDocument {
    * looks like when it is enforced rather than promised.
    */
   secrets?: SecretReference[]
+  startup?: StartupSelection
   /**
    * The schema version this document is written against.
    */
@@ -9038,6 +9043,18 @@ export interface SecretReference {
    * The secure store it lives in.
    */
   store: string
+}
+/**
+ * How this environment's control daemon is started when a command finds none running.
+ *
+ * Read by `kr new` when it finds no daemon to ask, so a change applies at the next start.
+ * No environment variable reaches it.
+ */
+export interface StartupSelection {
+  /**
+   * How the control daemon is started. Absent starts none.
+   */
+  controller?: ControllerStartup | null
 }
 /**
  * The managed voice broker this host names to its paired devices.
