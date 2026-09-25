@@ -93,7 +93,7 @@ const WINDOW_MARGIN: Duration = Duration::from_secs(1);
 const CHANGE_WITH_LEFT: usize = 4;
 
 /// How long a host serves an unpaired connection before it ends it, whatever was asked on it,
-/// counted from when the connection's handshake completed.
+/// counted from when the host answered the connection's handshake.
 const UNPAIRED_LIFE: Duration = kr_transport::listener::DEFAULT_HANDSHAKE_DEADLINE;
 
 /// How long before a connection ends, or before the attempt's deadline, a waiting device asks its
@@ -599,6 +599,9 @@ impl Pairing {
                 clock,
             )
             .map_err(|error| step_failed(&error, tries))?;
+        // The host counts the connection's time from when it answers the handshake, which is
+        // after the device's offer arrives: a time read before the offer goes is never later.
+        let opened = tokio::time::Instant::now();
         let mut preauth = within(
             WAIT_STEP,
             self.link
@@ -606,7 +609,6 @@ impl Pairing {
         )
         .await
         .map_err(|error| link_failed(&error, tries))?;
-        let opened = tokio::time::Instant::now();
         let selection = preauth.selection();
         if selection.endpoint_id != bundle.endpoint_id || selection.device_id != bundle.device_id {
             return Err(PairingFailure::new(
@@ -764,64 +766,67 @@ impl Pairing {
                      ended the invitation",
                 ));
             }
-            // Each question stays inside the host's budget for the connection: it waits for the
-            // window to make room. Near the end of a connection's questions the device changes to
-            // a fresh one, which is no loss of contact and is not shown as one; a connection that
-            // has none left is let go.
-            if let Some(unpaired) = held.as_mut() {
-                match unpaired.asked.turn(tokio::time::Instant::now(), &limits) {
-                    Turn::Now => {}
-                    Turn::After(wait) => {
-                        tokio::time::sleep(wait.min(self.left(&pending))).await;
-                        continue;
-                    }
-                    Turn::Spent => {
-                        drop(held.take());
-                        fresh_failed = 0;
-                        held = self.reconnect(&pending).await;
-                        continue;
-                    }
-                }
-            }
+            // Each question stays inside the host's budget for the connection, and goes no later
+            // than the connection's last call; `plan` says what comes next. Near the end of a
+            // connection the device changes to a fresh one, which is no loss of contact and is not
+            // shown as one; a connection that has no question left is let go.
+            //
             // A host that commits the device serves it no unpaired surface on a new connection, so
             // the connection the device already has is then the only place to learn what it
-            // became. Near the end of that connection, when its budget or its time leaves few
-            // questions, the device looks for a fresh connection before each question, and changes
-            // to one only once it has answered. It keeps the last question while fresh connections
-            // fail, and asks it at the connection's last call: the latest moment the host is sure
-            // to answer it, before the host ends the connection or the attempt's deadline comes.
-            let now = tokio::time::Instant::now();
-            let (left, until_last_call) =
-                held.as_ref().map_or((None, Duration::ZERO), |unpaired| {
-                    let last_call = self.last_call(&pending, unpaired);
-                    (
-                        Some(unpaired.asked.left(now, last_call, &limits)),
-                        last_call.saturating_duration_since(now),
+            // became. So the device changes to a fresh connection only once it has answered, and
+            // keeps the last question on the old one while fresh connections fail, for the
+            // connection's last call.
+            let next = match held.as_mut() {
+                Some(unpaired) => {
+                    let now = tokio::time::Instant::now();
+                    plan(
+                        &mut unpaired.asked,
+                        now,
+                        self.attempt_call(&pending, now),
+                        &limits,
                     )
-                });
+                }
+                // No connection: the question below finds that out, as a lost connection.
+                None => Next::Ask,
+            };
             let mut answered = None;
-            if left.is_some_and(|left| left <= CHANGE_WITH_LEFT) && !until_last_call.is_zero() {
-                match within(until_last_call, self.fresh_answer(&pending, &params)).await {
-                    Ok((fresh, answer)) => {
-                        held = Some(fresh);
-                        fresh_failed = 0;
-                        answered = Some(Ok(answer));
+            match next {
+                Next::Ask => {}
+                Next::Wait(wait) => {
+                    tokio::time::sleep(wait.min(self.left(&pending))).await;
+                    continue;
+                }
+                Next::LetGo => {
+                    drop(held.take());
+                    fresh_failed = 0;
+                    held = self.reconnect(&pending).await;
+                    continue;
+                }
+                Next::LookFirst {
+                    within: bound,
+                    keep,
+                } => {
+                    match within(bound, self.fresh_answer(&pending, &params)).await {
+                        Ok((fresh, answer)) => {
+                            held = Some(fresh);
+                            fresh_failed = 0;
+                            answered = Some(Ok(answer));
+                        }
+                        // The host's own word on a fresh connection is its word about the attempt.
+                        Err(LinkError::Refused(refusal)) => {
+                            fresh_failed = 0;
+                            answered = Some(Err(LinkError::Refused(refusal)));
+                        }
+                        Err(LinkError::Lost(_) | LinkError::Configuration(_)) if keep => {
+                            let delay =
+                                RECONNECT_DELAYS[fresh_failed.min(RECONNECT_DELAYS.len() - 1)];
+                            fresh_failed += 1;
+                            let until = self.until_cutoff(&pending, held.as_ref());
+                            tokio::time::sleep(delay.min(until)).await;
+                            continue;
+                        }
+                        Err(LinkError::Lost(_) | LinkError::Configuration(_)) => {}
                     }
-                    // The host's own word on a fresh connection is its word about the attempt.
-                    Err(LinkError::Refused(refusal)) => {
-                        fresh_failed = 0;
-                        answered = Some(Err(LinkError::Refused(refusal)));
-                    }
-                    Err(LinkError::Lost(_) | LinkError::Configuration(_)) if left == Some(1) => {
-                        let delay = RECONNECT_DELAYS[fresh_failed.min(RECONNECT_DELAYS.len() - 1)];
-                        fresh_failed += 1;
-                        let until = held.as_ref().map_or(Duration::ZERO, |unpaired| {
-                            self.until_last_call(&pending, unpaired)
-                        });
-                        tokio::time::sleep(delay.min(until)).await;
-                        continue;
-                    }
-                    Err(LinkError::Lost(_) | LinkError::Configuration(_)) => {}
                 }
             }
             let asked = match answered {
@@ -890,27 +895,35 @@ impl Pairing {
         }
     }
 
-    /// When the device asks its last question on `held`: the connection's own last call, or
-    /// [`LAST_CALL_MARGIN`] before the attempt's deadline, whichever comes first.
-    fn last_call(&self, pending: &PendingAttempt, held: &Unpaired) -> tokio::time::Instant {
-        let attempts =
-            tokio::time::Instant::now() + self.left(pending).saturating_sub(LAST_CALL_MARGIN);
-        held.asked.last_call().min(attempts)
+    /// The attempt's last call, [`LAST_CALL_MARGIN`] before its deadline, as a moment on the
+    /// clock `now` was read from. The deadline is a fixed time on the device's clock, so every
+    /// reading names the same moment; once it has passed, the call is `now` itself.
+    fn attempt_call(
+        &self,
+        pending: &PendingAttempt,
+        now: tokio::time::Instant,
+    ) -> tokio::time::Instant {
+        now + self.left(pending).saturating_sub(LAST_CALL_MARGIN)
     }
 
-    /// How long until the last call on `held`; nothing once it has come.
-    fn until_last_call(&self, pending: &PendingAttempt, held: &Unpaired) -> Duration {
-        self.last_call(pending, held)
-            .saturating_duration_since(tokio::time::Instant::now())
+    /// How long until the cutoff on `held`, read once from both clocks; nothing once it has come,
+    /// or when there is no connection.
+    fn until_cutoff(&self, pending: &PendingAttempt, held: Option<&Unpaired>) -> Duration {
+        let now = tokio::time::Instant::now();
+        held.map_or(Duration::ZERO, |held| {
+            cutoff(&held.asked, self.attempt_call(pending, now)).saturating_duration_since(now)
+        })
     }
 
     /// How long the device may wait before its next question: never past the attempt's deadline,
-    /// and never past the last call on the connection it holds while that call is still to come.
+    /// and never past the cutoff on the connection it holds while that is still to come.
     fn may_sleep(&self, pending: &PendingAttempt, held: Option<&Unpaired>) -> Duration {
         let left = self.left(pending);
-        match held.map(|held| self.until_last_call(pending, held)) {
-            Some(until) if !until.is_zero() => until.min(left),
-            _ => left,
+        let until = self.until_cutoff(pending, held);
+        if until.is_zero() {
+            left
+        } else {
+            until.min(left)
         }
     }
 
@@ -1034,6 +1047,7 @@ impl Pairing {
         if ConnectionPeer::of(&connection).endpoint() != pending.host_endpoint_id {
             return None;
         }
+        let opened = tokio::time::Instant::now();
         let preauth = within(
             self.step(pending),
             self.link
@@ -1041,12 +1055,7 @@ impl Pairing {
         )
         .await
         .ok()?;
-        Some(Unpaired::new(
-            connection,
-            preauth,
-            tokio::time::Instant::now(),
-            0,
-        ))
+        Some(Unpaired::new(connection, preauth, opened, 0))
     }
 
     /// Records the host that committed this device, and connects to it as what it became.
@@ -1205,9 +1214,9 @@ pub(crate) struct Unpaired {
 }
 
 impl Unpaired {
-    /// `connection` and its pre-authorisation surface, which opened at `opened` and on which
-    /// `already` questions were asked just now: the finish, or a direct invitation's challenge and
-    /// proof.
+    /// `connection` and its pre-authorisation surface, which the device began to open at `opened`
+    /// and on which `already` questions were asked just now: the finish, or a direct invitation's
+    /// challenge and proof.
     pub(crate) fn new(
         connection: Connection,
         preauth: Box<dyn Preauth>,
@@ -1237,8 +1246,9 @@ struct Asked {
     recent: VecDeque<tokio::time::Instant>,
     /// Every question asked on the connection.
     total: usize,
-    /// When the connection's pre-authorisation surface opened, by this device's clock, which is no
-    /// earlier than when the host began to serve it.
+    /// When the device began to open the connection's pre-authorisation surface, by its own clock:
+    /// before its offer went, so no later than when the host answered it and began to count the
+    /// connection's time.
     opened: tokio::time::Instant,
     /// Whether a question went at or after the connection's last call, which makes it the last.
     called: bool,
@@ -1256,7 +1266,8 @@ enum Turn {
 }
 
 impl Asked {
-    /// A connection that opened at `opened`, on which `already` questions were asked at `now`.
+    /// A connection the device began to open at `opened`, on which `already` questions were asked
+    /// at `now`.
     fn after(already: usize, opened: tokio::time::Instant, now: tokio::time::Instant) -> Self {
         Self {
             recent: std::iter::repeat_n(now, already).collect(),
@@ -1293,20 +1304,20 @@ impl Asked {
         self.opened + UNPAIRED_LIFE.saturating_sub(LAST_CALL_MARGIN)
     }
 
-    /// How many questions the connection has left at `now` when the last goes at `last_call`: what
+    /// How many questions the connection has left at `now` when the last goes at `cutoff`: what
     /// the host's budget leaves, and no more than one every [`STATUS_INTERVAL`] fits before then,
-    /// with the one at `last_call` itself.
+    /// with the one at `cutoff` itself.
     fn left(
         &self,
         now: tokio::time::Instant,
-        last_call: tokio::time::Instant,
+        cutoff: tokio::time::Instant,
         limits: &PreAuthLimits,
     ) -> usize {
         if self.called {
             return 0;
         }
         let before =
-            last_call.saturating_duration_since(now).as_millis() / STATUS_INTERVAL.as_millis();
+            cutoff.saturating_duration_since(now).as_millis() / STATUS_INTERVAL.as_millis();
         let by_time = usize::try_from(before)
             .unwrap_or(usize::MAX)
             .saturating_add(1);
@@ -1319,6 +1330,78 @@ impl Asked {
         self.recent.push_back(now);
         self.called |= now >= self.last_call();
     }
+}
+
+/// What a waiting device does next with the connection it holds.
+#[derive(Debug, PartialEq, Eq)]
+enum Next {
+    /// Asks its next question on the connection now.
+    Ask,
+    /// Waits this long for the host's window to make room, then plans again.
+    Wait(Duration),
+    /// Looks for a fresh connection first, for at most `within`, and changes to it once it has
+    /// answered. After a look that fails, the question goes on the held connection, unless `keep`:
+    /// then it is kept for the cutoff.
+    LookFirst { within: Duration, keep: bool },
+    /// Lets the connection go: it has no question left.
+    LetGo,
+}
+
+/// The cutoff on a connection whose questions are `asked`: its own last call, or the attempt's,
+/// `attempt_call`, whichever comes first.
+fn cutoff(asked: &Asked, attempt_call: tokio::time::Instant) -> tokio::time::Instant {
+    asked.last_call().min(attempt_call)
+}
+
+/// Plans a waiting device's next step on a connection whose questions are `asked`, at `now`, when
+/// the attempt's last call is `attempt_call`, inside the host's `limits`.
+///
+/// Before the cutoff the device asks at its pace, and from four questions before the end it looks
+/// for a fresh connection before each one; the last question before the cutoff is kept while fresh
+/// connections fail, and so is one the host's window would hold back past the cutoff. At the
+/// cutoff the kept question goes as soon as the host's window has room:
+/// at the connection's own last call it is the connection's last, and after the attempt's last
+/// call every answer is final, so the device goes on asking there at its pace and looks for no
+/// other connection.
+fn plan(
+    asked: &mut Asked,
+    now: tokio::time::Instant,
+    attempt_call: tokio::time::Instant,
+    limits: &PreAuthLimits,
+) -> Next {
+    let window = match asked.turn(now, limits) {
+        Turn::Spent => return Next::LetGo,
+        Turn::Now => Duration::ZERO,
+        Turn::After(wait) => wait,
+    };
+    let cutoff = cutoff(asked, attempt_call);
+    if now >= cutoff {
+        return if window.is_zero() {
+            Next::Ask
+        } else {
+            Next::Wait(window)
+        };
+    }
+    let until = cutoff - now;
+    // A window that stays full past the cutoff leaves the connection no question before it: the
+    // device looks elsewhere meanwhile, and keeps the question for when the window has room.
+    if window > until {
+        return Next::LookFirst {
+            within: until,
+            keep: true,
+        };
+    }
+    if !window.is_zero() {
+        return Next::Wait(window);
+    }
+    let left = asked.left(now, cutoff, limits);
+    if left <= CHANGE_WITH_LEFT {
+        return Next::LookFirst {
+            within: until,
+            keep: left == 1,
+        };
+    }
+    Next::Ask
 }
 
 /// How long a waiting device pauses after `refused` refusals in a row, as too soon, before its next
@@ -1947,6 +2030,139 @@ mod tests {
         // A connection the host has ended has no questions, whatever its budget.
         let mut idle = Asked::after(1, start, start);
         assert_eq!(idle.turn(start + UNPAIRED_LIFE, &limits), Turn::Spent);
+    }
+
+    /// KR-REQ-10.36, KR-REQ-10.23: once the attempt's own last call has come, its last seconds go
+    /// to the connection the device holds. Every answer there is final, so the device asks at its
+    /// pace and looks for no other connection, on every reading of its clocks after the call.
+    #[test]
+    fn after_the_attempts_last_call_the_held_connection_is_asked() {
+        let limits = PreAuthLimits::default();
+        let start = tokio::time::Instant::now();
+        let at = |seconds: u64| start + Duration::from_secs(seconds);
+        let mut asked = Asked::after(2, start, start);
+        asked.asked(start);
+        // Before the attempt's call, four questions from its end, the device looks elsewhere first;
+        // one question from it, it keeps that one.
+        assert_eq!(
+            plan(&mut asked, at(9), at(20), &limits),
+            Next::LookFirst {
+                within: Duration::from_secs(11),
+                keep: false
+            }
+        );
+        assert_eq!(
+            plan(&mut asked, at(18), at(20), &limits),
+            Next::LookFirst {
+                within: Duration::from_secs(2),
+                keep: true
+            }
+        );
+        // At and after the call, whenever the clocks are read, the question goes.
+        for now in [at(20), at(21), at(24)] {
+            assert_eq!(plan(&mut asked, now, now.min(at(20)), &limits), Next::Ask);
+            asked.asked(now);
+        }
+    }
+
+    /// KR-REQ-10.23: a waiting device plans each question by the host's budget and window and by the
+    /// connection's last call: it asks at its pace, looks for a fresh connection first from four
+    /// questions before the end by either count, keeps the last, asks it at the call, and lets the
+    /// connection go after it, or once the host has ended the connection.
+    #[test]
+    fn a_waiting_device_plans_by_budget_window_and_last_call() {
+        let limits = PreAuthLimits::default();
+        let start = tokio::time::Instant::now();
+        let at = |seconds: u64| start + Duration::from_secs(seconds);
+        let far = at(600);
+
+        // Early, with the window's room: ask.
+        let mut asked = Asked::after(1, start, start);
+        assert_eq!(plan(&mut asked, at(1), far, &limits), Next::Ask);
+        // The window full before the cutoff: wait for it.
+        for second in [1, 2, 3] {
+            asked.asked(at(second));
+        }
+        assert_eq!(
+            plan(&mut asked, at(4), far, &limits),
+            Next::Wait(Duration::from_secs(7))
+        );
+
+        // By budget: four left, then one left.
+        let mut asked = Asked::after(12, start, start);
+        assert_eq!(
+            plan(&mut asked, at(12), far, &limits),
+            Next::LookFirst {
+                within: Duration::from_secs(38),
+                keep: false
+            }
+        );
+        let mut asked = Asked::after(15, start, start);
+        assert_eq!(
+            plan(&mut asked, at(12), far, &limits),
+            Next::LookFirst {
+                within: Duration::from_secs(38),
+                keep: true
+            }
+        );
+
+        // By time: four left eleven seconds before the call, one left two seconds before it; the
+        // kept question goes at the call, and nothing after it.
+        let mut asked = Asked::after(2, start, start);
+        assert_eq!(
+            plan(&mut asked, at(39), far, &limits),
+            Next::LookFirst {
+                within: Duration::from_secs(11),
+                keep: false
+            }
+        );
+        assert_eq!(
+            plan(&mut asked, at(48), far, &limits),
+            Next::LookFirst {
+                within: Duration::from_secs(2),
+                keep: true
+            }
+        );
+        assert_eq!(plan(&mut asked, at(50), far, &limits), Next::Ask);
+        asked.asked(at(50));
+        assert_eq!(plan(&mut asked, at(51), far, &limits), Next::LetGo);
+
+        // A connection the host has ended has no question, whatever its budget.
+        let mut idle = Asked::after(2, start, start);
+        assert_eq!(plan(&mut idle, at(60), far, &limits), Next::LetGo);
+    }
+
+    /// KR-REQ-10.23: the host's window is full and stays full past the connection's last call, as
+    /// after a slow start whose challenge and proof went late. Waiting for the window would put the
+    /// next question after the call, with less time than the call leaves for an answer. The device
+    /// looks for a fresh connection instead, keeps the question, and asks it once the window has
+    /// room; nothing goes on the connection after that.
+    #[test]
+    fn a_window_full_past_the_cutoff_sends_the_device_looking() {
+        let limits = PreAuthLimits::default();
+        let start = tokio::time::Instant::now();
+        let at = |seconds: u64| start + Duration::from_secs(seconds);
+        let far = at(600);
+        // The challenge and the proof at 42 s, then two status questions.
+        let mut asked = Asked::after(2, start, at(42));
+        asked.asked(at(42));
+        asked.asked(at(45));
+        assert_eq!(asked.last_call(), at(50));
+        assert_eq!(
+            plan(&mut asked, at(48), far, &limits),
+            Next::LookFirst {
+                within: Duration::from_secs(2),
+                keep: true
+            }
+        );
+        // At the call the window still has no room; the question goes as soon as it has.
+        assert_eq!(
+            plan(&mut asked, at(50), far, &limits),
+            Next::Wait(Duration::from_secs(3))
+        );
+        assert_eq!(plan(&mut asked, at(53), far, &limits), Next::Ask);
+        asked.asked(at(53));
+        assert_eq!(plan(&mut asked, at(56), far, &limits), Next::LetGo);
     }
 
     /// KR-REQ-10.23: a host that counts the questions it refuses, and keeps a window longer than
