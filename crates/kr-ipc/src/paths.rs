@@ -1788,14 +1788,26 @@ pub fn flush_held_directory(
 ) -> std::io::Result<()> {
     use windows_sys::Win32::Storage::FileSystem::{FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY};
 
-    self::windows::reopen_directory(
+    flush_held_through(
         directory.as_handle(),
         match kind {
             NameKind::File => FILE_ADD_FILE,
             NameKind::Directory => FILE_ADD_SUBDIRECTORY,
         },
-    )?
-    .sync_all()
+    )
+}
+
+/// Flushes the directory a handle holds through a second handle, opened from it, that holds
+/// `right` and nothing more.
+///
+/// [`flush_through`] for a held directory: the flush is asked of the operating system through the
+/// second handle, which it grants only where that handle may write.
+#[cfg(windows)]
+fn flush_held_through(
+    directory: std::os::windows::io::BorrowedHandle<'_>,
+    right: u32,
+) -> std::io::Result<()> {
+    self::windows::reopen_directory(directory, right)?.sync_all()
 }
 
 /// How many links the walk over a path follows before it gives up.
@@ -2545,8 +2557,8 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// The second handle is flushed by the operating system, which refuses a handle that may not
-    /// write and flushes through one that may add a file.
+    /// The flush of a held directory is asked of the operating system through the second handle,
+    /// which refuses a handle that may not write and flushes through one that may add a file.
     #[cfg(windows)]
     #[test]
     fn the_held_flush_is_asked_of_the_operating_system() {
@@ -2556,26 +2568,26 @@ mod tests {
             FILE_ADD_FILE, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
         };
 
+        // The directory opens again with nothing more than the right to read its attributes, as
+        // the first call shows, so what refuses in the second is the flush: a flush that opened
+        // the second handle and never asked for the flush would return success instead.
         let root = temporary_root("flush-held-asked");
         let held = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             .open(&root)
             .expect("the directory is held open");
-        let reading = super::windows::reopen_directory(held.as_handle(), FILE_READ_ATTRIBUTES)
+        super::windows::reopen_directory(held.as_handle(), FILE_READ_ATTRIBUTES)
             .expect("the directory opens again with the right to read its attributes");
         assert_eq!(
-            reading
-                .sync_all()
+            flush_held_through(held.as_handle(), FILE_READ_ATTRIBUTES)
                 .expect_err("a flush through a handle that may not write")
                 .kind(),
             std::io::ErrorKind::PermissionDenied
         );
-        super::windows::reopen_directory(held.as_handle(), FILE_ADD_FILE)
-            .expect("the directory opens again with the right to add a file")
-            .sync_all()
-            .expect("and through that handle the flush is made");
-        drop((reading, held));
+        flush_held_through(held.as_handle(), FILE_ADD_FILE)
+            .expect("and through one that may add a file, the flush is made");
+        drop(held);
         std::fs::remove_dir_all(&root).ok();
     }
 
