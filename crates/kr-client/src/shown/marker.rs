@@ -1184,6 +1184,28 @@ mod cases {
         );
     }
 
+    /// A failure names a synchronised object's collection with the name the collection has, for
+    /// every kind the protocol defines, the recovery bundle among them. Both parts are closed
+    /// values, a kind from the protocol and an identifier, so there is no place to plant a marker:
+    /// the name is held exactly instead.
+    #[test]
+    fn a_failure_names_each_kinds_collection_as_the_collection_is_named() {
+        use crate::sync::store::{collection_of, shown_collection};
+
+        let object_id = SyncObjectId::new(uuid(9));
+        for kind in kr_protocol::sync::SyncObjectKind::ALL {
+            assert_eq!(
+                shown_collection(kind, object_id).as_str(),
+                collection_of(kind, object_id),
+                "{kind}"
+            );
+        }
+        assert_eq!(
+            shown_collection(kr_protocol::sync::SyncObjectKind::RecoveryBundle, object_id).as_str(),
+            "recovery_bundle/09090909-0909-0909-0909-090909090909"
+        );
+    }
+
     #[allow(dead_code, reason = "a path helper some cases share")]
     fn named(path: &Path) -> Shown {
         Shown::root(path)

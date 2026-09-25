@@ -347,4 +347,67 @@ mod tests {
             "WriteRecord{service_origin:\"<notprinted>\",expected:Nullable(None),..}",
         );
     }
+
+    /// A record the disk will not take back is named by the name the store gave it, which is a
+    /// digest of the location it is the record of, with the kind of fault: never by the location,
+    /// whose origin and locator a kit supplied. A directory it cannot flush is named as the one the
+    /// store was given.
+    #[test]
+    fn a_record_the_disk_will_not_take_back_says_nothing_of_its_location() {
+        use crate::shown::marker::{MARKER, assert_unmarked, failure_renderings};
+
+        let disk = tempfile::tempdir().expect("a directory");
+        let directory = disk.path().join("records");
+        std::fs::create_dir(&directory).expect("the store's directory");
+        let context = RecoveryContext {
+            service_origin: format!("https://{MARKER}:{MARKER}@reach.example/{MARKER}"),
+            bundle_locator: MARKER.to_owned(),
+        };
+        let (file, record) = RecordFile::open(&directory, &context).expect("the record's place");
+        assert!(record.is_none());
+        // The negative control: the location holds the marker, and the record's name does not.
+        assert!(context.bundle_locator.contains(MARKER));
+        assert!(!file.path.to_string_lossy().contains(MARKER));
+
+        // A directory in the record's place, which no platform removes as a file.
+        std::fs::create_dir(&file.path).expect("a directory in the record's place");
+        let refused = file
+            .restore(None)
+            .expect_err("a directory is not removed as a record");
+        // The neutral control: the record's own name and the kind of fault.
+        let said = refused.to_string();
+        let name = file
+            .path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .expect("a name");
+        assert!(
+            said.starts_with("the recovery bundle's write record at ") && said.contains(name),
+            "{said}"
+        );
+        assert_unmarked(
+            "a record the disk would not take back",
+            &failure_renderings(refused),
+        );
+        std::fs::remove_dir(&file.path).expect("the directory in the record's place");
+
+        // The store's directory gone: the record is not there to remove, and the directory
+        // cannot be flushed.
+        std::fs::remove_dir_all(&directory).expect("the store's directory");
+        let unflushed = file
+            .restore(None)
+            .expect_err("a directory that is gone is not flushed");
+        let said = unflushed.to_string();
+        assert!(
+            said.starts_with(&format!(
+                "the recovery bundle's write record at {} could not be used: ",
+                directory.display()
+            )),
+            "{said}"
+        );
+        assert_unmarked(
+            "a directory the store cannot flush",
+            &failure_renderings(unflushed),
+        );
+    }
 }

@@ -83,6 +83,8 @@ struct Held {
     revisions: u8,
     /// A request signed before this instant runs nothing and records nothing.
     cutoff_ms: u64,
+    /// What the refusal of such a request says, when a test gives it words of its own.
+    cutoff_words: Option<String>,
 }
 
 /// One request as the service read it.
@@ -153,6 +155,18 @@ impl Web {
             .entry(locator.to_owned())
             .or_default()
             .cutoff_ms = cutoff_ms;
+    }
+
+    /// Moves one collection's cutoff as [`Self::cut_off`] does, and has its refusal of a request
+    /// signed before it say `words`.
+    fn cut_off_saying(&self, locator: &str, cutoff_ms: u64, words: &str) {
+        self.cut_off(locator, cutoff_ms);
+        self.collections
+            .lock()
+            .expect("the collections")
+            .entry(locator.to_owned())
+            .or_default()
+            .cutoff_words = Some(words.to_owned());
     }
 
     fn seen(&self) -> Vec<Seen> {
@@ -275,7 +289,13 @@ impl Web {
         copy_on_writes: bool,
     ) -> ServiceHttpAnswer {
         if at_ms < held.cutoff_ms {
-            return refusal(409, "SIGNED_BEFORE_CUTOFF", "signed before the cutoff");
+            return refusal(
+                409,
+                "SIGNED_BEFORE_CUTOFF",
+                held.cutoff_words
+                    .as_deref()
+                    .unwrap_or("signed before the cutoff"),
+            );
         }
         let request = asked["request_id"]
             .as_str()
@@ -1703,6 +1723,123 @@ async fn a_write_signed_before_the_cutoff_is_held_as_unsettled() {
         Some(LostWrite::Unsettled { .. })
     ));
     assert_eq!(web.standing(&locator), (Some(2), Some("owner")));
+}
+
+/// A bundle write says what became of it in this program's words and nothing it carried or was
+/// answered: not the stream, which a refusal before anything is sent names by its length; not the
+/// account token that travels beside every request; and not what a service wrote in refusing a
+/// write as signed before its cutoff, which the store holds as unsettled in words of its own.
+#[tokio::test]
+async fn a_bundle_write_says_nothing_of_its_stream_its_token_or_the_services_words() {
+    use crate::shown::marker::{MARKER, assert_unmarked, failure_renderings};
+    use kr_protocol::sync::MIN_SEALED_RECOVERY_BUNDLE_BYTES;
+
+    let marked = |length: usize| -> Vec<u8> { MARKER.bytes().cycle().take(length).collect() };
+    let web = Web::open();
+    web.issue(MARKER, "owner", &[BACKUP_WRITE_SCOPE]);
+    let sign_in = SignIn::holding(MARKER);
+    let owner = client(&web, &sign_in, BACKUP_WRITE_SCOPE);
+    let locator = fresh_locator().expect("a locator");
+    let collection = bundle_collection(&at(ORIGIN, &locator));
+
+    // A stream a service does not keep, too short and too long: the negative control is the
+    // stream, which holds the marker; the neutral control is the rule it broke, with its lengths.
+    let shortest = usize::try_from(MIN_SEALED_RECOVERY_BUNDLE_BYTES).expect("a length");
+    let longest = usize::try_from(MAX_SEALED_RECOVERY_BUNDLE_BYTES).expect("a length");
+    for (stream, rule) in [
+        (
+            marked(shortest - 1),
+            format!(
+                "at least {MIN_SEALED_RECOVERY_BUNDLE_BYTES} bytes; this one is {}",
+                shortest - 1
+            ),
+        ),
+        (
+            marked(longest + 1),
+            format!(
+                "at most {MAX_SEALED_RECOVERY_BUNDLE_BYTES} bytes; this one is {}",
+                longest + 1
+            ),
+        ),
+    ] {
+        assert!(
+            stream
+                .windows(MARKER.len())
+                .any(|window| window == MARKER.as_bytes())
+        );
+        let dispatched = owner
+            .compare_exchange_dispatched(&collection, identity(0xd1), now_ms(), None, &stream)
+            .await
+            .expect("an account of the request");
+        let SyncDispatch::NotSent(refused) = dispatched else {
+            panic!("a stream no service keeps is not sent: {dispatched:?}");
+        };
+        let said = refused.to_string();
+        assert_eq!(
+            said,
+            format!(
+                "INVALID_ARGUMENT: that recovery bundle is not one a service admits: a sealed \
+                 recovery bundle is {rule}"
+            )
+        );
+        assert_unmarked("a stream no service keeps", &failure_renderings(refused));
+    }
+
+    // A client that presents no account refuses the write in its own words.
+    let dispatched = unsigned_client(&web)
+        .compare_exchange_dispatched(&collection, identity(0xd2), now_ms(), None, &marked(140))
+        .await
+        .expect("an account of the request");
+    let SyncDispatch::NotSent(refused) = dispatched else {
+        panic!("a bundle write with no account is not sent: {dispatched:?}");
+    };
+    assert_eq!(
+        refused.to_string(),
+        "HOST_NOT_CONFIGURED: a recovery bundle is reached with an account token, and this client \
+         presents no account"
+    );
+    assert_unmarked(
+        "a bundle write with no account",
+        &failure_renderings(refused),
+    );
+    assert!(web.seen().is_empty(), "nothing was sent");
+
+    // A write the service holds as signed before its cutoff, refused with the marker as its words.
+    let seed = RecoverySeed::generate().expect("a seed");
+    let mut store = store(&owner, at(ORIGIN, &locator));
+    let mut bundle = BundleStore::empty(now());
+    store
+        .commit(&seed, &mut bundle, now())
+        .await
+        .expect("the first bundle");
+    web.cut_off_saying(&locator, now_ms() + 60_000, MARKER);
+    let unsettled = store
+        .commit(&seed, &mut bundle, now())
+        .await
+        .expect_err("a write signed before the cutoff");
+    assert!(
+        matches!(unsettled, RecoveryError::BundleOutcomeUnknown { .. }),
+        "{unsettled:?}"
+    );
+    assert!(
+        unsettled
+            .to_string()
+            .contains("the service refused the write as signed before its cutoff, and ran nothing"),
+        "{unsettled}"
+    );
+    assert_unmarked(
+        "a write signed before the cutoff",
+        &failure_renderings(unsettled),
+    );
+    // The negative control for the token: it travelled beside every request that was sent.
+    let seen = web.seen();
+    assert!(!seen.is_empty());
+    for request in &seen {
+        assert_eq!(
+            request.authorization.as_deref(),
+            Some(format!("Bearer {MARKER}").as_str())
+        );
+    }
 }
 
 #[test]
