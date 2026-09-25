@@ -483,32 +483,35 @@ mod tests {
         use kr_shell_integration::host::package::PackageFault;
 
         let root = Path::new("/opt/kalareach/shells");
+        // The root is said with the platform's own separator throughout.
+        let said = ["", "opt", "kalareach", "shells"].join(std::path::MAIN_SEPARATOR_STR);
         for (fault, expected) in [
             (
                 PackageFault::Unreadable {
                     path: format!("/opt/kalareach/shells/{MARKER}"),
                     detail: MARKER.to_owned(),
                 },
-                "a package under /opt/kalareach/shells cannot be read",
+                format!("a package under {said} cannot be read"),
             ),
             (
                 PackageFault::MissingExecutable {
                     path: format!("/opt/kalareach/shells/{MARKER}/current"),
                 },
-                "a package under /opt/kalareach/shells names an executable that is not installed",
+                format!("a package under {said} names an executable that is not installed"),
             ),
             (
                 PackageFault::Unqualified {
                     requested: MARKER.to_owned(),
                 },
                 "the shell asked for has no qualified KalaReach package, so it cannot claim the \
-                 managed contract",
+                 managed contract"
+                    .to_owned(),
             ),
             (
                 PackageFault::NotInteractive {
                     detail: MARKER.to_owned(),
                 },
-                "a script invocation is not an interactive root shell",
+                "a script invocation is not an interactive root shell".to_owned(),
             ),
         ] {
             // The negative control: the fault's own text carries what it read.
