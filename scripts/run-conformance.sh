@@ -136,14 +136,14 @@ fetch_applications() {
     for place in "$archives" "$cache/index.json"; do
         if [ -L "$place" ]; then
             echo "run-conformance: $place is a link, and the application cache writes through none" >&2
-            return 1
+            exit 2
         fi
     done
     mkdir -p "$archives"
     for tool in curl tar python3 make; do
         if ! command -v "$tool" > /dev/null 2>&1; then
             echo "run-conformance: $tool is needed to fetch the applications and is not on the path" >&2
-            return 1
+            exit 2
         fi
     done
     local jobs
@@ -363,7 +363,9 @@ if selected applications && [ "$family" != windows ]; then
     cache="$(application_cache "${KR_CONFORMANCE_APPLICATIONS:-$default_cache}")" || exit 2
     export KR_CONFORMANCE_APPLICATIONS="$cache"
     echo "run-conformance: applications in $KR_CONFORMANCE_APPLICATIONS"
-    fetch_applications "$KR_CONFORMANCE_APPLICATIONS" || exit 2
+    # Called on its own, so that any command of it that fails ends the script: a refusal inside it
+    # exits 2 itself.
+    fetch_applications "$KR_CONFORMANCE_APPLICATIONS"
     arguments+=(--applications "$KR_CONFORMANCE_APPLICATIONS")
 fi
 
