@@ -125,12 +125,12 @@ pub fn render_kit(kit: &RecoveryKit) -> Result<Zeroizing<String>, RecoveryError>
 
 /// Returns the bytes a QR code carries in byte mode.
 ///
-/// They are [`render`]'s bytes. A scanner therefore reads the document a person could have typed,
+/// They are [`render_kit`]'s bytes. A scanner therefore reads the document a person could have typed,
 /// and a kit copied by either route is the same kit.
 ///
 /// # Errors
 ///
-/// See [`render`].
+/// See [`render_kit`].
 pub fn qr_payload(kit: &RecoveryKit) -> Result<Zeroizing<Vec<u8>>, RecoveryError> {
     Ok(Zeroizing::new(render_kit(kit)?.as_bytes().to_vec()))
 }
