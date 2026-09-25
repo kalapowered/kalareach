@@ -1124,6 +1124,49 @@ the host's sleep setting is doing:
 }
 ```
 
+`kr status --json` also carries `terminal_attachments`: each terminal attachment of the session as
+its worker reports it, with how it is presented and why. `presentation` is `direct` or `viewport`,
+and `presentation_reason` is null for a direct attachment, which needs no reason, and for a
+viewport whose worker was built before reasons existed. It is null as a whole for a session read
+from the control daemon, which has no live worker to ask; when the worker answered the session read
+and not the question about its attachments, `terminal_attachments_unread` says why.
+
+```json
+{
+  "terminal_attachments": [
+    {
+      "attachment_id": "0f8e2a64-9b1d-4c3e-8a57-2b6d9e1f4c70",
+      "presentation": "viewport",
+      "presentation_reason": "size_mismatch",
+      "dimensions": { "columns": 100, "rows": 30 },
+      "terminal_profile_id": "xterm-256color"
+    }
+  ]
+}
+```
+
+The text form prints one line per terminal attachment, and a viewport's line names its reason and
+what it means:
+
+```text
+attachment 0f8e2a64-9b1d-4c3e-8a57-2b6d9e1f4c70: viewport (size_mismatch): its size is not the session's
+```
+
+The reason is the first of these that holds, in this order:
+
+| Reason | What keeps the attachment off the live stream |
+| --- | --- |
+| `no_terminal_profile` | its client declared no terminal profile, as `--no-probe` does |
+| `unqualified_terminal_profile` | the profile its client declared is not one this build has qualified |
+| `size_mismatch` | its size is not the session's |
+| `history_window` | its window is above the live screen |
+| `stream_not_carryable` | the session's output is no longer something a terminal can be handed as it is |
+| `restoration_incomplete` | the screen it was last given could not carry everything the application addresses, such as a pending wrap |
+| `awaiting_parser_boundary` | forwarding waits for the session's output to reach the end of a sequence |
+
+The first three last as long as the attachment stays as it is, the window until the person
+returns to the live screen, and the others pass by themselves.
+
 A closed session carries its record instead of a null: whose it is, how it closed, the owned
 processes the closure terminated and anything that survived it.
 

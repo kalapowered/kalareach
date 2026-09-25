@@ -8,6 +8,7 @@
 //! reported, because that label is the difference between a session that implements empty-prompt
 //! Ctrl-D and one that does not.
 
+use kr_protocol::attachment::{AttachMode, AttachmentSummary, TerminalPresentationMode};
 use kr_protocol::desktop::{
     CapabilityRecord, DesktopCapabilityReport, DesktopContext, EnvironmentCapabilitiesResult,
     SleepInhibitionState,
@@ -389,6 +390,58 @@ pub fn desktop_line(summary: &SessionSummary) -> String {
     }
 }
 
+/// Renders each terminal attachment's presentation and the reason for it.
+///
+/// Section 8 asks `kr status` to report each terminal attachment's mode and its reason. An
+/// attachment that is not a terminal has neither and is left out. A viewport whose worker gave no
+/// reason, which a worker built before reasons existed does, says so with a null.
+#[must_use]
+pub fn terminal_attachments(attachments: &[AttachmentSummary]) -> Value {
+    Value::Array(
+        attachments
+            .iter()
+            .filter(|summary| summary.mode == AttachMode::Terminal)
+            .map(|summary| {
+                json!({
+                    "attachment_id": summary.attachment_id.to_string(),
+                    "presentation": summary.presentation.as_ref().map(|mode| mode.as_str()),
+                    "presentation_reason": summary.presentation_reason.map(|reason| reason.as_str()),
+                    "dimensions": summary.dimensions.as_ref().map(|dimensions| json!({
+                        "columns": dimensions.columns(),
+                        "rows": dimensions.rows(),
+                    })),
+                    "terminal_profile_id": summary.terminal_profile_id.as_ref().cloned(),
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Renders each terminal attachment's presentation and its reason as a line for a person.
+#[must_use]
+pub fn terminal_attachment_lines(attachments: &[AttachmentSummary]) -> Vec<String> {
+    attachments
+        .iter()
+        .filter(|summary| summary.mode == AttachMode::Terminal)
+        .map(|summary| {
+            let presented = match (
+                summary.presentation.as_ref().copied(),
+                summary.presentation_reason,
+            ) {
+                (Some(TerminalPresentationMode::Direct), _) => "direct".to_owned(),
+                (Some(TerminalPresentationMode::Viewport), Some(reason)) => {
+                    format!("viewport ({}): {}", reason.as_str(), reason.describe())
+                }
+                (Some(TerminalPresentationMode::Viewport), None) => {
+                    "viewport, with no reason reported by this session's worker".to_owned()
+                }
+                (None, _) => "no presentation reported".to_owned(),
+            };
+            format!("attachment {}: {presented}", summary.attachment_id)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,6 +518,93 @@ mod tests {
             root_process: kr_protocol::scalars::Nullable::null(),
             closure: kr_protocol::scalars::Nullable::null(),
         }
+    }
+
+    /// A terminal attachment of the kind the session's worker reports.
+    fn attachment(
+        byte: u8,
+        mode: AttachMode,
+        presentation: Option<TerminalPresentationMode>,
+        reason: Option<kr_protocol::attachment::PresentationReason>,
+    ) -> AttachmentSummary {
+        AttachmentSummary {
+            attachment_id: kr_protocol::ids::AttachmentId::new(
+                kr_protocol::scalars::Uuid::from_bytes([byte; 16]),
+            ),
+            ordinal: kr_protocol::ids::AttachmentOrdinal::new(u64::from(byte)),
+            mode,
+            claim_geometry: false,
+            dimensions: kr_protocol::scalars::Nullable::some(
+                kr_protocol::session::Dimensions::new(100, 30),
+            ),
+            presentation: kr_protocol::scalars::Nullable(presentation),
+            presentation_reason: reason,
+            terminal_profile_id: kr_protocol::scalars::Nullable::some("xterm-256color".to_owned()),
+            granted: kr_protocol::scalars::CanonicalSet::new(),
+            attached_at_ms: kr_protocol::scalars::TimestampMs::new(1),
+        }
+    }
+
+    /// KR-REQ-08.02: each terminal attachment is reported with its presentation and the reason for
+    /// it, a direct one with none, one whose worker gave no reason as such, and an attachment that
+    /// is not a terminal not at all.
+    #[test]
+    fn each_terminal_attachment_is_reported_with_its_presentation_and_reason() {
+        use kr_protocol::attachment::PresentationReason;
+
+        let attachments = [
+            attachment(
+                1,
+                AttachMode::Terminal,
+                Some(TerminalPresentationMode::Direct),
+                None,
+            ),
+            attachment(
+                2,
+                AttachMode::Terminal,
+                Some(TerminalPresentationMode::Viewport),
+                Some(PresentationReason::SizeMismatch),
+            ),
+            attachment(
+                3,
+                AttachMode::Terminal,
+                Some(TerminalPresentationMode::Viewport),
+                None,
+            ),
+            attachment(4, AttachMode::Semantic, None, None),
+        ];
+        let rendered = terminal_attachments(&attachments);
+        let entries = rendered.as_array().expect("a list");
+        assert_eq!(
+            entries.len(),
+            3,
+            "the semantic attachment is not a terminal: {rendered}"
+        );
+        assert_eq!(entries[0]["presentation"], "direct");
+        assert_eq!(entries[0]["presentation_reason"], Value::Null);
+        assert_eq!(entries[1]["presentation"], "viewport");
+        assert_eq!(entries[1]["presentation_reason"], "size_mismatch");
+        assert_eq!(
+            entries[1]["dimensions"],
+            json!({ "columns": 100, "rows": 30 })
+        );
+        assert_eq!(entries[1]["terminal_profile_id"], "xterm-256color");
+        assert_eq!(entries[2]["presentation_reason"], Value::Null);
+
+        let lines = terminal_attachment_lines(&attachments);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            lines[0],
+            format!("attachment {}: direct", attachments[0].attachment_id)
+        );
+        assert_eq!(
+            lines[1],
+            format!(
+                "attachment {}: viewport (size_mismatch): its size is not the session's",
+                attachments[1].attachment_id
+            )
+        );
+        assert!(lines[2].ends_with("viewport, with no reason reported by this session's worker"));
     }
 
     #[test]

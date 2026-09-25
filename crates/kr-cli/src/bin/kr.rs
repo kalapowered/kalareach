@@ -512,26 +512,27 @@ async fn run(cli: Cli) -> Result<Completion> {
             // The environment the session was found in, which is not always the one this
             // installation opens by default. Reading one environment's session and another's
             // power setting would describe a machine the session is not on.
-            let (read, host) = match find(&paths, &selector, wanted) {
-                Ok((known, descriptor)) => {
-                    let summary = match read_session(&descriptor).await {
-                        Ok(summary) => summary,
-                        // A descriptor that no longer answers is a hint that has gone stale. The
-                        // daemon reconciles it and returns the closure record.
-                        Err(CliError::HostUnavailable(_)) => {
-                            let mut client = open_controller(&known.paths, build_id()).await?;
-                            read_from_controller(&mut client, descriptor.session_id).await?
-                        }
-                        Err(error) => return Err(error),
-                    };
-                    (summary, known.paths)
-                }
+            // The attachments are read only where the session's own worker answered: a session
+            // read from the daemon has no live worker to ask.
+            let (read, attachments, host) = match find(&paths, &selector, wanted) {
+                Ok((known, descriptor)) => match read_session(&descriptor).await {
+                    Ok((summary, attachments)) => (summary, Some(attachments), known.paths),
+                    // A descriptor that no longer answers is a hint that has gone stale. The
+                    // daemon reconciles it and returns the closure record.
+                    Err(CliError::HostUnavailable(_)) => {
+                        let mut client = open_controller(&known.paths, build_id()).await?;
+                        let summary =
+                            read_from_controller(&mut client, descriptor.session_id).await?;
+                        (summary, None, known.paths)
+                    }
+                    Err(error) => return Err(error),
+                },
                 Err(CliError::UnknownSession(_)) => {
                     let mut client = open_controller(&environment.paths, build_id()).await?;
                     let session_id =
                         kr_cli::resolve::retained_session(&mut client, &selector).await?;
                     let summary = read_from_controller(&mut client, session_id).await?;
-                    (summary, environment.paths)
+                    (summary, None, environment.paths)
                 }
                 Err(error) => return Err(error),
             };
@@ -562,6 +563,19 @@ async fn run(cli: Cli) -> Result<Completion> {
                             .as_ref()
                             .map_or(serde_json::Value::Null, launch_profile_document),
                     );
+                    object.insert(
+                        "terminal_attachments".to_owned(),
+                        match attachments.as_ref() {
+                            Some(Ok(attachments)) => report::terminal_attachments(attachments),
+                            Some(Err(_)) | None => serde_json::Value::Null,
+                        },
+                    );
+                    if let Some(Err(why)) = attachments.as_ref() {
+                        object.insert(
+                            "terminal_attachments_unread".to_owned(),
+                            serde_json::json!(why),
+                        );
+                    }
                 }
                 print_json(&document);
             } else {
@@ -572,6 +586,17 @@ async fn run(cli: Cli) -> Result<Completion> {
                 }
                 if let Some(power) = power.as_ref() {
                     println!("{}", power.describe());
+                }
+                match attachments.as_ref() {
+                    Some(Ok(attachments)) => {
+                        for line in report::terminal_attachment_lines(attachments) {
+                            println!("{line}");
+                        }
+                    }
+                    Some(Err(why)) => {
+                        println!("terminal attachments: not read from the session's worker: {why}")
+                    }
+                    None => {}
                 }
                 if let Some(closure) = summary.closure.as_ref() {
                     println!(
@@ -1159,9 +1184,19 @@ async fn read_from_controller(
     read_result(outcome)
 }
 
+/// What `kr status` read of each attachment: the summaries its worker gave, or why they could not
+/// be read.
+type AttachmentsRead = std::result::Result<Vec<kr_protocol::attachment::AttachmentSummary>, String>;
+
+/// Reads a session from its own worker, and each of its attachments with it.
+///
+/// Each attachment's presentation and the reason for it travel in the worker's snapshot rather
+/// than in the session read, so the snapshot is asked on the same connection. It is a second
+/// question: a worker that cannot answer it leaves the session read standing, and the command says
+/// the attachments were not read rather than failing the whole status.
 async fn read_session(
     descriptor: &kr_protocol::worker::WorkerDescriptor,
-) -> Result<SessionReadResult> {
+) -> Result<(SessionReadResult, AttachmentsRead)> {
     let mut client = open_worker(descriptor, build_id()).await?;
     let outcome = client
         .request(
@@ -1171,7 +1206,25 @@ async fn read_session(
             },
         )
         .await?;
-    read_result(outcome)
+    let read = read_result(outcome)?;
+    let attachments = match client
+        .request(
+            Method::EventsSnapshot,
+            &kr_protocol::recovery::EventsSnapshotParams {
+                session_id: descriptor.session_id,
+                agent_resources_from: Nullable::null(),
+            },
+        )
+        .await
+    {
+        Ok(Ok(value)) => value
+            .to_typed::<kr_protocol::recovery::EventsSnapshotResult>()
+            .map(|snapshot| snapshot.attachments)
+            .map_err(|error| error.to_string()),
+        Ok(Err(refusal)) => Err(refusal.to_string()),
+        Err(error) => Err(error.to_string()),
+    };
+    Ok((read, attachments))
 }
 
 /// Reads a session read, from a worker of this build or of the one before it.
