@@ -110,15 +110,13 @@ pub const LIVENESS: std::time::Duration = std::time::Duration::from_secs(120);
 ///
 /// # Errors
 ///
-/// Returns the rule the value broke, without the value: an address may carry a credential in
-/// front of its host.
+/// Returns the rule the value broke, as the end of a sentence about the value ("is not ..."), and
+/// without the value: an address may carry a credential in front of its host.
 pub fn canonical_origin(named: &str) -> Result<(RendezvousOrigin, GatewayOrigin), String> {
-    let origin = RendezvousOrigin::new(named.to_owned()).map_err(|error| {
-        format!("what {ORIGIN_VARIABLE} names is not a canonical HTTPS origin: {error}")
-    })?;
-    let gateway = GatewayOrigin::new(named.to_owned()).map_err(|error| {
-        format!("what {ORIGIN_VARIABLE} names is not an origin a request travels to: {error}")
-    })?;
+    let origin = RendezvousOrigin::new(named.to_owned())
+        .map_err(|error| format!("is not a canonical HTTPS origin: {error}"))?;
+    let gateway = GatewayOrigin::new(named.to_owned())
+        .map_err(|error| format!("is not an origin a request travels to: {error}"))?;
     Ok((origin, gateway))
 }
 
@@ -150,7 +148,8 @@ impl Checkpoint {
             eprintln!("skipping the {leg} leg: {ORIGIN_VARIABLE} names no deployment");
             return None;
         }
-        let (origin, gateway) = canonical_origin(&named).unwrap_or_else(|rule| panic!("{rule}"));
+        let (origin, gateway) = canonical_origin(&named)
+            .unwrap_or_else(|rule| panic!("what {ORIGIN_VARIABLE} names {rule}"));
         Some(Self { origin, gateway })
     }
 
