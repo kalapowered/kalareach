@@ -19,6 +19,7 @@ import { fakeHost, type FakeHostControls } from '../../src/host/fake'
 import type { HostPort } from '../../src/host/port'
 import { Shell } from '../../src/mobile/entry'
 import { MobileApp, type MobileBuild } from '../../src/mobile/MobileApp'
+import { Inbox } from '../../src/mobile/views/Inbox'
 import { PURCHASE_WORDS } from '../../src/model/account'
 import { TOUCH_TARGET, type MobilePlatform } from '../../src/mobile/platform'
 
@@ -606,6 +607,50 @@ describe('the shell and the inbox read once they are listening (KR-REQ-13.02)', 
     })
     expect(shows('a-1')).toBe(false)
     expect(shows('a-2')).toBe(true)
+  })
+
+  // One listener is registered and the other is not: a change the first hears starts no read, and
+  // when the second cannot be registered, nothing read afterwards clears what the inbox says.
+  it('reads nothing until both listeners are registered, and keeps a registration failure', async () => {
+    const { port, controls } = fakeHost()
+    const held = controls.hold('attentionRead')
+    let refuse: (reason: unknown) => void = () => {}
+    render(
+      <AppProvider
+        port={{
+          ...port,
+          onConnection: () =>
+            new Promise<() => void>((_, reject) => {
+              refuse = reject
+            })
+        }}
+      >
+        <Inbox surface="ios" onOpenSession={() => undefined} />
+      </AppProvider>
+    )
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    await answeredElsewhere(port, controls, 'a-1')
+    expect(held.count).toBe(0)
+
+    await act(async () => {
+      refuse({
+        code: 'INTERNAL',
+        message: 'The shell did not register the listener.',
+        user_action: 'retry'
+      })
+      await Promise.resolve()
+    })
+    expect(await screen.findByText('The inbox could not be read')).toBeInTheDocument()
+
+    await act(async () => {
+      held.release()
+      await Promise.resolve()
+    })
+    expect(screen.getByText('The inbox could not be read')).toBeInTheDocument()
+    expect(shows('a-2')).toBe(false)
   })
 
   it('shows the inbox it read when nothing changed in between', async () => {

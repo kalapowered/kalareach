@@ -15,7 +15,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 
 import { Banner, Button, CommitButton, Sheet } from '../../components/ui'
 import { useApp } from '../../app/state'
-import { failureMessage, watch } from '../../host/port'
+import { failureMessage, watch, type Watch } from '../../host/port'
 import type { AttentionEntry, AttentionInbox } from '../../model/pending'
 import { ask } from '../model/call'
 import { count, emptyMessage, filter, locationOf, order, type InboxFilter } from '../model/inbox'
@@ -53,45 +53,60 @@ export function Inbox({
   const [open, setOpen] = useState<AttentionEntry | null>(null)
   const target = minimumTarget(surface)
 
-  // Reads are counted, and only the newest one's answer is shown: two reads can answer in either
-  // order, and an answer that a later read has overtaken never replaces what the later one says.
-  const reads = useRef(0)
-  const read = useCallback(() => {
-    reads.current += 1
-    const made = reads.current
-    ask(() => port.attentionRead({}))
-      .then((answer) => {
-        if (made !== reads.current) return
-        setInbox(answer)
-        setError(null)
-      })
-      .catch((failure: unknown) => {
-        if (made !== reads.current) return
-        // A host that cannot be read is a host out of contact, which is a state the inbox has. It
-        // is never a claim that anything on it failed.
-        setError(failureMessage(failure))
-      })
-  }, [port])
+  // The watch the inbox reads under, for the read an answered approval asks for.
+  const watching = useRef<Watch | null>(null)
 
-  // The inbox is read once its listeners are registered, so no change falls between the read and
-  // them, and read again on each change they hear.
-  useEffect(
-    () =>
-      watch(
-        [
-          port.subscribe((event) => {
-            const body = event.body as { kind?: string }
-            if (body.kind === 'attention') read()
-          }),
-          port.onConnection(read)
-        ],
-        read,
-        (failure) => {
+  /**
+   * Reads the inbox under the check `watch` answered, and shows the answer only while it holds:
+   * while this is the newest read and the listeners have not stopped. A read the watch would not
+   * start, before its listeners are registered or after they stopped, is not made.
+   */
+  const read = useCallback(
+    (current: (() => boolean) | null) => {
+      if (current === null) return
+      ask(() => port.attentionRead({}))
+        .then((answer) => {
+          if (!current()) return
+          setInbox(answer)
+          setError(null)
+        })
+        .catch((failure: unknown) => {
+          if (!current()) return
+          // A host that cannot be read is a host out of contact, which is a state the inbox has.
+          // It is never a claim that anything on it failed.
           setError(failureMessage(failure))
-        }
-      ),
-    [port, read]
+        })
+    },
+    [port]
   )
+
+  // The inbox is read once both listeners are registered, so no change falls between the read and
+  // them, and read again on each change they hear.
+  useEffect(() => {
+    let inbox: Watch | null = null
+    const again = () => {
+      read(inbox?.read() ?? null)
+    }
+    inbox = watch(
+      [
+        port.subscribe((event) => {
+          const body = event.body as { kind?: string }
+          if (body.kind === 'attention') again()
+        }),
+        port.onConnection(again)
+      ],
+      again,
+      (failure) => {
+        setError(failureMessage(failure))
+      }
+    )
+    const current = inbox
+    watching.current = current
+    return () => {
+      current.stop()
+      if (watching.current === current) watching.current = null
+    }
+  }, [port, read])
 
   const rows = useMemo(() => (inbox ? order(inbox) : []), [inbox])
   const counts = useMemo(() => (inbox ? count(inbox) : null), [inbox])
@@ -121,7 +136,7 @@ export function Inbox({
           state === 'applied' ? 'success' : 'pending'
         )
         setOpen(null)
-        read()
+        read(watching.current?.read() ?? null)
       })
       .catch((failure: unknown) => {
         say(failureMessage(failure), 'danger')

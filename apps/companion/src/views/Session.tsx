@@ -13,12 +13,35 @@ import type { SessionReadResult } from '@kalareach/protocol'
 
 import { Badge, Banner, Button, Card, CommitButton, Segmented, Sheet, Switch, ThemeChooser } from '../components/ui'
 import { useApp } from '../app/state'
-import { failureMessage, watch, type SessionSubject } from '../host/port'
+import { failureMessage, watch, type HostPort, type SessionSubject, type Watch } from '../host/port'
 import type { LaunchSurface } from '../model/pending'
 import { Conversation, outcomeMessage, receiptTone } from './Conversation'
 import { RawTerminal } from '../terminal/RawTerminal'
 import { ask } from '../mobile/model/call'
 import { describeApplicationState, sessionDescription } from './Sessions'
+
+/** What the view has read of one session, and the prompt's generation as it knows it now. */
+interface SessionReading {
+  readonly sessionId: string
+  readonly session: SessionReadResult | null
+  readonly surface: LaunchSurface | null
+  /** The one the surface was read at, or one heard since. */
+  readonly promptGeneration: string | null
+}
+
+/** What `reading` holds for `sessionId`: nothing yet, when it holds another session's. */
+function readingOf(reading: SessionReading | null, sessionId: string): SessionReading {
+  return reading?.sessionId === sessionId
+    ? reading
+    : { sessionId, session: null, surface: null, promptGeneration: null }
+}
+
+/** What a watch that has every listener registered was started for. */
+interface Listening {
+  readonly port: HostPort
+  readonly sessionId: string
+  readonly attempt: number
+}
 
 /** The view of one session. */
 export function Session({
@@ -29,57 +52,66 @@ export function Session({
   readonly pane: 'semantic' | 'terminal'
 }): ReactNode {
   const { port, go, say, tabs, closeTab } = useApp()
-  const [session, setSession] = useState<SessionReadResult | null>(null)
+  const [reading, setReading] = useState<SessionReading | null>(null)
   const [connected, setConnected] = useState(true)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [closing, setClosing] = useState(false)
-  const [surface, setSurface] = useState<LaunchSurface | null>(null)
-  // The prompt's generation as this view last learned it: the one the surface was read at, or one
-  // heard since. A surface read at an older generation draws its buttons disabled.
-  const [promptGeneration, setPromptGeneration] = useState<string | null>(null)
+  // "Try again" registers the listeners again, and reads only once they are.
+  const [attempt, setAttempt] = useState(0)
+  // The watch that has every listener registered, named by what it was started for. The launch
+  // surface is offered only while there is one, so no button is live while a change could go
+  // unheard.
+  const [listeningFor, setListeningFor] = useState<Listening | null>(null)
+  // The load of that watch, for a launch that asks the view to read again once it is done.
+  const reload = useRef<(() => void) | null>(null)
 
-  // The changes the listeners have heard, counted, so a read can tell whether one overtook it, and
-  // the loads made, so only the newest load's answers are shown whatever order they arrive in.
-  const heard = useRef({ connection: 0, generation: 0 })
-  const loads = useRef(0)
-
-  const load = useCallback(() => {
-    loads.current += 1
-    const made = loads.current
-    const before = { ...heard.current }
-    const newest = () => made === loads.current
-    ask(() => port.sessionRead({ session_id: sessionId }))
-      .then((result) => {
-        if (!newest()) return
-        setSession(result)
-        // An answer says the host was reached when it was read; a change heard since is newer.
-        if (heard.current.connection === before.connection) setConnected(true)
-      })
-      .catch(() => {
-        if (newest() && heard.current.connection === before.connection) setConnected(false)
-      })
-    ask(() => port.launchSurface({ session_id: sessionId }))
-      .then((read) => {
-        if (!newest()) return
-        setSurface(read)
-        if (heard.current.generation === before.generation) {
-          setPromptGeneration(read.prompt_generation)
-        }
-      })
-      .catch(() => {
-        // Without a verified empty prompt there is no launch surface, which is the right answer
-        // rather than a set of buttons drawn hopefully.
-        if (newest()) setSurface(null)
-      })
-  }, [port, sessionId])
-
-  // The session and its launch surface are read once the listeners are registered, so no change
-  // can fall between the reads and them.
+  // The session and its launch surface are read once the listeners are registered, and only
+  // within that watch: a read it did not start, or an answer after it ended, is never shown.
   useEffect(() => {
-    const stop = watch(
+    // The changes heard in this watch, counted, so a read can tell whether one overtook it.
+    let connectionChanges = 0
+    let generationChanges = 0
+    let watching: Watch | null = null
+    const update = (change: (known: SessionReading) => SessionReading) => {
+      setReading((current) => change(readingOf(current, sessionId)))
+    }
+    const load = () => {
+      const current = watching?.read() ?? null
+      if (current === null) return
+      const connectionAt = connectionChanges
+      const generationAt = generationChanges
+      ask(() => port.sessionRead({ session_id: sessionId }))
+        .then((result) => {
+          if (!current()) return
+          update((known) => ({ ...known, session: result }))
+          // An answer says the host was reached when it was read; a change heard since is newer.
+          if (connectionChanges === connectionAt) setConnected(true)
+        })
+        .catch(() => {
+          if (current() && connectionChanges === connectionAt) setConnected(false)
+        })
+      ask(() => port.launchSurface({ session_id: sessionId }))
+        .then((surface) => {
+          if (!current()) return
+          // A generation heard since this read was made is the prompt's, and the buttons drawn
+          // from the read stay disabled until the person has looked at the prompt again.
+          const overtaken = generationChanges !== generationAt
+          update((known) => ({
+            ...known,
+            surface,
+            promptGeneration: overtaken ? known.promptGeneration : surface.prompt_generation
+          }))
+        })
+        .catch(() => {
+          // Without a verified empty prompt there is no launch surface, which is the right answer
+          // rather than a set of buttons drawn hopefully.
+          if (current()) update((known) => ({ ...known, surface: null }))
+        })
+    }
+    watching = watch(
       [
         port.onConnection((state) => {
-          heard.current.connection += 1
+          connectionChanges += 1
           setConnected(state.connected)
         }),
         port.subscribe((event) => {
@@ -87,22 +119,42 @@ export function Session({
           if (body.kind !== 'prompt_generation' || !body.prompt_generation) return
           // The launch surface is only valid at the generation it was read at. A generation that
           // moved disables the buttons rather than silently launching against the new prompt.
-          heard.current.generation += 1
-          setPromptGeneration(body.prompt_generation)
+          generationChanges += 1
+          const generation = body.prompt_generation
+          update((known) => ({ ...known, promptGeneration: generation }))
         })
       ],
-      load,
       () => {
-        // A view that cannot follow the host says so, and its banner offers to read it again.
+        reload.current = load
+        setListeningFor({ port, sessionId, attempt })
+        load()
+      },
+      () => {
+        // A view that cannot follow the host says so and offers no launch. Its banner's "Try
+        // again" registers the listeners again before it reads.
+        setListeningFor(null)
         setConnected(false)
       }
     )
+    const started = watching
     return () => {
-      stop()
-      // What was read while these listeners ran is not shown once they have stopped.
-      loads.current += 1
+      started.stop()
+      if (reload.current === load) reload.current = null
     }
-  }, [port, load])
+  }, [port, sessionId, attempt])
+
+  const readAgain = useCallback(() => {
+    reload.current?.()
+  }, [])
+
+  const known = reading?.sessionId === sessionId ? reading : null
+  const listening =
+    listeningFor !== null &&
+    listeningFor.port === port &&
+    listeningFor.sessionId === sessionId &&
+    listeningFor.attempt === attempt
+  const session = known?.session ?? null
+  const surface = listening ? (known?.surface ?? null) : null
 
   const summary = session?.session
   const state = summary ? describeApplicationState(summary) : null
@@ -190,7 +242,15 @@ export function Session({
           tone="warning"
           title="Not in contact with this host"
           detail="This session may still be running. Nothing here says otherwise."
-          action={<Button onClick={load}>Try again</Button>}
+          action={
+            <Button
+              onClick={() => {
+                setAttempt((count) => count + 1)
+              }}
+            >
+              Try again
+            </Button>
+          }
         />
       ) : null}
 
@@ -201,10 +261,10 @@ export function Session({
           connected={connected}
           launch={
             surface
-              ? { surface, promptGeneration: promptGeneration ?? surface.prompt_generation }
+              ? { surface, promptGeneration: known?.promptGeneration ?? surface.prompt_generation }
               : null
           }
-          onLaunched={load}
+          onLaunched={readAgain}
         />
       ) : (
         <RawTerminal

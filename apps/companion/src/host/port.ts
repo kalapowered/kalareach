@@ -678,51 +678,80 @@ export interface HostPort {
 }
 
 /**
+ * A view's listeners, from their registration until they stop, and the reads made meanwhile.
+ *
+ * A view reads the state its listeners follow only while every one of them is registered, so no
+ * change they would hear can fall between a read and them, and it shows a read's answer only while
+ * the watch runs and no newer read has been started. `read` holds a view to both: it starts nothing
+ * before every listener is registered or once the watch has ended, and it answers the check each
+ * answer is shown under.
+ */
+export interface Watch {
+  /** Ends the watch: every listener stops, and no read started in it is answered after this. */
+  readonly stop: () => void
+  /**
+   * Starts a read. Until every listener is registered, and once the watch has ended, there is none
+   * to start and this answers null. Otherwise it answers a check that stays true while this is the
+   * newest read started and the watch has not ended.
+   */
+  readonly read: () => (() => boolean) | null
+}
+
+/**
  * Listens, and then reads.
  *
- * Every listener the port registers resolves once it is registered. This registers all of
- * `registrations` and, once every one of them is, calls `listening`: a view reads there the state
- * its listeners follow, so no change they would hear can fall between the read and the listeners.
- * The returned function stops them all, including one whose registration completes after it was
- * called, and `listening` is never called after it. The first registration that fails ends the
- * watch at once, as the returned function does, and goes to `failed`.
+ * Every listener the port offers resolves once it is registered. This registers all of
+ * `registrations` and, once every one of them is, calls `listening`, where a view starts its first
+ * read. `stop` stops them all, including one whose registration completes after it, and `listening`
+ * is never called after it. The first registration that fails ends the watch at once, as `stop`
+ * does, and goes to `failed`.
  */
 export function watch(
   registrations: readonly Promise<() => void>[],
   listening: () => void = () => undefined,
   failed: (failure: unknown) => void = () => undefined
-): () => void {
-  let watching = true
+): Watch {
+  let stage: 'registering' | 'listening' | 'ended' = 'registering'
   let unregistered = registrations.length
+  let newest = 0
   const stops: (() => void)[] = []
-  const end = () => {
-    watching = false
-    for (const stop of stops.splice(0)) stop()
+  const stop = () => {
+    stage = 'ended'
+    for (const each of stops.splice(0)) each()
   }
-  if (unregistered === 0) {
-    void Promise.resolve().then(() => {
-      if (watching) listening()
-    })
+  const registered = () => {
+    if (stage !== 'registering') return
+    stage = 'listening'
+    listening()
   }
+  if (unregistered === 0) void Promise.resolve().then(registered)
   for (const registration of registrations) {
     void registration.then(
-      (stop) => {
-        if (!watching) {
-          stop()
+      (unlisten) => {
+        if (stage === 'ended') {
+          unlisten()
           return
         }
-        stops.push(stop)
+        stops.push(unlisten)
         unregistered -= 1
-        if (unregistered === 0) listening()
+        if (unregistered === 0) registered()
       },
       (failure: unknown) => {
-        if (!watching) return
-        end()
+        if (stage === 'ended') return
+        stop()
         failed(failure)
       }
     )
   }
-  return end
+  return {
+    stop,
+    read: () => {
+      if (stage !== 'listening') return null
+      newest += 1
+      const started = newest
+      return () => stage === 'listening' && started === newest
+    }
+  }
 }
 
 /**
@@ -740,20 +769,22 @@ export function follow<T>(
   show: (value: T) => void,
   failed: (failure: unknown) => void
 ): () => void {
-  let following = true
+  let stopped = false
   let heard = false
-  const answered = (settle: () => void) => {
-    if (following && !heard) settle()
-  }
-  const stop = watch(
+  const following: Watch = watch(
     [
       listen((value) => {
-        if (!following) return
+        if (stopped) return
         heard = true
         show(value)
       })
     ],
     () => {
+      const current = following.read()
+      if (current === null) return
+      const answered = (settle: () => void) => {
+        if (current() && !heard) settle()
+      }
       // A port can refuse before it returns a promise; that refusal is an answer like any other.
       void (async () => {
         try {
@@ -769,14 +800,12 @@ export function follow<T>(
       })()
     },
     (failure) => {
-      answered(() => {
-        failed(failure)
-      })
+      if (!heard) failed(failure)
     }
   )
   return () => {
-    following = false
-    stop()
+    stopped = true
+    following.stop()
   }
 }
 

@@ -280,7 +280,7 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
         setCall,
         setNotice
       )
-    })])
+    })]).stop
   }, [call, port])
 
   const actions = useMemo<VoiceSurfaceActions>(

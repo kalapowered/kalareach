@@ -400,6 +400,90 @@ describe('the session view reads once it is listening (KR-REQ-13.02, KR-REQ-13.1
     expect(screen.getByTestId('launch-stale')).toBeInTheDocument()
   })
 
+  // A launch answers after the person has moved to another session in the same view: the read it
+  // asks for belongs to the session on screen, and nothing read for the first one is shown.
+  it('shows nothing of a session it has moved away from', async () => {
+    const person = userEvent.setup()
+    const { port } = fakeHost()
+    let finishLaunch = () => {}
+    const launching: HostPort = {
+      ...port,
+      shellLaunch: (params, subject) =>
+        new Promise((resolve, reject) => {
+          finishLaunch = () => {
+            port.shellLaunch(params, subject).then(resolve, reject)
+          }
+        })
+    }
+    render(
+      <AppProvider port={launching} initialPlace={{ view: 'sessions' }}>
+        <App />
+      </AppProvider>
+    )
+    await person.click(await screen.findByTestId('session-row-1'))
+    await screen.findByText('Session 1 · Waiting for you')
+    await person.click(screen.getByRole('button', { name: 'Sessions' }))
+    await person.click(await screen.findByTestId('session-row-2'))
+    await screen.findByText('Session 2 · Working')
+    await person.click(screen.getByRole('tab', { name: 'Session 01' }))
+    await screen.findByText('Session 1 · Waiting for you')
+
+    const codex = within(await screen.findByTestId('launch-surface')).getByRole('button', {
+      name: /Codex/
+    })
+    await person.click(codex)
+    await person.click(screen.getByRole('tab', { name: 'Session 02' }))
+    await screen.findByText('Session 2 · Working')
+
+    await act(async () => {
+      finishLaunch()
+      await Promise.resolve()
+    })
+    expect(await screen.findByText('Codex started.')).toBeInTheDocument()
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(screen.getByText('Session 2 · Working')).toBeInTheDocument()
+    expect(screen.queryByText('Session 1 · Waiting for you')).toBeNull()
+  })
+
+  // A view whose listeners could not be registered offers no launch, and trying again registers
+  // them again before it reads, so a later change of prompt is heard.
+  it('registers its listeners again before it reads again', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    let refusing = true
+    openSession({
+      ...port,
+      subscribe: (listener) =>
+        refusing
+          ? Promise.reject({
+              code: 'INTERNAL',
+              message: 'The shell did not register the listener.',
+              user_action: 'retry'
+            })
+          : port.subscribe(listener)
+    })
+    expect((await screen.findAllByText(LOST)).length).toBeGreaterThan(0)
+    expect(screen.queryByTestId('launch-surface')).toBeNull()
+
+    refusing = false
+    await person.click(screen.getByRole('button', { name: 'Try again' }))
+    const codex = () =>
+      within(screen.getByTestId('launch-surface')).getByRole('button', { name: /Codex/ })
+    await waitFor(() => {
+      expect(codex()).toBeEnabled()
+    })
+
+    act(() => {
+      controls.changePromptGeneration()
+    })
+    await waitFor(() => {
+      expect(codex()).toBeDisabled()
+    })
+    expect(screen.getByTestId('launch-stale')).toBeInTheDocument()
+  })
+
   it('shows what it read when nothing changed in between', async () => {
     const person = userEvent.setup()
     const { port, controls } = fakeHost()

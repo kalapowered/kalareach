@@ -166,7 +166,7 @@ describe('watching', () => {
     const nothing = vi.fn()
     watch([], nothing)
     const stopped = vi.fn()
-    watch([], stopped)()
+    watch([], stopped).stop()
     await settled(Promise.resolve())
     expect(nothing).toHaveBeenCalledTimes(1)
     expect(stopped).not.toHaveBeenCalled()
@@ -176,7 +176,7 @@ describe('watching', () => {
     const early = pending()
     const late = pending()
     const listening = vi.fn()
-    const stop = watch([early.registration, late.registration], listening)
+    const { stop } = watch([early.registration, late.registration], listening)
 
     early.complete()
     await settled(early.registration)
@@ -226,6 +226,41 @@ describe('watching', () => {
     expect(late.stop).toHaveBeenCalledTimes(1)
     expect(failed).toHaveBeenCalledTimes(1)
     expect(listening).not.toHaveBeenCalled()
+  })
+})
+
+describe('the reads a watch makes', () => {
+  it('starts a read only once every listener is registered, and shows only the newest', async () => {
+    const first = pending()
+    const second = pending()
+    const reads = watch([first.registration, second.registration])
+    expect(reads.read()).toBeNull()
+
+    first.complete()
+    await settled(first.registration)
+    expect(reads.read()).toBeNull()
+
+    second.complete()
+    await settled(second.registration)
+    const older = reads.read()
+    const newer = reads.read()
+    expect(older?.()).toBe(false)
+    expect(newer?.()).toBe(true)
+
+    reads.stop()
+    expect(newer?.()).toBe(false)
+    expect(reads.read()).toBeNull()
+  })
+
+  it('ends its reads when a registration is refused', async () => {
+    const kept = pending()
+    const refused = pending()
+    const reads = watch([kept.registration, refused.registration])
+
+    kept.complete()
+    refused.refuse({ code: 'INTERNAL', message: 'The shell refused the listener.' })
+    await settled(refused.registration)
+    expect(reads.read()).toBeNull()
   })
 })
 

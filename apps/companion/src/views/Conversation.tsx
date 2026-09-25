@@ -194,7 +194,7 @@ export function Conversation({
   }, [port, sessionId])
 
   useEffect(() => {
-    const stop = watch([port.subscribe((event) => {
+    const { stop } = watch([port.subscribe((event) => {
       const body = event.body as { kind?: string; node?: DocumentNode; receipt?: unknown }
       // An event belongs to the stream it names. A view showing one session ignores another's
       // rather than folding it into what the person is looking at.
@@ -356,7 +356,7 @@ export function Conversation({
     [port, state.draft.draftId, subject, update, say]
   )
 
-  useEffect(() => watch([port.onFilesDropped(attach)]), [port, attach])
+  useEffect(() => watch([port.onFilesDropped(attach)]).stop, [port, attach])
 
   // Losing contact removes the association, not the draft. That is a fact about the connection, so
   // it is derived here rather than written into the stored draft: the text, the revision and the
