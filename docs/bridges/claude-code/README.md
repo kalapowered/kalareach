@@ -141,6 +141,28 @@ The Claude Code package asks for no file access, so its launch is granted no dir
 No package can turn a command integration on yet, and the worker does not yet receive the installed
 connectors it launches from, so today a `claude` typed at a prompt runs as typed.
 
+## A Claude Code the integration did not launch
+
+Claude Code started any other way is adopted rather than launched: by absolute path, with its
+integration off, after a refused or retired launch, in a pipeline or another form the shell does not
+ask about, or from a shell that does not ask. Four times a second, while a command has the terminal,
+the worker looks at the terminal's foreground process group. It adopts a process there that the
+root shell started itself, that no launch holds, and whose executable the connector recognises, and
+records it as a native terminal instance. The record holds the executable and argument vector the
+kernel reports, the executable's digest, and the reason the shell's question was answered with a
+bypass, where it was.
+
+An adopted Claude Code gets no registration, endpoint or credential. Its environment names no
+registration either, since a bypassed invocation is given no variable, so its hooks answer `{}` with
+nothing to report to and its channel declares nothing. None of its bridges is admitted. The instance
+ends when its process exits. Adoption recognises Claude Code by the installed connector, which the
+worker does not yet receive, so today nothing is adopted.
+
+Every instance, launched or adopted, is announced to the session's attached views when it starts,
+when its bridges are refused and when it ends, with its mode, its plugin and profile, and the reason
+its bridges are refused where they are. An adopted instance's announcement says that none of its
+bridges is admitted.
+
 ## Admission
 
 The forwarder connects to the endpoint and writes one line before anything else:

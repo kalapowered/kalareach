@@ -4212,6 +4212,24 @@ also checked against the running image: the process must still execute what was 
 mismatch refuses that bridge and every later one. The launcher's contract is in the Claude Code
 bridge's documentation.
 
+A program the integration did not launch is adopted, never given a gateway after the fact. Four
+times a second, while a command has the terminal, the worker reads the terminal's foreground group,
+and records a process in it that the root shell started itself, that no instance holds and whose
+executable an installed connector recognises. It becomes a native terminal instance with the profile
+it was observed running: the kernel's executable and argument vector, its digest, and the bypass
+the shell's question was answered with, where there was one. It has no process record and no
+credential, so none of its bridges is admitted, and it ends when its process exits. A launched
+program is never adopted as well: its launch registered the process that presented itself, which
+keeps its identity when it execs the program. Until the worker receives the installed connectors,
+nothing is recognised and nothing is adopted.
+
+The session announces each of its agent instances to its attached views: when a launch is committed
+or a program adopted, when an instance's bridges are refused and why, and when it ends. It counts
+the announcements, keeps the list of live instances and publishes each announcement under its own
+lock, and a subscription or a snapshot carries that list with the count of the last announcement it
+includes, read under the same lock. A view installs the list and applies the announcements counted
+after it, so it holds every live instance once.
+
 An admitted hook sends one observation and waits for this host to apply it and close the connection.
 When that exchange completes, the host has the report before the hook answers the application. It
 does not when the hook reaches its deadline first, or when the application moves on without waiting,
