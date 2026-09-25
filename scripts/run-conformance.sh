@@ -24,7 +24,8 @@
 # release's source. A release this host cannot fetch or build is recorded as not installed, with
 # the reason, and never taken from the system's package manager.
 #
-# Exit status: 0 when the run passed, 1 when it ran and did not, 2 when it was refused before
+# On Windows the report is started from a native shell rather than this script; the script says
+# how. Exit status: 0 when the run passed, 1 when it ran and did not, 2 when it was refused before
 # running anything.
 
 set -euo pipefail
@@ -43,7 +44,7 @@ while [ $# -gt 0 ]; do
             ;;
         --all-terminals) all_terminals=1 ;;
         -h|--help)
-            sed -n '2,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            sed -n '2,29p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
             exit 2
             ;;
         *) echo "run-conformance: unknown argument $1" >&2; exit 2 ;;
@@ -68,7 +69,15 @@ selected() {
 case "$(uname -s)" in
     Darwin) os="apple-darwin"; family=macos ;;
     Linux) os="unknown-linux-gnu"; family=linux ;;
-    MINGW*|MSYS*|CYGWIN*) os="pc-windows-msvc"; family=windows ;;
+    MINGW*|MSYS*|CYGWIN*)
+        # A POSIX runtime on Windows enables privileges in the token of everything it starts and
+        # changes how the console's interrupt reaches it, so the suites would not run as they run
+        # on their own. The report is started from a native shell there.
+        echo "run-conformance: on Windows, start the report from PowerShell or cmd:" >&2
+        echo "  pnpm install --frozen-lockfile" >&2
+        echo "  cargo run --locked -p kr-conformance --bin kr-conformance -- run --root . --evidence <a directory under %TEMP%>" >&2
+        exit 2
+        ;;
     *) echo "run-conformance: $(uname -s) is not a platform the report runs on" >&2; exit 2 ;;
 esac
 case "$(uname -m)" in
@@ -136,14 +145,14 @@ fetch_applications() {
     for place in "$archives" "$cache/index.json"; do
         if [ -L "$place" ]; then
             echo "run-conformance: $place is a link, and the application cache writes through none" >&2
-            return 1
+            exit 2
         fi
     done
     mkdir -p "$archives"
     for tool in curl tar python3 make; do
         if ! command -v "$tool" > /dev/null 2>&1; then
             echo "run-conformance: $tool is needed to fetch the applications and is not on the path" >&2
-            return 1
+            exit 2
         fi
     done
     local jobs
@@ -355,7 +364,7 @@ if [ ${#groups[@]} -gt 0 ]; then
 fi
 [ "$all_terminals" -eq 1 ] && arguments+=(--all-terminals)
 
-if selected applications && [ "$family" != windows ]; then
+if selected applications; then
     case "$family" in
         macos) default_cache="$HOME/Library/Caches/kalareach/conformance-applications" ;;
         *) default_cache="${XDG_CACHE_HOME:-$HOME/.cache}/kalareach/conformance-applications" ;;
@@ -363,7 +372,9 @@ if selected applications && [ "$family" != windows ]; then
     cache="$(application_cache "${KR_CONFORMANCE_APPLICATIONS:-$default_cache}")" || exit 2
     export KR_CONFORMANCE_APPLICATIONS="$cache"
     echo "run-conformance: applications in $KR_CONFORMANCE_APPLICATIONS"
-    fetch_applications "$KR_CONFORMANCE_APPLICATIONS" || exit 2
+    # Called on its own, so that any command of it that fails ends the script: a refusal inside it
+    # exits 2 itself.
+    fetch_applications "$KR_CONFORMANCE_APPLICATIONS"
     arguments+=(--applications "$KR_CONFORMANCE_APPLICATIONS")
 fi
 
@@ -375,5 +386,4 @@ fi
 
 cargo build --locked -p kr-conformance --bin kr-conformance
 binary="${CARGO_TARGET_DIR:-$root/target}/debug/kr-conformance"
-[ "$family" = windows ] && binary="$binary.exe"
 exec "$binary" "${arguments[@]}"

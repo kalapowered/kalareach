@@ -235,12 +235,26 @@ pub fn check_directory(directory: &Path) -> Result<PathBuf, Refused> {
     }
     std::fs::create_dir_all(&real)
         .map_err(|error| Refused(format!("{} could not be created: {error}", real.display())))?;
-    let made = std::fs::canonicalize(&real)
+    let made = real_path(&real)
         .map_err(|error| Refused(format!("{} could not be resolved: {error}", real.display())))?;
     if made != real || !inside_temporary(&made) {
         return Err(outside());
     }
     Ok(made)
+}
+
+/// The path the system resolves `path` to, links and all. On Windows, a path on a drive is given in
+/// its ordinary form rather than the extended one the system answers with (`\\?\C:\...`), which the
+/// tests are handed and which not every program they start reads.
+fn real_path(path: &Path) -> std::io::Result<PathBuf> {
+    let real = std::fs::canonicalize(path)?;
+    if cfg!(windows)
+        && let Some(rest) = real.to_str().and_then(|text| text.strip_prefix(r"\\?\"))
+        && rest.as_bytes().get(1) == Some(&b':')
+    {
+        return Ok(PathBuf::from(rest));
+    }
+    Ok(real)
 }
 
 /// Whether `real`, a resolved path, is inside this platform's temporary directory.
@@ -251,7 +265,7 @@ fn inside_temporary(real: &Path) -> bool {
     }
     temporary
         .iter()
-        .filter_map(|candidate| std::fs::canonicalize(candidate).ok())
+        .filter_map(|candidate| real_path(candidate).ok())
         .any(|base| real != base && real.starts_with(&base))
 }
 
@@ -277,7 +291,7 @@ fn resolve(path: &Path) -> std::io::Result<PathBuf> {
         }
         rest.push(component);
     }
-    let mut real = std::fs::canonicalize(&existing)?;
+    let mut real = real_path(&existing)?;
     for component in rest {
         if let Component::Normal(name) = component {
             real.push(name);

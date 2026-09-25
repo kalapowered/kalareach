@@ -282,12 +282,16 @@ jobs:
           $temporary = (Get-Item $env:TEMP).FullName
           "KR_TEST_ARTIFACTS_DIR=$temporary\kr-conformance-evidence" >> $env:GITHUB_ENV
 
-      # The suites qualified on Windows, as the landing workflow's Windows job runs them; the other
-      # groups and the applications are recorded as not run here, each with its reason.
+      # The suites qualified on Windows, as the landing workflow's Windows job runs them, started
+      # from PowerShell as they are there: a POSIX shell's runtime would enable privileges in their
+      # token and change how the console's interrupt reaches them. The other groups and the
+      # applications are recorded as not run here, each with its reason.
       - name: The conformance report
         timeout-minutes: 150
-        shell: bash
-        run: bash scripts/run-conformance.sh
+        run: |
+          pnpm install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo run --locked -p kr-conformance --bin kr-conformance -- run --root $PWD.Path --evidence $env:KR_TEST_ARTIFACTS_DIR
 
       - name: Keep the result and the evidence
         if: ${{ !cancelled() }}

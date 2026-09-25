@@ -253,6 +253,14 @@ struct Capture {
     broken: Option<String>,
 }
 
+/// Whether an output event of `length` bytes is the last of its span or screen: the worker cuts a
+/// long one into chunks of the most an event carries, so only a shorter chunk is known to end it.
+/// A last chunk that is exactly that long is taken for one with more to come, which can make a
+/// case wait for a later delivery or fail at its bound, and never lets it pass on less.
+fn ends_its_delivery(length: usize) -> bool {
+    length < MAX_OUTPUT_EVENT_BYTES
+}
+
 impl Capture {
     /// Takes note of an event at `position`, which ends its delivery when `last` says so.
     fn took(&mut self, position: u64, last: bool) {
@@ -746,7 +754,7 @@ async fn keep_output(
                     }
                     Some((
                         event.cursor.get(),
-                        event.bytes.as_slice().len() < MAX_OUTPUT_EVENT_BYTES,
+                        ends_its_delivery(event.bytes.as_slice().len()),
                     ))
                 })
                 .map_err(|error| error.to_string()),
@@ -990,7 +998,14 @@ pub fn ascii_suffix_column(screen: &Screen, row: usize, suffix: &str) -> Option<
 
 #[cfg(test)]
 mod tests {
-    use super::Capture;
+    use super::{Capture, MAX_OUTPUT_EVENT_BYTES, ends_its_delivery};
+
+    #[test]
+    fn only_a_chunk_shorter_than_a_full_one_ends_its_delivery() {
+        assert!(ends_its_delivery(0));
+        assert!(ends_its_delivery(MAX_OUTPUT_EVENT_BYTES - 1));
+        assert!(!ends_its_delivery(MAX_OUTPUT_EVENT_BYTES));
+    }
 
     #[test]
     fn a_delivery_in_several_events_settles_only_with_its_last() {

@@ -86,11 +86,62 @@ fn imports_a_case_of_the_same_name_inside_its_body() {
     assert_eq!(shared(), 7);
 }
 
+mod renamed {
+    use super::cases::other_case as brought_up;
+
+    #[test]
+    fn calls_another_case_by_a_keyed_cases_name() {
+        assert_eq!(brought_up(), 9);
+    }
+}
+
+mod plain {
+    /// A case of this module's own, which names no row.
+    pub fn brought_up() -> u8 {
+        8
+    }
+}
+
+#[test]
+fn calls_through_a_module_its_body_brings_in_under_another_name() {
+    use plain as cases;
+    assert_eq!(cases::brought_up(), 8);
+}
+
+mod hidden {
+    /// KR-REQ-03.08: a case of the same name no glob outside this module can bring in.
+    #[allow(dead_code)]
+    fn check() {}
+}
+
+mod actual {
+    /// A case of this module's own, which names no row.
+    pub fn other() {}
+}
+
+mod facade {
+    pub use crate::actual::other as check;
+}
+
+#[allow(unused_imports)]
+use hidden::*;
+use facade::*;
+
+#[test]
+fn calls_the_name_a_glob_brings_in_for_another_case() {
+    check();
+}
+
 mod cases {
     mod deep {
         /// KR-REQ-03.08: the same case, written in a child module.
         pub fn brought_up() -> u8 {
             6
+        }
+
+        /// A case of this module's own, which names no row.
+        pub fn other_case() -> u8 {
+            9
         }
     }
 

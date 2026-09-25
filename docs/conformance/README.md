@@ -18,7 +18,15 @@ scripts/run-conformance.sh --all-terminals    # every group, and then section 27
 ```
 
 The script fetches what the applications group needs, installs the TypeScript packages when that
-group runs, builds the `kr-conformance` binary in `tests/conformance` and runs it. The result is
+group runs, builds the `kr-conformance` binary in `tests/conformance` and runs it. On Windows the
+report is started from PowerShell or cmd instead, because a POSIX shell's runtime enables privileges
+in the token of everything it starts and changes how the console's interrupt reaches it:
+
+```powershell
+pnpm install --frozen-lockfile
+cargo run --locked -p kr-conformance --bin kr-conformance -- run --root . --evidence <a directory under %TEMP%>
+```
+ The result is
 `<evidence>/conformance/result.json`, and each step's log is under `<evidence>/conformance/logs/`.
 
 The evidence directory is `KR_TEST_ARTIFACTS_DIR`, or a new directory under the platform's temporary
@@ -53,11 +61,13 @@ them unnoticed.
 
 Every `cargo test` step that keeps each test's output captured runs with `--show-output`, which
 prints what every passing test wrote under its name. A step that shows the output as it is written,
-with `--nocapture`, keeps its script's command. Before a step runs, its tests are built and listed:
-every test binary the build made has to be listed, run and read, and a listing that fails, a binary
-the log never ran, and a log that cannot be read are each the step's error. A target whose manifest
+with `--nocapture`, keeps its script's command. Before a step runs, its tests are built and listed
+through Cargo, one target at a time, and every test binary the build made then has to be run and
+read: a listing that fails, a binary the log never ran, and a log that cannot be read are each the
+step's error. A target whose manifest
 gives it a harness of its own (`harness = false`) is a program that prints neither a list nor
-verdicts: it is run, its exit status is the step's, and a comment on it is a reference.
+verdicts: it is never named in a listing, it is run with the step, its exit status is the step's,
+and a comment on it is a reference.
 
 A test that no selected group runs on this platform is reported as not run, with the reason. It is
 never reported as passed.
@@ -100,7 +110,7 @@ row that does not exist.
 | A test function whose name spells an identifier in snake case: `kr_req_11_07_...`, `kr_acc_004_...` | That test. A name that spells no accepted form is only a name |
 | A module comment (`//!`) of test code | Every test in that module and the modules inside it |
 | In test code, a comment block with a blank line after it | Every test from there to the next such block, or the end of the module |
-| In test code, a comment on a function | Every test of the same target whose body calls that function, the call resolved as the compiler resolves it: through the body's own `use` declarations, the module's functions, its `use` declarations and its globs. A local of the same name, a method, and a function of the same name elsewhere are not that function, and a call the report cannot follow to one function keys nothing |
+| In test code, a comment on a function | Every test of the same target whose body calls that function, where the report proves from the target's own source that the compiler resolves the call to it: through module definitions, `crate`, `self` and `super`, a `use` that keeps the item's own name, and globs, each judged by who may name what it brings in. A renaming `use`, a name or glob the calling body brings in for itself, a module whose macros make items, a glob it cannot follow and a visibility it cannot work out all stop it, and a call it cannot prove keys nothing, so the function's identifiers stay references rather than become a key the compiler would not make |
 | A `covers` field of a `const` or `static` case table | Every test of the same package whose body names the table |
 
 Test code is a test or bench target, or a module compiled under `cfg(test)`. A comment on product
