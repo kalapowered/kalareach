@@ -4449,6 +4449,24 @@ answered. Section 10 narrows a grant's history in one place, the shared host-sid
 broker's retained agent history is not one of the surfaces that filter admits, so answering a
 forwarded read would give a device more than its grant covers.
 
+`agent.approval.inspect` reads what the approval ledger keeps for one pending resource of the
+instance it names: whose decoder read the request (the plugin, its publisher and the installed
+digest), the upstream method and the native request identifier, the request's original bytes,
+whole, and their digest, the decisions the decoder offered in the upstream's order, the upstream's
+deadline, when the decoder wrote its reading, and where the request stands now. The broker checked
+the decoder's grant and trust, the source frame's package, generation and first use, and the
+projection's schema policy before the request became answerable. None of that shows the decoder
+read the bytes correctly, which is why the bytes come with the reading. The record also carries the
+moment the request arrived, when the broker recorded its source frame; the interpretation can come
+much later. A resource of another instance, one no decoder interpreted and one this host does not
+hold all get the same `STALE_SESSION` refusal, and its text does not say which. The read needs
+`session.view` and is listed for the local socket only, because a grant's history scope does not
+travel with a forwarded read and the worker would have nothing to narrow the record to. A paired
+device is refused as for any method outside its ingress. A caller acting under a grant that reaches
+the worker anyway is refused as `UNSUPPORTED_CAPABILITY`, with that reason and nothing of the
+record. An answer larger than the control frame the connection declared is refused with both sizes
+rather than sent.
+
 The five agent mutations each carry the binding revision they were prepared against. A revision
 behind the one in force is `STALE_SESSION`; a draft that moved is `DRAFT_CONFLICT`. A steer or a
 cancellation names the turn it acts on and is refused rather than redirected when that turn is not
