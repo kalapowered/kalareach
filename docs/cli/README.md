@@ -630,13 +630,15 @@ recorded, and leaves alone anything that changed after it was written. Both prin
 manifest: every directory created, every file written, and the configuration entry added.
 
 What cannot be done safely is refused before anything changes: a file or a server entry this host
-did not write, and a configuration document whose access controls a replacement could not carry.
-On Windows that is a document with another owner, a protected, absent or empty list, an entry set
-on the file itself, encryption, or a control this host does not evaluate. What the document alone cannot
-show, such as a directory whose list changed after the document inherited from it, is caught when
-the copy that would replace a file is compared with it, and a copy that differs stops the change
-there. After an interrupted installation, `kr skill install` says so and lists under `unresolved`
-anything that neither it nor a removal can account for.
+did not write, and a configuration document whose access controls a replacement could not carry. On
+Windows that is a document with another owner, a protected, absent or empty list, encryption, a
+control this host does not evaluate, or an entry set on the file itself where its list records which
+entries it inherited. Three things the document alone cannot show are caught when the copy that
+would replace a file is compared with it: an entry set on a file whose list was written the older
+way and records no inheritance, a directory whose list changed after the document inherited from it,
+and a document moved in from another directory. A copy that differs stops the change there, after
+whatever was written before it. After an interrupted installation, `kr skill install` says so and
+lists under `unresolved` anything that neither it nor a removal can account for.
 
 ## `kr agent-tools`
 
