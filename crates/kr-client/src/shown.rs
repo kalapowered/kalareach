@@ -1476,22 +1476,33 @@ mod tests {
 
     #[test]
     fn a_stored_name_is_said_only_when_the_store_wrote_it() {
+        // Written with `/` and joined with the platform's own separator, which on Windows are two
+        // different characters; the rendering says the platform's own throughout.
         let root = Path::new("/state/answers");
+        let separator = std::path::MAIN_SEPARATOR;
+        let directory = format!("{separator}state{separator}answers");
         let written = root.join("0e1f9a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b.answer");
         assert_eq!(
             Shown::stored(&written, &[], &["answer", "partial"]).as_str(),
-            written.display().to_string()
+            format!("{directory}{separator}0e1f9a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b.answer")
         );
-        let partial = root.join(
-            ".0e1f9a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b.0e1f9a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b.partial",
-        );
+        let partial_name =
+            ".0e1f9a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b.0e1f9a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b.partial";
         assert_eq!(
-            Shown::stored(&partial, &[], &["answer", "partial"]).as_str(),
-            partial.display().to_string()
+            Shown::stored(&root.join(partial_name), &[], &["answer", "partial"]).as_str(),
+            format!("{directory}{separator}{partial_name}")
         );
         assert_eq!(
             Shown::stored(&root.join("lock"), &["lock"], &[]).as_str(),
-            "/state/answers/lock"
+            format!("{directory}{separator}lock")
+        );
+        assert_eq!(
+            Shown::within(root, "lock").as_str(),
+            format!("{directory}{separator}lock")
+        );
+        assert_eq!(
+            Shown::root(&root.join("lock")).as_str(),
+            format!("{directory}{separator}lock")
         );
         // An extension the store does not write is not said, whatever its letters: a name is only
         // an identifier followed by the store's own extensions.
@@ -1506,7 +1517,7 @@ mod tests {
             assert!(!said.as_str().contains("password"), "{said}");
             assert_eq!(
                 said.as_str(),
-                "/state/answers/[a name this store did not write]"
+                format!("{directory}{separator}[a name this store did not write]")
             );
         }
     }
@@ -1521,17 +1532,24 @@ mod tests {
             .join("environment");
         let said = Shown::host_path(&tree);
         assert!(!said.as_str().contains(MARKER), "{said}");
+        // One separator throughout, the platform's own.
+        let separator = std::path::MAIN_SEPARATOR;
         assert_eq!(
             said.as_str(),
-            "/[a name]/[a name]/environments/[a name]/environment"
+            format!(
+                "{separator}[a name]{separator}[a name]{separator}environments{separator}[a name]\
+                 {separator}environment"
+            )
         );
         let descriptor = std::path::PathBuf::from("/[a name]")
             .join("sessions")
             .join("0e1f9a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b.kr");
+        let said = Shown::host_path(&descriptor);
         assert!(
-            Shown::host_path(&descriptor)
-                .as_str()
-                .ends_with("sessions/0e1f9a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b.kr")
+            said.as_str().ends_with(&format!(
+                "sessions{separator}0e1f9a2b-3c4d-4e5f-8a9b-0c1d2e3f4a5b.kr"
+            )),
+            "{said}"
         );
     }
 
