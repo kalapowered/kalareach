@@ -11,7 +11,8 @@
 //! `kr doctor` reports it with the document it came from. KR-REQ-07.13: with the start selected,
 //! neither the command that selects it nor the `kr new` that starts the daemon runs a
 //! service-manager, lingering or privilege tool found through its `PATH`, and neither writes
-//! anything into the home it is given.
+//! anything into the home it is given. KR-REQ-08.02: `kr status` on a session the started daemon
+//! holds reports each terminal attachment's presentation and the reason for it.
 //!
 //! The installation is laid out the way a package lays it out: `kr`, its restoration guard, the
 //! daemon and the worker side by side on the internal disk, where `kr` finds the daemon beside
@@ -32,12 +33,16 @@ use std::time::{Duration, Instant};
 
 use kr_ipc::client::LocalClient;
 use kr_ipc::identity::{ProcessQuery, ProcessState};
+use kr_protocol::attachment::{
+    AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult,
+};
+use kr_protocol::envelope::ActionTarget;
 use kr_protocol::hostinfo::HostInfoResult;
-use kr_protocol::ids::{BuildId, SessionId};
+use kr_protocol::ids::{ActionId, AttachmentId, BuildId, SessionEpoch, SessionId};
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
-use kr_protocol::scalars::Nullable;
-use kr_protocol::session::{SessionListParams, SessionListResult};
+use kr_protocol::scalars::{CanonicalSet, Nullable};
+use kr_protocol::session::{Dimensions, SessionListParams, SessionListResult};
 use serde_json::Value;
 
 mod support;
@@ -797,5 +802,135 @@ fn the_start_is_selected_with_no_daemon_and_the_doctor_names_its_source() {
     let row = reported("kr doctor after the clear");
     assert_eq!(row["value"], "none", "{row}");
     assert_eq!(row["source"], "default", "{row}");
+    host.close(&created);
+}
+
+/// Attaches a terminal to a session over its worker's own endpoint, and returns the connection the
+/// attachment lives on with it. The attachment lasts as long as the connection does.
+async fn terminal_attachment(
+    host: &Standalone,
+    session_id: SessionId,
+    dimensions: Dimensions,
+    profile: Option<&str>,
+) -> (LocalClient, AttachmentId) {
+    let descriptor = kr_ipc::descriptor::read_all(&host.tree.environment())
+        .expect("reads the runtime directory")
+        .into_iter()
+        .filter_map(|entry| entry.descriptor.ok())
+        .find(|descriptor| descriptor.session_id == session_id)
+        .expect("the session's descriptor is published");
+    let endpoint = kr_ipc::paths::Endpoint::from_path(&descriptor.endpoint).expect("an endpoint");
+    let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("reaches the worker");
+    client
+        .verify_worker(&descriptor)
+        .await
+        .expect("the worker answers its descriptor's challenge");
+    let mut requested = CanonicalSet::new();
+    requested.insert(AttachmentCapability::ObserveTerminal);
+    let attached: SessionAttachResult = client
+        .mutate(
+            Method::SessionAttach,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget {
+                environment_id: descriptor.environment_id,
+                session_id: Nullable::some(session_id),
+                session_epoch: Nullable::some(SessionEpoch::V1),
+                application_instance_id: Nullable::null(),
+                agent_binding_revision: Nullable::null(),
+            },
+            &SessionAttachParams {
+                session_id,
+                mode: AttachMode::Terminal,
+                claim_geometry: false,
+                dimensions: Nullable::some(dimensions),
+                terminal_profile_id: Nullable(profile.map(str::to_owned)),
+                requested,
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the attach succeeds")
+        .to_typed()
+        .expect("decodes");
+    (client, attached.attachment.attachment_id)
+}
+
+/// KR-REQ-08.02: `kr status` reports each terminal attachment's presentation and the reason for it.
+///
+/// Two terminals attach to a session the started daemon holds: one at the session's own size that
+/// declared no terminal profile, and one with a qualified profile at another size. Both are shown
+/// a projection, each for a reason of its own, and `kr status` says which and why, in text and in
+/// `--json`, as the session's own worker reports it. Neither reason passes with time, so what is
+/// read does not depend on when it is read.
+#[test]
+fn status_reports_each_terminal_attachments_presentation_and_its_reason() {
+    let host = Standalone::create();
+    host.select_standalone();
+    let output = start(host.new_session()).finish("kr new");
+    let created = document(&output, "kr new");
+    assert!(output.status.success(), "{created}");
+    let session_id: SessionId = created["session_id"]
+        .as_str()
+        .expect("a session identifier")
+        .parse()
+        .expect("parses");
+    let display = created["display_number"].to_string();
+    let canonical = Dimensions::new(
+        created["dimensions"]["columns"].as_u64().expect("columns"),
+        created["dimensions"]["rows"].as_u64().expect("rows"),
+    );
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let ((undeclared_client, undeclared), (smaller_client, smaller)) = runtime.block_on(async {
+        (
+            terminal_attachment(&host, session_id, canonical, None).await,
+            terminal_attachment(
+                &host,
+                session_id,
+                Dimensions::new(canonical.columns() - 20, canonical.rows() - 10),
+                Some("xterm-256color"),
+            )
+            .await,
+        )
+    });
+
+    let status = start(host.kr(&["--json", "status", &display])).finish("kr status");
+    let report = document(&status, "kr status");
+    assert!(status.status.success(), "{report}");
+    let terminals = report["terminal_attachments"]
+        .as_array()
+        .unwrap_or_else(|| panic!("kr status lists the terminal attachments: {report}"));
+    let reported = |attachment: AttachmentId| {
+        terminals
+            .iter()
+            .find(|entry| entry["attachment_id"] == attachment.to_string())
+            .unwrap_or_else(|| panic!("attachment {attachment} is listed: {report}"))
+    };
+    let entry = reported(undeclared);
+    assert_eq!(entry["presentation"], "viewport", "{entry}");
+    assert_eq!(
+        entry["presentation_reason"], "no_terminal_profile",
+        "{entry}"
+    );
+    let entry = reported(smaller);
+    assert_eq!(entry["presentation"], "viewport", "{entry}");
+    assert_eq!(entry["presentation_reason"], "size_mismatch", "{entry}");
+
+    let shown = start(host.kr(&["status", &display])).finish("kr status");
+    assert!(shown.status.success());
+    let printed = String::from_utf8_lossy(&shown.stdout);
+    for expected in [
+        format!("attachment {undeclared}: viewport (no_terminal_profile)"),
+        format!("attachment {smaller}: viewport (size_mismatch)"),
+    ] {
+        assert!(printed.contains(&expected), "{expected}: {printed}");
+    }
+
+    drop((undeclared_client, smaller_client));
     host.close(&created);
 }
