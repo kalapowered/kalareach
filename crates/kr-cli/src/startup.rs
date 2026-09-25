@@ -1151,7 +1151,8 @@ mod tests {
         .expect_err("no such way of starting");
         assert_eq!(
             refused.to_string(),
-            "the value given is not a way of starting the control daemon: choose standalone"
+            "the value given is not a way of starting the control daemon: choose standalone or \
+             service"
         );
         assert_unmarked(
             "a way of starting this build does not know",
