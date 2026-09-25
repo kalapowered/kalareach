@@ -796,8 +796,8 @@ async fn the_device_meets_the_deployment_restored_from_the_export() {
     let first_pass = device.transport.sent();
     drop(device);
 
-    // Opened again and reconciled again: nothing is outstanding, and nothing is sent under the
-    // ended identity.
+    // Opened again and reconciled again: nothing is outstanding, so nothing at all is sent, under
+    // the ended identity or any other.
     let device = open_device(
         &run,
         &run.path("device"),
@@ -811,34 +811,29 @@ async fn the_device_meets_the_deployment_restored_from_the_export() {
         .await
         .expect("reconciled");
     assert_eq!((again.settled, again.fenced, again.unsettled), (0, 0, 0));
-    let exchanged_under_it = first_pass
-        .iter()
-        .chain(device.transport.sent().iter())
-        .filter(|sent| {
-            sent.member == "exchange" && sent.request_id.as_deref() == Some(&lost_request)
-        })
-        .count();
     assert_eq!(
-        exchanged_under_it, 0,
-        "the lost publication is never attempted again"
+        device.transport.sent(),
+        Vec::new(),
+        "a reconciliation with nothing outstanding asks the service nothing"
     );
-    // Nothing on this path submits a draft: every request this device made was a settings-sync
-    // request, and none of them is an execution request.
+    // Before the reopening the ended identity went out once more after the restore, as the fence
+    // that ended it, and never as an attempt.
+    let after_the_restore: Vec<_> = first_pass
+        .iter()
+        .filter(|sent| sent.request_id.as_deref() == Some(&lost_request))
+        .map(|sent| sent.member.as_str())
+        .collect();
     assert!(
-        first_pass
+        !after_the_restore.contains(&"exchange"),
+        "the lost publication is never attempted again: {after_the_restore:?}"
+    );
+    assert_eq!(
+        after_the_restore
             .iter()
-            .chain(device.transport.sent().iter())
-            .all(|sent| [
-                "exchange",
-                "compare",
-                "status",
-                "fence",
-                "keys",
-                "rekey",
-                "memberships",
-                "resolve"
-            ]
-            .contains(&sent.member.as_str()))
+            .filter(|member| **member == "fence")
+            .count(),
+        1,
+        "one fence ended it: {after_the_restore:?}"
     );
     println!(
         "restore phase 3: every answer named recovery {recovery}; the lost settings write came back beside the device's object, the membership followed its own head, the restored draft came down beside the edited one, and the lost publication was ended at once and never sent again ({target})"
