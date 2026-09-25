@@ -21,6 +21,7 @@ use kr_protocol::rendezvous::{
     decode_client_frame, encode_frame,
 };
 use kr_protocol::scalars::{Bytes, Uuid, to_base64url};
+use kr_transport::config::ProxyUrl;
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
@@ -29,6 +30,11 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 use tokio_websockets::{Message, ServerBuilder, WebSocketStream};
+
+#[path = "support/connect_proxy.rs"]
+mod connect_proxy;
+
+use connect_proxy::ConnectProxy;
 
 /// How long a test waits for something before it fails as stuck.
 const WATCHDOG: Duration = Duration::from_secs(20);
@@ -361,6 +367,109 @@ async fn a_room_nobody_answers_for_is_unreachable() {
         matches!(opened, Err(RoomError::Unreachable { .. })),
         "{opened:?}"
     );
+}
+
+/// The port a loopback room listens on.
+fn port_of(room: &LoopbackRoom) -> &str {
+    room.origin
+        .as_str()
+        .rsplit(':')
+        .next()
+        .expect("a port in the origin")
+}
+
+/// The room hears nothing within a moment, so nothing went around the proxy.
+async fn room_heard_nothing(room: &LoopbackRoom) {
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), room.listener.accept())
+            .await
+            .is_err(),
+        "the attempt reached the room without the proxy"
+    );
+}
+
+/// KR-REQ-26.14: a host whose configuration selects a proxy opens its room through it. The proxy
+/// is asked for one `CONNECT` to the room's address, and the room's TLS and upgrade run inside the
+/// tunnel, so the path and the control token reach the room as they would directly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_opens_its_room_through_the_proxy_it_selected() {
+    let authority = Authority::new("rendezvous test authority");
+    let room = LoopbackRoom::start(&authority).await;
+    let proxy = ConnectProxy::tunnelling().await;
+    let connector = authority.trusted_by().through(Some(
+        proxy.url.parse::<ProxyUrl>().expect("a proxy address"),
+    ));
+    let token = token();
+    let (_socket, path, presented, _end) =
+        open_while(&connector, &room, RoomRole::Host(&token)).await;
+    assert_eq!(path, "/api/pair/room/abcd/host");
+    assert_eq!(
+        presented.as_deref(),
+        Some(to_base64url(token.expose()).as_str())
+    );
+    assert_eq!(
+        proxy.asked(),
+        vec![format!("CONNECT 127.0.0.1:{} HTTP/1.1", port_of(&room))]
+    );
+}
+
+/// A proxy that refuses the tunnel ends the attempt with the status it answered, and the room
+/// hears nothing: the socket is not opened around the proxy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_proxy_that_refuses_the_tunnel_ends_the_attempt() {
+    let authority = Authority::new("rendezvous test authority");
+    let room = LoopbackRoom::start(&authority).await;
+    let proxy = ConnectProxy::refusing(403).await;
+    let connector = authority.trusted_by().through(Some(
+        proxy.url.parse::<ProxyUrl>().expect("a proxy address"),
+    ));
+    let opened = tokio::time::timeout(
+        WATCHDOG,
+        connector.open(&room.origin, &locator(), RoomRole::Candidate),
+    )
+    .await
+    .expect("the attempt ends");
+    assert!(
+        matches!(
+            &opened,
+            Err(RoomError::Unreachable { reason, .. })
+                if reason.contains("refused the tunnel with status 403")
+        ),
+        "{opened:?}"
+    );
+    assert_eq!(proxy.asked().len(), 1, "the proxy was asked once");
+    room_heard_nothing(&room).await;
+}
+
+/// A proxy that cannot be reached ends the attempt as well, and the room hears nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_proxy_that_cannot_be_reached_is_not_gone_around() {
+    let authority = Authority::new("rendezvous test authority");
+    let room = LoopbackRoom::start(&authority).await;
+    let closed = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .await
+        .expect("a loopback port");
+    let port = closed.local_addr().expect("an address").port();
+    drop(closed);
+    let connector = authority.trusted_by().through(Some(
+        format!("http://127.0.0.1:{port}")
+            .parse::<ProxyUrl>()
+            .expect("a proxy address"),
+    ));
+    let opened = tokio::time::timeout(
+        WATCHDOG,
+        connector.open(&room.origin, &locator(), RoomRole::Candidate),
+    )
+    .await
+    .expect("the attempt ends");
+    assert!(
+        matches!(
+            &opened,
+            Err(RoomError::Unreachable { reason, .. }) if reason.contains("could not be reached")
+        ),
+        "{opened:?}"
+    );
+    room_heard_nothing(&room).await;
 }
 
 /// An upgrade answered with any other status is refused with that status, whatever the body:

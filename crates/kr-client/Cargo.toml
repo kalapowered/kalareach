@@ -33,8 +33,9 @@ reqwest.workspace = true
 # Named so this client can install the TLS provider it is built on when the process has none. A
 # process that already chose one keeps it, so what this buys is a default and not a guarantee.
 rustls.workspace = true
-# The rendezvous room socket's TLS is verified against the platform's trust store, as the managed
-# services' requests are.
+# The operating system's certificate verifier, which every TLS client here verifies a server with
+# on macOS, Windows, iOS and Android. On Linux it would trust whatever SSL_CERT_FILE or SSL_CERT_DIR
+# names, so there the distribution's store is read directly instead (`services::http`).
 rustls-platform-verifier.workspace = true
 serde.workspace = true
 serde_json.workspace = true

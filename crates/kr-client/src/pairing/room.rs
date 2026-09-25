@@ -1,12 +1,14 @@
 //! The rendezvous room socket, for a host and for a candidate.
 //!
 //! A short-code invitation's room is a WebSocket at `wss://<origin>/api/pair/room/<locator>/<role>`,
-//! opened on a TLS stream verified against the platform's trust store as the managed services'
-//! requests are. The two roles differ in one thing: a host proves its reservation with the control
-//! token in `KR-Pair-Control-Token`, and a candidate presents nothing, because the room serves it
-//! the record of the locator it asked for and no more. Everything else is one implementation, so
-//! the bounds on the upgrade, on the room's pings and on each direction's queue are the same for
-//! both.
+//! opened on a TLS stream verified against the platform's trust as the managed services' requests
+//! are ([`crate::services::http::platform_tls`]). The connection is the room's own, or, for a host
+//! whose configuration selects a proxy, a `CONNECT` tunnel through that proxy; a candidate has no
+//! such selection and connects directly. The two roles differ in one thing: a host proves its
+//! reservation with the control token in `KR-Pair-Control-Token`, and a candidate presents
+//! nothing, because the room serves it the record of the locator it asked for and no more.
+//! Everything else is one implementation, so the bounds on the upgrade, on the room's pings and on
+//! each direction's queue are the same for both.
 //!
 //! Once open, one task carries the socket's frames to and from its caller: it reads the socket
 //! only while no frame it read waits for the caller, so neither direction can hold the other up,
@@ -22,6 +24,7 @@
 
 use std::future::Future;
 use std::io;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
@@ -35,8 +38,8 @@ use kr_protocol::rendezvous::{
     encode_frame,
 };
 use kr_protocol::scalars::to_base64url;
-use rustls_platform_verifier::BuilderVerifierExt;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use kr_transport::config::ProxyUrl;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_rustls::TlsConnector;
@@ -57,6 +60,11 @@ const CLOSE_DEADLINE: Duration = Duration::from_secs(1);
 ///
 /// A real answer's head is a few hundred bytes.
 pub const MAX_UPGRADE_ANSWER_BYTES: usize = 16 * 1024;
+
+/// The most of a proxy's answer to a tunnel request that is read before its head is complete.
+///
+/// A real answer is a status line and a few headers.
+pub const MAX_TUNNEL_ANSWER_BYTES: usize = 16 * 1024;
 
 /// How many of the room's pings may arrive while the socket cannot take the answers to them.
 ///
@@ -115,7 +123,7 @@ pub enum RoomError {
         /// What is wrong.
         reason: String,
     },
-    /// The name, the connection or TLS failed, or the socket did not open in time.
+    /// The name, the connection, the proxy or TLS failed, or the socket did not open in time.
     #[error("the room at {origin} could not be reached: {reason}")]
     Unreachable {
         /// The origin.
@@ -141,39 +149,52 @@ pub enum RoomError {
     },
 }
 
-/// Opens room sockets with one TLS configuration.
+/// Opens room sockets with one TLS configuration, directly or through one proxy.
 #[derive(Clone, Debug)]
 pub struct RoomConnector {
     tls: Arc<ClientConfig>,
+    proxy: Option<ProxyUrl>,
 }
 
 impl RoomConnector {
-    /// A connector that verifies rooms against the platform's trust store.
+    /// A connector that verifies rooms against the platform's trust
+    /// ([`crate::services::http::platform_tls`]) and opens them directly.
     ///
     /// # Errors
     ///
     /// Returns [`RoomError::Configuration`] when the platform's verifier cannot be set up.
     pub fn platform() -> Result<Self, RoomError> {
-        let tls = ClientConfig::builder_with_provider(Arc::new(
-            tokio_rustls::rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .and_then(BuilderVerifierExt::with_platform_verifier)
-        .map_err(|error| RoomError::Configuration {
-            origin: "every origin".to_owned(),
-            reason: format!("the platform's certificate verifier cannot be set up: {error}"),
-        })?
-        .with_no_client_auth();
+        let tls =
+            crate::services::http::platform_tls(&[]).map_err(|error| RoomError::Configuration {
+                origin: "every origin".to_owned(),
+                reason: format!("the platform's certificate verifier cannot be set up: {error}"),
+            })?;
         Ok(Self::with_tls(tls))
     }
 
     /// A connector that verifies rooms with `tls`, for a service whose certificates come from an
-    /// authority the platform does not hold.
+    /// authority the platform does not hold, and opens them directly.
     #[must_use]
     pub fn with_tls(mut tls: ClientConfig) -> Self {
         // The upgrade is an HTTP/1.1 request, so that is the one protocol offered.
         tls.alpn_protocols = vec![b"http/1.1".to_vec()];
-        Self { tls: Arc::new(tls) }
+        Self {
+            tls: Arc::new(tls),
+            proxy: None,
+        }
+    }
+
+    /// The same connector, opening its sockets through `proxy`, or directly when that is `None`.
+    ///
+    /// A host names the proxy its configuration document selects, and a candidate has no such
+    /// document and names none; nothing is read from the environment. Through a proxy, a socket
+    /// is an HTTP `CONNECT` tunnel to the room, and the room's TLS runs inside it, so the proxy
+    /// sees where the socket goes and nothing that travels on it. A proxy that cannot be reached
+    /// or refuses the tunnel ends the attempt: nothing goes around it.
+    #[must_use]
+    pub fn through(mut self, proxy: Option<ProxyUrl>) -> Self {
+        self.proxy = proxy;
+        self
     }
 
     /// Opens a socket in the room of `locator` at `origin`, as `role`.
@@ -196,6 +217,7 @@ impl RoomConnector {
             OPEN_DEADLINE,
             open_socket(
                 Arc::clone(&self.tls),
+                self.proxy.as_ref(),
                 origin,
                 locator,
                 role.path(),
@@ -214,15 +236,16 @@ impl RoomConnector {
     }
 }
 
-/// Opens one socket: the connection, TLS verified for the origin's host, and the upgrade, with the
-/// control token when the role has one.
+/// Opens one socket: the connection, directly or through `proxy`, TLS verified for the origin's
+/// host, and the upgrade, with the control token when the role has one.
 async fn open_socket(
     tls: Arc<ClientConfig>,
+    proxy: Option<&ProxyUrl>,
     origin: &RendezvousOrigin,
     locator: &Locator,
     role: &str,
     token: Option<&str>,
-) -> Result<WebSocketStream<UpgradeGuard<tokio_rustls::client::TlsStream<TcpStream>>>, RoomError> {
+) -> Result<WebSocketStream<UpgradeGuard<tokio_rustls::client::TlsStream<Carrier>>>, RoomError> {
     let configuration = |reason: String| RoomError::Configuration {
         origin: origin.as_str().to_owned(),
         reason,
@@ -238,9 +261,21 @@ async fn open_socket(
     let (host, port) = host_and_port(authority).map_err(configuration)?;
     let server_name = ServerName::try_from(host.to_owned())
         .map_err(|_| configuration(format!("{host} is not a name TLS can verify")))?;
-    let connection = TcpStream::connect((host, port))
-        .await
-        .map_err(|error| unreachable("the connection failed", &error))?;
+    let connection = match proxy {
+        None => Carrier::Plain(
+            TcpStream::connect((host, port))
+                .await
+                .map_err(|error| unreachable("the connection failed", &error))?,
+        ),
+        Some(proxy) => {
+            tunnel(proxy, host, port, &tls)
+                .await
+                .map_err(|reason| RoomError::Unreachable {
+                    origin: origin.as_str().to_owned(),
+                    reason,
+                })?
+        }
+    };
     let stream = TlsConnector::from(tls)
         .connect(server_name, connection)
         .await
@@ -511,6 +546,151 @@ fn host_and_port(authority: &str) -> Result<(&str, u16), String> {
     Ok((host, port))
 }
 
+/// The connection a room's TLS runs over: the room's own, or a tunnel through a proxy, which is
+/// itself TLS when the proxy's address is an `https` one.
+enum Carrier {
+    Plain(TcpStream),
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+impl AsyncRead for Carrier {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for Carrier {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
+        }
+    }
+}
+
+/// Opens a tunnel to `host:port` through `proxy` with HTTP `CONNECT`, and returns it once the
+/// proxy has agreed.
+///
+/// The proxy's own address is reached directly, over TLS verified like a room's when it is an
+/// `https` address. Any 2xx answer is the proxy agreeing (RFC 9110, section 9.3.6); anything else,
+/// and an answer whose head has not ended within [`MAX_TUNNEL_ANSWER_BYTES`], ends the attempt.
+/// The head is read one byte at a time, so nothing that follows it is taken from the room's TLS.
+async fn tunnel(
+    proxy: &ProxyUrl,
+    host: &str,
+    port: u16,
+    tls: &Arc<ClientConfig>,
+) -> Result<Carrier, String> {
+    let address = proxy.as_url();
+    let proxy_port = address
+        .port_or_known_default()
+        .ok_or_else(|| format!("the proxy {proxy} names no port"))?;
+    let (connection, name) = match address.host() {
+        Some(url::Host::Domain(name)) => (
+            TcpStream::connect((name, proxy_port)).await,
+            ServerName::try_from(name.to_owned()).ok(),
+        ),
+        Some(url::Host::Ipv4(ip)) => (
+            TcpStream::connect((ip, proxy_port)).await,
+            Some(ServerName::from(IpAddr::V4(ip))),
+        ),
+        Some(url::Host::Ipv6(ip)) => (
+            TcpStream::connect((ip, proxy_port)).await,
+            Some(ServerName::from(IpAddr::V6(ip))),
+        ),
+        None => return Err(format!("the proxy {proxy} names no host")),
+    };
+    let connection =
+        connection.map_err(|error| format!("the proxy {proxy} could not be reached: {error}"))?;
+    let mut carrier = if address.scheme() == "https" {
+        let name = name.ok_or_else(|| format!("the proxy {proxy} is not a name TLS can verify"))?;
+        let stream = TlsConnector::from(Arc::clone(tls))
+            .connect(name, connection)
+            .await
+            .map_err(|error| format!("the TLS handshake with the proxy {proxy} failed: {error}"))?;
+        Carrier::Tls(Box::new(stream))
+    } else {
+        Carrier::Plain(connection)
+    };
+
+    let target = if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    let request = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n");
+    carrier
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|error| format!("the tunnel request to the proxy {proxy} failed: {error}"))?;
+    carrier
+        .flush()
+        .await
+        .map_err(|error| format!("the tunnel request to the proxy {proxy} failed: {error}"))?;
+
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        if head.len() >= MAX_TUNNEL_ANSWER_BYTES {
+            return Err(format!(
+                "the proxy {proxy}'s answer to the tunnel request is longer than an answer may be"
+            ));
+        }
+        let byte = carrier.read_u8().await.map_err(|error| {
+            format!("the proxy {proxy} ended the connection before it answered: {error}")
+        })?;
+        head.push(byte);
+    }
+    match tunnel_status(&head) {
+        Some(status) if (200..300).contains(&status) => Ok(carrier),
+        Some(status) => Err(format!(
+            "the proxy {proxy} refused the tunnel with status {status}"
+        )),
+        None => Err(format!(
+            "the proxy {proxy} did not answer the tunnel request with a status line"
+        )),
+    }
+}
+
+/// The status code of an HTTP/1.x answer's head: the three digits after its version.
+fn tunnel_status(head: &[u8]) -> Option<u16> {
+    let line = head.split(|&byte| byte == b'\r').next()?;
+    let line = std::str::from_utf8(line).ok()?;
+    let (version, rest) = line.split_once(' ')?;
+    if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+        return None;
+    }
+    let code = rest.get(..3)?;
+    let ends = rest.len() == 3 || rest.as_bytes()[3] == b' ';
+    (ends && code.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| code.parse().ok())
+        .flatten()
+}
+
 /// Starts the task that carries one room socket's frames, and returns the caller's ends of it.
 fn pump<S>(socket: WebSocketStream<S>) -> RoomSocket
 where
@@ -687,6 +867,35 @@ mod tests {
         assert_eq!(host_and_port("[::1]"), Ok(("::1", 443)));
         assert!(host_and_port("[::1:8443").is_err());
         assert!(host_and_port("pair.example.org:port").is_err());
+    }
+
+    /// A proxy's answer to a tunnel request is read by its status line, and only a status line of
+    /// HTTP/1.x with three digits is one.
+    #[test]
+    fn a_tunnel_answer_is_read_by_its_status_line() {
+        assert_eq!(
+            tunnel_status(b"HTTP/1.1 200 Connection established\r\n\r\n"),
+            Some(200)
+        );
+        assert_eq!(tunnel_status(b"HTTP/1.0 200\r\n\r\n"), Some(200));
+        assert_eq!(
+            tunnel_status(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n"),
+            Some(407)
+        );
+        for refused in [
+            &b"HTTP/2 200\r\n\r\n"[..],
+            b"HTTP/1.1 2000 OK\r\n\r\n",
+            b"HTTP/1.1 20a OK\r\n\r\n",
+            b"HTTP/1.1  200 OK\r\n\r\n",
+            b"\r\n\r\n",
+        ] {
+            assert_eq!(
+                tunnel_status(refused),
+                None,
+                "{}",
+                String::from_utf8_lossy(refused)
+            );
+        }
     }
 
     /// A control token never reaches a rendering of the role that carries it.
