@@ -473,8 +473,48 @@ async fn exchange(client: &mut LocalClient, frame: ControlFrame) -> Outcome {
     }
 }
 
-/// One read, forwarded by the control daemon for a paired device acting under a grant.
-fn forwarded<T: serde::Serialize>(method: Method, params: &T, request_id: u64) -> ControlFrame {
+/// The envelope the control daemon vouches for a paired device acting under a grant.
+fn device() -> ActorEnvelope {
+    ActorEnvelope {
+        actor_id: ActorId::new("device:a-test-phone").expect("an actor"),
+        ingress: ActorIngress::PairedDevice,
+        device_id: Nullable::some(DeviceId::new(Uuid::from_bytes([9; 16]))),
+        grant_id: Nullable::some(GrantId::new(Uuid::from_bytes([8; 16]))),
+        grant_revision: Nullable::some(AuthorityRevision::new(1)),
+        controller_generation: ControllerGeneration::new(1),
+        connection_id: ConnectionId::new(Uuid::from_bytes([7; 16])),
+    }
+}
+
+/// The envelope the control daemon vouches for a caller on its own local socket, naming the
+/// grant the caller acts under when it acts under one.
+fn local(under_a_grant: bool) -> ActorEnvelope {
+    ActorEnvelope {
+        actor_id: ActorId::new("local:a-test-user").expect("an actor"),
+        ingress: ActorIngress::LocalIpc,
+        device_id: Nullable::null(),
+        grant_id: if under_a_grant {
+            Nullable::some(GrantId::new(Uuid::from_bytes([6; 16])))
+        } else {
+            Nullable::null()
+        },
+        grant_revision: if under_a_grant {
+            Nullable::some(AuthorityRevision::new(1))
+        } else {
+            Nullable::null()
+        },
+        controller_generation: ControllerGeneration::new(1),
+        connection_id: ConnectionId::new(Uuid::from_bytes([5; 16])),
+    }
+}
+
+/// One read, forwarded by the control daemon for the actor it vouches for.
+fn forwarded<T: serde::Serialize>(
+    method: Method,
+    params: &T,
+    request_id: u64,
+    actor: ActorEnvelope,
+) -> ControlFrame {
     ControlFrame::ForwardedRead(Box::new(ForwardedRequest {
         request: Request {
             request_id: RequestId::new(request_id),
@@ -482,18 +522,12 @@ fn forwarded<T: serde::Serialize>(method: Method, params: &T, request_id: u64) -
             method_version: MethodVersion::V1,
             params: ParamsValue::from_typed(params).expect("encodes"),
         },
-        actor: ActorEnvelope {
-            actor_id: ActorId::new("device:a-test-phone").expect("an actor"),
-            ingress: ActorIngress::PairedDevice,
-            device_id: Nullable::some(DeviceId::new(Uuid::from_bytes([9; 16]))),
-            grant_id: Nullable::some(GrantId::new(Uuid::from_bytes([8; 16]))),
-            grant_revision: Nullable::some(AuthorityRevision::new(1)),
-            controller_generation: ControllerGeneration::new(1),
-            connection_id: ConnectionId::new(Uuid::from_bytes([7; 16])),
+        authority_deadline_boot_ms: if actor.grant_id.is_present() {
+            Nullable::some(U64::new(kr_ipc::clock::boot_elapsed_ms() + 30_000))
+        } else {
+            Nullable::null()
         },
-        authority_deadline_boot_ms: Nullable::some(U64::new(
-            kr_ipc::clock::boot_elapsed_ms() + 30_000,
-        )),
+        actor,
     }))
 }
 
@@ -725,7 +759,7 @@ async fn kr_req_11_26_the_record_says_where_the_request_stands_once_answered() {
 /// reads the table admits for a device through the same frame: `agent.capabilities` is served, and
 /// `agent.snapshot` is refused by name as before.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_forwarded_read_is_refused_and_carries_nothing_of_the_record() {
+async fn a_paired_devices_read_is_refused_by_the_method_table_and_carries_nothing() {
     let host = host().await;
     let resource_id = offer(&host, &request_frame(11, 0));
     let mut daemon = daemon(&host).await;
@@ -736,6 +770,7 @@ async fn a_forwarded_read_is_refused_and_carries_nothing_of_the_record() {
             Method::AgentApprovalInspect,
             &params(&host, instance(), resource_id),
             31,
+            device(),
         ),
     )
     .await;
@@ -759,6 +794,7 @@ async fn a_forwarded_read_is_refused_and_carries_nothing_of_the_record() {
                 subject: subject(host.session_id, instance()),
             },
             32,
+            device(),
         ),
     )
     .await;
@@ -776,6 +812,7 @@ async fn a_forwarded_read_is_refused_and_carries_nothing_of_the_record() {
                 from_node: Nullable::null(),
             },
             33,
+            device(),
         ),
     )
     .await;
@@ -908,4 +945,60 @@ async fn a_record_larger_than_the_peers_frame_is_refused_with_its_size() {
         .expect("a record that fits is read on the same connection");
     let record: AgentApprovalInspectResult = read.to_typed().expect("the record decodes");
     assert_eq!(record.resource_id, small);
+}
+
+/// Section 10 narrows the history a grant reaches in the shared host-side filter, and a grant's
+/// history scope does not reach this worker with a forwarded read. So a caller acting under a
+/// grant is refused with that reason, and nothing of the record, whichever socket the daemon
+/// heard it on. The local owner the daemon vouches for, acting under no grant, reads the whole
+/// record, as it does on the worker's own socket.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_under_a_grant_is_refused_with_its_reason_and_the_local_owner_is_served() {
+    let host = host().await;
+    let resource_id = offer(&host, &request_frame(11, 0));
+    let mut daemon = daemon(&host).await;
+
+    let refused = exchange(
+        &mut daemon,
+        forwarded(
+            Method::AgentApprovalInspect,
+            &params(&host, instance(), resource_id),
+            41,
+            local(true),
+        ),
+    )
+    .await;
+    let Outcome::Error(error) = refused else {
+        panic!("a read under a grant is refused: {refused:?}");
+    };
+    assert_eq!(error.code, ErrorCode::UnsupportedCapability);
+    assert!(
+        error.message.contains("history scope"),
+        "the refusal says why: {}",
+        error.message
+    );
+    for withheld in ["kalareach.codex", "session/request_permission", "allow"] {
+        assert!(
+            !error.message.contains(withheld),
+            "the refusal carries nothing of the record: {}",
+            error.message
+        );
+    }
+
+    let served = exchange(
+        &mut daemon,
+        forwarded(
+            Method::AgentApprovalInspect,
+            &params(&host, instance(), resource_id),
+            42,
+            local(false),
+        ),
+    )
+    .await;
+    let Outcome::Ok(value) = served else {
+        panic!("the local owner reads the record: {served:?}");
+    };
+    let record: AgentApprovalInspectResult = value.to_typed().expect("the record decodes");
+    assert_eq!(record.resource_id, resource_id);
+    assert_eq!(record.decoding.projection.decisions, offered());
 }
