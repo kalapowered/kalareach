@@ -466,9 +466,7 @@ pub struct Controller {
     /// restriction whose barrier has not run stops every admission and forward rather than being
     /// reported and passed over ([`Self::check_fence`]).
     debts: Arc<std::sync::Mutex<Debts>>,
-    /// Wakes the pass that raises a barrier for every debt still published. Shared, so the pass
-    /// can wait for it without holding the daemon.
-    debt_owed: Arc<tokio::sync::Notify>,
+
     /// The environment's transfer service, whose methods this daemon admits and dispatches.
     transfer: Arc<crate::transfer::TransferModule>,
     /// The environment's project service, whose methods this daemon admits and dispatches.
@@ -991,7 +989,7 @@ impl Controller {
             started,
             rights_ceiling: std::sync::Mutex::new(rights_ceiling),
             debts: Arc::new(std::sync::Mutex::new(Debts::default())),
-            debt_owed: Arc::new(tokio::sync::Notify::new()),
+
             boot_identity: setup.boot_identity,
             boot_epoch,
             windows: ActionWindowIssuer::with_default_validity(Arc::clone(&clock) as Arc<_>),
@@ -1811,8 +1809,6 @@ impl Controller {
             held.pending.remove(debt);
             held.published.insert(*debt, *reach);
         }
-        drop(held);
-        self.debt_owed.notify_one();
     }
 
     fn debts(&self) -> std::sync::MutexGuard<'_, Debts> {
@@ -1845,6 +1841,16 @@ impl Controller {
     /// published then, so admission and forwarding stay refused until a later pass raises the
     /// barrier.
     pub(crate) async fn barrier(&self) -> Result<RevocationBarrier> {
+        match self.raise_barrier(true).await? {
+            Some(barrier) => Ok(barrier),
+            None => self.announce_authority_revision().await,
+        }
+    }
+
+    /// The barrier itself. With nothing captured it advances nothing, and reports the barrier as
+    /// it stands only when `report_when_idle` asks it to: a pass that found nothing to retire
+    /// announces nothing, so it never speaks to a worker beside a barrier that is.
+    async fn raise_barrier(&self, report_when_idle: bool) -> Result<Option<RevocationBarrier>> {
         let captured = {
             let mut registry = self.registry.lock().await;
             let captured = self.debts().published.clone();
@@ -1889,7 +1895,11 @@ impl Controller {
             }
         };
         let Some((revision, captured, host_wide)) = captured else {
-            return self.announce_authority_revision().await;
+            return if report_when_idle {
+                self.announce_authority_revision().await.map(Some)
+            } else {
+                Ok(None)
+            };
         };
         self.leases.revoke(revision);
         // The host policy decides a paired device's request against the revision in force, so it
@@ -1930,7 +1940,7 @@ impl Controller {
                  the next start raises one more barrier for them: {error}"
             ),
         }
-        Ok(barrier)
+        Ok(Some(barrier))
     }
 
     /// Raises a barrier when a published debt is still owed one: a barrier that could not be
@@ -1943,37 +1953,48 @@ impl Controller {
         if self.debts().published.is_empty() {
             return Ok(None);
         }
-        self.barrier().await.map(Some)
+        self.raise_barrier(false).await
     }
 
-    /// Runs [`Self::raise_owed_barrier`] at once when woken, and every [`DEBT_PASS_INTERVAL`].
+    /// Raises a barrier for every debt that stayed published across a whole
+    /// [`DEBT_PASS_INTERVAL`]: one whose own barrier failed, or one a start published.
+    ///
+    /// A change raises its own barrier the moment it publishes, and captures its debt within that
+    /// barrier's first step, so a debt still published an interval later has no barrier coming.
+    /// Waiting that long is what keeps the pass from racing a change to its own debt.
     fn start_debt_pass(self: &Arc<Self>) {
         // Weak, and taken only when a debt is owed, so the pass is never what keeps a daemon, and
         // its environment lock, alive.
         let daemon = Arc::downgrade(self);
-        let owed = Arc::clone(&self.debt_owed);
         let debts = Arc::clone(&self.debts);
         tokio::spawn(async move {
+            let mut seen = std::collections::BTreeSet::new();
             loop {
-                let published = !debts
+                tokio::time::sleep(DEBT_PASS_INTERVAL).await;
+                let published: std::collections::BTreeSet<crate::grants::store::DebtId> = debts
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .published
-                    .is_empty();
-                if published {
-                    let Some(controller) = daemon.upgrade() else {
-                        return;
-                    };
-                    if let Err(error) = controller.raise_owed_barrier().await {
-                        eprintln!(
-                            "kr-controller: a barrier this host owes could not be raised yet, so \
-                             nothing is admitted or forwarded until it is: {error}"
-                        );
-                    }
-                } else if daemon.strong_count() == 0 {
+                    .keys()
+                    .copied()
+                    .collect();
+                let stayed = published.intersection(&seen).next().is_some();
+                seen = published;
+                if daemon.strong_count() == 0 {
                     return;
                 }
-                let _ = tokio::time::timeout(DEBT_PASS_INTERVAL, owed.notified()).await;
+                if !stayed {
+                    continue;
+                }
+                let Some(controller) = daemon.upgrade() else {
+                    return;
+                };
+                if let Err(error) = controller.raise_owed_barrier().await {
+                    eprintln!(
+                        "kr-controller: a barrier this host owes could not be raised yet, so \
+                         nothing is admitted or forwarded until it is: {error}"
+                    );
+                }
             }
         });
     }
