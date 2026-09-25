@@ -1077,9 +1077,10 @@ the setup takes the definition once it has been applied. kr ends no daemon, so i
 | macOS | a launchd job, `~/Library/LaunchAgents/kr-controller-<environment>.plist` | your graphical domain when the environment's sessions are desktop-bound by default, your background domain when they are headless |
 | Linux | a systemd user unit, `kr-controller-<environment>.service` in `$XDG_CONFIG_HOME/systemd/user`, `~/.config/systemd/user` by default | the user manager, with no `[Install]` section, so nothing enables it |
 
-On Linux, kr asks the user manager everything through `systemctl --user`, with the runtime
-directory set for it, so every question and every request reaches the same manager. A host whose
-user manager does not answer has no service start.
+On Linux, kr asks the user manager everything through `systemctl --user`, from the same
+environment with the runtime directory set, so every question and every request makes the same
+choice of manager and, while the managers stay as they are, reaches the same one. A host whose user
+manager does not answer has no service start.
 
 kr's definition runs the `kr-controller` installed beside `kr`, told this installation's runtime
 and state roots, working in the environment's state directory and writing to its `controller.log`,
