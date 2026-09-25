@@ -9,6 +9,8 @@
 //! What the build names is what the run is held to. Every test binary it built is listed, and has
 //! to be run and read; a listing that fails, a binary the log never ran, and a log that cannot be
 //! read are each the step's error, so a step can never pass on less output than it was built for.
+//! A target with a harness of its own (`harness = false`) is a program that prints neither a list
+//! nor verdicts: it is run, and only its exit status, which is the step's, counts.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -124,7 +126,12 @@ pub fn execute(step: &Step, number: usize, place: &Place<'_>, packages: &[Packag
         let listed = build_first(step, place, &log_path, packages).and_then(|(built, map)| {
             executed.built = built;
             executables = map;
-            list(step, place, &executables)
+            let own_harness: BTreeSet<&str> = executables
+                .iter()
+                .filter(|(_, target)| !has_harness(packages, target))
+                .map(|(executable, _)| executable.as_str())
+                .collect();
+            list(step, place, &executables, &own_harness)
         });
         match listed {
             Ok(listed) => executed.listed = listed,
@@ -224,8 +231,18 @@ fn file_name(path: &str) -> String {
     path.rsplit(['/', '\\']).next().unwrap_or(path).to_owned()
 }
 
+/// Whether `target` runs under the standard test harness, as its package's manifest says.
+#[must_use]
+pub fn has_harness(packages: &[Package], target: &TargetId) -> bool {
+    packages
+        .iter()
+        .flat_map(|package| &package.targets)
+        .find(|candidate| candidate.id == *target)
+        .is_none_or(|found| found.harness)
+}
+
 /// Every test each binary of a step holds, as the binaries list them through Cargo, whatever the
-/// step's own filters are.
+/// step's own filters are. A binary with a harness of its own lists nothing, and is left out.
 ///
 /// # Errors
 ///
@@ -235,6 +252,7 @@ fn list(
     step: &Step,
     place: &Place<'_>,
     executables: &BTreeMap<String, TargetId>,
+    own_harness: &BTreeSet<&str>,
 ) -> Result<BTreeMap<TargetId, BTreeSet<String>>, String> {
     let mut command: Vec<String> = step
         .command
@@ -273,6 +291,11 @@ fn list(
             let (_, executable) = rest.rsplit_once(" (")?;
             Some(Some(file_name(executable.strip_suffix(')')?)))
         })
+        .filter(|section| {
+            section
+                .as_deref()
+                .is_none_or(|executable| !own_harness.contains(executable))
+        })
         .collect();
     let mut lists: Vec<BTreeSet<String>> = Vec::new();
     let mut current = BTreeSet::new();
@@ -304,9 +327,11 @@ fn list(
         listed.insert(target.clone(), names);
     }
     let unlisted: Vec<String> = executables
-        .values()
-        .filter(|target| !listed.contains_key(*target))
-        .map(ToString::to_string)
+        .iter()
+        .filter(|(executable, target)| {
+            !own_harness.contains(executable.as_str()) && !listed.contains_key(*target)
+        })
+        .map(|(_, target)| target.to_string())
         .collect();
     if !unlisted.is_empty() {
         return Err(format!(
