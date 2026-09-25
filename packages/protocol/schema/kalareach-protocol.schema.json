@@ -2360,8 +2360,7 @@
       "type": "object"
     },
     "AttachmentSummary": {
-      "additionalProperties": false,
-      "description": "One attachment of a session.",
+      "description": "One attachment of a session.\n\nRead-only metadata: it describes an attachment in the answers of `session.attach` and\n`events.snapshot`, a field a newer host adds is explicitly optional, and a reader whose schema\npredates it ignores it rather than refusing the answer. Nothing here is signed or covered by a\nmutation digest, which is what lets a field be dropped unread.",
       "properties": {
         "attached_at_ms": {
           "$ref": "#/$defs/TimestampMs",
@@ -2447,7 +2446,8 @@
         "granted",
         "attached_at_ms"
       ],
-      "type": "object"
+      "type": "object",
+      "x-kalareach-read-only-metadata": true
     },
     "AttachmentViewportParams": {
       "additionalProperties": false,

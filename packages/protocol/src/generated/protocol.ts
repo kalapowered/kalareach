@@ -4514,6 +4514,11 @@ export interface AttachmentHandle1 {
 }
 /**
  * One attachment of a session.
+ *
+ * Read-only metadata: it describes an attachment in the answers of `session.attach` and
+ * `events.snapshot`, a field a newer host adds is explicitly optional, and a reader whose schema
+ * predates it ignores it rather than refusing the answer. Nothing here is signed or covered by a
+ * mutation digest, which is what lets a field be dropped unread.
  */
 export interface AttachmentSummary {
   /**
@@ -22079,6 +22084,11 @@ export interface SessionAttachResult {
 }
 /**
  * One attachment of a session.
+ *
+ * Read-only metadata: it describes an attachment in the answers of `session.attach` and
+ * `events.snapshot`, a field a newer host adds is explicitly optional, and a reader whose schema
+ * predates it ignores it rather than refusing the answer. Nothing here is signed or covered by a
+ * mutation digest, which is what lets a field be dropped unread.
  */
 export interface AttachmentSummary1 {
   /**

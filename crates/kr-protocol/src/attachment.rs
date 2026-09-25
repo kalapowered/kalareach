@@ -225,8 +225,13 @@ pub struct GeometryState {
 }
 
 /// One attachment of a session.
+///
+/// Read-only metadata: it describes an attachment in the answers of `session.attach` and
+/// `events.snapshot`, a field a newer host adds is explicitly optional, and a reader whose schema
+/// predates it ignores it rather than refusing the answer. Nothing here is signed or covered by a
+/// mutation digest, which is what lets a field be dropped unread.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[schemars(extend("x-kalareach-read-only-metadata" = true))]
 pub struct AttachmentSummary {
     /// The attachment identity, independent of the device behind it.
     pub attachment_id: AttachmentId,
@@ -487,14 +492,37 @@ mod tests {
         assert!(!unqualified.attachment_id.is_present());
         assert!(!unqualified.line_token.is_present());
     }
-    /// KR-REQ-08.02: a viewport carries its reason, a direct attachment carries none and is encoded
-    /// as it was before reasons existed, and a summary from a worker built before reasons still
-    /// reads, as one with no reason reported.
-    #[test]
-    fn a_viewport_says_why_and_a_direct_attachment_is_encoded_as_before() {
-        let summary = |presentation, reason| AttachmentSummary {
-            attachment_id: crate::ids::AttachmentId::new(crate::scalars::Uuid::from_bytes([7; 16])),
-            ordinal: crate::ids::AttachmentOrdinal::new(1),
+    /// The summary a reader built before reasons holds: the same fields without the reason, and
+    /// closed, as that reader's schema was.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    struct ClosedSummary {
+        attachment_id: AttachmentId,
+        ordinal: AttachmentOrdinal,
+        mode: AttachMode,
+        claim_geometry: bool,
+        dimensions: Nullable<Dimensions>,
+        presentation: Nullable<TerminalPresentationMode>,
+        terminal_profile_id: Nullable<String>,
+        granted: CanonicalSet<AttachmentCapability>,
+        attached_at_ms: TimestampMs,
+    }
+
+    /// A summary a later host might write: every field this build knows, and one it does not.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+    struct LaterSummary {
+        #[serde(flatten)]
+        summary: AttachmentSummary,
+        a_later_field: String,
+    }
+
+    fn summary(
+        presentation: TerminalPresentationMode,
+        reason: Option<PresentationReason>,
+    ) -> AttachmentSummary {
+        AttachmentSummary {
+            attachment_id: AttachmentId::new(crate::scalars::Uuid::from_bytes([7; 16])),
+            ordinal: AttachmentOrdinal::new(1),
             mode: AttachMode::Terminal,
             claim_geometry: false,
             dimensions: Nullable::some(Dimensions::new(80, 24)),
@@ -503,21 +531,77 @@ mod tests {
             terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
             granted: CanonicalSet::new(),
             attached_at_ms: TimestampMs::new(1),
-        };
-        let direct =
-            serde_json::to_value(summary(TerminalPresentationMode::Direct, None)).expect("encodes");
-        assert_eq!(direct["presentation"], "direct");
-        assert!(
-            direct.get("presentation_reason").is_none(),
-            "a direct attachment has no reason to carry: {direct}"
+        }
+    }
+
+    fn closed(summary: &AttachmentSummary) -> ClosedSummary {
+        ClosedSummary {
+            attachment_id: summary.attachment_id,
+            ordinal: summary.ordinal,
+            mode: summary.mode,
+            claim_geometry: summary.claim_geometry,
+            dimensions: summary.dimensions,
+            presentation: summary.presentation,
+            terminal_profile_id: summary.terminal_profile_id.clone(),
+            granted: summary.granted.clone(),
+            attached_at_ms: summary.attached_at_ms,
+        }
+    }
+
+    /// The bytes a value goes on the wire as.
+    fn wire<T: Serialize>(value: &T) -> Vec<u8> {
+        kr_cbor::encode(&kr_cbor::to_canonical_value(value).expect("encodes"))
+    }
+
+    fn read<T: crate::wire::WireMessage>(bytes: &[u8]) -> Result<T, kr_cbor::CborError> {
+        crate::wire::decode(bytes, &kr_cbor::Limits::DEFAULT)
+    }
+
+    /// KR-REQ-08.02: a summary a worker built before reasons writes is read by this build, as one
+    /// with no reason reported, through the same decoder every answer goes through.
+    #[test]
+    fn a_summary_written_before_reasons_is_read_with_no_reason() {
+        let earlier = closed(&summary(TerminalPresentationMode::Viewport, None));
+        let read: AttachmentSummary = read(&wire(&earlier)).expect("an earlier summary reads");
+        assert_eq!(
+            read.presentation.as_ref(),
+            Some(&TerminalPresentationMode::Viewport)
         );
-        let projected = serde_json::to_value(summary(
+        assert_eq!(read.presentation_reason, None, "no reason was reported");
+    }
+
+    /// KR-REQ-08.02: a direct attachment has no reason to carry, and its summary goes on the wire
+    /// as exactly the bytes a summary had before reasons existed.
+    #[test]
+    fn a_direct_summary_is_written_as_it_was_before_reasons() {
+        let direct = summary(TerminalPresentationMode::Direct, None);
+        assert_eq!(wire(&direct), wire(&closed(&direct)));
+        let reread: AttachmentSummary = read(&wire(&direct)).expect("reads back");
+        assert_eq!(reread, direct);
+    }
+
+    /// KR-REQ-08.02: a viewport's summary carries its reason, and a reader whose schema was closed
+    /// before reasons existed refuses it. That reader is the one this addition breaks; a reader of
+    /// this build reads the reason back.
+    #[test]
+    fn a_projected_summary_carries_its_reason_and_a_closed_earlier_reader_refuses_it() {
+        let projected = summary(
             TerminalPresentationMode::Viewport,
             Some(PresentationReason::SizeMismatch),
-        ))
-        .expect("encodes");
-        assert_eq!(projected["presentation"], "viewport");
-        assert_eq!(projected["presentation_reason"], "size_mismatch");
+        );
+        let bytes = wire(&projected);
+        assert!(
+            matches!(
+                read::<ClosedSummary>(&bytes),
+                Err(kr_cbor::CborError::UnknownField { .. })
+            ),
+            "a closed earlier reader refuses the field it does not know"
+        );
+        let reread: AttachmentSummary = read(&bytes).expect("this build reads the reason");
+        assert_eq!(
+            reread.presentation_reason,
+            Some(PresentationReason::SizeMismatch)
+        );
         for reason in PresentationReason::ALL {
             assert_eq!(
                 serde_json::to_value(reason).expect("encodes"),
@@ -526,18 +610,21 @@ mod tests {
             );
             assert!(!reason.describe().is_empty());
         }
+    }
 
-        let mut earlier = projected;
-        earlier
-            .as_object_mut()
-            .expect("an object")
-            .remove("presentation_reason");
+    /// Read-only metadata: a field a later host adds to a summary is ignored by this build, and the
+    /// summary it was added to is read whole.
+    #[test]
+    fn a_field_a_later_host_adds_to_a_summary_is_ignored() {
+        let later = LaterSummary {
+            summary: summary(
+                TerminalPresentationMode::Viewport,
+                Some(PresentationReason::HistoryWindow),
+            ),
+            a_later_field: "something a later build knows".to_owned(),
+        };
         let read: AttachmentSummary =
-            serde_json::from_value(earlier).expect("a summary from a build before reasons reads");
-        assert_eq!(
-            read.presentation.as_ref(),
-            Some(&TerminalPresentationMode::Viewport)
-        );
-        assert_eq!(read.presentation_reason, None, "with no reason reported");
+            read(&wire(&later)).expect("an unknown optional field is ignored");
+        assert_eq!(read, later.summary);
     }
 }
