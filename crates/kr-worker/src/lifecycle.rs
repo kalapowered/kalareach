@@ -15,8 +15,12 @@
 //! | Question | What answers it | What is left on a clock |
 //! | --- | --- | --- |
 //! | has the root shell ended? | the signal the kernel sends a parent when a child of it does | a sweep, in case a signal is lost; the whole answer where no such signal exists |
-//! | what does this session own? | input the session accepted and output it produced, which is where a new process usually comes from | the same sweep, for everything that comes from neither |
+//! | what does this session own? | input the session accepted, output it produced and a command the shell's integration reported starting, which is where a new process usually comes from | the same sweep, for everything that comes from none of them |
 //! | is the desktop still there? | nothing this host can subscribe to | the same sweep. The reading is this worker's own environment, so a check ten times a second answered from the same values each time |
+//!
+//! The same marks tell the adoption watch ([`crate::broker::adoption`]) when to look at the
+//! terminal's foreground for a program the integration did not launch. It keeps a clock only while
+//! it has something to look at, and says what that leaves out.
 //!
 //! The limits of the middle row are worth being exact about, because traffic is a *hint* rather
 //! than a proof and the observation it asks for is a sample rather than a record of what happened.
@@ -70,16 +74,52 @@ pub const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// delivers a child signal this interval is unused.
 pub const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Whether the session has done anything that is worth looking at the boundary for.
+/// Whether the session has done anything that is worth looking at the boundary, or at the
+/// terminal's foreground, for.
 ///
 /// A session's own traffic is what asks for an observation: a command that starts a job is input the
 /// session accepted, and a job that is running usually writes something. Both pass through
-/// [`crate::runtime`], and both mark this. Neither is proof that a process started, and the absence
-/// of both is not proof that none did: the module documentation says what that leaves out.
+/// [`crate::runtime`], and both mark this, as does a command the shell's integration reports
+/// starting. None of them is proof that a process started, and the absence of all of them is not
+/// proof that none did: the module documentation says what that leaves out.
+///
+/// Two readers take the mark, each at its own pace, so each has one of its own: the supervision,
+/// which observes the ownership boundary, and the adoption watch, which looks at the terminal's
+/// foreground. Taking one leaves the other.
 #[derive(Debug, Default)]
 pub struct Activity {
+    /// What the supervision takes.
+    boundary: Mark,
+    /// What the adoption watch takes.
+    foreground: Mark,
+}
+
+/// One reader's mark.
+#[derive(Debug, Default)]
+struct Mark {
     happened: AtomicBool,
     woken: Notify,
+}
+
+impl Mark {
+    /// Only the first note after the reader took the mark wakes it. A session printing steadily
+    /// notes thousands of times a second, and waking a reader on every one of them would cost more
+    /// than the polling it replaces.
+    fn note(&self) {
+        if !self.happened.swap(true, Ordering::Release) {
+            self.woken.notify_one();
+        }
+    }
+
+    fn take(&self) -> bool {
+        self.happened.swap(false, Ordering::Acquire)
+    }
+
+    /// A wait that is abandoned before it finishes loses nothing: the mark itself is what carries
+    /// the information, and it is read again on the next wait.
+    async fn marked(&self) {
+        self.woken.notified().await;
+    }
 }
 
 impl Activity {
@@ -89,28 +129,35 @@ impl Activity {
         Arc::new(Self::default())
     }
 
-    /// Marks that the session accepted input or produced output.
-    ///
-    /// Only the first mark after an observation wakes anything. A session printing steadily reaches
-    /// this thousands of times a second, and waking the supervision on every one of them would cost
-    /// more than the polling it replaces.
+    /// Marks that the session accepted input or produced output, or that its shell's integration
+    /// reported a command starting.
     pub fn note(&self) {
-        if !self.happened.swap(true, Ordering::Release) {
-            self.woken.notify_one();
-        }
+        self.boundary.note();
+        self.foreground.note();
     }
 
-    /// Takes the mark, and says whether there was one.
+    /// Takes the supervision's mark, and says whether there was one.
     fn take(&self) -> bool {
-        self.happened.swap(false, Ordering::Acquire)
+        self.boundary.take()
     }
 
-    /// Waits for a mark to be made.
-    ///
-    /// A wait that is abandoned before it finishes loses nothing: the mark itself is what carries
-    /// the information, and it is read again on the next wait.
+    /// Waits for the supervision's mark to be made.
     async fn marked(&self) {
-        self.woken.notified().await;
+        self.boundary.marked().await;
+    }
+
+    /// Takes the adoption watch's mark, and says whether there was one.
+    #[must_use]
+    pub fn take_foreground(&self) -> bool {
+        self.foreground.take()
+    }
+
+    /// Waits for the adoption watch's mark to be made.
+    ///
+    /// It can end with nothing to take: a note made while the watch was looking leaves its wake
+    /// behind after the mark itself has been taken. [`Activity::take_foreground`] says which.
+    pub async fn foreground_marked(&self) {
+        self.foreground.marked().await;
     }
 }
 
@@ -374,6 +421,21 @@ mod tests {
         let taken = started + OBSERVE_INTERVAL;
         assert_eq!(sweep.next_observation(), taken + OBSERVE_INTERVAL);
         assert!(sweep.observation_due(taken + OBSERVE_INTERVAL));
+    }
+
+    #[test]
+    fn each_reader_takes_a_mark_of_its_own() {
+        let activity = Activity::new();
+        activity.note();
+        assert!(activity.take(), "the supervision takes its mark");
+        assert!(
+            activity.take_foreground(),
+            "and the adoption watch's is still there to be taken"
+        );
+        assert!(!activity.take_foreground(), "once");
+        activity.note();
+        assert!(activity.take_foreground(), "the watch takes its mark");
+        assert!(activity.take(), "and the supervision's is still there");
     }
 
     #[test]

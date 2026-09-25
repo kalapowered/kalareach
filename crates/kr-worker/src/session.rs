@@ -262,6 +262,14 @@ pub struct Session {
     /// as typed, where the session gave one. Only the latest generation is kept: a program running
     /// now was started by the line being run now.
     answered: Answered,
+    /// What tells the supervision and the adoption watch that a process can have started here.
+    ///
+    /// The runtime marks it for the input this session accepts and the output it produces, and the
+    /// session itself for a command the shell's integration reports starting.
+    activity: Arc<crate::lifecycle::Activity>,
+    /// How many times the terminal's foreground has been read, for this host's own tests.
+    #[cfg(feature = "testing")]
+    foreground_reads: std::sync::atomic::AtomicUsize,
     /// The session's live agent instances, and how many announcements it has made about them.
     agent_instances: AgentInstances,
     /// Why the last interrupt this session tried did not reach the foreground group.
@@ -548,6 +556,9 @@ impl Session {
             late_installations: Vec::new(),
             command_blocks: std::collections::VecDeque::new(),
             answered: Answered::default(),
+            activity: crate::lifecycle::Activity::new(),
+            #[cfg(feature = "testing")]
+            foreground_reads: std::sync::atomic::AtomicUsize::new(0),
             agent_instances: AgentInstances::default(),
             interrupt_failed: None,
             held_input_bytes: 0,
@@ -773,6 +784,9 @@ impl Session {
 
         match hook {
             crate::fence::CommandHook::Resolve(params) => {
+                // The line is about to run what it names, which can take the terminal from the
+                // root shell.
+                self.activity.note();
                 let answer = self.resolve_invocation(&params);
                 self.answered.record(
                     params.prompt_generation,
@@ -789,6 +803,10 @@ impl Session {
                     && let Some(backends) = self.command_backends.as_ref()
                 {
                     backends.line_ended(prompt_generation);
+                }
+                // One that does not is a command starting, which can take the terminal.
+                if !block.finished() {
+                    self.activity.note();
                 }
                 self.record_command_block(*block);
                 EventOutcome::CommandBlockRecorded(kr_protocol::root::RootCommandBlockResult {
@@ -3062,6 +3080,30 @@ impl Session {
         }
     }
 
+    /// Returns what tells the supervision and the adoption watch that a process can have started
+    /// in this session.
+    #[must_use]
+    pub fn activity(&self) -> Arc<crate::lifecycle::Activity> {
+        Arc::clone(&self.activity)
+    }
+
+    /// Returns the process group the terminal has in the foreground, for the adoption watch: all a
+    /// look reads while the root shell has the terminal.
+    ///
+    /// None where [`Session::foreground`] is none: once the session no longer accepts input, before
+    /// its shell runs, and where the platform reports no foreground group.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn foreground_group(&self) -> Option<i32> {
+        #[cfg(feature = "testing")]
+        self.foreground_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !self.state.accepts_input() || self.shell.is_none() {
+            return None;
+        }
+        self.pty.foreground_group()
+    }
+
     /// Returns what the terminal has in the foreground, for the adoption watch: its process group,
     /// the root shell, and what the latest prompt generation's resolves were answered with.
     ///
@@ -3070,6 +3112,9 @@ impl Session {
     #[cfg(unix)]
     #[must_use]
     pub fn foreground(&self) -> Option<crate::broker::adoption::Foreground> {
+        #[cfg(feature = "testing")]
+        self.foreground_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if !self.state.accepts_input() {
             return None;
         }
@@ -3085,6 +3130,15 @@ impl Session {
             root_shell,
             answered: self.answered.for_line(line),
         })
+    }
+
+    /// Returns how many times the terminal's foreground has been read, for this host's own tests:
+    /// what a test counts to know whether a session nothing is happening in is being looked at.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn foreground_reads(&self) -> usize {
+        self.foreground_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Returns the oldest output cursor this session can still replay.
