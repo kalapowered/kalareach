@@ -28,6 +28,8 @@
 //!   repository's ceiling permits by itself, and every release that installs a native bridge, is
 //!   refused unless it carries the owner's confirmation of that exact installation.
 
+pub(crate) mod files;
+
 use std::sync::Arc;
 
 use kr_plugin_catalogue::transport::RepositoryTransport;
