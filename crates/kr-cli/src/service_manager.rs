@@ -1342,11 +1342,11 @@ mod platform {
 mod platform {
     //! The systemd user manager.
     //!
-    //! Every question kr puts to it and every request it makes go through `systemctl --user`,
-    //! with the runtime directory set for the command, so all of them reach the one manager that
-    //! directory belongs to, over the manager's own socket or the user bus as `systemctl` chooses.
-    //! What the manager holds is read from `systemctl show`'s key=value lines, and the drop-ins it
-    //! names are read from disk.
+    //! Every question kr puts to it and every request it makes go through `systemctl --user`, each
+    //! from the same environment with the runtime directory set, so each follows `systemctl`'s own
+    //! choice of manager, its own socket or a bus, and all of them reach the same one. What the
+    //! manager holds is read from `systemctl show`'s key=value lines, and the drop-ins it names are
+    //! read from disk.
 
     use std::path::PathBuf;
 
@@ -1592,9 +1592,9 @@ mod platform {
                     definition.path.display()
                 ));
             }
-            if let Some(why) = &self.unread_drop_ins {
+            if self.unread_drop_ins.is_some() {
                 return Some(format!(
-                    "kr cannot read back which drop-ins the user manager reads for {name}: {why}"
+                    "kr cannot check what the user manager reads for {name}"
                 ));
             }
             let mut problems = Vec::new();
@@ -1646,6 +1646,9 @@ mod platform {
 
         /// The drop-ins the manager reads for the unit, for a person to look in.
         pub(super) fn reads(&self) -> String {
+            if let Some(why) = &self.unread_drop_ins {
+                return format!("kr cannot read back which drop-ins it reads for it: {why}");
+            }
             if self.drop_ins.is_empty() {
                 return "it reads no drop-in for it".to_owned();
             }
@@ -1672,23 +1675,116 @@ mod platform {
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
+    /// The characters systemd's unit-file parser takes for whitespace.
+    const WHITESPACE: [char; 4] = [' ', '\t', '\n', '\r'];
+
+    /// The kind of line ending a byte is, as systemd's line reader tells them apart.
+    fn ending(byte: u8) -> u8 {
+        match byte {
+            b'\n' => 1,
+            b'\r' => 2,
+            0 => 4,
+            _ => 0,
+        }
+    }
+
+    /// A drop-in's lines as systemd's line reader splits them. A line ends at a line feed, a
+    /// carriage return or a NUL; the bytes that follow belong to the same ending while each kind
+    /// appears once and no NUL has come, so "\r\n" is one ending and "\n\n" is two.
+    fn physical_lines(text: &str) -> Vec<&str> {
+        let bytes = text.as_bytes();
+        let mut lines = Vec::new();
+        let (mut start, mut at) = (0, 0);
+        while at < bytes.len() {
+            let kind = ending(bytes[at]);
+            if kind == 0 {
+                at += 1;
+                continue;
+            }
+            lines.push(&text[start..at]);
+            let mut seen = kind;
+            at += 1;
+            while at < bytes.len() && seen & 4 == 0 {
+                let next = ending(bytes[at]);
+                if next == 0 || next & seen != 0 {
+                    break;
+                }
+                seen |= next;
+                at += 1;
+            }
+            start = at;
+        }
+        if start < bytes.len() {
+            lines.push(&text[start..]);
+        }
+        lines
+    }
+
+    /// Whether a line ends in a backslash that no backslash before it escapes.
+    fn ends_escaped(line: &str) -> bool {
+        line.chars()
+            .fold(false, |escaped, character| !escaped && character == '\\')
+    }
+
+    /// A drop-in's lines as systemd's unit-file parser reads them: a comment line is dropped
+    /// wherever it is, a byte-order mark at the start of a line is dropped the first time, and a
+    /// line that ends in an unescaped backslash goes on into the next, the backslash read as a
+    /// space.
+    fn logical_lines(text: &str) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut continuation: Option<String> = None;
+        let mut mark_seen = false;
+        for mut line in physical_lines(text) {
+            if line.trim_start_matches(WHITESPACE).starts_with(['#', ';']) {
+                continue;
+            }
+            if !mark_seen && let Some(rest) = line.strip_prefix('\u{feff}') {
+                line = rest;
+                mark_seen = true;
+            }
+            let mut joined = continuation.take().unwrap_or_default();
+            joined.push_str(line);
+            if ends_escaped(&joined) {
+                joined.pop();
+                joined.push(' ');
+                continuation = Some(joined);
+            } else {
+                lines.push(joined);
+            }
+        }
+        lines.extend(continuation);
+        lines
+    }
+
+    /// The key a line assigns, if it assigns one: what comes before its first `=`, trimmed.
+    fn key_of(line: &str) -> Option<&str> {
+        let line = line.trim_matches(WHITESPACE);
+        if line.is_empty() || line.starts_with(['#', ';', '[']) {
+            return None;
+        }
+        line.split_once('=')
+            .map(|(key, _)| key.trim_matches(WHITESPACE))
+    }
+
     /// The key in a drop-in that could set the daemon's command or how it is started: a key that
     /// starts with `Exec`, or `Type`, compared without regard to case.
     ///
-    /// Every line is read on its own, whatever section it is in and whether or not it continues
-    /// the one before, and only comment lines and section headers are passed over. So the scan can
-    /// refuse a drop-in the manager would read as harmless, and never passes one that sets either.
+    /// The drop-in is read twice: as systemd's parser reads it, with its line endings, comment
+    /// lines, byte-order mark and continued lines, and line by line with each line taken on its
+    /// own. A key either reading finds counts, and any section counts, so the scan can refuse a
+    /// drop-in the manager would read as harmless and never passes one that sets either.
     pub(super) fn command_key(contents: &str) -> Option<String> {
-        contents.lines().find_map(|line| {
-            let line = line.trim_start();
-            if line.starts_with(['#', ';', '[']) {
-                return None;
-            }
-            let (key, _) = line.split_once('=')?;
-            let key = key.trim();
-            let lower = key.to_ascii_lowercase();
-            (lower.starts_with("exec") || lower == "type").then(|| key.to_owned())
-        })
+        let logical = logical_lines(contents);
+        logical
+            .iter()
+            .map(String::as_str)
+            .chain(physical_lines(contents))
+            .filter_map(key_of)
+            .find(|key| {
+                let key = key.to_ascii_lowercase();
+                key.starts_with("exec") || key == "type"
+            })
+            .map(str::to_owned)
     }
 
     /// How `systemctl show` begins printing the command a definition names, up to its flags: the
