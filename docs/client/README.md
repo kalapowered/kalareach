@@ -617,10 +617,13 @@ finds its record and confirms that instead.
 
 While it waits for the owner, the device asks `pair.status` every three seconds. A host answers an
 unpaired connection four times in any ten seconds and sixteen times in all, so the device counts its
-questions the way the host does, waits when the window is full, and moves to a fresh connection
-before the one it has runs out. That move is not a lost connection, and the device does not show it
-as one. A host that turns a question away as too soon keeps the connection, and the device waits
-out the window and asks again.
+questions the way the host does and waits when the window is full. With one question left it opens
+a fresh connection and asks there, and it keeps the old connection until the fresh one answers: a
+host that commits the device meanwhile serves it nothing on a new unpaired connection, so the old
+one is then the only place to learn what the device became. That change is not a lost connection,
+and the device does not show it as one. A host that turns a question away as too soon keeps the
+connection. It counts the questions it refuses as well, so the device waits twice as long after
+each refusal in a row before it asks again.
 
 `owner` is the owner device's half. It reads `owner.confirmation.pending` over the device's
 authorised session, checks each challenge against what it would authorise, and describes it in one
@@ -628,8 +631,10 @@ line: what, on which host, and for how long. A challenge whose display does not 
 marked as one this device cannot check, and nothing is signed for it. The platform's ceremony is a
 trait the application implements; it is asked with that line and the challenge's remaining
 lifetime, and only a confirmation inside that lifetime is signed, on `owner_device_presence`, and
-completed. A host that takes the answer and says nothing for ten seconds ends the review as not
-confirmed.
+completed. Only the host's own refusal makes a review "not confirmed". A host that says nothing for
+ten seconds, or a connection that ends after the answer went, may still have taken it: the device
+asks what the host lists, and the review is "confirmed" when the challenge is listed as answered and
+"unknown" otherwise.
 
 ## Managed services
 
