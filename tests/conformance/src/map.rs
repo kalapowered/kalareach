@@ -34,7 +34,7 @@ use serde::Serialize;
 
 use crate::id::{self, Identifier, Refusal};
 use crate::plan::{CaseTable, Lane, matches};
-use crate::rust_items::{self, Entry, Import, Module, NO_CODE, Sources, Visibility};
+use crate::rust_items::{self, Entry, Import, Module, NO_CODE, SERDE_DERIVES, Sources, Visibility};
 use crate::typescript::{self, FileFacts, Keys, TsBinding};
 use crate::workspace::{self, Package, TargetId, TargetKind};
 
@@ -418,6 +418,9 @@ fn rust_package(map: &mut Map, sources: &mut Sources, root: &Path, package: &Pac
                     !unlisted
                         && test.assumes.is_disjoint(&claimed)
                         && crates_named(&test.assumes, package)
+                        && modules
+                            .iter()
+                            .all(|module| crates_named(&module.assumes, package))
                 })
                 .filter(|test| {
                     test.calls
@@ -455,7 +458,7 @@ fn rust_package(map: &mut Map, sources: &mut Sources, root: &Path, package: &Pac
             map.reference(
                 identifier,
                 source,
-                &format!("a comment on fn {name} in {file}, which no test calls"),
+                &format!("a comment on fn {name} in {file}, which no test is proved to call"),
             );
         }
     }
@@ -740,8 +743,13 @@ fn claimed_names(modules: &[Module], scope: &Scope) -> (BTreeSet<String>, bool) 
         for import in imports {
             match import {
                 Import::Name { name, path } => {
-                    let own = path.first().is_some_and(|root| standard(root))
-                        && path.last() == Some(name);
+                    // A standard library item, or one of serde's derives, under its own name is
+                    // the one trusted by that name; `serde::` is then held to the package's serde.
+                    let own = path.last() == Some(name)
+                        && (path.first().is_some_and(|root| standard(root))
+                            || (path.len() == 2
+                                && path[0] == "serde"
+                                && SERDE_DERIVES.contains(&name.as_str())));
                     if !own {
                         claimed.insert(name.clone());
                         claimed.insert(format!("{name}::"));
@@ -766,6 +774,11 @@ fn claimed_names(modules: &[Module], scope: &Scope) -> (BTreeSet<String>, bool) 
             claimed.extend(module.macros_in_text.iter().cloned());
         }
     }
+    // The attributes of items are trusted as the tests' are; one the target gives another meaning
+    // may add items anywhere.
+    unlisted |= modules
+        .iter()
+        .any(|module| !module.assumes.is_disjoint(&claimed));
     (claimed, unlisted)
 }
 

@@ -167,8 +167,12 @@ pub struct Module {
     /// that macro's name another meaning.
     pub macros_in_text: Vec<String>,
     /// Whether it brings in names its source does not list: an item under `#[macro_use]`, an
-    /// `extern crate`, or a macro invoked among its items, whose expansion may define anything.
+    /// `extern crate`, a macro invoked among its items, or an item under an attribute that may be
+    /// a macro, whose expansion may define anything.
     pub unlisted_names: bool,
+    /// The names the attributes of its items are taken on trust by, for the map to hold against
+    /// what the target defines and imports.
+    pub assumes: BTreeSet<String>,
     /// Whether an attribute on it, on the `mod` that declares it or on an enclosing module's, may be
     /// a macro that rewrites everything in it.
     pub rewritable: bool,
@@ -373,10 +377,12 @@ impl Attribute {
     /// `None` when it may rewrite or add to it. The built-in attributes, whose names no macro may
     /// take, need no trust. The `rustfmt` and `clippy` tool attributes are trusted by their roots,
     /// `#[test]` and `#[derive]` are macros of the standard library's prelude, a derive of the
-    /// standard library's traits adds implementations only, and `#[tokio::test]` runs the test's
-    /// block as written on a runtime; each is trusted by the names it is known by, which the map
-    /// holds against what the target defines and imports. Any other attribute may be a macro that
-    /// rewrites what it is on.
+    /// standard library's traits adds implementations only, serde's derives put all they add
+    /// inside an unnamed constant and read their `#[serde(...)]` helpers, and `#[tokio::test]` runs
+    /// the test's block as written on a runtime; each is trusted by the names it is known by
+    /// (`serde::` and `tokio::` for the crates), which the map holds against what the target
+    /// defines and imports and what the package depends on. Any other attribute may be a macro
+    /// that rewrites what it is on.
     fn trusted(&self) -> Option<Vec<String>> {
         const BUILT_IN: &[&str] = &[
             "allow",
@@ -417,21 +423,26 @@ impl Attribute {
             [root @ ("rustfmt" | "clippy"), ..] => Some(vec![format!("{root}::")]),
             ["test"] => Some(vec!["test".to_owned()]),
             ["tokio", "test"] => Some(vec!["tokio::".to_owned()]),
+            // A derive helper of serde's, which its derive reads and nothing expands.
+            ["serde"] => Some(vec!["serde::".to_owned()]),
             ["derive"] => {
-                let derived: Vec<String> = self
-                    .arguments
-                    .iter()
-                    .filter_map(Token::ident)
-                    .map(str::to_owned)
-                    .collect();
-                derived
-                    .iter()
-                    .all(|name| DERIVES.contains(&name.as_str()))
-                    .then(|| {
-                        std::iter::once("derive".to_owned())
-                            .chain(derived)
-                            .collect()
-                    })
+                let mut names = vec!["derive".to_owned()];
+                for derived in self.arguments.split(|token| token.is_punct(',')) {
+                    let derived: Vec<&str> = derived.iter().filter_map(Token::ident).collect();
+                    match derived.as_slice() {
+                        [] => {}
+                        [name] if DERIVES.contains(name) => names.push((*name).to_owned()),
+                        [name] if SERDE_DERIVES.contains(name) => {
+                            names.push((*name).to_owned());
+                            names.push("serde::".to_owned());
+                        }
+                        ["serde", name] if SERDE_DERIVES.contains(name) => {
+                            names.push("serde::".to_owned());
+                        }
+                        _ => return None,
+                    }
+                }
+                Some(names)
             }
             _ => None,
         }
@@ -495,6 +506,7 @@ fn parse_module(
         macros: Vec::new(),
         macros_in_text: Vec::new(),
         unlisted_names: false,
+        assumes: BTreeSet::new(),
         rewritable,
     };
     let mut children = Vec::new();
@@ -582,6 +594,13 @@ fn parse_module(
                 module.unlisted_names |= (invoked && !definition)
                     || (word(0) == Some("extern") && word(1) == Some("crate"))
                     || attributes.iter().any(|a| a.path == ["macro_use"]);
+                // An attribute macro or a derive on an item may add items beside it.
+                for attribute in &attributes {
+                    match attribute.trusted() {
+                        Some(names) => module.assumes.extend(names),
+                        None => module.unlisted_names = true,
+                    }
+                }
                 let rewrites = module.rewritable || attributes.iter().any(|a| !a.inert());
                 let entry = classify(item, &attributes, attached, token.line);
                 match entry {
@@ -1133,6 +1152,9 @@ fn use_tree(tokens: &[Token], mut at: usize, prefix: &[String], found: &mut Vec<
         }
     }
 }
+
+/// serde's derives, trusted by name where a `use serde::...` brings them in under their own names.
+pub const SERDE_DERIVES: &[&str] = &["Deserialize", "Serialize"];
 
 /// What the reading of a test's body proves it calls, and the names it took on trust to prove it.
 #[derive(Debug, Default)]
@@ -1789,6 +1811,37 @@ mod tests {
         assert!(conditional("outer"));
         assert!(conditional("inner"));
         assert!(!conditional("plain"));
+    }
+
+    #[test]
+    fn an_attribute_is_trusted_by_the_names_it_is_known_by() {
+        let trusted = |text: &str| {
+            let tokens = lex(text).expect("lexes");
+            attribute(&tokens, 1).trusted()
+        };
+        let names = |names: &[&str]| -> Option<Vec<String>> {
+            Some(names.iter().map(|name| (*name).to_owned()).collect())
+        };
+        assert_eq!(trusted("allow(unused)"), names(&[]));
+        assert_eq!(trusted("test"), names(&["test"]));
+        assert_eq!(
+            trusted("tokio::test(flavor = \"multi_thread\")"),
+            names(&["tokio::"])
+        );
+        assert_eq!(trusted("rustfmt::skip"), names(&["rustfmt::"]));
+        assert_eq!(
+            trusted("derive(Debug, Deserialize)"),
+            names(&["derive", "Debug", "Deserialize", "serde::"])
+        );
+        assert_eq!(
+            trusted("derive(Clone, serde::Serialize)"),
+            names(&["derive", "Clone", "serde::"])
+        );
+        assert_eq!(trusted("serde(deny_unknown_fields)"), names(&["serde::"]));
+        assert_eq!(trusted("derive(Debug, helpers::Generate)"), None);
+        assert_eq!(trusted("derive(schemars::JsonSchema)"), None);
+        assert_eq!(trusted("cfg_attr(unix, allow(unused))"), None);
+        assert_eq!(trusted("make_items"), None);
     }
 
     #[test]
