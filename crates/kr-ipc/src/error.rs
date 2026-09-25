@@ -124,6 +124,10 @@ pub enum IpcError {
         /// Why it is not trustworthy.
         reason: &'static str,
     },
+    /// A forwarded mutation would have carried a right that never travels to a worker
+    /// ([`kr_protocol::local::may_travel_to_a_worker`]).
+    #[error("{0} never travels to a worker")]
+    RightNotForwarded(kr_protocol::rights::ActionRight),
     /// A host identity could not be read from the operating system.
     #[error("{what}: {detail}")]
     IdentityUnavailable {
@@ -160,7 +164,8 @@ impl IpcError {
             Self::DirectoryNotOwnerOnly { .. }
             | Self::DirectoryAccessRefused { .. }
             | Self::PeerRejected { .. }
-            | Self::UntrustedFile { .. } => ErrorCode::PermissionDenied,
+            | Self::UntrustedFile { .. }
+            | Self::RightNotForwarded(_) => ErrorCode::PermissionDenied,
             Self::EnvironmentPrefixCollision { .. } => ErrorCode::EnvironmentUnavailable,
             Self::PeerUnknown { .. } => ErrorCode::PermissionDenied,
             Self::SocketPathTooLong { .. } => ErrorCode::HostNotConfigured,

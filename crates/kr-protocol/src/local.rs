@@ -177,6 +177,21 @@ pub fn states_utc_deadlines(capabilities: &CanonicalSet<CapabilityId>) -> bool {
         .any(|capability| capability.as_str() == FORWARDED_UTC_DEADLINE)
 }
 
+/// Whether a set of rights may travel to a worker beside a [`ForwardedMutation`]: never with
+/// `voice.use` in it.
+///
+/// A voice grant is decided only inside the control daemon. The device door decides a forwarded
+/// method under the pairing grant with `voice.use` taken out, the methods that need it are the
+/// daemon's own voice methods, and the voice module performs its one effect as the daemon's own
+/// request, which carries no rights. So no worker holds work under a voice grant, and withdrawing
+/// one owes no fence. Every builder of a forwarded mutation refuses a set this answers false for.
+#[must_use]
+pub fn may_travel_to_a_worker(
+    rights: &crate::scalars::CanonicalSet<crate::rights::ActionRight>,
+) -> bool {
+    !rights.contains(&crate::rights::ActionRight::VoiceUse)
+}
+
 /// A mutation the host admitted for a caller, passed to the component that owns its subject.
 ///
 /// The control daemon owns admission: it authenticates the caller, stamps the freshness window,

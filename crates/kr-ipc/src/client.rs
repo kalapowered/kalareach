@@ -477,6 +477,11 @@ impl LocalClient {
         grant_rights: &kr_protocol::scalars::CanonicalSet<kr_protocol::rights::ActionRight>,
         accepted_deadline_boot_ms: kr_protocol::scalars::U64,
     ) -> Result<std::result::Result<ParamsValue, ProtocolError>> {
+        if !kr_protocol::local::may_travel_to_a_worker(grant_rights) {
+            return Err(IpcError::RightNotForwarded(
+                kr_protocol::rights::ActionRight::VoiceUse,
+            ));
+        }
         let request_id = mutation.request_id;
         self.writer
             .write_message(&ControlFrame::Forwarded(Box::new(

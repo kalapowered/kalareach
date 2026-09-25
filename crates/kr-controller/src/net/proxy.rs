@@ -299,15 +299,25 @@ impl WorkerProxy {
 
     /// Forwards one admitted mutation and returns what the worker answered.
     ///
+    /// The rights it carries never include `voice.use`
+    /// ([`kr_protocol::local::may_travel_to_a_worker`]): a mutation vouched for with it is refused
+    /// before anything is sent.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the link fails or the worker does not answer in time.
+    /// Returns an error when the rights hold a voice right, when the link fails, or when the
+    /// worker does not answer in time.
     pub async fn forward_mutation(
         &self,
         mutation: &MutationRequest,
         vouched: Vouched<'_>,
         accepted_deadline_boot_ms: U64,
     ) -> Result<Forwarded> {
+        if !kr_protocol::local::may_travel_to_a_worker(vouched.grant_rights) {
+            return Err(ControllerError::PermissionDenied {
+                detail: "voice.use never travels to a worker".to_owned(),
+            });
+        }
         let request_id = self.next_request_id();
         let mut forwarded = mutation.clone();
         // The request identity is this link's; the durable identity is the action's, and that

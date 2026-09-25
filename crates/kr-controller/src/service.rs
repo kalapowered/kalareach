@@ -12498,7 +12498,7 @@ mod a_close_a_worker_never_answers {
                             other => match &recorded {
                                 None => Vec::new(),
                                 Some(recorded) => {
-                                    let refusal = refusal_of(&other);
+                                    let refusal = answer_of(&other, identity.session_id());
                                     recorded
                                         .lock()
                                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -12518,10 +12518,21 @@ mod a_close_a_worker_never_answers {
         })
     }
 
-    /// What a recording worker answers a request or a forwarded frame with: a refusal naming it.
-    fn refusal_of(frame: &ControlFrame) -> Option<ControlFrame> {
+    /// What a recording worker answers a request or a forwarded frame with: the daemon's own
+    /// `session.read` is answered with a live session, and everything else is refused.
+    fn answer_of(frame: &ControlFrame, session_id: SessionId) -> Option<ControlFrame> {
         let request_id = match frame {
-            ControlFrame::Request(request) => request.request_id,
+            ControlFrame::Request(request) => {
+                if request.method == Method::SessionRead.into() {
+                    return Some(ControlFrame::Response(kr_protocol::envelope::Response {
+                        request_id: request.request_id,
+                        outcome: kr_protocol::envelope::Outcome::Ok(
+                            ParamsValue::from_typed(&read_result(session_id)).expect("encodes"),
+                        ),
+                    }));
+                }
+                request.request_id
+            }
             ControlFrame::Forwarded(forwarded) => forwarded.mutation.request_id,
             ControlFrame::ForwardedRead(forwarded) => forwarded.request.request_id,
             _ => return None,
@@ -12533,6 +12544,34 @@ mod a_close_a_worker_never_answers {
                 "this worker records what it is sent and performs none of it",
             )),
         }))
+    }
+
+    /// A live session, as a worker answers the daemon's own `session.read`.
+    fn read_result(session_id: SessionId) -> kr_protocol::session::SessionReadResult {
+        kr_protocol::session::SessionReadResult {
+            session: kr_protocol::session::SessionSummary {
+                session_id,
+                session_epoch: SessionEpoch::V1,
+                environment_id: identity_environment(),
+                display_number: DisplayNumber::new(1),
+                state: kr_protocol::session::SessionState::Live,
+                shell_mode: kr_protocol::session::ShellMode::Managed,
+                shell_path: "/bin/zsh".to_owned(),
+                cwd: "/work".to_owned(),
+                worker_profile: WorkerProfile::HeadlessUser,
+                desktop: kr_protocol::identity::DesktopBinding::none(),
+                created_at_ms: kr_ipc::now_ms(),
+                dimensions: kr_protocol::session::INVISIBLE_DEFAULT_DIMENSIONS,
+                attachment_count: kr_protocol::scalars::U64::ZERO,
+                application_state: Nullable::null(),
+                root_process: Nullable::null(),
+                closure: Nullable::null(),
+            },
+            endpoint: Nullable::null(),
+            launch_profile: Nullable::null(),
+            last_command_block: Nullable::null(),
+            outstanding_launches: Nullable::null(),
+        }
     }
 
     /// The environment the fake worker's acknowledgement names.

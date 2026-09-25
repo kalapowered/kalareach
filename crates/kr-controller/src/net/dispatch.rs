@@ -3070,6 +3070,59 @@ mod tests {
         );
     }
 
+    /// Rights travel to a worker only beside a forwarded mutation, and a forwarded mutation is
+    /// built in exactly two places, each of which refuses a set that holds `voice.use`: the proxy
+    /// link a device's work goes over, and the local client. A third builder in the daemon or the
+    /// local client fails this, so no path can reach a worker with a voice right without passing
+    /// one of the two refusals.
+    #[test]
+    fn a_forwarded_mutation_is_built_only_where_a_voice_right_is_refused() {
+        fn walk(
+            directory: &std::path::Path,
+            found: &mut Vec<(String, usize)>,
+            root: &std::path::Path,
+        ) {
+            let mut entries: Vec<_> = std::fs::read_dir(directory)
+                .expect("reads the source directory")
+                .map(|entry| entry.expect("an entry").path())
+                .collect();
+            entries.sort();
+            for path in entries {
+                if path.is_dir() {
+                    walk(&path, found, root);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    let text = std::fs::read_to_string(&path).expect("reads the source");
+                    let built = text.matches(concat!("Forwarded", "Mutation {")).count();
+                    if built > 0 {
+                        let name = path
+                            .strip_prefix(root)
+                            .expect("inside the crates")
+                            .to_string_lossy()
+                            .replace('\\', "/");
+                        found.push((name, built));
+                    }
+                }
+            }
+        }
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the crates directory")
+            .to_path_buf();
+        let mut found = Vec::new();
+        for source in ["kr-controller/src", "kr-ipc/src"] {
+            walk(&root.join(source), &mut found, &root);
+        }
+        assert_eq!(
+            found,
+            vec![
+                ("kr-controller/src/net/proxy.rs".to_owned(), 1),
+                ("kr-ipc/src/client.rs".to_owned(), 1),
+            ],
+            "a forwarded mutation is built only by the two builders that refuse a voice right"
+        );
+    }
+
     /// No frame a worker receives carries a voice right, whichever way work reaches it, which is
     /// why a voice grant's withdrawal owes no fence. The device's pairing grant carries every
     /// right, `voice.use` included, and it holds a live voice grant; its session's worker records
@@ -3078,10 +3131,13 @@ mod tests {
     /// - Every method this door decides for it (`check_grant`, the decision a forwarded mutation's
     ///   rights are cut from) carries `voice.use` only when the method requires it, and each such
     ///   method is a voice method the daemon serves itself.
-    /// - Its forwarded mutation and its close reach the worker carrying exactly the rights decided
-    ///   for them, and a local close carries none.
+    /// - Its forwarded mutation and its close, sent through the door's own `mutate`, reach the
+    ///   worker carrying exactly the rights decided for them, and a local close carries none.
+    /// - Both builders of a forwarded mutation, the proxy link and the local client, refuse a set
+    ///   that holds `voice.use` before anything is sent.
     /// - Every voice effect is performed here or not at all: the one the daemon performs, a
-    ///   session read, reaches the worker as the daemon's own request, which carries no rights.
+    ///   session read, succeeds and reaches the worker as the daemon's own request, which carries
+    ///   no rights, and nothing else reaches it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn no_frame_a_worker_receives_carries_a_voice_right() {
         use std::sync::Arc;
@@ -3198,7 +3254,8 @@ mod tests {
             "the device holds voice.use for the methods that need it"
         );
 
-        // A forwarded mutation and a device's close, through this door's own paths.
+        // A forwarded mutation and a device's close, as the device sends them, through this
+        // door's own path from its window to the worker.
         let decided = |method: Method| {
             connection
                 .check_grant(Some(world.session_id), method.entry(), false)
@@ -3208,30 +3265,100 @@ mod tests {
                 .rights
         };
         let submit_rights = decided(Method::AgentPromptSubmit);
-        let mut submit = fake::close_request(world.environment_id, world.session_id);
-        submit.method = Method::AgentPromptSubmit.into();
-        let _ = connection
-            .proxied_mutation(&submit, world.accepted, revision, submit_rights.clone())
-            .await;
         let close_rights = decided(Method::SessionClose);
-        let (answer, answered) = tokio::sync::oneshot::channel();
-        let (tell, delivered) = tokio::sync::oneshot::channel();
-        let _ = tell.send(());
-        let envelope = connection.envelope(revision);
-        controller
-            .close_remote_session(
-                &fake::close_request(world.environment_id, world.session_id),
-                super::super::proxy::Vouched {
-                    actor: &envelope,
-                    grant_rights: &close_rights,
-                },
+        let window = connection
+            .windows
+            .issue(connection.connection_id, controller.boot_epoch)
+            .expect("a window");
+        let sent = |method: Method, request_id: u64, params: ParamsValue| MutationRequest {
+            request_id: RequestId::new(request_id),
+            method: method.into(),
+            method_version: MethodVersion::V1,
+            action_id: ActionId::new(kr_ipc::new_uuid()),
+            grant_id: Nullable::some(device.grant.grant_id),
+            target: ActionTarget {
+                environment_id: world.environment_id,
+                session_id: Nullable::some(world.session_id),
+                session_epoch: Nullable::some(SessionEpoch::V1),
+                application_instance_id: Nullable::null(),
+                agent_binding_revision: Nullable::null(),
+            },
+            expected: ParamsValue::empty(),
+            action_window_id: window.action_window_id.clone(),
+            requested_ttl_ms: kr_protocol::scalars::DurationMs::new(30_000),
+            params,
+        };
+        let _ = connection
+            .mutate(&sent(Method::AgentPromptSubmit, 11, ParamsValue::empty()))
+            .await;
+        let _ = connection
+            .mutate(&sent(
+                Method::SessionClose,
+                12,
+                ParamsValue::from_typed(&kr_protocol::session::SessionCloseParams {
+                    session_id: world.session_id,
+                })
+                .expect("encodes"),
+            ))
+            .await;
+
+        // Rights that hold a voice right are refused by both builders of a forwarded mutation,
+        // before anything is sent.
+        let with_voice: kr_protocol::scalars::CanonicalSet<ActionRight> =
+            [ActionRight::VoiceUse, ActionRight::SessionView]
+                .into_iter()
+                .collect();
+        let sent_before = recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        let refused = connection
+            .proxied_mutation(
+                &sent(Method::AgentPromptSubmit, 13, ParamsValue::empty()),
                 world.accepted,
-                &connection.expiry_observer(),
-                answer,
-                delivered,
+                revision,
+                with_voice.clone(),
             )
             .await;
-        let _ = answered.await;
+        assert!(
+            matches!(
+                &refused,
+                ControlFrame::Response(kr_protocol::envelope::Response {
+                    outcome: kr_protocol::envelope::Outcome::Error(error),
+                    ..
+                }) if error.message.contains("never travels to a worker")
+            ),
+            "the proxy refuses a voice right: {refused:?}"
+        );
+        let mut client = controller
+            .worker_client(&world.worker)
+            .await
+            .expect("the daemon's own link");
+        let link = client.as_mut().expect("the connection is open");
+        let local = link
+            .forward(
+                &fake::close_request(world.environment_id, world.session_id),
+                &world.actor,
+                &with_voice,
+                kr_protocol::scalars::U64::new(u64::MAX),
+            )
+            .await;
+        assert!(
+            matches!(
+                local,
+                Err(kr_ipc::IpcError::RightNotForwarded(ActionRight::VoiceUse))
+            ),
+            "the local client refuses a voice right: {local:?}"
+        );
+        drop(client);
+        assert_eq!(
+            recorded
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            sent_before,
+            "nothing reached the worker"
+        );
 
         // A local close.
         let carried = fake::admission(controller, world.accepted).await;
@@ -3276,7 +3403,13 @@ mod tests {
                 turn_id: None,
                 destination: None,
             };
-            let _ = controller.voice_perform(method, &proposal).await;
+            let performed = controller.voice_perform(method, &proposal).await;
+            if method == Method::SessionRead {
+                assert!(
+                    performed.as_ref().is_ok_and(|receipt| receipt.performed),
+                    "the daemon performs the read: {performed:?}"
+                );
+            }
         }
 
         let frames = recorded
@@ -3863,11 +3996,20 @@ mod write_boundary {
                 // What the write decides from is the floor that decision raises, and the decision
                 // holds the policy's lock while its write waits for storage. The batch is released
                 // once both hold; the lock alone can be taken before the floor moves.
-                while controller.utc_floor().get() <= lapses_at_ms
-                    || controller.policy.try_lock().is_ok()
-                {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
+                tokio::time::timeout(WAIT_BOUND, async {
+                    while controller.utc_floor().get() <= lapses_at_ms
+                        || controller.policy.try_lock().is_ok()
+                    {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "the decision did not raise the floor and hold the lock within \
+                         {WAIT_BOUND:?}"
+                    )
+                });
                 if peer_stops_reading {
                     stream.room.as_ref().expect("a slow peer").add_permits(1);
                 } else {
