@@ -535,7 +535,7 @@ export type SleepInhibitionSetting = 'off' | 'mains_only' | 'battery_too'
 /**
  * One way of starting this environment's control daemon.
  */
-export type ControllerStartup = 'standalone'
+export type ControllerStartup = 'standalone' | 'service'
 /**
  * The host's answer to a client proof.
  */

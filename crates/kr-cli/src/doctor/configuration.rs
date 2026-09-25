@@ -36,6 +36,20 @@ pub fn load(paths: &EnvironmentPaths) -> configuration::Loaded {
     }
 }
 
+/// Refuses a change this environment's configuration document would refuse, with nothing written.
+///
+/// For a command that has something to do before the edit and must not do it for an edit that
+/// will be refused. [`apply`] validates again at the moment it writes.
+///
+/// # Errors
+///
+/// Returns [`CliError::Usage`] when the edit would be refused.
+pub fn validate(paths: &EnvironmentPaths, change: &Change) -> Result<()> {
+    configuration::edit(&load(paths), change)
+        .map(|_| ())
+        .map_err(|refused| CliError::Usage(refused.to_string()))
+}
+
 /// Applies one validated change to this environment's configuration document.
 ///
 /// Validate, then check the revision again at the last moment, then write. A document at a version

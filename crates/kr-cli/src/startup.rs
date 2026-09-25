@@ -2,12 +2,19 @@
 //!
 //! Section 7 lets `kr new` have the per-user controller started on demand only on a host that was
 //! set up for it. A host that was not answers `HOST_NOT_CONFIGURED` with the setup action, and the
-//! command installs no service, enables no lingering and obtains no privilege on the way. Where no
-//! service manager was set up to start the daemon, the setup is the standalone headless profile:
-//! the one selection `startup.controller` in this environment's configuration document, which
-//! `kr host startup` writes as a validated edit with no daemon running and `kr doctor` reports.
+//! command installs no service, enables no lingering and obtains no privilege on the way. The setup
+//! is the one selection `startup.controller` in this environment's configuration document, which
+//! `kr host startup` writes as a validated edit with no daemon running and `kr doctor` reports. It
+//! chooses one of two starts.
 //!
-//! Under it, `kr new` runs the daemon installed beside this command, `kr-controller`, detached from
+//! The service start, `service`, is for a host whose per-user service manager should start the
+//! daemon: `kr host startup --set service` also writes the manager's definition of the daemon and
+//! records it, and `kr new` asks the manager to start it, as [`crate::service_manager`] describes.
+//! `kr host startup` moving away from it removes exactly what it wrote, and no daemon is ended.
+//!
+//! The standalone start, `standalone`, is the standalone headless profile, for a host where no
+//! service manager was set up to start the daemon. Under it, `kr new` runs the daemon installed
+//! beside this command, `kr-controller`, detached from
 //! the command: in a session and a process group of its own, with no controlling terminal and none
 //! of the command's streams, working in the environment's own state directory and told the
 //! environment's own runtime and state roots. It inherits the command's environment, `PATH`
@@ -18,9 +25,9 @@
 //! waits a bounded time for the daemon to answer and then goes on as it would against a daemon that
 //! was already running.
 //!
-//! What such a daemon writes goes to `controller.log` in the environment's state directory, and a
-//! daemon that does not answer in time is named in the command's failure with the last line of
-//! that log. The command does not end it: a daemon still starting, such as one waiting on a person
+//! What such a daemon writes goes to `controller.log` in the environment's state directory, where
+//! the service start's daemon writes too, and a daemon that does not answer in time is named in
+//! the command's failure with the last line of that log. The command does not end it: a daemon still starting, such as one waiting on a person
 //! to allow access to a credential store, may yet come up, and the singleton lock already keeps a
 //! second one from serving beside it.
 
@@ -35,6 +42,7 @@ use kr_protocol::local::LocalClientKind;
 use crate::cli::StartupArguments;
 use crate::error::{CliError, Result};
 use crate::resolve::{self, KnownEnvironment};
+use crate::service_manager;
 
 /// How long `kr new` waits for a daemon it started to answer on its endpoint.
 pub const START_BOUND: Duration = Duration::from_secs(30);
@@ -100,21 +108,38 @@ impl Chosen {
                 self.state.as_str()
             )
         } else {
-            resolve::SETUP_ACTION.to_owned()
+            SETUP_ACTION.to_owned()
         }
     }
 }
 
+/// What a person does about this installation's own environment when no daemon runs and nothing is
+/// chosen: start one, or choose which of the two starts `kr new` uses.
+#[cfg(unix)]
+const SETUP_ACTION: &str = "start the control daemon, kr-controller, for it, or, for this \
+                            installation's own environment, choose how kr new starts one: \
+                            `kr host startup --set service` has this user's service manager \
+                            start it, and `kr host startup --set standalone` starts it detached \
+                            from the command";
+
+/// What a person does about an environment whose control daemon is not running: start one. Neither
+/// start is set up on this platform.
+#[cfg(not(unix))]
+const SETUP_ACTION: &str = resolve::SETUP_ACTION;
+
 /// Runs `kr host startup`: shows what this environment chooses, or makes a choice as one validated
 /// edit of its configuration document.
 ///
-/// Nothing else changes. No daemon is asked, none is started, no service is installed and no
-/// privilege is obtained; `kr new` reads the choice the next time it finds no daemon running.
+/// Choosing the service start writes the service manager's definition of the daemon first, records
+/// it and has the manager take it; choosing anything else removes exactly what the service start
+/// wrote. Nothing more changes. No daemon is asked, none is started or ended, and no privilege is
+/// obtained; `kr new` reads the choice the next time it finds no daemon running.
 ///
 /// # Errors
 ///
-/// Returns [`CliError::Usage`] for a way of starting this build does not know and for an edit the
-/// document refuses, and the failure to write the document otherwise.
+/// Returns [`CliError::Usage`] for a way of starting this build does not know, for an edit the
+/// document refuses and for a definition kr may not replace, each with nothing changed, and what
+/// failed otherwise.
 pub fn run(paths: &HostPaths, arguments: &StartupArguments, json: bool) -> Result<()> {
     let environment = resolve::select(paths, None)?;
     let change = if arguments.clear {
@@ -137,24 +162,36 @@ pub fn run(paths: &HostPaths, arguments: &StartupArguments, json: bool) -> Resul
             })
             .transpose()?
     };
+    let mut notes = Vec::new();
+    let mut removal = service_manager::Removal::default();
     if let Some(startup) = change {
         #[cfg(not(unix))]
-        if startup == Some(ControllerStartup::Standalone) {
-            return Err(CliError::Usage(
-                "the standalone start runs the control daemon in a session of its own, which this \
-                 platform does not have; start the control daemon, kr-controller, for this \
-                 environment"
-                    .to_owned(),
-            ));
+        if let Some(startup) = startup {
+            return Err(CliError::Usage(format!(
+                "the {} start is not set up on this platform; start the control daemon, \
+                 kr-controller, for this environment",
+                startup.as_str()
+            )));
         }
-        crate::doctor::configuration::apply(
-            &environment.paths,
-            &Change::ControllerStartup(startup),
-        )?;
+        let change = Change::ControllerStartup(startup);
+        // Refused before anything else is touched, so a document this build must not rewrite
+        // leaves the service manager's definition as it was too.
+        crate::doctor::configuration::validate(&environment.paths, &change)?;
+        if startup == Some(ControllerStartup::Service) {
+            notes = service_manager::install(&environment.paths)?.notes;
+        } else {
+            removal = service_manager::remove(&environment.paths)?;
+            notes.append(&mut removal.notes);
+        }
+        crate::doctor::configuration::apply(&environment.paths, &change)?;
     }
     let chosen = Chosen::read(&environment.paths);
+    let inspection = service_manager::inspect(
+        &environment.paths,
+        chosen.controller == Some(ControllerStartup::Service),
+    )?;
     if json {
-        crate::report::print_json(&serde_json::json!({
+        let mut document = serde_json::json!({
             "ok": true,
             "environment_id": environment.environment_id.to_string(),
             "startup": {
@@ -167,40 +204,120 @@ pub fn run(paths: &HostPaths, arguments: &StartupArguments, json: bool) -> Resul
                 "document": chosen.document.display().to_string(),
                 "document_state": chosen.state.as_str(),
                 "revision": chosen.revision.to_string(),
+                "definition": inspection.as_ref().map(service_manager::Inspection::json),
             },
-        }));
+        });
+        if !removal.removed.is_empty() || !removal.left.is_empty() {
+            document["removed"] = serde_json::json!(
+                removal
+                    .removed
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+            );
+            document["left"] = serde_json::json!(
+                removal
+                    .left
+                    .iter()
+                    .map(|(path, why)| serde_json::json!({
+                        "path": path.display().to_string(),
+                        "why": why,
+                    }))
+                    .collect::<Vec<_>>()
+            );
+        }
+        if !notes.is_empty() {
+            document["notes"] = serde_json::json!(notes);
+        }
+        crate::report::print_json(&document);
     } else {
-        println!("{}", describe(&chosen));
+        println!("{}", describe(&chosen, inspection.as_ref()));
+        for path in &removal.removed {
+            println!("removed {}", path.display());
+        }
+        for (path, why) in &removal.left {
+            println!("left {}: {why}", path.display());
+        }
+        for note in &notes {
+            println!("{note}");
+        }
     }
     Ok(())
 }
 
 /// What `kr host startup` tells a person.
-fn describe(chosen: &Chosen) -> String {
+fn describe(chosen: &Chosen, inspection: Option<&service_manager::Inspection>) -> String {
+    let left_over = |text: String| match inspection {
+        Some(inspection) if inspection.recorded => format!(
+            "{text}\na service definition kr wrote is still installed, and nothing uses it: {}; kr \
+             host startup --clear removes it",
+            inspection.describe()
+        ),
+        _ => text,
+    };
     match chosen.controller {
-        Some(ControllerStartup::Standalone) => format!(
+        Some(ControllerStartup::Service) => format!(
+            "startup: service, from {} at revision {}: kr new asks this user's service manager to \
+             start this environment's control daemon when none is running; {}",
+            chosen.document.display(),
+            chosen.revision,
+            inspection.map_or_else(
+                || "this platform has no service start".to_owned(),
+                service_manager::Inspection::describe
+            )
+        ),
+        Some(ControllerStartup::Standalone) => left_over(format!(
             "startup: standalone, from {} at revision {}: kr new starts this environment's control \
              daemon itself when none is running",
             chosen.document.display(),
             chosen.revision
-        ),
-        None if chosen.state.is_a_problem() => format!(
+        )),
+        None if chosen.state.is_a_problem() => left_over(format!(
             "startup: none, because the configuration document {} is {}: kr new starts no \
              control daemon",
             chosen.document.display(),
             chosen.state.as_str()
+        )),
+        None => left_over(
+            "startup: none: kr new starts no control daemon, and says what to set up when none is \
+             running; kr host startup --set service has this user's service manager start it, and \
+             kr host startup --set standalone chooses the standalone start"
+                .to_owned(),
         ),
-        None => "startup: none: kr new starts no control daemon, and says what to set up when \
-                 none is running; kr host startup --set standalone chooses the standalone start"
-            .to_owned(),
     }
 }
 
-/// A daemon this command started.
+/// A daemon this command started, or had its service manager start.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Started {
-    /// Its process identifier.
-    pub pid: u32,
+    /// Its process identifier, when it is known.
+    pub pid: Option<u32>,
+    /// The start that started it.
+    pub start: ControllerStartup,
+    /// The service manager asked, under the service start.
+    pub manager: Option<service_manager::Manager>,
+}
+
+impl Started {
+    /// What `kr new` tells a person it did, for the environment the daemon serves.
+    #[must_use]
+    pub fn describe(&self, environment: kr_protocol::ids::EnvironmentId) -> String {
+        let process = self
+            .pid
+            .map_or_else(String::new, |pid| format!(" (process {pid})"));
+        match self.manager {
+            Some(manager) => format!(
+                "{} started the control daemon for environment {environment}{process} under the \
+                 service start",
+                manager.as_str()
+            ),
+            None => format!(
+                "started the control daemon for environment {environment}{process} under the {} \
+                 start",
+                self.start.as_str()
+            ),
+        }
+    }
 }
 
 /// How long each wait of the standalone start is.
@@ -221,8 +338,8 @@ const BOUNDS: Bounds = Bounds {
     start: START_BOUND,
 };
 
-/// Reaches the environment's control daemon for `kr new`, starting it first where this
-/// environment chooses the standalone start and none is running.
+/// Reaches the environment's control daemon for `kr new`, starting it first, or having the service
+/// manager start it, where this environment chooses a start and none is running.
 ///
 /// A daemon is started only when nothing listens on the environment's endpoint at all. One that is
 /// there and answers badly, or does not answer, is reported as it is: starting another beside it
@@ -273,10 +390,15 @@ async fn open_or_start_within(
         ));
     }
     let chosen = Chosen::read(&environment.paths);
-    if chosen.controller != Some(ControllerStartup::Standalone) {
-        return Err(resolve::not_running(&error, &chosen.setup_action()));
+    match chosen.controller {
+        Some(ControllerStartup::Standalone) => {
+            standalone(paths, &environment.paths, &endpoint, bounds).await
+        }
+        Some(ControllerStartup::Service) => {
+            managed(&environment.paths, &endpoint, &error, bounds).await
+        }
+        None => Err(resolve::not_running(&error, &chosen.setup_action())),
     }
-    standalone(paths, &environment.paths, &endpoint, bounds).await
 }
 
 /// What one attempt to reach a daemon found.
@@ -419,7 +541,11 @@ async fn standalone(
                 program.display()
             ))
         })?;
-    let started = Started { pid: child.id() };
+    let started = Started {
+        pid: Some(child.id()),
+        start: ControllerStartup::Standalone,
+        manager: None,
+    };
     let deadline = tokio::time::Instant::now() + bounds.start;
     // The daemon this command started, or the one another command started first: either way the
     // environment has its daemon, and it is the one the lock let through. The one started here is
@@ -445,10 +571,93 @@ async fn standalone(
         "the control daemon this command started for environment {} (process {}) did not \
              answer within {} seconds: {last}; {state}, and {said}; what it writes is in {}",
         environment.environment_id(),
-        started.pid,
+        child.id(),
         bounds.start.as_secs(),
         log.path.display()
     )))
+}
+
+/// Asks this user's service manager to start the daemon from the definition kr wrote, and waits
+/// for it to answer.
+///
+/// The definition is checked before the manager is asked: one that has gone, that kr did not
+/// write, or that was changed since is `HOST_NOT_CONFIGURED` with the setup action, and nothing is
+/// written or started. The daemon inherits the manager's environment rather than this command's,
+/// as every service the manager starts does.
+#[cfg(unix)]
+async fn managed(
+    environment: &EnvironmentPaths,
+    endpoint: &kr_ipc::paths::Endpoint,
+    error: &kr_ipc::IpcError,
+    bounds: Bounds,
+) -> Result<(LocalClient, Option<Started>)> {
+    // The log is checked, and emptied when it has grown too large, before the manager opens it,
+    // exactly as for the standalone start; the manager appends to it.
+    environment.create()?;
+    let log = Log::open(&environment.state_dir().join(LOG_FILE))?;
+    // Each command put to the manager is bounded, and they are waited for off the runtime's own
+    // threads.
+    let asking = environment.clone();
+    let asked = tokio::task::spawn_blocking(move || service_manager::start(&asking))
+        .await
+        .map_err(|error| {
+            CliError::Other(format!(
+                "asking the service manager to start the control daemon failed: {error}"
+            ))
+        })?;
+    let asked = match asked {
+        Ok(asked) => asked,
+        Err(service_manager::Refusal::NotSetUp(why)) => {
+            return Err(resolve::not_running(error, &why));
+        }
+        Err(service_manager::Refusal::Failed(why)) => {
+            return Err(unanswered(&format!(
+                "the service manager did not start the control daemon for environment {}: {why}",
+                environment.environment_id()
+            )));
+        }
+    };
+    let started = Started {
+        pid: asked.pid,
+        start: ControllerStartup::Service,
+        manager: Some(asked.manager),
+    };
+    let deadline = tokio::time::Instant::now() + bounds.start;
+    let last = match answered_by(endpoint, deadline, || {}).await {
+        Ok(client) => return Ok((client, Some(started))),
+        Err(last) => last,
+    };
+    let said = log.last_line().map_or_else(
+        || "its log holds nothing since it started".to_owned(),
+        |line| format!("the last line its log holds since it started is: {line}"),
+    );
+    Err(unanswered(&format!(
+        "the control daemon {} started for environment {}{} did not answer within {} seconds: \
+         {last}; {said}; what it writes is in {}",
+        asked.manager.as_str(),
+        environment.environment_id(),
+        asked
+            .pid
+            .map_or_else(String::new, |pid| format!(" (process {pid})")),
+        bounds.start.as_secs(),
+        log.path.display()
+    )))
+}
+
+/// The service start runs the daemon through a per-user service manager, and this platform has
+/// none this build writes definitions for.
+#[cfg(not(unix))]
+async fn managed(
+    _environment: &EnvironmentPaths,
+    _endpoint: &kr_ipc::paths::Endpoint,
+    error: &kr_ipc::IpcError,
+    _bounds: Bounds,
+) -> Result<(LocalClient, Option<Started>)> {
+    Err(resolve::not_running(
+        error,
+        "this environment chooses the service start, which this platform does not have; start the \
+         control daemon, kr-controller, for it",
+    ))
 }
 
 /// The standalone start runs the daemon in a session of its own, which only Unix has.
@@ -575,8 +784,9 @@ mod tests {
         assert!(!nothing_listening(&kr_ipc::IpcError::PeerClosed));
     }
 
-    /// KR-REQ-07.13: an environment that chooses nothing is told the setup action, which names both
-    /// ways a daemon comes to run: started by hand, or by `kr new` once the start is chosen.
+    /// KR-REQ-07.13: an environment that chooses nothing is told the setup action, which names every
+    /// way a daemon comes to run: started by hand, by the service manager once the service start is
+    /// chosen, or by `kr new` once the standalone start is chosen.
     #[test]
     fn an_environment_that_chooses_nothing_is_told_both_ways_to_set_up() {
         let host = kr_ipc::testing::TempHost::create();
@@ -590,7 +800,8 @@ mod tests {
         );
         #[cfg(unix)]
         assert!(
-            action.contains("kr host startup --set standalone"),
+            action.contains("kr host startup --set service")
+                && action.contains("kr host startup --set standalone"),
             "{action}"
         );
 
@@ -606,6 +817,37 @@ mod tests {
             unusable.setup_action().contains("is invalid"),
             "{}",
             unusable.setup_action()
+        );
+    }
+
+    /// KR-REQ-07.12: what `kr new` says it started names the start, and the service manager that
+    /// started the daemon under the service start.
+    #[test]
+    fn what_kr_new_started_names_the_start_and_the_manager() {
+        let environment = kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid());
+        let standalone = Started {
+            pid: Some(4242),
+            start: ControllerStartup::Standalone,
+            manager: None,
+        };
+        assert_eq!(
+            standalone.describe(environment),
+            format!(
+                "started the control daemon for environment {environment} (process 4242) under \
+                 the standalone start"
+            )
+        );
+        let service = Started {
+            pid: None,
+            start: ControllerStartup::Service,
+            manager: Some(service_manager::Manager::Systemd),
+        };
+        assert_eq!(
+            service.describe(environment),
+            format!(
+                "systemd started the control daemon for environment {environment} under the \
+                 service start"
+            )
         );
     }
 

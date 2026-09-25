@@ -1908,17 +1908,25 @@ pub mod configuration {
         /// the environment's singleton lock and advances its generation as every daemon does, so
         /// several commands starting one at once leave one daemon.
         Standalone,
+        /// This user's own service manager: a per-user definition of the daemon, a launchd job on
+        /// macOS and a systemd user unit on Linux, which `kr host startup` wrote and recorded. A
+        /// command that finds no daemon running asks the manager to start it, and the manager is
+        /// the daemon's parent. It starts one process for the job however many commands ask, and
+        /// the daemon takes the environment's singleton lock and advances its generation as every
+        /// daemon does.
+        Service,
     }
 
     impl ControllerStartup {
         /// Every way, in declaration order.
-        pub const ALL: [Self; 1] = [Self::Standalone];
+        pub const ALL: [Self; 2] = [Self::Standalone, Self::Service];
 
         /// Returns the stable wire string.
         #[must_use]
         pub const fn as_str(self) -> &'static str {
             match self {
                 Self::Standalone => "standalone",
+                Self::Service => "service",
             }
         }
 
@@ -7294,8 +7302,8 @@ mod tests {
     }
 
     /// KR-REQ-07.12, KR-REQ-26.13: how the control daemon is started is absent until a validated
-    /// edit chooses it, the one way this build knows is the standalone start, and anything else is
-    /// a document this build does not rewrite. The choice is reported with the document as its
+    /// edit chooses it, the ways this build knows are the standalone start and the service start,
+    /// and anything else is a document this build does not rewrite. The choice is reported with the document as its
     /// source and as applying at the next start, it leaves this host as a word of its own, and
     /// moving it owes no fence and invalidates no evidence. Clearing it is an edit too.
     #[test]
@@ -7367,14 +7375,14 @@ mod tests {
 
         // A way this build does not know is a document it does not rewrite.
         let unknown = configuration::load(Some(
-            br#"{"version": 1, "revision": 2, "startup": {"controller": "service"}}"#,
+            br#"{"version": 1, "revision": 2, "startup": {"controller": "elsewhere"}}"#,
         ));
         assert_eq!(unknown.status.state, DocumentState::Invalid);
         assert!(matches!(
             configuration::edit(&unknown, &chosen),
             Err(configuration::EditRefused::NotOurs(_))
         ));
-        assert_eq!(ControllerStartup::from_wire("service"), None);
+        assert_eq!(ControllerStartup::from_wire("elsewhere"), None);
         assert_eq!(
             ControllerStartup::from_wire("standalone"),
             Some(ControllerStartup::Standalone)
@@ -7386,6 +7394,66 @@ mod tests {
         assert_eq!(cleared.revision, 2);
         assert_eq!(cleared.document.startup.controller(), None);
         assert_eq!(row(Some(&cleared.document)).source, ValueSource::Default);
+    }
+
+    /// KR-REQ-07.12, KR-REQ-26.13: the service start is a choice of its own, written, read back
+    /// and reported as the word it is, and moving between it and the standalone start is one
+    /// validated edit each way.
+    #[test]
+    fn the_service_start_is_a_choice_of_its_own() {
+        use configuration::{ControllerStartup, STARTUP_CONTROLLER};
+
+        assert_eq!(
+            ControllerStartup::ALL.map(ControllerStartup::as_str),
+            ["standalone", "service"]
+        );
+        assert_eq!(
+            ControllerStartup::from_wire("service"),
+            Some(ControllerStartup::Service)
+        );
+        assert!(configuration::is_known_term("service"));
+
+        let service = Change::ControllerStartup(Some(ControllerStartup::Service));
+        let edited =
+            configuration::edit(&configuration::load(None), &service).expect("a validated edit");
+        assert!(
+            edited
+                .contents
+                .contains("\"startup\": {\n    \"controller\": \"service\"\n  }"),
+            "{}",
+            edited.contents
+        );
+        let reread = configuration::load(Some(edited.contents.as_bytes()));
+        assert_eq!(reread.status.state, DocumentState::Loaded);
+        assert_eq!(
+            reread
+                .document
+                .as_ref()
+                .and_then(|document| document.startup.controller()),
+            Some(ControllerStartup::Service)
+        );
+        let reported = configuration::selection_rows(
+            reread.document.as_ref(),
+            "/home/someone/.config/kalareach/config.json",
+        )
+        .into_iter()
+        .find(|row| row.key == STARTUP_CONTROLLER.key)
+        .expect("the startup is reported");
+        assert_eq!(
+            (reported.value(), reported.source),
+            ("service", ValueSource::HostConfiguration)
+        );
+
+        let standalone = configuration::edit(
+            &reread,
+            &Change::ControllerStartup(Some(ControllerStartup::Standalone)),
+        )
+        .expect("a validated edit");
+        assert_eq!(standalone.revision, 2);
+        assert_eq!(
+            standalone.document.startup.controller(),
+            Some(ControllerStartup::Standalone)
+        );
     }
 
     /// The wire words a report names are exactly the ones the enumerations spell.
