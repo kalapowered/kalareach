@@ -198,9 +198,13 @@ struct Backend {
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// The operating-system user the session runs as.
     os_user: String,
-    /// The directory the shell reported for this invocation, opened when the backend was
-    /// established, for a connector whose installation may read files.
-    host_directory: Option<kr_transfer::authority::AuthorisedDirectory>,
+    /// The directory the shell reported for this invocation, for a connector whose installation
+    /// may read files.
+    ///
+    /// The reading that reads the executable opens it first, off the session's lock, and publishes
+    /// the executable's identity only afterwards: an admission waits for that identity, so one that
+    /// has it finds the directory opened, or never to be.
+    host_directory: Arc<std::sync::OnceLock<kr_transfer::authority::AuthorisedDirectory>>,
     /// The session whose attached views a channel's transitions are delivered to, where one is.
     views: Option<(SessionId, Weak<crate::runtime::SessionRuntime>)>,
     #[cfg(feature = "testing")]
@@ -263,6 +267,10 @@ pub struct CommandBackends {
     /// Where the next committed launch stops before the launcher is told, for this host's own tests.
     #[cfg(feature = "testing")]
     confirm_pause: Arc<Mutex<Option<ConfirmPause>>>,
+    /// Where the next backend's reading stops before it opens the directory it grants, for this
+    /// host's own tests.
+    #[cfg(feature = "testing")]
+    directory_pause: Mutex<Option<DirectoryPause>>,
 }
 
 /// The two ends of one armed pause: what says the launch arrived there, and what lets it go on.
@@ -271,6 +279,17 @@ type ConfirmPause = (
     tokio::sync::oneshot::Sender<()>,
     tokio::sync::oneshot::Receiver<()>,
 );
+
+/// The two ends of one armed pause before a directory is opened, taken on a blocking thread.
+#[cfg(feature = "testing")]
+type DirectoryPause = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+
+/// How long a paused directory open waits to be let go before it goes on by itself.
+///
+/// A pause no test releases, as when the open is somewhere it holds the test up, ends on its own,
+/// so the test fails rather than waits for ever.
+#[cfg(feature = "testing")]
+const DIRECTORY_PAUSE_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl std::fmt::Debug for CommandBackends {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -323,6 +342,8 @@ impl CommandBackends {
             views: None,
             #[cfg(feature = "testing")]
             confirm_pause: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "testing")]
+            directory_pause: Mutex::new(None),
         }
     }
 
@@ -351,6 +372,25 @@ impl CommandBackends {
         let (release, go) = tokio::sync::oneshot::channel();
         *self
             .confirm_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
+        (watch, release)
+    }
+
+    /// Stops the next backend's reading before it opens the directory its launch is granted, for
+    /// this host's own tests: an open that takes its time.
+    ///
+    /// Returns the end that says the reading has arrived there and the end that lets it go on;
+    /// unreleased, it goes on by itself after [`DIRECTORY_PAUSE_LIMIT`]. It is compiled away in
+    /// every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_opening_the_directory(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (arrived, watch) = std::sync::mpsc::channel();
+        let (release, go) = std::sync::mpsc::channel();
+        *self
+            .directory_pause
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
         (watch, release)
@@ -611,19 +651,9 @@ impl CommandBackends {
         })?;
         let (identity_sender, identity) = tokio::sync::watch::channel(None);
         // A connector whose installation may read files is granted the directory the shell
-        // reported for this invocation. It is opened now, so what the launch is granted is the
-        // directory at the reported revision, whatever the path names later; one that cannot be
-        // opened leaves the launch with no directory, and every reverse file request refused.
-        let host_directory = connector
-            .granted(kr_plugin_sdk::capability::PluginCapability::FilesystemRead)
-            .then(|| {
-                kr_transfer::authority::AuthorisedDirectory::open_root(
-                    self.environment_id,
-                    Path::new(request.cwd),
-                )
-                .ok()
-            })
-            .flatten();
+        // reported for this invocation.
+        let reads_files =
+            connector.granted(kr_plugin_sdk::capability::PluginCapability::FilesystemRead);
         let backend = Arc::new(Backend {
             application_instance_id,
             prompt_generation: request.prompt_generation,
@@ -644,7 +674,7 @@ impl CommandBackends {
             stopped: Arc::new(AtomicBool::new(false)),
             tasks: Mutex::new(Vec::new()),
             os_user: self.os_user.clone(),
-            host_directory,
+            host_directory: Arc::new(std::sync::OnceLock::new()),
             views: self
                 .views
                 .as_ref()
@@ -657,7 +687,35 @@ impl CommandBackends {
             let hashed = Arc::clone(&self.hashed);
             let connector = Arc::clone(&backend.connector);
             let stopped = Arc::clone(&backend.stopped);
+            let granted = Arc::clone(&backend.host_directory);
+            let cwd = reads_files.then(|| PathBuf::from(request.cwd));
+            let environment_id = self.environment_id;
+            #[cfg(feature = "testing")]
+            let pause = self
+                .directory_pause
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
             self.handle.spawn_blocking(move || {
+                // The directory first, here rather than under the session's lock, because a path
+                // on a filesystem that has stopped answering can hold its open for as long as it
+                // likes. Opened now, what the launch is granted is the directory at the reported
+                // revision, whatever the path names later; one that cannot be opened leaves the
+                // launch with no directory, and every reverse file request refused. An open that
+                // outlasts the admission's wait for the identity below refuses the launch, which
+                // then runs as typed.
+                if let Some(cwd) = cwd {
+                    #[cfg(feature = "testing")]
+                    if let Some((arrived, go)) = pause {
+                        let _ = arrived.send(());
+                        let _ = go.recv_timeout(DIRECTORY_PAUSE_LIMIT);
+                    }
+                    if let Ok(opened) =
+                        kr_transfer::authority::AuthorisedDirectory::open_root(environment_id, &cwd)
+                    {
+                        let _ = granted.set(opened);
+                    }
+                }
                 let read =
                     crate::broker::image::read_identity(&path, &hashed, &stopped).map(|hashed| {
                         let version = connector
@@ -1155,10 +1213,12 @@ async fn admit_claimed<'a>(
         .map_err(|refused| refused.error)?;
     // The directory the invocation was resolved in, for reading only and confined to its own
     // mount. The grant is the instance's, so it goes with the instance: a launch given back takes
-    // it along, and so does the program's end.
+    // it along, and so does the program's end. A directory no grant can be made from (its handle
+    // cannot be taken again, or its mount cannot be told) is granted nothing, like one that could
+    // not be opened.
     if let Some(files) = backend
         .host_directory
-        .as_ref()
+        .get()
         .and_then(|directory| directory.try_clone().ok())
         .and_then(|root| {
             crate::broker::host::HostFiles::new(root, crate::broker::host::FileAccess::Read).ok()

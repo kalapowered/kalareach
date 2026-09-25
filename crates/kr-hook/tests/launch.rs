@@ -1527,3 +1527,33 @@ fn kr_req_12_16_a_launch_is_granted_the_directory_it_was_resolved_in_for_reading
     );
     let _ = finish(child);
 }
+
+/// KR-REQ-12.16: the directory a launch is granted is opened off the establish, which the session
+/// runs under its own lock. An open that takes its time, as one on a filesystem that has stopped
+/// answering does, holds neither the establish nor its answer, and the launch that follows still
+/// finds the directory granted.
+#[test]
+fn kr_req_12_16_a_directory_slow_to_open_does_not_hold_the_establish() {
+    let shell = Shell::reading();
+    let project = shell.placed.host.root().join("slow");
+    std::fs::create_dir_all(&project).expect("a project directory");
+    let (arrived, release) = shell.backends.pause_before_opening_the_directory();
+    let started = Instant::now();
+    let answer = shell.establish_in(&project);
+    let took = started.elapsed();
+    arrived
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the directory's open is reached");
+    assert!(
+        took < Duration::from_secs(1),
+        "the establish waited {took:?} for the directory's open"
+    );
+    release.send(()).expect("the open is let go");
+    let child = shell.launch(&answer, "slow", &[("LINGER", "2")]);
+    let instance = instance_of(&shell.report("slow"));
+    assert!(
+        shell.broker.host_files(instance).is_some(),
+        "the launch is granted the directory once it is open"
+    );
+    let _ = finish(child);
+}
