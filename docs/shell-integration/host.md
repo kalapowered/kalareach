@@ -215,6 +215,11 @@ the record's own shape is stated; these are the parts a session depends on.
 | `shell.modules` | The module tree, with each module's search path and ABI |
 | `startup_entry.file` | The file the guarded startup entry sources |
 
+The Zsh, Bash and Fish packages rebuild their shell with a reader patch, so each record names its
+patches. The PSReadLine package rebuilds nothing and patches nothing: its reader bridge is its own
+`KalaReach.ShellBridge` module, so its record names no patch and names that module in
+`shell.modules`, at the editor ABI it was qualified against.
+
 A hello is checked against the package's editor ABI and integration version, and the rest of the
 identity it carries — the executable, the upstream revision, the patches and the module tree — is
 recorded whole with the session, which is what its diagnostics report.
