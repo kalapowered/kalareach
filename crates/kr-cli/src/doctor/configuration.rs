@@ -11,6 +11,8 @@
 
 use std::path::PathBuf;
 
+use kr_client::shown;
+use kr_client::shown::Shown;
 use kr_ipc::paths::EnvironmentPaths;
 use kr_protocol::hostinfo::configuration::{self, Change};
 
@@ -53,11 +55,16 @@ pub fn apply(paths: &EnvironmentPaths, change: &Change) -> Result<u64> {
     paths.create()?;
     // The same lock the host takes, so a setting written here and one written by the daemon are
     // one edit at a time rather than two writers racing for the same revision.
-    let held = configuration::lock(paths.state_dir()).map_err(CliError::Usage)?;
-    let edited = configuration::edit(&load(paths), change)
-        .map_err(|refused| CliError::Usage(refused.to_string()))?;
-    configuration::still_current(&edited, &load(paths))
-        .map_err(|refused| CliError::Usage(refused.to_string()))?;
+    // The lock's own sentence names the directory it could not lock and why; this says the same
+    // of the directory this command was given, without repeating a library's text.
+    let held = configuration::lock(paths.state_dir()).map_err(|_| {
+        CliError::Usage(shown!(
+            "the configuration lock in {} is held by another writer or could not be taken",
+            Shown::root(paths.state_dir())
+        ))
+    })?;
+    let edited = configuration::edit(&load(paths), change).map_err(|refused| refusal(&refused))?;
+    configuration::still_current(&edited, &load(paths)).map_err(|refused| refusal(&refused))?;
     let path = document_path(paths);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -66,4 +73,17 @@ pub fn apply(paths: &EnvironmentPaths, change: &Change) -> Result<u64> {
         .map_err(CliError::Ipc)?;
     drop(held);
     Ok(edited.revision)
+}
+
+/// What a refused edit says: the configuration's own sentences, as its export rule says them.
+fn refusal(refused: &configuration::EditRefused) -> CliError {
+    CliError::Usage(match refused {
+        configuration::EditRefused::NotOurs(sentence) => Shown::sentence(sentence),
+        configuration::EditRefused::Invalid(sentences) => {
+            Shown::joined(sentences.iter().map(Shown::sentence), "; ")
+        }
+        configuration::EditRefused::Busy(_) => {
+            Shown::said("another writer is applying an edit to this configuration")
+        }
+    })
 }

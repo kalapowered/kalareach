@@ -343,7 +343,10 @@ fn a_selected_content_export_is_named_and_listed_in_the_manifest() {
         bytes: br#"{"sessions": []}"#.to_vec(),
     }];
     assert!(
-        content[0].describe().contains("shell command line"),
+        content[0]
+            .describe()
+            .as_str()
+            .contains("shell command line"),
         "the command prints what it will contain before writing"
     );
     let bundle = ComposedBundle::new(

@@ -12,12 +12,14 @@
 //! process is inside any session at all, answered conservatively, so that anything which cannot
 //! be established is neither inside nor outside.
 
+use kr_client::shown;
+use kr_client::shown::Shown;
 use std::time::Duration;
 
 use kr_ipc::client::LocalClient;
 use kr_ipc::identity::ProcessState;
 use kr_protocol::envelope::{ActionTarget, ParamsValue};
-use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{ActionId, BuildId, QuestionId, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::question::{CallerToken, QuestionReadOwnParams};
@@ -88,9 +90,12 @@ pub async fn discover(build_id: &BuildId) -> Result<Bound> {
             return Ok(bound);
         }
     }
-    Err(CliError::Refused(ProtocolError::new(
+    Err(CliError::Refused(kr_client::error::refusal(
         ErrorCode::NotInKrSession,
-        format!("this process is not inside a KalaReach session. {SETUP_INSTRUCTION}"),
+        shown!(
+            "this process is not inside a KalaReach session. {}",
+            SETUP_INSTRUCTION
+        ),
     )))
 }
 
@@ -104,7 +109,7 @@ pub enum Membership {
     /// Something that could hold this process did not say: a descriptor that cannot be read, a
     /// worker the kernel reports running that gave neither answer or could not establish one, or
     /// a host whose sessions cannot be listed. The reason says which.
-    Unknown(String),
+    Unknown(Shown),
 }
 
 /// How long one worker is given to say whether this process is its own.
@@ -119,27 +124,37 @@ pub const MEMBERSHIP_PROBE_DEADLINE: Duration = Duration::from_secs(5);
 /// [`Membership::Inside`], and anything else, a worker that could not establish it included,
 /// leaves it [`Membership::Unknown`].
 pub async fn membership(build_id: &BuildId) -> Membership {
-    let unknown = |why: String| Membership::Unknown(why);
     let paths = match kr_ipc::paths::HostPaths::discover() {
         Ok(paths) => paths,
-        Err(error) => return unknown(format!("this host's directories cannot be found: {error}")),
+        Err(error) => {
+            return Membership::Unknown(shown!(
+                "this host's directories cannot be found: {}",
+                Shown::ipc(&error)
+            ));
+        }
     };
     let boot = match kr_ipc::identity::boot_identity() {
         Ok(boot) => boot,
-        Err(error) => return unknown(format!("this boot cannot be identified: {error}")),
+        Err(error) => {
+            return Membership::Unknown(shown!(
+                "this boot cannot be identified: {}",
+                Shown::ipc(&error)
+            ));
+        }
     };
     let environments = match every_environment(&paths) {
         Ok(environments) => environments,
-        Err(why) => return unknown(why),
+        Err(why) => return Membership::Unknown(why),
     };
     let mut undecided = None;
     for known in environments {
         let entries = match kr_ipc::descriptor::read_all(&known.paths) {
             Ok(entries) => entries,
             Err(error) => {
-                undecided.get_or_insert(format!(
-                    "the sessions of environment {} cannot be listed: {error}",
-                    known.environment_id
+                undecided.get_or_insert(shown!(
+                    "the sessions of environment {} cannot be listed: {}",
+                    known.environment_id,
+                    Shown::ipc(&error)
                 ));
                 continue;
             }
@@ -147,10 +162,12 @@ pub async fn membership(build_id: &BuildId) -> Membership {
         for entry in entries {
             let descriptor = match entry.descriptor {
                 Ok(descriptor) => descriptor,
-                Err(reason) => {
-                    undecided.get_or_insert(format!(
-                        "the session descriptor {} cannot be read: {reason}",
-                        entry.path.display()
+                // The reason is the descriptor reader's own text about a file it found, and is not
+                // repeated: which file, and that it could not be read, is what establishes nothing.
+                Err(_) => {
+                    undecided.get_or_insert(shown!(
+                        "the session descriptor {} cannot be read",
+                        Shown::stored(&entry.path, &[])
                     ));
                     continue;
                 }
@@ -160,9 +177,9 @@ pub async fn membership(build_id: &BuildId) -> Membership {
             }
             match kr_ipc::identity::process_state(&descriptor.process_start_identity) {
                 ProcessState::Ended => continue,
-                ProcessState::Unknown { detail } => {
-                    undecided.get_or_insert(format!(
-                        "whether the worker of session {} is running cannot be read: {detail}",
+                ProcessState::Unknown { .. } => {
+                    undecided.get_or_insert(shown!(
+                        "whether the worker of session {} is running cannot be read",
                         descriptor.session_id
                     ));
                     continue;
@@ -174,14 +191,15 @@ pub async fn membership(build_id: &BuildId) -> Membership {
             let answered =
                 tokio::time::timeout(MEMBERSHIP_PROBE_DEADLINE, probe(&bound, build_id.clone()))
                     .await
-                    .unwrap_or_else(|_| Probe::Silent("it did not answer in time".to_owned()));
+                    .unwrap_or_else(|_| Probe::Silent(Shown::said("it did not answer in time")));
             match answered {
                 Probe::Inside => return Membership::Inside(session_id),
                 Probe::Outside => {}
                 Probe::Silent(why) => {
-                    undecided.get_or_insert(format!(
-                        "the worker of session {session_id} did not say whether this process is \
-                         its own: {why}"
+                    undecided.get_or_insert(shown!(
+                        "the worker of session {} did not say whether this process is its own: {}",
+                        session_id,
+                        why
                     ));
                 }
             }
@@ -200,10 +218,13 @@ pub async fn membership(build_id: &BuildId) -> Membership {
 /// environment.
 fn every_environment(
     paths: &kr_ipc::paths::HostPaths,
-) -> std::result::Result<Vec<crate::resolve::KnownEnvironment>, String> {
-    let installation = paths
-        .open_environment_id()
-        .map_err(|error| format!("this installation's environment cannot be read: {error}"))?;
+) -> std::result::Result<Vec<crate::resolve::KnownEnvironment>, Shown> {
+    let installation = paths.open_environment_id().map_err(|error| {
+        shown!(
+            "this installation's environment cannot be read: {}",
+            Shown::ipc(&error)
+        )
+    })?;
     let mut found = vec![crate::resolve::KnownEnvironment {
         environment_id: installation,
         paths: paths.environment(installation),
@@ -212,28 +233,44 @@ fn every_environment(
     let entries = match std::fs::read_dir(&root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(found),
-        Err(error) => return Err(format!("{} cannot be listed: {error}", root.display())),
+        Err(error) => {
+            return Err(shown!(
+                "{} cannot be listed: {}",
+                Shown::within(paths.state_root(), "environments"),
+                Shown::io(&error)
+            ));
+        }
     };
     for entry in entries {
-        let entry =
-            entry.map_err(|error| format!("{} cannot be listed: {error}", root.display()))?;
+        let entry = entry.map_err(|error| {
+            shown!(
+                "{} cannot be listed: {}",
+                Shown::within(paths.state_root(), "environments"),
+                Shown::io(&error)
+            )
+        })?;
         let path = entry.path();
-        let kind = entry
-            .file_type()
-            .map_err(|error| format!("{} cannot be inspected: {error}", path.display()))?;
+        let kind = entry.file_type().map_err(|error| {
+            shown!(
+                "{} cannot be inspected: {}",
+                Shown::stored(&path, &[]),
+                Shown::io(&error)
+            )
+        })?;
         if kind.is_symlink() {
-            return Err(format!(
+            return Err(shown!(
                 "{} is a link where an environment's directory would be",
-                path.display()
+                Shown::stored(&path, &[])
             ));
         }
         if !kind.is_dir() {
             continue;
         }
         let environment_id = kr_ipc::paths::read_environment_marker(&path).map_err(|error| {
-            format!(
-                "the environment at {} cannot be identified: {error}",
-                path.display()
+            shown!(
+                "the environment at {} cannot be identified: {}",
+                Shown::stored(&path, &[]),
+                Shown::ipc(&error)
             )
         })?;
         if found
@@ -257,7 +294,7 @@ enum Probe {
     /// It is not.
     Outside,
     /// The worker gave neither answer, for the reason given.
-    Silent(String),
+    Silent(Shown),
 }
 
 /// Asks one worker whether this process is inside its session, taking only a binding answer.
@@ -274,7 +311,7 @@ async fn probes_bound(bound: &Bound, build_id: BuildId) -> bool {
 async fn probe(bound: &Bound, build_id: BuildId) -> Probe {
     let mut client = match open(bound, build_id).await {
         Ok(client) => client,
-        Err(error) => return Probe::Silent(error.to_string()),
+        Err(error) => return Probe::Silent(shown!("{}", error)),
     };
     let params = QuestionReadOwnParams {
         session_id: bound.session_id(),
@@ -294,10 +331,10 @@ async fn probe(bound: &Bound, build_id: BuildId) -> Probe {
         Ok(Err(error)) if error.code == ErrorCode::PermissionDenied => Probe::Inside,
         Ok(Err(error)) if error.code == ErrorCode::NotInKrSession => Probe::Outside,
         Ok(Err(error)) if error.code == ErrorCode::ResourceUnavailable => {
-            Probe::Silent(error.message)
+            Probe::Silent(Shown::protocol(&error))
         }
-        Ok(Err(error)) => Probe::Silent(format!("it answered {}", error.code.as_str())),
-        Err(error) => Probe::Silent(error.to_string()),
+        Ok(Err(error)) => Probe::Silent(shown!("it answered {}", error.code)),
+        Err(error) => Probe::Silent(Shown::ipc(&error)),
     }
 }
 
@@ -336,7 +373,10 @@ where
 }
 
 fn decode<T: kr_protocol::wire::WireMessage>(value: ParamsValue) -> Result<T> {
-    value
-        .to_typed()
-        .map_err(|error| CliError::Other(format!("the host's answer could not be read: {error}")))
+    value.to_typed().map_err(|error| {
+        CliError::Other(shown!(
+            "the host's answer could not be read: {}",
+            Shown::cbor(&error)
+        ))
+    })
 }

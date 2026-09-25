@@ -23,6 +23,8 @@
     reason = "reading console input records has no safe interface"
 )]
 
+use kr_client::shown;
+use kr_client::shown::Shown;
 use std::os::windows::io::AsRawHandle as _;
 
 use kr_term::win32::{Fidelity, KeyRecord, control_keys, encode_all};
@@ -105,9 +107,9 @@ impl RecordReader {
             GetNumberOfConsoleInputEvents(self.handle.as_raw_handle().cast(), &raw mut count)
         };
         if asked == 0 {
-            return Err(CliError::Terminal(format!(
+            return Err(CliError::Terminal(shown!(
                 "read the console's input: {}",
-                std::io::Error::last_os_error()
+                Shown::io(&std::io::Error::last_os_error())
             )));
         }
         Ok(count)
@@ -139,9 +141,9 @@ impl RecordReader {
             )
         };
         if ok == 0 {
-            return Err(CliError::Terminal(format!(
+            return Err(CliError::Terminal(shown!(
                 "read the console's input: {}",
-                std::io::Error::last_os_error()
+                Shown::io(&std::io::Error::last_os_error())
             )));
         }
         let read = usize::try_from(read).unwrap_or(0).min(buffer.len());

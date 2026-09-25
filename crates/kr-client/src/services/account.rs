@@ -136,6 +136,14 @@ pub fn scope_shown(scope: &str) -> Shown {
 /// are kept whole for what they are for: a request presents them and a check reads them.
 #[must_use]
 pub fn scope_summary(scopes: &[String]) -> Shown {
+    let (known, unknown) = scope_names(scopes);
+    scope_words(&known, unknown)
+}
+
+/// The stored scopes this build knows, by their names and in the order they were stored, and how
+/// many others there are: [`scope_summary`] as values, for a document that lists them.
+#[must_use]
+pub fn scope_names(scopes: &[String]) -> (Vec<&'static str>, usize) {
     let mut known = Vec::new();
     let mut unknown = 0_usize;
     for scope in scopes {
@@ -145,6 +153,12 @@ pub fn scope_summary(scopes: &[String]) -> Shown {
             None => unknown += 1,
         }
     }
+    (known, unknown)
+}
+
+/// What [`scope_names`] says, in the words [`scope_summary`] uses.
+#[must_use]
+pub fn scope_words(known: &[&'static str], unknown: usize) -> Shown {
     let named = Shown::joined(known.iter().copied().map(Shown::said), ", ");
     match (known.is_empty(), unknown) {
         (true, 0) => Shown::said("no scopes"),

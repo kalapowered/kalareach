@@ -9,6 +9,8 @@
 //! Before any of that the restoration guard is armed, because the terminal must come back even if
 //! this process is killed outright. See [`crate::terminal`].
 
+use kr_client::shown;
+use kr_client::shown::Shown;
 use std::io::Read as _;
 use std::process::{Command, Stdio};
 
@@ -108,10 +110,9 @@ impl RestorationGuard {
         terminal: &ControllingTerminal,
         saved: &SavedModes,
     ) -> Result<Self> {
-        let handle = terminal
-            .handle()
-            .try_clone()
-            .map_err(|error| CliError::Terminal(format!("duplicate the terminal: {error}")))?;
+        let handle = terminal.handle().try_clone().map_err(|error| {
+            CliError::Terminal(shown!("duplicate the terminal: {}", Shown::io(&error)))
+        })?;
         Self::arm_on_handle(program, handle, saved)
     }
 
@@ -133,8 +134,9 @@ impl RestorationGuard {
         if let Err(silence) = guard.confirmed() {
             let _ = guard.child.kill();
             let _ = guard.child.wait();
-            return Err(CliError::Terminal(format!(
-                "the restoration guard did not report that it was holding the terminal: {silence}"
+            return Err(CliError::Terminal(shown!(
+                "the restoration guard did not report that it was holding the terminal: {}",
+                silence
             )));
         }
         Ok(guard)
@@ -152,10 +154,12 @@ impl RestorationGuard {
         terminal: std::fs::File,
         saved: &SavedModes,
     ) -> Result<Self> {
-        let (reader, writer) = std::io::pipe()
-            .map_err(|error| CliError::Terminal(format!("create the guard's pipe: {error}")))?;
-        let (ready_reader, ready_writer) = std::io::pipe()
-            .map_err(|error| CliError::Terminal(format!("create the guard's pipe: {error}")))?;
+        let (reader, writer) = std::io::pipe().map_err(|error| {
+            CliError::Terminal(shown!("create the guard's pipe: {}", Shown::io(&error)))
+        })?;
+        let (ready_reader, ready_writer) = std::io::pipe().map_err(|error| {
+            CliError::Terminal(shown!("create the guard's pipe: {}", Shown::io(&error)))
+        })?;
         let mut command = detached(program);
         command
             .arg("--modes")
@@ -163,9 +167,9 @@ impl RestorationGuard {
             .stdin(Stdio::from(reader))
             .stdout(Stdio::from(terminal))
             .stderr(Stdio::from(ready_writer));
-        let child = command
-            .spawn()
-            .map_err(|error| CliError::Terminal(format!("start the restoration guard: {error}")))?;
+        let child = command.spawn().map_err(|error| {
+            CliError::Terminal(shown!("start the restoration guard: {}", Shown::io(&error)))
+        })?;
         drop(command);
         Ok(Self {
             child,
@@ -183,9 +187,9 @@ impl RestorationGuard {
     /// The four ways this can fail are four different faults - a guard that could not start, one
     /// that died holding the terminal, one that is answering something else, and one that is merely
     /// slow - and the caller reports whichever it was rather than one sentence for all of them.
-    fn confirmed(&mut self) -> std::result::Result<(), String> {
+    fn confirmed(&mut self) -> std::result::Result<(), Shown> {
         let Some(reader) = self.confirmations.take() else {
-            return Err("its side of the report pipe is already closed".to_owned());
+            return Err(Shown::said("its side of the report pipe is already closed"));
         };
         let answer = std::thread::spawn(move || {
             let mut byte = [0_u8; 1];
@@ -200,42 +204,44 @@ impl RestorationGuard {
             // it, the read above returns nothing, and the answer below says it ended. What the
             // deadline bounds is the other case, a guard that is running and has not answered.
             if std::time::Instant::now() >= deadline {
-                return Err(format!(
-                    "it was still running and had not answered after {:?}",
-                    started.elapsed()
+                return Err(shown!(
+                    "it was still running and had not answered after {} ms",
+                    started.elapsed().as_millis()
                 ));
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         let Ok((reader, read)) = answer.join() else {
-            return Err("the thread reading its report failed".to_owned());
+            return Err(Shown::said("the thread reading its report failed"));
         };
         self.confirmations = Some(reader);
         match read {
             Ok((1, byte)) if byte == GUARD_READY => Ok(()),
-            Ok((1, byte)) => Err(format!(
-                "it answered {byte:#04x} rather than its readiness after {:?}",
-                started.elapsed()
+            Ok((1, byte)) => Err(shown!(
+                "it answered byte {} rather than its readiness after {} ms",
+                byte,
+                started.elapsed().as_millis()
             )),
             // No byte means its end of this pipe is closed, which means the process is gone.
-            Ok(_) => Err(format!(
-                "it ended without answering after {:?}{}",
-                started.elapsed(),
+            Ok(_) => Err(shown!(
+                "it ended without answering after {} ms{}",
+                started.elapsed().as_millis(),
                 self.departure()
             )),
-            Err(error) => Err(format!(
-                "reading its report failed after {:?}: {error}",
-                started.elapsed()
+            Err(error) => Err(shown!(
+                "reading its report failed after {} ms: {}",
+                started.elapsed().as_millis(),
+                Shown::io(&error)
             )),
         }
     }
 
     /// How the guard went, for a report about a guard that is no longer answering.
-    fn departure(&mut self) -> String {
+    fn departure(&mut self) -> Shown {
         match self.child.try_wait() {
-            Ok(Some(status)) => format!(" ({status})"),
-            Ok(None) => String::new(),
-            Err(error) => format!(" (its status could not be read: {error})"),
+            Ok(Some(status)) => shown!(" ({})", status),
+            Ok(None) => Shown::said(""),
+            Err(error) => shown!(" (its status could not be read: {})", Shown::io(&error)),
         }
     }
 
@@ -251,19 +257,20 @@ impl RestorationGuard {
         use std::io::Write as _;
 
         let Some(writer) = self.release.as_mut() else {
-            return Err(CliError::Terminal(
-                "the restoration guard is no longer listening".to_owned(),
-            ));
+            return Err(CliError::Terminal(Shown::said(
+                "the restoration guard is no longer listening",
+            )));
         };
         if writer.write_all(&[GUARD_BEGIN, b'\n']).is_err() || writer.flush().is_err() {
-            return Err(CliError::Terminal(
-                "the restoration guard could not be asked to hold the keyboard state".to_owned(),
-            ));
+            return Err(CliError::Terminal(Shown::said(
+                "the restoration guard could not be asked to hold the keyboard state",
+            )));
         }
         self.confirmed().map_err(|silence| {
-            CliError::Terminal(format!(
+            CliError::Terminal(shown!(
                 "the restoration guard did not report that it was holding the keyboard state: \
-                 {silence}"
+                 {}",
+                silence
             ))
         })
     }
@@ -582,9 +589,12 @@ async fn call<P: serde::Serialize + ?Sized, T: kr_protocol::wire::WireMessage>(
     let action_id = ActionId::new(kr_ipc::new_uuid());
     let outcome = client.mutate(method, action_id, target, params).await?;
     let value = outcome.map_err(CliError::Refused)?;
-    value
-        .to_typed()
-        .map_err(|error| CliError::Other(error.to_string()))
+    value.to_typed().map_err(|error| {
+        CliError::Other(shown!(
+            "the host's answer could not be read: {}",
+            Shown::cbor(&error)
+        ))
+    })
 }
 
 #[cfg(all(test, unix))]

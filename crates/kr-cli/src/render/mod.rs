@@ -26,6 +26,8 @@
 
 use kr_client::projection::paint::{Comparison, Keyboard, Window};
 use kr_client::projection::{Applied, Projection, Refusal};
+use kr_client::shown;
+use kr_client::shown::Shown;
 use kr_protocol::projection::ProjectionEvent;
 
 pub use kr_client::projection::{decode, is_projection_event};
@@ -237,7 +239,7 @@ impl ProjectedDisplay {
     /// `None` when it carried all of it. The count is what makes it a report rather than a warning:
     /// a person told that something was clipped can ask for a wider window.
     #[must_use]
-    pub fn degradation(&self) -> Option<String> {
+    pub fn degradation(&self) -> Option<Shown> {
         report(self.losses, self.session_degraded())
     }
 }
@@ -264,37 +266,39 @@ pub struct Qualification {
 impl Qualification {
     /// The sentence a person is shown, or `None` when everything was established.
     #[must_use]
-    pub fn report(&self) -> Option<String> {
+    pub fn report(&self) -> Option<Shown> {
         let mut parts = Vec::new();
         if !self.defaulted_modes.is_empty() {
-            let named: Vec<String> = self
+            let named = self
                 .defaulted_modes
                 .iter()
-                .map(|mode| format!("{} (mode {})", mode.description(), mode.number()))
-                .collect();
-            let (subject, verb) = if named.len() == 1 {
+                .map(|mode| shown!("{} (mode {})", mode.description(), mode.number()));
+            let (subject, verb) = if self.defaulted_modes.len() == 1 {
                 ("", "was")
             } else {
                 ("each of ", "were")
             };
-            parts.push(format!(
-                "{subject}{} {verb} put back to the documented default rather than to the value \
-                 this terminal had, because it never reported one",
-                named.join(", ")
+            parts.push(shown!(
+                "{}{} {} put back to the documented default rather than to the value this \
+                 terminal had, because it never reported one",
+                subject,
+                Shown::joined(named, ", "),
+                verb
             ));
         }
         if let Some(identity) = &self.width_unqualified {
-            parts.push(format!(
-                "it calls itself {identity}, which is not qualified for the character widths this \
-                 session measures with, so a character it draws wider than the session does can \
-                 cover the blank cell beside it, and every cluster after that one still lands on \
-                 the column the session holds it at"
+            parts.push(shown!(
+                "it calls itself {}, which is not qualified for the character widths this session \
+                 measures with, so a character it draws wider than the session does can cover the \
+                 blank cell beside it, and every cluster after that one still lands on the column \
+                 the session holds it at",
+                Shown::terminfo(identity)
             ));
         }
         if parts.is_empty() {
             return None;
         }
-        Some(parts.join("; "))
+        Some(Shown::joined(parts, "; "))
     }
 }
 
@@ -303,7 +307,7 @@ impl Qualification {
 /// Every field of a comparison has a phrase here. A comparison that is not complete and produces
 /// no phrase would print an empty report, which tells a person that something is wrong and not
 /// what, so the mapping is total by construction and checked by a test that walks it.
-fn report(losses: Comparison, degraded: bool) -> Option<String> {
+fn report(losses: Comparison, degraded: bool) -> Option<Shown> {
     {
         if losses.complete() && !degraded {
             return None;
@@ -312,29 +316,31 @@ fn report(losses: Comparison, degraded: bool) -> Option<String> {
         if degraded {
             // The session's own answer, not this terminal's: content it had to shorten to stay
             // inside a resident-state bound is content no window size can show.
-            parts.push("content the session shortened to stay inside its own bounds".to_owned());
+            parts.push(Shown::said(
+                "content the session shortened to stay inside its own bounds",
+            ));
         }
         if losses.cells_clipped > 0 {
             let cells = usize::try_from(losses.cells_clipped).unwrap_or(usize::MAX);
-            parts.push(format!(
+            parts.push(shown!(
                 "{} outside this window",
                 plural(cells, "cell", "cells")
             ));
         }
         if losses.clusters_replaced > 0 {
-            parts.push(format!(
+            parts.push(shown!(
                 "{} the window's edge fell inside",
                 plural(losses.clusters_replaced, "character", "characters")
             ));
         }
         if losses.runs_replaced > 0 {
-            parts.push(format!(
+            parts.push(shown!(
                 "{} this terminal cannot place",
                 plural(losses.runs_replaced, "run", "runs")
             ));
         }
         if losses.rows_outside > 0 {
-            parts.push(format!(
+            parts.push(shown!(
                 "{} of the session's rows outside this window, holding {}",
                 losses.rows_outside,
                 plural(
@@ -345,43 +351,42 @@ fn report(losses: Comparison, degraded: bool) -> Option<String> {
             ));
         }
         if losses.keyboard_withheld {
-            parts.push(
-                "the session's keyboard protocols, which this terminal was never asked about"
-                    .to_owned(),
-            );
+            parts.push(Shown::said(
+                "the session's keyboard protocols, which this terminal was never asked about",
+            ));
         }
         if losses.keyboard_stack > 0 {
-            parts.push(format!(
+            parts.push(shown!(
                 "{} the session holds, installed as a state rather than a stack",
                 plural(losses.keyboard_stack, "keyboard entry", "keyboard entries")
             ));
         }
         if losses.controls_dropped > 0 {
-            parts.push(format!(
+            parts.push(shown!(
                 "{} whose control bytes were dropped",
                 plural(losses.controls_dropped, "title or link", "titles or links")
             ));
         }
         if losses.soft_wraps > 0 {
-            parts.push(format!(
+            parts.push(shown!(
                 "{} drawn as separate rows",
                 plural(losses.soft_wraps, "wrapped line", "wrapped lines")
             ));
         }
         if losses.truncated_rows > 0 {
-            parts.push(format!(
+            parts.push(shown!(
                 "{} the session had already shortened",
                 plural(losses.truncated_rows, "row", "rows")
             ));
         }
         if losses.pending_wrap {
-            parts.push("a pending wrap".to_owned());
+            parts.push(Shown::said("a pending wrap"));
         }
         if losses.cursor_outside {
-            parts.push("the cursor outside this window".to_owned());
+            parts.push(Shown::said("the cursor outside this window"));
         }
         if losses.rows_unreachable > 0 {
-            parts.push(format!(
+            parts.push(shown!(
                 "{} of the session this window is too short to show",
                 plural(losses.rows_unreachable, "row", "rows")
             ));
@@ -391,20 +396,17 @@ fn report(losses: Comparison, degraded: bool) -> Option<String> {
             // the grid has nowhere to put one. Everything drawn here is addressed absolutely and
             // is unaffected; what is affected is an application that writes to this terminal
             // itself, which is why it is reported rather than passed over.
-            parts
-                .push("the session's own scroll region, which this window cannot carry".to_owned());
+            parts.push(Shown::said(
+                "the session's own scroll region, which this window cannot carry",
+            ));
         }
-        Some(parts.join(", "))
+        Some(Shown::joined(parts, ", "))
     }
 }
 
 /// Renders a count with the right form of its noun.
-fn plural(count: usize, one: &str, many: &str) -> String {
-    if count == 1 {
-        format!("{count} {one}")
-    } else {
-        format!("{count} {many}")
-    }
+fn plural(count: usize, one: &'static str, many: &'static str) -> Shown {
+    shown!("{} {}", count, if count == 1 { one } else { many })
 }
 
 /// Whether a refusal means the screen is gone rather than merely stale.
@@ -445,7 +447,7 @@ mod tests {
             .report()
             .expect("an unqualified destination is reported");
         assert!(
-            sentence.contains("xterm-256color"),
+            sentence.as_str().contains("xterm-256color"),
             "the report names the destination as it declared itself: {sentence}"
         );
         assert!(
@@ -460,7 +462,7 @@ mod tests {
         };
         let sentence = both.report().expect("both are reported");
         assert!(
-            sentence.contains("mode 1000") && sentence.contains("xterm-256color"),
+            sentence.as_str().contains("mode 1000") && sentence.as_str().contains("xterm-256color"),
             "each is named: {sentence}"
         );
     }
@@ -474,7 +476,9 @@ mod tests {
             "a frame that carried everything says nothing"
         );
         assert_eq!(
-            report(Comparison::default(), true).as_deref(),
+            report(Comparison::default(), true)
+                .as_ref()
+                .map(Shown::as_str),
             Some("content the session shortened to stay inside its own bounds"),
             "and the session's own shortening is this terminal's to report"
         );
@@ -503,7 +507,10 @@ mod tests {
             assert!(!losses.complete(), "{name} is a loss");
             let sentence = report(losses, false)
                 .unwrap_or_else(|| panic!("{name} is reported rather than passed over"));
-            assert!(!sentence.trim().is_empty(), "{name} has words of its own");
+            assert!(
+                !sentence.as_str().trim().is_empty(),
+                "{name} has words of its own"
+            );
         }
         // Two fields are counts of something else's loss rather than losses of their own: a row is
         // only clipped when cells of it were, and a cell is only outside when its row is. They

@@ -8,6 +8,8 @@
 //! reported, because that label is the difference between a session that implements empty-prompt
 //! Ctrl-D and one that does not.
 
+use kr_client::shown;
+use kr_client::shown::{Said, Shown};
 use kr_protocol::attachment::{AttachMode, AttachmentSummary, TerminalPresentationMode};
 use kr_protocol::desktop::{
     CapabilityRecord, DesktopCapabilityReport, DesktopContext, EnvironmentCapabilitiesResult,
@@ -32,14 +34,30 @@ pub enum Completion {
 }
 
 /// Renders a failure as machine-readable output.
+///
+/// The message is what the failure says, which its type holds to a [`Shown`].
 #[must_use]
 pub fn failure(error: &CliError) -> Value {
     json!({
         "ok": false,
         "code": error.code(),
-        "message": error.to_string(),
+        "message": error.said().as_str(),
         "exit_code": error.exit_code(),
     })
+}
+
+/// Writes one line on standard error.
+///
+/// Every failure, warning and notice this program writes there goes through here or through
+/// [`failed`], and each is a [`Shown`]: this program's own words, values with nothing in them to
+/// hide, and what a reducer or a door decided may be said.
+pub fn say(line: &Shown) {
+    eprintln!("{line}");
+}
+
+/// Reports a failure on standard error, as `kr: ` and what the failure says.
+pub fn failed(error: &CliError) {
+    say(&shown!("kr: {}", *error));
 }
 
 /// Renders a host's answer as machine-readable output: the answer exactly as the host sent it,
@@ -50,7 +68,10 @@ pub fn failure(error: &CliError) -> Value {
 /// Returns [`CliError::Other`] when the answer cannot be written as JSON.
 pub fn answer<T: serde::Serialize>(answer: &T) -> Result<Value, CliError> {
     let mut document = serde_json::to_value(answer).map_err(|error| {
-        CliError::Other(format!("the host's answer could not be written: {error}"))
+        CliError::Other(shown!(
+            "the host's answer could not be written: {}",
+            Shown::json(&error)
+        ))
     })?;
     match document.as_object_mut() {
         Some(object) => {
@@ -448,7 +469,7 @@ mod tests {
 
     #[test]
     fn a_failure_carries_its_code_and_exit_status() {
-        let value = failure(&CliError::AmbiguousSession("3".to_owned()));
+        let value = failure(&CliError::AmbiguousSession(Shown::said("3")));
         assert_eq!(value["ok"], json!(false));
         assert_eq!(value["code"], json!("AMBIGUOUS_SESSION"));
         assert_eq!(value["exit_code"], json!(5));

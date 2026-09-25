@@ -8,6 +8,9 @@
 
 use std::io::{Read, Write};
 
+use kr_client::shown;
+use kr_client::shown::{IoFault, Said, Shown};
+
 use kr_protocol::frame::{FRAME_LENGTH_PREFIX_LEN, FrameCodec, FrameError, StreamKind};
 use kr_protocol::identity::BridgeFrame;
 
@@ -27,7 +30,6 @@ pub const fn max_frame_len() -> usize {
 }
 
 /// What went wrong on a bridge's standard streams.
-#[derive(Debug)]
 pub enum PipeError {
     /// The peer closed the stream at a frame boundary. An ordinary end.
     Closed,
@@ -39,36 +41,43 @@ pub enum PipeError {
         expected: usize,
     },
     /// The frame is not one this bridge accepts: too large, empty, or not canonical.
-    Frame(FrameError),
+    ///
+    /// It holds what [`Shown::frame`] says of the refusal, never the frame's bytes: a bridge frame
+    /// carries a terminal's content.
+    Frame(Shown),
     /// The underlying stream failed.
-    Io(std::io::Error),
+    Io(IoFault),
 }
 
-impl core::fmt::Display for PipeError {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl Said for PipeError {
+    fn said(&self) -> Shown {
         match self {
-            Self::Closed => formatter.write_str("the bridge peer closed the stream"),
-            Self::Truncated { received, expected } => write!(
-                formatter,
-                "the bridge stream ended after {received} of {expected} payload bytes"
+            Self::Closed => Shown::said("the bridge peer closed the stream"),
+            Self::Truncated { received, expected } => shown!(
+                "the bridge stream ended after {} of {} payload bytes",
+                *received,
+                *expected
             ),
-            Self::Frame(error) => write!(formatter, "{error}"),
-            Self::Io(error) => write!(formatter, "{error}"),
+            Self::Frame(said) => said.clone(),
+            Self::Io(fault) => shown!("{}", *fault),
         }
     }
 }
+
+kr_client::display_as_said!(PipeError);
+kr_client::debug_as_display!(PipeError);
 
 impl std::error::Error for PipeError {}
 
 impl From<FrameError> for PipeError {
     fn from(error: FrameError) -> Self {
-        Self::Frame(error)
+        Self::Frame(Shown::frame(&error))
     }
 }
 
 impl From<std::io::Error> for PipeError {
     fn from(error: std::io::Error) -> Self {
-        Self::Io(error)
+        Self::Io(IoFault::from(error))
     }
 }
 
@@ -123,7 +132,7 @@ pub fn read_payload(source: &mut impl Read) -> Result<Vec<u8>, PipeError> {
 pub fn read_frame(source: &mut impl Read) -> Result<BridgeFrame, PipeError> {
     let payload = read_payload(source)?;
     let frame = kr_protocol::wire::decode(&payload, &StreamKind::Control.cbor_limits())
-        .map_err(|error| PipeError::Frame(FrameError::Cbor(error)))?;
+        .map_err(|error| PipeError::from(FrameError::Cbor(error)))?;
     Ok(frame)
 }
 
@@ -151,7 +160,7 @@ pub fn write_frame(sink: &mut impl Write, frame: &BridgeFrame) -> Result<(), Pip
 pub fn write_carried_payload(sink: &mut impl Write, payload: &[u8]) -> Result<(), PipeError> {
     let frame: kr_protocol::envelope::ControlFrame =
         kr_protocol::wire::decode(payload, &StreamKind::Control.cbor_limits())
-            .map_err(|error| PipeError::Frame(FrameError::Cbor(error)))?;
+            .map_err(|error| PipeError::from(FrameError::Cbor(error)))?;
     write_frame(sink, &BridgeFrame::Control(Box::new(frame)))
 }
 
@@ -180,12 +189,12 @@ mod tests {
         let mut stream: Vec<u8> = declared.to_be_bytes().to_vec();
         stream.push(0);
         let error = read_payload(&mut stream.as_slice()).expect_err("a refusal");
+        assert!(matches!(error, PipeError::Frame(_)), "{error}");
         assert!(
-            matches!(
-                error,
-                PipeError::Frame(FrameError::PayloadTooLarge { limit, .. })
-                    if limit == StreamKind::Control.max_payload_len()
-            ),
+            error.to_string().ends_with(&format!(
+                "exceeds the {}-byte limit",
+                StreamKind::Control.max_payload_len()
+            )),
             "{error}"
         );
     }
@@ -194,7 +203,8 @@ mod tests {
     fn a_zero_length_frame_is_refused() {
         let stream = 0_u32.to_be_bytes().to_vec();
         let error = read_payload(&mut stream.as_slice()).expect_err("a refusal");
-        assert!(matches!(error, PipeError::Frame(FrameError::EmptyPayload)));
+        assert!(matches!(error, PipeError::Frame(_)), "{error}");
+        assert_eq!(error.to_string(), "a frame payload cannot be empty");
     }
 
     #[test]

@@ -27,6 +27,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use kr_client::shown;
+use kr_client::shown::Shown;
 use kr_ipc::client::LocalClient;
 use kr_ipc::paths::{EnvironmentPaths, HostPaths};
 use kr_protocol::hostinfo::configuration::{Change, ControllerStartup, DocumentState};
@@ -90,17 +92,17 @@ impl Chosen {
     }
 
     /// What a person does about this environment when no daemon answers and none may be started.
-    fn setup_action(&self) -> String {
+    fn setup_action(&self) -> Shown {
         if self.state.is_a_problem() {
-            format!(
+            shown!(
                 "this environment's configuration document, {}, is {}, so it chooses no way of \
                  starting one; start the control daemon, kr-controller, for it, or correct the \
                  document",
-                self.document.display(),
+                Shown::root(&self.document),
                 self.state.as_str()
             )
         } else {
-            resolve::SETUP_ACTION.to_owned()
+            Shown::said(resolve::SETUP_ACTION)
         }
     }
 }
@@ -127,11 +129,13 @@ pub fn run(paths: &HostPaths, arguments: &StartupArguments, json: bool) -> Resul
                 ControllerStartup::from_wire(value)
                     .map(Some)
                     .ok_or_else(|| {
-                        CliError::Usage(format!(
-                            "{value} is not a way of starting the control daemon: choose {}",
-                            ControllerStartup::ALL
-                                .map(ControllerStartup::as_str)
-                                .join(" or ")
+                        CliError::Usage(shown!(
+                            "the value given is not a way of starting the control daemon: \
+                             choose {}",
+                            Shown::joined(
+                                ControllerStartup::ALL.map(|startup| Shown::said(startup.as_str())),
+                                " or "
+                            )
                         ))
                     })
             })
@@ -140,12 +144,11 @@ pub fn run(paths: &HostPaths, arguments: &StartupArguments, json: bool) -> Resul
     if let Some(startup) = change {
         #[cfg(not(unix))]
         if startup == Some(ControllerStartup::Standalone) {
-            return Err(CliError::Usage(
+            return Err(CliError::Usage(Shown::said(
                 "the standalone start runs the control daemon in a session of its own, which this \
                  platform does not have; start the control daemon, kr-controller, for this \
-                 environment"
-                    .to_owned(),
-            ));
+                 environment",
+            )));
         }
         crate::doctor::configuration::apply(
             &environment.paths,
@@ -250,7 +253,7 @@ async fn open_or_start_within(
     let error = match reach(&endpoint, bounds.answer).await {
         Reached::Answered(client) => return Ok((*client, None)),
         Reached::Silent => {
-            return Err(unanswered(&format!(
+            return Err(unanswered(shown!(
                 "the control daemon listening for environment {} accepted the connection and \
                      did not answer within {} seconds; nothing was started beside it",
                 environment.environment_id,
@@ -258,7 +261,12 @@ async fn open_or_start_within(
             )));
         }
         Reached::Refused(error) if nothing_listening(&error) => error,
-        Reached::Refused(error) => return Err(resolve::not_running(&error, resolve::SETUP_ACTION)),
+        Reached::Refused(error) => {
+            return Err(resolve::not_running(
+                &error,
+                Shown::said(resolve::SETUP_ACTION),
+            ));
+        }
     };
     // The daemon beside this command serves the environment its roots name as this installation's
     // own, and no other, so for any other environment there is nothing to choose here.
@@ -266,15 +274,16 @@ async fn open_or_start_within(
     if environment.environment_id != installation {
         return Err(resolve::not_running(
             &error,
-            &format!(
+            shown!(
                 "start the control daemon, kr-controller, for it; the standalone start serves this \
-                 installation's own environment, {installation}, and no other"
+                 installation's own environment, {}, and no other",
+                installation
             ),
         ));
     }
     let chosen = Chosen::read(&environment.paths);
     if chosen.controller != Some(ControllerStartup::Standalone) {
-        return Err(resolve::not_running(&error, &chosen.setup_action()));
+        return Err(resolve::not_running(&error, chosen.setup_action()));
     }
     standalone(paths, &environment.paths, &endpoint, bounds).await
 }
@@ -305,10 +314,10 @@ async fn reach(endpoint: &kr_ipc::paths::Endpoint, bound: Duration) -> Reached {
 }
 
 /// The failure a daemon that does not answer in time ends `kr new` with.
-fn unanswered(message: &str) -> CliError {
+fn unanswered(message: Shown) -> CliError {
     CliError::Unfinished {
         code: kr_protocol::error::ErrorCode::EnvironmentUnavailable,
-        message: message.to_owned(),
+        message,
     }
 }
 
@@ -334,13 +343,15 @@ async fn answered_by(
     endpoint: &kr_ipc::paths::Endpoint,
     deadline: tokio::time::Instant,
     mut between: impl FnMut(),
-) -> std::result::Result<LocalClient, String> {
+) -> std::result::Result<LocalClient, Shown> {
     loop {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         let last = match reach(endpoint, left).await {
             Reached::Answered(client) => return Ok(*client),
-            Reached::Silent => "the endpoint accepted the connection and did not answer".to_owned(),
-            Reached::Refused(error) => error.to_string(),
+            Reached::Silent => {
+                Shown::said("the endpoint accepted the connection and did not answer")
+            }
+            Reached::Refused(error) => Shown::ipc(&error),
         };
         between();
         if tokio::time::Instant::now() >= deadline {
@@ -364,18 +375,19 @@ async fn answered_by(
 /// Returns [`CliError::HostUnavailable`] when where this command is installed cannot be read.
 pub fn daemon_program() -> Result<PathBuf> {
     let unreadable = |error: std::io::Error| {
-        CliError::HostUnavailable(format!(
+        CliError::HostUnavailable(shown!(
             "the standalone start runs the control daemon installed beside this command, and \
-             where this command is installed could not be read: {error}"
+             where this command is installed could not be read: {}",
+            Shown::io(&error)
         ))
     };
     let this = std::env::current_exe()
         .and_then(std::fs::canonicalize)
         .map_err(unreadable)?;
     let directory = this.parent().ok_or_else(|| {
-        unreadable(std::io::Error::other(
+        unreadable(std::io::Error::other(Shown::said(
             "this command's path has no directory",
-        ))
+        )))
     })?;
     Ok(directory.join(format!("kr-controller{}", std::env::consts::EXE_SUFFIX)))
 }
@@ -392,10 +404,10 @@ async fn standalone(
 ) -> Result<(LocalClient, Option<Started>)> {
     let program = daemon_program()?;
     if !program.is_file() {
-        return Err(CliError::HostUnavailable(format!(
+        return Err(CliError::HostUnavailable(shown!(
             "the standalone start runs the control daemon installed beside this command, {}, and \
              there is none there",
-            program.display()
+            Shown::root(&program)
         )));
     }
     // The directories the daemon works and writes in. It creates them itself as well, and both are
@@ -414,9 +426,10 @@ async fn standalone(
         .stderr(log.output()?)
         .spawn()
         .map_err(|error| {
-            CliError::HostUnavailable(format!(
-                "the control daemon {} could not be started: {error}",
-                program.display()
+            CliError::HostUnavailable(shown!(
+                "the control daemon {} could not be started: {}",
+                Shown::root(&program),
+                Shown::io(&error)
             ))
         })?;
     let started = Started { pid: child.id() };
@@ -434,21 +447,46 @@ async fn standalone(
         Err(last) => last,
     };
     let state = child.try_wait().ok().flatten().map_or_else(
-        || "it is still running".to_owned(),
-        |status| format!("it has ended ({status})"),
+        || Shown::said("it is still running"),
+        |status| shown!("it has ended ({})", status),
     );
     let said = log.last_line().map_or_else(
-        || "its log holds nothing since it started".to_owned(),
-        |line| format!("the last line its log holds since it started is: {line}"),
+        || Shown::said("its log holds nothing since it started"),
+        |line| last_line_said(&line),
     );
-    Err(unanswered(&format!(
+    Err(unanswered(shown!(
         "the control daemon this command started for environment {} (process {}) did not \
-             answer within {} seconds: {last}; {state}, and {said}; what it writes is in {}",
+             answer within {} seconds: {}; {}, and {}; what it writes is in {}",
         environment.environment_id(),
         started.pid,
         bounds.start.as_secs(),
-        log.path.display()
+        last,
+        state,
+        said,
+        Shown::root(&log.path)
     )))
+}
+
+/// What a failure says of the last line a daemon's log holds.
+///
+/// The daemon's refusal of an environment another daemon already holds is said, because it is the
+/// daemon's own sentence and names the environment by its identifier. Any other line is whatever
+/// the daemon, or a library it uses, wrote, so the failure says that the log holds one and names
+/// the log, rather than repeating it.
+#[cfg(unix)]
+fn last_line_said(line: &str) -> Shown {
+    const HELD: &str = "kr-controller: another control daemon already owns environment ";
+    match line
+        .strip_prefix(HELD)
+        .and_then(|environment| environment.parse::<kr_protocol::ids::EnvironmentId>().ok())
+    {
+        Some(environment) => shown!(
+            "the last line its log holds since it started is: kr-controller: another control \
+             daemon already owns environment {}",
+            environment
+        ),
+        None => Shown::said("its log holds a line since it started, which is not repeated here"),
+    }
 }
 
 /// The standalone start runs the daemon in a session of its own, which only Unix has.
@@ -459,12 +497,11 @@ async fn standalone(
     _endpoint: &kr_ipc::paths::Endpoint,
     _bounds: Bounds,
 ) -> Result<(LocalClient, Option<Started>)> {
-    Err(CliError::HostUnavailable(
+    Err(CliError::HostUnavailable(Shown::said(
         "this environment chooses the standalone start, which runs the control daemon in a \
          session of its own, and this platform does not have one; start the control daemon, \
-         kr-controller, for it"
-            .to_owned(),
-    ))
+         kr-controller, for it",
+    )))
 }
 
 /// The log a daemon the standalone start runs writes to, opened once and checked.
@@ -501,10 +538,10 @@ impl Log {
             || about.uid() != kr_ipc::paths::current_uid()
             || about.mode() & 0o077 != 0
         {
-            return Err(CliError::HostUnavailable(format!(
+            return Err(CliError::HostUnavailable(shown!(
                 "{} is not a file of this user's that only this user can read and write, so the \
                  control daemon's output is not written to it; remove it and run kr new again",
-                path.display()
+                Shown::root(path)
             )));
         }
         let mut from = about.len();
@@ -585,12 +622,14 @@ mod tests {
         assert_eq!(chosen.state, DocumentState::Absent);
         let action = chosen.setup_action();
         assert!(
-            action.contains("start the control daemon, kr-controller"),
+            action
+                .as_str()
+                .contains("start the control daemon, kr-controller"),
             "{action}"
         );
         #[cfg(unix)]
         assert!(
-            action.contains("kr host startup --set standalone"),
+            action.as_str().contains("kr host startup --set standalone"),
             "{action}"
         );
 
@@ -603,7 +642,7 @@ mod tests {
         assert_eq!(unusable.controller, None);
         assert_eq!(unusable.state, DocumentState::Invalid);
         assert!(
-            unusable.setup_action().contains("is invalid"),
+            unusable.setup_action().as_str().contains("is invalid"),
             "{}",
             unusable.setup_action()
         );
@@ -705,7 +744,7 @@ mod tests {
             .await
             .map(|_| ())
             .expect_err("nothing answers");
-        assert!(last.contains("did not answer"), "{last}");
+        assert!(last.as_str().contains("did not answer"), "{last}");
         assert!(attempts >= 1);
         assert!(
             started.elapsed() < Duration::from_secs(10),

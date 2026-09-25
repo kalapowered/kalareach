@@ -471,6 +471,22 @@ impl Shown {
         Self::route(name)
     }
 
+    /// A terminal type as the environment names one (`TERM`): said when it is a terminfo name, at
+    /// most 64 bytes of lowercase letters, digits and `-+._`, and a placeholder otherwise.
+    #[must_use]
+    pub fn terminfo(name: &str) -> Self {
+        let terminfo = !name.is_empty()
+            && name.len() <= 64
+            && name.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"-+._".contains(&byte)
+            });
+        if terminfo {
+            Self::decided(name.to_owned())
+        } else {
+            Self::said("[a terminal type]")
+        }
+    }
+
     /// The path of a request this client makes: each segment that is an identifier or a lowercase
     /// word, and a placeholder for any other.
     ///
@@ -567,6 +583,35 @@ impl Shown {
     #[must_use]
     pub fn package(text: &ControlText) -> Self {
         Self::decided(text.0.clone())
+    }
+
+    /// A sentence a host check composed, as the host's own export rule says it to another reader:
+    /// its words when this process composed it from its own literals, numbers and closed terms, and
+    /// its class and length when it arrived from a document or a reply.
+    #[must_use]
+    pub fn sentence(sentence: &kr_protocol::hostinfo::export::Sentence) -> Self {
+        Self::decided(kr_protocol::hostinfo::export::stated(sentence))
+    }
+
+    /// The signal a closure record says ended a session's shell, as the platform names it, which
+    /// the host's worker records to be shown to the person whose session it was.
+    ///
+    /// Only a record's own field can be said here. Text longer than 64 bytes, or holding anything
+    /// but letters, digits, spaces and `:/()-+.`, is not how a platform names a signal, and is
+    /// replaced.
+    #[must_use]
+    pub fn signal(record: &kr_protocol::session::ClosureRecord) -> Option<Self> {
+        let name = record.root_signal.as_ref()?;
+        let named = !name.is_empty()
+            && name.len() <= 64
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b" :/()-+.".contains(&byte));
+        Some(if named {
+            Self::decided(name.clone())
+        } else {
+            Self::said("[a signal name]")
+        })
     }
 }
 
@@ -820,7 +865,7 @@ macro_rules! plain {
 
 // Numbers and switches.
 plain!(
-    u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, bool
+    u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, f64, bool
 );
 // This program's words, and what a reducer or a door decided.
 plain!(&'static str, Shown, IoFault, std::io::ErrorKind);
@@ -884,6 +929,7 @@ plain!(
     kr_protocol::method::MethodVersion,
     kr_protocol::question::QuestionState,
     kr_protocol::question::QuestionKind,
+    kr_protocol::session::SessionState,
     kr_protocol::sync::SyncObjectKind,
     kr_protocol::service::ServiceRequestSigner,
     kr_protocol::service::GatewayOrigin,
@@ -891,7 +937,14 @@ plain!(
     kr_protocol::sync::SyncObjectError,
     kr_protocol::sync::RecoveryBundleError,
     kr_protocol::collection_keys::CollectionKeyRecordError,
+    kr_protocol::pairing::PairingTextError,
+    kr_protocol::identity::EnrolmentError,
 );
+// An exit status is a code or a signal, which the operating system reports and names.
+plain!(std::process::ExitStatus);
+// A terminal probe failure is one of the terminal library's fixed reasons.
+#[cfg(feature = "terminal")]
+plain!(kr_term::error::ProbeFailure);
 
 #[cfg(test)]
 pub(crate) mod marker;

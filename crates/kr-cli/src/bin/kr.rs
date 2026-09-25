@@ -1,5 +1,7 @@
 //! The `kr` command line.
 
+use kr_client::shown;
+use kr_client::shown::Shown;
 use std::process::ExitCode;
 
 use clap::Parser as _;
@@ -44,7 +46,7 @@ fn main() -> ExitCode {
     {
         Ok(runtime) => runtime,
         Err(error) => {
-            eprintln!("kr: could not start: {error}");
+            report::say(&shown!("kr: could not start: {}", Shown::io(&error)));
             return ExitCode::FAILURE;
         }
     };
@@ -57,7 +59,7 @@ fn main() -> ExitCode {
             if json {
                 print_json(&report::failure(&error));
             } else {
-                eprintln!("kr: {error}");
+                report::failed(&error);
             }
             ExitCode::from(error.exit_code())
         }
@@ -65,15 +67,19 @@ fn main() -> ExitCode {
 }
 
 /// Reports a usage mistake, in the form the caller asked for.
+///
+/// A mistake is said as the command's own declarations and the kind of mistake say it, never with
+/// what was typed: an argument this command does not take can be a secret pasted in the wrong
+/// place.
 fn usage(error: &clap::Error, json: bool) -> ExitCode {
     if error.use_stderr() {
+        let failure = CliError::Usage(shown!("{}", kr_cli::shown::usage(error)));
         if json {
-            let failure = CliError::Usage(error.render().to_string().trim().to_owned());
             print_json(&report::failure(&failure));
-            return ExitCode::from(failure.exit_code());
+        } else {
+            report::say(&shown!("{}", kr_cli::shown::usage(error)));
         }
-        eprint!("{}", error.render());
-        return ExitCode::from(2);
+        return ExitCode::from(failure.exit_code());
     }
     // `--help` and `--version` are not failures.
     print!("{}", error.render());
@@ -91,9 +97,9 @@ async fn run(cli: Cli) -> Result<Completion> {
             let shell_mode = match arguments.shell_mode.as_str() {
                 "managed" => ShellMode::Managed,
                 "native_compat" => ShellMode::NativeCompat,
-                other => {
-                    return Err(CliError::Usage(format!(
-                        "{other} is not a shell mode; choose managed or native_compat"
+                _ => {
+                    return Err(CliError::Usage(Shown::said(
+                        "the shell mode is managed or native_compat",
                     )));
                 }
             };
@@ -243,7 +249,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                     object.insert(
                         "outcome".to_owned(),
                         outcome.as_ref().map_or(serde_json::Value::Null, |outcome| {
-                            serde_json::json!(outcome.detail())
+                            serde_json::json!(outcome.detail().as_str())
                         }),
                     );
                     // An attachment that ended with the session's closure has its record, so the
@@ -290,7 +296,10 @@ async fn run(cli: Cli) -> Result<Completion> {
                     ),
                 }
                 if let Some(error) = presentation_error.as_ref() {
-                    eprintln!("kr: the session was created; its terminal was not opened: {error}");
+                    report::say(&shown!(
+                        "kr: the session was created; its terminal was not opened: {}",
+                        *error
+                    ));
                 }
                 if let Some(outcome) = outcome.as_ref() {
                     println!("{}", outcome.detail());
@@ -339,7 +348,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                 print_json(&serde_json::json!({
                     "ok": !outcome.is_failure(),
                     "session_id": session_id.to_string(),
-                    "outcome": outcome.detail(),
+                    "outcome": outcome.detail().as_str(),
                     "closure": outcome.closure().map(report::closure),
                 }));
             } else {
@@ -354,10 +363,11 @@ async fn run(cli: Cli) -> Result<Completion> {
             let (_, descriptor) = find(&paths, &selector, None)?;
             let mut client = open_worker(&descriptor, build_id()).await?;
             let attachment_id = match arguments.attachment.as_deref() {
-                Some(text) => Some(
-                    text.parse()
-                        .map_err(|_| CliError::Usage(format!("{text} is not an attachment")))?,
-                ),
+                Some(text) => Some(text.parse().map_err(|_| {
+                    CliError::Usage(Shown::said(
+                        "the text given is not an attachment identifier",
+                    ))
+                })?),
                 // Nothing was named, so this command presents the capability the line it runs
                 // from was given and the session answers from that. A caller holding none gets
                 // `AMBIGUOUS_ATTACHMENT` with the instruction to name the attachment, never a
@@ -637,10 +647,9 @@ async fn run(cli: Cli) -> Result<Completion> {
         Command::Skill(command) => skill(&paths, command, cli.json).await,
         Command::AgentTools(arguments) => {
             if !arguments.stdio {
-                return Err(CliError::Usage(
-                    "the tool server speaks over standard input and output: pass --stdio"
-                        .to_owned(),
-                ));
+                return Err(CliError::Usage(Shown::said(
+                    "the tool server speaks over standard input and output: pass --stdio",
+                )));
             }
             // Nothing is printed here. Standard output is the protocol's own stream from this
             // point, and one stray line on it would be a frame the client cannot parse.
@@ -684,9 +693,11 @@ async fn run(cli: Cli) -> Result<Completion> {
                         // On the error stream, because standard output is one document. A person
                         // sees what they selected either way, and a `--json` reader is not handed
                         // two things to parse.
-                        eprintln!("--include-content adds the content-bearing diagnostic export:");
+                        report::say(&Shown::said(
+                            "--include-content adds the content-bearing diagnostic export:",
+                        ));
                         for entry in &selected {
-                            eprintln!("{}", entry.describe());
+                            report::say(&entry.describe());
                         }
                         selected
                     } else {
@@ -768,9 +779,9 @@ async fn run(cli: Cli) -> Result<Completion> {
             } else {
                 // The one document above already says which diagnostics failed, so the failure is
                 // reported rather than returned and the exit status carries it.
-                Ok(Completion::Reported(CliError::Other(
-                    "one or more diagnostics did not pass".to_owned(),
-                )))
+                Ok(Completion::Reported(CliError::Other(Shown::said(
+                    "one or more diagnostics did not pass",
+                ))))
             }
         }
         Command::Host(arguments) => match arguments.command {
@@ -783,9 +794,8 @@ async fn run(cli: Cli) -> Result<Completion> {
                 // time it asks itself the question.
                 if let Some(chosen) = power.set.as_deref() {
                     let chosen = SleepInhibitionSetting::from_wire(chosen).ok_or_else(|| {
-                        CliError::Usage(format!(
-                            "{chosen} is not a power setting: choose off, mains_only or \
-                             battery_too"
+                        CliError::Usage(Shown::said(
+                            "the power setting is off, mains_only or battery_too",
                         ))
                     })?;
                     kr_cli::doctor::configuration::apply(
@@ -833,16 +843,20 @@ async fn run(cli: Cli) -> Result<Completion> {
                         Ok(()) => {}
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                         Err(error) => {
-                            return Err(CliError::Other(format!(
-                                "could not remove {}: {error}",
-                                file.display()
+                            return Err(CliError::Other(shown!(
+                                "could not remove {}: {}",
+                                Shown::within(
+                                    environment.paths.state_dir(),
+                                    kr_shell_integration::host::terminal::PREFERENCE_FILE
+                                ),
+                                Shown::io(&error)
                             )));
                         }
                     }
                 } else if let Some(chosen) = terminal.set.as_deref() {
                     if !available.iter().any(|application| application.id == chosen) {
-                        return Err(CliError::TerminalUnavailable(format!(
-                            "{chosen} is not installed on this host; it has {}",
+                        return Err(CliError::TerminalUnavailable(shown!(
+                            "the terminal given is not installed on this host; it has {}",
                             describe_terminals(&available)
                         )));
                     }
@@ -1003,13 +1017,12 @@ async fn run(cli: Cli) -> Result<Completion> {
                 kr_cli::bridge::print(command, cli.json).await?;
                 Ok(Completion::Done)
             }
-            (true, Some(_)) => Err(CliError::Usage(
-                "--stdio serves a bridge; it takes no other operation".to_owned(),
-            )),
-            (false, None) => Err(CliError::Usage(
-                "kr bridge --stdio serves a bridge; otherwise name list, enrol, forget or refresh"
-                    .to_owned(),
-            )),
+            (true, Some(_)) => Err(CliError::Usage(Shown::said(
+                "--stdio serves a bridge; it takes no other operation",
+            ))),
+            (false, None) => Err(CliError::Usage(Shown::said(
+                "kr bridge --stdio serves a bridge; otherwise name list, enrol, forget or refresh",
+            ))),
         },
     }
 }
@@ -1067,12 +1080,13 @@ fn launch_profile_document(profile: &kr_protocol::session::LaunchProfile) -> ser
 /// Names the terminal applications this host has, in the order it would choose them.
 fn describe_terminals(
     available: &[kr_shell_integration::host::terminal::TerminalApplication],
-) -> String {
-    available
-        .iter()
-        .map(|application| application.id.clone())
-        .collect::<Vec<_>>()
-        .join(", ")
+) -> Shown {
+    Shown::joined(
+        available
+            .iter()
+            .map(|application| Shown::identifier(&application.id)),
+        ", ",
+    )
 }
 
 /// Presents a session that has just been created.
@@ -1125,7 +1139,7 @@ async fn present(
                 .presentation_error
                 .as_ref()
                 .map_or(Ok(None), |error| {
-                    Err(CliError::TerminalUnavailable(error.message.clone()))
+                    Err(CliError::TerminalUnavailable(Shown::protocol(error)))
                 })
         }
     }
@@ -1146,12 +1160,16 @@ async fn attach_unpublished(
     match kr_cli::resolve::registered(paths, selector, environment).await? {
         kr_cli::resolve::Registered::Closed { session_id, record } => {
             let how = record.as_ref().map_or_else(
-                || "the host did not send its record".to_owned(),
+                || Shown::said("the host did not send its record"),
                 kr_cli::session::how_it_closed,
             );
-            let error = CliError::Refused(kr_protocol::error::ProtocolError::new(
+            let error = CliError::Refused(kr_client::error::refusal(
                 kr_protocol::error::ErrorCode::SessionClosed,
-                format!("session {session_id} has closed: {how}; attaching to it starts nothing"),
+                shown!(
+                    "session {} has closed: {}; attaching to it starts nothing",
+                    session_id,
+                    how
+                ),
             ));
             if json {
                 let mut document = report::failure(&error);
@@ -1161,14 +1179,16 @@ async fn attach_unpublished(
                     .map_or(serde_json::Value::Null, report::closure);
                 print_json(&document);
             } else {
-                eprintln!("kr: {error}");
+                report::failed(&error);
             }
             Ok(Completion::Reported(error))
         }
         kr_cli::resolve::Registered::Unpublished { session_id, state } => {
-            Err(CliError::HostUnavailable(format!(
-                "session {session_id} is {state} and has not published where to attach to it; \
-                 try again once it is live"
+            Err(CliError::HostUnavailable(shown!(
+                "session {} is {} and has not published where to attach to it; \
+                 try again once it is live",
+                session_id,
+                state
             )))
         }
     }
@@ -1277,7 +1297,10 @@ fn read_result(
                 last_command_block: Nullable::null(),
                 outstanding_launches: Nullable::null(),
             }),
-            Err(_) => Err(CliError::Other(error.to_string())),
+            Err(_) => Err(CliError::Other(shown!(
+                "the host's answer could not be read: {}",
+                Shown::cbor(&error)
+            ))),
         },
     }
 }
@@ -1294,8 +1317,11 @@ fn session_selector(named: Option<&str>) -> Result<SessionSelector> {
 fn parse_environment(named: Option<&str>) -> Result<Option<EnvironmentId>> {
     named
         .map(|text| {
-            text.parse::<EnvironmentId>()
-                .map_err(|_| CliError::Usage(format!("{text} is not an environment identifier")))
+            text.parse::<EnvironmentId>().map_err(|_| {
+                CliError::Usage(Shown::said(
+                    "the text given is not an environment identifier",
+                ))
+            })
         })
         .transpose()
 }
@@ -1441,7 +1467,7 @@ fn report_answered(
                 document["question_id"] = serde_json::json!(question_id.to_string());
                 print_json(&document);
             } else {
-                eprintln!("kr: {error}");
+                report::failed(&error);
             }
             Ok(Completion::Reported(error))
         }
@@ -1472,14 +1498,14 @@ fn answer_form(form: &kr_cli::cli::AnswerForm) -> Result<kr_protocol::question::
     if form.no {
         return Ok(QuestionAnswer::Decision { decided: false });
     }
-    Err(CliError::Usage(
-        "give one of --text, --choice, --yes, --no or --other".to_owned(),
-    ))
+    Err(CliError::Usage(Shown::said(
+        "give one of --text, --choice, --yes, --no or --other",
+    )))
 }
 
 fn parse_question(text: &str) -> Result<kr_protocol::ids::QuestionId> {
     text.parse()
-        .map_err(|_| CliError::Usage(format!("{text} is not a question identifier")))
+        .map_err(|_| CliError::Usage(Shown::said("the text given is not a question identifier")))
 }
 
 /// Runs `kr skill`.
@@ -1559,9 +1585,12 @@ async fn host_read<T: kr_protocol::wire::WireMessage, P: serde::Serialize + ?Siz
     params: &P,
 ) -> Result<T> {
     match client.request(method, params).await? {
-        Ok(value) => value
-            .to_typed()
-            .map_err(|error| CliError::Other(error.to_string())),
+        Ok(value) => value.to_typed().map_err(|error| {
+            CliError::Other(shown!(
+                "the host's answer could not be read: {}",
+                Shown::cbor(&error)
+            ))
+        }),
         Err(refused) if refused.code == kr_protocol::error::ErrorCode::PermissionDenied => {
             *client = open_controller(paths, build_id()).await?;
             typed(client.request(method, params).await?)
@@ -1579,7 +1608,12 @@ fn typed<T: kr_protocol::wire::WireMessage>(
     outcome
         .map_err(CliError::Refused)?
         .to_typed()
-        .map_err(|error| CliError::Other(error.to_string()))
+        .map_err(|error| {
+            CliError::Other(shown!(
+                "the host's answer could not be read: {}",
+                Shown::cbor(&error)
+            ))
+        })
 }
 
 fn print_json(value: &serde_json::Value) {

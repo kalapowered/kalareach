@@ -57,6 +57,7 @@ pub mod report;
 pub mod resolve;
 pub mod session;
 pub mod shell;
+pub mod shown;
 pub mod skill;
 pub mod startup;
 pub mod terminal;

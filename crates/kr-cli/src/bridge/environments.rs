@@ -4,6 +4,8 @@
 //! built from it. The command translates what a person typed and prints what the daemon answered;
 //! it decides nothing about whether an environment is running, because only the daemon has asked.
 
+use kr_client::shown;
+use kr_client::shown::Shown;
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::identity::{
     EnvironmentAccess, EnvironmentEnrolParams, EnvironmentEnrolResult, EnvironmentEnrolment,
@@ -34,8 +36,8 @@ pub fn access(text: &str) -> Result<EnvironmentAccess> {
         "container" => Ok(EnvironmentAccess::Container),
         "ssh" => Ok(EnvironmentAccess::SshHost),
         "paired" => Ok(EnvironmentAccess::PairedHost),
-        other => Err(CliError::Usage(format!(
-            "{other} is not an access class; choose wsl, container, ssh or paired"
+        _ => Err(CliError::Usage(Shown::said(
+            "--access takes an access class: wsl, container, ssh or paired",
         ))),
     }
 }
@@ -60,9 +62,12 @@ pub async fn list(arguments: &BridgeListArguments) -> Result<EnvironmentInventor
         )
         .await?
         .map_err(CliError::Refused)?;
-    answer
-        .to_typed()
-        .map_err(|error| CliError::Other(format!("the host's answer is not an inventory: {error}")))
+    answer.to_typed().map_err(|error| {
+        CliError::Other(shown!(
+            "the host's answer is not an inventory: {}",
+            Shown::cbor(&error)
+        ))
+    })
 }
 
 /// Records an environment this host may reach.
@@ -79,9 +84,11 @@ pub async fn enrol(arguments: &BridgeEnrolArguments) -> Result<EnvironmentEnrolR
         _ => arguments.target.clone(),
     };
     let environment_id = match arguments.environment_id.as_deref() {
-        Some(text) => text
-            .parse::<EnvironmentId>()
-            .map_err(|_| CliError::Usage(format!("{text} is not an environment identifier")))?,
+        Some(text) => text.parse::<EnvironmentId>().map_err(|_| {
+            CliError::Usage(Shown::said(
+                "--environment-id takes an environment identifier, a UUID",
+            ))
+        })?,
         // Asking a destination which environment it is means running the helper inside it, and
         // running anything inside a stopped environment starts it. Section 3 leaves starting to
         // refresh, create and attach, so a probe is asked for by name and is put only to an
@@ -91,18 +98,18 @@ pub async fn enrol(arguments: &BridgeEnrolArguments) -> Result<EnvironmentEnrolR
             query_helper_identity(access_class, &target, &arguments.user, &arguments.helper)
                 .await
                 .map_err(|error| {
-                    CliError::Usage(format!(
-                        "the destination did not say which environment it is ({error}); pass \
-                         --environment-id <uuid> instead"
+                    CliError::Usage(shown!(
+                        "the destination did not say which environment it is ({}); pass \
+                         --environment-id <uuid> instead",
+                        error
                     ))
                 })?
         }
         None => {
-            return Err(CliError::Usage(
+            return Err(CliError::Usage(Shown::said(
                 "an enrolment records the environment's own identity: pass --environment-id \
-                 <uuid>, or start the environment and pass --probe to ask it"
-                    .to_owned(),
-            ));
+                 <uuid>, or start the environment and pass --probe to ask it",
+            )));
         }
     };
     let enrolment = EnvironmentEnrolment {
@@ -120,7 +127,7 @@ pub async fn enrol(arguments: &BridgeEnrolArguments) -> Result<EnvironmentEnrolR
     };
     enrolment
         .validate()
-        .map_err(|error| CliError::Usage(error.to_string()))?;
+        .map_err(|error| CliError::Usage(shown!("{}", error)))?;
     let mut client = resolve::open_controller(&known.paths, crate::build_id()).await?;
     let answer = client
         .mutate(
@@ -131,9 +138,12 @@ pub async fn enrol(arguments: &BridgeEnrolArguments) -> Result<EnvironmentEnrolR
         )
         .await?
         .map_err(CliError::Refused)?;
-    answer
-        .to_typed()
-        .map_err(|error| CliError::Other(format!("the host's answer is not an enrolment: {error}")))
+    answer.to_typed().map_err(|error| {
+        CliError::Other(shown!(
+            "the host's answer is not an enrolment: {}",
+            Shown::cbor(&error)
+        ))
+    })
 }
 
 /// Resolves what a person typed to the identifier the container runtime issued.
@@ -148,22 +158,27 @@ fn resolve_container_target(target: &str) -> Result<String> {
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|error| {
-            CliError::Usage(format!(
-                "{RUNTIME} could not be run to resolve {target} to a container identifier \
-                 ({error}); pass the identifier the runtime issued"
+            CliError::Usage(shown!(
+                "{} could not be run to resolve the target to a container identifier ({}); pass \
+                 the identifier the runtime issued",
+                RUNTIME,
+                Shown::io(&error)
             ))
         })?;
+    // Neither the target nor what the runtime printed is repeated: the target is what was typed,
+    // and the runtime's own output is whatever it chose to say.
     if !output.status.success() {
-        return Err(CliError::Usage(format!(
-            "{RUNTIME} knows no container {target}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+        return Err(CliError::Usage(shown!(
+            "{} knows no container by that name ({})",
+            RUNTIME,
+            output.status
         )));
     }
     let resolved = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     if !kr_protocol::identity::is_container_identifier(&resolved) {
-        return Err(CliError::Usage(format!(
-            "{RUNTIME} answered {resolved:?} for {target}, which is not the whole identifier a \
-             container carries"
+        return Err(CliError::Usage(shown!(
+            "{} answered with something that is not the whole identifier a container carries",
+            RUNTIME
         )));
     }
     Ok(resolved)
@@ -182,22 +197,23 @@ fn probe_permitted(
 ) -> Result<()> {
     let observed = kr_controller::bridge::platform::destination_state(access, target, user, helper)
         .map_err(|error| {
-            CliError::Usage(format!(
-                "this host could not ask whether {target} is running, so it will not start it by \
-                 asking ({error}); pass --environment-id <uuid> instead"
+            CliError::Usage(shown!(
+                "this host could not ask whether the destination is running ({}), so it will not \
+                 start it by asking; pass --environment-id <uuid> instead",
+                error.code()
             ))
         })?;
-    probe_decision(observed, target)
+    probe_decision(observed)
 }
 
 /// The rule a probe follows once the platform has answered.
-fn probe_decision(observed: EnvironmentPresence, target: &str) -> Result<()> {
+fn probe_decision(observed: EnvironmentPresence) -> Result<()> {
     match observed {
         EnvironmentPresence::Running => Ok(()),
         EnvironmentPresence::EnvironmentStopped | EnvironmentPresence::Stale => {
-            Err(CliError::Usage(format!(
-                "{target} is not running, and asking it which environment it is would start it; \
-                 start it yourself, or pass --environment-id <uuid>"
+            Err(CliError::Usage(Shown::said(
+                "the destination is not running, and asking it which environment it is would \
+                 start it; start it yourself, or pass --environment-id <uuid>",
             )))
         }
     }
@@ -215,9 +231,11 @@ async fn query_helper_identity(
     target: &str,
     user: &str,
     helper: &str,
-) -> std::result::Result<EnvironmentId, String> {
+) -> std::result::Result<EnvironmentId, Shown> {
+    // What the launch and the destination said is not repeated: it carries the target, the user
+    // and whatever the destination wrote.
     let command = kr_controller::bridge::launch::helper_command(access, target, user, helper)
-        .map_err(|error| error.to_string())?;
+        .map_err(|_| Shown::said("the helper's command could not be built"))?;
     let hello = kr_protocol::identity::BridgeHello {
         protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
         build_id: crate::build_id(),
@@ -229,7 +247,7 @@ async fn query_helper_identity(
     };
     let acknowledgement = kr_controller::bridge::invoke::discover(&command, &hello)
         .await
-        .map_err(|refusal| refusal.to_string())?;
+        .map_err(|_| Shown::said("the helper did not answer with its environment"))?;
     Ok(acknowledgement.environment_id)
 }
 
@@ -267,9 +285,12 @@ pub async fn forget(arguments: &BridgeForgetArguments) -> Result<EnvironmentForg
         )
         .await?
         .map_err(CliError::Refused)?;
-    answer
-        .to_typed()
-        .map_err(|error| CliError::Other(format!("the host's answer is not a removal: {error}")))
+    answer.to_typed().map_err(|error| {
+        CliError::Other(shown!(
+            "the host's answer is not a removal: {}",
+            Shown::cbor(&error)
+        ))
+    })
 }
 
 /// Observes one enrolled environment now.
@@ -294,9 +315,12 @@ pub async fn refresh(arguments: &BridgeRefreshArguments) -> Result<EnvironmentRe
         )
         .await?
         .map_err(CliError::Refused)?;
-    answer
-        .to_typed()
-        .map_err(|error| CliError::Other(format!("the host's answer is not a refresh: {error}")))
+    answer.to_typed().map_err(|error| {
+        CliError::Other(shown!(
+            "the host's answer is not a refresh: {}",
+            Shown::cbor(&error)
+        ))
+    })
 }
 
 /// Resolves what a person typed to the identity the record carries.
@@ -315,20 +339,23 @@ async fn labelled(client: &mut kr_ipc::client::LocalClient, label: &str) -> Resu
         .await?
         .map_err(CliError::Refused)?;
     let inventory: EnvironmentInventoryResult = answer.to_typed().map_err(|error| {
-        CliError::Other(format!("the host's answer is not an inventory: {error}"))
+        CliError::Other(shown!(
+            "the host's answer is not an inventory: {}",
+            Shown::cbor(&error)
+        ))
     })?;
     let mut matched = inventory
         .rows
         .iter()
         .filter(|row| row.enrolment.selected_by(label));
     let Some(first) = matched.next() else {
-        return Err(CliError::Usage(format!(
-            "this host has no enrolled environment called {label}"
+        return Err(CliError::Usage(Shown::said(
+            "this host has no enrolled environment by that label",
         )));
     };
     if matched.next().is_some() {
-        return Err(CliError::Usage(format!(
-            "{label} names more than one enrolled environment; give the environment identifier"
+        return Err(CliError::Usage(Shown::said(
+            "that label names more than one enrolled environment; give the environment identifier",
         )));
     }
     Ok(first.enrolment.environment_id)
@@ -359,12 +386,12 @@ mod tests {
 
     #[test]
     fn a_probe_is_put_only_to_an_environment_that_is_already_running() {
-        probe_decision(EnvironmentPresence::Running, "Ubuntu-24.04").expect("running is asked");
+        probe_decision(EnvironmentPresence::Running).expect("running is asked");
         for quiet in [
             EnvironmentPresence::EnvironmentStopped,
             EnvironmentPresence::Stale,
         ] {
-            let refused = probe_decision(quiet, "Ubuntu-24.04").expect_err("not asked");
+            let refused = probe_decision(quiet).expect_err("not asked");
             assert!(refused.to_string().contains("would start it"), "{refused}");
         }
     }

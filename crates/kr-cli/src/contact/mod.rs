@@ -25,6 +25,8 @@
 //! neither is this server stopping because its transport ended: then the question ends with this
 //! process, as expired.
 
+use kr_client::shown;
+use kr_client::shown::{Said, Shown};
 use std::sync::Arc;
 
 use rmcp::handler::server::tool::ToolRouter;
@@ -39,7 +41,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{BuildId, QuestionId};
 use kr_protocol::method::Method;
 use kr_protocol::question::{
@@ -694,10 +696,12 @@ impl Contact {
         if self.cancelled_by_the_client(call) {
             return self.cancel_for_the_call(bound, question_id, token).await;
         }
-        Err(CliError::Refused(ProtocolError::new(
+        Err(CliError::Refused(kr_client::error::refusal(
             ErrorCode::ResourceUnavailable,
-            "the tool server is stopping; the question was not cancelled, and it ends when this \
-             process does",
+            Shown::said(
+                "the tool server is stopping; the question was not cancelled, and it ends when \
+                 this process does",
+            ),
         )))
     }
 
@@ -808,14 +812,18 @@ pub async fn run_stdio(build_id: BuildId) -> CliResult<()> {
         ),
         ended: Arc::clone(&contact.transport_ended),
     };
-    let service = contact
-        .serve(transport)
-        .await
-        .map_err(|error| CliError::Other(format!("the tool server could not start: {error}")))?;
-    let stopped = service
-        .waiting()
-        .await
-        .map_err(|error| CliError::Other(format!("the tool server stopped: {error}")));
+    let service = contact.serve(transport).await.map_err(|error| {
+        CliError::Other(shown!(
+            "the tool server could not start: {}",
+            crate::shown::tool_server(&error)
+        ))
+    })?;
+    let stopped = service.waiting().await.map_err(|error| {
+        CliError::Other(shown!(
+            "the tool server stopped: {}",
+            crate::shown::task(&error)
+        ))
+    });
     // A call the client cancelled just before the transport ended may still be cancelling its
     // question. It is given a bounded moment to finish, so the process does not exit under it.
     let _ = tokio::time::timeout(CALLS_FINISH_WITHIN, calls.finished()).await;
@@ -825,9 +833,9 @@ pub async fn run_stdio(build_id: BuildId) -> CliResult<()> {
 
 /// The refusal a call cancelled before its question was asked is answered with.
 fn asked_nothing() -> CliError {
-    CliError::Other(
-        "the call was cancelled before the question was asked; nothing was created".to_owned(),
-    )
+    CliError::Other(Shown::said(
+        "the call was cancelled before the question was asked; nothing was created",
+    ))
 }
 
 /// Renders a refusal as a tool error the agent can read and act on.
@@ -838,9 +846,9 @@ fn asked_nothing() -> CliError {
 fn refusal(error: CliError) -> CallToolResult {
     let protocol = match &error {
         CliError::Refused(refused) => refused.clone(),
-        other => ProtocolError::new(
+        other => kr_client::error::refusal(
             ErrorCode::from_wire(&other.code()).unwrap_or(ErrorCode::ResourceUnavailable),
-            other.to_string(),
+            other.said(),
         ),
     };
     let mut value = json!({
@@ -899,7 +907,7 @@ fn seconds(value: u64) -> DurationMs {
 
 fn parse_question(text: &str) -> CliResult<QuestionId> {
     text.parse()
-        .map_err(|_| CliError::Usage(format!("{text} is not a question identifier")))
+        .map_err(|_| CliError::Usage(Shown::said("the text given is not a question identifier")))
 }
 
 /// Renders a caller token for the agent to hold.
@@ -911,15 +919,15 @@ fn encode_token(token: &CallerToken) -> String {
 fn decode_token(text: &str) -> CliResult<CallerToken> {
     let trimmed = text.trim();
     if !trimmed.len().is_multiple_of(2) {
-        return Err(CliError::Usage("that is not a caller token".to_owned()));
+        return Err(CliError::Usage(Shown::said("that is not a caller token")));
     }
     let mut bytes = Vec::with_capacity(trimmed.len() / 2);
     for pair in trimmed.as_bytes().chunks(2) {
         let text = std::str::from_utf8(pair)
-            .map_err(|_| CliError::Usage("that is not a caller token".to_owned()))?;
+            .map_err(|_| CliError::Usage(Shown::said("that is not a caller token")))?;
         bytes.push(
             u8::from_str_radix(text, 16)
-                .map_err(|_| CliError::Usage("that is not a caller token".to_owned()))?,
+                .map_err(|_| CliError::Usage(Shown::said("that is not a caller token")))?,
         );
     }
     Ok(CallerToken::new(bytes))
@@ -1011,9 +1019,9 @@ mod tests {
     /// instruction.
     #[test]
     fn a_refusal_carries_the_stable_code_and_the_setup_instruction() {
-        let result = refusal(CliError::Refused(ProtocolError::new(
+        let result = refusal(CliError::Refused(kr_client::error::refusal(
             ErrorCode::NotInKrSession,
-            "nowhere",
+            Shown::said("nowhere"),
         )));
         let content = result.structured_content.expect("structured");
         assert_eq!(content["code"], "NOT_IN_KR_SESSION");

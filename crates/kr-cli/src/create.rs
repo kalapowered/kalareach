@@ -6,6 +6,7 @@
 //! of those needs a terminal, which is why an invisible creation cannot ask for it: colours
 //! attributed to a probe nobody ran would be a provenance the session made up.
 
+use kr_client::shown::Shown;
 use kr_protocol::session::{PalettePreset, PaletteRequest, Presentation, ProbedPalette};
 
 use crate::attach::RestorationGuard;
@@ -47,8 +48,8 @@ impl PaletteChoice {
             "light" => Ok(Self::Light),
             "dark" => Ok(Self::Dark),
             "probe" => Ok(Self::Probe),
-            other => Err(CliError::Usage(format!(
-                "--palette takes light, dark or probe, not {other}"
+            _ => Err(CliError::Usage(Shown::said(
+                "--palette takes light, dark or probe",
             ))),
         }
     }
@@ -86,11 +87,10 @@ pub fn resolve(choice: PaletteChoice, presentation: Presentation) -> Result<Chos
         PaletteChoice::Dark => preset(PalettePreset::Dark),
         PaletteChoice::Probe => {
             if presentation == Presentation::Invisible {
-                return Err(CliError::Usage(
+                return Err(CliError::Usage(Shown::said(
                     "--palette probe asks this terminal for its colours, and an invisible session \
-                     has no terminal; choose light or dark"
-                        .to_owned(),
-                ));
+                     has no terminal; choose light or dark",
+                )));
             }
             probed()
         }
@@ -140,11 +140,10 @@ fn probed() -> Result<Chosen> {
         // The exchange finished, so the person's own typing came back with it, and this refusal is
         // where it stops: no session exists to forward it to. They are owed the number.
         let _owed = crate::session::UndeliveredTyping::new(probe.typed.len());
-        return Err(CliError::TerminalProbeFailed(
+        return Err(CliError::TerminalProbeFailed(Shown::said(
             "this terminal did not report both its default foreground and its default background, \
-             so there is no shared palette to record; choose light or dark"
-                .to_owned(),
-        ));
+             so there is no shared palette to record; choose light or dark",
+        )));
     };
     Ok(Chosen {
         palette: PaletteRequest::Probe(ProbedPalette {

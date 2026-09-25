@@ -11,6 +11,8 @@
 //! anything; a destination that is not as expected is refused with nothing written. A write to a
 //! working tree is refused until the person passes back each limitation the host states for it.
 
+use kr_client::shown;
+use kr_client::shown::Shown;
 use kr_ipc::paths::HostPaths;
 use kr_protocol::changeset::{
     AffectedVersion, ApplyOutcomeClass, DestinationClass, DiffApplyParams, DiffApplyResult,
@@ -170,7 +172,7 @@ async fn apply(
         (None, false) => print!("{}", outcome(&applied, revert)),
         (Some(error), false) => {
             print!("{}", outcome(&applied, revert));
-            eprintln!("kr: {error}");
+            report::failed(error);
         }
     }
     Ok(unfinished.map_or(Completion::Done, Completion::Reported))
@@ -204,9 +206,10 @@ fn unfinished(applied: &DiffApplyResult, revert: bool) -> Option<CliError> {
     };
     Some(CliError::Unfinished {
         code,
-        message: format!(
-            "the {} did not finish: {what}; the result names each path and what to recover from",
-            if revert { "revert" } else { "apply" }
+        message: shown!(
+            "the {} did not finish: {}; the result names each path and what to recover from",
+            if revert { "revert" } else { "apply" },
+            what
         ),
     })
 }
@@ -224,19 +227,22 @@ const fn destination(argument: DestinationArgument) -> DestinationClass {
 /// The digest is the last part: a path can hold `=`, and a digest cannot.
 fn expectation(text: &str) -> Result<AffectedVersion> {
     let Some((path, expected)) = text.rsplit_once('=') else {
-        return Err(CliError::Usage(format!(
-            "--expect {text}: name a path and what it holds now, as PATH=DIGEST or PATH={ABSENT}"
+        return Err(CliError::Usage(shown!(
+            "--expect names a path and what it holds now, as PATH=DIGEST or PATH={}",
+            ABSENT
         )));
     };
     if path.is_empty() {
-        return Err(CliError::Usage(format!("--expect {text} names no path")));
+        return Err(CliError::Usage(Shown::said(
+            "an --expect value names no path",
+        )));
     }
     let expected_worktree_digest = if expected == ABSENT {
         Nullable::null()
     } else {
         Nullable::some(digest(expected).ok_or_else(|| {
-            CliError::Usage(format!(
-                "--expect {text}: {expected} is not a content digest as kr diff read shows one"
+            CliError::Usage(Shown::said(
+                "an --expect value's digest is not a content digest as kr diff read shows one",
             ))
         })?)
     };

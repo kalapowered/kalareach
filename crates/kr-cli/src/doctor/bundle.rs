@@ -21,6 +21,8 @@
 //! built in memory and written owner-only in one atomic replacement, because a bundle half-written
 //! into a path a person is about to attach to a message is worse than no bundle.
 
+use kr_client::shown;
+use kr_client::shown::Shown;
 use std::path::Path;
 
 use kr_protocol::hostinfo::export::Sentence;
@@ -61,8 +63,8 @@ pub struct Content {
 impl Content {
     /// The sentence the command prints before writing a bundle that will carry this.
     #[must_use]
-    pub fn describe(&self) -> String {
-        format!("  {}: {}", self.entry, self.describes.as_str())
+    pub fn describe(&self) -> Shown {
+        shown!("  {}: {}", self.entry, Shown::sentence(&self.describes))
     }
 }
 
@@ -100,8 +102,9 @@ pub fn write(path: &Path, bundle: &ComposedBundle, content: &[Content]) -> Resul
     {
         std::env::current_dir()
             .map_err(|error| {
-                CliError::Other(format!(
-                    "this bundle's destination could not be resolved: {error}"
+                CliError::Other(shown!(
+                    "this bundle's destination could not be resolved: {}",
+                    Shown::io(&error)
                 ))
             })?
             .join(path)
@@ -124,8 +127,12 @@ pub fn write(path: &Path, bundle: &ComposedBundle, content: &[Content]) -> Resul
                 .collect(),
         })
     };
-    let manifest = serde_json::to_vec_pretty(&bundle)
-        .map_err(|error| CliError::Other(format!("this bundle could not be written: {error}")))?;
+    let manifest = serde_json::to_vec_pretty(&bundle).map_err(|error| {
+        CliError::Other(shown!(
+            "this bundle could not be written: {}",
+            Shown::json(&error)
+        ))
+    })?;
     let report = super::doctor_lines(bundle.doctor().get(), true);
     let mut archive = Archive::new();
     archive.file(MANIFEST, &manifest)?;
@@ -167,13 +174,13 @@ impl Archive {
         let mut header = [0u8; BLOCK];
         let bytes = name.as_bytes();
         if bytes.len() > 100 {
-            return Err(CliError::Other(format!(
-                "{name} is longer than an archive entry name may be"
+            return Err(CliError::Other(Shown::said(
+                "an entry name is longer than an archive entry name may be",
             )));
         }
         if contents.len() as u64 > MAX_ENTRY_LEN {
-            return Err(CliError::Other(format!(
-                "{name} is larger than an archive entry may be"
+            return Err(CliError::Other(Shown::said(
+                "an entry is larger than an archive entry may be",
             )));
         }
         header[..bytes.len()].copy_from_slice(bytes);

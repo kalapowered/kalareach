@@ -4,6 +4,7 @@
 //! the definitions here: a literal `--` ends KalaReach option parsing, and no shell command or path
 //! is ever assembled by interpolating text.
 
+use kr_client::shown::Shown;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -1109,9 +1110,9 @@ impl NewArguments {
             "host-default" | "host_default" => kr_protocol::session::ShellStartup::HostDefault,
             "interactive" => kr_protocol::session::ShellStartup::Interactive,
             "login" => kr_protocol::session::ShellStartup::Login,
-            other => {
-                return Err(crate::CliError::Usage(format!(
-                    "{other} is not a startup selection; use host-default, interactive or login"
+            _ => {
+                return Err(crate::CliError::Usage(Shown::said(
+                    "--startup takes host-default, interactive or login",
                 )));
             }
         };
@@ -1247,9 +1248,9 @@ impl Presentation {
         if stdio_is_terminal {
             Ok(kr_protocol::session::Presentation::Attach)
         } else {
-            Err(crate::error::CliError::Usage(
-                "choose --attach, --terminal or --invisible: standard input and output are not terminals".to_owned(),
-            ))
+            Err(crate::error::CliError::Usage(Shown::said(
+                "choose --attach, --terminal or --invisible: standard input and output are not terminals",
+            )))
         }
     }
 }

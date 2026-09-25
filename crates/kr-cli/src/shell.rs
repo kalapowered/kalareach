@@ -7,6 +7,8 @@
 //! points a shell at another `ZDOTDIR`, substitutes an `--rcfile` or disables a profile, and the
 //! entry itself is inert in every shell KalaReach did not start.
 
+use kr_client::shown;
+use kr_client::shown::Shown;
 use kr_shell_integration::contract::qualification::ShellKind;
 use kr_shell_integration::host::package::{
     PACKAGE_ROOT_VARIABLE, PackageSet, ShellPackage, default_package_root,
@@ -66,7 +68,7 @@ pub struct EntryReport {
 /// Returns a configuration failure when a package's manifest cannot be read.
 pub fn packages() -> Result<PackageSet> {
     PackageSet::installed(&default_package_root())
-        .map_err(|fault| CliError::ShellIntegrationUnsupported(fault.to_string()))
+        .map_err(|fault| CliError::ShellIntegrationUnsupported(crate::shown::package_fault(&fault)))
 }
 
 /// Returns the packages one selector names.
@@ -84,13 +86,15 @@ pub fn selected<'a>(set: &'a PackageSet, shell: Option<&str>) -> Result<Vec<&'a 
         .copied()
         .find(|kind| kind.as_str() == requested)
         .ok_or_else(|| {
-            CliError::Usage(format!(
-                "{requested} is not a shell KalaReach qualifies; it qualifies zsh, bash, fish and powershell"
+            CliError::Usage(Shown::said(
+                "the shell given is not one KalaReach qualifies; it qualifies zsh, bash, fish and \
+                 powershell",
             ))
         })?;
     set.get(kind).map(|package| vec![package]).ok_or_else(|| {
-        CliError::ShellIntegrationUnsupported(format!(
-            "this installation has no qualified {requested} package"
+        CliError::ShellIntegrationUnsupported(shown!(
+            "this installation has no qualified {} package",
+            kind.as_str()
         ))
     })
 }
@@ -161,8 +165,9 @@ pub fn install(
                 Change::Added
             }
         } else {
-            startup::install(path, &body)
-                .map_err(|error| CliError::Other(format!("{}: {error}", entry.path)))?
+            startup::install(path, &body).map_err(|error| {
+                CliError::Other(shown!("{}: {}", Shown::root(path), Shown::io(&error)))
+            })?
         };
         entry.change = Some(change);
         // A dry run reports what is there; a real one reports what it just wrote.
@@ -194,8 +199,9 @@ pub fn shells(selector: Option<&str>) -> Result<Vec<ShellKind>> {
         .find(|kind| kind.as_str() == requested)
         .map(|kind| vec![kind])
         .ok_or_else(|| {
-            CliError::Usage(format!(
-                "{requested} is not a shell KalaReach qualifies; it qualifies zsh, bash, fish and powershell"
+            CliError::Usage(Shown::said(
+                "the shell given is not one KalaReach qualifies; it qualifies zsh, bash, fish and \
+                 powershell",
             ))
         })
 }
@@ -220,8 +226,9 @@ pub fn remove(kind: ShellKind, layout: &HomeLayout, dry_run: bool) -> Result<She
                 Change::Absent
             }
         } else {
-            startup::remove(path)
-                .map_err(|error| CliError::Other(format!("{}: {error}", entry.path)))?
+            startup::remove(path).map_err(|error| {
+                CliError::Other(shown!("{}: {}", Shown::root(path), Shown::io(&error)))
+            })?
         };
         entry.change = Some(change);
         entry.installed = if dry_run {

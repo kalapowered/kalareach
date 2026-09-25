@@ -19,24 +19,31 @@
 //! **The destination is this host's runtime root and nothing else.** The path is derived from the
 //! runtime root the host already owns; the operator names the file to read, not the file to write.
 
+use kr_client::shown;
+use kr_client::shown::Shown;
 use std::path::{Path, PathBuf};
 
+use kr_client::services::account::{scope_names, scope_words};
 use kr_client::services::voice::{
     ACCOUNT_TOKEN_FILE_LIMIT, StoredAccountToken, VOICE_SCOPE, account_token_path,
 };
 use kr_ipc::paths::HostPaths;
 
 use crate::error::{CliError, Result};
+use crate::shown::named;
 
 /// What an import did, for a person and for `--json`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Imported {
     /// Where the token was written.
     pub path: String,
-    /// The origin it belongs to.
+    /// The origin it belongs to, as a diagnostic names one: the scheme, the host and the port.
     pub origin: String,
-    /// The scopes it carries.
-    pub scopes: Vec<String>,
+    /// The scopes it carries that this build knows, by name.
+    pub scopes: Vec<&'static str>,
+    /// How many scopes it carries that this build does not know. They are counted, not repeated:
+    /// a scope is whatever the file said.
+    pub unknown_scopes: usize,
     /// When it stops being accepted, in UTC milliseconds, or null when the issuer did not say.
     pub expires_at_ms: Option<u64>,
     /// True when it carries the scope managed voice needs.
@@ -54,11 +61,10 @@ impl Imported {
             format!("Wrote the account token to {}.", self.path),
             format!("It belongs to {}.", self.origin),
         ];
-        lines.push(if self.scopes.is_empty() {
-            "It carries no scopes.".to_owned()
-        } else {
-            format!("It carries {}.", self.scopes.join(", "))
-        });
+        lines.push(format!(
+            "It carries {}.",
+            scope_words(&self.scopes, self.unknown_scopes)
+        ));
         if let Some(expires_at_ms) = self.expires_at_ms {
             lines.push(format!(
                 "It stops being accepted at {expires_at_ms} in UTC milliseconds."
@@ -97,30 +103,37 @@ pub fn import_into(source: &Path, runtime_root: &Path) -> Result<Imported> {
     // The operator names the file to read. The file to write is derived from the runtime root this
     // host already owns, so there is no argument that could put a token somewhere else.
     if !destination.starts_with(runtime_root) {
-        return Err(CliError::Usage(
-            "an account token is written inside this host's runtime directory".to_owned(),
-        ));
+        return Err(CliError::Usage(Shown::said(
+            "an account token is written inside this host's runtime directory",
+        )));
     }
     let bytes = read_source(source)?;
     let stored = StoredAccountToken::read(&bytes).map_err(|error| {
         // The refusal from the reader names the shape, never the value.
-        CliError::Usage(format!("{} could not be read: {error}", source.display()))
+        CliError::Usage(shown!("{} could not be read: {}", named(source), error))
     })?;
 
-    std::fs::create_dir_all(runtime_root)
-        .map_err(|error| CliError::Usage(format!("{}: {error}", runtime_root.display())))?;
+    std::fs::create_dir_all(runtime_root).map_err(|error| {
+        CliError::Usage(shown!(
+            "{}: {}",
+            Shown::root(runtime_root),
+            Shown::io(&error)
+        ))
+    })?;
     kr_ipc::paths::write_owner_only_file(
         &destination,
-        &stored
-            .write()
-            .map_err(|error| CliError::Usage(format!("the token could not be written: {error}")))?,
+        &stored.write().map_err(|error| {
+            CliError::Usage(shown!("the token could not be written: {}", error))
+        })?,
     )
     .map_err(CliError::from)?;
 
+    let (scopes, unknown_scopes) = scope_names(&stored.scopes);
     Ok(Imported {
         path: destination.display().to_string(),
-        origin: stored.origin.clone(),
-        scopes: stored.scopes.clone(),
+        origin: Shown::address(&stored.origin).into_string(),
+        scopes,
+        unknown_scopes,
         expires_at_ms: stored.expires_at_ms,
         carries_voice_scope: stored.carries(VOICE_SCOPE),
     })
@@ -139,14 +152,15 @@ pub fn token_path() -> Result<PathBuf> {
 /// Reads the operator's file, bounded.
 fn read_source(source: &Path) -> Result<Vec<u8>> {
     let metadata = std::fs::metadata(source)
-        .map_err(|error| CliError::Usage(format!("{}: {error}", source.display())))?;
+        .map_err(|error| CliError::Usage(shown!("{}: {}", named(source), Shown::io(&error))))?;
     if metadata.len() > ACCOUNT_TOKEN_FILE_LIMIT {
-        return Err(CliError::Usage(format!(
+        return Err(CliError::Usage(shown!(
             "{} is larger than an account token document",
-            source.display()
+            named(source)
         )));
     }
-    std::fs::read(source).map_err(|error| CliError::Usage(format!("{}: {error}", source.display())))
+    std::fs::read(source)
+        .map_err(|error| CliError::Usage(shown!("{}: {}", named(source), Shown::io(&error))))
 }
 
 #[cfg(test)]

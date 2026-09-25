@@ -11,6 +11,7 @@
 //! reviewer would see. A removal never takes what a workspace still holds unless the person says
 //! so, and the answer lists what is held.
 
+use kr_client::shown::Shown;
 use kr_ipc::paths::HostPaths;
 use kr_protocol::ids::{ChangeSetId, WorkspaceId};
 use kr_protocol::method::Method;
@@ -84,11 +85,10 @@ async fn create(paths: &HostPaths, arguments: &WorkspaceCreateArguments, json: b
         // class is in it; excluding one would need a tree of its own.
         WorkspaceKindArgument::Shared => {
             if !arguments.include.is_empty() {
-                return Err(CliError::Usage(
+                return Err(CliError::Usage(Shown::said(
                     "--include chooses what an isolated workspace starts with; a shared one is \
-                     the repository's own tree and keeps everything in place"
-                        .to_owned(),
-                ));
+                     the repository's own tree and keeps everything in place",
+                )));
             }
             (
                 WorkspaceKind::SharedExisting,

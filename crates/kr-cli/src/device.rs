@@ -6,6 +6,7 @@
 //! person deciding whether a revocation has taken effect needs to see which have answered. A
 //! revocation names the device by its identifier and takes every grant the device holds with it.
 
+use kr_client::shown;
 use kr_ipc::paths::HostPaths;
 use kr_protocol::ids::DeviceId;
 use kr_protocol::method::Method;
@@ -13,7 +14,8 @@ use kr_protocol::sharing::{
     DeviceListParams, DeviceListResult, DeviceRevokeParams, DeviceSummary, RevocationResult,
 };
 
-use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_client::error::refusal;
+use kr_protocol::error::ErrorCode;
 
 use crate::cli::{DeviceCommand, DeviceListArguments, DeviceRevokeArguments};
 use crate::daemon::{Daemon, identifier};
@@ -98,9 +100,12 @@ async fn revoke(
         .iter()
         .any(|summary| summary.device_id == device)
     {
-        return Err(CliError::Refused(ProtocolError::new(
+        return Err(CliError::Refused(refusal(
             ErrorCode::ResourceUnavailable,
-            format!("no device {device} has been paired with this host, so nothing was revoked"),
+            shown!(
+                "no device {} has been paired with this host, so nothing was revoked",
+                device
+            ),
         )));
     }
     let revoked: RevocationResult = daemon
@@ -116,7 +121,7 @@ async fn revoke(
         (None, false) => print!("{}", revocation(device, &revoked)),
         (Some(error), false) => {
             print!("{}", revocation(device, &revoked));
-            eprintln!("kr: {error}");
+            report::failed(error);
         }
     }
     Ok(pending.map_or(Completion::Done, Completion::Reported))
@@ -131,9 +136,10 @@ fn pending(device: DeviceId, revoked: &RevocationResult) -> Option<CliError> {
     }
     Some(CliError::Unfinished {
         code: ErrorCode::ResourceUnavailable,
-        message: format!(
-            "the revocation of device {device} is recorded and still pending: {} session \
+        message: shown!(
+            "the revocation of device {} is recorded and still pending: {} session \
              worker{} {} not fenced it yet, and asking again reports how far it has got",
+            device,
             waiting.len(),
             if waiting.len() == 1 { "" } else { "s" },
             if waiting.len() == 1 { "has" } else { "have" }

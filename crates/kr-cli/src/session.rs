@@ -8,6 +8,9 @@
 
 use std::sync::Arc;
 
+use kr_client::error::refusal;
+use kr_client::shown;
+use kr_client::shown::Shown;
 use kr_ipc::client::LocalClient;
 use kr_protocol::attachment::ViewportPosition;
 use kr_protocol::envelope::ControlFrame;
@@ -40,8 +43,8 @@ pub enum AttachOutcome {
     /// The session has ended, so this is no lost connection; how it ended is not known here, so it
     /// is no success either.
     ClosureUnreadable {
-        /// Why the closure could not be read.
-        detail: String,
+        /// Why the closure could not be read: the rule it broke and where, never what it held.
+        detail: Shown,
         /// Whether something typed here was not delivered because the session was closing.
         undelivered: bool,
     },
@@ -50,7 +53,7 @@ pub enum AttachOutcome {
     /// The connection to the worker ended.
     Disconnected,
     /// Input could not be delivered, and whether it arrived is not known.
-    DeliveryUncertain(String),
+    DeliveryUncertain(Shown),
 }
 
 /// What the line about a closure adds when the session refused something typed here.
@@ -59,13 +62,13 @@ const UNDELIVERED: &str = "; what was typed while it was closing was not deliver
 impl AttachOutcome {
     /// Returns the sentence a person is shown.
     #[must_use]
-    pub fn detail(&self) -> String {
+    pub fn detail(&self) -> Shown {
         match self {
-            Self::Detached => "detached".to_owned(),
+            Self::Detached => Shown::said("detached"),
             Self::Closed {
                 record,
                 undelivered,
-            } => format!(
+            } => shown!(
                 "the session closed: {}{}",
                 how_it_closed(record),
                 if *undelivered { UNDELIVERED } else { "" }
@@ -73,14 +76,15 @@ impl AttachOutcome {
             Self::ClosureUnreadable {
                 detail,
                 undelivered,
-            } => format!(
-                "the session closed, and how it closed could not be read ({detail}){}",
+            } => shown!(
+                "the session closed, and how it closed could not be read ({}){}",
+                *detail,
                 if *undelivered { UNDELIVERED } else { "" }
             ),
-            Self::LeaseLost => "another attachment took the input lease".to_owned(),
-            Self::Disconnected => "the connection to the session ended".to_owned(),
+            Self::LeaseLost => Shown::said("another attachment took the input lease"),
+            Self::Disconnected => Shown::said("the connection to the session ended"),
             Self::DeliveryUncertain(detail) => {
-                format!("some input may not have reached the session: {detail}")
+                shown!("some input may not have reached the session: {}", *detail)
             }
         }
     }
@@ -119,14 +123,15 @@ impl AttachOutcome {
                 (!closed_cleanly(record)).then(|| CliError::SessionClosed(self.detail()))
             }
             Self::ClosureUnreadable { .. } => Some(CliError::SessionClosed(self.detail())),
-            Self::LeaseLost => Some(CliError::Refused(kr_protocol::error::ProtocolError::new(
+            Self::LeaseLost => Some(CliError::Refused(refusal(
                 ErrorCode::LeaseLost,
                 self.detail(),
             ))),
             Self::Disconnected => Some(CliError::HostUnavailable(self.detail())),
-            Self::DeliveryUncertain(_) => Some(CliError::Refused(
-                kr_protocol::error::ProtocolError::new(ErrorCode::OutcomeUnknown, self.detail()),
-            )),
+            Self::DeliveryUncertain(_) => Some(CliError::Refused(refusal(
+                ErrorCode::OutcomeUnknown,
+                self.detail(),
+            ))),
         }
     }
 }
@@ -156,21 +161,21 @@ pub fn closed_cleanly(record: &ClosureRecord) -> bool {
 /// Says how a session closed, in the words a person is shown: what an attachment says when the
 /// session closes under it, and what an attach to a session that has already closed says.
 #[must_use]
-pub fn how_it_closed(record: &ClosureRecord) -> String {
+pub fn how_it_closed(record: &ClosureRecord) -> Shown {
     match record.reason {
         ClosureReason::RootExit => record.root_exit_code.as_ref().map_or_else(
-            || "its shell exited".to_owned(),
-            |code| format!("its shell exited with status {}", code.get()),
+            || Shown::said("its shell exited"),
+            |code| shown!("its shell exited with status {}", code.get()),
         ),
-        ClosureReason::RootSignal => record.root_signal.as_ref().map_or_else(
-            || "a signal ended its shell".to_owned(),
-            |signal| format!("a signal ended its shell ({signal})"),
+        ClosureReason::RootSignal => Shown::signal(record).map_or_else(
+            || Shown::said("a signal ended its shell"),
+            |signal| shown!("a signal ended its shell ({})", signal),
         ),
-        ClosureReason::CloseRequested => "it was closed on request".to_owned(),
-        ClosureReason::RootLaunchFailed => "its shell never became ready".to_owned(),
-        ClosureReason::WorkerCrash => "its worker ended before it finished closing".to_owned(),
-        ClosureReason::DesktopLost => "the desktop login it ran in ended".to_owned(),
-        ClosureReason::HostShutdown => "its host shut down".to_owned(),
+        ClosureReason::CloseRequested => Shown::said("it was closed on request"),
+        ClosureReason::RootLaunchFailed => Shown::said("its shell never became ready"),
+        ClosureReason::WorkerCrash => Shown::said("its worker ended before it finished closing"),
+        ClosureReason::DesktopLost => Shown::said("the desktop login it ran in ended"),
+        ClosureReason::HostShutdown => Shown::said("its host shut down"),
     }
 }
 
@@ -524,11 +529,11 @@ impl UndeliveredTyping {
 impl Drop for UndeliveredTyping {
     fn drop(&mut self) {
         if self.bytes > 0 {
-            eprintln!(
+            crate::report::say(&shown!(
                 "kr: {} bytes typed while this terminal was asked for its colours could not be \
                  delivered to the session",
                 self.bytes
-            );
+            ));
         }
     }
 }
@@ -631,10 +636,10 @@ pub async fn run(
     // which of the two they have before the screen arrives over it.
     let epoch = attachment.lease.as_ref().map(|lease| lease.lease.epoch);
     if epoch.is_none() {
-        eprintln!(
+        crate::report::say(&Shown::said(
             "kr: this terminal was not asked what it is, so the host will not let it type. \
-             Attach without --no-probe to control the session."
-        );
+             Attach without --no-probe to control the session.",
+        ));
     }
 
     // From the cursor the attachment was allocated at, not from the beginning of what is retained.
@@ -672,12 +677,12 @@ pub async fn run(
         terminal
             .handle()
             .try_clone()
-            .map_err(|error| CliError::Terminal(error.to_string()))?,
+            .map_err(|error| CliError::Terminal(Shown::io(&error)))?,
     );
     let input_handle = terminal
         .handle()
         .try_clone()
-        .map_err(|error| CliError::Terminal(error.to_string()))?;
+        .map_err(|error| CliError::Terminal(Shown::io(&error)))?;
     let mut input = crate::attach::spawn_input_reader(input_handle);
 
     // The terminal's size can change while the attachment runs. The session is told, so the
@@ -722,10 +727,11 @@ pub async fn run(
     // into a terminal that is showing a projection would wrap, overwrite cells and scroll the
     // bottom row, which is damage to the very screen it is describing.
     if let Some(detail) = display.degradation() {
-        eprintln!(
+        crate::report::say(&shown!(
             "kr: this terminal was showing a projection of the session, and it did not carry all \
-             of it: {detail}"
-        );
+             of it: {}",
+            detail
+        ));
     }
     // And what this attachment could not establish about the terminal itself: the modes it had to
     // put back to their documented default because nothing could be read for them, and a
@@ -743,7 +749,10 @@ pub async fn run(
             .filter(|identity| !kr_term::profile::width_qualified(identity)),
     };
     if let Some(detail) = qualification.report() {
-        eprintln!("kr: not everything about this terminal could be established: {detail}");
+        crate::report::say(&shown!(
+            "kr: not everything about this terminal could be established: {}",
+            detail
+        ));
     }
     Ok((outcome, descriptor.session_id))
 }
@@ -884,9 +893,9 @@ async fn drive(
         )
         .await
         {
-            return AttachOutcome::DeliveryUncertain(
-                "the connection ended while input was being sent".to_owned(),
-            );
+            return AttachOutcome::DeliveryUncertain(Shown::said(
+                "the connection ended while input was being sent",
+            ));
         }
         outstanding.insert(request_id, Outstanding::Input(sequence));
         sequence += 1;
@@ -957,9 +966,9 @@ async fn drive(
                     )
                     .await
                     {
-                        return AttachOutcome::DeliveryUncertain(
-                            "the connection ended while input was being sent".to_owned(),
-                        );
+                        return AttachOutcome::DeliveryUncertain(Shown::said(
+                            "the connection ended while input was being sent",
+                        ));
                     }
                     outstanding.insert(request_id, Outstanding::Input(sequence));
                     sequence += 1;
@@ -981,7 +990,7 @@ async fn drive(
                                 // session, and it is not a lost connection. What it would have
                                 // said is not known, so it is not reported as a success.
                                 Err(error) => AttachOutcome::ClosureUnreadable {
-                                    detail: error.to_string(),
+                                    detail: Shown::cbor(&error),
                                     undelivered,
                                 },
                             };
@@ -1301,9 +1310,11 @@ async fn drive(
                                     undelivered = true;
                                 }
                                 code => {
-                                    return AttachOutcome::DeliveryUncertain(format!(
-                                        "{code} at input {sent}: {}",
-                                        error.message
+                                    return AttachOutcome::DeliveryUncertain(shown!(
+                                        "{} at input {}: {}",
+                                        code,
+                                        sent,
+                                        Shown::protocol(&error)
                                     ));
                                 }
                             },
@@ -1473,9 +1484,9 @@ async fn drive(
                         )
                         .await
                         {
-                            return AttachOutcome::DeliveryUncertain(
-                                "the connection ended while input was being sent".to_owned(),
-                            );
+                            return AttachOutcome::DeliveryUncertain(Shown::said(
+                                "the connection ended while input was being sent",
+                            ));
                         }
                     }
                     return AttachOutcome::Detached;
@@ -1659,9 +1670,9 @@ async fn drive(
                 {
                     // The bytes were handed to a connection that has gone. Whether they arrived
                     // cannot be established from here, and the exit code says so.
-                    return AttachOutcome::DeliveryUncertain(
-                        "the connection ended while input was being sent".to_owned(),
-                    );
+                    return AttachOutcome::DeliveryUncertain(Shown::said(
+                        "the connection ended while input was being sent",
+                    ));
                 }
                 outstanding.insert(request_id, Outstanding::Input(sequence));
                 sequence += 1;
@@ -1820,6 +1831,7 @@ mod tests {
         AttachOutcome, SCROLL_BACK_KEY, SCROLL_FORWARD_KEY, landed, scroll_keys, scroll_step,
         scrolled,
     };
+    use kr_client::shown::Shown;
     use kr_protocol::attachment::ViewportPosition;
     use kr_protocol::scalars::{Nullable, U64};
     use kr_protocol::session::{ClosureReason, ClosureRecord};
@@ -1900,7 +1912,7 @@ mod tests {
             };
             assert_eq!(status(&outcome), expected, "{record:?}");
             assert_eq!(outcome.is_failure(), expected != 0, "{record:?}");
-            assert_eq!(outcome.detail(), said);
+            assert_eq!(outcome.detail().as_str(), said);
             assert_eq!(outcome.closure(), Some(&record));
         }
     }
@@ -1914,7 +1926,7 @@ mod tests {
         };
         assert_eq!(status(&outcome), 0);
         assert_eq!(
-            outcome.detail(),
+            outcome.detail().as_str(),
             "the session closed: it was closed on request; what was typed while it was closing \
              was not delivered"
         );
@@ -1925,13 +1937,13 @@ mod tests {
     #[test]
     fn a_closure_that_cannot_be_read_is_not_reported_as_a_success() {
         let outcome = AttachOutcome::ClosureUnreadable {
-            detail: "an unknown field".to_owned(),
+            detail: Shown::said("an unknown field"),
             undelivered: false,
         };
         assert_eq!(status(&outcome), 1);
         assert!(outcome.is_failure());
         assert_eq!(
-            outcome.detail(),
+            outcome.detail().as_str(),
             "the session closed, and how it closed could not be read (an unknown field)"
         );
         assert_eq!(outcome.closure(), None);
@@ -1942,7 +1954,10 @@ mod tests {
     fn a_connection_lost_without_a_closure_still_ends_with_status_3() {
         let outcome = AttachOutcome::Disconnected;
         assert_eq!(status(&outcome), 3);
-        assert_eq!(outcome.detail(), "the connection to the session ended");
+        assert_eq!(
+            outcome.detail().as_str(),
+            "the connection to the session ended"
+        );
         assert_eq!(outcome.closure(), None);
     }
 

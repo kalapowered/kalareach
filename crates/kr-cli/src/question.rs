@@ -30,16 +30,18 @@
 //! adds is the connection they are sent over: each session's worker, found by its descriptor and
 //! proved against it before anything is sent.
 
+use kr_client::shown;
+use kr_client::shown::Shown;
 use std::collections::BTreeMap;
 
 use kr_client::answers::{
     self, AnswerDraft, AnswerDrafts, AnswerError, Answered, QuestionHost, Reconciled, Retired,
 };
-use kr_client::error::ClientError;
+use kr_client::error::{ClientError, refusal as refusal_of};
 use kr_ipc::client::LocalClient;
 use kr_ipc::paths::HostPaths;
 use kr_protocol::envelope::ActionTarget;
-use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{ActionId, BuildId, EnvironmentId, QuestionId, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::question::{
@@ -200,7 +202,7 @@ pub async fn drafts(paths: &HostPaths, build_id: BuildId) -> Result<Vec<Reconcil
 fn unreconciled(workers: &Workers, error: AnswerError) -> CliError {
     match (error, workers.failure()) {
         (AnswerError::Host(ClientError::ConnectionEnded), Some(failure)) => {
-            CliError::HostUnavailable(format!("{}; no kept answer was retired", failure.why))
+            CliError::HostUnavailable(shown!("{}; no kept answer was retired", failure.why))
         }
         (error, _) => answer_failure(error),
     }
@@ -223,8 +225,9 @@ pub async fn send(
 ) -> Result<Question> {
     let drafts = kept_answers(paths)?;
     let draft = kept_draft(&drafts, question_id)?.ok_or_else(|| {
-        CliError::Usage(format!(
-            "no answer to question {question_id} is kept on this device"
+        CliError::Usage(shown!(
+            "no answer to question {} is kept on this device",
+            question_id
         ))
     })?;
     let workers = Workers::new(paths, build_id).knowing(std::slice::from_ref(&draft));
@@ -259,21 +262,28 @@ pub async fn send(
 /// as the worker connection recorded it step by step: nothing written, refused by the worker, or
 /// written with nothing to say whether the worker took it.
 fn still_kept_failure(workers: &Workers, question_id: QuestionId, error: AnswerError) -> CliError {
-    let retention = format!("the answer to question {question_id} is still kept on this device");
+    let retention = shown!(
+        "the answer to question {} is still kept on this device",
+        question_id
+    );
     let delivery = workers.delivery();
     let failure = workers.failure();
     match error {
         AnswerError::Host(
             ClientError::Host(refusal) | ClientError::Refused { error: refusal, .. },
-        ) => CliError::Refused(ProtocolError::new(
+        ) => CliError::Refused(refusal_of(
             refusal.code,
-            format!("{}; {}", refusal.message, retained(delivery, &retention)),
+            shown!(
+                "{}; {}",
+                Shown::protocol(&refusal),
+                retained(delivery, retention)
+            ),
         )),
         other => {
-            let why = failure.map_or_else(|| other.to_string(), |failure| failure.why);
+            let why = failure.map_or_else(|| shown!("{}", other), |failure| failure.why);
             CliError::AnswerKept {
                 code: other.code(),
-                message: kept_message(question_id, delivery, &why, &retention),
+                message: kept_message(question_id, delivery, why, retention),
             }
         }
     }
@@ -297,7 +307,7 @@ enum KeptCopy {
     /// None is kept.
     None,
     /// The store cannot be read, so whether one is kept is not known.
-    Unreadable(String),
+    Unreadable(Shown),
 }
 
 /// Whether an answer to `question_id` is kept on this device, read without failing, so that once
@@ -307,7 +317,7 @@ fn kept_copy(drafts: &AnswerDrafts, question_id: QuestionId) -> KeptCopy {
     match drafts.drafts() {
         Ok(kept) if kept.iter().any(|draft| draft.question_id == question_id) => KeptCopy::Kept,
         Ok(_) => KeptCopy::None,
-        Err(error) => KeptCopy::Unreadable(error.to_string()),
+        Err(error) => KeptCopy::Unreadable(shown!("{}", error)),
     }
 }
 
@@ -321,15 +331,19 @@ fn kept_draft(drafts: &AnswerDrafts, question_id: QuestionId) -> Result<Option<A
 }
 
 /// The failure an answer kept rather than delivered is reported as, with why and what to do next.
-fn kept(workers: &Workers, question_id: QuestionId, which: &str) -> CliError {
+fn kept(workers: &Workers, question_id: QuestionId, which: &'static str) -> CliError {
     let failure = workers.failure().unwrap_or_else(|| Failure {
         code: ErrorCode::ResourceUnavailable,
-        why: "its session's worker could not take it".to_owned(),
+        why: Shown::said("its session's worker could not take it"),
     });
-    let retention = format!("the answer to question {question_id} {which} on this device");
+    let retention = shown!(
+        "the answer to question {} {} on this device",
+        question_id,
+        which
+    );
     CliError::AnswerKept {
         code: failure.code,
-        message: kept_message(question_id, workers.delivery(), &failure.why, &retention),
+        message: kept_message(question_id, workers.delivery(), failure.why, retention),
     }
 }
 
@@ -347,23 +361,28 @@ fn taken(
 ) -> CliError {
     let after = workers
         .failure()
-        .map_or_else(|| error.to_string(), |failure| failure.why);
+        .map_or_else(|| shown!("{}", error), |failure| failure.why);
     let copy = match copy {
-        KeptCopy::Kept => format!(
-            "an answer to question {question_id} is still kept on this device, and \
-             `kr question drafts` retires it once its question reads as answered"
+        KeptCopy::Kept => shown!(
+            "an answer to question {} is still kept on this device, and \
+             `kr question drafts` retires it once its question reads as answered",
+            question_id
         ),
-        KeptCopy::None => "nothing is kept for it".to_owned(),
-        KeptCopy::Unreadable(why) => format!(
-            "whether an answer to question {question_id} is still kept on this device cannot be \
-             read ({why})"
+        KeptCopy::None => Shown::said("nothing is kept for it"),
+        KeptCopy::Unreadable(why) => shown!(
+            "whether an answer to question {} is still kept on this device cannot be read ({})",
+            question_id,
+            *why
         ),
     };
     CliError::Unfinished {
         code: error.code(),
-        message: format!(
-            "session {session_id}'s worker took the answer to question {question_id}, but \
-             {after}; {copy}"
+        message: shown!(
+            "session {}'s worker took the answer to question {}, but {}; {}",
+            session_id,
+            question_id,
+            after,
+            copy
         ),
     }
 }
@@ -374,18 +393,19 @@ fn unknown_copy(
     workers: &Workers,
     question_id: QuestionId,
     error: AnswerError,
-    why: &str,
+    why: &Shown,
 ) -> CliError {
-    let retention = format!(
-        "whether the answer to question {question_id} is still kept on this device cannot be \
-         read ({why})"
+    let retention = shown!(
+        "whether the answer to question {} is still kept on this device cannot be read ({})",
+        question_id,
+        *why
     );
     let reason = workers
         .failure()
-        .map_or_else(|| error.to_string(), |failure| failure.why);
+        .map_or_else(|| shown!("{}", error), |failure| failure.why);
     CliError::Unfinished {
         code: error.code(),
-        message: format!("{}: {reason}", retained(workers.delivery(), &retention)),
+        message: shown!("{}: {}", retained(workers.delivery(), retention), reason),
     }
 }
 
@@ -394,24 +414,30 @@ fn unknown_copy(
 /// as the store has it, because nothing removed it.
 fn ended_first(question_id: QuestionId, reason: Retired, copy: &KeptCopy) -> CliError {
     let what = match reason {
-        Retired::Ended(state) => format!("question {question_id} was already {state}"),
+        Retired::Ended(state) => shown!("question {} was already {}", question_id, state),
         Retired::Moved { revision } => {
-            format!("question {question_id} is now at revision {revision}")
+            shown!("question {} is now at revision {}", question_id, revision)
         }
-        Retired::Gone => format!("question {question_id} is not on this host any more"),
+        Retired::Gone => shown!("question {} is not on this host any more", question_id),
     };
     let earlier = match copy {
-        KeptCopy::Kept => "; an earlier answer to it is still kept on this device, and \
-                           `kr question drafts` retires it"
-            .to_owned(),
-        KeptCopy::None => String::new(),
-        KeptCopy::Unreadable(why) => format!(
-            "; whether an earlier answer to it is still kept on this device cannot be read ({why})"
+        KeptCopy::Kept => Shown::said(
+            "; an earlier answer to it is still kept on this device, and `kr question drafts` \
+             retires it",
+        ),
+        KeptCopy::None => Shown::said(""),
+        KeptCopy::Unreadable(why) => shown!(
+            "; whether an earlier answer to it is still kept on this device cannot be read ({})",
+            *why
         ),
     };
-    CliError::Refused(ProtocolError::new(
+    CliError::Refused(refusal_of(
         AnswerError::Retired(reason).code(),
-        format!("{what}, so this command did not send this answer{earlier}"),
+        shown!(
+            "{}, so this command did not send this answer{}",
+            what,
+            earlier
+        ),
     ))
 }
 
@@ -420,12 +446,14 @@ fn ended_first(question_id: QuestionId, reason: Retired, copy: &KeptCopy) -> Cli
 fn unkept(workers: &Workers, question_id: QuestionId, error: AnswerError) -> CliError {
     let why = workers
         .failure()
-        .map_or_else(|| error.to_string(), |failure| failure.why);
-    CliError::Refused(ProtocolError::new(
+        .map_or_else(|| shown!("{}", error), |failure| failure.why);
+    CliError::Refused(refusal_of(
         error.code(),
-        format!(
-            "{why}. The answer was not kept: `kr question show {question_id}` says whether its \
-             question was answered"
+        shown!(
+            "{}. The answer was not kept: `kr question show {}` says whether its question was \
+             answered",
+            why,
+            question_id
         ),
     ))
 }
@@ -433,15 +461,19 @@ fn unkept(workers: &Workers, question_id: QuestionId, error: AnswerError) -> Cli
 /// The failure reported for an answer its worker did not take, or may not have taken, that could
 /// not be kept on this device either, so the person knows it is in neither place.
 fn lost(workers: &Workers, question_id: QuestionId, error: &AnswerError) -> CliError {
-    let retention =
-        format!("the answer to question {question_id} could not be kept on this device ({error})");
+    let retention = shown!(
+        "the answer to question {} could not be kept on this device ({})",
+        question_id,
+        *error
+    );
     let why = workers.failure().map_or_else(
-        || "its session's worker could not take it".to_owned(),
+        || Shown::said("its session's worker could not take it"),
         |failure| failure.why,
     );
-    CliError::Other(format!(
-        "{}: {why}",
-        retained(workers.delivery(), &retention)
+    CliError::Other(shown!(
+        "{}: {}",
+        retained(workers.delivery(), retention),
+        why
     ))
 }
 
@@ -449,32 +481,40 @@ fn lost(workers: &Workers, question_id: QuestionId, error: &AnswerError) -> CliE
 ///
 /// An answer that may have reached its worker is never said to be unsent; the next
 /// `kr question drafts` retires it when it did arrive.
-fn kept_message(question_id: QuestionId, delivery: Delivery, why: &str, retention: &str) -> String {
+fn kept_message(
+    question_id: QuestionId,
+    delivery: Delivery,
+    why: Shown,
+    retention: Shown,
+) -> Shown {
     let next = match delivery {
-        Delivery::NotSent | Delivery::NotTaken => format!(
+        Delivery::NotSent | Delivery::NotTaken => shown!(
             "`kr question drafts` says whether it can still be sent, and \
-             `kr question send {question_id}` sends it"
+             `kr question send {}` sends it",
+            question_id
         ),
-        Delivery::Unknown => format!(
+        Delivery::Unknown => shown!(
             "`kr question drafts` retires it if it arrived, and \
-             `kr question send {question_id}` sends it if it did not"
+             `kr question send {}` sends it if it did not",
+            question_id
         ),
         Delivery::Taken => {
-            "`kr question drafts` retires it once its question reads as answered".to_owned()
+            Shown::said("`kr question drafts` retires it once its question reads as answered")
         }
     };
-    format!("{}: {why}. {next}", retained(delivery, retention))
+    shown!("{}: {}. {}", retained(delivery, retention), why, next)
 }
 
 /// That an answer is kept, and what this command established about its delivery.
-fn retained(delivery: Delivery, retention: &str) -> String {
+fn retained(delivery: Delivery, retention: Shown) -> Shown {
     match delivery {
-        Delivery::NotSent => format!("{retention}, and this command did not send it"),
-        Delivery::NotTaken => format!("{retention}, and its session's worker did not take it"),
-        Delivery::Unknown => {
-            format!("{retention}, and whether its session's worker took it is not known")
-        }
-        Delivery::Taken => format!("{retention}, and its session's worker took it"),
+        Delivery::NotSent => shown!("{}, and this command did not send it", retention),
+        Delivery::NotTaken => shown!("{}, and its session's worker did not take it", retention),
+        Delivery::Unknown => shown!(
+            "{}, and whether its session's worker took it is not known",
+            retention
+        ),
+        Delivery::Taken => shown!("{}, and its session's worker took it", retention),
     }
 }
 
@@ -499,17 +539,17 @@ enum Delivery {
 #[derive(Clone, Debug)]
 struct Failure {
     code: ErrorCode,
-    why: String,
+    why: Shown,
 }
 
 /// Turns a failure of the kept-answer rules into this command's own.
 fn answer_failure(error: AnswerError) -> CliError {
     let code = error.code();
     match error {
-        AnswerError::Form(message) => CliError::Usage(message.into_string()),
-        AnswerError::Retired(reason) => CliError::Refused(ProtocolError::new(
+        AnswerError::Form(message) => CliError::Usage(message),
+        AnswerError::Retired(reason) => CliError::Refused(refusal_of(
             code,
-            format!(
+            shown!(
                 "{}, so this command did not send the kept answer, which is no longer kept",
                 retired_because(reason)
             ),
@@ -518,31 +558,29 @@ fn answer_failure(error: AnswerError) -> CliError {
             ClientError::Host(refusal) | ClientError::Refused { error: refusal, .. },
         ) => CliError::Refused(refusal),
         AnswerError::Host(ClientError::Ipc(failure)) => {
-            CliError::Refused(failure.to_protocol_error())
+            CliError::Refused(refusal_of(failure.code(), Shown::ipc(&failure)))
         }
-        AnswerError::Host(other) => CliError::HostUnavailable(other.to_string()),
-        AnswerError::Unlisted => CliError::Refused(ProtocolError::new(code, unlisted_because())),
+        AnswerError::Host(other) => CliError::HostUnavailable(shown!("{}", other)),
+        AnswerError::Unlisted => CliError::Refused(refusal_of(code, Shown::said(UNLISTED_BECAUSE))),
         AnswerError::Store { .. } | AnswerError::Unreadable { .. } => {
-            CliError::Other(error.to_string())
+            CliError::Other(shown!("{}", error))
         }
     }
 }
 
 /// Why a kept answer is neither offered nor retired, in the words a person is shown.
-fn unlisted_because() -> String {
-    "its session does not list the question now, and its daemon's record does not say the \
-     session ended"
-        .to_owned()
-}
+const UNLISTED_BECAUSE: &str = "its session does not list the question now, and its daemon's \
+                                record does not say the session ended";
 
 /// Why a kept answer will not be sent, in the words a person is shown.
-fn retired_because(reason: Retired) -> String {
+fn retired_because(reason: Retired) -> Shown {
     match reason {
-        Retired::Ended(state) => format!("the question was {state} while the answer was kept"),
-        Retired::Moved { revision } => {
-            format!("the question moved to revision {revision} while the answer was kept")
-        }
-        Retired::Gone => "its session is not on this host any more".to_owned(),
+        Retired::Ended(state) => shown!("the question was {} while the answer was kept", state),
+        Retired::Moved { revision } => shown!(
+            "the question moved to revision {} while the answer was kept",
+            revision
+        ),
+        Retired::Gone => Shown::said("its session is not on this host any more"),
     }
 }
 
@@ -554,13 +592,13 @@ pub fn kept_rendered(reconciled: &Reconciled) -> Value {
         Reconciled::Unlisted(draft) => (
             draft,
             "unlisted",
-            Some(unlisted_because()),
+            Some(UNLISTED_BECAUSE.to_owned()),
             Some(AnswerError::Unlisted.code()),
         ),
         Reconciled::Retired { draft, reason } => (
             draft,
             "retired",
-            Some(retired_because(*reason)),
+            Some(retired_because(*reason).into_string()),
             Some(AnswerError::Retired(*reason).code()),
         ),
     };
@@ -589,8 +627,7 @@ pub fn kept_line(reconciled: &Reconciled) -> String {
         ),
         Reconciled::Unlisted(draft) => format!(
             "{}  unlisted  {}; it is still kept, and this command did not send it",
-            draft.question_id,
-            unlisted_because()
+            draft.question_id, UNLISTED_BECAUSE
         ),
         Reconciled::Retired { draft, reason } => format!(
             "{}  retired  {}; this command did not send it, and it is no longer kept",
@@ -688,7 +725,7 @@ impl Workers {
             .clone()
     }
 
-    fn failed(&self, code: ErrorCode, why: String) {
+    fn failed(&self, code: ErrorCode, why: Shown) {
         *self
             .failure
             .lock()
@@ -733,15 +770,18 @@ impl Workers {
     /// worker that cannot be reached say nothing about whether the session ended, and retire
     /// nothing.
     async fn open(&self, session_id: SessionId) -> std::result::Result<LocalClient, ClientError> {
-        let gone =
-            |why: String| ClientError::Host(ProtocolError::new(ErrorCode::UnknownSession, why));
+        let gone = |why: Shown| ClientError::refusal(ErrorCode::UnknownSession, why);
         let Some(descriptor) = self.descriptor(session_id)? else {
             return Err(match self.record(session_id, false).await {
                 Ok(Record::Ended(why)) => gone(why),
-                Ok(Record::NotEnded(why)) | Err(why) => ClientError::Host(ProtocolError::new(
+                Ok(Record::NotEnded(why)) | Err(why) => ClientError::refusal(
                     ErrorCode::ResourceUnavailable,
-                    format!("session {session_id} has published no descriptor, and {why}"),
-                )),
+                    shown!(
+                        "session {} has published no descriptor, and {}",
+                        session_id,
+                        why
+                    ),
+                ),
             });
         };
         match open_worker(&descriptor, self.build_id.clone()).await {
@@ -753,9 +793,11 @@ impl Workers {
                 Ok(Record::NotEnded(why)) | Err(why) => {
                     self.failed(
                         ErrorCode::ResourceUnavailable,
-                        format!(
-                            "session {session_id}'s worker could not be reached ({error}), and \
-                             {why}"
+                        shown!(
+                            "session {}'s worker could not be reached ({}), and {}",
+                            session_id,
+                            error,
+                            why
                         ),
                     );
                     Err(ClientError::ConnectionEnded)
@@ -780,28 +822,31 @@ impl Workers {
         &self,
         session_id: SessionId,
     ) -> std::result::Result<Option<WorkerDescriptor>, ClientError> {
-        let unreadable = |detail: String| {
-            ClientError::Host(ProtocolError::new(ErrorCode::ResourceUnavailable, detail))
-        };
+        let unreadable =
+            |detail: Shown| ClientError::refusal(ErrorCode::ResourceUnavailable, detail);
         let environment = self.environment(session_id).map_err(|why| {
-            unreadable(format!(
-                "session {session_id}'s descriptor cannot be looked for: {why}"
+            unreadable(shown!(
+                "session {}'s descriptor cannot be looked for: {}",
+                session_id,
+                why
             ))
         })?;
         kr_ipc::descriptor::read(&environment.paths, session_id).map_err(|error| {
-            unreadable(format!(
-                "whether session {session_id} has published a descriptor cannot be read: {error}"
+            unreadable(shown!(
+                "whether session {} has published a descriptor cannot be read: {}",
+                session_id,
+                Shown::ipc(&error)
             ))
         })
     }
 
     /// The environment `session_id` ran in, as this host knows it.
-    fn environment(&self, session_id: SessionId) -> std::result::Result<KnownEnvironment, String> {
+    fn environment(&self, session_id: SessionId) -> std::result::Result<KnownEnvironment, Shown> {
         let Some(environment_id) = self.environments.get(&session_id) else {
-            return Err("which environment it ran in is not known".to_owned());
+            return Err(Shown::said("which environment it ran in is not known"));
         };
         crate::resolve::select(&self.paths, Some(&environment_id.to_string()))
-            .map_err(|error| error.to_string())
+            .map_err(|error| shown!("{}", error))
     }
 
     /// What the daemon of the environment `session_id` ran in says of whether it ended.
@@ -819,9 +864,9 @@ impl Workers {
         &self,
         session_id: SessionId,
         published: bool,
-    ) -> std::result::Result<Record, String> {
+    ) -> std::result::Result<Record, Shown> {
         let Some(environment) = self.environments.get(&session_id) else {
-            return Err("which environment it ran in is not known".to_owned());
+            return Err(Shown::said("which environment it ran in is not known"));
         };
         let environment = environment.to_string();
         match crate::resolve::registered(
@@ -832,19 +877,21 @@ impl Workers {
         .await
         {
             Ok(crate::resolve::Registered::Closed { .. }) => {
-                Ok(Record::Ended(format!("session {session_id} has closed")))
+                Ok(Record::Ended(shown!("session {} has closed", session_id)))
             }
-            Err(CliError::UnknownSession(_)) if !published => Ok(Record::Ended(format!(
-                "this host has no record of session {session_id}"
+            Err(CliError::UnknownSession(_)) if !published => Ok(Record::Ended(shown!(
+                "this host has no record of session {}",
+                session_id
             ))),
-            Err(CliError::UnknownSession(_)) => Ok(Record::NotEnded(
-                "its environment's daemon has no record of it".to_owned(),
-            )),
+            Err(CliError::UnknownSession(_)) => Ok(Record::NotEnded(Shown::said(
+                "its environment's daemon has no record of it",
+            ))),
             Ok(crate::resolve::Registered::Unpublished { state, .. }) => Ok(Record::NotEnded(
-                format!("its environment's daemon reports it {state}"),
+                shown!("its environment's daemon reports it {}", state),
             )),
-            Err(error) => Err(format!(
-                "whether it has ended cannot be established: {error}"
+            Err(error) => Err(shown!(
+                "whether it has ended cannot be established: {}",
+                error
             )),
         }
     }
@@ -853,9 +900,9 @@ impl Workers {
 /// What the daemon of a session's environment says of whether the session ended.
 enum Record {
     /// It ended, and how that is known.
-    Ended(String),
+    Ended(Shown),
     /// It has not, as far as the record goes, and what the record says.
-    NotEnded(String),
+    NotEnded(Shown),
 }
 
 /// Whether a failure of the connection to a worker is the connection going, rather than something
@@ -924,9 +971,11 @@ impl QuestionHost for Workers {
                 connections.remove(&session_id);
                 self.failed(
                     failure.code(),
-                    format!(
-                        "the connection to session {session_id}'s worker failed before the answer \
-                         was sent ({failure})"
+                    shown!(
+                        "the connection to session {}'s worker failed before the answer was sent \
+                         ({})",
+                        session_id,
+                        Shown::ipc(&failure)
                     ),
                 );
                 return Err(ClientError::Ipc(failure));
@@ -941,7 +990,7 @@ impl QuestionHost for Workers {
                     Ok(resolved) => Ok(resolved.question),
                     Err(unreadable) => {
                         let error = ClientError::from(unreadable);
-                        self.failed(error.code(), format!("its reply cannot be read ({error})"));
+                        self.failed(error.code(), shown!("its reply cannot be read ({})", error));
                         Err(error)
                     }
                 }
@@ -952,16 +1001,23 @@ impl QuestionHost for Workers {
                 if refusal.code == ErrorCode::OutcomeUnknown {
                     self.failed(
                         refusal.code,
-                        format!(
-                            "session {session_id}'s worker could not say what became of it \
-                             ({refusal})"
+                        shown!(
+                            "session {}'s worker could not say what became of it ({}: {})",
+                            session_id,
+                            refusal.code,
+                            Shown::protocol(&refusal)
                         ),
                     );
                 } else {
                     self.delivered(Delivery::NotTaken);
                     self.failed(
                         refusal.code,
-                        format!("session {session_id}'s worker refused it ({refusal})"),
+                        shown!(
+                            "session {}'s worker refused it ({}: {})",
+                            session_id,
+                            refusal.code,
+                            Shown::protocol(&refusal)
+                        ),
                     );
                 }
                 Err(ClientError::from(refusal))
@@ -972,9 +1028,11 @@ impl QuestionHost for Workers {
                 connections.remove(&session_id);
                 self.failed(
                     ErrorCode::OutcomeUnknown,
-                    format!(
-                        "the connection to session {session_id}'s worker ended while the answer \
-                         was being sent ({failure})"
+                    shown!(
+                        "the connection to session {}'s worker ended while the answer was being \
+                         sent ({})",
+                        session_id,
+                        Shown::ipc(&failure)
                     ),
                 );
                 Err(ClientError::SubmissionUncertain { action_id })
@@ -985,9 +1043,11 @@ impl QuestionHost for Workers {
                 connections.remove(&session_id);
                 self.failed(
                     failure.code(),
-                    format!(
-                        "session {session_id}'s worker sent a reply this command cannot read, so \
-                         whether it took the answer is not known ({failure})"
+                    shown!(
+                        "session {}'s worker sent a reply this command cannot read, so whether it \
+                         took the answer is not known ({})",
+                        session_id,
+                        Shown::ipc(&failure)
                     ),
                 );
                 Err(ClientError::Ipc(failure))
@@ -1002,10 +1062,14 @@ impl QuestionHost for Workers {
         match self.record(session_id, published).await {
             Ok(Record::Ended(_)) => Ok(true),
             Ok(Record::NotEnded(_)) => Ok(false),
-            Err(why) => Err(ClientError::Host(ProtocolError::new(
+            Err(why) => Err(ClientError::refusal(
                 ErrorCode::ResourceUnavailable,
-                format!("session {session_id} does not list the question, and {why}"),
-            ))),
+                shown!(
+                    "session {} does not list the question, and {}",
+                    session_id,
+                    why
+                ),
+            )),
         }
     }
 }
@@ -1204,8 +1268,9 @@ async fn locate(
             return Ok((descriptor, question, client));
         }
     }
-    Err(CliError::Usage(format!(
-        "no session on this host has question {question_id}"
+    Err(CliError::Usage(shown!(
+        "no session on this host has question {}",
+        question_id
     )))
 }
 
@@ -1245,7 +1310,12 @@ async fn read<T: kr_protocol::wire::WireMessage>(
     outcome
         .map_err(CliError::Refused)?
         .to_typed()
-        .map_err(|error| CliError::Other(format!("the host's answer could not be read: {error}")))
+        .map_err(|error| {
+            CliError::Other(shown!(
+                "the host's answer could not be read: {}",
+                Shown::cbor(&error)
+            ))
+        })
 }
 
 async fn mutate<P, T>(
@@ -1265,7 +1335,12 @@ where
     outcome
         .map_err(CliError::Refused)?
         .to_typed()
-        .map_err(|error| CliError::Other(format!("the host's answer could not be read: {error}")))
+        .map_err(|error| {
+            CliError::Other(shown!(
+                "the host's answer could not be read: {}",
+                Shown::cbor(&error)
+            ))
+        })
 }
 
 /// Returns whether a question is still waiting for somebody.
