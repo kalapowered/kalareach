@@ -100,6 +100,11 @@ const UNPAIRED_LIFE: Duration = kr_transport::listener::DEFAULT_HANDSHAKE_DEADLI
 /// last question there: time for the question to arrive and for its answer to come back.
 const LAST_CALL_MARGIN: Duration = Duration::from_secs(10);
 
+/// How late for a connection's last call a waiting device may still ask its last question there,
+/// because the timer that wakes it for the call may fire a little late. Any later, and the device
+/// lets the connection go rather than send a question the host may no longer be there to answer.
+const LAST_CALL_GRACE: Duration = Duration::from_secs(1);
+
 /// How long a device waits before dialling a host again, in turn, and then every time after the
 /// last.
 pub const RECONNECT_DELAYS: [Duration; 4] = [
@@ -754,6 +759,8 @@ impl Pairing {
         let mut reconnects = 0_usize;
         let mut refused = 0_u32;
         let mut fresh_failed = 0_usize;
+        // Whether a look for a fresh connection has just failed.
+        let mut looked = false;
         loop {
             // The attempt's own deadline holds on every pass, whatever the host last said: a host
             // that keeps answering that the owner has not decided does not hold the device past
@@ -775,7 +782,9 @@ impl Pairing {
             // the connection the device already has is then the only place to learn what it
             // became. So the device changes to a fresh connection only once it has answered, and
             // keeps the last question on the old one while fresh connections fail, for the
-            // connection's last call.
+            // connection's last call. Every step before the cutoff ends by the cutoff, the wait for
+            // an answer included, so the device is free to ask that question on time.
+            let looked_just_now = std::mem::take(&mut looked);
             let next = match held.as_mut() {
                 Some(unpaired) => {
                     let now = tokio::time::Instant::now();
@@ -784,6 +793,7 @@ impl Pairing {
                         now,
                         self.attempt_call(&pending, now),
                         &limits,
+                        looked_just_now,
                     )
                 }
                 // No connection: the question below finds that out, as a lost connection.
@@ -796,16 +806,22 @@ impl Pairing {
                     tokio::time::sleep(wait.min(self.left(&pending))).await;
                     continue;
                 }
+                Next::Keep => {
+                    // The pause grows with each look that failed in a row while the question is
+                    // kept, as a reconnection's does.
+                    let pause = RECONNECT_DELAYS[fresh_failed.min(RECONNECT_DELAYS.len() - 1)];
+                    fresh_failed += 1;
+                    let until = self.until_cutoff(&pending, held.as_ref());
+                    tokio::time::sleep(pause.min(until)).await;
+                    continue;
+                }
                 Next::LetGo => {
                     drop(held.take());
                     fresh_failed = 0;
                     held = self.reconnect(&pending).await;
                     continue;
                 }
-                Next::LookFirst {
-                    within: bound,
-                    keep,
-                } => {
+                Next::Look { within: bound } => {
                     match within(bound, self.fresh_answer(&pending, &params)).await {
                         Ok((fresh, answer)) => {
                             held = Some(fresh);
@@ -817,15 +833,11 @@ impl Pairing {
                             fresh_failed = 0;
                             answered = Some(Err(LinkError::Refused(refusal)));
                         }
-                        Err(LinkError::Lost(_) | LinkError::Configuration(_)) if keep => {
-                            let delay =
-                                RECONNECT_DELAYS[fresh_failed.min(RECONNECT_DELAYS.len() - 1)];
-                            fresh_failed += 1;
-                            let until = self.until_cutoff(&pending, held.as_ref());
-                            tokio::time::sleep(delay.min(until)).await;
+                        // The look took time, so the next step is planned from when it ended.
+                        Err(LinkError::Lost(_) | LinkError::Configuration(_)) => {
+                            looked = true;
                             continue;
                         }
-                        Err(LinkError::Lost(_) | LinkError::Configuration(_)) => {}
                     }
                 }
             }
@@ -1349,10 +1361,12 @@ enum Next {
     Ask,
     /// Waits this long for the host's window to make room, then plans again.
     Wait(Duration),
-    /// Looks for a fresh connection first, for at most `within`, and changes to it once it has
-    /// answered. After a look that fails, the question goes on the held connection, unless `keep`:
-    /// then it is kept for the cutoff.
-    LookFirst { within: Duration, keep: bool },
+    /// Looks for a fresh connection for at most `within`, and changes to it once it has answered.
+    /// A look that fails is followed by a new plan, made when the look ended.
+    Look { within: Duration },
+    /// Keeps the next question for the cutoff, and pauses before it looks for a fresh connection
+    /// again: a look has just failed.
+    Keep,
     /// Lets the connection go: it has no question left.
     LetGo,
 }
@@ -1364,20 +1378,27 @@ fn cutoff(asked: &Asked, attempt_call: tokio::time::Instant) -> tokio::time::Ins
 }
 
 /// Plans a waiting device's next step on a connection whose questions are `asked`, at `now`, when
-/// the attempt's last call is `attempt_call`, inside the host's `limits`.
+/// the attempt's last call is `attempt_call`, inside the host's `limits`. `looked` says a look for
+/// a fresh connection has just failed.
 ///
 /// Before the cutoff the device asks at its pace, and from four questions before the end it looks
-/// for a fresh connection before each one; the last question before the cutoff is kept while fresh
-/// connections fail, and so is one that would leave the host's window no room at the cutoff. At the
-/// cutoff the kept question goes, the window having kept room for it:
-/// at the connection's own last call it is the connection's last, and after the attempt's last
-/// call every answer is final, so the device goes on asking there at its pace and looks for no
-/// other connection.
+/// for a fresh connection before each one. It keeps a question for the cutoff, and looks for a
+/// fresh connection meanwhile, when the question is the connection's last, when its answer could
+/// still be out when the cutoff comes, or when it would leave the host's window no room there.
+/// A device waits [`WAIT_STEP`] at most for an answer, so from that long before the cutoff the
+/// only question left there is the kept one. Every step the plan chooses before the cutoff ends by
+/// then, and a look that fails is followed by a new plan rather than by the question the plan meant
+/// before it, so the device is there on time and the kept question goes, the window having kept a
+/// place for it. At the connection's own last call that question is the connection's last, and
+/// nothing goes on the connection after it: a device that is later than a timer's grace lets the
+/// connection go instead. After the attempt's last call every answer is final, so the device goes
+/// on asking there at its pace, until the connection's own last call, and looks for no other.
 fn plan(
     asked: &mut Asked,
     now: tokio::time::Instant,
     attempt_call: tokio::time::Instant,
     limits: &PreAuthLimits,
+    looked: bool,
 ) -> Next {
     let window = match asked.turn(now, limits) {
         Turn::Spent => return Next::LetGo,
@@ -1386,45 +1407,43 @@ fn plan(
     };
     let cutoff = cutoff(asked, attempt_call);
     if now >= cutoff {
+        let last_call = asked.last_call();
+        if now.saturating_duration_since(last_call) > LAST_CALL_GRACE {
+            return Next::LetGo;
+        }
         if window.is_zero() {
             return Next::Ask;
         }
         // At the connection's own last call a full window leaves it no question the host is sure
-        // to answer, and a question asked later could meet a connection the host has ended.
-        return if now >= asked.last_call() {
+        // to answer.
+        return if now >= last_call {
             Next::LetGo
         } else {
             Next::Wait(window)
         };
     }
     let until = cutoff - now;
-    // A window that stays full past the cutoff leaves the connection no question before it: the
-    // device looks elsewhere meanwhile.
-    if window > until {
-        return Next::LookFirst {
-            within: until,
-            keep: true,
+    let left = asked.left(now, cutoff, limits);
+    let kept = left <= 1
+        // The window stays full past the cutoff.
+        || window > until
+        // The answer could still be out when the cutoff comes.
+        || until < WAIT_STEP
+        // The question would take the window's last place through the cutoff.
+        || (until < limits.window + WINDOW_MARGIN
+            && asked.in_window_at(cutoff, limits) + 1 >= limits.max_requests_per_window);
+    if kept {
+        return if looked {
+            Next::Keep
+        } else {
+            Next::Look { within: until }
         };
     }
     if !window.is_zero() {
         return Next::Wait(window);
     }
-    // A question now must leave the window room for the one at the cutoff: a question that would
-    // take its last slot through the cutoff is the one kept for it.
-    if until < limits.window + WINDOW_MARGIN
-        && asked.in_window_at(cutoff, limits) + 1 >= limits.max_requests_per_window
-    {
-        return Next::LookFirst {
-            within: until,
-            keep: true,
-        };
-    }
-    let left = asked.left(now, cutoff, limits);
-    if left <= CHANGE_WITH_LEFT {
-        return Next::LookFirst {
-            within: until,
-            keep: left == 1,
-        };
+    if left <= CHANGE_WITH_LEFT && !looked {
+        return Next::Look { within: until };
     }
     Next::Ask
 }
@@ -2068,24 +2087,25 @@ mod tests {
         let mut asked = Asked::after(2, start, start);
         asked.asked(start);
         // Before the attempt's call, four questions from its end, the device looks elsewhere first;
-        // one question from it, it keeps that one.
+        // two seconds from it, it keeps the question for the call.
         assert_eq!(
-            plan(&mut asked, at(9), at(20), &limits),
-            Next::LookFirst {
-                within: Duration::from_secs(11),
-                keep: false
+            plan(&mut asked, at(9), at(20), &limits, false),
+            Next::Look {
+                within: Duration::from_secs(11)
             }
         );
         assert_eq!(
-            plan(&mut asked, at(18), at(20), &limits),
-            Next::LookFirst {
-                within: Duration::from_secs(2),
-                keep: true
+            plan(&mut asked, at(18), at(20), &limits, false),
+            Next::Look {
+                within: Duration::from_secs(2)
             }
         );
         // At and after the call, whenever the clocks are read, the question goes.
         for now in [at(20), at(21), at(24)] {
-            assert_eq!(plan(&mut asked, now, now.min(at(20)), &limits), Next::Ask);
+            assert_eq!(
+                plan(&mut asked, now, now.min(at(20)), &limits, false),
+                Next::Ask
+            );
             asked.asked(now);
         }
     }
@@ -2103,91 +2123,90 @@ mod tests {
 
         // Early, with the window's room: ask.
         let mut asked = Asked::after(1, start, start);
-        assert_eq!(plan(&mut asked, at(1), far, &limits), Next::Ask);
+        assert_eq!(plan(&mut asked, at(1), far, &limits, false), Next::Ask);
         // The window full before the cutoff: wait for it.
         for second in [1, 2, 3] {
             asked.asked(at(second));
         }
         assert_eq!(
-            plan(&mut asked, at(4), far, &limits),
+            plan(&mut asked, at(4), far, &limits, false),
             Next::Wait(Duration::from_secs(7))
         );
 
-        // By budget: four left, then one left.
+        // By budget: with four left the device looks elsewhere first, and asks once that has
+        // failed; the last one it keeps while looks fail.
         let mut asked = Asked::after(12, start, start);
         assert_eq!(
-            plan(&mut asked, at(12), far, &limits),
-            Next::LookFirst {
-                within: Duration::from_secs(38),
-                keep: false
+            plan(&mut asked, at(12), far, &limits, false),
+            Next::Look {
+                within: Duration::from_secs(38)
             }
         );
+        assert_eq!(plan(&mut asked, at(12), far, &limits, true), Next::Ask);
         let mut asked = Asked::after(15, start, start);
         assert_eq!(
-            plan(&mut asked, at(12), far, &limits),
-            Next::LookFirst {
-                within: Duration::from_secs(38),
-                keep: true
+            plan(&mut asked, at(12), far, &limits, false),
+            Next::Look {
+                within: Duration::from_secs(38)
             }
         );
+        assert_eq!(plan(&mut asked, at(12), far, &limits, true), Next::Keep);
 
-        // By time: four left eleven seconds before the call, one left two seconds before it; the
-        // kept question goes at the call, and nothing after it.
+        // By time: four left eleven seconds before the call, and the question kept two seconds
+        // before it; the kept question goes at the call, and nothing after it.
         let mut asked = Asked::after(2, start, start);
         assert_eq!(
-            plan(&mut asked, at(39), far, &limits),
-            Next::LookFirst {
-                within: Duration::from_secs(11),
-                keep: false
+            plan(&mut asked, at(39), far, &limits, false),
+            Next::Look {
+                within: Duration::from_secs(11)
             }
         );
         assert_eq!(
-            plan(&mut asked, at(48), far, &limits),
-            Next::LookFirst {
-                within: Duration::from_secs(2),
-                keep: true
+            plan(&mut asked, at(48), far, &limits, false),
+            Next::Look {
+                within: Duration::from_secs(2)
             }
         );
-        assert_eq!(plan(&mut asked, at(50), far, &limits), Next::Ask);
+        assert_eq!(plan(&mut asked, at(48), far, &limits, true), Next::Keep);
+        assert_eq!(plan(&mut asked, at(50), far, &limits, false), Next::Ask);
         asked.asked(at(50));
-        assert_eq!(plan(&mut asked, at(51), far, &limits), Next::LetGo);
+        assert_eq!(plan(&mut asked, at(51), far, &limits, false), Next::LetGo);
 
         // A connection the host has ended has no question, whatever its budget.
         let mut idle = Asked::after(2, start, start);
-        assert_eq!(plan(&mut idle, at(60), far, &limits), Next::LetGo);
+        assert_eq!(plan(&mut idle, at(60), far, &limits, false), Next::LetGo);
     }
 
     /// KR-REQ-10.23: the question kept for a connection's last call always finds the host's window
-    /// with room. A question that would take the window's last slot through the call is kept for
-    /// the call instead, so the kept question goes at the call itself, never later.
+    /// with room. A question that would take the window's last place through the call is kept for
+    /// the call instead, so the kept question goes at the call itself, never later. This host keeps
+    /// a window of twenty seconds, so the place is taken well before the call.
     #[test]
     fn the_hosts_window_keeps_room_for_the_question_at_the_last_call() {
-        let limits = PreAuthLimits::default();
+        let limits = PreAuthLimits {
+            window: Duration::from_secs(20),
+            ..PreAuthLimits::default()
+        };
         let start = tokio::time::Instant::now();
         let at = |seconds: u64| start + Duration::from_secs(seconds);
         let far = at(600);
-        // A slow start: the challenge and the proof at 42 s, eight seconds before the call.
-        let mut asked = Asked::after(2, start, at(42));
+        // A slow start: the challenge and the proof at 32 s, eighteen seconds before the call.
+        let mut asked = Asked::after(2, start, at(32));
         assert_eq!(asked.last_call(), at(50));
+        assert_eq!(plan(&mut asked, at(32), far, &limits, false), Next::Ask);
+        asked.asked(at(32));
+        // A fourth question at 35 s would keep the window full until 53 s, past the call: it is
+        // kept.
         assert_eq!(
-            plan(&mut asked, at(42), far, &limits),
-            Next::LookFirst {
-                within: Duration::from_secs(8),
-                keep: false
+            plan(&mut asked, at(35), far, &limits, false),
+            Next::Look {
+                within: Duration::from_secs(15)
             }
         );
-        asked.asked(at(42));
-        // A fourth question at 45 s would fill the window until 56 s, past the call: it is kept.
-        assert_eq!(
-            plan(&mut asked, at(45), far, &limits),
-            Next::LookFirst {
-                within: Duration::from_secs(5),
-                keep: true
-            }
-        );
-        assert_eq!(plan(&mut asked, at(50), far, &limits), Next::Ask);
+        assert_eq!(plan(&mut asked, at(35), far, &limits, true), Next::Keep);
+        assert_eq!(plan(&mut asked, at(50), far, &limits, false), Next::Ask);
         asked.asked(at(50));
-        assert_eq!(plan(&mut asked, at(51), far, &limits), Next::LetGo);
+        assert_eq!(plan(&mut asked, at(51), far, &limits, false), Next::LetGo);
     }
 
     /// KR-REQ-10.23: a window that is full through a connection's last call, however it came to be,
@@ -2203,22 +2222,137 @@ mod tests {
         asked.asked(at(42));
         asked.asked(at(45));
         assert_eq!(
-            plan(&mut asked, at(48), far, &limits),
-            Next::LookFirst {
-                within: Duration::from_secs(2),
-                keep: true
+            plan(&mut asked, at(48), far, &limits, false),
+            Next::Look {
+                within: Duration::from_secs(2)
             }
         );
-        assert_eq!(plan(&mut asked, at(50), far, &limits), Next::LetGo);
+        assert_eq!(plan(&mut asked, at(50), far, &limits, false), Next::LetGo);
         // The attempt's own last call is not the connection's end: there the device waits for the
         // window and asks.
         let mut asked = Asked::after(2, start, at(10));
         asked.asked(at(10));
         asked.asked(at(13));
         assert_eq!(
-            plan(&mut asked, at(15), at(15), &limits),
+            plan(&mut asked, at(15), at(15), &limits, false),
             Next::Wait(Duration::from_secs(6))
         );
+    }
+
+    /// KR-REQ-10.23: a waiting device is free when a connection's last call comes. It waits for an
+    /// answer for as long as [`WAIT_STEP`], so a question whose answer could still be out when the
+    /// call comes is kept for the call instead, while the device looks for a fresh connection. Here
+    /// every answer takes eight seconds: questions go at 0, 11, 22 and 33 seconds, and one at 44
+    /// could be answered as late as 54, past the call at 50. So could the first question after a
+    /// start that ended at 42 seconds.
+    #[test]
+    fn a_question_whose_answer_may_be_out_at_the_last_call_is_kept_for_it() {
+        let limits = PreAuthLimits::default();
+        let start = tokio::time::Instant::now();
+        let at = |seconds: u64| start + Duration::from_secs(seconds);
+        let far = at(600);
+        // The finish, then a status question, and one after each eight-second answer and the
+        // pause that follows it.
+        let mut asked = Asked::after(1, start, start);
+        for second in [0, 11, 22, 33] {
+            assert_eq!(
+                plan(&mut asked, at(second), far, &limits, false),
+                Next::Ask,
+                "at {second} s"
+            );
+            asked.asked(at(second));
+        }
+        assert_eq!(asked.last_call(), at(50));
+        assert_eq!(
+            plan(&mut asked, at(44), far, &limits, false),
+            Next::Look {
+                within: Duration::from_secs(6)
+            }
+        );
+        // A fresh connection that fails at once changes nothing: the question is still kept.
+        assert_eq!(plan(&mut asked, at(44), far, &limits, true), Next::Keep);
+        assert_eq!(plan(&mut asked, at(50), far, &limits, false), Next::Ask);
+
+        // A slow start: the challenge and the proof at 42 s, eight seconds before the call.
+        let mut asked = Asked::after(2, start, at(42));
+        assert_eq!(
+            plan(&mut asked, at(42), far, &limits, false),
+            Next::Look {
+                within: Duration::from_secs(8)
+            }
+        );
+        assert_eq!(plan(&mut asked, at(42), far, &limits, true), Next::Keep);
+        assert_eq!(plan(&mut asked, at(50), far, &limits, false), Next::Ask);
+        asked.asked(at(50));
+        assert_eq!(plan(&mut asked, at(51), far, &limits, false), Next::LetGo);
+    }
+
+    /// KR-REQ-10.23: nothing goes on a connection after its last call, however the device came to
+    /// be late for it: a question sent then may meet a connection the host has ended. A device that
+    /// asked at 44 seconds and heard back at 52, past the call at 50, lets the connection go at 55
+    /// rather than ask there. A device that a timer wakes a moment after the call is still on time
+    /// for it, and one woken later than a timer's grace is not. After the attempt's own last call,
+    /// too, the device asks the connection until its last call and not after it.
+    #[test]
+    fn nothing_goes_on_a_connection_after_its_last_call() {
+        let limits = PreAuthLimits::default();
+        let start = tokio::time::Instant::now();
+        let at = |seconds: u64| start + Duration::from_secs(seconds);
+        let far = at(600);
+        let mut asked = Asked::after(1, start, start);
+        for second in [0, 11, 22, 33, 44] {
+            asked.asked(at(second));
+        }
+        assert_eq!(plan(&mut asked, at(55), far, &limits, false), Next::LetGo);
+
+        let mut on_time = Asked::after(1, start, start);
+        on_time.asked(at(33));
+        let call = on_time.last_call();
+        assert_eq!(
+            plan(&mut on_time, call + LAST_CALL_GRACE, far, &limits, false),
+            Next::Ask
+        );
+        assert_eq!(
+            plan(
+                &mut on_time,
+                call + LAST_CALL_GRACE + Duration::from_millis(1),
+                far,
+                &limits,
+                false
+            ),
+            Next::LetGo
+        );
+
+        let mut asked = Asked::after(1, start, start);
+        asked.asked(at(33));
+        assert_eq!(plan(&mut asked, at(44), at(30), &limits, false), Next::Ask);
+        asked.asked(at(44));
+        assert_eq!(
+            plan(&mut asked, at(52), at(30), &limits, false),
+            Next::LetGo
+        );
+    }
+
+    /// KR-REQ-10.23: a look for a fresh connection takes time, so a failed one is followed by a new
+    /// plan from when it ended, never by the question the plan meant before it. A look from 39
+    /// seconds leaves time for a question and its answer before the call at 50; one that failed at
+    /// 44 does not, and the question is kept. A look that failed at once is followed by the question
+    /// itself, and not by another look.
+    #[test]
+    fn a_failed_look_is_followed_by_a_new_plan() {
+        let limits = PreAuthLimits::default();
+        let start = tokio::time::Instant::now();
+        let at = |seconds: u64| start + Duration::from_secs(seconds);
+        let far = at(600);
+        let mut asked = Asked::after(2, start, start);
+        assert_eq!(
+            plan(&mut asked, at(39), far, &limits, false),
+            Next::Look {
+                within: Duration::from_secs(11)
+            }
+        );
+        assert_eq!(plan(&mut asked, at(39), far, &limits, true), Next::Ask);
+        assert_eq!(plan(&mut asked, at(44), far, &limits, true), Next::Keep);
     }
 
     /// KR-REQ-10.23: a host that counts the questions it refuses, and keeps a window longer than
