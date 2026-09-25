@@ -193,7 +193,7 @@ fn a_tree_with_nothing_ignored_reports_every_identifier_as_run() {
     // The module comment of the test file keys every test in it, each by its own name, and a test
     // its own comment keys as well is recorded once, by that comment.
     let module = &document.identifiers["KR-REQ-03.01"].tests;
-    assert_eq!(module.len(), 22);
+    assert_eq!(module.len(), 25);
     let commented: Vec<_> = module
         .iter()
         .filter(|test| test.test == "forms --test flow commented")
