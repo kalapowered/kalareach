@@ -92,7 +92,10 @@ UUIDs or counters, and codes and states from a fixed vocabulary), and from what 
 decided may be said. There is no way to make one from a `String`, so text that arrived from a
 person, a file, a host or a service reaches a diagnostic only through one of those.
 
-A reducer keeps what somebody diagnosing a fault needs and drops the rest:
+A reducer keeps what somebody diagnosing a fault needs and drops the rest. Where it says text that
+arrived, the text is one of a closed list this build holds, or has a shape that cannot carry chosen
+words: a UUID, eight or more hexadecimal digits, or decimal digits. A test of the characters alone is
+not enough, because anything can be written in a shape made of letters.
 
 | Reducer | What it says |
 | --- | --- |
@@ -101,15 +104,19 @@ A reducer keeps what somebody diagnosing a fault needs and drops the rest:
 | `json` | The kind of fault, with its line and column |
 | `io` | The kind of failure and the operating system's error number; a message a caller attached is dropped |
 | `frame`, `ipc`, `transport`, `crypto` | Their own fixed words, with CBOR and input or output failures said as above |
-| `identifier`, `route` | Each part that is an identifier or a lowercase word, and a placeholder for any other |
-| `terminfo` | A terminal type that is a terminfo name, and a placeholder for anything else |
-| `root`, `within`, `stored` | A directory this program was configured with or derived, a fixed name under one, and a file in a store, whose name is said only when the store wrote it |
+| `route` | Each segment of a request path that is a word of the service adapters' own paths or an identifier, and a placeholder for any other |
+| `collection` | A sync collection's kind, one of the protocol's, and its object's identifier |
+| `terminfo` | A terminal type that is one of the terminfo names this build lists |
+| `root`, `within` | A directory this program was configured with or derived, and a fixed name under one |
+| `stored` | A file in a store, whose name is said only when it is one of the store's fixed names or an identifier with the store's own extensions |
+| `host_path` | A path in this installation's tree: the configured runtime or state root whole, and below it only identifiers and the names the tree writes |
 
 A door passes text whole, because the value it takes was written to be shown to a person: a host's
 refusal message (section 23 makes that plain text for a person, with no credentials in it), a
-managed service's refusal, a package's words about its controls, and the signal a closure record
-names. A host sentence goes through a door too, and one that arrived from a document rather than
-being composed here is said by its class and its length.
+managed service's refusal, and a package's words about its controls. A host sentence goes through a
+door too, and one that arrived from a document rather than being composed here is said by its class
+and its length. The signal a closure record names is said when it is one of the names platforms
+give signals, with the number a platform puts after one.
 
 So an error holds text only as a `Shown`, and an input or output failure as an `IoFault`, which is
 not itself an error and is never a `source()`. A `thiserror` message is one literal whose holes
@@ -122,19 +129,25 @@ and `CliError` still carry the values other crates build and match (a host's `Pr
 
 The command line reports every failure through one reporter, which writes the line on standard
 error and the `--json` failure document. A usage mistake is said by its kind and by what the
-command declares: the argument, the values it takes, a suggestion and the usage line. What was
-typed is never repeated, because an argument in the wrong place can be a secret pasted into it.
+command declares: the argument, the values it takes, a suggestion and the usage line, which names
+the command `kr` however it was invoked. What was typed is never repeated, because an argument in
+the wrong place can be a secret pasted into it.
 `kr account token show` and `kr account token import` say a stored origin as an address, and the
 stored scopes as the names this build knows, with the others counted.
 
-Two tests hold this. `crates/kr-client/tests/shown_rule.rs` reads both crates' sources and names
-the file and line of anything that could put other text in a rendering: a hand-written `Display`, a
-`Plain` claim outside the two `shown.rs` files, an error field a rendering reaches that is none of
-the types above, a formatted panic, an assertion that prints what it compares, a log line, or
-standard error written outside the reporter. The marker tests plant one marker where input goes
-(each text leaf, map key and other leaf of a stored file or a service's answer, malformed bytes,
-typed arguments, origins) and look for it in every rendering that comes back, as text, as decimal
-and hexadecimal bytes, and in base64.
+Two tests hold this. `crates/kr-client/tests/shown_rule.rs` reads both crates' sources as the
+compiler does, with each literal's escapes decoded, each type named by its full path through the
+file's imports, and only code that cannot compile without `test` left out. It names the file and
+line of anything that could put other text in a rendering: a hand-written `Display`, a `Plain`
+claim outside the two `shown.rs` files, an error field a rendering reaches that is none of the
+types above, a formatted panic, an `unwrap` or `expect`, an assertion that prints what it compares,
+a log line, standard error written outside the reporter, and source it cannot follow, such as a
+renamed trait, a macro that writes an `impl`, a `#[path]` or an `include!`. The marker tests plant
+one marker where input goes (each text leaf, map key and other leaf of a stored file, malformed
+bytes, typed arguments, origins) and look for it in every rendering that comes back, as text, as
+decimal and hexadecimal bytes, and in base64; beside each, the same planting of another value is
+held to naming the fault's class and its place. A service's answer that cannot be read is said
+through `json` or `cbor`, whose renderings carry none of the answer by their types.
 
 The rule does not reach standard output yet, nor the `--json` answers other than a failure document
 and the account token's, nor the derived `Debug` of a type that is not a failure.
