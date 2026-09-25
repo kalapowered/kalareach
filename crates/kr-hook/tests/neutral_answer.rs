@@ -366,12 +366,12 @@ fn kr_req_12_27_a_standard_error_nobody_reads_cannot_hold_a_hook() {
                 "{case}: no answer within {SHORTEST_TIMEOUT:?}"
             );
             assert_eq!(held.answer, b"{}\n", "{case}");
-            assert_eq!(
-                held.code,
-                Some(0),
-                "{case}: exited within {SHORTEST_TIMEOUT:?}: {:?}",
+            assert!(
+                held.exited.is_some_and(|after| after < SHORTEST_TIMEOUT),
+                "{case}: no exit within {SHORTEST_TIMEOUT:?}: {:?}",
                 held.exited
             );
+            assert_eq!(held.code, Some(0), "{case}");
             if !full {
                 let mut said = String::new();
                 diagnostics

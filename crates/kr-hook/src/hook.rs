@@ -10,11 +10,12 @@
 //! each event its registration names reports. The deadline, the input bound, the exchange with the
 //! worker and the answer are this module's, the same for all of them.
 //!
-//! Every run is bounded by [`HOOK_DEADLINE`], well inside the shortest timeout any registration
-//! names (one second, for a session ending). When the deadline passes, the answer is written and
-//! the process ends, whatever is still in flight. The answer goes before anything the run says
-//! about itself: a diagnostic goes to standard error after it, in what remains of the deadline, so
-//! a standard error nobody reads can hold neither the answer nor the end.
+//! Every run waits for its observation for at most [`HOOK_DEADLINE`] from its start, well inside the
+//! shortest timeout any registration names (one second, for a session ending). When that passes,
+//! the answer is written and the process ends, whatever is still in flight. The answer goes before
+//! anything the run says about itself: a diagnostic goes to standard error after it, and is waited
+//! for only until the same deadline, so a standard error nobody reads can hold neither the answer
+//! nor the end.
 
 use std::time::Duration;
 
@@ -24,8 +25,8 @@ use crate::registration::{Bridge, Paths, Registration};
 /// The surface every hook declares itself to the worker as.
 pub const SURFACE: &str = "hook";
 
-/// How long one hook run may take, from its start to its answer, and to its end with whatever it
-/// says on standard error after the answer.
+/// How long a hook waits for its observation, from its start, before it answers anyway. A
+/// diagnostic written after the answer is waited for only until the same moment.
 ///
 /// Every registration gives a session ending one second and every other event five. An
 /// application cancels a hook that reaches its timeout and discards its output, and Gemini CLI
@@ -139,7 +140,7 @@ pub fn run(application: &'static Application) -> std::process::ExitCode {
     // remains of the deadline and no more.
     answer();
     if let Some(failure) = failure {
-        crate::report_within(&failure, HOOK_DEADLINE.saturating_sub(started.elapsed()));
+        crate::report_by(&failure, started + HOOK_DEADLINE);
     }
     std::process::ExitCode::SUCCESS
 }

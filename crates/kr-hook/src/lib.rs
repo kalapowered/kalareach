@@ -70,10 +70,6 @@ pub fn run(command: cli::Command) -> std::process::ExitCode {
     }
 }
 
-/// The most one diagnostic line [`report_within`] writes takes, in bytes, with its newline: the
-/// most a pipe with room for it takes in one write on every system this forwarder runs on.
-pub const MAX_DIAGNOSTIC_BYTES: usize = 512;
-
 /// Writes one diagnostic line to standard error.
 ///
 /// Standard error is where a person debugging reads what happened. For a hook that exits 0,
@@ -82,101 +78,100 @@ pub const MAX_DIAGNOSTIC_BYTES: usize = 512;
 /// change what the application does.
 ///
 /// The write waits for as long as standard error makes it wait. A process that must answer by a
-/// deadline answers first and says what went wrong through [`report_within`]. The launcher says
-/// what it has to say this way, before it runs the program: once the program runs, nothing of the
-/// launcher is left to say it, and its standard error is the terminal the program writes to next,
-/// which holds the program's own first line wherever it would hold this one.
+/// deadline answers first and says what went wrong through [`report_by`]. The launcher says what it
+/// has to say this way, before it runs the program, which on Unix takes the launcher's place so
+/// that nothing of the launcher is left to say it afterwards. No deadline applies to the launcher:
+/// the shell waits for the program as it waits for any command.
 pub fn report(line: &str) {
     use std::io::Write as _;
     let _ = writeln!(std::io::stderr().lock(), "kr-hook: {line}");
 }
 
-/// Writes one diagnostic line to standard error if standard error takes it within `within`.
+/// Writes one diagnostic line to standard error, and waits for the write no later than `by`.
 ///
 /// A standard error nobody reads fills up, and a write to a full one waits until somebody reads.
-/// So the line goes only once standard error has room for all of it, which is waited for no longer
-/// than `within`, and is dropped otherwise: whatever standard error is, the caller goes on in time.
-/// With nothing left of `within`, the line still goes if standard error has room at once. It is
-/// one write of at most [`MAX_DIAGNOSTIC_BYTES`], cut to fit.
-pub fn report_within(line: &str, within: std::time::Duration) {
-    write_within(diagnostic(line).as_bytes(), within);
+/// A terminal, a file or a pipe another process writes to can make a write wait too, even one
+/// that had room a moment before. So the write is made on a thread of its own, and the caller goes
+/// on at `by` whether the write has finished or not. A write still waiting when the process ends
+/// ends with it, and its line is lost: with nothing left before `by`, the line is written only if
+/// that thread gets to it before the process ends.
+pub fn report_by(line: &str, by: std::time::Instant) {
+    write_by(format!("kr-hook: {line}\n").into_bytes(), by, |bytes| {
+        use std::io::Write as _;
+        let _ = std::io::stderr().lock().write_all(bytes);
+    });
 }
 
-/// `line` as the one line a diagnostic is written as, cut at a character boundary to fit
-/// [`MAX_DIAGNOSTIC_BYTES`] with its newline.
-fn diagnostic(line: &str) -> String {
-    let mut said = format!("kr-hook: {line}");
-    let mut end = said.len().min(MAX_DIAGNOSTIC_BYTES - 1);
-    while !said.is_char_boundary(end) {
-        end -= 1;
-    }
-    said.truncate(end);
-    said.push('\n');
-    said
-}
-
-/// Writes `bytes` to standard error once it has room for them, waiting no longer than `within`.
-#[cfg(unix)]
-fn write_within(bytes: &[u8], within: std::time::Duration) {
-    use std::io::Write as _;
-    let stderr = std::io::stderr();
-    let deadline = std::time::Instant::now() + within;
-    loop {
-        let left = deadline.saturating_duration_since(std::time::Instant::now());
-        let timeout = rustix::event::Timespec {
-            tv_sec: i64::try_from(left.as_secs()).unwrap_or(i64::MAX),
-            tv_nsec: i64::from(left.subsec_nanos()),
-        };
-        let mut waiting = [rustix::event::PollFd::new(
-            &stderr,
-            rustix::event::PollFlags::OUT,
-        )];
-        match rustix::event::poll(&mut waiting, Some(&timeout)) {
-            // Room for a write of this size, so the write does not wait. Closed or failed is said
-            // by the same flags, and then nothing is written.
-            Ok(1..) => {
-                if waiting[0].revents().contains(rustix::event::PollFlags::OUT) {
-                    let _ = stderr.lock().write_all(bytes);
-                }
-                return;
-            }
-            Err(rustix::io::Errno::INTR) => {}
-            Ok(0) | Err(_) => return,
-        }
-    }
-}
-
-/// Writes `bytes` to standard error on a thread of its own, waiting for it no longer than
-/// `within`, where standard error cannot be asked whether it has room.
-#[cfg(not(unix))]
-fn write_within(bytes: &[u8], within: std::time::Duration) {
-    use std::io::Write as _;
-    let bytes = bytes.to_vec();
+/// Hands `bytes` to `write` on a thread of its own, and waits for it no later than `by`.
+///
+/// A thread that cannot be started writes nothing: a diagnostic never costs the caller its
+/// answer.
+fn write_by(bytes: Vec<u8>, by: std::time::Instant, write: impl FnOnce(&[u8]) + Send + 'static) {
     let (written, done) = std::sync::mpsc::channel();
-    // A write that is still waiting when the process ends goes with it.
-    std::thread::spawn(move || {
-        let _ = std::io::stderr().lock().write_all(&bytes);
+    let started = std::thread::Builder::new().spawn(move || {
+        write(&bytes);
         let _ = written.send(());
     });
-    let _ = done.recv_timeout(within);
+    if started.is_ok() {
+        let _ = done.recv_timeout(by.saturating_duration_since(std::time::Instant::now()));
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
     use super::*;
 
+    /// A write that never finishes, at any point in it, holds its caller no later than the bound.
     #[test]
-    fn a_diagnostic_is_one_line_that_fits_one_write() {
-        assert_eq!(
-            diagnostic("the worker did not answer"),
-            "kr-hook: the worker did not answer\n"
+    fn a_write_that_stalls_holds_its_caller_only_until_the_bound() {
+        let (release, stalled) = std::sync::mpsc::channel::<()>();
+        let begun = Instant::now();
+        write_by(
+            b"a line".to_vec(),
+            begun + Duration::from_millis(100),
+            move |_| {
+                // Stalls until the test lets it go, which is after the caller has gone on, or for
+                // half a minute, so a caller that waited for it fails rather than hangs.
+                let _ = stalled.recv_timeout(Duration::from_secs(30));
+            },
         );
-        // A long line is cut at a character boundary, with its newline inside the bound.
-        let long = "\u{e9}".repeat(MAX_DIAGNOSTIC_BYTES);
-        let said = diagnostic(&long);
-        assert!(said.len() <= MAX_DIAGNOSTIC_BYTES, "{}", said.len());
-        assert!(said.len() >= MAX_DIAGNOSTIC_BYTES - 2, "{}", said.len());
-        assert!(said.ends_with('\n'));
-        assert_eq!(said.lines().count(), 1);
+        let took = begun.elapsed();
+        drop(release);
+        assert!(took >= Duration::from_millis(100), "{took:?}");
+        assert!(took < Duration::from_secs(10), "{took:?}");
+    }
+
+    /// The control: a write that finishes is waited for, and gets the whole line.
+    #[test]
+    fn a_write_that_finishes_is_waited_for() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let into = Arc::clone(&written);
+        write_by(
+            b"kr-hook: a line\n".to_vec(),
+            Instant::now() + Duration::from_secs(60),
+            move |bytes| {
+                into.lock().expect("the buffer").extend_from_slice(bytes);
+            },
+        );
+        assert_eq!(
+            written.lock().expect("the buffer").as_slice(),
+            b"kr-hook: a line\n"
+        );
+    }
+
+    /// With nothing left before the bound, the caller does not wait at all.
+    #[test]
+    fn a_bound_already_passed_is_not_waited_for() {
+        let (release, stalled) = std::sync::mpsc::channel::<()>();
+        let begun = Instant::now();
+        write_by(b"a line".to_vec(), begun, move |_| {
+            let _ = stalled.recv_timeout(Duration::from_secs(30));
+        });
+        let took = begun.elapsed();
+        drop(release);
+        assert!(took < Duration::from_secs(10), "{took:?}");
     }
 }
