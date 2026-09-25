@@ -25,6 +25,8 @@
 //! throughout: the old one until the rename, the new one after it. A step that fails before the
 //! rename leaves the old record and says so. One that fails after it has published the new record,
 //! which every later read returns, and says that whether the change survives a crash is not known.
+//! The first record is written the same way and given its name by a link instead, which never
+//! replaces a record that exists.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -146,17 +148,18 @@ enum Destination {
     Split,
 }
 
-/// The points a publication passes, in order.
+/// The points a publication passes, in order. The first record is published by a link, every
+/// later one by a rename, and both pass the same points.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Boundary {
     /// The temporary file exists and is empty.
     Created,
     /// The new record is in the temporary file, and may not be on disk yet.
     Written,
-    /// The temporary file is flushed and closed, and is renamed next.
+    /// The temporary file is flushed and closed, and is published next.
     Flushed,
     /// The record's name holds the new record; the directory is flushed next.
-    Renamed,
+    Published,
 }
 
 /// One environment's machine-group record.
@@ -172,9 +175,10 @@ impl MachineStore {
     /// Opens this environment's record, minting its group when the environment has none yet.
     ///
     /// A missing record is a first start, and the group minted for it is a group of this one
-    /// environment. The record is published by an exclusive create, so of two callers that both
-    /// found none only one group is ever published. Temporary files an earlier publication left
-    /// behind are removed; nothing reads them.
+    /// environment. The first record is published by a link, which never replaces a name that
+    /// exists, so of two callers that both found none only one group is ever published. Temporary
+    /// files an earlier publication left behind, a first start's included, are removed; nothing
+    /// reads them.
     ///
     /// # Errors
     ///
@@ -190,7 +194,7 @@ impl MachineStore {
             lock: paths.singleton_lock(),
         };
         store.check_lock(lock)?;
-        let _writer = writer();
+        let _writer = store.writer();
         store.remove_leftovers();
         if store.read()?.is_none() {
             store.mint(now_ms)?;
@@ -281,7 +285,7 @@ impl MachineStore {
         now_ms: u64,
     ) -> Result<MachineGroup> {
         self.check_lock(lock)?;
-        let _writer = writer();
+        let _writer = self.writer();
         let current = self.group()?;
         if current.expected() != expected {
             return Err(ControllerError::Refused {
@@ -372,6 +376,11 @@ impl MachineStore {
     }
 
     /// Publishes the first record of a first start.
+    ///
+    /// The record is complete and flushed before its name exists, and a link gives it the name.
+    /// Unlike a rename, a link never replaces a name that exists, so a first start that finds a
+    /// record published meanwhile keeps that one. A first start that stopped before the link left
+    /// only a temporary file, which the next open removes before it mints again.
     fn mint(&self, now_ms: u64) -> Result<()> {
         let record = MachineGroup {
             environment_id: self.environment_id,
@@ -379,33 +388,37 @@ impl MachineStore {
             revision: 1,
             change: Change::Created { at_ms: now_ms },
         };
-        match kr_ipc::paths::create_new_owner_only_file(
-            &self.record,
-            &encode(&record, &self.record)?,
-        ) {
-            Ok(()) => Ok(()),
+        let bytes = encode(&record, &self.record)?;
+        let temporary = self.temporary();
+        let linked = self
+            .stage(&temporary, &bytes)
+            .and_then(|()| self.passed(Boundary::Flushed))
+            .and_then(|()| std::fs::hard_link(&temporary, &self.record));
+        let _ = std::fs::remove_file(&temporary);
+        match linked {
+            Ok(()) => {}
             // Somebody published first. Theirs is the environment's group, and it is read and
             // checked like any other record.
-            Err(kr_ipc::IpcError::Io { source, .. })
-                if source.kind() == std::io::ErrorKind::AlreadyExists =>
-            {
-                Ok(())
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+            Err(error) => {
+                return Err(storage(
+                    "create the machine group record",
+                    &self.record,
+                    error,
+                ));
             }
-            Err(error) => Err(storage(
-                "create the machine group record",
-                &self.record,
-                error,
-            )),
         }
+        // The record exists from here on, and the next open reads it. A failed flush is reported,
+        // because the first start cannot say it recorded the group durably.
+        self.passed(Boundary::Published)
+            .and_then(|()| flush_directory(&self.directory))
+            .map_err(|error| storage("create the machine group record", &self.record, error))
     }
 
     /// Replaces the record with `record`, whole.
     fn publish(&self, record: &MachineGroup) -> Result<()> {
         let bytes = encode(record, &self.record)?;
-        let temporary = self.directory.join(format!(
-            "{TEMPORARY_PREFIX}{}{TEMPORARY_SUFFIX}",
-            kr_ipc::new_uuid()
-        ));
+        let temporary = self.temporary();
         let staged = self
             .stage(&temporary, &bytes)
             .and_then(|()| self.passed(Boundary::Flushed))
@@ -421,7 +434,7 @@ impl MachineStore {
         }
         // The record's name holds the new record from here on, and every later read returns it.
         // What cannot be told without the directory flush is whether it survives a crash.
-        self.passed(Boundary::Renamed)
+        self.passed(Boundary::Published)
             .and_then(|()| flush_directory(&self.directory))
             .map_err(|error| ControllerError::Uncertain {
                 detail: format!(
@@ -432,6 +445,14 @@ impl MachineStore {
                     record.revision
                 ),
             })
+    }
+
+    /// Names a new temporary file of this store, in the record's own directory.
+    fn temporary(&self) -> PathBuf {
+        self.directory.join(format!(
+            "{TEMPORARY_PREFIX}{}{TEMPORARY_SUFFIX}",
+            kr_ipc::new_uuid()
+        ))
     }
 
     /// Writes `bytes` to a new temporary file, owner-only from its creation, flushed and closed.
@@ -470,6 +491,16 @@ impl MachineStore {
         }
     }
 
+    /// Takes this process's writer lock.
+    fn writer(&self) -> std::sync::MutexGuard<'static, ()> {
+        // A test learns here that a caller has come to the lock, whether or not it has to wait.
+        #[cfg(test)]
+        seam::locking(&self.record);
+        WRITER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Says a publication of this record has passed `boundary`. A test stops or holds one here.
     #[cfg(test)]
     fn passed(&self, boundary: Boundary) -> std::io::Result<()> {
@@ -491,13 +522,6 @@ impl MachineStore {
 /// Mints a group: a random identifier from the platform's secure random source, and nothing else.
 fn new_machine_id() -> MachineId {
     MachineId::new(kr_ipc::new_uuid())
-}
-
-/// Takes this process's writer lock.
-fn writer() -> std::sync::MutexGuard<'static, ()> {
-    WRITER
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Encodes a record as the file holds it.
@@ -545,8 +569,11 @@ mod seam {
 
     /// What a publication does at a registered boundary.
     pub(super) enum Interruption {
-        /// Fails there, as a publication whose next operation failed.
+        /// Fails there, as a publication whose next operation failed. Its own clean-up runs.
         Fail,
+        /// Ends there as a crash would: the thread unwinds, so nothing after this point runs and
+        /// the files stay as they were at this moment.
+        Crash,
         /// Says it has arrived, then waits there until it is let go on.
         Pause {
             arrived: Sender<()>,
@@ -558,12 +585,37 @@ mod seam {
 
     static REGISTERED: Mutex<Registered> = Mutex::new(Vec::new());
 
+    /// Callers waiting to hear that a store of their record has come to the writer lock.
+    static LOCKING: Mutex<Vec<(PathBuf, Sender<()>)>> = Mutex::new(Vec::new());
+
     /// Registers one interruption of the next publication of `record` to reach `boundary`.
     pub(super) fn register(record: &Path, boundary: Boundary, interruption: Interruption) {
         REGISTERED
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push((record.to_path_buf(), boundary, interruption));
+    }
+
+    /// Asks to be told, once, when a store of `record` next comes to the writer lock.
+    pub(super) fn watch_lock(record: &Path, told: Sender<()>) {
+        LOCKING
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((record.to_path_buf(), told));
+    }
+
+    /// Tells whoever asked that a store of `record` has come to the writer lock.
+    pub(super) fn locking(record: &Path) {
+        let watcher = {
+            let mut watching = LOCKING.lock().unwrap_or_else(PoisonError::into_inner);
+            watching
+                .iter()
+                .position(|(path, _)| path == record)
+                .map(|index| watching.remove(index))
+        };
+        if let Some((_, told)) = watcher {
+            let _ = told.send(());
+        }
     }
 
     /// Acts on the interruption registered for this record and boundary, if there is one.
@@ -580,6 +632,9 @@ mod seam {
             Some((_, _, Interruption::Fail)) => Err(std::io::Error::other(format!(
                 "a test stopped this publication after {boundary:?}"
             ))),
+            Some((_, _, Interruption::Crash)) => {
+                panic!("a test crashed this publication after {boundary:?}")
+            }
             Some((_, _, Interruption::Pause { arrived, resume })) => {
                 let _ = arrived.send(());
                 let _ = resume.recv_timeout(Duration::from_secs(30));
@@ -591,7 +646,8 @@ mod seam {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::panic::AssertUnwindSafe;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
@@ -669,6 +725,46 @@ mod tests {
             .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
             .filter(|name| name.starts_with(TEMPORARY_PREFIX))
             .collect()
+    }
+
+    /// The names in `directory`.
+    fn names(directory: &Path) -> BTreeSet<String> {
+        std::fs::read_dir(directory)
+            .expect("reads a directory")
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// Every point a publication passes, in order.
+    const BOUNDARIES: [Boundary; 4] = [
+        Boundary::Created,
+        Boundary::Written,
+        Boundary::Flushed,
+        Boundary::Published,
+    ];
+
+    /// The longest a test waits for another thread to reach a point it must reach. Only a failing
+    /// test waits this long.
+    const WAIT: Duration = Duration::from_secs(10);
+
+    /// Lets a held publication go on when it is dropped, so a test that fails while one is held
+    /// never leaves it waiting.
+    struct Resume(mpsc::Sender<()>);
+
+    impl Drop for Resume {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    /// Tells a reader to stop when it is dropped, however the test around it ends.
+    struct Finish<'a>(&'a AtomicBool);
+
+    impl Drop for Finish<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
     }
 
     /// What a file holds and what its metadata says.
@@ -991,56 +1087,129 @@ mod tests {
         assert_eq!(restarted, split, "the group did not survive a restart");
     }
 
-    /// KR-REQ-03.07: a step stopped after any point of its publication leaves the old group or the
-    /// new one, never neither and never a fresh one. Stopped before the rename it leaves the old
-    /// record and no temporary file, and says the step failed; stopped after the rename it leaves
-    /// the new record and says that whether the change survives a crash is not known.
+    /// KR-REQ-03.07: a step interrupted after any point of its publication, by a failure or by a
+    /// crash, leaves the old group or the new one, never neither and never a fresh one: the old
+    /// one until the record's name is replaced, the new one from then on. A failure is answered
+    /// with `STORAGE_UNAVAILABLE` before that point and `OUTCOME_UNKNOWN` after it, and removes
+    /// its temporary file; a crash leaves the temporary file, and the next open removes it.
     #[test]
-    fn a_publication_stopped_at_any_point_leaves_the_old_group_or_the_new_one() {
-        for boundary in [
-            Boundary::Created,
-            Boundary::Written,
-            Boundary::Flushed,
-            Boundary::Renamed,
-        ] {
-            let environment = Environment::create();
-            let store = environment.open();
-            let before = store.group().expect("reads the group");
-            let into = some_group();
-            seam::register(&environment.record(), boundary, Interruption::Fail);
-            let outcome = store.join(
-                &environment.lock,
-                into,
-                before.expected(),
-                &approval(),
-                2_000,
-            );
-            let failure = outcome.expect_err("the stopped step reports a failure");
-            assert!(
-                leftovers(environment.paths().state_dir()).is_empty(),
-                "a step stopped after {boundary:?} left a temporary file"
-            );
-            let after = environment.reopened();
-            if boundary == Boundary::Renamed {
-                assert_eq!(
-                    failure.code(),
-                    ErrorCode::OutcomeUnknown,
-                    "after {boundary:?}"
+    fn a_step_interrupted_at_any_point_leaves_the_old_group_or_the_new_one() {
+        for crash in [false, true] {
+            for boundary in BOUNDARIES {
+                let environment = Environment::create();
+                let store = environment.open();
+                let before = store.group().expect("reads the group");
+                let into = some_group();
+                let interruption = if crash {
+                    Interruption::Crash
+                } else {
+                    Interruption::Fail
+                };
+                seam::register(&environment.record(), boundary, interruption);
+                let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    store.join(
+                        &environment.lock,
+                        into,
+                        before.expected(),
+                        &approval(),
+                        2_000,
+                    )
+                }));
+                let published = boundary == Boundary::Published;
+                let what = if crash { "a crash" } else { "a failure" };
+                match outcome {
+                    Ok(answer) => {
+                        assert!(!crash, "{what} after {boundary:?} did not end the step");
+                        let failure = answer.expect_err("the failed step says so");
+                        let code = if published {
+                            ErrorCode::OutcomeUnknown
+                        } else {
+                            ErrorCode::StorageUnavailable
+                        };
+                        assert_eq!(failure.code(), code, "{what} after {boundary:?}");
+                        assert!(
+                            leftovers(environment.paths().state_dir()).is_empty(),
+                            "{what} after {boundary:?} left its temporary file"
+                        );
+                    }
+                    Err(_) => assert!(crash, "{what} after {boundary:?} unwound"),
+                }
+                let after = environment.reopened();
+                assert!(
+                    leftovers(environment.paths().state_dir()).is_empty(),
+                    "the open after {what} after {boundary:?} left a temporary file"
                 );
-                assert_eq!(after.machine_id, into, "after {boundary:?}");
-                assert_eq!(after.revision, before.revision + 1, "after {boundary:?}");
-            } else {
-                assert_eq!(
-                    failure.code(),
-                    ErrorCode::StorageUnavailable,
-                    "after {boundary:?}"
-                );
-                assert_eq!(
-                    after, before,
-                    "a step stopped after {boundary:?} changed the group"
-                );
+                if published {
+                    assert_eq!(after.machine_id, into, "{what} after {boundary:?}");
+                    assert_eq!(
+                        after.revision,
+                        before.revision + 1,
+                        "{what} after {boundary:?}"
+                    );
+                } else {
+                    assert_eq!(after, before, "{what} after {boundary:?} changed the group");
+                }
             }
         }
+    }
+
+    /// KR-REQ-03.07: at every point of a step's publication the record's name holds a whole
+    /// record: the old one until the new one replaces it, and the new one from then on. The step
+    /// is held at each point while the record is read.
+    #[test]
+    fn the_record_is_whole_at_every_point_of_a_publication() {
+        let environment = Environment::create();
+        let store = environment.open();
+        let before = store.group().expect("reads the group");
+        let into = some_group();
+        let mut checkpoints = Vec::new();
+        for boundary in BOUNDARIES {
+            let (arrived, arrival) = mpsc::channel();
+            let (resume, resumed) = mpsc::channel();
+            seam::register(
+                &environment.record(),
+                boundary,
+                Interruption::Pause {
+                    arrived,
+                    resume: resumed,
+                },
+            );
+            checkpoints.push((boundary, arrival, Resume(resume)));
+        }
+        std::thread::scope(|scope| {
+            let step = scope.spawn(|| {
+                store.join(
+                    &environment.lock,
+                    into,
+                    before.expected(),
+                    &approval(),
+                    2_000,
+                )
+            });
+            for (boundary, arrival, resume) in checkpoints {
+                arrival
+                    .recv_timeout(WAIT)
+                    .unwrap_or_else(|_| panic!("the step never reached {boundary:?}"));
+                let bytes = std::fs::read(environment.record()).unwrap_or_else(|error| {
+                    panic!("the record's name held no file after {boundary:?}: {error}")
+                });
+                let on_disk: MachineGroup =
+                    serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+                        panic!("the record's name held part of one after {boundary:?}: {error}")
+                    });
+                if boundary == Boundary::Published {
+                    assert_eq!(on_disk.machine_id, into, "after {boundary:?}");
+                } else {
+                    assert_eq!(on_disk, before, "after {boundary:?}");
+                }
+                drop(resume);
+            }
+            let written = step
+                .join()
+                .expect("the step ran")
+                .expect("the step published its record");
+            assert_eq!(written.machine_id, into);
+        });
     }
 
     /// KR-REQ-03.07: a step never writes into the file that holds the current record. A second
@@ -1083,26 +1252,38 @@ mod tests {
         }
     }
 
-    /// KR-REQ-03.07: a reader never finds the record's name missing or holding part of a record,
-    /// however many steps publish while it reads.
+    /// KR-REQ-03.07: a reader running beside real publications never finds the record's name
+    /// missing or holding part of a record. The held checkpoints above prove each point of one
+    /// publication; this reads while 64 run freely, from before the first one starts.
     #[test]
     fn a_reader_always_finds_a_whole_record_while_steps_publish() {
         let environment = Environment::create();
         let store = environment.open();
         let record = environment.record();
         let done = AtomicBool::new(false);
+        let (reading, started) = mpsc::channel();
         std::thread::scope(|scope| {
             let reader = scope.spawn(|| {
-                let mut reads = 0_u32;
-                while !done.load(Ordering::Acquire) {
+                let mut reads = 0_u64;
+                loop {
                     let bytes = std::fs::read(&record)
                         .map_err(|error| format!("the record's name held no file: {error}"))?;
                     serde_json::from_slice::<MachineGroup>(&bytes)
                         .map_err(|error| format!("the record's name held part of one: {error}"))?;
                     reads += 1;
+                    if reads == 1 {
+                        let _ = reading.send(());
+                    }
+                    if done.load(Ordering::Acquire) {
+                        return Ok::<u64, String>(reads);
+                    }
                 }
-                Ok::<u32, String>(reads)
             });
+            // The reader stops when the publishing ends, however it ends.
+            let finish = Finish(&done);
+            // A reader that failed at once ends without saying it started; its failure is reported
+            // below.
+            let _ = started.recv_timeout(WAIT);
             let mut current = store.group().expect("reads the group");
             for _ in 0..64 {
                 current = store
@@ -1115,7 +1296,7 @@ mod tests {
                     )
                     .expect("joins");
             }
-            done.store(true, Ordering::Release);
+            drop(finish);
             let reads = reader
                 .join()
                 .expect("the reader ran")
@@ -1170,8 +1351,10 @@ mod tests {
         );
     }
 
-    /// KR-REQ-03.07: opening the store while a step is publishing waits for the step, so it never
-    /// removes the temporary file the step is about to rename into place.
+    /// KR-REQ-03.07: opening the store while a step is publishing waits for the writer lock the
+    /// step holds, so it never removes the temporary file the step is about to publish. The step is
+    /// held just before its rename; the opener says when it has come to the lock, and cannot have
+    /// finished by then.
     #[test]
     fn opening_waits_for_a_publication_in_progress() {
         let environment = Environment::create();
@@ -1187,6 +1370,7 @@ mod tests {
                 resume: resumed,
             },
         );
+        let resume = Resume(resume);
         let into = some_group();
         let environment = &environment;
         std::thread::scope(|scope| {
@@ -1200,8 +1384,11 @@ mod tests {
                 )
             });
             arrival
-                .recv_timeout(Duration::from_secs(30))
-                .expect("the step reached its rename");
+                .recv_timeout(WAIT)
+                .expect("the step reached its publication");
+            // Asked only now, so the answer is the opener's: the step already holds the lock.
+            let (told, locking) = mpsc::channel();
+            seam::watch_lock(&environment.record(), told);
             let (opened, opening) = mpsc::channel();
             let opener = scope.spawn(move || {
                 let read = MachineStore::open(&environment.lock, &environment.paths(), 3_000)
@@ -1209,8 +1396,14 @@ mod tests {
                 let _ = opened.send(());
                 read
             });
-            let finished_early = opening.recv_timeout(Duration::from_secs(1)).is_ok();
-            resume.send(()).expect("lets the step go on");
+            locking
+                .recv_timeout(WAIT)
+                .expect("the opener came to the writer lock");
+            assert!(
+                opening.try_recv().is_err(),
+                "an open finished while a step was publishing"
+            );
+            drop(resume);
             let written = step
                 .join()
                 .expect("the step ran")
@@ -1219,13 +1412,117 @@ mod tests {
                 .join()
                 .expect("the opener ran")
                 .expect("the opener read the record");
-            assert!(
-                !finished_early,
-                "an open finished while a step was publishing"
-            );
             assert_eq!(written.machine_id, into);
             assert_eq!(read, written);
         });
+    }
+
+    /// KR-REQ-03.07: a first start interrupted after any point of its publication, by a failure
+    /// or by a crash, leaves no record, so the next start mints a group, or the whole record it
+    /// published, which the next start keeps. Nothing it wrote is left behind once the next start
+    /// has run.
+    #[test]
+    fn a_first_start_interrupted_at_any_point_leaves_no_record_or_a_whole_one() {
+        for crash in [false, true] {
+            for boundary in BOUNDARIES {
+                let environment = Environment::create();
+                let directory = environment.paths().state_dir().to_path_buf();
+                let mut expected = names(&directory);
+                expected.insert(RECORD_FILE.to_owned());
+                let interruption = if crash {
+                    Interruption::Crash
+                } else {
+                    Interruption::Fail
+                };
+                seam::register(&environment.record(), boundary, interruption);
+                let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    MachineStore::open(&environment.lock, &environment.paths(), 1_000)
+                }));
+                let what = if crash { "a crash" } else { "a failure" };
+                match outcome {
+                    Ok(answer) => {
+                        assert!(!crash, "{what} after {boundary:?} did not end the start");
+                        assert_eq!(
+                            answer.expect_err("the failed start says so").code(),
+                            ErrorCode::StorageUnavailable,
+                            "{what} after {boundary:?}"
+                        );
+                    }
+                    Err(_) => assert!(crash, "{what} after {boundary:?} unwound"),
+                }
+                let published = std::fs::read(environment.record()).ok();
+                assert_eq!(
+                    published.is_some(),
+                    boundary == Boundary::Published,
+                    "{what} after {boundary:?}"
+                );
+                let started_again = environment.reopened();
+                assert_eq!(started_again.change, Change::Created { at_ms: 1_000 });
+                if let Some(bytes) = published {
+                    let kept: MachineGroup =
+                        serde_json::from_slice(&bytes).expect("the published record is whole");
+                    assert_eq!(
+                        started_again, kept,
+                        "the next start replaced the group {what} after {boundary:?} published"
+                    );
+                }
+                assert_eq!(
+                    names(&directory),
+                    expected,
+                    "{what} after {boundary:?} left a file the next start did not remove"
+                );
+            }
+        }
+    }
+
+    /// KR-REQ-03.07: a first start that finds a record published after it looked keeps that
+    /// record and publishes nothing of its own, so of two first starts only one group is ever
+    /// published.
+    #[test]
+    fn a_first_start_never_replaces_a_record_published_meanwhile() {
+        let environment = Environment::create();
+        let (arrived, arrival) = mpsc::channel();
+        let (resume, resumed) = mpsc::channel();
+        seam::register(
+            &environment.record(),
+            Boundary::Flushed,
+            Interruption::Pause {
+                arrived,
+                resume: resumed,
+            },
+        );
+        let resume = Resume(resume);
+        let other = MachineGroup {
+            environment_id: environment.host.environment_id(),
+            machine_id: some_group(),
+            revision: 1,
+            change: Change::Created { at_ms: 500 },
+        };
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                MachineStore::open(&environment.lock, &environment.paths(), 1_000)
+                    .and_then(|store| store.group())
+            });
+            arrival
+                .recv_timeout(WAIT)
+                .expect("the first start is about to publish");
+            kr_ipc::paths::write_owner_only_file(
+                &environment.record(),
+                &encode(&other, &environment.record()).expect("encodes a record"),
+            )
+            .expect("another start publishes first");
+            drop(resume);
+            let kept = first
+                .join()
+                .expect("the first start ran")
+                .expect("the first start read the record");
+            assert_eq!(
+                kept, other,
+                "a first start replaced a record published meanwhile"
+            );
+        });
+        assert_eq!(environment.reopened(), other);
+        assert!(leftovers(environment.paths().state_dir()).is_empty());
     }
 
     /// KR-REQ-03.07: a step approved against a record that is no longer current is refused, and so
