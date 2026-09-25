@@ -747,8 +747,11 @@ impl OwnerConfirmations {
         let sent = tokio::time::timeout(ANSWER_WITHIN, self.channel.complete(&params)).await;
         match sent {
             Ok(Ok(())) => ReviewOutcome::Confirmed,
-            // The host's own refusal: it did not take the answer.
-            Ok(Err(ClientError::Host(error) | ClientError::Refused { error, .. })) => {
+            // The host's own refusal: it did not take the answer. A host that says it does not
+            // know what came of the answer has refused nothing.
+            Ok(Err(ClientError::Host(error) | ClientError::Refused { error, .. }))
+                if error.code != ErrorCode::OutcomeUnknown =>
+            {
                 if error.code == ErrorCode::OwnerConfirmationRequired
                     && self.clock.wall_clock_ms() >= expires_at_ms
                 {
@@ -757,7 +760,8 @@ impl OwnerConfirmations {
                     ReviewOutcome::NotConfirmed
                 }
             }
-            // No reply, or none from the host: it may have taken the answer all the same.
+            // No reply, one that does not know, or none from the host: it may have taken the
+            // answer all the same.
             Ok(Err(_)) | Err(_) => self.settled(&listed.request).await,
         }
     }
@@ -783,6 +787,7 @@ mod tests {
     use super::*;
 
     use kr_crypto::keys::DeviceKeys;
+    use kr_protocol::error::ProtocolError;
     use kr_protocol::grant::{EnvironmentSelector, HistoryScope, SessionSelector};
     use kr_protocol::ids::{ConfirmationId, DeviceId, DeviceKeyRevision, GrantId, InvitationId};
     use kr_protocol::invitation::PairCandidateView;
@@ -970,10 +975,21 @@ mod tests {
     struct Listing {
         pending: Mutex<Vec<PendingConfirmation>>,
         completions: AtomicUsize,
-        /// Takes every answer and never says anything back.
-        silent: std::sync::atomic::AtomicBool,
-        /// Takes every answer, lists its challenge as answered, and never says anything back.
-        takes_silently: std::sync::atomic::AtomicBool,
+        /// Lists a challenge as answered once an answer to it arrives.
+        takes: std::sync::atomic::AtomicBool,
+        /// What the host replies to an answer.
+        reply: Mutex<Reply>,
+    }
+
+    /// What a host replies to an answer.
+    #[derive(Clone, Copy)]
+    enum Reply {
+        /// That it took it.
+        Took,
+        /// Nothing, ever.
+        Nothing,
+        /// That it does not know what came of it.
+        OutcomeUnknown,
     }
 
     impl OwnerChannel for Listing {
@@ -987,18 +1003,21 @@ mod tests {
             _params: &'a OwnerConfirmationCompleteParams,
         ) -> BoxFuture<'a, Result<(), ClientError>> {
             self.completions.fetch_add(1, Ordering::SeqCst);
-            let takes = self.takes_silently.load(Ordering::SeqCst);
-            if takes {
+            if self.takes.load(Ordering::SeqCst) {
                 for pending in self.pending.lock().expect("the listing").iter_mut() {
                     pending.answered = true;
                 }
             }
-            let silent = takes || self.silent.load(Ordering::SeqCst);
+            let reply = *self.reply.lock().expect("the reply");
             Box::pin(async move {
-                if silent {
-                    std::future::pending::<()>().await;
+                match reply {
+                    Reply::Took => Ok(()),
+                    Reply::Nothing => std::future::pending().await,
+                    Reply::OutcomeUnknown => Err(ClientError::Host(ProtocolError::new(
+                        ErrorCode::OutcomeUnknown,
+                        "the host could not tell whether the answer took effect",
+                    ))),
                 }
-                Ok(())
             })
         }
     }
@@ -1077,8 +1096,8 @@ mod tests {
                 answered: false,
             }]),
             completions: AtomicUsize::new(0),
-            silent: std::sync::atomic::AtomicBool::new(false),
-            takes_silently: std::sync::atomic::AtomicBool::new(false),
+            takes: std::sync::atomic::AtomicBool::new(true),
+            reply: Mutex::new(Reply::Took),
         });
         let confirmations = OwnerConfirmations::new(
             host,
@@ -1158,7 +1177,8 @@ mod tests {
             candidate("Pixel 8"),
             grant(&[ActionRight::SessionView], an_hour()),
         );
-        listing.silent.store(true, Ordering::SeqCst);
+        listing.takes.store(false, Ordering::SeqCst);
+        *listing.reply.lock().expect("the reply") = Reply::Nothing;
         let listed = confirmations.pending().await.expect("the listing");
         let asked = Asked(Mutex::new(Vec::new()));
         let started = tokio::time::Instant::now();
@@ -1184,7 +1204,7 @@ mod tests {
             candidate("Pixel 8"),
             grant(&[ActionRight::SessionView], an_hour()),
         );
-        listing.takes_silently.store(true, Ordering::SeqCst);
+        *listing.reply.lock().expect("the reply") = Reply::Nothing;
         let listed = confirmations.pending().await.expect("the listing");
         let asked = Asked(Mutex::new(Vec::new()));
         let outcome =
@@ -1193,5 +1213,30 @@ mod tests {
                 .expect("the review ends");
         assert_eq!(outcome, ReviewOutcome::Confirmed);
         assert_eq!(listing.completions.load(Ordering::SeqCst), 1);
+    }
+
+    /// KR-REQ-10.06: a host that replies that it does not know what came of an answer has not
+    /// refused it. The review asks what the host lists: a challenge listed as answered was taken,
+    /// and one listed unanswered leaves the outcome unknown, never "not confirmed".
+    #[tokio::test]
+    async fn an_answer_whose_outcome_the_host_does_not_know_is_settled_from_what_it_lists() {
+        for (takes, settled) in [
+            (true, ReviewOutcome::Confirmed),
+            (false, ReviewOutcome::Unknown),
+        ] {
+            let (confirmations, listing) = listed_device(
+                candidate("Pixel 8"),
+                grant(&[ActionRight::SessionView], an_hour()),
+            );
+            listing.takes.store(takes, Ordering::SeqCst);
+            *listing.reply.lock().expect("the reply") = Reply::OutcomeUnknown;
+            let listed = confirmations.pending().await.expect("the listing");
+            let asked = Asked(Mutex::new(Vec::new()));
+            assert_eq!(
+                confirmations.review(&listed[0], &asked).await,
+                settled,
+                "the host took it: {takes}"
+            );
+        }
     }
 }
