@@ -350,6 +350,11 @@ export interface ToastMessage {
    * keeping its identity, so the toast stays put and whatever has focus in it keeps focus.
    */
   readonly topic?: string
+  /**
+   * Which time the words are said, for a message updated in place: a new count puts the words in
+   * the live region anew, so a screen reader says them again even when they read the same.
+   */
+  readonly said?: number
 }
 
 /**
@@ -428,7 +433,7 @@ function ToastBody({
       >
         {message.tone === 'danger' ? '!' : message.tone === 'pending' ? '…' : '✓'}
       </span>
-      <span>{message.text}</span>
+      <span key={message.said ?? 0}>{message.text}</span>
       {action === undefined ? null : (
         <Button
           onClick={() => {
