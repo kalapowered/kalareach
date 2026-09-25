@@ -625,27 +625,18 @@ mod platform {
     /// task that did not read back as the one registered.
     pub fn register(definition: &TaskDefinition) -> Result<(), String> {
         let _lock = registration_lock(&definition.name)?;
-        if let Standing::Foreign(detail) = standing(definition)? {
-            return Err(format!("{detail}, so it is left as it is"));
-        }
-        let file = definition
-            .working_directory
-            .join(format!("{}.xml", definition.name));
-        let mut bytes = vec![0xff, 0xfe];
-        bytes.extend(definition.xml().encode_utf16().flat_map(u16::to_le_bytes));
-        kr_ipc::paths::write_owner_only_file(&file, &bytes)
-            .map_err(|error| format!("write the definition of {}: {error}", definition.name))?;
-        let file_text = file.display().to_string();
-        let created =
-            schtasks_within(&["/Create", "/TN", &definition.name, "/XML", &file_text, "/F"]);
-        let _ = std::fs::remove_file(&file);
-        let output = created.map_err(|failure| failure.detail())?;
-        if !output.status.success() {
-            return Err(format!(
-                "the Task Scheduler did not register {}: {}",
-                definition.name,
-                decode_output(&output.stderr).trim()
-            ));
+        let replace = match standing(definition)? {
+            Standing::Foreign(detail) => return Err(format!("{detail}, so it is left as it is")),
+            Standing::Owned(_) => true,
+            Standing::Absent => false,
+        };
+        if let Err(detail) = create_task(definition, replace) {
+            // A creation refused because the name was taken meanwhile, by something that does not
+            // take this lock, leaves that task as it is and says whose it is.
+            return match standing(definition)? {
+                Standing::Foreign(foreign) => Err(format!("{foreign}, so it is left as it is")),
+                _ => Err(detail),
+            };
         }
         match standing(definition)? {
             Standing::Owned(differences) if differences.is_empty() => Ok(()),
@@ -660,6 +651,39 @@ mod platform {
             )),
             Standing::Foreign(detail) => Err(detail),
         }
+    }
+
+    /// Registers `definition` through the Task Scheduler.
+    ///
+    /// `replace` says the task under the name is this environment's own, found so under the
+    /// registration lock, and is replaced. Otherwise the name was free when it was looked at, and
+    /// the creation takes it only if it still is: a definition given as XML without `/F` is
+    /// registered as a new task and refused when the name is held, so a task something else made
+    /// in the meantime is never replaced.
+    pub(super) fn create_task(definition: &TaskDefinition, replace: bool) -> Result<(), String> {
+        let file = definition
+            .working_directory
+            .join(format!("{}.xml", definition.name));
+        let mut bytes = vec![0xff, 0xfe];
+        bytes.extend(definition.xml().encode_utf16().flat_map(u16::to_le_bytes));
+        kr_ipc::paths::write_owner_only_file(&file, &bytes)
+            .map_err(|error| format!("write the definition of {}: {error}", definition.name))?;
+        let file_text = file.display().to_string();
+        let mut arguments = vec!["/Create", "/TN", &definition.name, "/XML", &file_text];
+        if replace {
+            arguments.push("/F");
+        }
+        let created = schtasks_within(&arguments);
+        let _ = std::fs::remove_file(&file);
+        let output = created.map_err(|failure| failure.detail())?;
+        if !output.status.success() {
+            return Err(format!(
+                "the Task Scheduler did not register {}: {}",
+                definition.name,
+                decode_output(&output.stderr).trim()
+            ));
+        }
+        Ok(())
     }
 
     /// Removes this environment's own task, and says whether there was one.
@@ -1739,6 +1763,32 @@ mod tests {
                 standing(&theirs).expect("asked"),
                 Standing::Owned(Vec::new()),
                 "and it is exactly as its own environment registered it"
+            );
+        }
+
+        /// A creation made for a name that was free when it was looked at, and that something
+        /// else took in the meantime, is refused and leaves that task exactly as it is: the
+        /// registration never replaces a task it did not find to be the environment's own.
+        #[test]
+        fn a_creation_for_a_free_name_never_replaces_a_task_that_took_it_meanwhile() {
+            let host = TempHost::create();
+            let ours = definition(&host, &harmless());
+            let theirs = TaskDefinition {
+                environment_id: EnvironmentId::new(kr_ipc::new_uuid()),
+                ..ours.clone()
+            };
+            let _registered = Registered(theirs.clone());
+            register(&theirs).expect("the task that took the name meanwhile");
+            let created = super::super::platform::create_task(&ours, false);
+            assert_eq!(
+                standing(&theirs).expect("asked"),
+                Standing::Owned(Vec::new()),
+                "the task that took the name is exactly as it was, whatever the creation said: \
+                 {created:?}"
+            );
+            assert!(
+                created.is_err(),
+                "and the creation for a free name says it did not take it"
             );
         }
 
