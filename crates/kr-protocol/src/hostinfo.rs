@@ -6983,6 +6983,9 @@ mod tests {
             format!("http://{secret}@proxy.example.com:3128"),
             format!("https://:{secret}@proxy.example.com"),
             format!("socks5://user:{secret}@proxy.example.com:1080"),
+            format!("http://@{secret}.example.com"),
+            format!("http://:@{secret}.example.com"),
+            format!("http://user:{secret}@proxy.example.com:99999"),
         ];
         let not_origins = [
             format!("socks5://{secret}.example.com:1080"),

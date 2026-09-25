@@ -180,9 +180,14 @@ impl std::str::FromStr for ProxyUrl {
 
     /// Reads a proxy's origin.
     ///
-    /// A credential is refused before anything else is decided about the address, so the refusal
-    /// says why even when something else is wrong with it too.
+    /// A credential is refused as written, before anything else is decided about the address, so
+    /// the refusal says why even when something else is wrong with it too. The URL parser is too
+    /// late for that: it drops an empty user and password, and it refuses a port it cannot read
+    /// without saying anything about the user in front of it.
     fn from_str(value: &str) -> std::result::Result<Self, ProxyUrlError> {
+        if names_user_information(value) {
+            return Err(ProxyUrlError::Credentials);
+        }
         let url = Url::parse(value).map_err(ProxyUrlError::Unparsable)?;
         if !url.username().is_empty() || url.password().is_some() {
             return Err(ProxyUrlError::Credentials);
@@ -201,6 +206,20 @@ impl std::fmt::Display for ProxyUrl {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(formatter)
     }
+}
+
+/// Whether `value` names a user or a password before its host, even an empty one, which is where a
+/// URL carries a credential.
+///
+/// The authority is everything between the scheme's `//` and the first `/`, `?`, `#` or `\` after
+/// it, whatever the scheme, so an `@` in a path or a query is not mistaken for one. The host
+/// configuration document refuses a proxy by the same rule.
+fn names_user_information(value: &str) -> bool {
+    let after_scheme = value.split_once("//").map_or(value, |(_, rest)| rest);
+    after_scheme
+        .split(['/', '?', '#', '\\'])
+        .next()
+        .is_some_and(|authority| authority.contains('@'))
 }
 
 /// Why an address is not a usable proxy.
@@ -495,6 +514,21 @@ mod tests {
             ),
             (
                 format!("socks5://user:{secret}@proxy.example.com:1080"),
+                ProxyUrlError::Credentials,
+            ),
+            // An empty user and password are user information as written, although the URL
+            // parser drops them, and a credential in front of a port the parser refuses is still
+            // refused as a credential.
+            (
+                format!("http://@{secret}.example.com"),
+                ProxyUrlError::Credentials,
+            ),
+            (
+                format!("http://:@{secret}.example.com"),
+                ProxyUrlError::Credentials,
+            ),
+            (
+                format!("http://user:{secret}@proxy.example.com:99999"),
                 ProxyUrlError::Credentials,
             ),
             (
