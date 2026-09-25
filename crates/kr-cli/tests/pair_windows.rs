@@ -343,7 +343,7 @@ impl ConsoleOutput {
 /// positive leg on this platform and a task of its own.
 #[cfg_attr(
     windows,
-    ignore = "the daemon's invitation issuance does not complete on Windows; the positive leg of KR-REQ-10.53 on this platform is its own task"
+    ignore = "the daemon's invitation issuance hangs on Windows; the positive leg of KR-REQ-10.53 on this platform is owned by its own task"
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_first_owner_invitation_is_confirmed_at_a_console() {
