@@ -7869,10 +7869,20 @@ impl Controller {
         let mut sessions = Vec::new();
         let workers: Vec<KnownWorker> = self.directory.lock().await.iter().cloned().collect();
         for worker in workers {
+            let session_id = worker.descriptor.session_id;
             match self.read_from_worker(&worker).await {
                 Ok(read) => sessions.push(read.session),
+                // As for a read: a session whose closure is recorded is listed with the closed
+                // sessions or not at all, and one whose worker is on its way out is listed as this
+                // daemon last knew it.
                 Err(_) => {
-                    let _ = self.reconcile(worker.descriptor.session_id).await;
+                    if matches!(self.reconcile(session_id).await, Ok(None)) {
+                        let recorded = self.registry.lock().await.closure(session_id);
+                        let ending = self.directory.lock().await.ending(session_id);
+                        if let (Ok(None), Some(read)) = (recorded, ending) {
+                            sessions.push(read.session);
+                        }
+                    }
                 }
             }
         }
@@ -7917,9 +7927,25 @@ impl Controller {
                 }
                 // A worker that cannot be reached is not necessarily gone. Reconciliation asks the
                 // kernel; only a confirmed death produces a closure record.
+                //
+                // Short of that, the session is answered from this daemon's own record rather than
+                // with the failed connection. A worker that has finished its closure stops
+                // answering before the kernel says it has ended, and a read that meets it on its
+                // way out is owed the session's state: its closure where one was recorded
+                // meanwhile, by the close's watcher or another path, and otherwise the session
+                // closing, as its worker last described it (`Directory::ending`). Only where this
+                // daemon has no word of an end is there nothing to answer with, and that read is
+                // refused as one to try again.
                 Err(error) => {
                     if self.reconcile(params.session_id).await?.is_none() {
-                        return Err(error);
+                        let recorded = self.registry.lock().await.closure(params.session_id)?;
+                        if recorded.is_none() {
+                            let ending = self.directory.lock().await.ending(params.session_id);
+                            return match ending {
+                                Some(read) => encode(&read),
+                                None => Err(error),
+                            };
+                        }
                     }
                 }
             }
@@ -8658,20 +8684,24 @@ impl Controller {
                     Some(record) => {
                         self.record_closure_once(record).await?;
                     }
-                    // The worker has accepted the close and is stopping its processes. Something
-                    // has to notice when that finishes, so the tombstone is written and the
-                    // descriptor removed rather than left pointing at a process that has gone.
-                    None => {
-                        tokio::spawn(
-                            Arc::clone(self)
-                                .watch_closure(params.session_id, ClosureReason::CloseRequested),
-                        );
-                    }
+                    // The worker has accepted the close and is stopping its processes.
+                    None => self.close_accepted(params.session_id).await,
                 }
                 encode(&reply)
             }
             Err(error) => Err(ControllerError::InvalidArgument(error.to_string())),
         }
+    }
+
+    /// Settles what follows a worker's acceptance of a close this daemon passed to it.
+    ///
+    /// The session is closing from here until its closure is recorded, which is what a read that
+    /// meets the worker on its way out is answered with (`Directory::ending`). Something also has
+    /// to notice when the worker finishes, so the tombstone is written and the descriptor removed
+    /// rather than left pointing at a process that has gone.
+    pub(crate) async fn close_accepted(self: &Arc<Self>, session_id: SessionId) {
+        self.directory.lock().await.accepted_close(session_id);
+        tokio::spawn(Arc::clone(self).watch_closure(session_id, ClosureReason::CloseRequested));
     }
 
     /// Waits for a closing worker to end, then records its closure and retires it.
@@ -9374,11 +9404,18 @@ impl Controller {
                 return Err(error.into());
             }
         };
-        match result {
+        let read = match result {
             Ok(value) => reported_read(&value)
-                .map_err(|error| ControllerError::InvalidArgument(error.to_string())),
-            Err(error) => Err(ControllerError::InvalidArgument(error.to_string())),
-        }
+                .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?,
+            Err(error) => return Err(ControllerError::InvalidArgument(error.to_string())),
+        };
+        drop(held);
+        // Kept for the moment this worker can no longer be asked (`Directory::ending`).
+        self.directory
+            .lock()
+            .await
+            .heard(worker.descriptor.session_id, &read);
+        Ok(read)
     }
 
     /// Returns this daemon's one connection to a worker, opening it if there is none.
@@ -12446,53 +12483,15 @@ mod a_close_a_worker_never_answers {
                     let (mut reader, mut writer) = split(connection, StreamKind::Control);
                     let connection_id = ConnectionId::new(kr_ipc::new_uuid());
                     while let Ok(frame) = reader.read_message::<ControlFrame>().await {
-                        let answers = match frame {
-                            ControlFrame::Hello(_) => vec![
-                                ControlFrame::HelloAck(Box::new(LocalHelloAck {
-                                    selected_version: kr_protocol::hello::PROTOCOL_VERSION,
-                                    role: LocalRole::Worker,
-                                    connection_id,
-                                    environment_id: identity_environment(),
-                                    boot_identity: kr_ipc::identity::boot_identity()
-                                        .expect("a boot identity"),
-                                    peer: peer.to_wire(),
-                                    action_window: ActionWindow {
-                                        action_window_id: ActionWindowId::new("worker:test")
-                                            .expect("a window"),
-                                        connection_id,
-                                        boot_epoch: kr_protocol::ids::BootEpoch::new(1),
-                                        issued_at_ms: kr_ipc::now_ms(),
-                                        valid_for_ms: DurationMs::new(60_000),
-                                    },
-                                    capabilities: CanonicalSet::new(),
-                                    max_receive: ReceiveLimits::default(),
-                                })),
-                                ControlFrame::GenerationChallenge(GenerationChallenge {
-                                    nonce: kr_ipc::verify::fresh_challenge()
-                                        .expect("a challenge")
-                                        .nonce,
-                                }),
-                            ],
-                            ControlFrame::VerifyChallenge(challenge) => {
-                                vec![ControlFrame::VerifyProof(
-                                    identity
-                                        .answer(&challenge, &endpoint_text)
-                                        .expect("answers its own challenge"),
-                                )]
-                            }
-                            ControlFrame::GenerationToken(token) => {
-                                vec![ControlFrame::GenerationAccepted(GenerationAccepted {
-                                    generation: token.generation,
-                                    fenced_previous: false,
-                                })]
-                            }
-                            // A proxy link says what it is for, and the worker agrees.
-                            ControlFrame::ControllerRole(role) => {
-                                vec![ControlFrame::ControllerRole(role)]
-                            }
+                        let handshake =
+                            handshake(&frame, &identity, &endpoint_text, connection_id, &peer);
+                        let answers = match (handshake, frame) {
+                            (Some(answers), _) => answers,
                             // A recording worker installs the revision announced to it, with
                             // nothing to fence, so this daemon may dispatch to it.
-                            ControlFrame::AuthorityRevision(notice) if recorded.is_some() => {
+                            (None, ControlFrame::AuthorityRevision(notice))
+                                if recorded.is_some() =>
+                            {
                                 vec![ControlFrame::AuthorityRevisionAck(
                                     kr_protocol::worker::AuthorityRevisionAck {
                                         session_id: identity.session_id(),
@@ -12502,7 +12501,7 @@ mod a_close_a_worker_never_answers {
                                 )]
                             }
                             // A silent worker never answers what arrives here, a close among it.
-                            other => match &recorded {
+                            (None, other) => match &recorded {
                                 None => Vec::new(),
                                 Some(recorded) => {
                                     let refusal = answer_of(&other, identity.session_id());
@@ -12523,6 +12522,59 @@ mod a_close_a_worker_never_answers {
                 });
             }
         })
+    }
+
+    /// What a fake worker answers the handshake with that the daemon makes before it will speak
+    /// to a worker at all: the version exchange, the challenge over the descriptor's key, the
+    /// controller generation and the role a link says it is for. Any other frame is `None`, and the
+    /// fake worker answers it in its own way.
+    pub(super) fn handshake(
+        frame: &ControlFrame,
+        identity: &WorkerIdentity,
+        endpoint_text: &str,
+        connection_id: ConnectionId,
+        peer: &kr_ipc::peer::PeerIdentity,
+    ) -> Option<Vec<ControlFrame>> {
+        match frame {
+            ControlFrame::Hello(_) => Some(vec![
+                ControlFrame::HelloAck(Box::new(LocalHelloAck {
+                    selected_version: kr_protocol::hello::PROTOCOL_VERSION,
+                    role: LocalRole::Worker,
+                    connection_id,
+                    environment_id: identity_environment(),
+                    boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+                    peer: peer.to_wire(),
+                    action_window: ActionWindow {
+                        action_window_id: ActionWindowId::new("worker:test").expect("a window"),
+                        connection_id,
+                        boot_epoch: kr_protocol::ids::BootEpoch::new(1),
+                        issued_at_ms: kr_ipc::now_ms(),
+                        valid_for_ms: DurationMs::new(60_000),
+                    },
+                    capabilities: CanonicalSet::new(),
+                    max_receive: ReceiveLimits::default(),
+                })),
+                ControlFrame::GenerationChallenge(GenerationChallenge {
+                    nonce: kr_ipc::verify::fresh_challenge()
+                        .expect("a challenge")
+                        .nonce,
+                }),
+            ]),
+            ControlFrame::VerifyChallenge(challenge) => Some(vec![ControlFrame::VerifyProof(
+                identity
+                    .answer(challenge, endpoint_text)
+                    .expect("answers its own challenge"),
+            )]),
+            ControlFrame::GenerationToken(token) => {
+                Some(vec![ControlFrame::GenerationAccepted(GenerationAccepted {
+                    generation: token.generation,
+                    fenced_previous: false,
+                })])
+            }
+            // A proxy link says what it is for, and the worker agrees.
+            ControlFrame::ControllerRole(role) => Some(vec![ControlFrame::ControllerRole(*role)]),
+            _ => None,
+        }
     }
 
     /// What a recording worker answers a request or a forwarded frame with: the daemon's own
@@ -12554,7 +12606,7 @@ mod a_close_a_worker_never_answers {
     }
 
     /// A live session, as a worker answers the daemon's own `session.read`.
-    fn read_result(session_id: SessionId) -> kr_protocol::session::SessionReadResult {
+    pub(super) fn read_result(session_id: SessionId) -> kr_protocol::session::SessionReadResult {
         kr_protocol::session::SessionReadResult {
             session: kr_protocol::session::SessionSummary {
                 session_id,
@@ -12660,6 +12712,17 @@ mod a_close_a_worker_never_answers {
     /// A daemon with one fake worker in its directory, silent or recording
     /// ([`serve_fake_worker`]), and everything a close needs.
     pub(super) async fn fake_worker(recorded: Option<Recorded>) -> Silent {
+        fake_world(move |listener, identity, endpoint_text| {
+            serve_fake_worker(listener, identity, endpoint_text, recorded)
+        })
+        .await
+    }
+
+    /// A daemon with one fake worker in its directory, served by `serve` on the worker's own
+    /// endpoint, and everything a close needs.
+    pub(super) async fn fake_world(
+        serve: impl FnOnce(Listener, Arc<WorkerIdentity>, String) -> tokio::task::JoinHandle<()>,
+    ) -> Silent {
         let temp = kr_ipc::testing::TempHost::create();
         let environment = temp.environment();
         let environment_id = temp.environment_id();
@@ -12715,12 +12778,7 @@ mod a_close_a_worker_never_answers {
             published_at_ms: kr_ipc::now_ms(),
         };
         let listener = Listener::bind(&worker_endpoint).expect("binds the worker endpoint");
-        let serving = serve_fake_worker(
-            listener,
-            Arc::clone(&identity),
-            worker_endpoint.as_text(),
-            recorded,
-        );
+        let serving = serve(listener, Arc::clone(&identity), worker_endpoint.as_text());
         let worker = KnownWorker {
             descriptor,
             endpoint: worker_endpoint,
@@ -12988,6 +13046,426 @@ mod a_close_a_worker_never_answers {
             "the close fences the path it used, not the one it was queued behind"
         );
         serving.abort();
+    }
+}
+
+#[cfg(test)]
+mod a_read_that_meets_a_worker_on_its_way_out {
+    //! A read of a session whose worker stops answering part way through it.
+    //!
+    //! A worker that has finished its closure stops answering before the kernel says its process
+    //! has ended, so a read that is waiting on it can meet its connection ending while nothing yet
+    //! says the worker has gone. The worker here is a double that goes that way when a test tells
+    //! it to. Its process is this test's own, so the kernel says it is running throughout, and the
+    //! registry names that process as the session's worker, as it names a real one.
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use kr_ipc::endpoint::Listener;
+    use kr_ipc::framed::split;
+    use kr_ipc::verify::WorkerIdentity;
+    use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Response};
+    use kr_protocol::error::ErrorCode;
+    use kr_protocol::frame::StreamKind;
+    use kr_protocol::identity::WorkerProfile;
+    use kr_protocol::ids::{AuthorityRevision, ConnectionId, RequestId, SessionEpoch};
+    use kr_protocol::method::Method;
+    use kr_protocol::scalars::Nullable;
+    use kr_protocol::session::{
+        ClosureReason, ClosureRecord, Durability, OwnershipCoverage, SessionCloseResult,
+        SessionListParams, SessionListResult, SessionReadParams, SessionReadResult, SessionState,
+    };
+    use tokio::sync::{Notify, oneshot};
+
+    use super::a_close_a_worker_never_answers::{self as fake, Silent};
+    use crate::registry::WorkerRecord;
+
+    /// A worker whose session a test moves along, and which goes when the test says so.
+    ///
+    /// It answers a read with its session as live until it is sent a close, which it accepts by
+    /// saying the session is closing, as a worker does before it stops anything; a test can also
+    /// start the closing itself, as a shell that exits does. Told to go, it goes the way a worker
+    /// that has finished its closure goes: at the next read it is sent, its endpoint stops
+    /// accepting, and then the connection that read is waiting on ends unanswered.
+    #[derive(Default)]
+    struct Scripted {
+        /// Whether its session is closing.
+        closing: AtomicBool,
+        /// The read it goes at, once a test has set one.
+        end: std::sync::Mutex<Option<End>>,
+        /// Tells the endpoint to stop accepting.
+        going: Notify,
+        /// Says the endpoint has stopped accepting.
+        gone: Notify,
+    }
+
+    /// Where a scripted worker goes: at the next read it is sent.
+    struct End {
+        /// Told that the read has arrived.
+        arrived: oneshot::Sender<()>,
+        /// Waited for before the worker goes; dropping it is the same as sending.
+        go: oneshot::Receiver<()>,
+    }
+
+    impl Scripted {
+        /// Has this worker go at the next read it is sent. The first half says when that read has
+        /// arrived, and the worker goes once the second is sent or dropped.
+        fn end_at_next_read(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+            let (arrived, arrival) = oneshot::channel();
+            let (go, going) = oneshot::channel();
+            *self
+                .end
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(End { arrived, go: going });
+            (arrival, go)
+        }
+    }
+
+    /// A worker's answer to request `request_id`.
+    fn respond(request_id: RequestId, value: &impl serde::Serialize) -> ControlFrame {
+        ControlFrame::Response(Response {
+            request_id,
+            outcome: Outcome::Ok(ParamsValue::from_typed(value).expect("encodes")),
+        })
+    }
+
+    /// Serves `script` on a worker's endpoint.
+    fn serve_scripted(
+        listener: Listener,
+        identity: Arc<WorkerIdentity>,
+        endpoint_text: String,
+        script: Arc<Scripted>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                let accepted = tokio::select! {
+                    accepted = listener.accept() => accepted,
+                    () = script.going.notified() => break,
+                };
+                let Ok((connection, peer)) = accepted else {
+                    break;
+                };
+                let identity = Arc::clone(&identity);
+                let endpoint_text = endpoint_text.clone();
+                let script = Arc::clone(&script);
+                tokio::spawn(async move {
+                    let (mut reader, mut writer) = split(connection, StreamKind::Control);
+                    let connection_id = ConnectionId::new(kr_ipc::new_uuid());
+                    while let Ok(frame) = reader.read_message::<ControlFrame>().await {
+                        let handshake = fake::handshake(
+                            &frame,
+                            &identity,
+                            &endpoint_text,
+                            connection_id,
+                            &peer,
+                        );
+                        let answers = match (handshake, frame) {
+                            (Some(answers), _) => answers,
+                            (None, ControlFrame::Request(request))
+                                if request.method == Method::SessionRead.into() =>
+                            {
+                                let end = script
+                                    .end
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .take();
+                                if let Some(end) = end {
+                                    let _ = end.arrived.send(());
+                                    let _ = end.go.await;
+                                    // The endpoint goes first and this connection after it, as a
+                                    // worker's do when its process exits.
+                                    script.going.notify_one();
+                                    script.gone.notified().await;
+                                    return;
+                                }
+                                let mut read = fake::read_result(identity.session_id());
+                                if script.closing.load(Ordering::Acquire) {
+                                    read.session.state = SessionState::Closing;
+                                }
+                                vec![respond(request.request_id, &read)]
+                            }
+                            (None, ControlFrame::Forwarded(forwarded))
+                                if forwarded.mutation.method == Method::SessionClose.into() =>
+                            {
+                                script.closing.store(true, Ordering::Release);
+                                vec![respond(
+                                    forwarded.mutation.request_id,
+                                    &SessionCloseResult {
+                                        session_id: identity.session_id(),
+                                        state: SessionState::Closing,
+                                        durability: Durability::Durable,
+                                        closure: Nullable::null(),
+                                    },
+                                )]
+                            }
+                            _ => Vec::new(),
+                        };
+                        for answer in answers {
+                            if writer.write_message(&answer).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+            drop(listener);
+            script.gone.notify_one();
+        })
+    }
+
+    /// A daemon with a scripted worker in its directory, and the registry's own row for that
+    /// worker. The row names this test's process, which is the process the kernel is asked about.
+    async fn scripted(script: &Arc<Scripted>) -> Silent {
+        let script = Arc::clone(script);
+        let world = fake::fake_world(move |listener, identity, endpoint_text| {
+            serve_scripted(listener, identity, endpoint_text, script)
+        })
+        .await;
+        let descriptor = &world.worker.descriptor;
+        world
+            .controller
+            .registry
+            .lock()
+            .await
+            .adopt_worker(&WorkerRecord {
+                session_id: world.session_id,
+                display_number: descriptor.display_number,
+                public_key: descriptor.worker_public_key,
+                process_identity: descriptor.process_start_identity.clone(),
+                endpoint: descriptor.endpoint.clone(),
+                profile: WorkerProfile::HeadlessUser,
+                state: SessionState::Live,
+                acknowledged_revision: AuthorityRevision::new(0),
+            })
+            .expect("the registry records the worker");
+        fake::acknowledged(&world.controller, world.session_id);
+        world
+    }
+
+    /// Reads the session through the daemon, as a client's `session.read` does.
+    async fn read(world: &Silent) -> crate::error::Result<SessionReadResult> {
+        world
+            .controller
+            .session_read(
+                &ParamsValue::from_typed(&SessionReadParams {
+                    session_id: world.session_id,
+                })
+                .expect("encodes"),
+            )
+            .await
+            .map(|value| value.to_typed().expect("decodes"))
+    }
+
+    /// Closes the session through the daemon, and returns what the worker accepted it with.
+    async fn close(world: &Silent) -> SessionCloseResult {
+        world
+            .controller
+            .session_close(
+                &fake::close_request(world.environment_id, world.session_id),
+                &world.actor,
+                Some(world.accepted),
+                fake::admission(&world.controller, world.accepted).await,
+            )
+            .await
+            .expect("the worker accepts the close")
+            .to_typed()
+            .expect("decodes")
+    }
+
+    /// Whether the registry has a closure recorded for the session.
+    async fn recorded(world: &Silent) -> bool {
+        world
+            .controller
+            .registry
+            .lock()
+            .await
+            .closure(world.session_id)
+            .expect("the registry answers")
+            .is_some()
+    }
+
+    /// A read that meets the end of a worker whose close this daemon accepted is answered from
+    /// this daemon's own record: the session is closing, and its closure is this host's to record
+    /// once the kernel says the worker has ended.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_read_that_meets_the_end_of_a_worker_whose_close_was_accepted_answers_closing() {
+        let script = Arc::new(Scripted::default());
+        let world = scripted(&script).await;
+        assert_eq!(
+            read(&world)
+                .await
+                .expect("the worker answers")
+                .session
+                .state,
+            SessionState::Live
+        );
+        assert_eq!(close(&world).await.state, SessionState::Closing);
+
+        // The worker finishes its closure and goes while a read is waiting on it.
+        let (_arrived, go) = script.end_at_next_read();
+        drop(go);
+        let answer = read(&world)
+            .await
+            .expect("a closing session is answered for from this daemon's own record");
+        assert_eq!(answer.session.session_id, world.session_id);
+        assert_eq!(answer.session.state, SessionState::Closing);
+        assert!(
+            answer.endpoint.0.is_none(),
+            "an endpoint that has stopped answering is not handed out"
+        );
+        assert!(
+            !recorded(&world).await,
+            "and nothing is recorded over a worker the kernel says is still running"
+        );
+        world.serving.abort();
+    }
+
+    /// A session that began closing on its own is answered for the same way: its worker said it
+    /// was closing, and that is what the session still is when the worker stops answering.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_read_that_meets_the_end_of_a_worker_that_said_it_was_closing_answers_closing() {
+        let script = Arc::new(Scripted::default());
+        let world = scripted(&script).await;
+        // The shell exits, and the worker begins the closure itself.
+        script.closing.store(true, Ordering::Release);
+        assert_eq!(
+            read(&world)
+                .await
+                .expect("the worker answers")
+                .session
+                .state,
+            SessionState::Closing
+        );
+
+        let (_arrived, go) = script.end_at_next_read();
+        drop(go);
+        let answer = read(&world)
+            .await
+            .expect("a closing session is answered for from this daemon's own record");
+        assert_eq!(answer.session.state, SessionState::Closing);
+        assert!(!recorded(&world).await);
+        world.serving.abort();
+    }
+
+    /// A read that meets the end of a worker after the session's closure was recorded is answered
+    /// with that closure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_read_that_meets_the_end_of_a_worker_whose_closure_was_recorded_answers_it() {
+        let script = Arc::new(Scripted::default());
+        let world = scripted(&script).await;
+        assert_eq!(close(&world).await.state, SessionState::Closing);
+
+        let (arrived, go) = script.end_at_next_read();
+        let reading = tokio::spawn({
+            let controller = Arc::clone(&world.controller);
+            let params = ParamsValue::from_typed(&SessionReadParams {
+                session_id: world.session_id,
+            })
+            .expect("encodes");
+            async move { controller.session_read(&params).await }
+        });
+        arrived.await.expect("the read reaches the worker");
+        // The closure is recorded while the read waits on the worker.
+        let record = ClosureRecord {
+            session_id: world.session_id,
+            session_epoch: SessionEpoch::V1,
+            reason: ClosureReason::CloseRequested,
+            root_exit_code: Nullable::null(),
+            root_signal: Nullable::null(),
+            terminated: Vec::new(),
+            surviving: Vec::new(),
+            ownership_coverage: OwnershipCoverage::Complete,
+            durability: Durability::Durable,
+            closed_at_ms: kr_ipc::now_ms(),
+        };
+        world
+            .controller
+            .retire(&record)
+            .await
+            .expect("the closure is recorded");
+        drop(go);
+
+        let answer: SessionReadResult = reading
+            .await
+            .expect("the read finishes")
+            .expect("a closed session is answered with its closure")
+            .to_typed()
+            .expect("decodes");
+        assert_eq!(answer.session.state, SessionState::Closed);
+        assert_eq!(answer.session.closure.0, Some(record));
+        world.serving.abort();
+    }
+
+    /// A list that meets the end of a worker whose close this daemon accepted lists the session as
+    /// closing rather than leaving it out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_list_that_meets_the_end_of_a_worker_whose_close_was_accepted_lists_it_closing() {
+        let script = Arc::new(Scripted::default());
+        let world = scripted(&script).await;
+        assert_eq!(
+            read(&world)
+                .await
+                .expect("the worker answers")
+                .session
+                .state,
+            SessionState::Live
+        );
+        assert_eq!(close(&world).await.state, SessionState::Closing);
+
+        let (_arrived, go) = script.end_at_next_read();
+        drop(go);
+        let listed: SessionListResult = world
+            .controller
+            .session_list(
+                &ParamsValue::from_typed(&SessionListParams {
+                    environment_id: Nullable::null(),
+                    include_closed: false,
+                })
+                .expect("encodes"),
+            )
+            .await
+            .expect("the daemon lists its sessions")
+            .to_typed()
+            .expect("decodes");
+        let listed: Vec<_> = listed
+            .sessions
+            .iter()
+            .map(|session| (session.session_id, session.state))
+            .collect();
+        assert_eq!(listed, vec![(world.session_id, SessionState::Closing)]);
+        world.serving.abort();
+    }
+
+    /// Where this daemon has no word of an end, a worker that stops answering is not taken for
+    /// one: the session was live when its worker last answered, the kernel says the worker is
+    /// still running, and the read is refused as something to try again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_read_that_meets_a_live_workers_connection_ending_is_refused_for_now() {
+        let script = Arc::new(Scripted::default());
+        let world = scripted(&script).await;
+        assert_eq!(
+            read(&world)
+                .await
+                .expect("the worker answers")
+                .session
+                .state,
+            SessionState::Live
+        );
+
+        let (_arrived, go) = script.end_at_next_read();
+        drop(go);
+        let refused = read(&world)
+            .await
+            .expect_err("nothing this daemon holds says what the session is now");
+        assert_eq!(refused.code(), ErrorCode::ResourceUnavailable, "{refused}");
+        assert!(
+            refused.code().retry_category().permits_automatic_retry(),
+            "and a read may be asked again: {refused}"
+        );
+        assert!(!recorded(&world).await);
+        world.serving.abort();
     }
 }
 

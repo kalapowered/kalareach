@@ -1349,15 +1349,8 @@ impl Controller {
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         match reply.closure.as_ref() {
             Some(record) => self.retire(record).await?,
-            // The worker has accepted the close and is stopping its processes. Something has to
-            // notice when that finishes, so the tombstone is written and the descriptor removed
-            // rather than left pointing at a process that has gone.
-            None => {
-                tokio::spawn(Arc::clone(self).watch_closure(
-                    session_id,
-                    kr_protocol::session::ClosureReason::CloseRequested,
-                ));
-            }
+            // The worker has accepted the close and is stopping its processes.
+            None => self.close_accepted(session_id).await,
         }
         crate::service::encode(&reply)
     }
