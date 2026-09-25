@@ -321,6 +321,65 @@ and four lines hold:
 - it cannot say the capability works *here*: only a host probe or a live binding establishes that,
   and a catalogue record gets its own state saying which release it describes.
 
+## Native bridges
+
+A release whose manifest carries a native bridge recipe changes files in the application's own
+directory, which the host does not own. The daemon applies the recipe once an installation that
+holds `native_bridge.install` has committed, and takes it out when the package is removed or that
+grant is withdrawn. Enabling and disabling the package leave it: the registration belongs to the
+installation the owner confirmed, and what the host serves through it follows admission. After every
+plugin change, and each time the daemon starts, each package's bridge is brought to what its
+installation wants. The method's answer and receipt say what the catalogue did and are never changed
+by the recipe.
+
+Before anything is written, everything the recipe needs is checked, and a failed check is a refusal
+that writes nothing:
+
+- the host changes an application's directory on macOS and Linux only, because only there can it
+  tell whether a replacement keeps who may read what it replaces;
+- the application is one whose directory this host knows: Claude Code's is `.claude` in the
+  account's home, the directory it reads when `CLAUDE_CONFIG_DIR` is not set;
+- the forwarder the registration is expected to start is the `kr-hook` beside the daemon;
+- every step the recipe installs has the removal that undoes it, and every file it installs is the
+  bytes its recipe names;
+- every executable the package's match rules name on the daemon's search path is read, never run,
+  and each must be one a signed qualification record of the package names by its SHA-256 digest, at
+  a version inside the recipe's range. A version nothing establishes refuses the recipe. A catalogue
+  qualification result names a capability, a subject and its profile rather than an executable's
+  digest, so it establishes no version here;
+- every path is walked from one handle on the application's directory, each directory opened without
+  following a link, and a link or a non-directory on the way, or a destination that is not a regular
+  file, is refused;
+- a file already at a destination that no record of this host names with its digest is refused, even
+  when it holds the same bytes, and so is a configuration key already set that this host did not
+  set, whatever its value;
+- a configuration document is edited only when it is strict JSON with no member name repeated in any
+  object, and only when a replacement keeps its protection: one with an access-control list, or in a
+  directory that would give its replacement one, is refused.
+
+A configuration key is spliced into the document's own text and every other byte is kept, so the
+document's layout, its members' order and its numbers are as they were, and removing the key
+restores the document exactly. A document that changes between the host's reading and its
+replacement is read again, so what somebody wrote meanwhile is kept. Each file is written under a
+temporary name, flushed and renamed into place only where nothing is; directories are made the same
+way.
+
+Each change is noted in the package's journal before it is made and recorded after it, with the
+identity of the file it staged. A daemon that stops part way leaves notes the next run settles from
+what is on disk: a temporary file still there was never put in place, a destination holding the
+staged identity is the host's, and anything else is somebody else's and is left alone. An
+application either finishes or is taken out and recorded as refused with its reason, and a release
+is reported as applied only once every change is in place. A key that may be the host's and cannot
+be shown to be, because its document was replaced after the host wrote it and before it recorded
+doing so, is neither taken out nor claimed, and while it stays the bridge is not reported as
+applied.
+
+A removal takes each file out only while it still holds the bytes installed, and the key only while
+it holds the value written, then the directories the host made once they are empty. Whatever has
+changed since is left in place and named in the journal. The journal also says what an applied
+release yields for the sessions that launch its application: the application name its registration
+invokes the forwarder for, the registrations it makes and the forwarder it is expected to start.
+
 ## The transport, and the broker
 
 A repository is read over https or from a local directory, and nothing else: a Git URL, a branch or

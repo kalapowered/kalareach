@@ -743,6 +743,18 @@ enabling, pinning, granting and uninstalling it all work with no enrolment behin
 whose payloads are no longer cached is refused as unavailable offline, because there is no longer a
 root to verify a fetch against.
 
+An installed release whose manifest carries a native bridge recipe, installed with
+`native_bridge.install` granted, has the recipe applied in the application's own directory once the
+installation has committed; removing the package, or a grant that withdraws that capability, takes
+it out again, and enabling or disabling the package leaves it. After every plugin change, and each
+time the daemon starts, the package's bridge is brought to what its installation wants, so a recipe
+a stopped daemon left part way is finished or taken out before anything else is served. The recipe
+keeps a journal of its own for each package under `native-bridges/` in the environment's state
+directory, apart from the catalogue's records, and never changes a method's answer or receipt: an
+installation's answer says what the catalogue did, and the journal says what the recipe did.
+`docs/plugins/catalogue.md` has what is checked before anything is written and what a removal
+leaves.
+
 The registry admits a paired device to all thirteen of these methods, and the daemon serves them
 through the same module a local caller reaches, so a device's `catalogue.list` and the owner's are
 one answer. A catalogue and an installed package belong to the environment, so there is no worker to

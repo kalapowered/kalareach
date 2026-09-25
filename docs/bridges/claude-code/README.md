@@ -35,6 +35,15 @@ plugin off. The core repository keeps a copy of the three files in
 accepts, and that every hook is in that form. A package change moves the copies and the digests
 together.
 
+The host applies the recipe in `.claude` in the account's home, the directory Claude Code reads when
+`CLAUDE_CONFIG_DIR` is not set, once the owner's confirmed installation of the release has
+committed, and removes it when the package is removed; `docs/plugins/catalogue.md` says what it
+checks before writing anything and what a removal leaves. The settings key is spliced into the
+person's own `settings.json`, so every other byte of it stays as it was. The registration names the
+forwarder as `kr-hook`, a bare command Claude Code finds on its own search path. The installation
+expects the `kr-hook` beside the daemon, and a connection running another copy is refused at
+admission, so the launched Claude Code has to find that one first.
+
 The five hook events are the ones whose exit codes refuse nothing: the action has already happened,
 or the code is ignored. A hook here observes because the forwarder never answers anything but `{}`,
 and on these five events even a wrong exit code could not block anything.
