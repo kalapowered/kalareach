@@ -2267,11 +2267,11 @@ recover from. Exclusive creation is also what stops a second admission of the sa
 writing over ciphertext the first is still accounting for, and that second admission is refused
 outright.
 
-One limit is stated rather than implied. **On Windows nothing flushes a directory entry**: there
-is no portable way to do it, and opening a directory as a file fails outright, so a staging write
-that tried would fail after the ciphertext was already on the disk. The contents are written and
-flushed on every platform, so a reader never sees a file half written; what a Windows host does not
-get is the guarantee that a *name* survives losing power.
+The directories are flushed on every platform. Windows flushes a directory only through a handle
+that may change it, so there each is opened with the one right its change used: the directory that
+holds the file with the right to add a file, and each directory above it, up to the staging root,
+with the right to add a directory. A removal of staged ciphertext flushes the same directories, and
+is not reported as done until that flush has succeeded.
 
 A crash between the file and the row leaves ciphertext no row claims, and the staging directory is
 walked for exactly that. The staging directory is held as an absolute path whatever the caller
