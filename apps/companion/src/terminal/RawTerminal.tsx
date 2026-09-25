@@ -262,7 +262,7 @@ export function RawTerminal({
         ) : null}
       </header>
 
-      {failure ? (
+      {failure !== null ? (
         <p className="banner warning" role="status">
           {failure}
         </p>

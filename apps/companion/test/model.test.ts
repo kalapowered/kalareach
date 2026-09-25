@@ -54,6 +54,7 @@ import {
   ZOOM_STEPS
 } from '../src/terminal/modes'
 import { projectEndpoint, rubberband, shouldDismiss, stepSpring } from '../src/motion'
+import { failureMessage } from '../src/host/port'
 // The protocol crate's source, as text: the sentences the host gives each presentation reason.
 import attachmentSource from '../../../crates/kr-protocol/src/attachment.rs?raw'
 
@@ -520,6 +521,24 @@ describe('the frame scheduler', () => {
     expect(frame).toHaveBeenCalledOnce()
     expect(flushed).toEqual([[1]])
     vi.unstubAllGlobals()
+  })
+})
+
+describe('the words for a failure', () => {
+  it('are the failure’s own words, and never none', () => {
+    expect(failureMessage({ code: 'X', message: 'The host said no.', user_action: 'retry' })).toBe(
+      'The host said no.'
+    )
+    expect(failureMessage(new Error('The call failed.'))).toBe('The call failed.')
+    for (const wordless of [
+      { code: 'X', message: '', user_action: 'retry' },
+      { code: 'X', message: '   ', user_action: 'retry' },
+      new Error(''),
+      'not a failure shape',
+      null
+    ]) {
+      expect(failureMessage(wordless)).toBe('Something went wrong.')
+    }
   })
 })
 

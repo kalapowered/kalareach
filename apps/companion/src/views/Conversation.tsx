@@ -567,7 +567,7 @@ export function Conversation({
     <div className="conversation" data-testid="conversation">
       {banner ? <Banner tone={banner.tone} title={banner.title} detail={banner.detail} /> : null}
 
-      {refusal ? (
+      {refusal !== null ? (
         <div data-testid="conversation-unread">
           <Banner tone="warning" title="This conversation could not be read" detail={refusal} />
         </div>

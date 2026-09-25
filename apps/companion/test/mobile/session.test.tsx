@@ -145,6 +145,25 @@ describe("the phone's session view keeps each read to its own session", () => {
     expect(screen.queryByText('Nothing in this conversation yet.')).toBeNull()
   })
 
+  it('shows a refusal that came with no words as a refusal, not as an empty conversation', async () => {
+    const { port } = fakeHost()
+    render(
+      <AppProvider
+        port={{
+          ...port,
+          agentSnapshot: () =>
+            Promise.reject({ code: 'RESOURCE_UNAVAILABLE', message: '', user_action: 'retry' })
+        }}
+      >
+        <OnSession sessionId={SESSION_MAIN} />
+      </AppProvider>
+    )
+
+    expect(await screen.findByText('This conversation could not be read')).toBeInTheDocument()
+    expect(screen.getByText('Something went wrong.')).toBeInTheDocument()
+    expect(screen.queryByText('Nothing in this conversation yet.')).toBeNull()
+  })
+
   it('shows the conversation it read when nothing changed in between', async () => {
     const { port } = fakeHost()
     render(

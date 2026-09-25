@@ -192,6 +192,19 @@ describe('the conversation reads its document once it is listening (KR-REQ-13.02
     expect(within(refusal).getByText('The host refused before it answered.')).toBeInTheDocument()
   })
 
+  it('shows a refusal that came with no words as a refusal', async () => {
+    const { port } = fakeHost()
+    openConversation({
+      ...port,
+      agentSnapshot: () =>
+        Promise.reject({ code: 'RESOURCE_UNAVAILABLE', message: '', user_action: 'retry' })
+    })
+
+    const refusal = await screen.findByTestId('conversation-unread')
+    expect(refusal.textContent).toContain('This conversation could not be read')
+    expect(refusal.textContent).toContain('Something went wrong.')
+  })
+
   it('reads the document again once the host is back, and the refusal goes', async () => {
     const { port, controls } = fakeHost()
     controls.setConnected(false)

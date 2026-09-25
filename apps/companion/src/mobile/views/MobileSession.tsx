@@ -358,7 +358,7 @@ export function MobileSession({
       <div className="m-pane" ref={paneRef} onScroll={remember}>
         {pane === 'semantic' ? (
           <div className="m-stream" data-testid="mobile-conversation">
-            {read?.refusal ? (
+            {read !== null && read.refusal !== null ? (
               <Banner
                 tone="warning"
                 title="This conversation could not be read"

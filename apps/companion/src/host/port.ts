@@ -881,11 +881,13 @@ export function isHostError(value: unknown): value is HostError {
   )
 }
 
-/** The message to show for a failure, whatever shape it arrived in. */
+/**
+ * The message to show for a failure, whatever shape it arrived in, and never an empty one: a
+ * failure that came with no words of its own is still a failure, and says so in these.
+ */
 export function failureMessage(value: unknown): string {
-  if (isHostError(value)) return value.message
-  if (value instanceof Error) return value.message
-  return 'Something went wrong.'
+  const own = isHostError(value) || value instanceof Error ? value.message : ''
+  return own.trim().length > 0 ? own : 'Something went wrong.'
 }
 
 /** The protocol code of a failure, or null when it did not carry one. */
