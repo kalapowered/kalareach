@@ -438,7 +438,10 @@ fn read_listing(
             }
         }
     }
-    if let Some((executable, ..)) = current {
+    if let Some(executable) = current
+        .map(|(executable, ..)| executable)
+        .or_else(|| others.pop())
+    {
         return Err(format!("the listing began {executable} and never ended it"));
     }
     let unlisted: Vec<String> = executables
@@ -706,6 +709,14 @@ mod tests {
                 listing(first, &["a"]),
                 begin(second),
                 "b: test\n".to_owned(),
+            ],
+            "never ended",
+        );
+        fails(
+            &[
+                listing(first, &["a"]),
+                listing(second, &["b"]),
+                begin(doctests),
             ],
             "never ended",
         );
