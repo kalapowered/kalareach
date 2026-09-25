@@ -220,13 +220,11 @@ set up for that. The document's `startup` section records the setup:
 the daemon. `kr new` then runs the `kr-controller` installed beside it, detached: in a session and a
 process group of its own with no controlling terminal, its standard streams going to
 `controller.log` in the environment's state directory, working in that directory, and given the
-environment's own runtime and state roots. It inherits the command's environment except `PATH`,
-which is the one a per-user service manager gives a daemon on the platform
-(`/usr/bin:/bin:/usr/sbin:/sbin` on macOS, `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`
-elsewhere), so the programs the daemon runs are the platform's and not whatever a caller's shell
-put first. Its IPC is the owner-only endpoints every daemon serves, and it takes the environment's
-singleton lock and advances its generation like any other start; several commands starting it at
-once leave one daemon. The command waits up to 30 seconds for it to answer, and
+environment's own runtime and state roots. It inherits the command's environment, `PATH` included,
+as a daemon started by hand from the same shell does. Its IPC is the owner-only endpoints every
+daemon serves, and it takes the environment's singleton lock and advances its generation like any
+other start; several commands starting it at once leave one daemon. The command waits up to 30
+seconds for it to answer, and
 [docs/cli/README.md](../cli/README.md#when-no-control-daemon-is-running) says what a person sees.
 
 `kr host startup` writes the section as one validated edit with no daemon running, and `kr doctor`

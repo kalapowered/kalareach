@@ -10,19 +10,18 @@
 //! Under it, `kr new` runs the daemon installed beside this command, `kr-controller`, detached from
 //! the command: in a session and a process group of its own, with no controlling terminal and none
 //! of the command's streams, working in the environment's own state directory and told the
-//! environment's own runtime and state roots. It searches the platform's own directories for the
-//! tools it runs, which is the search path a service manager would have given it, rather than
-//! whatever the shell that happened to run the first `kr new` puts first. Everything else about it
-//! is an ordinary start: it keeps its keys where an installed daemon keeps them, serves the
+//! environment's own runtime and state roots. It inherits the command's environment, `PATH`
+//! included, exactly as a daemon started by hand from the same shell does. Everything else about
+//! it is an ordinary start: it keeps its keys where an installed daemon keeps them, serves the
 //! private endpoints it always serves, and takes the environment's singleton lock and advances its
 //! generation, which is what leaves one daemon when several commands start one at once. The command
-//! waits a bounded time for the daemon's endpoint and then goes on as it would against a daemon that
+//! waits a bounded time for the daemon to answer and then goes on as it would against a daemon that
 //! was already running.
 //!
 //! What such a daemon writes goes to `controller.log` in the environment's state directory, and a
-//! daemon that does not answer in time is named in the command's failure with the last thing it
-//! wrote. The command does not end it: a daemon still starting, such as one waiting on a person to
-//! allow access to a credential store, may yet come up, and the singleton lock already keeps a
+//! daemon that does not answer in time is named in the command's failure with the last line of
+//! that log. The command does not end it: a daemon still starting, such as one waiting on a person
+//! to allow access to a credential store, may yet come up, and the singleton lock already keeps a
 //! second one from serving beside it.
 
 use std::path::PathBuf;
@@ -40,6 +39,9 @@ use crate::resolve::{self, KnownEnvironment};
 /// How long `kr new` waits for a daemon it started to answer on its endpoint.
 pub const START_BOUND: Duration = Duration::from_secs(30);
 
+/// How long one attempt to reach a daemon that is already listening is given to be answered.
+pub const ANSWER_BOUND: Duration = Duration::from_secs(10);
+
 /// How often the endpoint is tried while the command waits.
 #[cfg(unix)]
 const RETRY: Duration = Duration::from_millis(50);
@@ -55,16 +57,6 @@ const LOG_LIMIT: u64 = 1024 * 1024;
 /// The most of the log a failure reads back.
 #[cfg(unix)]
 const LOG_TAIL: u64 = 4096;
-
-/// Where a daemon the standalone start runs looks for the programs it runs: the search path a
-/// per-user service manager gives a daemon on this platform.
-#[cfg(target_os = "macos")]
-const SEARCH_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
-
-/// Where a daemon the standalone start runs looks for the programs it runs: the search path a
-/// per-user service manager gives a daemon on this platform.
-#[cfg(all(unix, not(target_os = "macos")))]
-const SEARCH_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// What this environment's configuration document chooses about starting its control daemon.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -211,49 +203,113 @@ pub struct Started {
     pub pid: u32,
 }
 
+/// How long each wait of the standalone start is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Bounds {
+    /// One attempt to reach a daemon: the connection and the daemon's hello together. A daemon
+    /// that accepts the connection and never says hello has not answered.
+    answer: Duration,
+    /// From the moment this command starts a daemon to the moment one answers.
+    #[cfg(unix)]
+    start: Duration,
+}
+
+/// The waits `kr new` uses.
+const BOUNDS: Bounds = Bounds {
+    answer: ANSWER_BOUND,
+    #[cfg(unix)]
+    start: START_BOUND,
+};
+
 /// Reaches the environment's control daemon for `kr new`, starting it first where this
 /// environment chooses the standalone start and none is running.
 ///
-/// A daemon is started only when nothing answers on the environment's endpoint at all. One that is
-/// there and answers badly is reported as it is, because starting another beside it would be
-/// starting a daemon that cannot take the environment.
+/// A daemon is started only when nothing listens on the environment's endpoint at all. One that is
+/// there and answers badly, or does not answer, is reported as it is: starting another beside it
+/// would be starting a daemon that cannot take the environment.
 ///
 /// # Errors
 ///
 /// Returns [`CliError::HostUnavailable`] with the setup action when no daemon answers and none may
-/// be started, and [`CliError::Unfinished`] with `ENVIRONMENT_UNAVAILABLE` when a daemon this
-/// command started did not answer within [`START_BOUND`].
+/// be started, and [`CliError::Unfinished`] with `ENVIRONMENT_UNAVAILABLE` when a daemon that is
+/// there did not answer within [`ANSWER_BOUND`] or one this command started did not answer within
+/// [`START_BOUND`].
 pub async fn open_or_start(
     paths: &HostPaths,
     environment: &KnownEnvironment,
 ) -> Result<(LocalClient, Option<Started>)> {
+    open_or_start_within(paths, environment, BOUNDS).await
+}
+
+async fn open_or_start_within(
+    paths: &HostPaths,
+    environment: &KnownEnvironment,
+    bounds: Bounds,
+) -> Result<(LocalClient, Option<Started>)> {
     let endpoint = environment.paths.controller_endpoint()?;
-    let error = match LocalClient::connect(&endpoint, LocalClientKind::Cli, crate::build_id()).await
-    {
-        Ok(client) => return Ok((client, None)),
-        Err(error) => error,
+    let error = match reach(&endpoint, bounds.answer).await {
+        Reached::Answered(client) => return Ok((*client, None)),
+        Reached::Silent => {
+            return Err(unanswered(&format!(
+                "the control daemon listening for environment {} accepted the connection and \
+                     did not answer within {} seconds; nothing was started beside it",
+                environment.environment_id,
+                bounds.answer.as_secs_f64()
+            )));
+        }
+        Reached::Refused(error) if nothing_listening(&error) => error,
+        Reached::Refused(error) => return Err(resolve::not_running(&error, resolve::SETUP_ACTION)),
     };
-    if !nothing_listening(&error) {
-        return Err(resolve::not_running(&error, resolve::SETUP_ACTION));
-    }
-    let chosen = Chosen::read(&environment.paths);
-    if chosen.controller != Some(ControllerStartup::Standalone) {
-        return Err(resolve::not_running(&error, &chosen.setup_action()));
-    }
     // The daemon beside this command serves the environment its roots name as this installation's
-    // own, and no other.
+    // own, and no other, so for any other environment there is nothing to choose here.
     let installation = paths.open_environment_id()?;
     if environment.environment_id != installation {
         return Err(resolve::not_running(
             &error,
             &format!(
-                "the standalone start runs the control daemon of this installation's own \
-                 environment, {installation}; start the control daemon, kr-controller, for {}",
-                environment.environment_id
+                "start the control daemon, kr-controller, for it; the standalone start serves this \
+                 installation's own environment, {installation}, and no other"
             ),
         ));
     }
-    standalone(paths, &environment.paths, &endpoint).await
+    let chosen = Chosen::read(&environment.paths);
+    if chosen.controller != Some(ControllerStartup::Standalone) {
+        return Err(resolve::not_running(&error, &chosen.setup_action()));
+    }
+    standalone(paths, &environment.paths, &endpoint, bounds).await
+}
+
+/// What one attempt to reach a daemon found.
+enum Reached {
+    /// A daemon answered, and this is the connection to it.
+    Answered(Box<LocalClient>),
+    /// Something accepted the connection and did not answer within the bound.
+    Silent,
+    /// The connection failed.
+    Refused(kr_ipc::IpcError),
+}
+
+/// Makes one attempt to reach the daemon at `endpoint`, the connection and its hello together
+/// bounded by `bound`.
+async fn reach(endpoint: &kr_ipc::paths::Endpoint, bound: Duration) -> Reached {
+    match tokio::time::timeout(
+        bound,
+        LocalClient::connect(endpoint, LocalClientKind::Cli, crate::build_id()),
+    )
+    .await
+    {
+        Ok(Ok(client)) => Reached::Answered(Box::new(client)),
+        Ok(Err(error)) => Reached::Refused(error),
+        Err(_) => Reached::Silent,
+    }
+}
+
+/// The failure a daemon that does not answer in time ends `kr new` with.
+fn unanswered(message: &str) -> CliError {
+    CliError::Unfinished {
+        code: kr_protocol::error::ErrorCode::EnvironmentUnavailable,
+        message: message.to_owned(),
+    }
 }
 
 /// Whether a failure to reach a daemon says that nothing is listening, rather than that something
@@ -267,6 +323,34 @@ fn nothing_listening(error: &kr_ipc::IpcError) -> bool {
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
             )
     )
+}
+
+/// Tries the daemon at `endpoint` until one answers or `deadline` passes, each attempt bounded by
+/// what is left of the deadline, and runs `between` after every attempt that failed.
+///
+/// Returns the connection, or what the last attempt found.
+#[cfg(unix)]
+async fn answered_by(
+    endpoint: &kr_ipc::paths::Endpoint,
+    deadline: tokio::time::Instant,
+    mut between: impl FnMut(),
+) -> std::result::Result<LocalClient, String> {
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let last = match reach(endpoint, left).await {
+            Reached::Answered(client) => return Ok(*client),
+            Reached::Silent => "the endpoint accepted the connection and did not answer".to_owned(),
+            Reached::Refused(error) => error.to_string(),
+        };
+        between();
+        if tokio::time::Instant::now() >= deadline {
+            return Err(last);
+        }
+        tokio::time::sleep(
+            RETRY.min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+        )
+        .await;
+    }
 }
 
 /// The control daemon the standalone start runs: the one installed beside this command.
@@ -296,12 +380,15 @@ pub fn daemon_program() -> Result<PathBuf> {
     Ok(directory.join(format!("kr-controller{}", std::env::consts::EXE_SUFFIX)))
 }
 
-/// Starts the daemon detached from this command and waits for its endpoint.
+/// Starts the daemon detached from this command and waits for it to answer.
+///
+/// It inherits this command's environment, as a daemon started by hand from the same shell does.
 #[cfg(unix)]
 async fn standalone(
     paths: &HostPaths,
     environment: &EnvironmentPaths,
     endpoint: &kr_ipc::paths::Endpoint,
+    bounds: Bounds,
 ) -> Result<(LocalClient, Option<Started>)> {
     let program = daemon_program()?;
     if !program.is_file() {
@@ -314,11 +401,7 @@ async fn standalone(
     // The directories the daemon works and writes in. It creates them itself as well, and both are
     // the same idempotent creation.
     environment.create()?;
-    let log = environment.state_dir().join(LOG_FILE);
-    let (written, from) = open_log(&log)?;
-    let output = written
-        .try_clone()
-        .map_err(|error| CliError::Ipc(kr_ipc::IpcError::io("open", &log, error)))?;
+    let log = Log::open(&environment.state_dir().join(LOG_FILE))?;
     let mut child = std::process::Command::new(&program)
         .arg("--runtime-dir")
         .arg(paths.runtime_root())
@@ -326,10 +409,9 @@ async fn standalone(
         .arg(paths.state_root())
         .arg("--own-session")
         .current_dir(environment.state_dir())
-        .env("PATH", SEARCH_PATH)
         .stdin(std::process::Stdio::null())
-        .stdout(output)
-        .stderr(written)
+        .stdout(log.output()?)
+        .stderr(log.output()?)
         .spawn()
         .map_err(|error| {
             CliError::HostUnavailable(format!(
@@ -338,40 +420,35 @@ async fn standalone(
             ))
         })?;
     let started = Started { pid: child.id() };
-    let deadline = tokio::time::Instant::now() + START_BOUND;
-    let last = loop {
-        match LocalClient::connect(endpoint, LocalClientKind::Cli, crate::build_id()).await {
-            // The daemon this command started, or the one another command started first: either way
-            // the environment has its daemon, and it is the one the lock let through.
-            Ok(client) => return Ok((client, Some(started))),
-            Err(error) if tokio::time::Instant::now() >= deadline => break error,
-            Err(_) => {}
-        }
-        // Collected as soon as it ends, so a daemon that could not take the environment is not
-        // left waiting on this command.
+    let deadline = tokio::time::Instant::now() + bounds.start;
+    // The daemon this command started, or the one another command started first: either way the
+    // environment has its daemon, and it is the one the lock let through. The one started here is
+    // collected as soon as it ends, so a daemon that could not take the environment is not left
+    // waiting on this command.
+    let last = match answered_by(endpoint, deadline, || {
         let _ = child.try_wait();
-        tokio::time::sleep(RETRY).await;
+    })
+    .await
+    {
+        Ok(client) => return Ok((client, Some(started))),
+        Err(last) => last,
     };
-    let ended = child.try_wait().ok().flatten();
-    let state = ended.map_or_else(
+    let state = child.try_wait().ok().flatten().map_or_else(
         || "it is still running".to_owned(),
         |status| format!("it has ended ({status})"),
     );
-    let said = last_line(&log, from).map_or_else(
-        || "it wrote nothing".to_owned(),
-        |line| format!("the last it wrote was: {line}"),
+    let said = log.last_line().map_or_else(
+        || "its log holds nothing since it started".to_owned(),
+        |line| format!("the last line its log holds since it started is: {line}"),
     );
-    Err(CliError::Unfinished {
-        code: kr_protocol::error::ErrorCode::EnvironmentUnavailable,
-        message: format!(
-            "the control daemon this command started for environment {} (process {}) did not \
+    Err(unanswered(&format!(
+        "the control daemon this command started for environment {} (process {}) did not \
              answer within {} seconds: {last}; {state}, and {said}; what it writes is in {}",
-            environment.environment_id(),
-            started.pid,
-            START_BOUND.as_secs(),
-            log.display()
-        ),
-    })
+        environment.environment_id(),
+        started.pid,
+        bounds.start.as_secs(),
+        log.path.display()
+    )))
 }
 
 /// The standalone start runs the daemon in a session of its own, which only Unix has.
@@ -380,6 +457,7 @@ async fn standalone(
     _paths: &HostPaths,
     _environment: &EnvironmentPaths,
     _endpoint: &kr_ipc::paths::Endpoint,
+    _bounds: Bounds,
 ) -> Result<(LocalClient, Option<Started>)> {
     Err(CliError::HostUnavailable(
         "this environment chooses the standalone start, which runs the control daemon in a \
@@ -389,46 +467,89 @@ async fn standalone(
     ))
 }
 
-/// Opens the log a daemon the standalone start runs writes to: for appending, owner-only, and never
-/// through a link. Returns it and where this start's part of it begins.
+/// The log a daemon the standalone start runs writes to, opened once and checked.
 #[cfg(unix)]
-fn open_log(path: &std::path::Path) -> Result<(std::fs::File, u64)> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    let failed = |error| CliError::Ipc(kr_ipc::IpcError::io("open", path, error));
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(failed)?;
-    let mut length = file.metadata().map_err(failed)?.len();
-    if length > LOG_LIMIT {
-        file.set_len(0).map_err(failed)?;
-        length = 0;
-    }
-    Ok((file, length))
+struct Log {
+    file: std::fs::File,
+    path: PathBuf,
+    /// Where this start's part of it begins.
+    from: u64,
 }
 
-/// The last line written to the log since `from`, when there is one.
 #[cfg(unix)]
-fn last_line(path: &std::path::Path, from: u64) -> Option<String> {
-    use std::io::{Read as _, Seek as _};
+impl Log {
+    /// Opens the log for appending and reading, never through a link and never waiting on it, and
+    /// takes it only when it is a regular file of this user's that nobody else can read or write.
+    ///
+    /// The mode a file is created with says nothing about a file that was already there, and a
+    /// FIFO left where the log belongs would hold the start open before its bound began. So what
+    /// was opened is checked, rather than what the name was expected to be.
+    fn open(path: &std::path::Path) -> Result<Self> {
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
-    let mut file = std::fs::File::open(path).ok()?;
-    let length = file.metadata().ok()?.len();
-    file.seek(std::io::SeekFrom::Start(
-        from.max(length.saturating_sub(LOG_TAIL)),
-    ))
-    .ok()?;
-    let mut bytes = Vec::new();
-    file.take(LOG_TAIL).read_to_end(&mut bytes).ok()?;
-    String::from_utf8_lossy(&bytes)
-        .lines()
-        .map(str::trim)
-        .rfind(|line| !line.is_empty())
-        .map(str::to_owned)
+        let failed = |error| CliError::Ipc(kr_ipc::IpcError::io("open", path, error));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+            .map_err(failed)?;
+        let about = file.metadata().map_err(failed)?;
+        if !about.file_type().is_file()
+            || about.uid() != kr_ipc::paths::current_uid()
+            || about.mode() & 0o077 != 0
+        {
+            return Err(CliError::HostUnavailable(format!(
+                "{} is not a file of this user's that only this user can read and write, so the \
+                 control daemon's output is not written to it; remove it and run kr new again",
+                path.display()
+            )));
+        }
+        let mut from = about.len();
+        if from > LOG_LIMIT {
+            file.set_len(0).map_err(failed)?;
+            from = 0;
+        }
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+            from,
+        })
+    }
+
+    /// A handle a daemon writes its output through: the same open file, appended to.
+    fn output(&self) -> Result<std::fs::File> {
+        self.file
+            .try_clone()
+            .map_err(|error| CliError::Ipc(kr_ipc::IpcError::io("open", &self.path, error)))
+    }
+
+    /// The last line written since this start began, read through the handle that was checked.
+    ///
+    /// Several starts can share the log, so the line is the log's rather than certainly this
+    /// start's daemon's.
+    fn last_line(&self) -> Option<String> {
+        use std::os::unix::fs::FileExt as _;
+
+        let length = self.file.metadata().ok()?.len();
+        let begin = self.from.max(length.saturating_sub(LOG_TAIL));
+        let mut bytes = vec![0; usize::try_from(length.saturating_sub(begin)).ok()?];
+        let mut read = 0;
+        while read < bytes.len() {
+            match self.file.read_at(&mut bytes[read..], begin + read as u64) {
+                Ok(0) | Err(_) => break,
+                Ok(count) => read += count,
+            }
+        }
+        bytes.truncate(read);
+        String::from_utf8_lossy(&bytes)
+            .lines()
+            .map(str::trim)
+            .rfind(|line| !line.is_empty())
+            .map(str::to_owned)
+    }
 }
 
 #[cfg(test)]
@@ -467,6 +588,7 @@ mod tests {
             action.contains("start the control daemon, kr-controller"),
             "{action}"
         );
+        #[cfg(unix)]
         assert!(
             action.contains("kr host startup --set standalone"),
             "{action}"
@@ -516,7 +638,7 @@ mod tests {
         let message = refused.to_string();
         assert!(
             message.contains(&format!(
-                "this installation's own environment, {}",
+                "the standalone start serves this installation's own environment, {}, and no other",
                 host.environment_id()
             )),
             "{message}"
@@ -532,21 +654,146 @@ mod tests {
         );
     }
 
-    /// A failure reads back the last thing the daemon it started wrote, from where its start
-    /// began.
+    /// Something that accepts connections on an environment's endpoint and never says hello.
+    #[cfg(unix)]
+    struct Silent {
+        accepting: tokio::task::JoinHandle<()>,
+    }
+
+    #[cfg(unix)]
+    impl Silent {
+        fn listen(endpoint: &kr_ipc::paths::Endpoint) -> Self {
+            let listener = kr_ipc::endpoint::Listener::bind(endpoint).expect("binds the endpoint");
+            Self {
+                accepting: tokio::spawn(async move {
+                    let mut held = Vec::new();
+                    while let Ok(accepted) = listener.accept().await {
+                        held.push(accepted);
+                    }
+                }),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Silent {
+        fn drop(&mut self) {
+            self.accepting.abort();
+        }
+    }
+
+    /// KR-REQ-07.12: a daemon that accepts the connection and never answers is waited for no
+    /// longer than the bound, both when it is first tried and while a start waits for an answer.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_endpoint_that_never_answers_is_waited_for_no_longer_than_the_bound() {
+        let host = kr_ipc::testing::TempHost::create();
+        let endpoint = host
+            .environment()
+            .controller_endpoint()
+            .expect("an endpoint");
+        let _silent = Silent::listen(&endpoint);
+
+        let started = tokio::time::Instant::now();
+        assert!(matches!(
+            reach(&endpoint, Duration::from_millis(300)).await,
+            Reached::Silent
+        ));
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        let mut attempts = 0;
+        let last = answered_by(&endpoint, deadline, || attempts += 1)
+            .await
+            .map(|_| ())
+            .expect_err("nothing answers");
+        assert!(last.contains("did not answer"), "{last}");
+        assert!(attempts >= 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "both waits ended at their bounds: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// KR-REQ-07.12: with the standalone start chosen, a daemon that is listening and does not
+    /// answer is reported as the environment being unavailable, and nothing is started beside it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_daemon_that_does_not_answer_is_reported_and_none_is_started_beside_it() {
+        let host = kr_ipc::testing::TempHost::create();
+        let environment = host.environment();
+        kr_ipc::paths::write_owner_only_file(
+            &crate::doctor::configuration::document_path(&environment),
+            br#"{"version": 1, "revision": 1, "startup": {"controller": "standalone"}}"#,
+        )
+        .expect("chooses the standalone start");
+        let _silent = Silent::listen(&environment.controller_endpoint().expect("an endpoint"));
+
+        let Err(refused) = open_or_start_within(
+            host.paths(),
+            &KnownEnvironment {
+                environment_id: host.environment_id(),
+                paths: environment.clone(),
+            },
+            Bounds {
+                answer: Duration::from_millis(300),
+                start: Duration::from_secs(1),
+            },
+        )
+        .await
+        else {
+            panic!("nothing answered");
+        };
+        assert_eq!(refused.code(), "ENVIRONMENT_UNAVAILABLE");
+        assert!(
+            refused
+                .to_string()
+                .contains("accepted the connection and did not answer within 0.3 seconds"),
+            "{refused}"
+        );
+        assert!(
+            !environment.state_dir().join(LOG_FILE).exists(),
+            "and no daemon was started beside it"
+        );
+    }
+
+    /// The log is taken only when it is a regular file of this user's that nobody else can read
+    /// or write, and a failure reads back the last line written since its start began.
     #[cfg(unix)]
     #[test]
-    fn the_last_line_is_read_from_where_this_start_began() {
+    fn the_log_is_checked_and_read_from_where_this_start_began() {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let host = kr_ipc::testing::TempHost::create();
-        let log = host.environment().state_dir().join(LOG_FILE);
-        let (_, from) = open_log(&log).expect("opens the log");
-        assert_eq!(from, 0);
-        assert_eq!(last_line(&log, from), None, "a start that wrote nothing");
+        let directory = host.environment().state_dir().to_path_buf();
+        let log = directory.join(LOG_FILE);
+        let opened = Log::open(&log).expect("opens a new log");
+        assert_eq!(opened.from, 0);
+        assert_eq!(opened.last_line(), None, "a start that wrote nothing");
+        drop(opened);
         std::fs::write(&log, "an earlier start\n").expect("an earlier start's line");
-        let (_, from) = open_log(&log).expect("opens the log");
-        assert_eq!(last_line(&log, from), None, "which is not this start's");
+        let opened = Log::open(&log).expect("opens the log");
+        assert_eq!(opened.last_line(), None, "which is not this start's");
         std::fs::write(&log, "an earlier start\nthis start\nand its last word\n\n")
             .expect("this start's lines");
-        assert_eq!(last_line(&log, from).as_deref(), Some("and its last word"));
+        assert_eq!(opened.last_line().as_deref(), Some("and its last word"));
+
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644))
+            .expect("widens the log");
+        assert!(Log::open(&log).is_err(), "a log others can read is refused");
+
+        let fifo = directory.join("fifo-log");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("runs mkfifo");
+        assert!(made.success());
+        assert!(
+            Log::open(&fifo).is_err(),
+            "a FIFO is refused, and opening it does not wait"
+        );
+
+        let link = directory.join("linked-log");
+        std::os::unix::fs::symlink(&log, &link).expect("links the log");
+        assert!(Log::open(&link).is_err(), "a link is not followed");
     }
 }

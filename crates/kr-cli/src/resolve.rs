@@ -206,10 +206,16 @@ pub async fn open_worker(descriptor: &WorkerDescriptor, build_id: BuildId) -> Re
 }
 
 /// What a person does about an environment whose control daemon is not running: start one, or
-/// set this host up for `kr new` to start one itself.
-pub const SETUP_ACTION: &str = "start the control daemon, kr-controller, for it, or select the \
-                                standalone start with `kr host startup --set standalone` so that \
-                                `kr new` starts one";
+/// set this installation up for `kr new` to start one itself.
+#[cfg(unix)]
+pub const SETUP_ACTION: &str = "start the control daemon, kr-controller, for it, or, for this \
+                                installation's own environment, select the standalone start with \
+                                `kr host startup --set standalone` so that `kr new` starts one";
+
+/// What a person does about an environment whose control daemon is not running: start one. The
+/// standalone start runs the daemon in a session of its own, which this platform does not have.
+#[cfg(not(unix))]
+pub const SETUP_ACTION: &str = "start the control daemon, kr-controller, for it";
 
 /// Connects to the control daemon.
 ///

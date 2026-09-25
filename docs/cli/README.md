@@ -131,26 +131,31 @@ with what to do: start the daemon, `kr-controller`, or choose the standalone sta
 `kr host startup --set standalone`. The command installs no service, enables no lingering and
 obtains no privilege on the way.
 
-With the standalone start chosen, `kr new` starts the daemon itself when nothing answers on the
+With the standalone start chosen, `kr new` starts the daemon itself when nothing listens on the
 environment's endpoint: the `kr-controller` installed beside `kr`, detached from the command. It runs
 in a session and a process group of its own with no controlling terminal and none of the command's
-standard streams, works in the environment's own state directory, is told the environment's own
-runtime and state roots, and looks for the programs it runs in the platform's own directories rather
-than in the `PATH` of whoever ran the first `kr new`. It is otherwise an ordinary start: its keys go
-where an installed daemon keeps them, it serves the usual owner-only endpoints, and it takes the
-environment's singleton lock and advances its generation. That lock is what leaves one daemon when
-several commands start one at once; a daemon that cannot take it ends, and the command that started
-it goes on with the one that did. The start is for this installation's own environment only, and a
-command that names another environment is told to start that environment's daemon.
+standard streams, works in the environment's own state directory, and is told the environment's own
+runtime and state roots. It inherits the command's environment, `PATH` included, exactly as a daemon
+started by hand from the same shell does, so the tools it runs by name are the ones that shell
+finds. It is otherwise an ordinary start: its keys go where an installed daemon keeps them, it serves
+the usual owner-only endpoints, and it takes the environment's singleton lock and advances its
+generation. That lock is what leaves one daemon when several commands start one at once; a daemon
+that cannot take it ends, and the command that started it goes on with the one that did. The start
+is for this installation's own environment only, and a command that names another environment is
+told to start that environment's daemon.
 
 The command waits up to 30 seconds for an answer, then creates the session exactly as it would with
 a daemon that was already running. In text form it first says, on standard error, which daemon it
 started. A daemon that has not answered in 30 seconds ends the command with
 `ENVIRONMENT_UNAVAILABLE` and exit status 1, naming the process, whether it is still running and the
-last line it wrote. What the daemon writes is in `controller.log` in the environment's state
-directory. The command does not end a daemon that is slow to come up, such as one waiting for
-somebody to allow it into a credential store: it may still come up, and the lock keeps a second one
-from serving beside it.
+last line of its log. What the daemon writes goes to `controller.log` in the environment's state
+directory, which has to be a file of this user's that nobody else can read or write; a log grown
+past 1 MiB is emptied when the next start begins. The command does not end a daemon that is slow to
+come up, such as one waiting for somebody to allow it into a credential store: it may still come up,
+and the lock keeps a second one from serving beside it.
+
+Something that is listening on the endpoint and does not answer within 10 seconds is reported the
+same way, `ENVIRONMENT_UNAVAILABLE`, and nothing is started beside it.
 
 Other commands never start a daemon. `kr list`, `kr status` and the rest answer `HOST_NOT_CONFIGURED`
 with the same setup action when none is running.
@@ -1040,7 +1045,8 @@ kr host startup --clear                # choose nothing; kr new says what to set
 ```
 
 The choice is the `startup.controller` selection of the versioned per-user host configuration
-document, and `--set` and `--clear` each apply one validated revision of it. No daemon is asked and
+document, and `--set` and `--clear` each apply one validated revision of it, making the
+environment's own directories first on a host where no daemon has run yet. No daemon is asked and
 none is started: `kr new` reads the choice the next time it finds no daemon running, which is why
 `kr doctor` reports it as applying at the next start. Writing it installs no service, enables no
 lingering and obtains no privilege. `standalone` is the one way this build knows. The standalone
