@@ -31,7 +31,9 @@ use kr_protocol::scalars::Uuid;
 use kr_protocol::session::CommandIntegration;
 use kr_protocol::session::EnvironmentVariable;
 use kr_worker::broker::Broker;
-use kr_worker::broker::commands::{CommandBackends, CommandBackendsConfig, EstablishRequest};
+use kr_worker::broker::commands::{
+    BackendState, CommandBackends, CommandBackendsConfig, EstablishRequest,
+};
 use kr_worker::broker::connectors::{ConnectorSources, fixture};
 use kr_worker::persistence::JournalHealth;
 
@@ -2235,33 +2237,65 @@ fn kr_req_12_07_a_session_that_closes_mid_launch_leaves_no_instance() {
 /// KR-REQ-12.07, KR-REQ-12.16: a launch that commits after its session has started to close, and
 /// before the close retires its backend, ends with the session too: the close reads nothing of the
 /// launch before the retirement, so whatever the launch did in between, its instance and its grant
-/// end, and its launcher, never told, runs what was typed.
+/// end, and its launcher, never told, runs what was typed. Each step waits at a pause the test lets
+/// go of, so the order is the same on any machine: the launch going and not committed, the close
+/// started, the commit, and then the retirement.
 #[test]
 fn kr_req_12_07_a_launch_committed_while_its_session_closes_leaves_no_instance() {
     let shell = Shell::reading();
     let project = shell.placed.host.root().join("raced");
     std::fs::create_dir_all(&project).expect("a project directory");
     let answer = shell.establish_in(&project);
+    let (going, commit) = shell.backends.pause_before_committing();
     let (retiring, go_on) = shell.backends.pause_before_retiring();
-    let (committed, confirm) = shell.backends.pause_before_confirming();
-    let mut held = shell.launcher(&shell.executable, &Shell::answered(), Some(1000));
+    let (mut committed, confirm) = shell.backends.pause_before_confirming();
+    // The program runs only once the test is done, whichever route its launcher takes, so the
+    // process the instance names is there throughout.
+    let done = shell.placed.host.root().join("raced.done");
+    let mut held = shell.launcher_until(&shell.executable, &Shell::answered(), &done);
     shell.prepare(&mut held, Some(&answer), "raced", &[]);
     held.current_dir(&project);
-    let held = held.spawn().expect("the launcher starts");
-    let registration = Shell::registration(&answer);
-    eventually("the launch is admitted", || registration.exists());
-    let instance = Shell::registered_instance(&answer);
+    let mut held = held.spawn().expect("the launcher starts");
 
-    // The session starts to close while the launcher holds before it says it is going, and the
-    // close stops before it retires the backend.
+    // The launch says it is going, and waits before it is committed.
+    shell
+        .runtime
+        .block_on(async { tokio::time::timeout(LIVENESS, going).await })
+        .expect("the launch says it is going")
+        .expect("and waits before it is committed");
+    let instance = Shell::registered_instance(&answer);
+    assert!(
+        matches!(
+            shell.backends.state_of(instance),
+            Some(BackendState::Launching)
+        ),
+        "the launch is going and not committed"
+    );
+
+    // The session starts to close, and the close waits before it retires the backend.
     let backends = Arc::clone(&shell.backends);
     let closing = std::thread::spawn(move || backends.close());
     retiring
         .recv_timeout(LIVENESS)
         .expect("the close reaches the backend");
+    assert!(
+        shell.backends.state_of(instance).is_none(),
+        "the close has taken the session's backends"
+    );
+    assert!(
+        matches!(
+            committed.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "nothing committed before the close started"
+    );
+
     // The launch commits in between.
+    commit.send(()).expect("the launch commits");
     shell.at_the_confirmation(committed);
     assert!(shell.broker.binding_state(instance).is_ok(), "committed");
+
+    // The close retires the backend, and ends what the launch committed.
     go_on.send(()).expect("the close goes on");
     let _ = closing.join().expect("the close finishes");
     assert!(
@@ -2273,9 +2307,10 @@ fn kr_req_12_07_a_launch_committed_while_its_session_closes_leaves_no_instance()
         "and so does its grant"
     );
     let _ = confirm.send(());
-    let _ = finish(held);
+    std::fs::write(&done, "").expect("the program may run");
     assert_typed(
-        &shell.report("raced"),
+        &shell.report_from("raced", &mut held),
         "a launch committed while its session closed",
     );
+    let _ = finish(held);
 }

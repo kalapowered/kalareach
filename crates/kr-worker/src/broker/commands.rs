@@ -215,6 +215,8 @@ struct Backend {
     announced: Mutex<Announced>,
     #[cfg(feature = "testing")]
     confirm_pause: Arc<Mutex<Option<ConfirmPause>>>,
+    #[cfg(feature = "testing")]
+    commit_pause: Arc<Mutex<Option<ConfirmPause>>>,
 }
 
 /// What a backend's instance was last announced as, and what may still be announced about it.
@@ -332,6 +334,10 @@ pub struct CommandBackends {
     /// Where the next committed launch stops before the launcher is told, for this host's own tests.
     #[cfg(feature = "testing")]
     confirm_pause: Arc<Mutex<Option<ConfirmPause>>>,
+    /// Where the next launch that says it is going stops before it is committed, for this host's
+    /// own tests.
+    #[cfg(feature = "testing")]
+    commit_pause: Arc<Mutex<Option<ConfirmPause>>>,
     /// Where the next backend's reading stops before it opens the directory it grants, for this
     /// host's own tests.
     #[cfg(feature = "testing")]
@@ -413,6 +419,8 @@ impl CommandBackends {
             #[cfg(feature = "testing")]
             confirm_pause: Arc::new(Mutex::new(None)),
             #[cfg(feature = "testing")]
+            commit_pause: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "testing")]
             directory_pause: Mutex::new(None),
             #[cfg(feature = "testing")]
             retire_pause: Mutex::new(None),
@@ -476,12 +484,32 @@ impl CommandBackends {
         (watch, release)
     }
 
+    /// Stops the next launch that says it is going before it is committed, for this host's own
+    /// tests: the backend is still being launched while it waits.
+    ///
+    /// Returns the end that says the launch has arrived there and the end that lets it go on. It
+    /// is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_committing(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (arrived, watch) = tokio::sync::oneshot::channel();
+        let (release, go) = tokio::sync::oneshot::channel();
+        *self
+            .commit_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
+        (watch, release)
+    }
+
     /// Stops the next close before it retires its first backend, for this host's own tests: a
     /// launch can then commit between the close starting and the retirement.
     ///
-    /// Returns the end that says the close has arrived there and the end that lets it go on;
-    /// unreleased, it goes on by itself after [`DIRECTORY_PAUSE_LIMIT`]. It is compiled away in
-    /// every shipped build.
+    /// Returns the end that says the close has arrived there and the end that lets it go on, which
+    /// it also does once the test drops that end. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     pub fn pause_before_retiring(
         &self,
@@ -626,7 +654,7 @@ impl CommandBackends {
                     .take();
                 if let Some((arrived, go)) = armed {
                     let _ = arrived.send(());
-                    let _ = go.recv_timeout(DIRECTORY_PAUSE_LIMIT);
+                    let _ = go.recv();
                 }
             }
             // Retired first, under its lifecycle lock, so no launch commits under it afterwards;
@@ -809,6 +837,8 @@ impl CommandBackends {
                 .map(|runtime| (self.session_id, Weak::clone(runtime))),
             #[cfg(feature = "testing")]
             confirm_pause: Arc::clone(&self.confirm_pause),
+            #[cfg(feature = "testing")]
+            commit_pause: Arc::clone(&self.commit_pause),
         });
         let reading = {
             let path = PathBuf::from(&backend.invocation.executable);
@@ -1329,6 +1359,18 @@ async fn admit_launch(
         return Err(BrokerError::denied(
             "the admitted launch did not say it is going",
         ));
+    }
+    #[cfg(feature = "testing")]
+    {
+        let armed = backend
+            .commit_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            let _ = go.await;
+        }
     }
     // The commit, under the lifecycle lock: the state, the guard and the supervision together, or,
     // for a backend retired meanwhile, none of them, and the guard gives back.
