@@ -461,11 +461,11 @@ fn the_mobile_bundle_names_a_platform_floor_and_no_release_identity() {
     let configuration = configuration();
     assert_eq!(
         configuration["bundle"]["iOS"]["minimumSystemVersion"],
-        serde_json::json!("14.0")
+        serde_json::json!("17.0")
     );
     assert_eq!(
         configuration["bundle"]["android"]["minSdkVersion"],
-        serde_json::json!(24)
+        serde_json::json!(29)
     );
     // A signing identity, a development team and a provisioning profile belong to whoever holds
     // the accounts, not to this repository. Inventing one here would produce a build that looks
