@@ -35,10 +35,12 @@ pub struct Capture(Mutex<Vec<String>>);
 
 impl Capture {
     pub fn keep(&self, value: &impl serde::Serialize) {
-        self.0
-            .lock()
-            .expect("the capture")
-            .push(serde_json::to_string(value).expect("serialises"));
+        self.keep_text(serde_json::to_string(value).expect("serialises"));
+    }
+
+    /// Keeps text exactly as the page would receive it.
+    pub fn keep_text(&self, text: impl Into<String>) {
+        self.0.lock().expect("the capture").push(text.into());
     }
 
     pub fn texts(&self) -> Vec<String> {
@@ -329,4 +331,232 @@ pub async fn listed(owner: &Owner, matching: impl Fn(&RequestView) -> bool) -> R
     })
     .await
     .expect("the owner device lists the request")
+}
+
+/// A pasteboard and an alert a test controls: the text the pasteboard holds, and the answer the
+/// person gives when an invitation names another service. It counts what it was asked.
+#[derive(Debug, Default)]
+pub struct StubPaste {
+    text: Mutex<Option<String>>,
+    accepts: std::sync::atomic::AtomicBool,
+    /// The services the person was asked about, each with the one this computer is set to use.
+    pub asked: Mutex<Vec<(String, String)>>,
+}
+
+impl StubPaste {
+    /// A pasteboard holding `text`, whose person answers `accepts` when asked.
+    pub fn holding(text: &str, accepts: bool) -> Arc<Self> {
+        let stub = Self::default();
+        *stub.text.lock().expect("the pasteboard") = Some(text.to_owned());
+        stub.accepts
+            .store(accepts, std::sync::atomic::Ordering::SeqCst);
+        Arc::new(stub)
+    }
+
+    /// What the pasteboard holds now.
+    pub fn held(&self) -> Option<String> {
+        self.text.lock().expect("the pasteboard").clone()
+    }
+
+    /// Copies `text` to the pasteboard, and answers `accepts` from now on.
+    pub fn copy(&self, text: &str, accepts: bool) {
+        *self.text.lock().expect("the pasteboard") = Some(text.to_owned());
+        self.accepts
+            .store(accepts, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl companion_tauri::pairing::PastePlatform for StubPaste {
+    fn text(&self) -> Option<String> {
+        self.held()
+    }
+
+    fn clear(&self) -> bool {
+        *self.text.lock().expect("the pasteboard") = None;
+        true
+    }
+
+    fn use_another_service<'a>(
+        &'a self,
+        named: &'a kr_protocol::pairing::RendezvousOrigin,
+        configured: &'a str,
+    ) -> kr_client::pairing::BoxFuture<'a, bool> {
+        self.asked
+            .lock()
+            .expect("the record")
+            .push((named.as_str().to_owned(), configured.to_owned()));
+        let accepts = self.accepts.load(std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move { accepts })
+    }
+}
+
+/// Where the bundle's pages are served from, which is where the page's calls come from.
+#[cfg(windows)]
+const BUNDLE: &str = "http://tauri.localhost";
+#[cfg(not(windows))]
+const BUNDLE: &str = "tauri://localhost";
+
+/// This computer's companion backend on the mock runtime, made of a test's parts: the pairing
+/// commands the application registers, called as the page calls them, and everything the page is
+/// sent, as the page receives it: each command's answer or refusal, and each of the two events.
+pub struct Companion {
+    pub app: tauri::App<tauri::test::MockRuntime>,
+    window: tauri::WebviewWindow<tauri::test::MockRuntime>,
+    /// Each event the page was sent, as its payload.
+    pub heard: Arc<Capture>,
+    /// Each command's answer or refusal, as the page received it.
+    pub answered: Arc<Capture>,
+}
+
+impl Companion {
+    /// Starts the backend on `parts`, with its records under `data`, answering confirmations
+    /// through `ceremony` and pasting through `paste`.
+    pub fn start(
+        data: &std::path::Path,
+        parts: Parts,
+        ceremony: Arc<dyn kr_client::pairing::owner::Ceremony>,
+        paste: Arc<dyn companion_tauri::pairing::PastePlatform>,
+    ) -> Self {
+        use tauri::Listener as _;
+
+        let app = tauri::test::mock_builder()
+            .manage(companion_tauri::AppState::new())
+            .invoke_handler(tauri::generate_handler![
+                companion_tauri::commands::pairing_set_origin,
+                companion_tauri::commands::pairing_view,
+                companion_tauri::commands::pairing_start_code,
+                companion_tauri::commands::pairing_paste,
+                companion_tauri::commands::pairing_start_read,
+                companion_tauri::commands::pairing_stop,
+                companion_tauri::commands::owner_confirmations,
+                companion_tauri::commands::owner_confirmation_review,
+            ])
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("an application");
+        let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .expect("a window");
+        let heard = Arc::new(Capture::default());
+        for event in [
+            companion_tauri::pairing::PAIRING_EVENT,
+            companion_tauri::pairing::CONFIRMATIONS_EVENT,
+        ] {
+            let heard = Arc::clone(&heard);
+            app.listen_any(event, move |published| heard.keep_text(published.payload()));
+        }
+        companion_tauri::start_pairing(app.handle(), data, parts, ceremony, paste)
+            .expect("this computer opens as a device that pairs");
+        Self {
+            app,
+            window,
+            heard,
+            answered: Arc::new(Capture::default()),
+        }
+    }
+
+    /// Everything the page was sent: every event and every answer.
+    pub fn sent(&self) -> Vec<String> {
+        let mut sent = self.heard.texts();
+        sent.extend(self.answered.texts());
+        sent
+    }
+
+    /// This computer as a device, for what a test does around the page.
+    pub fn device(&self) -> Arc<Device> {
+        use tauri::Manager as _;
+        self.app
+            .state::<companion_tauri::AppState>()
+            .device()
+            .expect("opened")
+    }
+
+    /// Calls `command` with `body` as the page does, through the invoke path, and returns what the
+    /// page receives: the command's answer, or its refusal. Both are kept with what the page was
+    /// sent.
+    pub fn call(
+        &self,
+        command: &str,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, serde_json::Value> {
+        assert!(
+            companion_tauri::commands::NAMED_COMMANDS
+                .iter()
+                .any(|(name, _)| *name == command),
+            "{command} is a command the application registers"
+        );
+        let answered = tokio::task::block_in_place(|| {
+            tauri::test::get_ipc_response(
+                &self.window,
+                tauri::webview::InvokeRequest {
+                    cmd: command.into(),
+                    callback: tauri::ipc::CallbackFn(0),
+                    error: tauri::ipc::CallbackFn(1),
+                    url: BUNDLE.parse().expect("the bundle's address"),
+                    body: tauri::ipc::InvokeBody::Json(body),
+                    headers: Default::default(),
+                    invoke_key: tauri::test::INVOKE_KEY.to_owned(),
+                },
+            )
+        });
+        match answered {
+            Ok(answer) => {
+                let answer: serde_json::Value =
+                    answer.deserialize().expect("an answer the page can read");
+                self.answered.keep(&answer);
+                Ok(answer)
+            }
+            Err(refusal) => {
+                self.answered.keep(&refusal);
+                Err(refusal)
+            }
+        }
+    }
+
+    /// Asks for the pairing screen's state until `until` accepts it, as the page would read it.
+    pub async fn reached(&self, until: impl Fn(&serde_json::Value) -> bool) -> serde_json::Value {
+        tokio::time::timeout(WATCHDOG, async {
+            loop {
+                let view = self
+                    .call("pairing_view", serde_json::json!({}))
+                    .expect("the pairing screen's state");
+                if until(&view["state"]) {
+                    return view;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("the attempt gets there")
+    }
+
+    /// Asks for the owner confirmations until one `matching` accepts is listed, and returns it.
+    pub async fn listed(&self, matching: impl Fn(&serde_json::Value) -> bool) -> serde_json::Value {
+        tokio::time::timeout(WATCHDOG, async {
+            loop {
+                let view = self
+                    .call("owner_confirmations", serde_json::json!({}))
+                    .expect("the confirmations");
+                if let Some(request) = view["requests"]
+                    .as_array()
+                    .and_then(|requests| requests.iter().find(|request| matching(request)))
+                {
+                    return request.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("the owner device lists the request")
+    }
+}
+
+/// The parts a test's device is made of: secrets in `secrets`, rooms through `room`, endpoints on
+/// loopback, and this boot's clock.
+pub fn parts(secrets: Arc<dyn SecretStore>, room: Arc<dyn CandidateRoom>) -> Parts {
+    Parts {
+        secrets,
+        room,
+        bind: Some(loopback()),
+        clock: Arc::new(DeviceClock::current().expect("a clock")),
+    }
 }

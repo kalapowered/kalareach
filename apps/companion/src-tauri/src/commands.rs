@@ -909,12 +909,10 @@ pub fn pairing_start_code(state: State<'_, AppState>, code: String) -> Result<()
 /// Reads an invitation from the pasteboard in native code, and holds it for the person to use.
 /// The page is told what it is, never what it says.
 #[tauri::command]
-pub async fn pairing_paste(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-) -> Result<crate::device::PasteView> {
+pub async fn pairing_paste(state: State<'_, AppState>) -> Result<crate::device::PasteView> {
     let device = state.device()?;
-    Ok(pairing::paste(&app, &device).await)
+    let platform = state.paste()?;
+    Ok(pairing::paste(&*platform, &device).await)
 }
 
 /// Starts pairing with the invitation read from the pasteboard.
