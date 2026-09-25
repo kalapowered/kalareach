@@ -14,8 +14,8 @@
 //! shortest timeout any registration names (one second, for a session ending). When that passes,
 //! the answer is written and the process ends, whatever is still in flight. The answer goes before
 //! anything the run says about itself: a diagnostic goes to standard error after it, and is waited
-//! for only until the same deadline, so a standard error nobody reads can hold neither the answer
-//! nor the end.
+//! for only until the same deadline, or for [`DIAGNOSTIC_ALLOWANCE`] after an answer that came at
+//! it, so a standard error nobody reads can hold neither the answer nor, past that, the end.
 
 use std::time::Duration;
 
@@ -26,12 +26,20 @@ use crate::registration::{Bridge, Paths, Registration};
 pub const SURFACE: &str = "hook";
 
 /// How long a hook waits for its observation, from its start, before it answers anyway. A
-/// diagnostic written after the answer is waited for only until the same moment.
+/// diagnostic written after the answer is waited for until the same moment, or for
+/// [`DIAGNOSTIC_ALLOWANCE`] after the answer when that is later.
 ///
 /// Every registration gives a session ending one second and every other event five. An
 /// application cancels a hook that reaches its timeout and discards its output, and Gemini CLI
 /// also warns the person, so the deadline sits well inside the shorter one.
 pub const HOOK_DEADLINE: Duration = Duration::from_millis(500);
+
+/// How long a diagnostic written after the answer is waited for at the least.
+///
+/// A run that spent all of [`HOOK_DEADLINE`] waiting for its worker still says why, on a standard
+/// error that takes the line, and one that does not take it holds the hook this much longer at
+/// most, which keeps the end well inside the shortest timeout any registration names.
+pub const DIAGNOSTIC_ALLOWANCE: Duration = Duration::from_millis(100);
 
 /// The most of a hook's input this forwarder reads.
 ///
@@ -138,10 +146,11 @@ pub fn run(application: &'static Application) -> std::process::ExitCode {
     };
     // The application waits for the answer, and a standard error nobody reads can hold a write to
     // it for as long as nobody reads it. So the answer goes first, and the diagnostic gets what
-    // remains of the deadline and no more.
+    // remains of the deadline, or the allowance when the answer used the deadline up.
     answer();
     if let Some(failure) = failure {
-        crate::report_by(&failure, started + HOOK_DEADLINE);
+        let by = (started + HOOK_DEADLINE).max(std::time::Instant::now() + DIAGNOSTIC_ALLOWANCE);
+        crate::report_by(&failure, by);
     }
     std::process::ExitCode::SUCCESS
 }

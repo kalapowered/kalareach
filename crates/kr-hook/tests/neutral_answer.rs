@@ -334,6 +334,12 @@ fn kr_req_12_27_a_worker_that_never_answers_cannot_hold_a_hook() {
             ran.took
         );
         assert!(ran.took < SHORTEST_TIMEOUT, "{case}: {:?}", ran.took);
+        // A run that spent its whole deadline waiting still says why, after the answer.
+        assert!(
+            ran.stderr.starts_with("kr-hook: "),
+            "{case}: the hook says why on standard error: {:?}",
+            ran.stderr
+        );
     }
 }
 
