@@ -196,6 +196,58 @@ describe('pairing with a host', () => {
     expect((again as HTMLInputElement).selectionEnd).toBe('aB3x-Yz7-9Qw'.length)
   })
 
+  it('lets go of the typed code once pairing ends, and keeps it only to try it again', async () => {
+    const CODE = 'aB3x-Yz7-9Qw'
+    const { controls } = start()
+    const typed = async () => {
+      const field = await screen.findByLabelText('Pairing code')
+      await userEvent.clear(field)
+      await userEvent.type(field, CODE)
+    }
+    const shown = async () =>
+      (await screen.findByLabelText<HTMLInputElement>('Pairing code')).value
+    const waiting: AttemptState = {
+      state: 'awaiting_approval',
+      value: 'f3c1 46fd',
+      expires_at_ms: IN_FIVE_MINUTES,
+      rights: [],
+      authority: 'view sessions',
+      grant_expires_at_ms: null
+    }
+
+    // Paired: the code is spent.
+    await typed()
+    attempt(controls, waiting)
+    attempt(controls, {
+      state: 'paired',
+      host: { name: 'studio', owner: false, authority: 'view sessions', grant_expires_at_ms: null }
+    })
+    await userEvent.click(await screen.findByTestId('pairing-done'))
+    expect(await shown()).toBe('')
+
+    // Stopped while waiting for the owner.
+    await typed()
+    attempt(controls, waiting)
+    await userEvent.click(await screen.findByTestId('stop-waiting'))
+    expect(await shown()).toBe('')
+
+    // Ended in a way no second try of the same code can mend.
+    for (const kind of ['host_tries_used', 'declined', 'expired'] as const) {
+      await typed()
+      attempt(controls, { state: 'ended', failure: { kind, tries_left: 2 } })
+      await userEvent.click(await screen.findByTestId('failure-action'))
+      expect(await shown(), kind).toBe('')
+    }
+
+    // Ended in a way the same code may mend: it waits in the field.
+    for (const kind of ['service_unreachable', 'no_host_answered', 'service_not_pairing'] as const) {
+      await typed()
+      attempt(controls, { state: 'ended', failure: { kind, tries_left: 2 } })
+      await userEvent.click(await screen.findByTestId('failure-action'))
+      expect(await shown(), kind).toBe(CODE)
+    }
+  })
+
   it('shows a pasted invitation as a summary, and pairs or cancels it', async () => {
     const { controls } = start()
     controls.setPasteboard({

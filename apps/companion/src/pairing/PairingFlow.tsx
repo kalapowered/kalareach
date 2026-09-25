@@ -35,6 +35,7 @@ import {
   failureWords,
   minutesLeft,
   timeLeft,
+  triesTheCodeAgain,
   type NextAction
 } from './words'
 
@@ -56,6 +57,20 @@ function screenOf(view: PairingView): Screen {
     case 'ended':
       return 'ended'
   }
+}
+
+/**
+ * Whether `view` shows the typed code spent. It is the one secret the page holds, and only until
+ * pairing ends: once the attempt pairs, or ends in a way no second try of the same code can mend,
+ * it leaves the field.
+ */
+function spends(view: PairingView): boolean {
+  const { state } = view
+  return (
+    state.state === 'paired' ||
+    (state.state === 'ended' &&
+      !triesTheCodeAgain(failureWords(state.failure.kind, view.origin.host).action))
+  )
 }
 
 /** " until 14:30", or nothing for a grant that does not end. */
@@ -85,10 +100,14 @@ export function PairingFlow(): ReactNode {
     // The state is read once the listener is registered, so no change can fall between the two.
     // An event heard before the read answers is at least as new, so the read is let go then.
     let heard = false
+    const shown = (next: PairingView) => {
+      setView(next)
+      if (spends(next)) setCode('')
+    }
     port
       .onPairing((next) => {
         heard = true
-        if (watching) setView(next)
+        if (watching) shown(next)
       })
       .then(async (unlisten) => {
         if (!watching) {
@@ -97,7 +116,7 @@ export function PairingFlow(): ReactNode {
         }
         stop = unlisten
         const current = await port.pairingView()
-        if (watching && !heard) setView(current)
+        if (watching && !heard) shown(current)
       })
       .catch((error: unknown) => {
         if (watching) setFailure(failureMessage(error))
@@ -191,11 +210,6 @@ export function PairingFlow(): ReactNode {
         selectOnEntry.current = true
         stop()
         return
-      case 'new_code':
-        stop(() => {
-          setCode('')
-        })
-        return
       case 'change_service':
         stop(() => {
           setDraftOrigin(view?.origin.origin ?? '')
@@ -205,6 +219,7 @@ export function PairingFlow(): ReactNode {
       case 'paste_again':
         stop(paste)
         return
+      case 'new_code':
       case 'try_again':
       case 'start_again':
       case 'done':
@@ -397,6 +412,7 @@ export function PairingFlow(): ReactNode {
             <Button
               data-testid="stop-waiting"
               onClick={() => {
+                setCode('')
                 stop(() => {
                   say('Stopped. The host keeps the request until it expires or the owner declines it.')
                 })
@@ -421,6 +437,7 @@ export function PairingFlow(): ReactNode {
             <Button
               data-testid="stop-waiting"
               onClick={() => {
+                setCode('')
                 stop(() => {
                   say('Stopped. The host keeps the request until it expires or the owner declines it.')
                 })
