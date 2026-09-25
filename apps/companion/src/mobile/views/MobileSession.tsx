@@ -16,7 +16,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 
 import { useApp } from '../../app/state'
 import { Badge, Banner, Button, Segmented } from '../../components/ui'
-import { failureCode, failureMessage } from '../../host/port'
+import { failureCode, failureMessage, watch, type Watch } from '../../host/port'
 import {
   edit,
   notSubmittableBecause,
@@ -36,7 +36,16 @@ import {
   failed
 } from '../../model/receipts'
 import { renderMarkdown } from '../../markdown/render'
-import { ZOOM_DEFAULT_INDEX, ZOOM_STEPS, zoomBy, type ViewMode } from '../../terminal/modes'
+import {
+  presentationOf,
+  terminalAttachment,
+  unreadPresentation,
+  ZOOM_DEFAULT_INDEX,
+  ZOOM_STEPS,
+  zoomBy,
+  type Presentation,
+  type ViewMode
+} from '../../terminal/modes'
 import { AccessoryRow } from '../components/keys'
 import { AttachmentPicker } from '../components/picker'
 import { sequenceForKeyPress, afterKey, pressModifier, sequenceFor, NO_LATCH, type Latch } from '../model/accessory'
@@ -94,6 +103,8 @@ export function MobileSession({
   const [pane, setPane] = useState<Pane>('semantic')
   const [nodes, setNodes] = useState<readonly ReadNode[]>([])
   const [screen, setScreen] = useState<readonly string[]>([])
+  // How the host presents this view's terminal, as the newest snapshot said.
+  const [presented, setPresented] = useState<Presentation | null>(null)
   const [mode, setMode] = useState<ViewMode>('control')
   const [zoom, setZoom] = useState(ZOOM_DEFAULT_INDEX)
   const [pan, setPan] = useState({ x: 0, y: 0 })
@@ -146,17 +157,40 @@ export function MobileSession({
       })
   }, [port, sessionId])
 
+  // The terminal's screen and the session's snapshot are read each time the terminal is shown,
+  // under one watch with no listeners that ends when the view leaves the terminal or the session:
+  // only the newest read's answers are shown, and what an ended watch read goes with it.
   useEffect(() => {
     if (pane !== 'terminal') return
-    ask(() => port.terminalProjection({ session_id: sessionId }))
-      .then((projection) => {
-        setScreen(
-          projection.rows.map((row) => row.cells.map((cell) => cell.text || ' ').join(''))
-        )
-      })
-      .catch(() => {
-        setScreen([])
-      })
+    const reading: Watch = watch([], () => {
+      const current = reading.read()
+      if (current === null) return
+      ask(() => port.terminalProjection({ session_id: sessionId }))
+        .then((projection) => {
+          if (!current()) return
+          setScreen(
+            projection.rows.map((row) => row.cells.map((cell) => cell.text || ' ').join(''))
+          )
+        })
+        .catch(() => {
+          if (!current()) return
+          setScreen([])
+        })
+      ask(() => port.eventsSnapshot({ session_id: sessionId, agent_resources_from: null }))
+        .then((snapshot) => {
+          if (!current()) return
+          setPresented(presentationOf(snapshot.attachments, terminalAttachment(sessionId)))
+        })
+        .catch((failure: unknown) => {
+          if (!current()) return
+          setPresented(unreadPresentation(failureMessage(failure)))
+        })
+    })
+    return () => {
+      reading.stop()
+      setScreen([])
+      setPresented(null)
+    }
   }, [port, sessionId, pane])
 
   // Restoring the position happens after the view has drawn, which is the only moment the element
@@ -348,6 +382,11 @@ export function MobileSession({
                 {mode === 'control' ? 'Look around' : 'Take control'}
               </Button>
               <span>{`Zoom ${Math.round((ZOOM_STEPS[zoom] ?? 1) * 100)}%`}</span>
+              {presented ? (
+                <span data-testid="terminal-presentation" data-presentation={presented.state}>
+                  {presented.sentence}
+                </span>
+              ) : null}
             </div>
             <AccessoryRow
               surface={surface}

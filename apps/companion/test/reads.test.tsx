@@ -472,6 +472,37 @@ describe('the raw terminal shows its newest read, and only for its own session',
     }
   }
 
+  it('shows no failure from before on a return to a session, until it has read it again', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    let refusing = true
+    open(
+      {
+        ...port,
+        terminalProjection: (params) =>
+          refusing && (params as { session_id?: string }).session_id === SESSION_MAIN
+            ? Promise.reject({
+                code: 'RESOURCE_UNAVAILABLE',
+                message: 'The screen could not be read.',
+                user_action: 'retry'
+              })
+            : port.terminalProjection(params)
+      },
+      { view: 'sessions' }
+    )
+    await twoSessions(person)
+    await person.click(screen.getByRole('tab', { name: 'Terminal' }))
+    expect(await screen.findByText('The screen could not be read.')).toBeInTheDocument()
+
+    refusing = false
+    const reads = controls.hold('terminalProjection')
+    await person.click(screen.getByRole('tab', { name: 'Session 02' }))
+    await made(reads, 1)
+    await person.click(screen.getByRole('tab', { name: 'Session 01' }))
+    await made(reads, 2)
+    expect(screen.queryByText('The screen could not be read.')).toBeNull()
+  })
+
   it('draws nothing of a session it has left, however far its renderer had got', async () => {
     const person = userEvent.setup()
     const opened = vi.spyOn(Terminal.prototype, 'open')

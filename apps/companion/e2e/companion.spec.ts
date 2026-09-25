@@ -11,6 +11,8 @@
 
 import { expect, test, type Page } from '@playwright/test'
 
+import { terminalAttachment } from '../src/terminal/modes'
+
 import { PRESENTATION_DEADLINE } from './bounds'
 
 /** Where a screenshot for the evidence goes. */
@@ -470,6 +472,84 @@ test.describe('the raw terminal', () => {
     await page.mouse.wheel(0, 120)
     await expect(surface).toHaveAttribute('data-wheel-to-application', '2')
     await page.screenshot({ path: shot('terminal-modes-13.18'), fullPage: true })
+  })
+})
+
+test.describe('how the host presents a raw view', () => {
+  const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+  const VIEW = terminalAttachment(SESSION_MAIN)
+
+  /** Where a screenshot for this browser goes, so each engine keeps its own. */
+  const shotFor = (name: string): string => shot(`${name}-${test.info().project.name}`)
+
+  /** Opens the harness in one colour mode, whatever the system's. */
+  async function inTheme(page: Page, theme: 'light' | 'dark'): Promise<void> {
+    await page.addInitScript((mode) => {
+      localStorage.setItem('kalareach-theme', mode)
+    }, theme)
+  }
+
+  for (const theme of ['light', 'dark'] as const) {
+    // KR-REQ-08.02: the desktop raw view says it is a viewport, and why, in the host's words.
+    test(`the desktop raw view says how it is presented and why, ${theme}, at 320 px`, async ({
+      page
+    }) => {
+      await inTheme(page, theme)
+      await openSession(page)
+      await page.evaluate((view) => {
+        window.krTestHost?.presentAttachment(view, 'viewport', 'size_mismatch')
+      }, VIEW)
+      await page.getByRole('tab', { name: 'Terminal' }).click()
+      await page.setViewportSize({ width: 320, height: 720 })
+
+      await expect(page.getByTestId('terminal-presentation')).toHaveText(
+        "This view is shown a viewport because its size is not the session's."
+      )
+      await expect(page.locator('html')).toHaveAttribute('data-theme', theme)
+      await page.screenshot({
+        path: shotFor(`terminal-presentation-08.02-desktop-320-${theme}`),
+        fullPage: true
+      })
+    })
+
+    // KR-REQ-08.02: the phone's raw view says the same, in the same words.
+    test(`the phone's raw view says how it is presented and why, ${theme}, at 320 px`, async ({
+      page
+    }) => {
+      await inTheme(page, theme)
+      await page.setViewportSize({ width: 320, height: 720 })
+      await page.goto(`/harness.html?surface=ios&session=${SESSION_MAIN}`)
+      await page.evaluate((view) => {
+        window.krTestHost?.presentAttachment(view, 'viewport', 'no_terminal_profile')
+      }, VIEW)
+      await page.getByRole('tab', { name: 'Terminal' }).click()
+
+      await expect(page.getByTestId('terminal-presentation')).toHaveText(
+        "This view is shown a viewport because its client declared no terminal profile, so what the session's output would do on its terminal is not known."
+      )
+      await expect(page.locator('html')).toHaveAttribute('data-theme', theme)
+      await page.screenshot({
+        path: shotFor(`terminal-presentation-08.02-phone-320-${theme}`),
+        fullPage: true
+      })
+    })
+  }
+
+  // KR-REQ-08.02: a direct view shows no reason, and once its window moves above the live screen
+  // it reads the snapshot again and gives the reason then in force.
+  test('a direct view gives the reason for a viewport once its window moves', async ({ page }) => {
+    await openSession(page)
+    await page.getByRole('tab', { name: 'Terminal' }).click()
+    const presentation = page.getByTestId('terminal-presentation')
+    await expect(presentation).toHaveText("This view is shown the session's output directly.")
+
+    await page.getByRole('tab', { name: 'View' }).click()
+    await page.getByTestId('terminal-surface').hover()
+    await page.mouse.wheel(0, 120)
+    await expect(presentation).toHaveText(
+      'This view is shown a viewport because its window is above the live screen.'
+    )
+    await page.screenshot({ path: shotFor('terminal-presentation-08.02-moved'), fullPage: true })
   })
 })
 

@@ -29,10 +29,13 @@ import { ask } from '../mobile/model/call'
 import { drawRow, measuredReproducible } from './clusters'
 import {
   describeProvenance,
+  presentationOf,
   routeWheel,
+  unreadPresentation,
   zoomBy,
   ZOOM_DEFAULT_INDEX,
   ZOOM_STEPS,
+  type Presentation,
   type ViewMode
 } from './modes'
 
@@ -63,13 +66,19 @@ export function RawTerminal({
   const [failed, setFailed] = useState<{ readonly sessionId: string; readonly message: string } | null>(
     null
   )
+  // How the host presents this view, as the newest snapshot said, with the session it was read for.
+  const [presented, setPresented] = useState<{
+    readonly sessionId: string
+    readonly presentation: Presentation
+  } | null>(null)
   const [wheelToApplication, setWheelToApplication] = useState(0)
-  // Every read of the screen, on opening and after the window moves, is made under one watch with
-  // no listeners, which starts again for each session: only the newest read's answer is shown, and
-  // nothing read for a session the view has left.
+  // Every read of the screen and of the session's snapshot, on opening and after the window moves,
+  // is made under one watch with no listeners, which starts again for each session: only the newest
+  // read's answers are shown, and nothing read for a session the view has left.
   const reads = useRef<Watch | null>(null)
   const screen = shown?.sessionId === sessionId ? shown.screen : null
   const failure = failed?.sessionId === sessionId ? failed.message : null
+  const presentation = presented?.sessionId === sessionId ? presented.presentation : null
 
   useEffect(() => {
     const element = host.current
@@ -93,8 +102,9 @@ export function RawTerminal({
   }, [zoom, sessionId])
 
   /**
-   * Reads this session's screen under `reading`, and shows the answer or the failure only while
-   * that read is the newest the watch has started and the watch is running.
+   * Reads this session's screen and its snapshot under `reading`, and shows each answer or failure
+   * only while that read is the newest the watch has started and the watch is running. The
+   * snapshot says how the host presents this view, from this view's own attachment.
    */
   const readUnder = useCallback(
     (reading: Watch | null) => {
@@ -110,8 +120,17 @@ export function RawTerminal({
           if (!current()) return
           setFailed({ sessionId, message: failureMessage(error) })
         })
+      ask(() => port.eventsSnapshot({ session_id: sessionId, agent_resources_from: null }))
+        .then((snapshot) => {
+          if (!current()) return
+          setPresented({ sessionId, presentation: presentationOf(snapshot.attachments, attachmentId) })
+        })
+        .catch((error: unknown) => {
+          if (!current()) return
+          setPresented({ sessionId, presentation: unreadPresentation(failureMessage(error)) })
+        })
     },
-    [port, sessionId]
+    [port, sessionId, attachmentId]
   )
 
   useEffect(() => {
@@ -126,6 +145,7 @@ export function RawTerminal({
       // its screen has been read again.
       setShown(null)
       setFailed(null)
+      setPresented(null)
     }
   }, [readUnder])
 
@@ -256,8 +276,13 @@ export function RawTerminal({
       />
 
       <footer className="terminal-footer between">
-        <span className="small faint" data-testid="terminal-position">
-          {position}
+        <span className="row wrap small faint">
+          {presentation ? (
+            <span data-testid="terminal-presentation" data-presentation={presentation.state}>
+              {presentation.sentence}
+            </span>
+          ) : null}
+          <span data-testid="terminal-position">{position}</span>
         </span>
         <span className="row">
           <Button

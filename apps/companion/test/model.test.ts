@@ -7,6 +7,7 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import type { DocumentNode } from '@kalareach/plugin-sdk'
+import type { AttachmentSummary, PresentationReason } from '@kalareach/protocol'
 
 import {
   applyNode,
@@ -44,8 +45,17 @@ import {
 } from '../src/model/receipts'
 import { emptyControlState, evaluate, isRendered, visibilityOf } from '../src/model/controls'
 import { drawCell, drawRow, REPLACEMENT } from '../src/terminal/clusters'
-import { routeWheel, zoomBy, ZOOM_STEPS } from '../src/terminal/modes'
+import {
+  PRESENTATION_REASONS,
+  presentationOf,
+  routeWheel,
+  terminalAttachment,
+  zoomBy,
+  ZOOM_STEPS
+} from '../src/terminal/modes'
 import { projectEndpoint, rubberband, shouldDismiss, stepSpring } from '../src/motion'
+// The protocol crate's source, as text: the sentences the host gives each presentation reason.
+import attachmentSource from '../../../crates/kr-protocol/src/attachment.rs?raw'
 
 function node(id: string, revision: string, text = id): DocumentNode {
   return {
@@ -512,3 +522,67 @@ describe('the frame scheduler', () => {
     vi.unstubAllGlobals()
   })
 })
+
+describe("a raw view's presentation", () => {
+  const view = terminalAttachment('8a7b6c50-22bb-4c3d-8e4f-000000000101')
+
+  /** One attachment's summary, as a session snapshot carries it. */
+  function summary(
+    attachmentId: string,
+    presentation: AttachmentSummary['presentation'],
+    reason?: PresentationReason
+  ): AttachmentSummary {
+    return {
+      attached_at_ms: '1',
+      attachment_id: attachmentId,
+      claim_geometry: false,
+      dimensions: { columns: '120', rows: '40' },
+      granted: ['observe_terminal'],
+      mode: presentation === null ? 'semantic' : 'terminal',
+      ordinal: '1',
+      presentation,
+      ...(reason === undefined ? {} : { presentation_reason: reason }),
+      terminal_profile_id: null
+    }
+  }
+
+  it('gives a viewport the reason in the host words for each of the seven reasons', () => {
+    for (const [reason, words] of Object.entries(PRESENTATION_REASONS) as [PresentationReason, string][]) {
+      const read = presentationOf([summary(view, 'viewport', reason)], view)
+      expect(read).toEqual({
+        state: 'viewport',
+        reason,
+        sentence: `This view is shown a viewport because ${words}.`
+      })
+    }
+  })
+
+  it('reads its own attachment and never another one', () => {
+    const others = [summary('another', 'viewport', 'size_mismatch'), summary('semantic', null)]
+    expect(presentationOf(others, view).state).toBe('unreported')
+    expect(presentationOf([...others, summary(view, 'direct')], view).state).toBe('direct')
+  })
+
+  it('never takes a viewport with no reason for a direct presentation', () => {
+    const read = presentationOf([summary(view, 'viewport')], view)
+    expect(read.state).toBe('viewport')
+    expect(read.reason).toBeNull()
+    expect(read.sentence).not.toContain('directly')
+  })
+
+  it('words each reason exactly as the host does', () => {
+    // The protocol crate's own sentence for each reason, read from its source: the arms of
+    // `PresentationReason::describe`, with each Rust line continuation joined the way Rust joins it.
+    const body = attachmentSource.slice(attachmentSource.indexOf('pub const fn describe(self)'))
+    const described: Record<string, string> = {}
+    for (const arm of body.matchAll(/Self::(\w+) => \{?\s*"((?:[^"\\]|\\.)*)"/gs)) {
+      if (Object.keys(described).length === 7) break
+      const name = arm[1].replace(/[A-Z]/g, (letter: string, at: number) =>
+        (at === 0 ? '' : '_') + letter.toLowerCase()
+      )
+      described[name] = arm[2].replace(/\\\n\s*/g, '')
+    }
+    expect(described).toEqual(PRESENTATION_REASONS)
+  })
+})
+
