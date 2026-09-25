@@ -1451,6 +1451,132 @@ async fn kr_req_11_26_a_restored_identifier_leaves_its_requests_the_recording_pa
         .expect("the recorder's decoder reads its request");
 }
 
+/// KR-REQ-11.26 and KR-REQ-11.27: a connection identifier keeps the package it first recorded
+/// requests under, for good. Restoring it under another package's tables is refused, in the process
+/// that recorded its requests and in one that restarted from the ledger, for a connection whose
+/// first request was recorded inside a gap as well. Restored under its own package's tables, the
+/// native client's answer settles what it recorded.
+#[tokio::test]
+async fn kr_req_11_26_a_connection_identifier_keeps_its_package_across_a_restart() {
+    let mut store = common::SharedStore::open();
+    let path = store.path.clone();
+    let other = other_package();
+    let register_and_pin = |broker: &Broker| {
+        broker
+            .register_instance(
+                instance(2),
+                IntegrationMode::Gateway,
+                None,
+                Some(managed(instance(2), true)),
+            )
+            .expect("the instance is registered");
+        broker
+            .pin_table(instance(2), installed(), declarative_table(), rich_table())
+            .expect("the installed tables are pinned");
+        broker
+            .pin_table(
+                instance(2),
+                other.clone(),
+                declarative_table_of(&other),
+                rich_table(),
+            )
+            .expect("another package's tables are pinned");
+    };
+    let restore = |broker: &Broker, connection: GatewayConnectionId, plugin_id: &PluginId| {
+        broker.restore_native_connection(
+            connection,
+            instance(2),
+            &CREDENTIAL,
+            &process_identity(41, 900),
+            plugin_id,
+            "1",
+        )
+    };
+
+    let (recorded, gapped) = {
+        let broker =
+            Broker::open(Some(&path), session(), store.health()).expect("the broker opens");
+        register_and_pin(&broker);
+        let connection = broker
+            .open_native_connection(
+                instance(2),
+                &CREDENTIAL,
+                &process_identity(41, 900),
+                &package(),
+                "1",
+            )
+            .expect("the native connection is authenticated");
+        let recorded = forward(&broker, "11", 2).expect("recorded");
+        broker.close_connection(connection);
+        let refusal = restore(&broker, connection, &other.plugin_id)
+            .expect_err("another package's tables do not read this identifier's requests");
+        assert!(
+            matches!(refusal, BrokerError::PermissionDenied { .. }),
+            "{refusal}"
+        );
+
+        // A connection whose first request is recorded inside a gap: its package is committed
+        // with the gap.
+        let gapped_connection = broker
+            .open_native_connection(
+                instance(2),
+                &CREDENTIAL,
+                &process_identity(41, 900),
+                &package(),
+                "1",
+            )
+            .expect("a second native connection is authenticated");
+        broker
+            .refuse_ledger_writes(true)
+            .expect("the store is put in query-only mode");
+        let gapped = broker
+            .forward_native(
+                gapped_connection,
+                permission_frame("21").as_bytes(),
+                TimestampMs::new(3),
+            )
+            .expect("the native request is still recorded")
+            .1
+            .expect("it expects a response");
+        assert_eq!(
+            gapped.durability,
+            kr_protocol::session::Durability::Volatile
+        );
+        broker
+            .refuse_ledger_writes(false)
+            .expect("the store takes writes again");
+        store.recover_journal(4);
+        broker
+            .recover(TimestampMs::new(4))
+            .expect("the gap is committed");
+        (recorded.resource_id, gapped_connection)
+    };
+
+    let restarted =
+        Broker::open(Some(&path), session(), JournalHealth::shared()).expect("the broker reopens");
+    register_and_pin(&restarted);
+    for connection in [GatewayConnectionId::new(1), gapped] {
+        let refusal = restore(&restarted, connection, &other.plugin_id)
+            .expect_err("the restart knows whose requests the identifier holds");
+        assert!(
+            matches!(refusal, BrokerError::PermissionDenied { .. }),
+            "{connection}: {refusal}"
+        );
+        restore(&restarted, connection, &package())
+            .expect("restored under its own package's tables");
+    }
+    let answered = restarted
+        .native_answer_through(
+            GatewayConnectionId::new(1),
+            br#"{"id":11,"result":{"outcome":"allow"}}"#,
+            TimestampMs::new(5),
+            |_| Ok(()),
+        )
+        .expect("the native client's answer is carried");
+    assert_eq!(answered.resource_id, recorded);
+    assert_eq!(answered.state, PendingState::Resolved);
+}
+
 /// KR-REQ-11.25: narrowing an installation's grants narrows a component package's trust with them.
 /// `approval.respond` leaving takes the answer away and leaves the decoding; `approval.decode`
 /// leaving drops the trust whole. Both are written where a restart reads them.
