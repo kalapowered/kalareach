@@ -95,7 +95,11 @@ person, a file, a host or a service reaches a diagnostic only through one of tho
 A reducer keeps what somebody diagnosing a fault needs and drops the rest. Where it says text that
 arrived, the text is one of a closed list this build holds, or has a shape that cannot carry chosen
 words: a UUID, eight or more hexadecimal digits, or decimal digits. A test of the characters alone is
-not enough, because anything can be written in a shape made of letters.
+not enough, because anything can be written in a shape made of letters. Three say more, each by a
+contract of its own: `address` says a host's name, because which service or relay failed is what a
+person acts on; `root` and `within` say a directory the program was configured with or derived,
+which the caller vouches for; and the command line's `named` says a path the person typed, back to
+them.
 
 | Reducer | What it says |
 | --- | --- |
@@ -109,7 +113,7 @@ not enough, because anything can be written in a shape made of letters.
 | `terminfo` | A terminal type that is one of the terminfo names this build lists |
 | `root`, `within` | A directory this program was configured with or derived, and a fixed name under one |
 | `stored` | A file in a store, whose name is said only when it is one of the store's fixed names or an identifier with the store's own extensions |
-| `host_path` | A path in this installation's tree: the configured runtime or state root whole, and below it only identifiers and the names the tree writes |
+| `host_path` | A path in this installation's tree: the configured runtime or state root whole, and below it only identifiers and the names the tree writes; outside it, a drive's letter but never a server's, a share's or a device's name |
 
 A door passes text whole, because the value it takes was written to be shown to a person: a host's
 refusal message (section 23 makes that plain text for a person, with no credentials in it), a
@@ -140,9 +144,10 @@ compiler does, with each literal's escapes decoded, each type named by its full 
 file's imports, and only code that cannot compile without `test` left out. It names the file and
 line of anything that could put other text in a rendering: a hand-written `Display`, a `Plain`
 claim outside the two `shown.rs` files, an error field a rendering reaches that is none of the
-types above, a formatted panic, an `unwrap` or `expect`, an assertion that prints what it compares,
-a log line, standard error written outside the reporter, and source it cannot follow, such as a
-renamed trait, a macro that writes an `impl`, a `#[path]` or an `include!`. The marker tests plant
+types above, a formatted panic, an `unwrap` or `expect` in either call form, an assertion that
+prints what it compares, a log line, standard error written outside the reporter, and source it
+cannot follow: a renamed import, a macro, a derive it does not know, an attribute under `cfg_attr`
+that it reads, a `#[path]` or an `include!`. The marker tests plant
 one marker where input goes (each text leaf, map key and other leaf of a stored file, malformed
 bytes, typed arguments, origins) and look for it in every rendering that comes back, as text, as
 decimal and hexadecimal bytes, and in base64; beside each, the same planting of another value is
