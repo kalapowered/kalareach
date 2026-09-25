@@ -27,7 +27,7 @@ const DECIDING: [&str; 3] = ["decision", "continue", "hookSpecificOutput"];
 const SHORTEST_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// How long a hook may wait for its worker before it answers anyway.
-const DEADLINE: Duration = kr_hook::claude_code::hook::HOOK_DEADLINE;
+const DEADLINE: Duration = kr_hook::hook::HOOK_DEADLINE;
 
 /// One application's hook invocation, and a payload for each event its registration names, as
 /// the application writes them on the hook's standard input.

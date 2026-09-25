@@ -130,7 +130,7 @@ fn the_hooks_file_registers_the_five_observing_events_within_the_deadline() {
             "{event}"
         );
         assert!(
-            kr_hook::claude_code::hook::HOOK_DEADLINE < std::time::Duration::from_secs(timeout),
+            kr_hook::hook::HOOK_DEADLINE < std::time::Duration::from_secs(timeout),
             "{event}: the forwarder answers before Claude Code would cancel it"
         );
     }

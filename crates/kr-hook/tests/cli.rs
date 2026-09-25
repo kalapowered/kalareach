@@ -115,7 +115,7 @@ fn kr_req_12_18_a_hook_whose_input_never_closes_still_answers_in_time() {
     assert_eq!(ran.code, Some(0), "{}", ran.stderr);
     assert_eq!(ran.stdout, b"{}\n");
     assert!(
-        ran.took >= kr_hook::claude_code::hook::HOOK_DEADLINE,
+        ran.took >= kr_hook::hook::HOOK_DEADLINE,
         "it waited for its input until its deadline: {:?}",
         ran.took
     );
