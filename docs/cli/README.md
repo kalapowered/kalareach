@@ -552,9 +552,12 @@ answer only while that question is still what the person answered. An answer who
 known is retired by the next `kr question drafts` if it did arrive, so it is never sent twice. When
 `kr question send` cannot send it, the failure keeps its own code and says the answer is still kept.
 
-Only a session with no descriptor at all is gone. When a session's descriptor is there and cannot
-be read, or is readable by anyone but its owner, `kr question drafts` fails and retires nothing,
-because such a descriptor says nothing about whether the session is still running.
+A kept answer is retired as gone only on the word of the daemon of the environment its session ran
+in: a closure its registry keeps, or, for a session with no descriptor, no record of the session at
+all. Nothing on disk, or missing from it, retires one. When the descriptor is missing and there is
+no daemon to ask, when the daemon reports the session still live, and when a descriptor is there
+and cannot be read or is readable by anyone but its owner, `kr question drafts` fails and retires
+nothing.
 
 ## `kr skill`
 

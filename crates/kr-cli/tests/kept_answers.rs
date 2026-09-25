@@ -55,6 +55,17 @@ enum Behaviour {
     RefusesReads,
     /// Replies to an answer with a frame that is not a message, and takes nothing.
     RepliesWithGarbage,
+    /// Refuses an answer with `OUTCOME_UNKNOWN`: it cannot say what became of it.
+    CannotSayWhatBecameOfAnswers,
+}
+
+/// What a scripted control daemon says of the session when it is asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Registry {
+    /// The session closed.
+    Closed,
+    /// The session is live.
+    Live,
 }
 
 /// What the scripted worker holds.
@@ -196,6 +207,127 @@ impl Host {
 
     fn question(&self) -> String {
         self.question_id.to_string()
+    }
+}
+
+impl Host {
+    /// Starts a control daemon for this host's environment that answers `session.read` for the
+    /// scripted session as `registry` says, until the returned task is ended.
+    fn daemon(&self, registry: Registry) -> tokio::task::JoinHandle<()> {
+        let environment = self.temp.environment();
+        let endpoint = environment.controller_endpoint().expect("an endpoint");
+        let listener = Listener::bind(&endpoint).expect("binds the control endpoint");
+        let environment_id = self.temp.environment_id();
+        let session_id = self.state().question.session_id;
+        tokio::spawn(async move {
+            while let Ok((connection, peer)) = listener.accept().await {
+                tokio::spawn(serve_daemon(
+                    connection,
+                    peer,
+                    environment_id,
+                    session_id,
+                    registry,
+                ));
+            }
+        })
+    }
+}
+
+/// Answers one caller of the scripted control daemon.
+async fn serve_daemon(
+    connection: kr_ipc::endpoint::Connection,
+    peer: kr_ipc::peer::PeerIdentity,
+    environment_id: kr_protocol::ids::EnvironmentId,
+    session_id: SessionId,
+    registry: Registry,
+) {
+    let (mut reader, mut writer) = kr_ipc::framed::split(connection, StreamKind::Control);
+    let Ok(ControlFrame::Hello(hello)) = reader.read_message::<ControlFrame>().await else {
+        return;
+    };
+    let connection_id = ConnectionId::new(kr_ipc::new_uuid());
+    let acknowledgement = kr_protocol::local::LocalHelloAck {
+        selected_version: PROTOCOL_VERSION,
+        role: kr_protocol::local::LocalRole::Controller,
+        connection_id,
+        environment_id,
+        boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+        peer: kr_protocol::local::LocalPeer {
+            uid: kr_protocol::scalars::U64::new(u64::from(peer.uid)),
+            gid: kr_protocol::scalars::U64::new(u64::from(peer.gid)),
+            pid: Nullable::null(),
+        },
+        action_window: kr_protocol::hello::ActionWindow {
+            action_window_id: kr_protocol::ids::ActionWindowId::new("window-1")
+                .expect("a window identifier"),
+            connection_id,
+            boot_epoch: kr_protocol::ids::BootEpoch::new(1),
+            issued_at_ms: TimestampMs::new(kr_ipc::now_ms().get()),
+            valid_for_ms: kr_protocol::scalars::DurationMs::new(60_000),
+        },
+        capabilities: CanonicalSet::new(),
+        max_receive: hello.max_receive,
+    };
+    if writer
+        .write_message(&ControlFrame::HelloAck(Box::new(acknowledgement)))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    while let Ok(frame) = reader.read_message::<ControlFrame>().await {
+        let ControlFrame::Request(request) = frame else {
+            continue;
+        };
+        let outcome = match (request.method.as_str(), registry) {
+            ("session.read", Registry::Closed) => Outcome::Error(ProtocolError::new(
+                ErrorCode::SessionClosed,
+                "the session has closed",
+            )),
+            ("session.read", Registry::Live) => Outcome::Ok(
+                ParamsValue::from_typed(&live_session(environment_id, session_id))
+                    .expect("a session"),
+            ),
+            (other, _) => Outcome::Error(refusal(&format!("this daemon answers no {other}"))),
+        };
+        let response = ControlFrame::Response(Response {
+            request_id: request.request_id,
+            outcome,
+        });
+        if writer.write_message(&response).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// The scripted session, as a daemon reads it while it is live.
+fn live_session(
+    environment_id: kr_protocol::ids::EnvironmentId,
+    session_id: SessionId,
+) -> kr_protocol::session::SessionReadResult {
+    kr_protocol::session::SessionReadResult {
+        session: kr_protocol::session::SessionSummary {
+            session_id,
+            session_epoch: SessionEpoch::V1,
+            environment_id,
+            display_number: DisplayNumber::new(1),
+            state: kr_protocol::session::SessionState::Live,
+            shell_mode: kr_protocol::session::ShellMode::NativeCompat,
+            shell_path: "/bin/sh".to_owned(),
+            cwd: "/".to_owned(),
+            worker_profile: WorkerProfile::HeadlessUser,
+            desktop: kr_protocol::identity::DesktopBinding::none(),
+            created_at_ms: TimestampMs::new(1),
+            dimensions: kr_protocol::session::Dimensions::new(80, 24),
+            attachment_count: kr_protocol::scalars::U64::new(0),
+            application_state: Nullable::null(),
+            root_process: Nullable::null(),
+            closure: Nullable::null(),
+        },
+        endpoint: Nullable::null(),
+        launch_profile: Nullable::null(),
+        last_command_block: Nullable::null(),
+        outstanding_launches: Nullable::null(),
     }
 }
 
@@ -354,6 +486,16 @@ async fn serve_one(
                     }
                 }
                 let outcome = match mutation.method.as_str() {
+                    "question.answer" if behaviour == Behaviour::CannotSayWhatBecameOfAnswers => {
+                        state
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .answers_received += 1;
+                        Err(ProtocolError::new(
+                            ErrorCode::OutcomeUnknown,
+                            "this worker cannot say what became of the answer",
+                        ))
+                    }
                     "question.answer" => take(&state, &mutation.params),
                     other => Err(refusal(&format!("this worker answers no {other}"))),
                 };
@@ -588,10 +730,9 @@ async fn an_answer_whose_reply_was_lost_is_kept_as_unknown_and_never_sent_twice(
     assert_eq!(host.answers_received(), 1, "and it was not sent again");
 }
 
-/// KR-REQ-11.63: only a session with no descriptor at all is gone. A descriptor that cannot be read
-/// or is not the owner's alone says nothing about the session, so `kr question drafts` fails and
-/// retires nothing. The controls: the same descriptor put right is offered again, and one that is
-/// not there retires the answer as gone.
+/// KR-REQ-11.63: a descriptor that cannot be read, or is not the owner's alone, says nothing about
+/// the session, so `kr question drafts` fails and retires nothing. The control: the same
+/// descriptor put right is offered again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_descriptor_that_cannot_be_read_retires_nothing() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -629,15 +770,108 @@ async fn a_descriptor_that_cannot_be_read_retires_nothing() {
     let (status, document) = host.json(&["question", "drafts"]);
     assert_eq!(status, Some(0), "{document}");
     assert_eq!(document["drafts"][0]["state"], "offered", "{document}");
+    assert_eq!(host.answers_received(), 0, "nothing was ever sent");
+}
 
-    // Not there at all, the session is gone.
-    std::fs::remove_file(&host.descriptor).expect("removed");
+/// KR-REQ-11.63: a session is gone only when its environment's daemon says so. With its descriptor
+/// missing, a kept answer is retired unsent when the daemon's registry records the session closed,
+/// and nothing is retired while there is no daemon to ask or the daemon reports the session live,
+/// even though its worker cannot be found.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_missing_descriptor_retires_a_kept_answer_only_on_the_daemons_word() {
+    let host = Host::start(Behaviour::EndsAfterTheRead).await;
+    let question = host.question();
+    let (status, _) = host.json(&["question", "answer", &question, "--choice", "left"]);
+    assert_eq!(status, Some(3));
+    host.behave(Behaviour::Serves);
+    std::fs::remove_file(&host.descriptor).expect("the descriptor goes");
+
+    // No daemon to ask.
+    let (status, document) = host.json(&["question", "drafts"]);
+    assert_ne!(status, Some(0), "{document}");
+    assert!(
+        host.kept().is_file(),
+        "with nobody to ask, nothing is retired"
+    );
+
+    // A daemon that reports the session live.
+    let daemon = host.daemon(Registry::Live);
+    let (status, document) = host.json(&["question", "drafts"]);
+    assert_ne!(status, Some(0), "{document}");
+    assert!(
+        document["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("live")),
+        "{document}"
+    );
+    assert!(
+        host.kept().is_file(),
+        "a live session's answer is not retired"
+    );
+    daemon.abort();
+    let _ = daemon.await;
+    let _ = std::fs::remove_file(
+        host.temp
+            .environment()
+            .controller_endpoint()
+            .expect("an endpoint")
+            .as_path(),
+    );
+
+    // A daemon whose registry records the session closed.
+    let daemon = host.daemon(Registry::Closed);
     let (status, document) = host.json(&["question", "drafts"]);
     assert_eq!(status, Some(0), "{document}");
     assert_eq!(document["drafts"][0]["state"], "retired", "{document}");
     assert_eq!(document["drafts"][0]["reason_code"], "UNKNOWN_SESSION");
-    assert!(!host.kept().exists());
-    assert_eq!(host.answers_received(), 0, "nothing was ever sent");
+    assert!(
+        !host.kept().exists(),
+        "a closed session's answer is retired"
+    );
+    assert_eq!(host.answers_received(), 0, "and it was never sent");
+    daemon.abort();
+}
+
+/// KR-REQ-11.63: a worker that cannot say what became of an answer leaves its fate unknown, so the
+/// answer is kept and never called unsent or refused, whether it was answered or sent from what
+/// was kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_a_worker_cannot_account_for_is_kept_as_unknown() {
+    let host = Host::start(Behaviour::CannotSayWhatBecameOfAnswers).await;
+    let question = host.question();
+    for line in [
+        vec!["question", "answer", question.as_str(), "--choice", "left"],
+        vec!["question", "send", question.as_str()],
+    ] {
+        let (status, document) = host.json(&line);
+        assert_ne!(status, Some(0), "{line:?}: {document}");
+        assert_eq!(document["code"], "OUTCOME_UNKNOWN", "{line:?}: {document}");
+        let message = document["message"].as_str().expect("a message");
+        assert!(message.contains("is not known"), "{message}");
+        assert!(!message.contains("was not sent"), "{message}");
+        assert!(!message.contains("did not take"), "{message}");
+        assert!(host.kept().is_file(), "{line:?}: the answer is kept");
+    }
+}
+
+/// KR-REQ-11.63: a kept answer sent to a worker whose reply cannot be read is still kept, under the
+/// reply's own code, and is not called unsent, because the answer went out before the reply came
+/// back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kept_answer_whose_reply_cannot_be_read_is_still_kept_as_unknown() {
+    let host = Host::start(Behaviour::EndsAfterTheRead).await;
+    let question = host.question();
+    let (status, _) = host.json(&["question", "answer", &question, "--choice", "left"]);
+    assert_eq!(status, Some(3));
+    host.behave(Behaviour::RepliesWithGarbage);
+    let (status, document) = host.json(&["question", "send", &question]);
+    assert_eq!(status, Some(3), "{document}");
+    assert_eq!(document["code"], "INVALID_ARGUMENT", "{document}");
+    let message = document["message"].as_str().expect("a message");
+    assert!(message.contains("is not known"), "{message}");
+    assert!(!message.contains("was not sent"), "{message}");
+    assert!(host.kept().is_file(), "the answer is still kept");
+    assert_eq!(host.answers_received(), 1);
 }
 
 /// KR-REQ-11.63: a worker that refuses the read `kr question send` makes first is reported with its
@@ -683,7 +917,7 @@ async fn a_malformed_reply_is_shown_and_not_kept() {
     assert_eq!(status, Some(8), "{document}");
     assert_eq!(document["ok"], Value::Bool(false), "{document}");
     assert!(document.get("kept").is_none(), "{document}");
-    assert_ne!(document["code"], "OUTCOME_UNKNOWN", "{document}");
+    assert_eq!(document["code"], "INVALID_ARGUMENT", "{document}");
     assert!(!host.kept().exists(), "a malformed reply keeps nothing");
     assert_eq!(host.answers_received(), 1);
 }
