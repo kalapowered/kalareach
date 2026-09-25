@@ -1,19 +1,24 @@
-//! The identity this tree's inputs give a package, by the rule its own build names it with.
+//! Whether a built package is this tree's own, by the identity its build named it with.
 //!
 //! A built package is named by a digest of the inputs it was built from, so the identity an
 //! installation's `current` names says which inputs those were. A package is this tree's only when
-//! that identity is the one this tree's inputs give. An installation can hold a build of other
-//! patches, left there by a build of another tree, and a suite that drove it would report on those
-//! patches as though they were this tree's.
+//! the tree's own inputs are among them. An installation can hold a build of other patches, left
+//! there by a build of another tree, and a suite that drove it would report on those patches as
+//! though they were this tree's.
 //!
-//! The rule is the build's own, restated here: `scripts/build-shells.sh` for the Zsh, Bash and Fish
-//! packages, and `Publish-KalaReachQualification` in `shells/psreadline/module` for the PowerShell
-//! package. An input that is a fact of the machine rather than of the tree is taken from the
-//! package's own record where the record holds it: the compiler a build used, and the PowerShell
-//! host and PSReadLine a qualification found. The rest is read from this process's environment
-//! the way the build reads its own: the preprocessor and linker flags, and for a package built
-//! through CMake the Rust toolchain and its flags. A build whose rule changes without this module
-//! names packages every suite here refuses, and the refusal says so.
+//! Some of the inputs are the tree's, and some are the machine's: the compiler, the flags in the
+//! build's environment, the Rust toolchain, and for the PowerShell package the host and editor the
+//! qualification found. The machine's are taken as the package's own record holds them, never
+//! from this process's environment, which need not be the build's: a toolchain named in the
+//! environment reaches a test run through `cargo` spelled out in full, and flags can be set for a
+//! test run alone. So a correct package never reads as another tree's because of how it was run.
+//!
+//! `scripts/build-shells.sh` records the exact text it digested, so for the Zsh, Bash and Fish
+//! packages the check is that the text digests to the identity, and that every line of it that is
+//! the tree's is the line this tree gives; a package whose line differs is reported by that line.
+//! `Publish-KalaReachQualification` in `shells/psreadline/module` records every fact of the
+//! machine it digested, so for the PowerShell package the text is put together here by its rule,
+//! from this tree and those facts, and digested.
 
 use std::path::Path;
 
@@ -22,27 +27,117 @@ use sha2::{Digest as _, Sha256};
 
 use super::repository_root;
 
-/// What this tree's inputs make the identity of the package of `kind` whose record is `record`.
+/// The lines of a recorded build's inputs that are the tree's, by the names the build gives them.
+const TREE_LINES: &[&str] = &[
+    "shell", "manifest", "script", "upstream", "env", "patch", "source", "startup",
+];
+
+/// The lines that are the machine's, which are taken as recorded.
+const MACHINE_LINES: &[&str] = &[
+    "cc",
+    "cppflags",
+    "ldflags",
+    "rustc",
+    "toolchain",
+    "rustflags",
+];
+
+/// The line every recorded build's inputs start with, which names the rule.
+const RULE: &str = "kr-shell-package/1";
+
+/// Says whether the package of `kind` named `identity`, whose record is `record`, is this tree's.
 ///
 /// # Errors
 ///
-/// Returns what could not be read: an input of this tree's, or a fact the record should hold.
-pub fn tree_identity(kind: ShellKind, record: &serde_json::Value) -> Result<String, String> {
+/// Returns why it is not: its record cannot say, or the inputs it names are not this tree's, with
+/// the first input that differs.
+pub fn this_trees(
+    kind: ShellKind,
+    identity: &str,
+    record: &serde_json::Value,
+) -> Result<(), String> {
     let root = repository_root();
-    let inputs = match kind {
-        ShellKind::Zsh | ShellKind::Bash | ShellKind::Fish => build_inputs(&root, kind, record)?,
-        ShellKind::PowerShell => qualification_inputs(&root, record)?,
-    };
-    Ok(hex(&Sha256::digest(inputs.as_bytes()))[..16].to_owned())
+    match kind {
+        ShellKind::Zsh | ShellKind::Bash | ShellKind::Fish => {
+            let recorded = record["build"]["inputs"].as_str().ok_or(
+                "its record does not hold the inputs it was built from, so it was built before \
+                 the build recorded them",
+            )?;
+            recorded_build_is_this_trees(&tree_lines(&root, kind)?, identity, recorded)
+        }
+        ShellKind::PowerShell => {
+            let inputs = qualification_inputs(&root, record)?;
+            let tree = &hex(&Sha256::digest(inputs.as_bytes()))[..16];
+            if tree == identity {
+                Ok(())
+            } else {
+                Err(format!(
+                    "this tree's module, manifest and startup entry, with the host and editor its \
+                     record names, give {tree}"
+                ))
+            }
+        }
+    }
 }
 
-/// The inputs `scripts/build-shells.sh` digests for a package it builds, in its order and with its
-/// separators.
-fn build_inputs(
-    root: &Path,
-    kind: ShellKind,
-    record: &serde_json::Value,
-) -> Result<String, String> {
+/// Checks a recorded build's inputs against the lines this tree gives, in order.
+fn recorded_build_is_this_trees(
+    tree: &[String],
+    identity: &str,
+    recorded: &str,
+) -> Result<(), String> {
+    let digest = hex(&Sha256::digest(recorded.as_bytes()));
+    if &digest[..16] != identity {
+        return Err(format!(
+            "the inputs its record holds digest to {}, which is not its identity",
+            &digest[..16]
+        ));
+    }
+    let mut built = Vec::new();
+    for line in recorded.lines().filter(|line| !line.is_empty()) {
+        let name = line.split_once('=').map_or(line, |(name, _)| name);
+        if line == RULE || TREE_LINES.contains(&name) {
+            built.push(line);
+        } else if !MACHINE_LINES.contains(&name) {
+            return Err(format!(
+                "its inputs hold {line:?}, which is neither this tree's nor the machine's by the \
+                 rule this check knows; if the build's rule changed, restate it here"
+            ));
+        }
+    }
+    // The first place the two part names the input that differs: one the tree has and the build
+    // did not, one the build had and the tree does not, or one each side has a different copy of.
+    for index in 0..built.len().max(tree.len()) {
+        let had = built.get(index).copied();
+        let gives = tree.get(index).map(String::as_str);
+        if had == gives {
+            continue;
+        }
+        return Err(match (had, gives) {
+            (Some(had), Some(gives)) if built[index..].contains(&gives) => {
+                format!("it was built from {had:?}, which this tree does not have")
+            }
+            (Some(had), Some(gives)) if tree[index..].iter().any(|line| line == had) => {
+                format!("this tree gives {gives:?}, which it was not built from")
+            }
+            (Some(had), Some(gives)) => {
+                format!("it was built from {had:?} where this tree gives {gives:?}")
+            }
+            (Some(had), None) => {
+                format!("it was built from {had:?}, which this tree does not have")
+            }
+            (None, Some(gives)) => {
+                format!("this tree gives {gives:?}, which it was not built from")
+            }
+            (None, None) => unreachable!("an index past both ends is not visited"),
+        });
+    }
+    Ok(())
+}
+
+/// The lines of a build's inputs that are this tree's, in the order `scripts/build-shells.sh`
+/// writes them.
+fn tree_lines(root: &Path, kind: ShellKind) -> Result<Vec<String>, String> {
     let package = root.join("shells").join(kind.as_str());
     let manifest_path = package.join("manifest.json");
     let manifest = read_json(&manifest_path)?;
@@ -52,77 +147,55 @@ fn build_inputs(
             .map(str::to_owned)
             .ok_or_else(|| format!("{} names no {what}", manifest_path.display()))
     };
-    // The compiler the build used, which its record holds as the build wrote it into the inputs.
-    let compiler = record["build"]["toolchain"]
-        .as_str()
-        .ok_or("the package's record names no toolchain")?;
-    let mut inputs = format!(
-        "kr-shell-package/1\nshell={}\nmanifest={}\nscript={}\nupstream={} {}\ncc={compiler}\n\
-         cppflags={}\nldflags={}\n",
-        text(&manifest["shell"], "shell")?,
-        digest_file(&manifest_path)?,
-        digest_file(&root.join("scripts").join("build-shells.sh"))?,
-        text(&manifest["upstream"]["sha256"], "upstream digest")?,
-        text(&manifest["upstream"]["archive"], "upstream archive")?,
-        variable("CPPFLAGS"),
-        variable("LDFLAGS"),
-    );
+    let mut lines = vec![
+        RULE.to_owned(),
+        format!("shell={}", text(&manifest["shell"], "shell")?),
+        format!("manifest={}", digest_file(&manifest_path)?),
+        format!(
+            "script={}",
+            digest_file(&root.join("scripts").join("build-shells.sh"))?
+        ),
+        format!(
+            "upstream={} {}",
+            text(&manifest["upstream"]["sha256"], "upstream digest")?,
+            text(&manifest["upstream"]["archive"], "upstream archive")?
+        ),
+    ];
+    // A shell built through CMake is also named by the environment its manifest gives the build.
     if manifest["build_system"].as_str() == Some("cmake") {
-        // A shell whose own source is Rust is named by that toolchain as well, which the build
-        // pins by the name the repository's own toolchain file resolves to.
-        // `cut -d' ' -f1` on each line of what rustup shows, as the build takes it.
-        let toolchain = std::env::var("RUSTUP_TOOLCHAIN")
-            .ok()
-            .filter(|name| !name.is_empty())
-            .or_else(|| {
-                output(root, "rustup", &["show", "active-toolchain"], None).map(|shown| {
-                    shown
-                        .lines()
-                        .map(|line| line.split(' ').next().unwrap_or_default())
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
-            })
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| "stable".to_owned());
-        let rustc = output(root, "rustc", &["--version"], Some(&toolchain)).unwrap_or_default();
-        let environment = manifest["environment"]
+        let mut pairs: Vec<String> = manifest["environment"]
             .as_object()
             .map(|pairs| {
-                let mut pairs: Vec<String> = pairs
+                pairs
                     .iter()
                     .map(|(name, value)| format!("{name}={}", value.as_str().unwrap_or_default()))
-                    .collect();
-                pairs.sort();
-                pairs.join(" ")
+                    .collect()
             })
             .unwrap_or_default();
-        inputs.push_str(&format!(
-            "\nrustc={rustc}\ntoolchain={toolchain}\nrustflags={}\nenv={environment}\n",
-            variable("RUSTFLAGS")
-        ));
+        pairs.sort();
+        lines.push(format!("env={}", pairs.join(" ")));
     }
     for patch in manifest["patches"].as_array().into_iter().flatten() {
         let file = text(&patch["file"], "patch file")?;
-        inputs.push_str(&format!(
-            "\npatch={} {file}",
+        lines.push(format!(
+            "patch={} {file}",
             digest_file(&package.join(&file))?
         ));
     }
     for source in manifest["sources"].as_array().into_iter().flatten() {
         let file = text(&source["file"], "source file")?;
         let install = text(&source["install"], "source destination")?;
-        inputs.push_str(&format!(
-            "\nsource={} {install}",
+        lines.push(format!(
+            "source={} {install}",
             digest_file(&package.join(&file))?
         ));
     }
     let startup = text(&manifest["startup"]["file"], "startup entry")?;
-    inputs.push_str(&format!(
-        "\nstartup={} {startup}",
+    lines.push(format!(
+        "startup={} {startup}",
         digest_file(&package.join(&startup))?
     ));
-    Ok(inputs)
+    Ok(lines)
 }
 
 /// The inputs `Publish-KalaReachQualification` digests for the PowerShell package, in its order.
@@ -209,32 +282,112 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// A variable the build reads with an empty default.
-fn variable(name: &str) -> String {
-    std::env::var(name).unwrap_or_default()
+/// The Fish package's tree lines, laid out as `scripts/build-shells.sh` lays out a whole record
+/// with the machine lines given, and the identity that text digests to.
+fn a_fish_build(machine: &[&str]) -> (String, String) {
+    let tree = tree_lines(&repository_root(), ShellKind::Fish).expect("this tree's Fish inputs");
+    let (head, rest) = tree.split_at(5);
+    let text = format!(
+        "{}\n{}\n\n{}",
+        head.join("\n"),
+        machine.join("\n"),
+        rest.join("\n")
+    );
+    let identity = hex(&Sha256::digest(text.as_bytes()))[..16].to_owned();
+    (text, identity)
 }
 
-/// What a program prints, as a command substitution takes it, run in the repository's own root as
-/// the build is, and under `toolchain` where one is named.
-fn output(
-    root: &Path,
-    program: &str,
-    arguments: &[&str],
-    toolchain: Option<&str>,
-) -> Option<String> {
-    let mut command = std::process::Command::new(program);
-    command
-        .args(arguments)
-        .current_dir(root)
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    if let Some(toolchain) = toolchain {
-        command.env("RUSTUP_TOOLCHAIN", toolchain);
+/// A build is this tree's by the inputs its record holds, whatever the machine it was built on
+/// said: a toolchain named by its short name, and flags this process does not have.
+#[test]
+fn a_build_is_this_trees_whatever_its_machine_lines_say() {
+    for toolchain in ["1.97.1", "1.97.1-x86_64-unknown-linux-gnu", "stable"] {
+        let toolchain = format!("toolchain={toolchain}");
+        let (text, identity) = a_fish_build(&[
+            "cc=cc Apple clang version 21.0.0",
+            "cppflags=-DSOMETHING=1",
+            "ldflags=",
+            "rustc=rustc 1.97.1 (00000000 2026-09-01)",
+            &toolchain,
+            "rustflags=-C instrument-coverage",
+        ]);
+        let record = serde_json::json!({"build": {"inputs": text}});
+        assert_eq!(
+            this_trees(ShellKind::Fish, &identity, &record),
+            Ok(()),
+            "{toolchain}"
+        );
     }
-    let finished = command.output().ok()?;
-    Some(
-        String::from_utf8_lossy(&finished.stdout)
-            .trim_end_matches('\n')
-            .to_owned(),
+}
+
+/// A build that is not this tree's is named by the input that differs, and a record that cannot
+/// say what it was built from is not taken for this tree's.
+#[test]
+fn a_build_of_other_inputs_is_named_by_the_input_that_differs() {
+    let machine = [
+        "cc=cc",
+        "cppflags=",
+        "ldflags=",
+        "rustc=rustc",
+        "toolchain=t",
+        "rustflags=",
+    ];
+    let (text, identity) = a_fish_build(&machine);
+    let patch = text
+        .lines()
+        .find(|line| line.starts_with("patch="))
+        .expect("the Fish package has a patch")
+        .to_owned();
+
+    let changed = text.replacen(&patch, &format!("{patch}-older"), 1);
+    let changed_identity = hex(&Sha256::digest(changed.as_bytes()))[..16].to_owned();
+    let refusal = this_trees(
+        ShellKind::Fish,
+        &changed_identity,
+        &serde_json::json!({"build": {"inputs": changed}}),
     )
+    .expect_err("a build of another patch is not this tree's");
+    assert!(
+        refusal.contains(&patch) && refusal.contains("-older"),
+        "{refusal}"
+    );
+
+    let without = text.replacen(&format!("{patch}\n"), "", 1);
+    let without_identity = hex(&Sha256::digest(without.as_bytes()))[..16].to_owned();
+    let refusal = this_trees(
+        ShellKind::Fish,
+        &without_identity,
+        &serde_json::json!({"build": {"inputs": without}}),
+    )
+    .expect_err("a build without one of this tree's patches is not this tree's");
+    assert!(refusal.contains("which it was not built from"), "{refusal}");
+
+    let refusal = this_trees(
+        ShellKind::Fish,
+        "0000000000000000",
+        &serde_json::json!({"build": {"inputs": text}}),
+    )
+    .expect_err("inputs that are not the identity's are not this build's");
+    assert!(refusal.contains("which is not its identity"), "{refusal}");
+
+    let refusal = this_trees(
+        ShellKind::Fish,
+        &identity,
+        &serde_json::json!({"build": {}}),
+    )
+    .expect_err("a record from before the build recorded its inputs cannot say");
+    assert!(
+        refusal.contains("built before the build recorded them"),
+        "{refusal}"
+    );
+
+    let unknown = format!("{text}\nsomething=new");
+    let unknown_identity = hex(&Sha256::digest(unknown.as_bytes()))[..16].to_owned();
+    let refusal = this_trees(
+        ShellKind::Fish,
+        &unknown_identity,
+        &serde_json::json!({"build": {"inputs": unknown}}),
+    )
+    .expect_err("an input this check does not know is not taken on trust");
+    assert!(refusal.contains("restate it here"), "{refusal}");
 }

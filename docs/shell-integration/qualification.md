@@ -26,11 +26,12 @@ drive a package need this tree's built packages, and the ones that install a cus
 fetched customisations; an ordinary run leaves those checks out, and `-- --include-ignored` runs
 them where both are there, which is what `scripts/e2e-fence.sh` and continuous integration do. There
 a package or a customisation that is not here fails the check that needed it. A package counts as
-built only when it is this tree's: the identity the installation's `current` names has to be the one
-this tree's inputs give, by the rule the build names the package with, and a build of anything else
-is reported with both identities. The corpus writes its evidence to `KR_TEST_ARTIFACTS_DIR`, or,
-where that is unset, to a directory it makes for itself in the system's temporary directory, named
-`kr-test-artifacts-` and a random suffix, and keeps. Evidence it cannot write fails the run.
+built only when it is this tree's: the inputs its record holds digest to the identity the
+installation's `current` names, and each of those inputs that is the tree's is the one this tree
+gives. A build of anything else is reported by the input that differs. The corpus writes its
+evidence to `KR_TEST_ARTIFACTS_DIR`, or, where that is unset, to a directory it makes for itself in
+the system's temporary directory, named `kr-test-artifacts-` and a random suffix, and keeps.
+Evidence it cannot write fails the run.
 
 ## The corpus
 
