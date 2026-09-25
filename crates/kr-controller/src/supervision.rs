@@ -373,6 +373,12 @@ pub fn detect() -> Box<dyn WorkerSupervisor> {
             return Box::new(SystemdSupervisor::new());
         }
     }
+    // On Windows this is still the daemon's own start, a breakaway from its job, which cannot
+    // leave a job above that forbids breakaway. It stays until the daemon's session creation runs
+    // the synchronous start on a blocking thread and a replacement daemon in another login
+    // session is refused; then Windows returns `windows::TaskSupervisor`, whose starter creates
+    // every worker outside the daemon's jobs, and the breakaway start, `worker_must_break_away`
+    // and its unit test are deleted.
     Box::new(DetachedSupervisor::new())
 }
 
@@ -1099,6 +1105,9 @@ fn detached_command(
     Ok(child.id())
 }
 
+/// The Windows start of a detached worker, which asks to break away from the daemon's job.
+///
+/// Deleted once `detect()` returns the task supervisor on Windows; the condition is written there.
 #[cfg(not(unix))]
 fn detached_command(
     program: &Path,
