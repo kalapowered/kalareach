@@ -23,9 +23,13 @@ group runs, builds the `kr-conformance` binary in `tests/conformance` and runs i
 The evidence directory is `KR_TEST_ARTIFACTS_DIR`, or a new directory under the platform's temporary
 directory when that is not set. The report refuses one outside the temporary directory (`/tmp` or
 `TMPDIR` on Unix, the user's temporary directory on Windows) before it creates anything, because
-section 21 keeps test artefacts there. Every step runs with `KR_TEST_ARTIFACTS_DIR` naming the same
-directory, so what a test records beside its verdict, such as a performance figure, lands with the
-result.
+section 21 keeps test artefacts there. It refuses a path with `..` in it as well, and resolves what
+it made to check it again. Every step runs with `KR_TEST_ARTIFACTS_DIR` naming the same directory,
+so what a test records beside its verdict, such as a performance figure, lands with the result.
+
+Each run takes an evidence directory of its own. The report makes `<evidence>/conformance/` new for
+the run, and refuses a directory that already holds one, so no log, test report or result of an
+earlier run can be read as this run's.
 
 The exit status is 0 when the run passed, 1 when it ran and did not, and 2 when it was refused
 before running anything. A run passes when no identifier failed, every step exited 0 and its output
@@ -36,14 +40,21 @@ could be read.
 
 | Group | Linux | macOS | Windows |
 | --- | --- | --- | --- |
-| `rust` | `cargo test --locked --workspace --no-fail-fast` | The same, leaving out by name the cases the hosted runner cannot host (podman, a second filesystem, the platform credential store), each with its reason, and the two timed cases in a step of their own | The suites qualified on Windows, one command each, as the landing workflow's Windows job runs them |
+| `rust` | `cargo test --locked --workspace --no-fail-fast` | The same, leaving out by name the cases the landing workflow's macOS job leaves out (podman, a second filesystem, the platform credential store, a built shell package), each with its reason, and the two timed cases in a step of their own | The suites qualified on Windows, one command each, as the landing workflow's Windows job runs them. The case that writes the credential store runs where `KR_TEST_PLATFORM_SECRET_STORE=1` is set, as the conformance workflow's runner sets it |
 | `end-to-end` | The suites `scripts/end-to-end.sh` runs, one test at a time, the network suite with its ignored tests | As on Linux | Not run: these drive Unix pseudo-terminals |
 | `performance` | The measurements `scripts/performance.sh` takes, and the release-build terminal and transport measurements | As on Linux | Not run: these drive Unix pseudo-terminals |
 | `typescript` | Each package's `test` script with vitest's JSON report, and the report's own TypeScript reading test | As on Linux | Not run |
 | `applications` | The application matrix | As on Linux | Not run: each program is recorded with its reason |
 
-The report's own tests check the `end-to-end` and `performance` lists against the two scripts, so
-the report cannot drift from them unnoticed.
+The report's own tests check the `end-to-end` and `performance` lists against the two scripts, and
+the macOS and Windows plans against the landing workflow's jobs, so the report cannot drift from
+them unnoticed.
+
+Every `cargo test` step that keeps each test's output captured runs with `--show-output`, which
+prints what every passing test wrote under its name. A step that shows the output as it is written,
+with `--nocapture`, keeps its script's command. Before a step runs, its tests are built and listed:
+every test binary the build made has to be listed, run and read, and a listing that fails, a binary
+the log never ran, and a log that cannot be read are each the step's error.
 
 A test that no selected group runs on this platform is reported as not run, with the reason. It is
 never reported as passed.
@@ -111,6 +122,9 @@ text is never taken for a comment.
 - A test's title keys it, and a `describe`'s title keys every test inside it.
 - Any other comment is a reference.
 
+A test declared once for a table of cases (`it.each`, `test.each`) is as many tests as the table
+has rows. Each is recorded under the title the run gave it, with a command that runs that one row.
+
 ### Tests another toolchain builds
 
 | Files | Why the report does not run them |
@@ -132,12 +146,19 @@ Each keyed test has one outcome on this platform:
 | `passed` | A step ran it and it passed |
 | `failed` | A step ran it and it failed, or its binary's output could not be read against the summary the harness printed |
 | `ignored` | Every step that listed it left it out, with the reason its `#[ignore]` gives |
-| `not_run` | No step of this run ran it here: a step's own flags left it out, no selected group runs its target on this platform, or another toolchain builds it. The reason says which |
+| `not_run` | No step of this run ran it here: a step's own flags left it out, no selected group runs its target on this platform, another toolchain builds it, or it returned early and said why. The reason says which |
 | `not_built` | A step ran its target and this platform's build of it has no such test |
 | `known_difference` | It ran and held what the profile defines, and it recorded that the application it is about reads the same thing differently |
 
+A test that returns early, because what it needs is absent, passes as far as the harness is
+concerned. The suites say so on a line that starts `skipped:`, `skipping:` or `not exercised`, and
+the report finds that line in what the test wrote and reports the test as not run, with the line as
+its reason. A line of that kind the report cannot give to one test makes its binary's output
+unreadable, which fails the step.
+
 A test that several steps list takes the strongest outcome among them: failed, then passed, then
-ignored, then not run, then not built.
+ignored, then not run, then not built. A test keyed to one identifier twice, by its own comment and
+by its module's, is recorded once, by its own.
 
 Each identifier has one verdict: `failed` when any of its tests failed, `passed` when at least one
 passed and none failed, `known_difference` when none passed or failed and at least one is a known
@@ -178,7 +199,7 @@ identifier's `references` and `figures`.
     "evidence_directory": "/tmp/kr-test-artifacts"
   },
   "steps": [
-    { "number": 1, "group": "rust", "what": "the workspace's tests", "command": "cargo test --locked --workspace --no-fail-fast", "needs": [], "exit": 0, "seconds": 812, "log": "conformance/logs/01-the-workspace-s-tests.log", "error": null }
+    { "number": 1, "group": "rust", "what": "the workspace's tests", "command": "cargo test --locked --workspace --no-fail-fast -- --show-output", "needs": [], "exit": 0, "seconds": 812, "log": "conformance/logs/01-the-workspace-s-tests.log", "error": null }
   ],
   "identifiers": {
     "KR-ACC-004": {
@@ -220,7 +241,7 @@ identifier's `references` and `figures`.
 | `run` | What was tested, with what, where: the commit (and whether tracked files differed from it), the toolchain, the machine, the terminal profile from its committed fixture, every package's version, the applications and how each was installed, and the groups selected |
 | `steps` | Every command the run ran, as run, with its exit status, how long it took and its log, relative to the evidence directory. `needs` names the variables a step reads from the environment |
 | `identifiers` | Every identifier a test or a reference names and, in a run of every group, every row of section 21's and section 27's tables whether named or not |
-| `tests[].test` | The package, target and test name, or the TypeScript file and full title |
+| `tests[].test` | The package, target and test name, or the TypeScript file and its titles as the run gave them, joined by ` > ` |
 | `tests[].source` | Where the key is written |
 | `tests[].keyed_by` | `attached_comment`, `comment_inside`, `test_name`, `section_comment`, `called_function`, `module_comment`, `case_table`, `title` or `file_comment` |
 | `tests[].command` | The command that reproduces the test on its own, narrowed from the step that ran it |

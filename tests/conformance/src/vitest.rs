@@ -1,4 +1,5 @@
-//! Reads a vitest JSON report: each test's file, the line its call starts on, and its status.
+//! Reads a vitest JSON report: each test's file, the line its call starts on, its titles as the run
+//! expanded them, and its status.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -7,9 +8,19 @@ use serde_json::Value;
 
 use crate::libtest::Outcome;
 
+/// One test a run reported.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Case {
+    /// The titles of the suites it is in, outermost first, and then its own, as the run expanded
+    /// them: a table of tests declared by one call has a title of its own for each row.
+    pub titles: Vec<String>,
+    /// What it came to.
+    pub outcome: Outcome,
+}
+
 /// One package's results, by the file relative to the repository and the line each test's call
-/// starts on. A table of tests declared by one call has one entry per test at the same line.
-pub type Results = BTreeMap<(String, usize), Vec<Outcome>>;
+/// starts on. A table of tests declared by one call has one case per row at the same line.
+pub type Results = BTreeMap<(String, usize), Vec<Case>>;
 
 /// Reads the report at `path`, whose test files are named relative to the repository at `root`.
 ///
@@ -58,10 +69,23 @@ pub fn parse(value: &Value, root: &Path) -> Result<Results, String> {
                 Some(status) => Outcome::Ignored(Some(format!("{status} in its suite"))),
                 None => Outcome::Failed,
             };
+            let mut titles: Vec<String> = test["ancestorTitles"]
+                .as_array()
+                .ok_or("a test without its suites' titles")?
+                .iter()
+                .map(|title| title.as_str().map(str::to_owned))
+                .collect::<Option<_>>()
+                .ok_or("a suite title that is not text")?;
+            titles.push(
+                test["title"]
+                    .as_str()
+                    .ok_or("a test without a title")?
+                    .to_owned(),
+            );
             results
                 .entry((relative.clone(), line))
                 .or_default()
-                .push(outcome);
+                .push(Case { titles, outcome });
         }
     }
     Ok(results)
@@ -72,35 +96,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn each_test_is_read_by_its_file_and_line() {
+    fn each_test_is_read_by_its_file_and_line_with_the_titles_the_run_gave_it() {
         let value = serde_json::json!({
             "testResults": [{
                 "name": "/repository/apps/companion/test/a.test.ts",
                 "assertionResults": [
-                    { "status": "passed", "location": { "line": 7, "column": 3 } },
-                    { "status": "skipped", "location": { "line": 12, "column": 3 } },
-                    { "status": "failed", "location": { "line": 12, "column": 3 } }
+                    { "ancestorTitles": ["surface"], "title": "draws", "status": "passed",
+                      "location": { "line": 7, "column": 3 } },
+                    { "ancestorTitles": ["surface"], "title": "reads plain", "status": "skipped",
+                      "location": { "line": 12, "column": 3 } },
+                    { "ancestorTitles": ["surface"], "title": "reads rich", "status": "failed",
+                      "location": { "line": 12, "column": 3 } }
                 ]
             }]
         });
         let results = parse(&value, Path::new("/repository")).expect("parses");
+        let case = |titles: &[&str], outcome: Outcome| Case {
+            titles: titles.iter().map(|title| (*title).to_owned()).collect(),
+            outcome,
+        };
         assert_eq!(
             results[&("apps/companion/test/a.test.ts".to_owned(), 7)],
-            [Outcome::Passed]
+            [case(&["surface", "draws"], Outcome::Passed)]
         );
         assert_eq!(
             results[&("apps/companion/test/a.test.ts".to_owned(), 12)],
             [
-                Outcome::Ignored(Some("skipped in its suite".to_owned())),
-                Outcome::Failed
+                case(
+                    &["surface", "reads plain"],
+                    Outcome::Ignored(Some("skipped in its suite".to_owned()))
+                ),
+                case(&["surface", "reads rich"], Outcome::Failed)
             ]
         );
     }
 
     #[test]
-    fn a_report_without_locations_is_refused() {
+    fn a_report_without_locations_or_titles_is_refused() {
         let value = serde_json::json!({
-            "testResults": [{ "name": "/r/a.test.ts", "assertionResults": [{ "status": "passed" }] }]
+            "testResults": [{ "name": "/r/a.test.ts", "assertionResults": [
+                { "ancestorTitles": [], "title": "t", "status": "passed" }
+            ] }]
+        });
+        assert!(parse(&value, Path::new("/r")).is_err());
+        let value = serde_json::json!({
+            "testResults": [{ "name": "/r/a.test.ts", "assertionResults": [
+                { "status": "passed", "location": { "line": 1, "column": 1 } }
+            ] }]
         });
         assert!(parse(&value, Path::new("/r")).is_err());
     }

@@ -134,10 +134,21 @@ pub struct Step {
 
 impl Step {
     /// A `cargo` command of `group`, described as `what`.
+    ///
+    /// A `cargo test` that leaves each test's output captured is given `--show-output`, which
+    /// prints what every test that passed wrote, under its name: that is where a test that returned
+    /// early says so, and where the report reads it. One that shows the output as it is written,
+    /// with `--nocapture`, is left as it is.
     #[must_use]
     pub fn cargo(group: Group, what: &str, arguments: &[&str]) -> Self {
         let mut command = vec!["cargo".to_owned()];
         command.extend(arguments.iter().map(|argument| (*argument).to_owned()));
+        if arguments.first() == Some(&"test") && !arguments.contains(&"--nocapture") {
+            if !arguments.contains(&"--") {
+                command.push("--".to_owned());
+            }
+            command.push("--show-output".to_owned());
+        }
         Self {
             group,
             what: what.to_owned(),
@@ -259,6 +270,14 @@ const MACOS_SKIPS: &[(&str, &str)] = &[
     (
         "a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again",
         "writes the platform's credential store, which the landing workflow's companion job does with its switch set",
+    ),
+    (
+        "the_built_packages_are_qualified_where_this_run_has_them",
+        "launches a built shell package, and this run builds none; the landing workflow's shell-packages job builds them and drives them",
+    ),
+    (
+        "a_real_qualified_package_registers_and_qualifies_on_this_hosts_endpoint",
+        "launches a built shell package, and this run builds none; the landing workflow's shell-packages job builds them and drives them",
     ),
     (
         "a_repository_whose_own_data_is_on_another_filesystem_is_captured",
@@ -635,20 +654,39 @@ fn windows() -> Vec<Step> {
             "the PowerShell bridge client over a named pipe",
             &["test", "--locked", "-p", "kr-shell-integration", "--test", "pwsh_windows"],
         ),
+        // The landing workflow runs these three with `--nocapture`, so that a case that could not
+        // build what it needs says so; `--show-output` prints the same, under each test's name.
         Step::cargo(
             Group::Rust,
             "the repository boundary",
-            &["test", "--locked", "-p", "kr-project", "--test", "boundary", "--", "--nocapture"],
+            &["test", "--locked", "-p", "kr-project", "--test", "boundary"],
         ),
         Step::cargo(
             Group::Rust,
             "what an apply carries across",
-            &["test", "--locked", "-p", "kr-changeset", "--test", "apply", "--", "--nocapture"],
+            &["test", "--locked", "-p", "kr-changeset", "--test", "apply"],
         ),
         Step::cargo(
             Group::Rust,
             "filesystem authority and access-control lists",
-            &["test", "--locked", "-p", "kr-transfer", "--lib", "--test", "authority", "--", "--nocapture"],
+            &["test", "--locked", "-p", "kr-transfer", "--lib", "--test", "authority"],
+        ),
+        // The one case that writes this machine's credential store runs only where the run was
+        // started with KR_TEST_PLATFORM_SECRET_STORE=1, as the conformance workflow's runner is;
+        // anywhere else it says it did nothing and is not run.
+        Step::cargo(
+            Group::Rust,
+            "a collection key kept in this machine's credential store",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-client",
+                "--lib",
+                "--",
+                "--exact",
+                "sync::keys::tests::a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again",
+            ],
         ),
     ];
     let mut registry = Step::cargo(
@@ -873,6 +911,24 @@ mod tests {
                 .count(),
             MACOS_SKIPS.len()
         );
+    }
+
+    #[test]
+    fn a_test_step_shows_what_its_passing_tests_wrote_unless_it_shows_it_as_written() {
+        let line = |arguments: &[&str]| Step::cargo(Group::Rust, "x", arguments).line();
+        assert_eq!(
+            line(&["test", "--locked", "--workspace"]),
+            "cargo test --locked --workspace -- --show-output"
+        );
+        assert_eq!(
+            line(&["test", "-p", "a", "--", "--test-threads=1"]),
+            "cargo test -p a -- --test-threads=1 --show-output"
+        );
+        assert_eq!(
+            line(&["test", "-p", "a", "--", "--nocapture"]),
+            "cargo test -p a -- --nocapture"
+        );
+        assert_eq!(line(&["build", "-p", "a"]), "cargo build -p a");
     }
 
     #[test]

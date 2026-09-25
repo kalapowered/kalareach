@@ -26,4 +26,14 @@ mod tests {
     #[test]
     #[ignore = "needs a device; the device lane runs it"]
     fn is_ignored_too() {}
+
+    /// KR-REQ-04.05.
+    #[test]
+    fn returns_early() {
+        if std::env::var_os("OUTCOMES_DEVICE").is_none() {
+            println!("skipped: OUTCOMES_DEVICE names no device to drive");
+            return;
+        }
+        panic!("a device was named, and this tree has none");
+    }
 }
