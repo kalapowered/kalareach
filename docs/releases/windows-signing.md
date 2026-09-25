@@ -71,7 +71,20 @@ them, its thumbprint, when it expires, the timestamping authority that countersi
 certificate chain from the root. It also records the SHA-256 digests of the data files. Beside the
 archive is a `SHA256SUMS` covering the archive itself.
 
-Checking a downloaded copy takes two commands:
+Both records end every line in a line feed alone, although the runner that writes them is Windows.
+A carriage return would break the sum on macOS: `shasum` and the `sha256sum` macOS ships read it as
+part of the file name and report the archive missing, while GNU `sha256sum` drops it and passes.
+Before anything is uploaded, the release job holds both records to line feeds and runs
+`sha256sum -c` over the archive (`scripts/check-release-sums.sh`). The gate job first drives that
+check with records made to fail, a carriage return among them.
+
+Checking the archive takes one command on Linux or macOS, in the directory that holds both files:
+
+```bash
+sha256sum -c SHA256SUMS        # or: shasum -a 256 -c SHA256SUMS
+```
+
+Checking a signature after unpacking takes two commands:
 
 ```powershell
 Get-AuthenticodeSignature .\kr.exe | Format-List
