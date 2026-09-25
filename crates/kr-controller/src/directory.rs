@@ -23,7 +23,7 @@ use kr_protocol::identity::BootIdentity;
 use kr_protocol::ids::{BuildId, ControllerGeneration, SessionId};
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::scalars::Nullable;
-use kr_protocol::session::{SessionReadResult, SessionState};
+use kr_protocol::session::{SessionReadResult, SessionState, SessionSummary};
 use kr_protocol::worker::WorkerDescriptor;
 
 use crate::error::Result;
@@ -56,8 +56,10 @@ pub struct Quarantined {
 /// What one worker last said about its session.
 #[derive(Debug, Default)]
 struct Heard {
-    /// The worker's last answer to a read, where one has reached this daemon since it started.
-    read: Option<SessionReadResult>,
+    /// The session as the worker last described it, where one of its answers has reached this
+    /// daemon since it started. The description alone: what else a read carries either reaches
+    /// the worker or is the session's content, and neither is this daemon's to hand out.
+    session: Option<SessionSummary>,
     /// Whether the worker accepted a close this daemon passed to it.
     closing: bool,
 }
@@ -159,13 +161,13 @@ impl Directory {
         self.verified.values()
     }
 
-    /// Keeps what a worker in the directory has just said about its session.
+    /// Keeps how a worker in the directory has just described its session.
     ///
     /// A worker that has left the directory had its closure recorded while it was being asked,
     /// and the record is the answer from then on, so what it said is not kept.
     pub fn heard(&mut self, session_id: SessionId, read: &SessionReadResult) {
         if self.verified.contains_key(&session_id) {
-            self.heard.entry(session_id).or_default().read = Some(read.clone());
+            self.heard.entry(session_id).or_default().session = Some(read.session.clone());
         }
     }
 
@@ -182,8 +184,9 @@ impl Directory {
     /// has ended, and until then no closure can be recorded. The session is what its worker last
     /// said it was, and `closing` where the worker had not said so but had accepted a close this
     /// daemon passed to it: the closure is this daemon's to record once the kernel says the worker
-    /// has gone. The endpoint, the launch profile and the launches waiting on it are left out,
-    /// because they are how a client reaches a worker that no longer answers.
+    /// has gone. The rest of a read is left unsaid. The endpoint, the launch profile and the
+    /// launches waiting on the worker are how a client reaches a worker that no longer answers,
+    /// and the last command block is the session's content, which only its worker hands out.
     ///
     /// Nothing is described where no end is under way, or where the worker has not answered this
     /// daemon since it started. That is a worker this daemon cannot reach, and nothing here says
@@ -191,18 +194,21 @@ impl Directory {
     #[must_use]
     pub fn ending(&self, session_id: SessionId) -> Option<SessionReadResult> {
         let heard = self.heard.get(&session_id)?;
-        let mut read = heard.read.clone()?;
-        match read.session.state {
+        let mut session = heard.session.clone()?;
+        match session.state {
             SessionState::Closing | SessionState::Closed => {}
             SessionState::Creating | SessionState::Live if heard.closing => {
-                read.session.state = SessionState::Closing;
+                session.state = SessionState::Closing;
             }
             SessionState::Creating | SessionState::Live => return None,
         }
-        read.endpoint = Nullable::null();
-        read.launch_profile = Nullable::null();
-        read.outstanding_launches = Nullable::null();
-        Some(read)
+        Some(SessionReadResult {
+            session,
+            endpoint: Nullable::null(),
+            launch_profile: Nullable::null(),
+            last_command_block: Nullable::null(),
+            outstanding_launches: Nullable::null(),
+        })
     }
 }
 
