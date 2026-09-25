@@ -107,8 +107,9 @@ system's name servers first, and when they fail or there are none it falls back 
 resolvers iroh falls back to (Cloudflare, Google and Quad9), over plain DNS, which asks again over
 TCP when an answer is truncated or does not come, and over DNS over TLS. iroh's own fallback also
 asks over DNS over HTTPS, and that client follows `HTTPS_PROXY` and `ALL_PROXY` whether or not a
-proxy is selected; this one has no HTTP client, so no variable moves a lookup. DNS over TLS verifies
-against the relay's anchors: the public ones, and any `relay_ca_roots` add.
+proxy is selected; this one has no HTTP client, so no proxy variable moves a lookup. On Windows the
+system's configuration includes the hosts file, which the resolver finds under `SystemRoot`. DNS
+over TLS verifies against the relay's anchors: the public ones, and any `relay_ca_roots` add.
 
 The proxy is each machine's own choice. A pairing invitation and a host bundle carry the relays and
 discovery services a device dials with, never the proxy the inviting machine goes through. Nothing

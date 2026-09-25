@@ -745,7 +745,9 @@ and the others the platform verifier's own probe looks for, and every file in `/
 read. While either is set, the platform verifier would trust only what it names, and an inherited
 variable would then decide who can answer for a service. So an authority given only through one of
 them is not trusted until it is installed in the system store, with `update-ca-certificates` or
-`update-ca-trust` for example, and `kr doctor` says the same.
+`update-ca-trust` for example, and `kr doctor` says the same. The network endpoint is not one of
+these clients: it verifies its relays and Pkarr servers against the public anchors and any relay
+trust anchors its configuration names (see the transport guide).
 
 The service sees one request at most for one dispatch, which is what keeps a request identity and
 its receipt simple. The transport never sends again a request that may have reached the service:

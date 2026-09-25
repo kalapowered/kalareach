@@ -848,26 +848,33 @@ pub fn checks(effective: &EffectiveConfiguration) -> Vec<DoctorCheck> {
     // because an owner whose authority is given only through one needs to hear where it goes.
     let stores = configuration::certificate_store_variables_here();
     overrides = overrides
-        .stated(". Certificates are verified against the platform's own store, and ")
+        .stated(
+            ". The managed-service, rendezvous, delivery, plugin repository and mail clients \
+             verify a server against the platform's own store, and ",
+        )
         .terms(configuration::CERTIFICATE_STORE_VARIABLES, " and ")
         .stated(
-            " are not read: an authority given only through them is not trusted until it is \
-             installed in the system store; set here: ",
+            " are not read: an authority given only through them is not trusted by those clients \
+             until it is installed in the system store; set here: ",
         );
     overrides = if stores.is_empty() {
         overrides.stated("none")
     } else {
         overrides.terms(stores, ", ")
     };
+    overrides = overrides.stated(
+        ". The network endpoint verifies its relays and discovery servers against the public \
+         anchors and network.relay_trust_anchors",
+    );
     checks.push(DoctorCheck::new(
         "configuration-overrides",
         "Which environment variables participate",
         // What is read outside the precedence is the platform's naming of its locations and its
         // login, and the proxy and hosts file variables the endpoint's library reads for its
         // relay checks and lookups. Every provider origin this host uses is its configuration
-        // document's, the certificates it trusts are the platform store's, and its owner is
-        // recorded by pairing, so no inherited variable here reaches authority, an origin or
-        // whom this host trusts.
+        // document's, the certificates it trusts are the platform store's and, for the endpoint,
+        // the public and document anchors, and its owner is recorded by pairing, so no inherited
+        // variable here reaches authority, an origin or whom this host trusts.
         DoctorStatus::Ok,
         overrides,
         None,

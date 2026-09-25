@@ -3640,16 +3640,18 @@ pub mod configuration {
     ///
     /// Every network selection, the proxy included, and the voice broker's origin are this host's
     /// configuration document's ([`NetworkSelection`], [`VoiceSelection`]), and nothing reads them
-    /// from the environment. Certificates are verified against the platform's own store, and the
-    /// variables other programs take to name another store ([`CERTIFICATE_STORE_VARIABLES`]) are
-    /// not read at all. No variable names this host's owner: the owner is recorded through local
-    /// IPC, by the pairing that establishes it.
+    /// from the environment. The managed-service, rendezvous, delivery, plugin repository and mail
+    /// clients verify a server against the platform's own store, the network endpoint verifies its
+    /// relays and discovery servers against the public anchors and the document's relay trust
+    /// anchors, and neither reads the variables other programs take to name a store
+    /// ([`CERTIFICATE_STORE_VARIABLES`]). No variable names this host's owner: the owner is
+    /// recorded through local IPC, by the pairing that establishes it.
     ///
     /// The list names what this build reads that decides something: a location, the login this
     /// host describes, or where the endpoint's relay checks and lookups go. It is not an inventory
     /// of every variable a process in this tree ever looks at, and it does not claim to be one. A
     /// name that is in neither this table nor [`ALLOWLIST`] takes no part in the precedence.
-    pub const UNGOVERNED: [UngovernedVariable; 21] = [
+    pub const UNGOVERNED: [UngovernedVariable; 25] = [
         UngovernedVariable {
             variable: "TMPDIR",
             selects: "the platform's per-user temporary directory, which is the macOS runtime root",
@@ -3695,6 +3697,25 @@ pub mod configuration {
             selects: "the account's local application data directory on Windows",
         },
         UngovernedVariable {
+            variable: "USERPROFILE",
+            selects: "the account's home directory where HOME is not set, as Windows names it, \
+                      which an agent's tool configuration is written under",
+        },
+        UngovernedVariable {
+            variable: "USER",
+            selects: "the account name a host, a worker or a bridge helper reports for the login it \
+                      runs in",
+        },
+        UngovernedVariable {
+            variable: "LOGNAME",
+            selects: "the same, where USER is not set, for a worker or a bridge helper",
+        },
+        UngovernedVariable {
+            variable: "USERNAME",
+            selects: "the same, where USER is not set (nor, for a worker or a bridge helper, \
+                      LOGNAME), as Windows names the account",
+        },
+        UngovernedVariable {
             variable: "HTTPS_PROXY",
             selects: "the proxy iroh's relay latency probe goes through when network.proxy_url \
                       names none",
@@ -3731,7 +3752,8 @@ pub mod configuration {
         },
         UngovernedVariable {
             variable: "REQUEST_METHOD",
-            selects: "whether the captive-portal check passes over HTTP_PROXY, as a CGI program must",
+            selects: "whether those two relay checks take a proxy from the environment at all: \
+                      while it is set, as in a CGI program, they take none",
         },
         UngovernedVariable {
             variable: "SystemRoot",
@@ -3745,9 +3767,12 @@ pub mod configuration {
     ///
     /// On Linux the platform verifier trusts only what `SSL_CERT_FILE` or `SSL_CERT_DIR` names while
     /// either is set, which would let an inherited variable decide who may answer for a service.
-    /// This build verifies every server against the platform's own store instead, on Linux the
-    /// distribution's, so an authority given only through one of these is not trusted until it is
-    /// installed in the system store. `kr doctor` says so, and says which of them is set here.
+    /// This build's managed-service, rendezvous, delivery, plugin repository and mail clients verify
+    /// against the platform's own store instead, on Linux the distribution's, so an authority given
+    /// only through one of these is not trusted by them until it is installed in the system store.
+    /// The network endpoint verifies its relays and discovery servers against the public anchors and
+    /// `network.relay_trust_anchors`, and reads neither variable. `kr doctor` says so, and says
+    /// which of them is set here.
     pub const CERTIFICATE_STORE_VARIABLES: [&str; 2] = ["SSL_CERT_FILE", "SSL_CERT_DIR"];
 
     /// Returns the variables in [`UNGOVERNED`] that this process actually has set.
@@ -6886,6 +6911,17 @@ mod tests {
                     .iter()
                     .any(|entry| entry.variable == variable),
                 "{variable} takes part and is named"
+            );
+        }
+        // The account name the host, a worker and a bridge helper report, and the home an agent's
+        // tool configuration goes under on Windows, are read from the login's environment, and
+        // named.
+        for variable in ["USER", "LOGNAME", "USERNAME", "USERPROFILE"] {
+            assert!(
+                configuration::UNGOVERNED
+                    .iter()
+                    .any(|entry| entry.variable == variable),
+                "{variable} is read and is named"
             );
         }
         // A certificate store is never the environment's to choose: those variables are in

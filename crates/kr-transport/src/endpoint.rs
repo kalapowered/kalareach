@@ -665,8 +665,9 @@ const PUBLIC_RESOLVERS: [[IpAddr; 4]; 3] = [
 ///
 /// iroh's own resolver has the same two tiers, but its fallback also asks over DNS over HTTPS, and
 /// that client follows `HTTPS_PROXY` and `ALL_PROXY` whether or not a proxy is selected. This one
-/// speaks no HTTP, so nothing the environment names moves a lookup. DNS over TLS verifies against
-/// the same anchors as the relay, and like the rest of the lookup it goes directly.
+/// speaks no HTTP, so no proxy variable moves a lookup. (On Windows the system's configuration
+/// includes the hosts file, which the resolver reads under `SystemRoot`.) DNS over TLS verifies
+/// against the same anchors as the relay, and like the rest of the lookup it goes directly.
 fn dns_resolver(ca_tls: &CaTlsConfig) -> Result<iroh::dns::DnsResolver> {
     let tls = ca_tls
         .client_config(iroh_relay::tls::default_provider())

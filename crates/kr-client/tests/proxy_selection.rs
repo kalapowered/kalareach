@@ -169,7 +169,7 @@ async fn no_proxy_variable_moves_a_client_this_product_builds() {
             .env("ALL_PROXY", &variables)
             .env_remove("NO_PROXY")
             .env_remove("no_proxy")
-            // With it set, as in a CGI program, the plain-HTTP proxy variable is ignored.
+            // With it set, as in a CGI program, every proxy variable is ignored.
             .env_remove("REQUEST_METHOD")
             .current_dir(std::env::temp_dir())
             .output()

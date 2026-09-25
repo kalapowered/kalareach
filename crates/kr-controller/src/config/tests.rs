@@ -422,7 +422,13 @@ fn the_diagnostics_report_the_document_the_order_the_overrides_and_the_ceilings(
     assert!(
         overrides
             .detail()
-            .contains("not trusted until it is installed in the system store"),
+            .contains("until it is installed in the system store"),
+        "{overrides:?}"
+    );
+    // The endpoint's relays and discovery servers are verified against other anchors, and the
+    // sentence says which rather than claiming the system store for them.
+    assert!(
+        overrides.detail().contains("network.relay_trust_anchors"),
         "{overrides:?}"
     );
 }

@@ -399,16 +399,19 @@ those set here rather than leaving the sentence above to be read as more than it
 
 | Group | Variables | What they select |
 | --- | --- | --- |
-| platform locations | `TMPDIR`, `XDG_RUNTIME_DIR`, `XDG_STATE_HOME`, `XDG_CONFIG_HOME`, `HOME`, `LOCALAPPDATA` | the operating system's own conventional directories, which is what the native locations above are derived from |
-| session readings | `PATH`, `DISPLAY`, `XAUTHORITY`, `XDG_SESSION_ID`, `SESSIONNAME` | what the platform says about the login this host is running in and where a capability probe looks for the tools it reports on |
+| platform locations | `TMPDIR`, `XDG_RUNTIME_DIR`, `XDG_STATE_HOME`, `XDG_CONFIG_HOME`, `HOME`, `LOCALAPPDATA`, `USERPROFILE` | the operating system's own conventional directories, which is what the native locations above are derived from, and on Windows the home an agent's tool configuration is written under |
+| session readings | `PATH`, `DISPLAY`, `XAUTHORITY`, `XDG_SESSION_ID`, `SESSIONNAME`, `USER`, `LOGNAME`, `USERNAME` | what the platform says about the login this host is running in, its account name included, and where a capability probe looks for the tools it reports on |
 | network library | `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` and their lower-case spellings, `REQUEST_METHOD`, `SystemRoot` | with no `network.proxy_url`, the proxy iroh's relay latency probe and captive-portal check go through; and on Windows where the endpoint reads the hosts file. iroh reads these itself and offers no way not to |
 
 No group reaches authority, a provider origin or whom this host trusts. The network library's
 variables move where two relay checks and a lookup go; they choose no relay, no service and no
 trust. No variable selects a network service, the proxy or the voice broker: those are the
-configuration document's `network` and `voice` sections. Certificates are verified against the
-platform's own store, and `SSL_CERT_FILE` and `SSL_CERT_DIR` are not read, so an authority given
-only through them is not trusted until it is installed in the system store; `kr doctor` says so.
+configuration document's `network` and `voice` sections. The managed-service, rendezvous, delivery,
+plugin repository and mail clients verify a server against the platform's own store, and
+`SSL_CERT_FILE` and `SSL_CERT_DIR` are not read, so an authority given only through them is not
+trusted by those clients until it is installed in the system store; `kr doctor` says so. The
+endpoint verifies its relays and discovery servers against the public anchors and
+`network.relay_trust_anchors`, and a private authority for those is named there.
 No variable names this host's owner either: the owner is recorded through local IPC, by the pairing
 that establishes it (see "Pairing and the host's owner" below).
 
