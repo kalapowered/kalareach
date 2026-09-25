@@ -844,12 +844,30 @@ pub fn checks(effective: &EffectiveConfiguration) -> Vec<DoctorCheck> {
         }
         line
     };
+    // The certificate store variables other programs read are named even when none is set,
+    // because an owner whose authority is given only through one needs to hear where it goes.
+    let stores = configuration::certificate_store_variables_here();
+    overrides = overrides
+        .stated(". Certificates are verified against the platform's own store, and ")
+        .terms(configuration::CERTIFICATE_STORE_VARIABLES, " and ")
+        .stated(
+            " are not read: an authority given only through them is not trusted until it is \
+             installed in the system store; set here: ",
+        );
+    overrides = if stores.is_empty() {
+        overrides.stated("none")
+    } else {
+        overrides.terms(stores, ", ")
+    };
     checks.push(DoctorCheck::new(
         "configuration-overrides",
         "Which environment variables participate",
         // What is read outside the precedence is the platform's naming of its locations and its
-        // login. Every provider origin this host uses is its configuration document's, and its
-        // owner is recorded by pairing, so no inherited variable here reaches authority.
+        // login, and the proxy and hosts file variables the endpoint's library reads for its
+        // relay checks and lookups. Every provider origin this host uses is its configuration
+        // document's, the certificates it trusts are the platform store's, and its owner is
+        // recorded by pairing, so no inherited variable here reaches authority, an origin or
+        // whom this host trusts.
         DoctorStatus::Ok,
         overrides,
         None,

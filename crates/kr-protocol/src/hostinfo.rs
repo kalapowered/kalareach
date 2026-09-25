@@ -3625,21 +3625,29 @@ pub mod configuration {
     /// exceptions to it are written down: `kr doctor` prints this list, so what a person is told
     /// about this host matches what this host actually does.
     ///
-    /// Two kinds are here, and neither reaches authority or a provider origin. The platform
-    /// directory variables are how the operating system itself names its conventional locations,
-    /// and reading them is what "native OS-appropriate locations" means rather than an exception
-    /// to it. The session variables are how the platform describes the login this host is running
-    /// in, which is a reading of the environment rather than a choice about it. Every network
-    /// selection and the voice broker's origin are this host's configuration document's
-    /// ([`NetworkSelection`], [`VoiceSelection`]), and nothing reads them from the environment. No
-    /// variable names this host's owner: the owner is recorded through local IPC, by the pairing
-    /// that establishes it.
+    /// Three kinds are here, and none reaches authority, a provider origin or whom this host
+    /// trusts to answer for one. The platform directory variables are how the operating system
+    /// itself names its conventional locations, and reading them is what "native OS-appropriate
+    /// locations" means rather than an exception to it. The session variables are how the platform
+    /// describes the login this host is running in, which is a reading of the environment rather
+    /// than a choice about it. The network variables are read by the endpoint's library, which
+    /// offers no way not to: with no proxy selected, iroh's relay latency probe and captive-portal
+    /// check go through the proxy the environment names, and on Windows the endpoint's resolver
+    /// reads the hosts file under `SystemRoot`. They move where those requests go and can mislead
+    /// the captive-portal check; they choose no relay, no service and no trust.
     ///
-    /// The list names what this build reads that decides something: a location or the login this
-    /// host describes. It is not an inventory of every variable a process in this tree ever looks
-    /// at, and it does not claim to be one. A name that is in neither this table nor
-    /// [`ALLOWLIST`] takes no part in the precedence.
-    pub const UNGOVERNED: [UngovernedVariable; 11] = [
+    /// Every network selection, the proxy included, and the voice broker's origin are this host's
+    /// configuration document's ([`NetworkSelection`], [`VoiceSelection`]), and nothing reads them
+    /// from the environment. Certificates are verified against the platform's own store, and the
+    /// variables other programs take to name another store ([`CERTIFICATE_STORE_VARIABLES`]) are
+    /// not read at all. No variable names this host's owner: the owner is recorded through local
+    /// IPC, by the pairing that establishes it.
+    ///
+    /// The list names what this build reads that decides something: a location, the login this
+    /// host describes, or where the endpoint's relay checks and lookups go. It is not an inventory
+    /// of every variable a process in this tree ever looks at, and it does not claim to be one. A
+    /// name that is in neither this table nor [`ALLOWLIST`] takes no part in the precedence.
+    pub const UNGOVERNED: [UngovernedVariable; 21] = [
         UngovernedVariable {
             variable: "TMPDIR",
             selects: "the platform's per-user temporary directory, which is the macOS runtime root",
@@ -3684,7 +3692,61 @@ pub mod configuration {
             variable: "LOCALAPPDATA",
             selects: "the account's local application data directory on Windows",
         },
+        UngovernedVariable {
+            variable: "HTTPS_PROXY",
+            selects: "the proxy iroh's relay latency probe goes through when network.proxy_url \
+                      names none",
+        },
+        UngovernedVariable {
+            variable: "https_proxy",
+            selects: "the same, where HTTPS_PROXY is not set",
+        },
+        UngovernedVariable {
+            variable: "HTTP_PROXY",
+            selects: "the proxy iroh's captive-portal check goes through when network.proxy_url \
+                      names none",
+        },
+        UngovernedVariable {
+            variable: "http_proxy",
+            selects: "the same, where HTTP_PROXY is not set",
+        },
+        UngovernedVariable {
+            variable: "ALL_PROXY",
+            selects: "the proxy either of those relay checks goes through when network.proxy_url \
+                      names none and the check's own variable is not set",
+        },
+        UngovernedVariable {
+            variable: "all_proxy",
+            selects: "the same, where ALL_PROXY is not set",
+        },
+        UngovernedVariable {
+            variable: "NO_PROXY",
+            selects: "the relays those two checks reach without the proxy the variables name",
+        },
+        UngovernedVariable {
+            variable: "no_proxy",
+            selects: "the same, where NO_PROXY is not set",
+        },
+        UngovernedVariable {
+            variable: "REQUEST_METHOD",
+            selects: "whether the captive-portal check passes over HTTP_PROXY, as a CGI program must",
+        },
+        UngovernedVariable {
+            variable: "SystemRoot",
+            selects: "where the network endpoint reads the Windows hosts file, which may name an \
+                      address for a relay or a discovery service",
+        },
     ];
+
+    /// The variables other programs read to choose the certificate authorities they trust, which
+    /// this build never reads.
+    ///
+    /// On Linux the platform verifier trusts only what `SSL_CERT_FILE` or `SSL_CERT_DIR` names while
+    /// either is set, which would let an inherited variable decide who may answer for a service.
+    /// This build verifies every server against the platform's own store instead, on Linux the
+    /// distribution's, so an authority given only through one of these is not trusted until it is
+    /// installed in the system store. `kr doctor` says so, and says which of them is set here.
+    pub const CERTIFICATE_STORE_VARIABLES: [&str; 2] = ["SSL_CERT_FILE", "SSL_CERT_DIR"];
 
     /// Returns the variables in [`UNGOVERNED`] that this process actually has set.
     ///
@@ -3692,10 +3754,39 @@ pub mod configuration {
     /// matters to a person reading a diagnostic is whether this host is running under one.
     #[must_use]
     pub fn ungoverned_here() -> Vec<UngovernedVariable> {
-        UNGOVERNED
-            .iter()
-            .copied()
-            .filter(|entry| std::env::var_os(entry.variable).is_some())
+        ungoverned_among(
+            |variable| std::env::var_os(variable).is_some(),
+            cfg!(windows),
+        )
+    }
+
+    /// Returns the entries of [`UNGOVERNED`] that `set` says are set, each variable once.
+    ///
+    /// Windows names its variables without regard to case, so there `HTTPS_PROXY` and
+    /// `https_proxy` are one variable, and it is reported under the first name the table gives it.
+    pub(super) fn ungoverned_among(
+        set: impl Fn(&str) -> bool,
+        case_blind: bool,
+    ) -> Vec<UngovernedVariable> {
+        let mut here: Vec<UngovernedVariable> = Vec::new();
+        for entry in UNGOVERNED {
+            let repeated = case_blind
+                && here
+                    .iter()
+                    .any(|kept| kept.variable.eq_ignore_ascii_case(entry.variable));
+            if !repeated && set(entry.variable) {
+                here.push(entry);
+            }
+        }
+        here
+    }
+
+    /// Returns the variables in [`CERTIFICATE_STORE_VARIABLES`] that this process has set.
+    #[must_use]
+    pub fn certificate_store_variables_here() -> Vec<&'static str> {
+        CERTIFICATE_STORE_VARIABLES
+            .into_iter()
+            .filter(|variable| std::env::var_os(variable).is_some())
             .collect()
     }
 
@@ -3714,10 +3805,10 @@ pub mod configuration {
     /// comes from a table this module or the protocol already owns: the preference keys, the
     /// selection keys and the words their values are reported in, the ceiling keys, the enrolment
     /// budgets, the documented environment variables, the variables this build reads outside the
-    /// precedence, the wire words of the closed enumerations a report names, and the operating
-    /// system and processor words of the platform this build was compiled for. A string that is
-    /// none of them is something somebody else wrote, and a sentence carries its class and its
-    /// length instead.
+    /// precedence, the certificate store variables it does not read, the wire words of the closed
+    /// enumerations a report names, and the operating system and processor words of the platform
+    /// this build was compiled for. A string that is none of them is something somebody else wrote,
+    /// and a sentence carries its class and its length instead.
     #[must_use]
     pub fn is_known_term(value: &str) -> bool {
         PREFERENCES.iter().any(|preference| preference.key == value)
@@ -3731,6 +3822,7 @@ pub mod configuration {
             || ungoverned_here()
                 .iter()
                 .any(|entry| entry.variable == value)
+            || CERTIFICATE_STORE_VARIABLES.contains(&value)
             || WIRE_WORDS.contains(&value)
             // The platform this build was compiled for, in the words the compiler wrote in.
             || value == std::env::consts::OS
@@ -6741,9 +6833,10 @@ mod tests {
         assert!(configuration::still_current(&prepared, &absent).is_ok());
     }
 
-    /// KR-REQ-26.14: what this build reads outside the precedence is written down, not implied,
-    /// and it is the platform's own naming of its locations and its login: a variable of this
-    /// product's own either takes part in the precedence or is not read at all.
+    /// KR-REQ-26.14: what this build reads outside the precedence is written down, not implied:
+    /// the platform's own naming of its locations and its login, and what the endpoint's library
+    /// reads for its relay checks and lookups. A variable of this product's own either takes part
+    /// in the precedence or is not read at all, and so is a certificate store's.
     #[test]
     fn every_variable_this_build_reads_outside_the_precedence_is_named() {
         for entry in &configuration::UNGOVERNED {
@@ -6771,6 +6864,55 @@ mod tests {
                 .all(|entry| !entry.variable.contains("OWNER")),
             "no variable names this host's owner"
         );
+        // What the endpoint's library still reads is named with why: the proxy variables its two
+        // relay checks follow when no proxy is selected, and the Windows root it reads the hosts
+        // file under.
+        for variable in [
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+            "REQUEST_METHOD",
+            "SystemRoot",
+        ] {
+            assert!(
+                configuration::UNGOVERNED
+                    .iter()
+                    .any(|entry| entry.variable == variable),
+                "{variable} takes part and is named"
+            );
+        }
+        // A certificate store is never the environment's to choose: those variables are in
+        // neither table, and a report can still name them to say so.
+        for variable in configuration::CERTIFICATE_STORE_VARIABLES {
+            assert!(
+                configuration::allowlisted(variable).is_none()
+                    && configuration::UNGOVERNED
+                        .iter()
+                        .all(|entry| entry.variable != variable),
+                "{variable} is not read"
+            );
+            assert!(configuration::is_known_term(variable), "{variable}");
+        }
+    }
+
+    /// Where a platform names its variables without regard to case, a variable the table lists
+    /// under two spellings is reported once, under the first; elsewhere they are two variables.
+    #[test]
+    fn a_variable_is_reported_once_where_case_does_not_count() {
+        let set = |variable: &str| variable.eq_ignore_ascii_case("HTTPS_PROXY");
+        let reported = |case_blind| {
+            configuration::ungoverned_among(set, case_blind)
+                .into_iter()
+                .map(|entry| entry.variable)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(reported(true), vec!["HTTPS_PROXY"]);
+        assert_eq!(reported(false), vec!["HTTPS_PROXY", "https_proxy"]);
     }
 
     /// The variables that used to select this host's network and its voice broker.

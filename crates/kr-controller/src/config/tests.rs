@@ -414,6 +414,17 @@ fn the_diagnostics_report_the_document_the_order_the_overrides_and_the_ceilings(
         overrides.detail().contains("This build also reads"),
         "and it says what this build reads outside the precedence: {overrides:?}"
     );
+    // KR-REQ-26.14: the certificate store variables other programs read are named whether or not
+    // they are set, with where an authority given only through them has to go.
+    for variable in configuration::CERTIFICATE_STORE_VARIABLES {
+        assert!(overrides.detail().contains(variable), "{overrides:?}");
+    }
+    assert!(
+        overrides
+            .detail()
+            .contains("not trusted until it is installed in the system store"),
+        "{overrides:?}"
+    );
 }
 
 /// KR-REQ-26.13: a stale `power.json` is reported in one line and never read.
