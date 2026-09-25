@@ -764,8 +764,9 @@ mod windows {
         GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
         GetSecurityDescriptorSacl, GetTokenInformation, INHERITED_ACE, IsValidSid,
         LABEL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-        SCOPE_SECURITY_INFORMATION, SE_DACL_PROTECTED, SE_SACL_PROTECTED, SECURITY_ATTRIBUTES,
-        TOKEN_INFORMATION_CLASS, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenOwner, TokenUser,
+        SCOPE_SECURITY_INFORMATION, SE_DACL_AUTO_INHERITED, SE_DACL_PROTECTED,
+        SE_SACL_AUTO_INHERITED, SE_SACL_PROTECTED, SECURITY_ATTRIBUTES, TOKEN_INFORMATION_CLASS,
+        TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenOwner, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateDirectoryW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_ENCRYPTED, FILE_GENERIC_EXECUTE,
@@ -1185,27 +1186,37 @@ mod windows {
     ///
     /// A file is replaced by writing a new file in its directory and renaming it over the old one,
     /// and the new file carries what Windows gives a file created there, not what the old one
-    /// carried. Two readings are equal when everything that decides access is equal: the owner, the
-    /// discretionary list (absent, or protected or not with its entries in order, each an allow or a
-    /// deny with its flags, its account and its rights, generic rights read as the file rights they
-    /// stand for), and the system list's protection with its mandatory label entries in order, each
-    /// label's mask read as the policy it is. Nothing else is compared, because nothing else is
-    /// read: a file carrying any other control that decides access is refused instead (see
+    /// carried. Two readings are equal when everything that decides access is equal, as the file
+    /// system stores it: the owner; the discretionary list (absent, or with its protection, whether
+    /// it records inheritance, and its entries in order, each an allow or a deny with its flags,
+    /// its account and its rights, generic rights read as the file rights they stand for); and the
+    /// system list's protection, whether it records inheritance, and its mandatory label entries in
+    /// order, each label's mask read as the policy it is. Nothing else is compared, because nothing
+    /// else is read: a file carrying any other control that decides access is refused instead (see
     /// [`FileAccess::read`]).
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct FileAccess {
         owner: Account,
         discretionary: Option<AccessList>,
-        system_protected: bool,
-        labels: Vec<AccessEntry>,
+        system: SystemList,
     }
 
-    /// A discretionary list: whether it is protected from what its directory passes down, and its
-    /// entries in the order access is decided by.
+    /// A discretionary list: whether it is protected from what its directory passes down, whether
+    /// it records which entries it inherited, and its entries in the order access is decided by.
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct AccessList {
         protected: bool,
+        records_inheritance: bool,
         entries: Vec<AccessEntry>,
+    }
+
+    /// The part of the system list that decides access: its protection, whether it records which
+    /// labels it inherited, and its mandatory labels in order.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct SystemList {
+        protected: bool,
+        records_inheritance: bool,
+        labels: Vec<AccessEntry>,
     }
 
     /// One entry of a discretionary list, or one mandatory label.
@@ -1326,22 +1337,29 @@ mod windows {
             Self::read(&file)
         }
 
-        /// Returns true when everything that decides access came from the file's directory: there
-        /// is a discretionary list, it is not protected, it has entries and every one of them is
-        /// inherited, the system list is not protected, and every label is inherited.
+        /// Returns true when the file's descriptor records nothing set on the file itself: there is
+        /// a discretionary list with entries, neither list is protected from the directory, and in
+        /// each list that records inheritance every entry is marked inherited.
         ///
-        /// That is what a file created in a directory carries, so a file of which this is true
-        /// carries nothing a new file there would not be given by the same directory.
+        /// That is the shape of what a file created in its directory carries. A list records which
+        /// entries it inherited only when it is automatically inherited: one written the older way,
+        /// as every file under some profiles is, marks no entry inherited whatever its origin, so
+        /// from it this cannot tell, and says nothing against the file. The comparison of a
+        /// replacement with the file it replaces decides there, as it does for a directory whose
+        /// list changed since the file inherited from it and for a file moved in from elsewhere.
         #[must_use]
-        pub fn is_inherited_whole(&self) -> bool {
+        pub fn records_nothing_set_here(&self) -> bool {
             let Some(list) = &self.discretionary else {
                 return false;
             };
+            let set_here = |recorded: bool, entries: &[AccessEntry]| {
+                recorded && entries.iter().any(|entry| !entry.is_inherited())
+            };
             !list.protected
                 && !list.entries.is_empty()
-                && list.entries.iter().all(AccessEntry::is_inherited)
-                && !self.system_protected
-                && self.labels.iter().all(AccessEntry::is_inherited)
+                && !self.system.protected
+                && !set_here(list.records_inheritance, &list.entries)
+                && !set_here(self.system.records_inheritance, &self.system.labels)
         }
 
         /// Returns true when the file belongs to the account this process gives the files it
@@ -1443,6 +1461,7 @@ mod windows {
         } else {
             Some(AccessList {
                 protected: control & SE_DACL_PROTECTED != 0,
+                records_inheritance: control & SE_DACL_AUTO_INHERITED != 0,
                 entries: entries(list, descriptor, false)?,
             })
         };
@@ -1468,8 +1487,11 @@ mod windows {
         Ok(FileAccess {
             owner,
             discretionary,
-            system_protected: control & SE_SACL_PROTECTED != 0,
-            labels,
+            system: SystemList {
+                protected: control & SE_SACL_PROTECTED != 0,
+                records_inheritance: control & SE_SACL_AUTO_INHERITED != 0,
+                labels,
+            },
         })
     }
 
@@ -1945,57 +1967,80 @@ mod windows {
             assert_eq!(file_rights(FILE_GENERIC_READ), FILE_GENERIC_READ);
         }
 
-        /// A list is inherited whole only when nothing in it, and nothing in the system list, was
-        /// set on the file itself: each case below changes one thing from the control.
+        /// A descriptor records nothing set on the file itself only when a list is present with
+        /// entries, neither list is protected, and every entry of a list that records inheritance
+        /// is marked inherited: each case below changes one thing from the control, which records
+        /// inheritance in both lists. A list written the older way records no inheritance, so an
+        /// entry in it that is not marked inherited says nothing either way.
         #[test]
-        fn a_list_is_inherited_whole_only_when_nothing_in_it_was_set_here() {
+        fn only_a_list_that_records_inheritance_shows_an_entry_set_here() {
             let control = FileAccess {
                 owner: system(),
                 discretionary: Some(AccessList {
                     protected: false,
+                    records_inheritance: true,
                     entries: vec![entry(EntryKind::Allow, INHERITED_ACE, FILE_ALL_ACCESS)],
                 }),
-                system_protected: false,
-                labels: vec![entry(EntryKind::Label, INHERITED_ACE, 1)],
+                system: SystemList {
+                    protected: false,
+                    records_inheritance: true,
+                    labels: vec![entry(EntryKind::Label, INHERITED_ACE, 1)],
+                },
             };
-            assert!(control.is_inherited_whole());
+            assert!(control.records_nothing_set_here());
 
-            let mut protected = control.clone();
-            if let Some(list) = protected.discretionary.as_mut() {
-                list.protected = true;
-            }
-            let mut explicit = control.clone();
-            if let Some(list) = explicit.discretionary.as_mut() {
-                list.entries
-                    .push(entry(EntryKind::Deny, 0, FILE_GENERIC_WRITE));
-            }
-            let mut empty = control.clone();
-            if let Some(list) = empty.discretionary.as_mut() {
-                list.entries.clear();
-            }
-            let absent = FileAccess {
-                discretionary: None,
-                ..control.clone()
+            let changed = |change: &dyn Fn(&mut FileAccess)| {
+                let mut access = control.clone();
+                change(&mut access);
+                access
             };
-            let system_protected = FileAccess {
-                system_protected: true,
-                ..control.clone()
-            };
-            let labelled = FileAccess {
-                labels: vec![entry(EntryKind::Label, 0, 1)],
-                ..control.clone()
-            };
+            fn list(access: &mut FileAccess) -> &mut AccessList {
+                access
+                    .discretionary
+                    .as_mut()
+                    .expect("the control has a list")
+            }
             for (what, access) in [
-                ("a protected list of inherited entries", protected),
-                ("an explicit entry", explicit),
-                ("an empty list", empty),
-                ("no list", absent),
-                ("a protected system list", system_protected),
-                ("an explicit label", labelled),
+                (
+                    "a protected list of inherited entries",
+                    changed(&|access| list(access).protected = true),
+                ),
+                (
+                    "an entry set here",
+                    changed(&|access| {
+                        list(access)
+                            .entries
+                            .push(entry(EntryKind::Deny, 0, FILE_GENERIC_WRITE));
+                    }),
+                ),
+                (
+                    "an empty list",
+                    changed(&|access| list(access).entries.clear()),
+                ),
+                ("no list", changed(&|access| access.discretionary = None)),
+                (
+                    "a protected system list",
+                    changed(&|access| access.system.protected = true),
+                ),
+                (
+                    "a label set here",
+                    changed(&|access| access.system.labels = vec![entry(EntryKind::Label, 0, 1)]),
+                ),
             ] {
-                assert!(!access.is_inherited_whole(), "{what}");
+                assert!(!access.records_nothing_set_here(), "{what}");
                 assert_ne!(access, control, "{what}");
             }
+
+            // Written the older way, neither list says which of its entries it inherited.
+            let older = changed(&|access| {
+                let list = list(access);
+                list.records_inheritance = false;
+                list.entries = vec![entry(EntryKind::Allow, 0, FILE_ALL_ACCESS)];
+                access.system.records_inheritance = false;
+                access.system.labels = vec![entry(EntryKind::Label, 0, 1)];
+            });
+            assert!(older.records_nothing_set_here(), "{older:?}");
+            assert_ne!(older, control);
         }
 
         /// The entry types this host evaluates, and the ones it names and refuses.
@@ -2987,8 +3032,8 @@ mod tests {
             .unwrap_or_else(|refusal| panic!("{} is read: {refusal:?}", path.display()))
     }
 
-    /// Two files made in one directory have the same access, which is all inherited from the
-    /// directory and owned by the account this process gives new files: what a replacement made
+    /// Two files made in one directory have the same access, which records nothing set on either
+    /// file and is owned by the account this process gives new files: what a replacement made
     /// beside a document carries.
     #[cfg(windows)]
     #[test]
@@ -2997,7 +3042,7 @@ mod tests {
         let first = access(&directory.file("first"));
         let second = access(&directory.file("second"));
         assert_eq!(first, second);
-        assert!(first.is_inherited_whole(), "{first:?}");
+        assert!(first.records_nothing_set_here(), "{first:?}");
         assert!(first.is_owned_as_new_files_are().expect("the token"));
     }
 
@@ -3043,10 +3088,10 @@ mod tests {
         ] {
             assert_ne!(changed, &made, "{what}");
         }
-        assert!(!granted.is_inherited_whole(), "{granted:?}");
-        assert!(!protected.is_inherited_whole(), "{protected:?}");
+        assert!(!granted.records_nothing_set_here(), "{granted:?}");
+        assert!(!protected.records_nothing_set_here(), "{protected:?}");
         assert!(
-            owned.is_inherited_whole(),
+            owned.records_nothing_set_here(),
             "only its owner changed: {owned:?}"
         );
         assert!(!owned.is_owned_as_new_files_are().expect("the token"));
@@ -3055,7 +3100,7 @@ mod tests {
     }
 
     /// A file whose directory passes one entry fewer has another access than one whose directory
-    /// passes it, though both are inherited whole.
+    /// passes it, though neither records anything set on the file itself.
     #[cfg(windows)]
     #[test]
     fn a_file_whose_directory_passes_one_entry_fewer_has_another_access() {
@@ -3072,7 +3117,7 @@ mod tests {
         let without = access(&fewer.file("without"));
         let with = access(&more.file("with"));
         assert_ne!(without, with);
-        assert!(without.is_inherited_whole() && with.is_inherited_whole());
+        assert!(without.records_nothing_set_here() && with.records_nothing_set_here());
         assert_eq!(access(&fewer.file("control")), without);
     }
 
@@ -3082,7 +3127,9 @@ mod tests {
     #[test]
     fn order_rights_and_an_absent_list_are_read_as_they_are() {
         let directory = Inheriting::new("described");
-        let allow_deny = "D:P(A;;FR;;;WD)(D;;FW;;;WD)";
+        // The deny names writing the contents alone, so that neither order keeps this process from
+        // opening the file to read it.
+        let allow_deny = "D:P(A;;FR;;;WD)(D;;0x2;;;WD)";
         let first = access(&directory.described("allow-deny", allow_deny));
         assert_eq!(
             access(&directory.described("allow-deny-again", allow_deny)),
@@ -3090,7 +3137,7 @@ mod tests {
             "the same descriptor reads the same"
         );
         assert_ne!(
-            access(&directory.described("deny-allow", "D:P(D;;FW;;;WD)(A;;FR;;;WD)")),
+            access(&directory.described("deny-allow", "D:P(D;;0x2;;;WD)(A;;FR;;;WD)")),
             first,
             "entries in another order"
         );
@@ -3108,12 +3155,12 @@ mod tests {
         let absent = access(&directory.described("no-list", "D:NO_ACCESS_CONTROL"));
         let empty = access(&directory.described("empty-list", "D:P"));
         assert_ne!(absent, empty, "no list is not an empty one");
-        assert!(!absent.is_inherited_whole() && !empty.is_inherited_whole());
+        assert!(!absent.records_nothing_set_here() && !empty.records_nothing_set_here());
     }
 
     /// A mandatory label is read with its policy: one that forbids reading up is another access
-    /// than none, and than one that forbids only writing up; a label set on an otherwise inherited
-    /// file keeps it from being inherited whole.
+    /// than none, and than one that forbids only writing up; a label set on a file its directory
+    /// made is another access than its sibling's.
     #[cfg(windows)]
     #[test]
     fn a_label_is_read_with_the_policy_it_sets() {
@@ -3131,10 +3178,18 @@ mod tests {
             reading,
             "another policy"
         );
-        let inherited = access(&directory.file("inherited"));
-        let set_here = access(&directory.described("label-set-here", "S:(ML;;NW;;;ME)"));
-        assert!(inherited.is_inherited_whole(), "{inherited:?}");
-        assert!(!set_here.is_inherited_whole(), "{set_here:?}");
+        let made = access(&directory.file("made"));
+        let relabelled = directory.file("relabelled");
+        run(
+            "icacls.exe",
+            &[
+                relabelled.as_os_str(),
+                "/setintegritylevel".as_ref(),
+                "L".as_ref(),
+            ],
+        );
+        assert_ne!(access(&relabelled), made, "a label set on the file");
+        assert_eq!(access(&directory.file("sibling")), made, "the control");
     }
 
     /// Controls this host does not evaluate are refused rather than read: a conditional entry, a
@@ -3200,9 +3255,9 @@ mod tests {
     }
 
     /// A file that inherited its list before its directory's list changed without the change
-    /// reaching it has another access than a file made there afterwards, though both read as
-    /// inherited whole: what reading a document alone cannot see, and what comparing the
-    /// replacement with it does.
+    /// reaching it has another access than a file made there afterwards, though neither records
+    /// anything set on the file itself: what reading a document alone cannot see, and what
+    /// comparing the replacement with it does.
     #[cfg(windows)]
     #[test]
     fn a_file_that_inherited_before_its_directory_changed_differs_from_a_new_one() {
@@ -3218,7 +3273,7 @@ mod tests {
         assert_eq!(access(&old), before, "the file inside kept its list");
         let new = access(&directory.file("new"));
         assert_ne!(new, before);
-        assert!(new.is_inherited_whole() && before.is_inherited_whole());
+        assert!(new.records_nothing_set_here() && before.records_nothing_set_here());
     }
 
     /// A path through a junction is flushed to where the junction leads.
