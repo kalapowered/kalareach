@@ -188,8 +188,22 @@ pub struct RegisteredTask {
     pub execution_time_limit: String,
     /// The priority its process runs at.
     pub priority: String,
-    /// Whether it is enabled, when the export says; absent is the default, enabled.
-    pub enabled: String,
+    /// Whether it is enabled; absent is the default, enabled.
+    pub enabled: bool,
+    /// The privileges it runs with, as written; absent is the default, `LeastPrivilege`.
+    pub run_level: String,
+    /// Whether a run may not start on batteries; absent is the default, true.
+    pub disallow_start_on_batteries: bool,
+    /// Whether a run stops when the machine goes on batteries; absent is the default, true.
+    pub stop_going_on_batteries: bool,
+    /// Whether a run waits for the machine to be idle; absent is the default, false.
+    pub run_only_if_idle: bool,
+    /// Whether a run stops when the machine stops being idle; absent is the default, true.
+    pub stop_on_idle_end: bool,
+    /// Whether a run waits for a network; absent is the default, false.
+    pub run_only_if_network: bool,
+    /// Whether it may be run when asked; absent is the default, true.
+    pub start_on_demand: bool,
     /// How many actions it has.
     pub actions: usize,
     /// Whether it has a trigger, which would run it without its being asked.
@@ -199,25 +213,40 @@ pub struct RegisteredTask {
 impl RegisteredTask {
     /// Reads a task's exported XML.
     ///
-    /// Only the fields this host decides on are read. An element the export leaves out is read as
-    /// empty, which the checks below treat as the Task Scheduler's default where the default is
-    /// what this host writes and as a difference otherwise.
+    /// Only the fields this host decides on are read, each within the part of the definition it
+    /// belongs to, so a trigger's own `Enabled` is never read as the task's. A setting the export
+    /// leaves out is read as the Task Scheduler's documented default for it.
     #[must_use]
     pub fn parse(xml: &str) -> Self {
+        let principals = element(xml, "Principals").unwrap_or_default();
+        let settings = element(xml, "Settings").unwrap_or_default();
+        let idle = element(settings, "IdleSettings").unwrap_or_default();
+        let actions = element(xml, "Actions").unwrap_or_default();
         Self {
-            user: text(xml, "UserId"),
-            logon: element(xml, "LogonType").and_then(|value| LogonType::parse(value.trim())),
-            description: text(xml, "Description"),
-            command: text(xml, "Command"),
-            arguments: text(xml, "Arguments"),
-            working_directory: text(xml, "WorkingDirectory"),
-            multiple_instances: text(xml, "MultipleInstancesPolicy"),
-            execution_time_limit: text(xml, "ExecutionTimeLimit"),
-            priority: text(xml, "Priority"),
-            enabled: text(xml, "Enabled"),
+            user: text(principals, "UserId"),
+            logon: element(principals, "LogonType")
+                .and_then(|value| LogonType::parse(value.trim())),
+            description: text(
+                element(xml, "RegistrationInfo").unwrap_or_default(),
+                "Description",
+            ),
+            command: text(actions, "Command"),
+            arguments: text(actions, "Arguments"),
+            working_directory: text(actions, "WorkingDirectory"),
+            multiple_instances: text(settings, "MultipleInstancesPolicy"),
+            execution_time_limit: text(settings, "ExecutionTimeLimit"),
+            priority: text(settings, "Priority"),
+            enabled: flag(settings, "Enabled", true),
+            run_level: text(principals, "RunLevel"),
+            disallow_start_on_batteries: flag(settings, "DisallowStartIfOnBatteries", true),
+            stop_going_on_batteries: flag(settings, "StopIfGoingOnBatteries", true),
+            run_only_if_idle: flag(settings, "RunOnlyIfIdle", false),
+            stop_on_idle_end: flag(idle, "StopOnIdleEnd", true),
+            run_only_if_network: flag(settings, "RunOnlyIfNetworkAvailable", false),
+            start_on_demand: flag(settings, "AllowStartOnDemand", true),
             actions: ["Exec", "ComHandler", "SendEmail", "ShowMessage"]
                 .into_iter()
-                .map(|action| count(xml, action))
+                .map(|action| count(actions, action))
                 .sum(),
             triggered: element(xml, "Triggers").is_some_and(|triggers| triggers.contains('<')),
         }
@@ -275,8 +304,40 @@ impl RegisteredTask {
         if self.triggered {
             differences.push("it has a trigger, so it runs without being asked".to_owned());
         }
-        if self.logon.is_none() {
-            differences.push("it logs on in a way this host does not register".to_owned());
+        if self.logon != Some(expected.logon) {
+            differences.push(format!(
+                "it logs on as {}, not {}",
+                self.logon
+                    .map_or("something this host does not register", LogonType::as_str),
+                expected.logon.as_str()
+            ));
+        }
+        let run_level = self.run_level.trim();
+        if !run_level.is_empty() && run_level != "LeastPrivilege" {
+            differences.push(format!(
+                "it runs at {run_level}, not with the least privilege"
+            ));
+        }
+        for (differs, what) in [
+            (
+                self.disallow_start_on_batteries,
+                "it does not start on batteries",
+            ),
+            (
+                self.stop_going_on_batteries,
+                "it stops when the machine goes on batteries",
+            ),
+            (self.run_only_if_idle, "it waits for the machine to be idle"),
+            (
+                self.stop_on_idle_end,
+                "it stops when the machine stops being idle",
+            ),
+            (self.run_only_if_network, "it waits for a network"),
+            (!self.start_on_demand, "it may not be run when asked"),
+        ] {
+            if differs {
+                differences.push(what.to_owned());
+            }
         }
         if self.multiple_instances.trim() != "Parallel" {
             differences.push(format!(
@@ -296,7 +357,7 @@ impl RegisteredTask {
                 self.priority
             ));
         }
-        if self.enabled.trim() == "false" {
+        if !self.enabled {
             differences.push("it is disabled".to_owned());
         }
         differences
@@ -323,6 +384,15 @@ fn escape(text: &str) -> String {
         }
     }
     escaped
+}
+
+/// Reads a boolean element, or `default` when it is absent or not a boolean.
+fn flag(xml: &str, name: &str, default: bool) -> bool {
+    match element(xml, name).map(str::trim) {
+        Some("true") => true,
+        Some("false") => false,
+        _ => default,
+    }
 }
 
 /// Reads the text of the first element named `name`, with its entities resolved, or empty.
@@ -481,16 +551,17 @@ mod platform {
         let output = schtasks_within(&["/Query", "/TN", &definition.name, "/XML"])
             .map_err(|failure| failure.detail())?;
         if !output.status.success() {
+            // Why it could not be read is said in the machine's own language, so it is not read.
+            // The list of every task this user can see says whether the name is held at all.
             let said = decode_output(&output.stderr);
-            // The Task Scheduler's word for a name nothing holds.
-            if said.contains("cannot find") {
+            if !is_listed(&definition.name)? {
                 return Ok(Standing::Absent);
             }
-            return Err(format!(
-                "the Task Scheduler could not say whether {} is registered: {}",
+            return Ok(Standing::Foreign(format!(
+                "a task named {} is registered and this user cannot read it ({})",
                 definition.name,
                 said.trim()
-            ));
+            )));
         }
         let registered = RegisteredTask::parse(&decode_output(&output.stdout));
         let sid_of = |name: &str| kr_ipc::starter::account_sid(name).ok();
@@ -507,6 +578,40 @@ mod platform {
         Ok(Standing::Owned(registered.differences(definition)))
     }
 
+    /// Whether a task named `name` is in the Task Scheduler's root folder, as this user sees it.
+    fn is_listed(name: &str) -> Result<bool, String> {
+        let output = schtasks_within(&["/Query", "/FO", "CSV", "/NH"])
+            .map_err(|failure| failure.detail())?;
+        if !output.status.success() {
+            return Err(format!(
+                "the Task Scheduler could not list its tasks: {}",
+                decode_output(&output.stderr).trim()
+            ));
+        }
+        let wanted = format!("\\{name}");
+        Ok(decode_output(&output.stdout).lines().any(|line| {
+            line.trim_start()
+                .strip_prefix('"')
+                .and_then(|rest| rest.split('"').next())
+                .is_some_and(|listed| listed.eq_ignore_ascii_case(&wanted))
+        }))
+    }
+
+    /// How long a registration waits for another one of the same task to finish.
+    const REGISTRATION_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Holds the one lock every process of this user takes before it changes the task named
+    /// `name`, whichever environment it serves: two environments whose identities share a prefix
+    /// share the name, and a check of the task followed by a change to it holds only while no other
+    /// change of this host's comes between them.
+    fn registration_lock(name: &str) -> Result<kr_ipc::starter::NamedLock, String> {
+        kr_ipc::starter::NamedLock::acquire(
+            &format!("Global\\{name}-registration"),
+            REGISTRATION_BOUND,
+        )
+        .map_err(|error| format!("the registration of {name} could not be locked: {error}"))
+    }
+
     /// Registers `definition`, or brings this environment's own task back to it.
     ///
     /// A task of the same name that is not this environment's is refused and left as it is. The
@@ -519,6 +624,7 @@ mod platform {
     /// Returns what went wrong: a foreign task, a registration the Task Scheduler refused, or a
     /// task that did not read back as the one registered.
     pub fn register(definition: &TaskDefinition) -> Result<(), String> {
+        let _lock = registration_lock(&definition.name)?;
         if let Standing::Foreign(detail) = standing(definition)? {
             return Err(format!("{detail}, so it is left as it is"));
         }
@@ -566,6 +672,7 @@ mod platform {
     ///
     /// Returns what went wrong: a foreign task, or a removal the Task Scheduler refused.
     pub fn remove(definition: &TaskDefinition) -> Result<bool, String> {
+        let _lock = registration_lock(&definition.name)?;
         match standing(definition)? {
             Standing::Absent => return Ok(false),
             Standing::Foreign(detail) => return Err(format!("{detail}, so it is left as it is")),
@@ -734,11 +841,21 @@ mod launching {
         pub fn new(environment: EnvironmentPaths, starter: &Path) -> std::io::Result<Self> {
             let user = starter::current_user_sid()?;
             let expected = TaskDefinition::for_setup(user, &environment, starter);
-            Ok(Self {
+            Ok(Self::for_definition(environment, expected))
+        }
+
+        /// A supervisor for `environment` whose task must be exactly `expected`: a test host that
+        /// registered its task with the logon its session allows expects that one.
+        #[must_use]
+        pub const fn for_definition(
+            environment: EnvironmentPaths,
+            expected: TaskDefinition,
+        ) -> Self {
+            Self {
                 environment,
                 expected,
                 reach_bound: REACH_BOUND,
-            })
+            }
         }
 
         /// Gives a starter `bound`, rather than the usual half minute, to reach a launch once the
@@ -861,6 +978,22 @@ mod launching {
                 session,
             };
             let bytes = match encode(&Answer::Launch(handed)) {
+                // A frame the pipe would refuse to carry is refused here, before anything leaves
+                // this daemon: it is nothing started, not a launch whose answer was lost.
+                Ok(bytes) if bytes.len() > starter::MAX_LAUNCH_FRAME => {
+                    let detail = format!(
+                        "the launch of {} is {} bytes, more than the {} the launch pipe carries",
+                        launch.program.display(),
+                        bytes.len(),
+                        starter::MAX_LAUNCH_FRAME
+                    );
+                    if let Ok(declined) = encode(&Answer::Declined {
+                        reason: detail.clone(),
+                    }) {
+                        let _ = stream.send(&declined, Instant::now() + EXCHANGE_BOUND);
+                    }
+                    return not_started(detail);
+                }
                 Ok(bytes) => bytes,
                 Err(detail) => return not_started(detail),
             };
@@ -1195,11 +1328,7 @@ pub mod testing {
         ///
         /// Returns what went wrong when the account, the session or the registration failed.
         pub fn register(environment: &EnvironmentPaths, starter: &Path) -> Result<Self, String> {
-            let user = kr_ipc::starter::current_user_sid()
-                .map_err(|error| format!("this account: {error}"))?;
-            let logon =
-                logon_for_this_session().map_err(|error| format!("this session: {error}"))?;
-            let definition = TaskDefinition::new(user, environment, starter, logon);
+            let definition = definition(environment, starter)?;
             register(&definition)?;
             Ok(Self { definition })
         }
@@ -1208,6 +1337,12 @@ pub mod testing {
         #[must_use]
         pub const fn definition(&self) -> &TaskDefinition {
             &self.definition
+        }
+
+        /// The supervisor that starts through this task, expecting exactly this definition.
+        #[must_use]
+        pub fn supervisor(&self, environment: &EnvironmentPaths) -> TaskSupervisor {
+            TaskSupervisor::for_definition(environment.clone(), self.definition.clone())
         }
     }
 
@@ -1228,9 +1363,24 @@ pub mod testing {
     ) -> Result<(TestTask, TaskSupervisor), String> {
         let starter = built_binary("kr-controller")?;
         let task = TestTask::register(environment, &starter)?;
-        let supervisor = TaskSupervisor::new(environment.clone(), &starter)
-            .map_err(|error| format!("the supervisor: {error}"))?;
+        let supervisor = task.supervisor(environment);
         Ok((task, supervisor))
+    }
+
+    /// The definition a test host registers for `environment`, running `starter`, with the logon
+    /// this host allows.
+    ///
+    /// # Errors
+    ///
+    /// Returns what went wrong when the account or the session could not be read.
+    pub fn definition(
+        environment: &EnvironmentPaths,
+        starter: &Path,
+    ) -> Result<TaskDefinition, String> {
+        let user = kr_ipc::starter::current_user_sid()
+            .map_err(|error| format!("this account: {error}"))?;
+        let logon = logon_for_this_session().map_err(|error| format!("this session: {error}"))?;
+        Ok(TaskDefinition::new(user, environment, starter, logon))
     }
 }
 
@@ -1342,6 +1492,8 @@ mod tests {
              \x20 <Principals>\r\n    <Principal id=\"Author\">\r\n      <UserId>HOST\\me</UserId>\r\n\
              \x20     <LogonType>S4U</LogonType>\r\n    </Principal>\r\n  </Principals>\r\n\
              \x20 <Settings>\r\n    <MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy>\r\n\
+             \x20   <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\r\n\
+             \x20   <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\r\n\
              \x20   <Priority>5</Priority>\r\n    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\r\n\
              \x20   <IdleSettings>\r\n      <StopOnIdleEnd>false</StopOnIdleEnd>\r\n    </IdleSettings>\r\n  </Settings>\r\n\
              \x20 <Triggers />\r\n\
@@ -1393,8 +1545,11 @@ mod tests {
     }
 
     /// Every way a registered task can differ from the one this build registers is named: its
-    /// program, what it gives it, the directory, a second action, a trigger, a logon this host
-    /// does not register, and each setting the starter depends on.
+    /// program, what it gives it, the directory, a second action, a trigger, a logon other than the
+    /// one expected, a privilege above the least, and each setting a run of the starter depends on:
+    /// batteries, idleness, a network, being run when asked, parallel runs, the time limit, the
+    /// priority and being enabled. A battery setting left out is the Task Scheduler's default,
+    /// which is not this build's.
     #[test]
     fn every_way_a_task_can_differ_from_this_builds_is_named() {
         let host = TempHost::create();
@@ -1424,6 +1579,33 @@ mod tests {
                 "<LogonType>InteractiveToken</LogonType>",
                 "<LogonType>Password</LogonType>",
             ),
+            changed(
+                "<LogonType>InteractiveToken</LogonType>",
+                "<LogonType>S4U</LogonType>",
+            ),
+            changed(
+                "<RunLevel>LeastPrivilege</RunLevel>",
+                "<RunLevel>HighestAvailable</RunLevel>",
+            ),
+            changed(
+                "<DisallowStartIfOnBatteries>false",
+                "<DisallowStartIfOnBatteries>true",
+            ),
+            changed(
+                "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>",
+                "",
+            ),
+            changed(
+                "<StopIfGoingOnBatteries>false",
+                "<StopIfGoingOnBatteries>true",
+            ),
+            changed("<RunOnlyIfIdle>false", "<RunOnlyIfIdle>true"),
+            changed("<StopOnIdleEnd>false", "<StopOnIdleEnd>true"),
+            changed(
+                "<RunOnlyIfNetworkAvailable>false",
+                "<RunOnlyIfNetworkAvailable>true",
+            ),
+            changed("<AllowStartOnDemand>true", "<AllowStartOnDemand>false"),
             changed(
                 "<MultipleInstancesPolicy>Parallel",
                 "<MultipleInstancesPolicy>IgnoreNew",
