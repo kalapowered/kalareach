@@ -206,8 +206,9 @@ impl NetworkGuard {
 
     /// Returns the configuration a pairing invitation carries, with this endpoint's current hints.
     ///
-    /// The selected services are this host's own configuration; the direct addresses are hints
-    /// taken as they stand now, because that is all a hint ever is.
+    /// The selected services are this host's own configuration. The direct addresses are the ones
+    /// this endpoint reports for itself now ([`Self::direct_addresses`]), taken as they stand,
+    /// because that is all a hint ever is.
     ///
     /// # Errors
     ///
@@ -219,12 +220,30 @@ impl NetworkGuard {
             .to_network_config()
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         config.direct_addresses = self
-            .bound_sockets()
+            .direct_addresses()
             .into_iter()
             .filter_map(|socket| kr_protocol::pairing::NetworkHint::new(socket.to_string()).ok())
             .take(kr_protocol::pairing::MAX_NETWORK_HINTS)
             .collect();
         Ok(config)
+    }
+
+    /// Returns the direct addresses this endpoint reports for itself, which are where a peer dials
+    /// it.
+    ///
+    /// They are not the sockets it bound. A socket bound to the unspecified address answers on the
+    /// machine's own addresses, so the endpoint names those, on the port it bound, and never the
+    /// unspecified address itself: `0.0.0.0` and `[::]` name no machine a peer could reach. The
+    /// endpoint finds its interface addresses when it binds, before it accepts anything, and adds
+    /// an address a relay observed or a gateway mapped once it learns one. An endpoint with no IP
+    /// transport, one that only relays, has none.
+    pub(crate) fn direct_addresses(&self) -> Vec<std::net::SocketAddr> {
+        self.listener
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|listener| listener.endpoint().addr().ip_addrs().copied().collect())
+            .unwrap_or_default()
     }
 
     /// Returns the configuration this host's endpoint was built from: its relay map and the
@@ -233,7 +252,10 @@ impl NetworkGuard {
         &self.host.endpoint
     }
 
-    /// Returns the addresses this endpoint is bound to, which are the hints a peer dials.
+    /// Returns the sockets this endpoint is bound to, one per IP transport.
+    ///
+    /// A peer dials [`Self::direct_addresses`] instead: a socket bound to the unspecified address
+    /// is not an address anyone can reach.
     pub(crate) fn bound_sockets(&self) -> Vec<std::net::SocketAddr> {
         self.listener
             .lock()
@@ -292,8 +314,9 @@ impl Network {
 
     /// Returns the configuration a pairing invitation carries, with this endpoint's current hints.
     ///
-    /// The selected services are this host's own configuration; the direct addresses are hints
-    /// taken as they stand now, because that is all a hint ever is.
+    /// The selected services are this host's own configuration. The direct addresses are the ones
+    /// this endpoint reports for itself now ([`Self::direct_addresses`]), taken as they stand,
+    /// because that is all a hint ever is.
     ///
     /// # Errors
     ///
@@ -302,7 +325,17 @@ impl Network {
         self.guard.network_config()
     }
 
-    /// Returns the addresses this endpoint is bound to, which are the hints a peer dials.
+    /// Returns the direct addresses this endpoint reports for itself, which are where a peer dials
+    /// it and what a pairing invitation hints.
+    ///
+    /// They are not the sockets it bound: a socket bound to the unspecified address answers on the
+    /// machine's own addresses, and the endpoint names those rather than the unspecified address.
+    #[must_use]
+    pub fn direct_addresses(&self) -> Vec<std::net::SocketAddr> {
+        self.guard.direct_addresses()
+    }
+
+    /// Returns the sockets this endpoint is bound to, one per IP transport.
     #[must_use]
     pub fn bound_sockets(&self) -> Vec<std::net::SocketAddr> {
         self.guard.bound_sockets()

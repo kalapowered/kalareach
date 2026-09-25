@@ -74,6 +74,16 @@ into the address that is dialled; nothing in the configuration advertises them a
 own. Cached hints are not permanent routes either: after a failure or a network change, resolve the
 pinned endpoint identity again rather than reusing an address that worked before.
 
+The host fills an invitation's `direct_addresses` from the addresses its endpoint reports for itself
+(`Endpoint::addr`), never from the sockets it bound. A socket bound to the unspecified address
+answers on the machine's own addresses, so a host with no `bind_addr` hints its interface addresses
+on the bound port; a host bound to one address hints that address; an address a relay observed or a
+gateway mapped is added once the endpoint learns it. `0.0.0.0` and `[::]` never appear, because
+they name no machine a peer could reach. The endpoint finds its interface addresses when it binds,
+before the host can issue anything. An invitation therefore hints no direct address only when the
+host is relay-only, or when no interface is up, loopback included; a device then has only the
+selected relay and discovery to reach it by.
+
 The publication filter applies to the publisher, not to the endpoint. An endpoint-wide filter would
 also strip the direct addresses that local network discovery exists to advertise, so the public
 record stays relay-only while a selected mDNS service publishes what a local network needs.

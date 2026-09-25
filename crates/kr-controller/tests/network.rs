@@ -1178,12 +1178,49 @@ fn host_paired_record(daemon: &RunningDaemon) -> PairedPeer {
     }
 }
 
+/// Returns the direct-address hints a direct invitation carries, as the addresses a device dials.
+fn hinted_addresses(payload: &kr_protocol::pairing::DirectQrPayload) -> Vec<std::net::SocketAddr> {
+    payload
+        .network_config
+        .direct_addresses
+        .iter()
+        .map(|hint| {
+            hint.as_str()
+                .parse()
+                .expect("every direct-address hint is a socket address")
+        })
+        .collect()
+}
+
+/// Says why `hints` are not where a device can dial this host, or nothing when they are.
+///
+/// They are when there is at least one, none is an unspecified address, and each is an address
+/// the host's endpoint reports for itself (`own`). An unspecified address names no machine: a
+/// device that dialled `0.0.0.0` or `[::]` would reach only itself.
+fn undialable(
+    hints: &[std::net::SocketAddr],
+    own: &BTreeSet<std::net::SocketAddr>,
+) -> Option<String> {
+    if hints.is_empty() {
+        return Some("no direct address is hinted".to_owned());
+    }
+    if let Some(unspecified) = hints.iter().find(|hint| hint.ip().is_unspecified()) {
+        return Some(format!("{unspecified} names no machine"));
+    }
+    hints
+        .iter()
+        .find(|hint| !own.contains(*hint))
+        .map(|foreign| {
+            format!("{foreign} is not an address the host's endpoint reports for itself: {own:?}")
+        })
+}
+
 // Ignored by default like the rest of this suite: the host fixture needs the worker binary that
 // `scripts/end-to-end.sh` builds, and that script runs the suite with `--include-ignored`.
 /// KR-REQ-17.45: a host's current direct addresses reach a device through the pairing exchange
 /// rather than through any lookup. Neither the host nor the device selects a relay or a discovery
-/// service. The invitation the host issues carries exactly the addresses its endpoint is bound to
-/// now, and a device that knows nothing but the invitation dials the host there and pairs.
+/// service. The invitation the host issues carries exactly the addresses its endpoint reports for
+/// itself now, and a device that knows nothing but the invitation dials the host there and pairs.
 #[ignore = "starts a control daemon; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_pairing_invitation_carries_the_hosts_current_direct_addresses() {
@@ -1197,22 +1234,18 @@ async fn a_pairing_invitation_carries_the_hosts_current_direct_addresses() {
     let mut client = daemon.client().await;
     let invited = invite(&daemon, &mut client, &owner, &proposed).await;
     let payload = pairing_calls::direct_payload(&invited);
-    let bound: BTreeSet<String> = daemon
-        .network
-        .bound_sockets()
-        .iter()
-        .map(ToString::to_string)
-        .collect();
-    assert!(!bound.is_empty(), "the host is bound to direct addresses");
-    let hinted: BTreeSet<String> = payload
-        .network_config
-        .direct_addresses
-        .iter()
-        .map(|hint| hint.as_str().to_owned())
-        .collect();
+    let own: BTreeSet<std::net::SocketAddr> =
+        daemon.network.direct_addresses().into_iter().collect();
+    assert!(
+        !own.is_empty(),
+        "the host's endpoint reports direct addresses"
+    );
+    let hinted = hinted_addresses(&payload);
+    assert_eq!(undialable(&hinted, &own), None, "the hints are dialable");
     assert_eq!(
-        hinted, bound,
-        "the invitation carries the addresses the host is bound to now"
+        hinted.iter().copied().collect::<BTreeSet<_>>(),
+        own,
+        "the invitation carries the addresses the host's endpoint reports for itself now"
     );
     let selected = &payload.network_config;
     assert!(
@@ -1226,6 +1259,65 @@ async fn a_pairing_invitation_carries_the_hosts_current_direct_addresses() {
     // The device dials the host at the invitation's hints and nowhere else, and the pairing
     // completes over that path.
     let device = Device::create(&loopback()).await;
+    let record = redeem(&daemon, &mut client, &device, &owner, &invited).await;
+    assert!(
+        daemon
+            .network
+            .devices()
+            .record_for_device(record.device_id)
+            .expect("reads the device records")
+            .is_some(),
+        "the host recorded the device it paired with"
+    );
+
+    daemon.stop().await;
+}
+
+// Not built for macOS. The host here listens on every interface, and the devices dial it at the
+// machine's own network addresses. macOS asks the person at the machine before a program first
+// sends to its local network, unless it runs from Terminal, over SSH, as root or as a launchd
+// daemon, and its firewall can ask about a program that accepts connections on every interface.
+// A test never asks anyone for a permission; the loopback test above covers the hints there.
+/// KR-REQ-17.45: a host that names no bind address listens on every interface, and the invitation
+/// it issues hints the addresses its endpoint found there, never the unspecified addresses it is
+/// bound to. `0.0.0.0` and `[::]` name no machine, so a device that scanned them would have no
+/// direct path to the host, which is the path a direct invitation exists to offer.
+#[cfg(not(target_os = "macos"))]
+#[ignore = "starts a control daemon; run through scripts/end-to-end.sh"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_on_every_interface_hints_the_addresses_it_found_there() {
+    let Some(host) = Host::create() else {
+        return;
+    };
+    let everywhere = EndpointConfig::default();
+    assert_eq!(everywhere.bind_addr, None, "the host names no bind address");
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let daemon = host.start(everywhere.clone(), &owner).await;
+    let bound = daemon.network.bound_sockets();
+    assert!(
+        !bound.is_empty() && bound.iter().all(|socket| socket.ip().is_unspecified()),
+        "the host is bound to the unspecified addresses: {bound:?}"
+    );
+
+    let proposed = proposal();
+    let mut client = daemon.client().await;
+    let invited = invite(&daemon, &mut client, &owner, &proposed).await;
+    let payload = pairing_calls::direct_payload(&invited);
+    let own: BTreeSet<std::net::SocketAddr> =
+        daemon.network.direct_addresses().into_iter().collect();
+    let hinted = hinted_addresses(&payload);
+    if let Some(why) = undialable(&hinted, &own) {
+        panic!("the invitation hints {hinted:?}, and {why}");
+    }
+    // The control: the check refuses the list a host bound like this one hinted before, its bound
+    // sockets, so what passed above is the hints themselves.
+    assert!(
+        undialable(&bound, &own).is_some(),
+        "the check refuses the unspecified addresses the host is bound to"
+    );
+
+    // And a device that knows nothing but the invitation dials the host at those hints and pairs.
+    let device = Device::create(&everywhere).await;
     let record = redeem(&daemon, &mut client, &device, &owner, &invited).await;
     assert!(
         daemon
