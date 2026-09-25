@@ -5,8 +5,8 @@
 //! * `passed` or `failed`, from a step that ran it;
 //! * `ignored`, with the reason its attribute gives, when every step that listed it left it out;
 //! * `not_run`, with the reason, when no step of this run ran it here: a step left it out by name,
-//!   no selected group runs its target on this platform, its lane is another toolchain's, a step
-//!   that would run it failed before it did, or it returned early and said why;
+//!   no selected group runs its target on this platform, its lane is another toolchain's, the step
+//!   that built it failed before a run of it could be read, or it returned early and said why;
 //! * `not_built`, when a step ran its target and this platform's build of it has no such test.
 //!
 //! An identifier has failed when any of its tests failed, has passed when at least one ran and
@@ -970,7 +970,7 @@ impl<'a> Resolver<'a> {
             .find(|step| step.error.is_some() && step.built.contains(target))
         {
             return format!(
-                "`{}` built this target and did not run it ({})",
+                "`{}` built this target, and no run of it can be read from that step ({})",
                 stopped.step.line(),
                 stopped.error.clone().unwrap_or_default()
             );
