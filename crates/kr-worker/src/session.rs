@@ -3211,7 +3211,7 @@ impl Session {
     }
 
     /// Records a read of the terminal's foreground, for this host's own tests.
-    #[cfg(feature = "testing")]
+    #[cfg(all(unix, feature = "testing"))]
     fn note_foreground_read(&self) {
         self.foreground_reads
             .lock()
