@@ -20,6 +20,7 @@ use std::time::Duration;
 use iroh::{Endpoint, EndpointAddr};
 use kr_client::session::Session;
 use kr_client::transport::NetworkTransport;
+use kr_controller::service::net::config::NetworkSettings;
 use kr_controller::service::net::devices::DeviceRecord;
 use kr_controller::service::net::{self, Network, NetworkSetup};
 use kr_controller::service::{Controller, ControllerSetup};
@@ -91,8 +92,8 @@ pub struct Host {
     pub owner_device: Option<Device>,
     /// The rendezvous service this host offers codes through, in this process.
     pub room: room::TestRoom,
-    /// The network configuration the host was started with, which a restart keeps.
-    endpoint_config: EndpointConfig,
+    /// The network settings the host was started with, which a restart keeps.
+    settings: NetworkSettings,
 }
 
 impl Host {
@@ -113,7 +114,10 @@ impl Host {
         Self::start_on(
             kr_ipc::testing::TempHost::create(),
             room::TestRoom::new(),
-            loopback(),
+            NetworkSettings {
+                endpoint: loopback(),
+                ..NetworkSettings::default()
+            },
         )
         .await
     }
@@ -121,10 +125,22 @@ impl Host {
     /// Starts a daemon whose network selects the services `endpoint` names, with `owner` as its
     /// first owner.
     pub async fn start_with_endpoint(owner: &DeviceKeys, endpoint: EndpointConfig) -> Self {
+        Self::start_with_settings(
+            owner,
+            NetworkSettings {
+                endpoint,
+                ..NetworkSettings::default()
+            },
+        )
+        .await
+    }
+
+    /// Starts a daemon whose network is built from `settings`, with `owner` as its first owner.
+    pub async fn start_with_settings(owner: &DeviceKeys, settings: NetworkSettings) -> Self {
         let mut host = Self::start_on(
             kr_ipc::testing::TempHost::create(),
             room::TestRoom::new(),
-            endpoint,
+            settings,
         )
         .await;
         let (device, record) = bootstrap_owner(&host, owner).await;
@@ -136,6 +152,12 @@ impl Host {
     /// Stops this daemon and starts another on the same environment tree, the way a restart of
     /// the host does: every durable record stays, and nothing held in memory does.
     pub async fn restart(self) -> Self {
+        let settings = self.settings.clone();
+        self.restart_with(settings).await
+    }
+
+    /// Restarts this daemon as [`Self::restart`] does, with its network built from `settings`.
+    pub async fn restart_with(self, settings: NetworkSettings) -> Self {
         let Self {
             temp,
             controller,
@@ -143,7 +165,6 @@ impl Host {
             clients,
             owner,
             room,
-            endpoint_config,
             ..
         } = self;
         clients.abort();
@@ -161,17 +182,17 @@ impl Host {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         drop(controller);
-        let mut host = Self::start_on(temp, room, endpoint_config).await;
+        let mut host = Self::start_on(temp, room, settings).await;
         host.owner = owner;
         host
     }
 
     /// Starts a daemon on the network over an environment tree that may already hold records,
-    /// offering codes through `room`, with `endpoint` as its network configuration.
+    /// offering codes through `room`, with its network built from `settings`.
     async fn start_on(
         temp: kr_ipc::testing::TempHost,
         room: room::TestRoom,
-        network_endpoint: EndpointConfig,
+        settings: NetworkSettings,
     ) -> Self {
         let environment = temp.environment();
         let environment_id = temp.environment_id();
@@ -206,10 +227,7 @@ impl Host {
         let network = net::register(
             &controller,
             NetworkSetup {
-                settings: kr_controller::service::net::config::NetworkSettings {
-                    endpoint: network_endpoint.clone(),
-                    ..kr_controller::service::net::config::NetworkSettings::default()
-                },
+                settings: settings.clone(),
                 secrets: Arc::new(MemoryStore::new()),
                 rendezvous: Some(Arc::new(room.clone())),
             },
@@ -227,7 +245,7 @@ impl Host {
             owner: None,
             owner_device: None,
             room,
-            endpoint_config: network_endpoint,
+            settings,
         }
     }
 

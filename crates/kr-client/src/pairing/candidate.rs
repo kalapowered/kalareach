@@ -88,6 +88,10 @@ pub const STATUS_INTERVAL: Duration = Duration::from_secs(3);
 /// however long the network took, and that is never the same twice.
 const WINDOW_MARGIN: Duration = Duration::from_secs(1);
 
+/// How many times a device doubles its wait after refusals in a row, as a host that counts the
+/// questions it refuses turns away one asked again before its own window has passed.
+const MOST_DOUBLINGS: u32 = 3;
+
 /// How long a device waits before dialling a host again, in turn, and then every time after the
 /// last.
 pub const RECONNECT_DELAYS: [Duration; 4] = [
@@ -737,6 +741,7 @@ impl Pairing {
         // The budget every host serves an unpaired connection by, unless it was built otherwise.
         let limits = PreAuthLimits::default();
         let mut reconnects = 0_usize;
+        let mut refused = 0_u32;
         loop {
             // The attempt's own deadline holds on every pass, whatever the host last said: a host
             // that keeps answering that the owner has not decided does not hold the device past
@@ -794,6 +799,7 @@ impl Pairing {
             match asked {
                 Ok(answer) => {
                     reconnects = 0;
+                    refused = 0;
                     match self.answered(&mut pending, answer, progress)? {
                         Some((device_id, grant_id)) => {
                             let _ = held.take();
@@ -805,11 +811,16 @@ impl Pairing {
                     }
                 }
                 // A host whose window is fuller than this device counted says so and keeps the
-                // connection: that is no answer about the attempt, so the device waits the window
-                // out and asks again. A host that ended the connection with it is found out by the
-                // next question, as a connection lost.
+                // connection: that is no answer about the attempt, so the device waits and asks
+                // again. The host counts the questions it refuses too, and its window may be longer
+                // than the one this device paces by, so each refusal in a row doubles the wait. A
+                // host that ended the connection with it is found out by the next question, as a
+                // connection lost.
                 Err(LinkError::Refused(refusal)) if refusal.code == ErrorCode::RateLimited => {
-                    tokio::time::sleep(limits.window.min(self.left(&pending))).await;
+                    let wait = (limits.window + WINDOW_MARGIN)
+                        .saturating_mul(1 << refused.min(MOST_DOUBLINGS));
+                    refused += 1;
+                    tokio::time::sleep(wait.min(self.left(&pending))).await;
                 }
                 Err(LinkError::Refused(refusal)) => {
                     let _ = self.hosts.clear_attempt();

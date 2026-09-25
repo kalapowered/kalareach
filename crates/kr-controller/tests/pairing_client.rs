@@ -33,6 +33,7 @@ use kr_client::pairing::owner::{
 use kr_client::pairing::paired::{AttemptMode, PairedHost, PairedHosts};
 use kr_client::pairing::room::{RoomError, RoomSocket};
 use kr_client::session::Session;
+use kr_controller::service::net::config::NetworkSettings;
 use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::MemoryStore;
 use kr_ipc::client::LocalClient;
@@ -64,6 +65,7 @@ use kr_protocol::rendezvous::{ClientFrame, ServiceFrame, decode_message, encode_
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{CanonicalSet, Digest256, EndpointKey, Nullable, SecretBytes32};
 use kr_transport::handshake::LocalIdentity;
+use kr_transport::preauth::PreAuthLimits;
 use net_support::pairing::{self as calls, Signer};
 use net_support::{Host, proposal};
 use tokio::sync::{mpsc, watch};
@@ -1585,6 +1587,47 @@ async fn a_device_waits_inside_the_hosts_request_budget_for_an_owner_who_takes_t
         made(&link).opened.load(Ordering::SeqCst) >= 2,
         "the device moved to a fresh connection before the first had no questions left"
     );
+}
+
+/// KR-REQ-10.23: a host may serve an unpaired connection by other limits than the ones a device
+/// paces itself by. This one answers one request in any twenty seconds, and counts the ones it
+/// refuses too, so a device that asked again every ten seconds would keep that window full and
+/// never hear an answer. The device waits longer after each refusal in a row, and pairs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_waits_longer_for_a_host_whose_window_is_longer() {
+    let owner_keys = keys();
+    // The owner pairs under the limits every host serves, and the host then starts again under
+    // the longer window.
+    let host = Host::start(&owner_keys)
+        .await
+        .restart_with(NetworkSettings {
+            endpoint: net_support::loopback(),
+            preauth_limits: PreAuthLimits {
+                max_requests_per_window: 1,
+                window: Duration::from_secs(20),
+                ..PreAuthLimits::default()
+            },
+            ..NetworkSettings::default()
+        })
+        .await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let invited = invite_code(environment, &mut client, &viewer(), None, &owner).await;
+    let (origin, code, _) = code_of(&invited);
+
+    let device = ProductDevice::new(Arc::new(host.room.clone()), |link| Arc::new(link));
+    let (attempt, mut shown) = device.enter(&origin, &code);
+    awaiting_value(&mut shown).await;
+    calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
+        .await
+        .expect("the owner approves");
+    let paired = tokio::time::timeout(Duration::from_secs(120), attempt)
+        .await
+        .expect("the device hears the host's answer")
+        .expect("the attempt ran")
+        .expect("paired");
+    assert_eq!(paired.host_endpoint_id, host.network().endpoint_id());
 }
 
 /// KR-REQ-10.36, KR-REQ-10.23: the owner approves just as the device changes to a fresh connection,
