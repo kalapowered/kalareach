@@ -483,6 +483,17 @@ impl Attribute {
 
     /// The value of `#[name = "value"]`.
     fn value(&self, name: &str) -> Option<String> {
+        self.literal(name).map(|(value, _)| value)
+    }
+
+    /// The value of `#[name = "value"]` where it is written with no escape and no line
+    /// continuation, which the reading decodes exactly as the compiler does.
+    fn plain_value(&self, name: &str) -> Option<String> {
+        self.literal(name)
+            .and_then(|(value, escaped)| (!escaped).then_some(value))
+    }
+
+    fn literal(&self, name: &str) -> Option<(String, bool)> {
         if self.path != [name] {
             return None;
         }
@@ -490,10 +501,10 @@ impl Attribute {
             [
                 eq,
                 Token {
-                    tok: Tok::Str(value),
+                    tok: Tok::Str(value, escaped),
                     ..
                 },
-            ] if eq.is_punct('=') => Some(value.clone()),
+            ] if eq.is_punct('=') => Some((value.clone(), *escaped)),
             _ => None,
         }
     }
@@ -644,18 +655,27 @@ fn parse_module(
                     }
                     _ => Vec::new(),
                 };
-                let explicit = attributes
-                    .iter()
-                    .chain(&inner)
-                    .find_map(|a| a.value("path"));
-                if attributes
-                    .iter()
-                    .chain(&inner)
-                    .any(Attribute::may_set_a_path)
-                    && matches!(
-                        entry,
-                        Classified::InlineModule { .. } | Classified::ModuleFile { .. }
-                    )
+                let module_entry = matches!(
+                    entry,
+                    Classified::InlineModule { .. } | Classified::ModuleFile { .. }
+                );
+                // The first `path` attribute is the compiler's; one whose value is written with an
+                // escape is not followed, since the reading may decode it otherwise.
+                let path_attribute = attributes.iter().chain(&inner).find(|a| a.path == ["path"]);
+                let explicit = path_attribute.and_then(|a| a.plain_value("path"));
+                let unreadable = path_attribute.is_some() && explicit.is_none();
+                if module_entry && unreadable {
+                    children.push(Parsed::Warning(Warning {
+                        file: context.relative.clone(),
+                        line: token.line,
+                        what: "a `path` attribute whose value is written with an escape or is no plain string, which the reading does not decode as the compiler may".to_owned(),
+                    }));
+                }
+                if module_entry
+                    && attributes
+                        .iter()
+                        .chain(&inner)
+                        .any(Attribute::may_set_a_path)
                 {
                     children.push(Parsed::Warning(Warning {
                         file: context.relative.clone(),
@@ -694,15 +714,18 @@ fn parse_module(
                                 directory.join(&name).join("mod.rs"),
                             ]
                         };
-                        children.push(Parsed::Declaration(Declaration {
-                            path: child_path,
-                            line: token.line,
-                            candidates,
-                            pathed: explicit.is_some(),
-                            test_code: test_code || cfg_test,
-                            rewritable: rewrites,
-                            conditional: absent,
-                        }));
+                        // A file the reading cannot name is not read; the warning says so.
+                        if !unreadable {
+                            children.push(Parsed::Declaration(Declaration {
+                                path: child_path,
+                                line: token.line,
+                                candidates,
+                                pathed: explicit.is_some(),
+                                test_code: test_code || cfg_test,
+                                rewritable: rewrites,
+                                conditional: absent,
+                            }));
+                        }
                     }
                 }
                 pending.clear();
@@ -873,7 +896,7 @@ fn item_keyword(tokens: &[Token], start: usize) -> Option<&str> {
             }
             Some("extern") if following_name != Some("crate") => {
                 at = following?;
-                if matches!(tokens[at].tok, Tok::Str(_)) {
+                if matches!(tokens[at].tok, Tok::Str(..)) {
                     at = next(at + 1)?;
                 }
             }
@@ -897,7 +920,7 @@ fn head(tokens: &[Token]) -> usize {
             Some("const") if matches!(next, Some("fn" | "unsafe" | "async" | "extern")) => at += 1,
             Some("extern") if next != Some("crate") => {
                 at += 1;
-                if matches!(tokens.get(at).map(|t| &t.tok), Some(Tok::Str(_))) {
+                if matches!(tokens.get(at).map(|t| &t.tok), Some(Tok::Str(..))) {
                     at += 1;
                 }
             }
@@ -1503,7 +1526,7 @@ fn covers(tokens: &[Token]) -> Vec<Covers> {
                         }
                     }
                     Tok::Punct(',') if depth == 0 => break,
-                    Tok::Str(value) => strings.push(value.clone()),
+                    Tok::Str(value, _) => strings.push(value.clone()),
                     _ => {}
                 }
                 end += 1;
@@ -1564,11 +1587,25 @@ pub fn breaches(
     file: &str,
     helpers: &BTreeSet<String>,
 ) -> Result<Vec<Breach>, ScanError> {
-    let tokens = sources.tokens(&root.join(file)).map_err(|what| ScanError {
+    let path = root.join(file);
+    let tokens = sources.tokens(&path).map_err(|what| ScanError {
         file: file.to_owned(),
         what,
     })?;
-    Ok(conventions(tokens, helpers)
+    let mut found = conventions(tokens, helpers);
+    // A first line that starts `#!` is a shebang or an inner attribute by rules on whitespace and
+    // comments that the reading need not follow where it is written `#![` at once.
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    if text.starts_with("#!") && !text[2..].starts_with('[') {
+        found.insert(
+            0,
+            (
+                1,
+                "a first line that starts `#!` without `[` right after it, which the compiler reads as a shebang or as an attribute by rules the reading does not follow".to_owned(),
+            ),
+        );
+    }
+    Ok(found
         .into_iter()
         .map(|(line, what)| Breach {
             file: file.to_owned(),
@@ -1681,7 +1718,8 @@ fn levels(tokens: &[Token]) -> Levels {
 }
 
 /// Where each `enum`'s body opens: after `enum` and its name, the first `{` outside every group and
-/// every angle bracket of its generics and `where` clause (a `>` after `-` is an arrow's).
+/// every angle bracket of its generics and `where` clause (a `>` after `-` is an arrow's, and a `{`
+/// after `!` opens a macro's arguments).
 fn enum_bodies(tokens: &[Token]) -> BTreeSet<usize> {
     let mut found = BTreeSet::new();
     for (index, token) in tokens.iter().enumerate() {
@@ -1692,7 +1730,8 @@ fn enum_bodies(tokens: &[Token]) -> BTreeSet<usize> {
         let mut angles = 0_usize;
         for at in index + 2..tokens.len() {
             match tokens[at].tok {
-                Tok::Punct('{') if groups == 0 && angles == 0 => {
+                // A macro's braces in the header (`ty!{}`) are a group, not the body.
+                Tok::Punct('{') if groups == 0 && angles == 0 && !tokens[at - 1].is_punct('!') => {
                     found.insert(at);
                     break;
                 }
@@ -1951,7 +1990,19 @@ fn trusted_declaration(
     }
     // Any other name in a `use` declaration, a segment of a path included (`use a::core::{self}`),
     // is held to what the declaration brings in by that name.
-    let declaration = declaration?;
+    let Some(declaration) = declaration else {
+        // A crate root is written only as a path's first name, a method or field, the crate an
+        // `extern crate` of its own name brings in, or an attribute's path; anywhere else it may
+        // be a binding, a type or a generic parameter, which a path starting at it would find.
+        let path = around.punct_after(1, ':') && around.punct_after(2, ':');
+        let method = around.punct_before(1, '.') && !around.punct_before(2, '.');
+        let extern_crate =
+            around.word_before(1) == Some("crate") && around.word_before(2) == Some("extern");
+        let attribute = around.punct_before(1, '[')
+            && (around.punct_before(2, '#') || around.punct_before(2, '!'));
+        return (root && !path && !method && !extern_crate && !attribute)
+            .then_some("a name a path starting at it may find instead of the crate");
+    };
     if around.word_after(1) == Some("as") {
         return None;
     }
@@ -2364,6 +2415,7 @@ mod tests {
             "fn t() { enum E<T = [u8; 1]> { shared(), Other(T) } }",
             "enum E<const N: usize = { 1 }> { shared() }",
             "enum E<F> where F: Fn() -> u8 { shared(F) }",
+            "fn t() { enum E where ty!{}: Sized { shared() } }",
         ] {
             let found = breached(text);
             assert!(!found.is_empty(), "{text}");
@@ -2426,6 +2478,12 @@ mod tests {
             ("use x as rustfmt;", "rustfmt"),
             ("use foo::derive;", "derive"),
             ("use serde_derive::Serialize;", "Serialize"),
+            // A crate root written anywhere but at the start of a path, as a generic parameter, a
+            // binding or a field, may be what a path starting at it finds.
+            ("fn other<core>() {}", "core"),
+            ("fn t() { let tokio = 1; }", "tokio"),
+            ("fn t(std: u8) {}", "std"),
+            ("struct S { alloc: u8 }", "alloc"),
             // A definition written as text is one all the same: the check reads tokens.
             (
                 "const _: &str = stringify!(macro_rules! line { () => {} });",
@@ -2457,6 +2515,9 @@ mod tests {
             "#[tokio::test] async fn t() {}",
             "#[rustfmt::skip] fn t() {}",
             "fn t() { let _ = stringify!(use external::*;); }",
+            "#[derive(serde::Serialize)]\n#[serde(rename_all = \"camelCase\")]\nstruct S;",
+            "#[tokio::test]\nasync fn t() { tokio::spawn(async {}); std::mem::drop(1); }",
+            "fn t() { let _ = value.alloc(); let _ = ::core::mem::size_of::<u8>(); }",
         ] {
             assert_eq!(breached(text), [], "{text}");
         }
