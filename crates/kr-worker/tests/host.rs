@@ -10,7 +10,7 @@
 //! inherit this process's. A process a service manager launches is its own identity to the
 //! operating system, and one that reaches a removable volume asks the person sitting at the
 //! machine for permission; a test suite must never do that, so every create checks what the
-//! kernel actually gave the process it started.
+//! kernel actually gave the process it started, where the platform can be asked for it.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -485,17 +485,16 @@ async fn create(client: &mut LocalClient, host: &Host) -> SessionCreateResult {
 ///
 /// Read from the process table rather than from anything this test arranged: what is being checked
 /// is what the process actually got, and a launch that quietly inherited a directory looks exactly
-/// like one that was given the right one until the kernel is asked. `None` means this platform has
-/// no way to ask, which fails the check that needs the answer; a platform that has one and refuses
-/// to answer fails here.
-fn working_directory_of(pid: u32) -> Option<PathBuf> {
+/// like one that was given the right one until the kernel is asked. Linux and macOS answer that
+/// for another process, and a refusal to answer fails here. Windows has no supported query for
+/// another process's working directory, so this is not built there.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn working_directory_of(pid: u32) -> PathBuf {
     #[cfg(target_os = "linux")]
     {
-        Some(
-            std::fs::read_link(format!("/proc/{pid}/cwd")).unwrap_or_else(|error| {
-                panic!("the working directory of process {pid} could not be read: {error}")
-            }),
-        )
+        std::fs::read_link(format!("/proc/{pid}/cwd")).unwrap_or_else(|error| {
+            panic!("the working directory of process {pid} could not be read: {error}")
+        })
     }
     #[cfg(target_os = "macos")]
     {
@@ -503,19 +502,12 @@ fn working_directory_of(pid: u32) -> Option<PathBuf> {
             .args(["-a", "-d", "cwd", "-p", &pid.to_string(), "-Fn"])
             .output()
             .unwrap_or_else(|error| panic!("the process table could not be read: {error}"));
-        Some(
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .find_map(|line| line.strip_prefix('n').map(PathBuf::from))
-                .unwrap_or_else(|| {
-                    panic!("the process table named no working directory for process {pid}")
-                }),
-        )
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = pid;
-        None
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|line| line.strip_prefix('n').map(PathBuf::from))
+            .unwrap_or_else(|| {
+                panic!("the process table named no working directory for process {pid}")
+            })
     }
 }
 
@@ -526,6 +518,10 @@ fn working_directory_of(pid: u32) -> Option<PathBuf> {
 /// on this machine that is a build tree on a removable volume. A process holding one open is a
 /// volume the person at the machine cannot eject and, on macOS, a permission prompt for every
 /// rebuilt binary.
+///
+/// On Linux and macOS the kernel's own answer for the running worker is compared. Windows has no
+/// supported query for another process's working directory, so there what is checked is the
+/// directory the host configured and the binary it started.
 fn runs_where_the_host_put_it(host: &Host, session_id: SessionId) {
     let registry = Registry::open(host.paths().registry_database(), host.environment_id)
         .expect("opens the registry");
@@ -551,19 +547,17 @@ fn runs_where_the_host_put_it(host: &Host, session_id: SessionId) {
         "and the binary it started is not inside it either: {}",
         host.worker.display()
     );
-    // A create that could not be checked has not been shown to keep the worker off the workspace,
-    // so a platform with no way to ask fails here rather than passing a check it never made.
-    let actual = working_directory_of(pid).unwrap_or_else(|| {
-        panic!(
-            "this platform does not report another process's working directory, so this check \
-             cannot run here; it runs on Linux and macOS"
-        )
-    });
-    assert_eq!(
-        std::fs::canonicalize(&actual).unwrap_or(actual),
-        expected,
-        "the worker runs in the directory the host configured"
-    );
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let actual = working_directory_of(pid);
+        assert_eq!(
+            std::fs::canonicalize(&actual).unwrap_or(actual),
+            expected,
+            "the worker runs in the directory the host configured"
+        );
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let _ = pid;
 }
 
 /// Returns the workspace this test was built from.
