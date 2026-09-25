@@ -1111,8 +1111,9 @@ async fn an_unreachable_worker_retires_a_kept_answer_only_on_a_recorded_closure(
 }
 
 /// KR-REQ-11.63: only a session's daemon says whether the session ended, so a worker that refuses
-/// to read its questions with `UNKNOWN_SESSION` retires nothing. The control is the same worker
-/// serving again, whose kept answer is offered.
+/// to read its questions with `UNKNOWN_SESSION` retires nothing. With a daemon that holds the
+/// session live the answer is listed as unlisted and still kept; with no daemon to ask nothing is
+/// decided. The control is the same worker serving again, whose kept answer is offered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_worker_that_disowns_its_session_retires_nothing() {
     let host = kept_answer().await;
@@ -1120,12 +1121,17 @@ async fn a_worker_that_disowns_its_session_retires_nothing() {
     let (status, document) = host.json(&["question", "drafts"]);
     assert_ne!(status, Some(0), "{document}");
     assert_eq!(document["code"], "RESOURCE_UNAVAILABLE", "{document}");
-    let message = document["message"].as_str().expect("a message");
+    assert!(host.kept().is_file(), "with no daemon, nothing is retired");
+
+    let daemon = host.daemon(Registry::Live);
+    let (status, document) = host.json(&["question", "drafts"]);
+    assert_eq!(status, Some(0), "{document}");
+    assert_eq!(document["drafts"][0]["state"], "unlisted", "{document}");
     assert!(
-        message.contains("does not know its own session"),
-        "{message}"
+        host.kept().is_file(),
+        "a live session's answer is not retired"
     );
-    assert!(host.kept().is_file(), "nothing is retired");
+    daemon.abort();
 
     host.behave(Behaviour::Serves);
     let (status, document) = host.json(&["question", "drafts"]);
@@ -1163,8 +1169,26 @@ async fn a_kept_answer_whose_question_is_not_listed_is_retired_only_on_the_daemo
                 host.kept().is_file(),
                 "{registry:?}: drafts retires nothing: {document}"
             );
+            if registry == Some(Registry::Live) {
+                // Held live: listed as unlisted, and still kept.
+                assert_eq!(status, Some(0), "{document}");
+                assert_eq!(document["drafts"][0]["state"], "unlisted", "{document}");
+                assert_eq!(document["drafts"][0]["reason_code"], "RESOURCE_UNAVAILABLE");
+                let shown = host.kr(&["question", "drafts"]);
+                let shown = String::from_utf8_lossy(&shown.stdout);
+                assert!(shown.contains("unlisted"), "{shown}");
+                assert!(shown.contains("still kept"), "{shown}");
+            } else {
+                // No daemon to ask: nothing is decided.
+                assert_ne!(status, Some(0), "{document}");
+            }
             let (status, document) = host.json(&["question", "send", &question]);
             assert_ne!(status, Some(0), "{registry:?}: {document}");
+            let message = document["message"].as_str().expect("a message");
+            assert!(
+                message.contains("this command did not send it"),
+                "{message}"
+            );
             assert!(
                 host.kept().is_file(),
                 "{registry:?}: send retires nothing: {document}"

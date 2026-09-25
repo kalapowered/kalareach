@@ -89,13 +89,27 @@ enum Line {
     Refuses(ErrorCode),
 }
 
+/// What the host's own record says of the session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Record {
+    /// It holds the session.
+    Held,
+    /// The session ended.
+    Ended,
+    /// It cannot be read.
+    Unreadable,
+}
+
 /// A host holding one session's questions.
 struct Host {
     questions: Mutex<Vec<Question>>,
     line: Mutex<Line>,
+    record: Mutex<Record>,
     /// Every answer that reached the host, in order.
     answers: Mutex<Vec<QuestionAnswerParams>>,
     reads: AtomicUsize,
+    /// How often the record was asked whether the session ended.
+    records: AtomicUsize,
 }
 
 impl Host {
@@ -103,9 +117,18 @@ impl Host {
         Self {
             questions: Mutex::new(questions),
             line: Mutex::new(Line::Up),
+            record: Mutex::new(Record::Held),
             answers: Mutex::new(Vec::new()),
             reads: AtomicUsize::new(0),
+            records: AtomicUsize::new(0),
         }
+    }
+
+    /// A host whose record says `record` of a session that lists no question.
+    fn listing_nothing(record: Record) -> Self {
+        let host = Self::with(Vec::new());
+        *host.record.lock().expect("the lock") = record;
+        host
     }
 
     fn answers(&self) -> Vec<QuestionAnswerParams> {
@@ -202,6 +225,23 @@ impl QuestionHost for Host {
         };
         async move { outcome }
     }
+
+    fn session_ended(
+        &self,
+        _session_id: SessionId,
+    ) -> impl Future<Output = Result<bool, ClientError>> + Send {
+        self.records.fetch_add(1, Ordering::SeqCst);
+        let record = *self.record.lock().expect("the lock");
+        let outcome = match record {
+            Record::Held => Ok(false),
+            Record::Ended => Ok(true),
+            Record::Unreadable => Err(ClientError::Host(ProtocolError::new(
+                ErrorCode::ResourceUnavailable,
+                "the record cannot be read",
+            ))),
+        };
+        async move { outcome }
+    }
 }
 
 fn store() -> (tempfile::TempDir, AnswerDrafts) {
@@ -272,6 +312,11 @@ async fn a_reconnect_offers_a_kept_answer_and_sends_nothing() {
     assert_eq!(reconciled, vec![Reconciled::Offered(kept.clone())]);
     assert!(host.answers().is_empty(), "a reconnect sends nothing");
     assert_eq!(host.reads.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        host.records.load(Ordering::SeqCst),
+        0,
+        "a listed question asks nothing of the record"
+    );
     assert_eq!(drafts.drafts().expect("reads"), vec![kept]);
     assert_eq!(
         host.questions.lock().expect("the lock")[0].state,
@@ -332,10 +377,10 @@ async fn a_kept_answer_is_never_sent_to_a_question_that_ended_meanwhile() {
         assert!(drafts.drafts().expect("reads").is_empty());
     }
 
-    // A session the host no longer has holds no question to answer.
+    // A session the host's record says ended holds no question to answer.
     let (_directory, drafts) = store();
     let kept = answer_offline(&drafts, &question(14)).await;
-    let host = Host::with(Vec::new());
+    let host = Host::listing_nothing(Record::Ended);
     assert_eq!(
         reconcile(&host, &drafts).await.expect("reconciles"),
         vec![Reconciled::Retired {
@@ -344,32 +389,53 @@ async fn a_kept_answer_is_never_sent_to_a_question_that_ended_meanwhile() {
         }]
     );
     assert!(host.answers().is_empty());
+    assert!(drafts.drafts().expect("reads").is_empty());
 }
 
 /// KR-REQ-11.63: a question its session no longer lists does not say the session ended; only the
-/// host's own record of the session says that. While the session is held, a kept answer whose
-/// question is not listed is neither retired by a reconnect nor by a send, and nothing is sent.
+/// host's own record of the session says that. While the record holds the session, a kept answer
+/// whose question is not listed is reported as unlisted and stays kept, and a send neither retires
+/// nor sends it; a record that cannot be read retires nothing either. The control is a record that
+/// says the session ended, which retires the answer as gone, on a reconnect or on a send.
 #[tokio::test]
 async fn a_kept_answer_whose_question_is_not_listed_is_not_retired_while_its_session_is_held() {
     let (_directory, drafts) = store();
     let kept = answer_offline(&drafts, &question(15)).await;
-    // The session is held and lists no question.
-    let host = Host::with(Vec::new());
+    let host = Host::listing_nothing(Record::Held);
 
     let reconciled = reconcile(&host, &drafts).await.expect("reconciles");
-    assert!(
-        !reconciled
-            .iter()
-            .any(|item| matches!(item, Reconciled::Retired { .. })),
-        "{reconciled:?}"
-    );
+    assert_eq!(reconciled, vec![Reconciled::Unlisted(kept.clone())]);
     assert_eq!(drafts.drafts().expect("reads"), vec![kept.clone()]);
-
     let refused = send(&host, &drafts, &kept)
         .await
         .expect_err("there is no question to send it to");
-    assert!(!matches!(refused, AnswerError::Retired(_)), "{refused:?}");
-    assert_eq!(drafts.drafts().expect("reads"), vec![kept]);
+    assert!(matches!(refused, AnswerError::Unlisted), "{refused:?}");
+    assert_eq!(refused.code(), ErrorCode::ResourceUnavailable);
+    assert_eq!(drafts.drafts().expect("reads"), vec![kept.clone()]);
+    assert_eq!(
+        host.records.load(Ordering::SeqCst),
+        2,
+        "the record was asked once by each"
+    );
+
+    *host.record.lock().expect("the lock") = Record::Unreadable;
+    let unread = reconcile(&host, &drafts)
+        .await
+        .expect_err("a record that cannot be read retires nothing");
+    assert!(matches!(unread, AnswerError::Host(_)), "{unread:?}");
+    let unsent = send(&host, &drafts, &kept).await.expect_err("not sent");
+    assert!(matches!(unsent, AnswerError::Host(_)), "{unsent:?}");
+    assert_eq!(drafts.drafts().expect("reads"), vec![kept.clone()]);
+    assert!(host.answers().is_empty(), "nothing was sent");
+
+    // The record says the session ended.
+    *host.record.lock().expect("the lock") = Record::Ended;
+    let retired = send(&host, &drafts, &kept).await.expect_err("retired");
+    assert!(
+        matches!(retired, AnswerError::Retired(Retired::Gone)),
+        "{retired:?}"
+    );
+    assert!(drafts.drafts().expect("reads").is_empty());
     assert!(host.answers().is_empty(), "nothing was sent");
 }
 

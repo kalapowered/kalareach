@@ -22,7 +22,9 @@
 //! sent and before the worker says what became of it, the answer is written to this user's state
 //! directory with the question and the revision the person was shown, and the person is told.
 //! `kr question drafts` reads the questions again and says of each kept answer whether it can
-//! still be sent, or was retired because its question ended or moved; it sends nothing.
+//! still be sent, is unlisted because its session no longer lists the question while the session's
+//! daemon does not record it ended, or was retired because its question ended or moved or its
+//! session is gone; it sends nothing.
 //! `kr question send` sends one kept answer, after reading its question once more, and nothing else
 //! sends a kept answer. The rules are the client library's own ([`kr_client::answers`]); what this
 //! adds is the connection they are sent over: each session's worker, found by its descriptor and
@@ -518,10 +520,18 @@ fn answer_failure(error: AnswerError) -> CliError {
             CliError::Refused(failure.to_protocol_error())
         }
         AnswerError::Host(other) => CliError::HostUnavailable(other.to_string()),
+        AnswerError::Unlisted => CliError::Refused(ProtocolError::new(code, unlisted_because())),
         AnswerError::Store { .. } | AnswerError::Unreadable { .. } => {
             CliError::Other(error.to_string())
         }
     }
+}
+
+/// Why a kept answer is neither offered nor retired, in the words a person is shown.
+fn unlisted_because() -> String {
+    "its session does not list the question now, and its daemon's record does not say the \
+     session ended"
+        .to_owned()
 }
 
 /// Why a kept answer will not be sent, in the words a person is shown.
@@ -538,16 +548,27 @@ fn retired_because(reason: Retired) -> String {
 /// Renders one kept answer, as `kr question drafts` found it, for a script.
 #[must_use]
 pub fn kept_rendered(reconciled: &Reconciled) -> Value {
-    let (draft, state, reason) = match reconciled {
-        Reconciled::Offered(draft) => (draft, "offered", None),
-        Reconciled::Retired { draft, reason } => (draft, "retired", Some(*reason)),
+    let (draft, state, reason, reason_code) = match reconciled {
+        Reconciled::Offered(draft) => (draft, "offered", None, None),
+        Reconciled::Unlisted(draft) => (
+            draft,
+            "unlisted",
+            Some(unlisted_because()),
+            Some(AnswerError::Unlisted.code()),
+        ),
+        Reconciled::Retired { draft, reason } => (
+            draft,
+            "retired",
+            Some(retired_because(*reason)),
+            Some(AnswerError::Retired(*reason).code()),
+        ),
     };
     json!({
         "question_id": draft.question_id.to_string(),
         "session_id": draft.session_id.to_string(),
         "state": state,
-        "reason": reason.map(retired_because),
-        "reason_code": reason.map(|reason| AnswerError::Retired(reason).code().as_str()),
+        "reason": reason,
+        "reason_code": reason_code.map(ErrorCode::as_str),
         "question_revision": draft.question_revision.get(),
         "answer": answer_document(&draft.answer),
         "drafted_at_ms": draft.drafted_at_ms.get(),
@@ -564,6 +585,11 @@ pub fn kept_line(reconciled: &Reconciled) -> String {
             answer_words(&draft.answer),
             draft.question_revision.get(),
             draft.question_id
+        ),
+        Reconciled::Unlisted(draft) => format!(
+            "{}  unlisted  {}; it is still kept, and this command did not send it",
+            draft.question_id,
+            unlisted_because()
         ),
         Reconciled::Retired { draft, reason } => format!(
             "{}  retired  {}; this command did not send it, and it is no longer kept",
@@ -706,10 +732,12 @@ impl Workers {
     /// worker that cannot be reached say nothing about whether the session ended, and retire
     /// nothing.
     async fn open(&self, session_id: SessionId) -> std::result::Result<LocalClient, ClientError> {
+        let gone =
+            |why: String| ClientError::Host(ProtocolError::new(ErrorCode::UnknownSession, why));
         let Some(descriptor) = self.descriptor(session_id)? else {
-            return Err(match self.ended(session_id, true).await {
-                Ok(gone) => gone,
-                Err(why) => ClientError::Host(ProtocolError::new(
+            return Err(match self.record(session_id, false).await {
+                Ok(Record::Ended(why)) => gone(why),
+                Ok(Record::NotEnded(why)) | Err(why) => ClientError::Host(ProtocolError::new(
                     ErrorCode::ResourceUnavailable,
                     format!("session {session_id} has published no descriptor, and {why}"),
                 )),
@@ -719,9 +747,9 @@ impl Workers {
             Ok(client) => Ok(client),
             // A worker that cannot be reached may have ended with its session; only a closure
             // its daemon keeps says so.
-            Err(error) => match self.ended(session_id, false).await {
-                Ok(gone) => Err(gone),
-                Err(why) => {
+            Err(error) => match self.record(session_id, true).await {
+                Ok(Record::Ended(why)) => Err(gone(why)),
+                Ok(Record::NotEnded(why)) | Err(why) => {
                     self.failed(
                         ErrorCode::ResourceUnavailable,
                         format!(
@@ -775,21 +803,22 @@ impl Workers {
             .map_err(|error| error.to_string())
     }
 
-    /// Whether the daemon of the environment `session_id` ran in establishes that it ended.
+    /// What the daemon of the environment `session_id` ran in says of whether it ended.
     ///
-    /// A closure its registry keeps does, and so, when the session has published no descriptor,
-    /// does a registry that never held the session at all: nothing on this host can reach such a
-    /// session again. Everything else, a daemon that is not running, a session it reports live, a
-    /// registry with no record of a session whose descriptor is still published, an environment
-    /// this host does not have, establishes nothing, and what the daemon said is returned.
-    async fn ended(
+    /// A closure its registry keeps says it did, and so, for a session whose descriptor is proved
+    /// absent (`published` false), does a registry that never held it: nothing on this host can
+    /// reach such a session again. A session the daemon reports live, or has no record of while its
+    /// descriptor is published, has not ended as far as the record goes.
+    ///
+    /// # Errors
+    ///
+    /// A daemon that cannot be asked, and an environment this host does not have, establish
+    /// nothing; the error says why.
+    async fn record(
         &self,
         session_id: SessionId,
-        unpublished: bool,
-    ) -> std::result::Result<ClientError, String> {
-        let gone = |detail: String| {
-            ClientError::Host(ProtocolError::new(ErrorCode::UnknownSession, detail))
-        };
+        published: bool,
+    ) -> std::result::Result<Record, String> {
         let Some(environment) = self.environments.get(&session_id) else {
             return Err("which environment it ran in is not known".to_owned());
         };
@@ -802,22 +831,30 @@ impl Workers {
         .await
         {
             Ok(crate::resolve::Registered::Closed { .. }) => {
-                Ok(gone(format!("session {session_id} has closed")))
+                Ok(Record::Ended(format!("session {session_id} has closed")))
             }
-            Err(CliError::UnknownSession(_)) if unpublished => Ok(gone(format!(
+            Err(CliError::UnknownSession(_)) if !published => Ok(Record::Ended(format!(
                 "this host has no record of session {session_id}"
             ))),
-            Err(CliError::UnknownSession(_)) => {
-                Err("its environment's daemon has no record of it".to_owned())
-            }
-            Ok(crate::resolve::Registered::Unpublished { state, .. }) => {
-                Err(format!("its environment's daemon reports it {state}"))
-            }
+            Err(CliError::UnknownSession(_)) => Ok(Record::NotEnded(
+                "its environment's daemon has no record of it".to_owned(),
+            )),
+            Ok(crate::resolve::Registered::Unpublished { state, .. }) => Ok(Record::NotEnded(
+                format!("its environment's daemon reports it {state}"),
+            )),
             Err(error) => Err(format!(
                 "whether it has ended cannot be established: {error}"
             )),
         }
     }
+}
+
+/// What the daemon of a session's environment says of whether the session ended.
+enum Record {
+    /// It ended, and how that is known.
+    Ended(String),
+    /// It has not, as far as the record goes, and what the record says.
+    NotEnded(String),
 }
 
 /// Whether a failure of the connection to a worker is the connection going, rather than something
@@ -854,18 +891,6 @@ impl QuestionHost for Workers {
             .await;
         let value = match outcome {
             Ok(Ok(value)) => value,
-            // The host's `UNKNOWN_SESSION` retires a kept answer, and only a session's daemon says
-            // a session ended. A worker refusing with that code about its own session is passed on
-            // as the refusal it is, one that retires nothing.
-            Ok(Err(refusal)) if refusal.code == ErrorCode::UnknownSession => {
-                return Err(ClientError::Host(ProtocolError::new(
-                    ErrorCode::ResourceUnavailable,
-                    format!(
-                        "session {session_id}'s worker answered that it does not know its own \
-                         session ({refusal}), and only its daemon says whether a session ended"
-                    ),
-                )));
-            }
             Ok(Err(refusal)) => return Err(ClientError::from(refusal)),
             Err(error) => {
                 connections.remove(&session_id);
@@ -966,6 +991,20 @@ impl QuestionHost for Workers {
                 );
                 Err(ClientError::Ipc(failure))
             }
+        }
+    }
+
+    /// Whether the daemon of the environment the session ran in says it ended, with its descriptor
+    /// read as `open` reads it, so a session is gone here exactly when it is gone there.
+    async fn session_ended(&self, session_id: SessionId) -> std::result::Result<bool, ClientError> {
+        let published = self.descriptor(session_id)?.is_some();
+        match self.record(session_id, published).await {
+            Ok(Record::Ended(_)) => Ok(true),
+            Ok(Record::NotEnded(_)) => Ok(false),
+            Err(why) => Err(ClientError::Host(ProtocolError::new(
+                ErrorCode::ResourceUnavailable,
+                format!("session {session_id} does not list the question, and {why}"),
+            ))),
         }
     }
 }

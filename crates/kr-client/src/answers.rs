@@ -14,6 +14,11 @@
 //!   [`send`], the caller's own step for a person who chose to send it, and it checks the question
 //!   once more before it does.
 //!
+//! A session's worker says what became of its questions, and nothing else does. Whether the session
+//! itself ended is the host's own record to say, so a draft whose question its session does not list
+//! is retired as gone only when [`QuestionHost::session_ended`] says the session ended. While the
+//! record holds the session, the draft stays kept, is reported as unlisted and is not offered.
+//!
 //! A draft that its question outlived is never sent, whatever became of the question: somebody else
 //! answered it, the agent withdrew it or its call was cancelled, its time ran out, or the binding it
 //! was asked under changed. An answer whose outcome was unknown when it was kept reconciles the same
@@ -37,6 +42,7 @@ use kr_protocol::question::{
     QuestionResolveResult, QuestionState, check_answer,
 };
 use kr_protocol::scalars::{DurationMs, Nullable, TimestampMs};
+use kr_protocol::session::{SessionReadParams, SessionReadResult, SessionState};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ClientError;
@@ -111,7 +117,8 @@ pub enum Retired {
         /// The revision it is at now.
         revision: QuestionRevision,
     },
-    /// The host no longer has the question, because its session is gone.
+    /// The host no longer has the question, because its session is gone: its session does not list
+    /// it, and the host's record of the session says the session ended.
     Gone,
 }
 
@@ -121,6 +128,10 @@ pub enum Reconciled {
     /// Its question is still pending at the revision the person answered. It is offered again, and
     /// nothing has been sent.
     Offered(AnswerDraft),
+    /// Its question is not among those its session lists, and the host's record of the session
+    /// does not say the session ended. It is still kept, it is not offered, and nothing has been
+    /// sent.
+    Unlisted(AnswerDraft),
     /// Its question ended or moved while this client was away. It was not sent, and it is no longer
     /// kept.
     Retired {
@@ -149,6 +160,13 @@ pub enum AnswerError {
     /// The draft could not be sent because its question ended or moved.
     #[error("the question ended or moved while the answer was kept: {0:?}")]
     Retired(Retired),
+    /// The draft was not sent because its question is not among those its session lists, and the
+    /// host's record of the session does not say the session ended. It is still kept.
+    #[error(
+        "the question is not among those its session lists, and the host's record of the session \
+         does not say the session ended"
+    )]
+    Unlisted,
     /// The store on this device refused.
     #[error("the answers kept at {path} cannot be used: {error}")]
     Store {
@@ -180,6 +198,7 @@ impl AnswerError {
             Self::Retired(Retired::Ended(_)) => ErrorCode::QuestionResolved,
             Self::Retired(Retired::Moved { .. }) => ErrorCode::StaleSession,
             Self::Retired(Retired::Gone) => ErrorCode::UnknownSession,
+            Self::Unlisted => ErrorCode::ResourceUnavailable,
             Self::Store { .. } | Self::Unreadable { .. } => ErrorCode::StorageUnavailable,
             Self::Host(error) => error.code(),
         }
@@ -206,6 +225,16 @@ pub trait QuestionHost {
         target: ActionTarget,
         params: QuestionAnswerParams,
     ) -> impl Future<Output = std::result::Result<Question, ClientError>> + Send;
+
+    /// Whether the host's own record of a session says the session ended.
+    ///
+    /// A worker that does not list a question has said nothing about its session, so a draft is
+    /// retired as gone only on this: `Ok(true)` when the record establishes that the session ended,
+    /// `Ok(false)` when it does not, and an error when it cannot be read, which retires nothing.
+    fn session_ended(
+        &self,
+        session_id: SessionId,
+    ) -> impl Future<Output = std::result::Result<bool, ClientError>> + Send;
 }
 
 impl QuestionHost for Session {
@@ -243,6 +272,28 @@ impl QuestionHost for Session {
             .await?
             .to_typed()?;
         Ok(result.question)
+    }
+
+    async fn session_ended(&self, session_id: SessionId) -> std::result::Result<bool, ClientError> {
+        match self
+            .read::<_, SessionReadResult>(Method::SessionRead, &SessionReadParams { session_id })
+            .await
+        {
+            Ok(read) => {
+                Ok(read.session.closure.0.is_some() || read.session.state == SessionState::Closed)
+            }
+            // A closed session's record can answer with the closure itself, and a host with no
+            // record of the session at all no longer has it.
+            Err(ClientError::Host(refused))
+                if matches!(
+                    refused.code,
+                    ErrorCode::SessionClosed | ErrorCode::UnknownSession
+                ) =>
+            {
+                Ok(true)
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -438,13 +489,16 @@ pub async fn answer<H: QuestionHost>(
 ///
 /// Each session a kept answer names is read once, resolved questions included. A draft whose
 /// question is still pending at the revision the person answered is offered again and stays kept.
-/// Every other draft is retired: it is not sent and it is no longer kept, and the result says why,
-/// so the person can be told that their answer did not go and what happened instead.
+/// A draft whose question ended or moved is retired: it is not sent and it is no longer kept, and
+/// the result says why, so the person can be told that their answer did not go and what happened
+/// instead. A draft whose question its session does not list is retired as gone only when the
+/// host's record says the session ended, and is otherwise kept and reported as unlisted.
 ///
 /// # Errors
 ///
-/// Returns [`AnswerError::Host`] when a session cannot be read, in which case nothing is retired,
-/// and [`AnswerError::Store`] when the store cannot be read or a retired answer cannot be removed.
+/// Returns [`AnswerError::Host`] when a session, or the record of one whose question it does not
+/// list, cannot be read, in which case nothing is retired, and [`AnswerError::Store`] when the
+/// store cannot be read or a retired answer cannot be removed.
 pub async fn reconcile<H: QuestionHost>(
     host: &H,
     drafts: &AnswerDrafts,
@@ -457,11 +511,36 @@ pub async fn reconcile<H: QuestionHost>(
     for session_id in sessions {
         match host.questions(session_id).await {
             Ok(questions) => current.extend(questions),
-            // A session the host does not have any more holds no question to answer.
+            // A session the host does not have any more lists no question. Whether it ended is
+            // its record's to say, below.
             Err(ClientError::Host(refused)) if refused.code == ErrorCode::UnknownSession => {}
             Err(error) => return Err(AnswerError::Host(error)),
         }
     }
+    // The record of every session with a draft whose question it does not list, read once each
+    // and before anything is retired, so a record that cannot be read retires nothing.
+    let mut ended: Vec<(SessionId, bool)> = Vec::new();
+    for draft in &kept {
+        let listed = current
+            .iter()
+            .any(|question| question.question_id == draft.question_id);
+        if !listed
+            && !ended
+                .iter()
+                .any(|(session_id, _)| *session_id == draft.session_id)
+        {
+            let record = host
+                .session_ended(draft.session_id)
+                .await
+                .map_err(AnswerError::Host)?;
+            ended.push((draft.session_id, record));
+        }
+    }
+    let session_ended = |session_id: SessionId| {
+        ended
+            .iter()
+            .any(|(ended_id, record)| *ended_id == session_id && *record)
+    };
     let mut reconciled = Vec::with_capacity(kept.len());
     for draft in kept {
         let question = current
@@ -469,6 +548,9 @@ pub async fn reconcile<H: QuestionHost>(
             .find(|question| question.question_id == draft.question_id);
         match draft.submission(question) {
             Ok(_) => reconciled.push(Reconciled::Offered(draft)),
+            Err(Retired::Gone) if !session_ended(draft.session_id) => {
+                reconciled.push(Reconciled::Unlisted(draft));
+            }
             Err(reason) => {
                 drafts.discard(draft.question_id)?;
                 reconciled.push(Reconciled::Retired { draft, reason });
@@ -486,9 +568,10 @@ pub async fn reconcile<H: QuestionHost>(
 ///
 /// # Errors
 ///
-/// Returns [`AnswerError::Retired`] when the question ended or moved, [`AnswerError::Host`] when the
-/// host refused or could not be reached, and [`AnswerError::Store`] when the store cannot be
-/// updated.
+/// Returns [`AnswerError::Retired`] when the question ended or moved, [`AnswerError::Unlisted`] when
+/// its session does not list the question and the host's record does not say the session ended,
+/// [`AnswerError::Host`] when the host refused or could not be reached, and [`AnswerError::Store`]
+/// when the store cannot be updated.
 pub async fn send<H: QuestionHost>(
     host: &H,
     drafts: &AnswerDrafts,
@@ -500,6 +583,11 @@ pub async fn send<H: QuestionHost>(
         .find(|question| question.question_id == draft.question_id);
     let params = match draft.submission(current) {
         Ok(params) => params,
+        // A question its session does not list is gone only when the host's record of the
+        // session says the session ended.
+        Err(Retired::Gone) if !host.session_ended(draft.session_id).await? => {
+            return Err(AnswerError::Unlisted);
+        }
         Err(reason) => {
             drafts.discard(draft.question_id)?;
             return Err(AnswerError::Retired(reason));

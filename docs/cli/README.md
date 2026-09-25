@@ -554,24 +554,29 @@ place of it, and exits with 1.
 `kr question drafts` reads each kept answer's question again. An answer whose question is still
 pending at the revision it answered is offered, and stays kept. Any other is retired: its question
 was answered, cancelled or expired, moved to another revision, or its session is gone; the command
-does not send it, and it is no longer kept. The command sends nothing, however often it runs. `kr
-question send` is the one way a kept answer is sent: it reads the question once more and sends the
-answer only while that question is still what the person answered. An answer whose outcome was not
-known is retired by the next `kr question drafts` if it did arrive, so it is never sent twice. When
-`kr question send` cannot send it, the failure keeps its own code and says the answer is still kept.
-An answer `kr question answer` gives to a question that ended or moved before the answer reached it
-is not sent, and the command says whether an answer kept for that question earlier is still kept.
+does not send it, and it is no longer kept. An answer whose question its session no longer lists,
+while the session's daemon does not record the session ended, is unlisted: it stays kept and is not
+offered, and `kr question send` neither sends nor retires it. The command sends nothing, however
+often it runs. `kr question send` is the one way a kept answer is sent: it reads the question once
+more and sends the answer only while that question is still what the person answered. An answer
+whose outcome was not known is retired by the next `kr question drafts` if it did arrive, so it is
+never sent twice. When `kr question send` cannot send it, the failure keeps its own code and says
+the answer is still kept. An answer `kr question answer` gives to a question that ended or moved
+before the answer reached it is not sent, and the command says whether an answer kept for that
+question earlier is still kept.
 
 A kept answer is retired as gone only on the word of the daemon of the environment its session ran
 in: a closure its registry keeps, or, for a session with no descriptor, no record of the session at
-all. Nothing on disk, or missing from it, retires one. The descriptor is looked for only in that
-environment, under the session's own name. When the descriptor is missing and there is no daemon to
-ask, when the daemon reports the session still live, when the descriptor or its directory cannot be
-read or is readable by anyone but its owner, and when the environment cannot be identified, `kr
-question drafts` fails and retires nothing. A worker that cannot be reached retires its answer only
-on a closure its daemon keeps; the descriptor it left behind says nothing either way. Otherwise `kr
-question drafts` exits with 3, names the worker it could not reach and what its daemon said of the
-session, and retires nothing.
+all. Nothing on disk, or missing from it, retires one, and neither does a session's worker that no
+longer lists the question. An answer is retired as ended or moved on its session's own report of its
+question. The descriptor is looked for only in the environment the session ran in, under the
+session's own name. When the descriptor is missing and there is no daemon to ask, when the daemon
+reports the session still live, when the descriptor or its directory cannot be read or is readable
+by anyone but its owner, and when the environment cannot be identified, `kr question drafts` fails
+and retires nothing. A worker that cannot be reached retires its answer only on a closure its daemon
+keeps; the descriptor it left behind says nothing either way. Otherwise `kr question drafts` exits
+with 3, names the worker it could not reach and what its daemon said of the session, and retires
+nothing.
 
 ## `kr skill`
 
