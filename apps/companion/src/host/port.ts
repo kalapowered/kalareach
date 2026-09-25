@@ -684,8 +684,8 @@ export interface HostPort {
  * `registrations` and, once every one of them is, calls `listening`: a view reads there the state
  * its listeners follow, so no change they would hear can fall between the read and the listeners.
  * The returned function stops them all, including one whose registration completes after it was
- * called, and `listening` is never called after it. A registration that fails stops the others and
- * goes to `failed`.
+ * called, and `listening` is never called after it. The first registration that fails ends the
+ * watch at once, as the returned function does, and goes to `failed`.
  */
 export function watch(
   registrations: readonly Promise<() => void>[],
@@ -693,33 +693,36 @@ export function watch(
   failed: (failure: unknown) => void = () => undefined
 ): () => void {
   let watching = true
+  let unregistered = registrations.length
   const stops: (() => void)[] = []
-  const stopAll = () => {
+  const end = () => {
+    watching = false
     for (const stop of stops.splice(0)) stop()
   }
-  void Promise.allSettled(
-    registrations.map((registration) =>
-      registration.then((stop) => {
-        if (watching) stops.push(stop)
-        else stop()
-      })
-    )
-  ).then((settled) => {
-    if (!watching) return
-    const refused = settled.find(
-      (each): each is PromiseRejectedResult => each.status === 'rejected'
-    )
-    if (refused === undefined) {
-      listening()
-      return
-    }
-    stopAll()
-    failed(refused.reason)
-  })
-  return () => {
-    watching = false
-    stopAll()
+  if (unregistered === 0) {
+    void Promise.resolve().then(() => {
+      if (watching) listening()
+    })
   }
+  for (const registration of registrations) {
+    void registration.then(
+      (stop) => {
+        if (!watching) {
+          stop()
+          return
+        }
+        stops.push(stop)
+        unregistered -= 1
+        if (unregistered === 0) listening()
+      },
+      (failure: unknown) => {
+        if (!watching) return
+        end()
+        failed(failure)
+      }
+    )
+  }
+  return end
 }
 
 /** One row of the projected screen, as the raw view draws it. */

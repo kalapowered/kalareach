@@ -161,6 +161,15 @@ describe('watching', () => {
     second.complete()
     await settled(second.registration)
     expect(listening).toHaveBeenCalledTimes(1)
+
+    // With nothing to register, the read goes ahead, and a watch stopped first never reads.
+    const nothing = vi.fn()
+    watch([], nothing)
+    const stopped = vi.fn()
+    watch([], stopped)()
+    await settled(Promise.resolve())
+    expect(nothing).toHaveBeenCalledTimes(1)
+    expect(stopped).not.toHaveBeenCalled()
   })
 
   it('stops every listener, even one registered after it stopped, and then reads nothing', async () => {
@@ -195,6 +204,27 @@ describe('watching', () => {
       code: 'INTERNAL',
       message: 'The shell refused the listener.'
     })
+    expect(listening).not.toHaveBeenCalled()
+  })
+
+  it('gives up at the first refusal, without waiting for a registration still on its way', async () => {
+    const kept = pending()
+    const refused = pending()
+    const late = pending()
+    const listening = vi.fn()
+    const failed = vi.fn()
+    watch([kept.registration, refused.registration, late.registration], listening, failed)
+
+    kept.complete()
+    refused.refuse({ code: 'INTERNAL', message: 'The shell refused the listener.' })
+    await settled(refused.registration)
+    expect(kept.stop).toHaveBeenCalledTimes(1)
+    expect(failed).toHaveBeenCalledTimes(1)
+
+    late.complete()
+    await settled(late.registration)
+    expect(late.stop).toHaveBeenCalledTimes(1)
+    expect(failed).toHaveBeenCalledTimes(1)
     expect(listening).not.toHaveBeenCalled()
   })
 })
