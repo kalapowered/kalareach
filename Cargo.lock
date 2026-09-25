@@ -4432,6 +4432,7 @@ dependencies = [
  "kr-protocol",
  "kr-worker",
  "rmcp",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.11.0",

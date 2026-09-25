@@ -8,7 +8,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-12.07 | a backend's endpoint, credential and launch record exist before the answer; a bypass creates nothing; one line runs one integrated invocation |
+//! | KR-REQ-12.07 | a backend's endpoint, credential and launch record exist before the answer; a bypass creates nothing; one line runs one integrated invocation; each session has a root of its own |
 
 #![cfg(unix)]
 
@@ -54,7 +54,7 @@ struct Setup {
     backends: CommandBackends,
     broker: Arc<Broker>,
     executable: PathBuf,
-    root: PathBuf,
+    runtime: PathBuf,
 }
 
 impl Setup {
@@ -63,7 +63,7 @@ impl Setup {
     }
 
     fn with(adjust: impl FnOnce(CommandBackendsConfig) -> CommandBackendsConfig) -> Self {
-        let directory = private_directory("kr-cb-");
+        let directory = private_directory("kcb");
         let bin = directory.join("bin");
         std::fs::create_dir_all(&bin).expect("a bin directory");
         let launcher = bin.join("kr-hook");
@@ -78,7 +78,9 @@ impl Setup {
             sources.replace(vec![source]).is_empty(),
             "the connector is installed"
         );
-        let root = directory.join("c");
+        // The case's own directory, so a backend's socket path stays inside the bound it has on
+        // macOS: the session root and the backend's directory add two short levels below it.
+        let runtime = directory.clone();
         let broker = Arc::new(
             Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens"),
         );
@@ -86,7 +88,7 @@ impl Setup {
             session_id: session(),
             environment_id: EnvironmentId::new(Uuid::from_bytes([4; 16])),
             os_user: "someone".to_owned(),
-            root: root.clone(),
+            runtime_dir: runtime.clone(),
             sources,
             launcher: Some(launcher),
         });
@@ -100,7 +102,7 @@ impl Setup {
             backends,
             broker,
             executable,
-            root,
+            runtime,
         }
     }
 
@@ -115,9 +117,12 @@ impl Setup {
         }
     }
 
-    /// The directories established so far.
+    /// The directories established so far, in the session's root, which the first establish makes.
     fn established(&self) -> Vec<PathBuf> {
-        match std::fs::read_dir(&self.root) {
+        let Some(root) = self.backends.root() else {
+            return Vec::new();
+        };
+        match std::fs::read_dir(root) {
             Ok(entries) => entries
                 .map(|entry| entry.expect("an entry").path())
                 .collect(),
@@ -199,6 +204,11 @@ async fn kr_req_12_07_an_integrated_invocation_gets_a_backend_that_exists_before
     let variable = &answer.environment[0];
     assert_eq!(variable.name, "KR_REGISTRATION");
     let registration = PathBuf::from(&variable.value);
+    assert_eq!(
+        registration.file_name().and_then(|name| name.to_str()),
+        Some("registration.2.2"),
+        "the registration's name says the two added flags start at index 2"
+    );
     let directory = registration
         .parent()
         .expect("the backend's directory")
@@ -216,7 +226,11 @@ async fn kr_req_12_07_an_integrated_invocation_gets_a_backend_that_exists_before
     let record: serde_json::Value =
         serde_json::from_slice(&std::fs::read(directory.join("launch")).expect("a launch record"))
             .expect("the record is JSON");
-    assert_eq!(record["added"], serde_json::json!(fixture::FLAGS));
+    assert_eq!(
+        record.as_object().map(|record| record.len()),
+        Some(2),
+        "the record says where to connect and where the credential is, and nothing else: {record}"
+    );
     let endpoint = PathBuf::from(record["endpoint"].as_str().expect("an endpoint"));
     assert!(endpoint.exists(), "the endpoint is bound before the answer");
     assert_eq!(
@@ -261,7 +275,7 @@ async fn kr_req_12_07_a_bypassed_invocation_creates_nothing() {
         .expect_err("a relative executable");
 
     assert!(
-        setup.established().is_empty(),
+        setup.backends.root().is_none(),
         "no bypass made a directory, an endpoint or a credential"
     );
 
@@ -289,7 +303,7 @@ async fn a_platform_that_cannot_publish_a_credential_file_establishes_nothing() 
             session_id: session(),
             environment_id: EnvironmentId::new(Uuid::from_bytes([4; 16])),
             os_user: "someone".to_owned(),
-            root: setup.root.clone(),
+            runtime_dir: setup.runtime.clone(),
             sources: Arc::clone(setup.backends.sources()),
             launcher: Some(setup.directory.join("bin").join("kr-hook")),
         },
@@ -299,12 +313,12 @@ async fn a_platform_that_cannot_publish_a_credential_file_establishes_nothing() 
     gated
         .establish(&request(&setup, &claude, &integration, 1))
         .expect_err("refused before anything is made");
-    assert!(setup.established().is_empty());
+    assert!(gated.root().is_none(), "not even the session's root");
 }
 
 /// KR-REQ-12.07: one line runs one integrated invocation. A retry of the same invocation gets the
 /// backend it was given; another invocation in the line runs as typed; a later line retires the
-/// earlier line's backend no launch took, and leaves its launch record.
+/// earlier line's backend no launch took, launch record and all.
 #[tokio::test]
 async fn kr_req_12_07_one_line_runs_one_integrated_invocation() {
     let setup = Setup::new();
@@ -350,8 +364,9 @@ async fn kr_req_12_07_one_line_runs_one_integrated_invocation() {
     assert!(!endpoint.exists(), "the earlier line's endpoint is gone");
     assert!(!directory.join("credential").exists(), "and its credential");
     assert!(
-        directory.join("launch").exists(),
-        "its launch record stays, for a launcher that looks late"
+        !directory.join("launch").exists(),
+        "and its launch record: a launcher that looks late runs what was typed, which the \
+         variable's file name says"
     );
 }
 
@@ -376,5 +391,60 @@ async fn a_finished_line_retires_its_unbound_backend() {
     );
     setup.backends.line_ended(PromptGeneration::new(3));
     assert!(!directory.join("credential").exists());
-    assert!(directory.join("launch").exists());
+    assert!(!directory.join("launch").exists());
+}
+
+/// KR-REQ-12.07: two sessions whose identifiers share their first eight digits get roots of their
+/// own, so closing one leaves the other's backend where it is.
+#[tokio::test]
+async fn kr_req_12_07_each_session_has_a_root_of_its_own() {
+    let setup = Setup::new();
+    let integration = Setup::integration();
+    let claude = invocation(&["claude"]);
+    let mut neighbour_id = [1_u8; 16];
+    neighbour_id[4..].fill(9);
+    let neighbour = CommandBackends::new(
+        Arc::clone(&setup.broker),
+        CommandBackendsConfig {
+            session_id: SessionId::new(Uuid::from_bytes(neighbour_id)),
+            environment_id: EnvironmentId::new(Uuid::from_bytes([4; 16])),
+            os_user: "someone".to_owned(),
+            runtime_dir: setup.runtime.clone(),
+            sources: Arc::clone(setup.backends.sources()),
+            launcher: Some(setup.directory.join("bin").join("kr-hook")),
+        },
+        tokio::runtime::Handle::current(),
+    );
+    assert_eq!(
+        session().to_string().get(..8),
+        SessionId::new(Uuid::from_bytes(neighbour_id))
+            .to_string()
+            .get(..8),
+        "the two identifiers share their first eight digits"
+    );
+    let mine = setup
+        .backends
+        .establish(&request(&setup, &claude, &integration, 1))
+        .expect("a backend for this session");
+    let theirs = neighbour
+        .establish(&request(&setup, &claude, &integration, 1))
+        .expect("a backend for the other");
+    assert_ne!(setup.backends.root(), neighbour.root(), "separate roots");
+    setup.backends.close();
+    let their_directory = PathBuf::from(&theirs.environment[0].value)
+        .parent()
+        .expect("the directory")
+        .to_path_buf();
+    assert!(
+        their_directory.join("credential").exists() && their_directory.join("launch").exists(),
+        "closing one session leaves the other's backend"
+    );
+    assert!(
+        !PathBuf::from(&mine.environment[0].value)
+            .parent()
+            .expect("the directory")
+            .exists(),
+        "and removes its own"
+    );
+    neighbour.close();
 }

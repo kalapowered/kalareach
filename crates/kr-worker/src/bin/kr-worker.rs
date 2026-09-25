@@ -287,7 +287,7 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             session_id,
             environment_id,
             os_user: kr_worker::desktop::os_user(),
-            root: command_backends_root(&environment, session_id),
+            runtime_dir: environment.runtime_dir().to_path_buf(),
             sources: Arc::new(kr_worker::broker::connectors::ConnectorSources::new()),
             launcher: installed_launcher(),
         });
@@ -458,24 +458,6 @@ fn managed_package(specification: &WorkerLaunchSpec) -> Result<Option<ShellPacka
                     .to_owned(),
             })?;
     ShellPackage::read(std::path::Path::new(directory)).map(Some)
-}
-
-/// Returns the owner-only directory this session's command backends are made in.
-///
-/// It is inside the environment's runtime directory, which is owner-only and on the internal disk,
-/// and its name is short: a backend's socket lives two levels below it, and a socket path has a
-/// small fixed bound.
-fn command_backends_root(
-    environment: &kr_ipc::paths::EnvironmentPaths,
-    session_id: SessionId,
-) -> std::path::PathBuf {
-    let name: String = session_id
-        .to_string()
-        .chars()
-        .filter(char::is_ascii_hexdigit)
-        .take(8)
-        .collect();
-    environment.runtime_dir().join(format!("c{name}"))
 }
 
 /// Returns this installation's launcher, the `kr-hook` beside this executable in every packaged

@@ -27,6 +27,9 @@ kr-protocol.workspace = true
 # Claude Code starts its channel server as a stdio MCP server, so this is the MCP server library
 # the command line's own contact tools already use, at the same pinned release.
 rmcp.workspace = true
+# The launcher connects on a non-blocking socket, so a full queue at the worker's endpoint cannot hold
+# it past its deadline; the standard library connects only blocking.
+rustix = { workspace = true, features = ["net"] }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "rt", "sync", "time"] }

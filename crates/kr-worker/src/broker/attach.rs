@@ -1042,7 +1042,9 @@ impl NativeGateway {
                         "this endpoint has not launched anything to authenticate against",
                     )
                 })?;
-                self.admit_bridge(pending, registration).await
+                self.authenticate_bridge(pending, registration)?
+                    .admit()
+                    .await
             }
             Opening::Launch(_) => Err(BrokerError::denied(
                 "this connection presents a launch, and this endpoint admits bridges here",
@@ -1064,7 +1066,8 @@ impl NativeGateway {
 
     /// Reads one accepted connection's first frame, under [`HELLO_DEADLINE`], and says what it is.
     ///
-    /// Nothing past that frame is read. A bridge's hello goes on to [`NativeGateway::admit_bridge`];
+    /// Nothing past that frame is read. A bridge's hello goes on to
+    /// [`NativeGateway::authenticate_bridge`];
     /// an invocation presenting itself goes to the command backend that owns this endpoint.
     ///
     /// # Errors
@@ -1098,19 +1101,23 @@ impl NativeGateway {
         }
     }
 
-    /// Authenticates and admits one bridge whose hello [`NativeGateway::open`] has read, against
-    /// the registration of the launch it claims to belong to.
+    /// Authenticates one bridge whose hello [`NativeGateway::open`] has read, against the
+    /// registration of the launch it claims to belong to, and writes nothing yet.
+    ///
+    /// The bridge is the session owner's, the process the kernel names, started by the registered
+    /// process, the installed forwarder, and it presents the launch's private exchange. What the
+    /// caller checks next it checks for the program's own bridge; [`AuthenticatedBridge::admit`]
+    /// then answers it.
     ///
     /// # Errors
     ///
     /// Returns [`BrokerError::PermissionDenied`] when any check fails, which closes the connection
-    /// without a word, and [`BrokerError::UpstreamUnavailable`] when the admission cannot be
-    /// written.
-    pub async fn admit_bridge(
+    /// without a word.
+    pub fn authenticate_bridge(
         &self,
         pending: PendingBridge,
         registration: &Registration,
-    ) -> Result<crate::broker::bridge::AdmittedBridge> {
+    ) -> Result<AuthenticatedBridge> {
         let PendingBridge {
             peer,
             reader,
@@ -1151,19 +1158,19 @@ impl NativeGateway {
                 "the kernel's record of when this bridge started cannot be read: {why}"
             ))
         })?;
-        let mut stream =
-            crate::broker::bridge::BridgeStream::new(reader, writer, held, self.launch.framing);
-        stream
-            .write_frame(&crate::broker::bridge::admission_frame(declared.surface))
-            .await?;
-        Ok(crate::broker::bridge::AdmittedBridge {
+        Ok(AuthenticatedBridge {
             surface: declared.surface,
             process: crate::broker::bridge::BridgeProcess {
                 identity,
                 starter,
                 started,
             },
-            stream,
+            stream: crate::broker::bridge::BridgeStream::new(
+                reader,
+                writer,
+                held,
+                self.launch.framing,
+            ),
         })
     }
 
@@ -1515,6 +1522,40 @@ pub struct PendingBridge {
     hello: Hello,
     credential: Vec<u8>,
     held: Vec<u8>,
+}
+
+/// A bridge that passed every check against the launch it belongs to and has not been answered.
+pub struct AuthenticatedBridge {
+    surface: crate::broker::bridge::BridgeSurface,
+    process: crate::broker::bridge::BridgeProcess,
+    stream: crate::broker::bridge::BridgeStream,
+}
+
+impl std::fmt::Debug for AuthenticatedBridge {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthenticatedBridge")
+            .field("surface", &self.surface)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AuthenticatedBridge {
+    /// Answers the bridge that it is admitted, and hands it over.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UpstreamUnavailable`] when the admission cannot be written.
+    pub async fn admit(mut self) -> Result<crate::broker::bridge::AdmittedBridge> {
+        self.stream
+            .write_frame(&crate::broker::bridge::admission_frame(self.surface))
+            .await?;
+        Ok(crate::broker::bridge::AdmittedBridge {
+            surface: self.surface,
+            process: self.process,
+            stream: self.stream,
+        })
+    }
 }
 
 impl std::fmt::Debug for PendingBridge {

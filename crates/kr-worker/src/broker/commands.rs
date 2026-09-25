@@ -19,28 +19,32 @@
 //!    establish, with the credential, running the file this backend hashed with the vector it
 //!    answered. The launch profile is recorded, the instance registered by its reservation, and the
 //!    registration published whole, naming that process. The launcher is told it is admitted.
-//! 4. **Commit**, when the launcher says it is going: it execs the program in place, keeping its
-//!    process identity, so the registration names the program before the program runs.
+//! 4. **Commit**, when the launcher says it is going: the backend is committed and says so, and only
+//!    then does the launcher exec the program in place, keeping its process identity, so the
+//!    registration names the program before the program runs.
 //!
 //! A launcher that is refused, runs out of time or cannot reach the endpoint runs the invocation as
-//! typed, without the flags and without the variable: the launch record tells it which flags were
-//! added, and the record outlives the backend for that reason.
+//! typed, without the flags and without the variable. The registration's file name says where the
+//! added flags stand in the vector, so what was typed is known from the variable alone, whatever has
+//! become of the backend.
 //!
 //! # What is served
 //!
 //! One accept loop per backend, one task per accepted connection, at most
-//! [`MAX_CONCURRENT_ADMISSIONS`] at once. A bridge that connects while a launch is being committed
-//! waits for the commit; one that connects to a backend no launch holds is refused.
+//! [`MAX_CONCURRENT_ADMISSIONS`] at once, each ended when the backend is retired. A bridge that
+//! connects while a launch is being committed waits for the commit; one that connects to a backend no
+//! launch holds is refused. A bridge is authenticated before it can ask whether the process executes
+//! what was hashed, so only the program's own bridges decide that.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use kr_protocol::broker::{AuthenticationState, BinaryIdentity, IntegrationMode, LaunchProfile};
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{ApplicationInstanceId, EnvironmentId, LaunchProfileId, SessionId};
 use kr_protocol::root::{CommandBackend, CwdRevision, PromptGeneration};
-use kr_protocol::scalars::{Digest256, Uuid};
+use kr_protocol::scalars::Uuid;
 use kr_protocol::session::{CommandIntegration, EnvironmentVariable};
 
 use crate::broker::Broker;
@@ -49,6 +53,7 @@ use crate::broker::bridge::{BridgeStream, BridgeSurface};
 use crate::broker::connectors::{ConnectorSources, InstalledConnector};
 use crate::broker::error::{BrokerError, Result};
 use crate::broker::framing::Framing;
+use crate::broker::image::{ExecutableIdentity, FileIdentity, HashedFiles};
 use crate::broker::listener::Registration;
 use crate::broker::process::{Credential, ManagedProcess};
 use crate::broker::profiles::ForegroundMark;
@@ -58,6 +63,10 @@ use crate::broker::profiles::ForegroundMark;
 /// A connection beyond them is closed unread: its hook answers `{}` and its report is lost, or its
 /// channel fails its handshake, which is what a worker that does not answer already means.
 pub const MAX_CONCURRENT_ADMISSIONS: usize = 16;
+
+/// The prefix of a backend's registration file name, which goes on `.<at>.<count>`: where in the
+/// answered vector the integration's flags start, and how many there are.
+pub const REGISTRATION_PREFIX: &str = "registration";
 
 /// How long a launch the backend admitted has to say it is going.
 ///
@@ -73,77 +82,8 @@ pub const IDENTITY_WAIT: std::time::Duration = std::time::Duration::from_millis(
 /// The file a backend's launch record is published as.
 pub const LAUNCH_RECORD_FILE: &str = "launch";
 
-/// How many times the identity of a file that changed while it was read is read again.
-const IDENTITY_ATTEMPTS: usize = 3;
-
 /// How often the committed program is looked at while it runs.
 const SUPERVISION_POLL: std::time::Duration = crate::broker::attach::TERMINAL_POLL;
-
-/// A file's identity, as the kernel reports it for one opened file.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct FileIdentity {
-    /// The device it is on.
-    pub device: u64,
-    /// Its inode.
-    pub inode: u64,
-    /// Its length in bytes.
-    pub size: u64,
-    /// Its last modification, in nanoseconds.
-    pub modified_ns: i128,
-    /// Its last status change, in nanoseconds.
-    pub changed_ns: i128,
-}
-
-impl FileIdentity {
-    /// Reads the identity of one opened file.
-    #[cfg(unix)]
-    fn of(metadata: &std::fs::Metadata) -> Self {
-        use std::os::unix::fs::MetadataExt as _;
-        Self {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            size: metadata.size(),
-            modified_ns: i128::from(metadata.mtime()) * 1_000_000_000
-                + i128::from(metadata.mtime_nsec()),
-            changed_ns: i128::from(metadata.ctime()) * 1_000_000_000
-                + i128::from(metadata.ctime_nsec()),
-        }
-    }
-
-    /// A platform without inodes names no identity this backend could hold a file to.
-    #[cfg(not(unix))]
-    fn of(metadata: &std::fs::Metadata) -> Self {
-        Self {
-            device: 0,
-            inode: 0,
-            size: metadata.len(),
-            modified_ns: 0,
-            changed_ns: 0,
-        }
-    }
-
-    /// Returns true when a file the kernel reports is this one: the same device, inode, length and
-    /// modification. The change time is left out, because the kernel's record of a mapped file does
-    /// not carry it.
-    #[must_use]
-    pub fn is_mapped_as(&self, device: u64, inode: u64, size: u64, modified_s: i64) -> bool {
-        self.device == device
-            && self.inode == inode
-            && self.size == size
-            && self.modified_ns.div_euclid(1_000_000_000) == i128::from(modified_s)
-    }
-}
-
-/// What the backend read about the executable an invocation runs.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExecutableIdentity {
-    /// The file object that was hashed.
-    pub file: FileIdentity,
-    /// The SHA-256 digest of its bytes.
-    pub digest: Digest256,
-    /// The version a signed qualification record names for that digest, where one does.
-    pub version: Option<String>,
-}
 
 /// Where one backend is.
 #[derive(Clone, Debug)]
@@ -175,6 +115,9 @@ struct Backend {
     prompt_generation: PromptGeneration,
     invocation: Invocation,
     directory: PathBuf,
+    registration: PathBuf,
+    /// Set when the backend's line is over while a launch holds it, so a rollback retires it.
+    line_over: AtomicBool,
     profile_id: LaunchProfileId,
     gateway: Arc<NativeGateway>,
     credential: Credential,
@@ -186,7 +129,7 @@ struct Backend {
     image: Mutex<Option<std::result::Result<(), String>>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     #[cfg(feature = "testing")]
-    commit_pause: Arc<Mutex<Option<CommitPause>>>,
+    confirm_pause: Arc<Mutex<Option<ConfirmPause>>>,
 }
 
 impl std::fmt::Debug for Backend {
@@ -229,21 +172,23 @@ pub struct CommandBackends {
     session_id: SessionId,
     environment_id: EnvironmentId,
     os_user: String,
-    root: PathBuf,
+    runtime_dir: PathBuf,
+    /// The session's own root, made fresh at the first establish and removed at close.
+    root: Mutex<Option<PathBuf>>,
     sources: Arc<ConnectorSources>,
     launcher: Option<PathBuf>,
     handle: tokio::runtime::Handle,
     publishes_credential_file: bool,
     backends: Mutex<Vec<Arc<Backend>>>,
-    digests: Arc<Mutex<BTreeMap<FileIdentity, Digest256>>>,
-    /// Where the next admitted launch stops before it commits, for this host's own tests.
+    hashed: Arc<HashedFiles>,
+    /// Where the next committed launch stops before the launcher is told, for this host's own tests.
     #[cfg(feature = "testing")]
-    commit_pause: Arc<Mutex<Option<CommitPause>>>,
+    confirm_pause: Arc<Mutex<Option<ConfirmPause>>>,
 }
 
-/// The two ends of one armed commit pause: what says the launch arrived, and what lets it go on.
+/// The two ends of one armed pause: what says the launch arrived there, and what lets it go on.
 #[cfg(feature = "testing")]
-type CommitPause = (
+type ConfirmPause = (
     tokio::sync::oneshot::Sender<()>,
     tokio::sync::oneshot::Receiver<()>,
 );
@@ -252,7 +197,7 @@ impl std::fmt::Debug for CommandBackends {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("CommandBackends")
-            .field("root", &self.root)
+            .field("runtime_dir", &self.runtime_dir)
             .field("launcher", &self.launcher)
             .finish_non_exhaustive()
     }
@@ -267,8 +212,8 @@ pub struct CommandBackendsConfig {
     pub environment_id: EnvironmentId,
     /// The operating-system user the session runs as.
     pub os_user: String,
-    /// The owner-only directory each backend's own directory is made in.
-    pub root: PathBuf,
+    /// The directory the session's own root is made in, fresh, at the first establish.
+    pub runtime_dir: PathBuf,
     /// The connectors the installation handed over.
     pub sources: Arc<ConnectorSources>,
     /// The installation's `kr-hook`, which the shell runs an integrated invocation through.
@@ -288,25 +233,27 @@ impl CommandBackends {
             session_id: config.session_id,
             environment_id: config.environment_id,
             os_user: config.os_user,
-            root: config.root,
+            runtime_dir: config.runtime_dir,
+            root: Mutex::new(None),
             sources: config.sources,
             launcher: config.launcher,
             handle,
             publishes_credential_file: ManagedProcess::publishes_credential_file(),
             backends: Mutex::new(Vec::new()),
-            digests: Arc::new(Mutex::new(BTreeMap::new())),
+            hashed: Arc::new(HashedFiles::default()),
             #[cfg(feature = "testing")]
-            commit_pause: Arc::new(Mutex::new(None)),
+            confirm_pause: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Stops the next launch that says it is going before it is committed, for this host's own
-    /// tests: a bridge that connects then meets a launch still being committed.
+    /// Stops the next launch that says it is going after it is committed and before the launcher is
+    /// told, for this host's own tests: the backend is committed while its process still runs the
+    /// launcher.
     ///
     /// Returns the end that says the launch has arrived there and the end that lets it go on. It is
     /// compiled away in every shipped build.
     #[cfg(feature = "testing")]
-    pub fn pause_before_commit(
+    pub fn pause_before_confirming(
         &self,
     ) -> (
         tokio::sync::oneshot::Receiver<()>,
@@ -315,7 +262,7 @@ impl CommandBackends {
         let (arrived, watch) = tokio::sync::oneshot::channel();
         let (release, go) = tokio::sync::oneshot::channel();
         *self
-            .commit_pause
+            .confirm_pause
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
         (watch, release)
@@ -369,6 +316,11 @@ impl CommandBackends {
         }
         let launcher = self.launcher()?;
         check_executable(request.executable)?;
+        let added_at =
+            added_run(request.typed, request.arguments, request.added).ok_or_else(|| {
+                "the answered vector is not the typed one with the added flags as one run"
+                    .to_owned()
+            })?;
 
         let invocation = Invocation {
             typed: request.typed.to_vec(),
@@ -382,18 +334,10 @@ impl CommandBackends {
             .backends
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // A resolve for a later line says every earlier line is over, so an earlier backend no
-        // launch took is retired.
-        let (earlier, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut *backends)
-            .into_iter()
-            .partition(|backend| {
-                backend.prompt_generation < request.prompt_generation
-                    && (backend.is_unbound() || backend.is_retired())
-            });
-        *backends = kept;
-        for backend in earlier {
-            backend.retire();
-        }
+        // A resolve for a later line says every earlier line is over.
+        end_lines(&mut backends, |generation| {
+            generation < request.prompt_generation
+        });
         // One backend per line. A retry of the same invocation is answered with the backend it was
         // given; anything else in the line runs as typed.
         if let Some(existing) = backends
@@ -409,7 +353,7 @@ impl CommandBackends {
             );
         }
         let backend = self
-            .create(request, invocation, connector)
+            .create(request, invocation, added_at, connector)
             .map_err(|error| error.to_string())?;
         let answer = self.answer(&backend, request.prompt_generation, &launcher);
         backends.push(backend);
@@ -425,24 +369,13 @@ impl CommandBackends {
             .backends
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (ended, kept): (Vec<_>, Vec<_>) =
-            std::mem::take(&mut *backends)
-                .into_iter()
-                .partition(|backend| {
-                    backend.prompt_generation <= prompt_generation
-                        && (backend.is_unbound() || backend.is_retired())
-                });
-        *backends = kept;
-        for backend in ended {
-            backend.retire();
-        }
+        end_lines(&mut backends, |generation| generation <= prompt_generation);
     }
 
-    /// Retires every backend, because the session is closing, and removes their directory.
+    /// Retires every backend, because the session is closing, and removes the session's root.
     ///
-    /// Nothing a launch is running is ended here: the session's own closure owns the program. The
-    /// launch records go with the directory: a launcher that looks now finds none and runs its
-    /// program without the integration's variable, in a session that is going away.
+    /// Nothing a launch is running is ended here: the session's own closure owns the program. A
+    /// launcher that looks now finds nothing to present to, and runs what was typed.
     pub fn close(&self) {
         let backends = std::mem::take(
             &mut *self
@@ -453,7 +386,38 @@ impl CommandBackends {
         for backend in backends {
             backend.retire();
         }
-        let _ = std::fs::remove_dir_all(&self.root);
+        let root = self
+            .root
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(root) = root {
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    /// Returns the session's root, once the first establish has made it.
+    #[must_use]
+    pub fn root(&self) -> Option<PathBuf> {
+        self.root
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Returns the session's root, making it fresh the first time: a new name in the runtime
+    /// directory, so no two sessions share one whatever their identifiers.
+    fn session_root(&self) -> Result<PathBuf> {
+        let mut root = self
+            .root
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(root) = root.as_ref() {
+            return Ok(root.clone());
+        }
+        let made = new_private_directory(&self.runtime_dir, "c")?;
+        *root = Some(made.clone());
+        Ok(made)
     }
 
     /// Returns the state of the backend established for one instance, where one is.
@@ -504,11 +468,7 @@ impl CommandBackends {
             prompt_generation,
             environment: vec![EnvironmentVariable {
                 name: "KR_REGISTRATION".to_owned(),
-                value: backend
-                    .directory
-                    .join(crate::broker::attach::REGISTRATION_FILE)
-                    .display()
-                    .to_string(),
+                value: backend.registration.display().to_string(),
             }],
             launcher: launcher.display().to_string(),
         }
@@ -519,15 +479,16 @@ impl CommandBackends {
         &self,
         request: &EstablishRequest<'_>,
         invocation: Invocation,
+        added_at: usize,
         connector: Arc<InstalledConnector>,
     ) -> Result<Arc<Backend>> {
         let _entered = self.handle.enter();
         let application_instance_id =
             ApplicationInstanceId::new(Uuid::from_bytes(*kr_ipc::new_uuid().as_bytes()));
-        make_private_directory(&self.root)?;
         // A socket path has a small fixed bound, so the backend's directory has a short name of its
         // own rather than the instance's identifier; it is fresh, and taken new.
-        let directory = new_private_directory(&self.root)?;
+        let directory = new_private_directory(&self.session_root()?, "")?;
+        let registration = directory.join(registration_name(added_at, invocation.added.len()));
         let profile_id = crate::broker::profiles::new_profile_id(kr_ipc::now_ms())?;
         let launch = NativeLaunch {
             profile_id: profile_id.clone(),
@@ -552,7 +513,6 @@ impl CommandBackends {
         let record = serde_json::json!({
             "endpoint": gateway.address().for_diagnostics(),
             "credential": credential_path.display().to_string(),
-            "added": invocation.added,
         });
         kr_ipc::paths::write_owner_only_file(
             &directory.join(LAUNCH_RECORD_FILE),
@@ -568,6 +528,8 @@ impl CommandBackends {
             prompt_generation: request.prompt_generation,
             invocation,
             directory,
+            registration,
+            line_over: AtomicBool::new(false),
             profile_id,
             gateway,
             credential,
@@ -579,20 +541,18 @@ impl CommandBackends {
             image: Mutex::new(None),
             tasks: Mutex::new(Vec::new()),
             #[cfg(feature = "testing")]
-            commit_pause: Arc::clone(&self.commit_pause),
+            confirm_pause: Arc::clone(&self.confirm_pause),
         });
         let reading = {
             let path = PathBuf::from(&backend.invocation.executable);
-            let digests = Arc::clone(&self.digests);
+            let hashed = Arc::clone(&self.hashed);
             let connector = Arc::clone(&backend.connector);
             self.handle.spawn_blocking(move || {
-                let read = read_identity(&path, &digests).map(|(file, digest)| {
-                    let version = connector.qualified_version(&digest).map(str::to_owned);
-                    ExecutableIdentity {
-                        file,
-                        digest,
-                        version,
-                    }
+                let read = crate::broker::image::read_identity(&path, &hashed).map(|hashed| {
+                    let version = connector
+                        .qualified_version(&hashed.digest)
+                        .map(str::to_owned);
+                    ExecutableIdentity { hashed, version }
                 });
                 let _ = identity_sender.send(Some(read));
             })
@@ -621,10 +581,12 @@ impl Backend {
         matches!(*self.state.borrow(), BackendState::Retired)
     }
 
-    /// Ends this backend: no more connections, no endpoint, no credential and no registration.
+    /// Ends this backend: no more connections, no running admission, no endpoint, no credential, no
+    /// registration and no launch record.
     ///
-    /// The launch record stays until the session's directory goes, so a launcher that looks later
-    /// still finds the flags it has to leave out.
+    /// Each admission task ends when it sees the state become retired, dropping its connection and
+    /// any guard it holds. A launcher that looks later finds nothing and runs what was typed, which
+    /// its variable's file name tells it.
     fn retire(&self) {
         self.state.send_replace(BackendState::Retired);
         for task in self
@@ -636,14 +598,47 @@ impl Backend {
             task.abort();
         }
         let _ = std::fs::remove_file(self.directory.join(crate::broker::attach::CREDENTIAL_FILE));
-        let _ = std::fs::remove_file(
-            self.directory
-                .join(crate::broker::attach::REGISTRATION_FILE),
-        );
+        let _ = std::fs::remove_file(&self.registration);
+        let _ = std::fs::remove_file(self.directory.join(LAUNCH_RECORD_FILE));
         if let crate::broker::listener::ListenerAddress::PrivateSocket(socket) =
             self.gateway.address()
         {
             let _ = std::fs::remove_file(socket);
+        }
+    }
+
+    /// Marks this backend's line as over: unbound, it is retired now; being launched, its rollback
+    /// will retire it. Returns true when it is done with and can be forgotten.
+    fn end_line(&self) -> bool {
+        self.line_over.store(true, Ordering::SeqCst);
+        if self.is_unbound() || self.is_retired() {
+            self.retire();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Takes back a launch that did not go: the backend is unbound again for a retry of the same
+    /// invocation, or retired when its line ended meanwhile.
+    fn roll_back(&self) {
+        let _ = std::fs::remove_file(&self.registration);
+        let mut retired = false;
+        self.state.send_if_modified(|state| {
+            if matches!(state, BackendState::Launching) {
+                if self.line_over.load(Ordering::SeqCst) {
+                    *state = BackendState::Retired;
+                    retired = true;
+                } else {
+                    *state = BackendState::Unbound;
+                }
+                true
+            } else {
+                false
+            }
+        });
+        if retired {
+            self.retire();
         }
     }
 
@@ -700,7 +695,13 @@ async fn serve(backend: Arc<Backend>, broker: Arc<Broker>, environment_id: Envir
         let broker = Arc::clone(&broker);
         tokio::spawn(async move {
             let _permit = permit;
-            admit(backend, broker, environment_id, accepted).await;
+            // Retiring the backend ends the admission wherever it is: its connection closes, and a
+            // guard it holds gives back.
+            let mut state = backend.state.subscribe();
+            tokio::select! {
+                () = admit(Arc::clone(&backend), broker, environment_id, accepted) => {}
+                _ = state.wait_for(|state| matches!(state, BackendState::Retired)) => {}
+            }
         });
     }
 }
@@ -726,10 +727,15 @@ async fn admit(
             else {
                 return;
             };
+            // Only the program's own bridges may ask whether it executes what was hashed.
+            let Ok(authenticated) = backend.gateway.authenticate_bridge(pending, &registration)
+            else {
+                return;
+            };
             if let Err(_refused) = verify_once(&backend, &registration) {
                 return;
             }
-            let Ok(admitted) = backend.gateway.admit_bridge(pending, &registration).await else {
+            let Ok(admitted) = authenticated.admit().await else {
                 return;
             };
             match admitted.surface {
@@ -772,7 +778,10 @@ async fn committed(
     }
 }
 
-/// Checks, once for the instance, that the committed process runs the file this backend hashed.
+/// Checks, once for the instance, that the committed process executes what this backend hashed.
+///
+/// Only an authenticated bridge asks: it descends from the registered process, which starts no child
+/// before its exec, so the verdict kept is taken after the exec.
 fn verify_once(backend: &Backend, registration: &Registration) -> std::result::Result<(), String> {
     let mut image = backend
         .image
@@ -786,8 +795,9 @@ fn verify_once(backend: &Backend, registration: &Registration) -> std::result::R
         .borrow()
         .clone()
         .unwrap_or_else(|| Err("the executable's identity was never read".to_owned()));
-    let verified =
-        identity.and_then(|identity| verify_image(&registration.expected_process, &identity.file));
+    let verified = identity.and_then(|identity| {
+        crate::broker::image::verify_image(&registration.expected_process, &identity)
+    });
     *image = Some(verified.clone());
     verified
 }
@@ -850,7 +860,8 @@ async fn admit_launch(
         .map_err(|error| {
             BrokerError::denied(format!("the executable presented cannot be read: {error}"))
         })?;
-    if launch.executable != backend.invocation.executable || presented_file != identity.file {
+    if launch.executable != backend.invocation.executable || presented_file != identity.hashed.file
+    {
         return Err(BrokerError::denied(
             "the executable presented is not the file this backend was established for",
         ));
@@ -886,7 +897,7 @@ async fn admit_launch(
     let registered = match admitted {
         Ok(registered) => registered,
         Err(error) => {
-            backend.settle_launch(BackendState::Unbound);
+            backend.roll_back();
             return Err(error);
         }
     };
@@ -898,31 +909,15 @@ async fn admit_launch(
         Ok(Ok(Some(ref frame))) if is_going(frame)
     );
     if !said_going {
-        let _ = std::fs::remove_file(
-            backend
-                .directory
-                .join(crate::broker::attach::REGISTRATION_FILE),
-        );
         drop(guard);
-        backend.settle_launch(BackendState::Unbound);
+        backend.roll_back();
         return Err(BrokerError::denied(
             "the admitted launch did not say it is going",
         ));
     }
-    #[cfg(feature = "testing")]
-    {
-        let armed = backend
-            .commit_pause
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some((arrived, go)) = armed {
-            let _ = arrived.send(());
-            let _ = go.await;
-        }
-    }
     if !backend.settle_launch(BackendState::Committed(Arc::new(registration))) {
-        // Retired while the launch was admitted: the session is closing, and nothing is kept.
+        // Retired while the launch was admitted: nothing is kept, and the launcher, which is not
+        // told it is committed, runs what was typed.
         drop(guard);
         return Err(BrokerError::denied("this backend was retired"));
     }
@@ -933,6 +928,22 @@ async fn admit_launch(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push(supervising);
+    #[cfg(feature = "testing")]
+    {
+        let armed = backend
+            .confirm_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            let _ = go.await;
+        }
+    }
+    // The launcher execs with the integration's flags only on this. Should it not arrive, the
+    // launcher runs what was typed without the variable, and the instance, which names that process,
+    // has no bridge and ends with it.
+    stream.write_frame(&confirmation()).await?;
     Ok(())
 }
 
@@ -952,7 +963,7 @@ async fn admit_claimed<'a>(
         environment_id,
         binary: BinaryIdentity {
             resolved_path: backend.invocation.executable.clone(),
-            digest: identity.digest,
+            digest: identity.hashed.digest,
             version: identity
                 .version
                 .clone()
@@ -973,7 +984,7 @@ async fn admit_claimed<'a>(
         crate::broker::process::TransportHandle {
             transport: crate::broker::process::BrokerTransport::PrivateSocket,
             application_instance_id: backend.application_instance_id,
-            executable_digest: identity.digest,
+            executable_digest: identity.hashed.digest,
             process: process.clone(),
         },
         backend.credential.duplicate(),
@@ -995,14 +1006,12 @@ async fn admit_claimed<'a>(
             .join(crate::broker::attach::CREDENTIAL_FILE),
     );
     let published = format!("{}framing=json_lines\n", registration.to_file());
-    let registration_path = backend
-        .directory
-        .join(crate::broker::attach::REGISTRATION_FILE);
-    kr_ipc::paths::write_owner_only_file(&registration_path, published.as_bytes()).map_err(
+    let registration_path = &backend.registration;
+    kr_ipc::paths::write_owner_only_file(registration_path, published.as_bytes()).map_err(
         |error| BrokerError::ledger(format!("could not write the registration: {error}")),
     )?;
     if let Err(error) = stream.write_frame(&admission()).await {
-        let _ = std::fs::remove_file(&registration_path);
+        let _ = std::fs::remove_file(registration_path);
         return Err(error);
     }
     Ok((registered, registration))
@@ -1011,6 +1020,13 @@ async fn admit_claimed<'a>(
 /// The frame a launch that was admitted is answered with.
 fn admission() -> Vec<u8> {
     serde_json::json!({ "kr_launch": { "admitted": true } })
+        .to_string()
+        .into_bytes()
+}
+
+/// The frame a launch that was committed is answered with; the launcher execs on it.
+fn confirmation() -> Vec<u8> {
+    serde_json::json!({ "kr_launch": { "committed": true } })
         .to_string()
         .into_bytes()
 }
@@ -1042,6 +1058,34 @@ async fn supervise(backend: Arc<Backend>, broker: Arc<Broker>, process: ProcessS
         }
         tokio::time::sleep(SUPERVISION_POLL).await;
     }
+}
+
+/// Ends the lines `ended` says are over: their unbound backends are retired and forgotten, and a
+/// backend being launched is marked so that its rollback retires it.
+fn end_lines(backends: &mut Vec<Arc<Backend>>, ended: impl Fn(PromptGeneration) -> bool) {
+    backends.retain(|backend| !(ended(backend.prompt_generation) && backend.end_line()));
+}
+
+/// Returns where the added flags stand in the answered vector: the index of the one run whose
+/// removal gives the typed vector.
+fn added_run(typed: &[String], answered: &[String], added: &[String]) -> Option<usize> {
+    if answered.len() != typed.len().checked_add(added.len())? {
+        return None;
+    }
+    if added.is_empty() {
+        return (answered == typed).then_some(0);
+    }
+    (0..=typed.len()).find(|&at| {
+        answered.get(at..at + added.len()) == Some(added)
+            && answered.get(..at) == typed.get(..at)
+            && answered.get(at + added.len()..) == typed.get(at..)
+    })
+}
+
+/// The file name a backend's registration is published under, which tells the launcher where the
+/// added flags stand: `registration.<at>.<count>`.
+fn registration_name(at: usize, count: usize) -> String {
+    format!("{REGISTRATION_PREFIX}.{at}.{count}")
 }
 
 /// Refuses an executable that is not an absolute path to a regular file.
@@ -1098,8 +1142,9 @@ fn make_private_directory(directory: &Path) -> Result<()> {
     crate::broker::process::check_private_directory(directory)
 }
 
-/// Makes a new owner-only directory with a short fresh name inside `root`.
-fn new_private_directory(root: &Path) -> Result<PathBuf> {
+/// Makes a new owner-only directory with a short fresh name, `prefix` then eight hexadecimal
+/// digits, inside `root`; a name already there is drawn again.
+fn new_private_directory(root: &Path, prefix: &str) -> Result<PathBuf> {
     for _ in 0..8 {
         let name: String = kr_ipc::new_uuid()
             .to_string()
@@ -1107,7 +1152,7 @@ fn new_private_directory(root: &Path) -> Result<PathBuf> {
             .filter(char::is_ascii_hexdigit)
             .take(8)
             .collect();
-        let directory = root.join(name);
+        let directory = root.join(format!("{prefix}{name}"));
         match std::fs::create_dir(&directory) {
             Ok(()) => {
                 make_private_directory(&directory)?;
@@ -1126,73 +1171,6 @@ fn new_private_directory(root: &Path) -> Result<PathBuf> {
         "no fresh backend directory could be made in {}",
         root.display()
     )))
-}
-
-/// Reads one executable's identity and digest through one opened file.
-///
-/// The identity is read before and after the bytes are hashed through the same descriptor, so the
-/// digest belongs to the file object the identity names; a file that changed meanwhile is read
-/// again, and one that keeps changing is not read at all. A script is refused: the image its process
-/// runs is its interpreter, which nothing here could tie to it.
-fn read_identity(
-    path: &Path,
-    digests: &Mutex<BTreeMap<FileIdentity, Digest256>>,
-) -> std::result::Result<(FileIdentity, Digest256), String> {
-    use sha2::Digest as _;
-    use std::io::Read as _;
-    for _ in 0..IDENTITY_ATTEMPTS {
-        let mut file = std::fs::File::open(path)
-            .map_err(|error| format!("{} cannot be read: {error}", path.display()))?;
-        let before = file
-            .metadata()
-            .map(|metadata| FileIdentity::of(&metadata))
-            .map_err(|error| format!("{} cannot be read: {error}", path.display()))?;
-        let cached = digests
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&before)
-            .copied();
-        if let Some(digest) = cached {
-            return Ok((before, digest));
-        }
-        let mut hasher = sha2::Sha256::new();
-        let mut buffer = vec![0_u8; 1 << 20];
-        let mut first = true;
-        loop {
-            let read = file
-                .read(&mut buffer)
-                .map_err(|error| format!("{} cannot be read: {error}", path.display()))?;
-            if read == 0 {
-                break;
-            }
-            let chunk = buffer.get(..read).unwrap_or_default();
-            if first && chunk.starts_with(b"#!") {
-                return Err(format!(
-                    "{} is a script, and the program it runs is its interpreter",
-                    path.display()
-                ));
-            }
-            first = false;
-            hasher.update(chunk);
-        }
-        let after = file
-            .metadata()
-            .map(|metadata| FileIdentity::of(&metadata))
-            .map_err(|error| format!("{} cannot be read: {error}", path.display()))?;
-        if before != after {
-            continue;
-        }
-        let digest = Digest256::from_bytes(hasher.finalize().into());
-        digests
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(before, digest);
-        return Ok((before, digest));
-    }
-    Err(format!(
-        "{} kept changing while it was read",
-        path.display()
-    ))
 }
 
 /// Refuses a process that started before `established_at`, on the clock the kernel records starts
@@ -1256,206 +1234,9 @@ const fn forward_now() -> Option<u64> {
     None
 }
 
-/// Checks, from the kernel's own record, that a process runs the file object this backend hashed.
-#[cfg(target_os = "linux")]
-fn verify_image(
-    process: &ProcessStartIdentity,
-    file: &FileIdentity,
-) -> std::result::Result<(), String> {
-    use std::os::unix::fs::MetadataExt as _;
-    let link = format!("/proc/{}/exe", process.pid.get());
-    let executed = std::fs::metadata(&link).map_err(|error| {
-        format!(
-            "the image of process {} cannot be read: {error}",
-            process.pid
-        )
-    })?;
-    if !matches!(
-        kr_ipc::identity::process_state(process),
-        kr_ipc::identity::ProcessState::Running
-    ) {
-        return Err(format!("process {} is not the one registered", process.pid));
-    }
-    if file.is_mapped_as(
-        executed.dev(),
-        executed.ino(),
-        executed.size(),
-        executed.mtime(),
-    ) {
-        Ok(())
-    } else {
-        Err(format!(
-            "process {} runs another file than the one its launch presented",
-            process.pid
-        ))
-    }
-}
-
-/// Checks, from the kernel's own record, that a process runs the file object this backend hashed.
-///
-/// The kernel's record of the process's mapped regions names each region's file by its vnode. The
-/// executed image is always mapped, and nothing of the launcher survives its exec, so the check
-/// holds when a mapped region's file is the one that was hashed.
-#[cfg(target_os = "macos")]
-fn verify_image(
-    process: &ProcessStartIdentity,
-    file: &FileIdentity,
-) -> std::result::Result<(), String> {
-    let pid = i32::try_from(process.pid.get())
-        .map_err(|_| format!("{} is not a process identifier", process.pid))?;
-    let mut address = 0_u64;
-    for _ in 0..MAX_REGIONS {
-        let Ok(region) =
-            libproc::libproc::proc_pid::pidinfo::<regions::RegionWithPathInfo>(pid, address)
-        else {
-            break;
-        };
-        let stat = &region.prp_vip.vip_vi.vi_stat;
-        if stat.vst_ino != 0
-            && file.is_mapped_as(
-                u64::from(stat.vst_dev),
-                stat.vst_ino,
-                u64::try_from(stat.vst_size).unwrap_or(u64::MAX),
-                stat.vst_mtime,
-            )
-        {
-            return if matches!(
-                kr_ipc::identity::process_state(process),
-                kr_ipc::identity::ProcessState::Running
-            ) {
-                Ok(())
-            } else {
-                Err(format!("process {} is not the one registered", process.pid))
-            };
-        }
-        let next = region
-            .prp_prinfo
-            .pri_address
-            .saturating_add(region.prp_prinfo.pri_size);
-        if next <= address {
-            break;
-        }
-        address = next;
-    }
-    Err(format!(
-        "process {} maps no file that is the one its launch presented",
-        process.pid
-    ))
-}
-
-/// The most regions one image check reads.
-#[cfg(target_os = "macos")]
-const MAX_REGIONS: usize = 1 << 16;
-
-/// No record of a process's image is read on this platform, so nothing here is verified.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn verify_image(
-    process: &ProcessStartIdentity,
-    _file: &FileIdentity,
-) -> std::result::Result<(), String> {
-    Err(format!(
-        "this platform keeps no record of the image process {} runs",
-        process.pid
-    ))
-}
-
-/// The kernel's record of one mapped region, as `proc_pidinfo` answers `PROC_PIDREGIONPATHINFO`.
-#[cfg(target_os = "macos")]
-mod regions {
-    use libproc::libproc::net_info::VInfoStat;
-    use libproc::libproc::proc_pid::{PIDInfo, PidInfoFlavor};
-
-    /// `struct proc_regioninfo`.
-    #[repr(C)]
-    pub struct RegionInfo {
-        pub pri_protection: u32,
-        pub pri_max_protection: u32,
-        pub pri_inheritance: u32,
-        pub pri_flags: u32,
-        pub pri_offset: u64,
-        pub pri_behavior: u32,
-        pub pri_user_wired_count: u32,
-        pub pri_user_tag: u32,
-        pub pri_pages_resident: u32,
-        pub pri_pages_shared_now_private: u32,
-        pub pri_pages_swapped_out: u32,
-        pub pri_pages_dirtied: u32,
-        pub pri_ref_count: u32,
-        pub pri_shadow_depth: u32,
-        pub pri_share_mode: u32,
-        pub pri_private_pages_resident: u32,
-        pub pri_shared_pages_resident: u32,
-        pub pri_obj_id: u32,
-        pub pri_depth: u32,
-        pub pri_address: u64,
-        pub pri_size: u64,
-    }
-
-    /// `struct vnode_info`.
-    #[repr(C)]
-    pub struct VnodeInfo {
-        pub vi_stat: VInfoStat,
-        pub vi_type: i32,
-        pub vi_pad: i32,
-        pub vi_fsid: [i32; 2],
-    }
-
-    /// `struct vnode_info_path`.
-    #[repr(C)]
-    pub struct VnodeInfoPath {
-        pub vip_vi: VnodeInfo,
-        pub vip_path: [u8; 1024],
-    }
-
-    /// `struct proc_regionwithpathinfo`.
-    #[repr(C)]
-    pub struct RegionWithPathInfo {
-        pub prp_prinfo: RegionInfo,
-        pub prp_vip: VnodeInfoPath,
-    }
-
-    impl PIDInfo for RegionWithPathInfo {
-        fn flavor() -> PidInfoFlavor {
-            PidInfoFlavor::RegionPathInfo
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The kernel's record of this test's own regions names this test's own executable, which is
-    /// what pins the record's layout on the platform that has it.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn a_process_s_own_image_is_the_file_it_was_started_from() {
-        let exe = std::env::current_exe().expect("this test's executable");
-        let digests = Mutex::new(BTreeMap::new());
-        let (file, _digest) = read_identity(&exe, &digests).expect("its identity is read");
-        let me = kr_ipc::identity::current_process_start_identity().expect("this process");
-        verify_image(&me, &file).expect("this process runs its own executable");
-        let other = FileIdentity {
-            inode: file.inode.wrapping_add(1),
-            ..file
-        };
-        assert!(
-            verify_image(&me, &other).is_err(),
-            "and not a file it was not started from"
-        );
-    }
-
-    #[test]
-    fn a_script_is_not_an_executable_this_backend_holds() {
-        let directory = std::env::temp_dir().join(format!("kr-script-{}", kr_ipc::new_uuid()));
-        std::fs::create_dir_all(&directory).expect("a directory");
-        let script = directory.join("claude");
-        std::fs::write(&script, b"#!/bin/sh\nexec true\n").expect("a script");
-        let digests = Mutex::new(BTreeMap::new());
-        let refused = read_identity(&script, &digests).expect_err("a script is refused");
-        assert!(refused.contains("script"), "{refused}");
-        let _ = std::fs::remove_dir_all(&directory);
-    }
 
     fn registration() -> Arc<Registration> {
         Arc::new(Registration::new(
@@ -1513,6 +1294,55 @@ mod tests {
                 .is_none(),
             "a backend no launch holds admits no bridge"
         );
+    }
+
+    fn words(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| (*part).to_owned()).collect()
+    }
+
+    #[test]
+    fn the_added_flags_are_found_where_they_stand() {
+        let added = words(&["--flag", "value"]);
+        assert_eq!(
+            added_run(
+                &words(&["claude", "--", "prompt"]),
+                &words(&["claude", "--flag", "value", "--", "prompt"]),
+                &added
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            added_run(
+                &words(&["claude", "-p"]),
+                &words(&["claude", "-p", "--flag", "value"]),
+                &added
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            added_run(&words(&["claude"]), &words(&["claude"]), &[]),
+            Some(0),
+            "nothing added"
+        );
+        assert_eq!(
+            added_run(
+                &words(&["claude", "-p"]),
+                &words(&["claude", "--flag", "-p", "value"]),
+                &added
+            ),
+            None,
+            "not one run"
+        );
+        assert_eq!(
+            added_run(
+                &words(&["claude", "-p"]),
+                &words(&["claude", "-q", "--flag", "value"]),
+                &added
+            ),
+            None,
+            "not the typed vector around it"
+        );
+        assert_eq!(registration_name(3, 2), "registration.3.2");
     }
 
     #[test]

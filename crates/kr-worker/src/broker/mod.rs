@@ -59,6 +59,7 @@ pub mod error;
 pub mod framing;
 pub mod gateway;
 pub mod host;
+pub mod image;
 pub mod ledger;
 pub mod listener;
 pub mod methods;

@@ -11,8 +11,8 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-12.07 | the backend and its registration exist before the program runs, and a refused invocation runs as typed |
-//! | KR-REQ-05.09 | a launch is admitted by the kernel's account of its process, its parent and its start, and the backend's credential |
+//! | KR-REQ-12.07 | the backend and its registration exist before the program runs; a refused, timed-out, uncommitted or orphaned invocation runs as typed |
+//! | KR-REQ-05.09 | a launch is admitted by the kernel's account of its process, its parent and its start, and the backend's credential; the program's bridges only when it executes what was hashed |
 //! | KR-REQ-11.34 | the launched program's hooks are admitted against the registration the launch published |
 
 #![cfg(unix)]
@@ -162,14 +162,15 @@ impl Shell {
         let broker = Arc::new(
             Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens"),
         );
-        let root = placed.host.root().join("c");
+        // The host tree itself, so a backend's socket path stays inside the bound it has on macOS.
+        let runtime_dir = placed.host.root().to_path_buf();
         let backends = CommandBackends::new(
             Arc::clone(&broker),
             CommandBackendsConfig {
                 session_id: session(),
                 environment_id: EnvironmentId::new(Uuid::from_bytes([4; 16])),
                 os_user: "someone".to_owned(),
-                root,
+                runtime_dir,
                 sources,
                 launcher: Some(placed.forwarder.clone()),
             },
@@ -204,7 +205,11 @@ impl Shell {
 
     /// The answered vector: the typed one with the integration's flags added.
     fn answered() -> Vec<String> {
-        let mut answered = Self::typed();
+        Self::answered_for(&Self::typed())
+    }
+
+    fn answered_for(typed: &[String]) -> Vec<String> {
+        let mut answered = typed.to_vec();
         answered.extend(words(&fixture::FLAGS));
         answered
     }
@@ -215,12 +220,16 @@ impl Shell {
     }
 
     fn establish_for(&self, executable: &Path) -> CommandBackend {
+        self.establish_with(executable, &Self::typed())
+    }
+
+    fn establish_with(&self, executable: &Path, typed: &[String]) -> CommandBackend {
         let generation = self
             .generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let integration = Self::integration();
-        let typed = Self::typed();
-        let answered = Self::answered();
+        let typed = typed.to_vec();
+        let answered = Self::answered_for(&typed);
         let added = words(&fixture::FLAGS);
         let _entered = self.runtime.enter();
         self.backends
@@ -309,11 +318,26 @@ impl Shell {
         }
     }
 
-    fn directory(answer: &CommandBackend) -> PathBuf {
+    fn registration(answer: &CommandBackend) -> PathBuf {
         PathBuf::from(&answer.environment[0].value)
+    }
+
+    fn directory(answer: &CommandBackend) -> PathBuf {
+        Self::registration(answer)
             .parent()
             .expect("the backend's directory")
             .to_path_buf()
+    }
+
+    /// The instance a published registration names.
+    fn registered_instance(answer: &CommandBackend) -> ApplicationInstanceId {
+        std::fs::read_to_string(Self::registration(answer))
+            .expect("the registration")
+            .lines()
+            .find_map(|line| line.strip_prefix("instance="))
+            .expect("it names an instance")
+            .parse()
+            .expect("an instance")
     }
 }
 
@@ -366,12 +390,13 @@ fn assert_typed(report: &BTreeMap<String, String>, what: &str) {
 /// KR-REQ-12.07, KR-REQ-05.09: the root shell's own child, started after the establish, with the
 /// backend's credential and the answered invocation, is admitted, and its registration exists
 /// when the program first runs and names the program. When the program ends, so do the instance,
-/// the endpoint, the credential and the registration; the launch record stays.
+/// the endpoint, the credential, the registration and the launch record.
 #[test]
 fn kr_req_12_07_a_launch_is_published_before_the_program_runs() {
     let shell = Shell::new();
     let answer = shell.establish();
     let directory = Shell::directory(&answer);
+    let registration = Shell::registration(&answer);
     let child = shell.launch(&answer, "first", &[("LINGER", "1")]);
     let report = shell.report("first");
     assert_eq!(
@@ -408,10 +433,14 @@ fn kr_req_12_07_a_launch_is_published_before_the_program_runs() {
     eventually("the instance ends with its program", || {
         shell.broker.binding_state(instance).is_err()
     });
-    eventually("its endpoint, credential and registration go", || {
-        !directory.join("credential").exists() && !directory.join("registration").exists()
-    });
-    assert!(directory.join("launch").exists(), "the launch record stays");
+    eventually(
+        "its endpoint, credential, registration and record go",
+        || {
+            !directory.join("credential").exists()
+                && !registration.exists()
+                && !directory.join("launch").exists()
+        },
+    );
 }
 
 /// KR-REQ-05.09, KR-REQ-12.07: a launch the backend refuses runs as typed, without the flags and
@@ -502,36 +531,11 @@ fn kr_req_05_09_a_refused_launch_runs_the_invocation_as_typed() {
 #[test]
 fn kr_req_12_07_a_backend_that_does_not_answer_leaves_the_invocation_as_typed() {
     let shell = Shell::new();
-    let quiet = shell.placed.host.root().join("q");
-    std::fs::create_dir_all(&quiet).expect("a directory");
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&quiet, std::fs::Permissions::from_mode(0o700)).expect("private");
-    }
+    let quiet = private(&shell, "q");
     let endpoint = quiet.join("e.sock");
     // Listening, so the launcher connects, and never accepting, so nothing answers it.
     let listener = std::os::unix::net::UnixListener::bind(&endpoint).expect("a quiet endpoint");
-    kr_ipc::paths::create_new_owner_only_file(
-        &quiet.join("credential"),
-        "09".repeat(32).as_bytes(),
-    )
-    .expect("a credential");
-    let record = serde_json::json!({
-        "endpoint": endpoint.display().to_string(),
-        "credential": quiet.join("credential").display().to_string(),
-        "added": fixture::FLAGS,
-    });
-    kr_ipc::paths::write_owner_only_file(&quiet.join("launch"), record.to_string().as_bytes())
-        .expect("a launch record");
-    let answer = CommandBackend {
-        session_id: session(),
-        prompt_generation: PromptGeneration::new(1),
-        environment: vec![EnvironmentVariable {
-            name: "KR_REGISTRATION".to_owned(),
-            value: quiet.join("registration").display().to_string(),
-        }],
-        launcher: shell.placed.forwarder.display().to_string(),
-    };
+    let answer = hand_made_backend(&shell, &quiet, &endpoint);
     let started = Instant::now();
     let (_, said) = finish(shell.launch(&answer, "quiet", &[]));
     assert!(
@@ -549,17 +553,17 @@ fn kr_req_12_07_a_backend_that_does_not_answer_leaves_the_invocation_as_typed() 
 fn kr_req_12_07_a_launch_that_never_goes_is_rolled_back() {
     let shell = Shell::new();
     let answer = shell.establish();
-    let directory = Shell::directory(&answer);
+    let registration = Shell::registration(&answer);
     let mut held = shell.launcher(&shell.executable, &Shell::answered(), Some(20_000));
     shell.prepare(&mut held, Some(&answer), "held", &[]);
     let mut held = held.spawn().expect("the launcher starts");
     eventually("the registration is published on the admission", || {
-        directory.join("registration").exists()
+        registration.exists()
     });
     let _ = held.kill();
     let _ = held.wait();
     eventually("and taken back when the launch does not go", || {
-        !directory.join("registration").exists()
+        !registration.exists()
     });
 
     let child = shell.launch(&answer, "retry", &[]);
@@ -569,7 +573,7 @@ fn kr_req_12_07_a_launch_that_never_goes_is_rolled_back() {
 }
 
 /// KR-REQ-12.07: a launcher stopped before it looked, whose line then ended, still runs the
-/// invocation as typed when it is resumed: the launch record outlives the backend.
+/// invocation as typed when it is resumed: what was typed is in its variable's file name.
 #[test]
 fn kr_req_12_07_a_launcher_resumed_after_its_line_ended_runs_as_typed() {
     let shell = Shell::new();
@@ -661,10 +665,8 @@ fn kr_req_11_34_the_launched_program_s_hook_moves_the_binding_and_a_replaced_one
         ],
     );
     let held = held.spawn().expect("the launcher starts");
-    let directory = Shell::directory(&answer);
-    eventually("the launch is admitted", || {
-        directory.join("registration").exists()
-    });
+    let registration = Shell::registration(&answer);
+    eventually("the launch is admitted", || registration.exists());
     retarget(&swapped, another);
     let report = shell.report("swapped");
     assert_eq!(report["registered"], "yes", "the launch went ahead");
@@ -733,4 +735,405 @@ fn kr_req_05_09_admissions_run_beside_each_other_up_to_their_bound() {
          {read:?}"
     );
     drop(held);
+}
+
+/// A backend directory made by hand around `endpoint`: its credential, its launch record, and an
+/// answer naming a registration whose file name places the two added flags after the typed vector.
+fn hand_made_backend(shell: &Shell, directory: &Path, endpoint: &Path) -> CommandBackend {
+    kr_ipc::paths::create_new_owner_only_file(
+        &directory.join("credential"),
+        "09".repeat(32).as_bytes(),
+    )
+    .expect("a credential");
+    let record = serde_json::json!({
+        "endpoint": endpoint.display().to_string(),
+        "credential": directory.join("credential").display().to_string(),
+    });
+    kr_ipc::paths::write_owner_only_file(&directory.join("launch"), record.to_string().as_bytes())
+        .expect("a launch record");
+    CommandBackend {
+        session_id: session(),
+        prompt_generation: PromptGeneration::new(1),
+        environment: vec![EnvironmentVariable {
+            name: "KR_REGISTRATION".to_owned(),
+            value: directory
+                .join(format!("registration.{}.2", Shell::typed().len()))
+                .display()
+                .to_string(),
+        }],
+        launcher: shell.placed.forwarder.display().to_string(),
+    }
+}
+
+/// A private directory for a backend made by hand.
+fn private(shell: &Shell, name: &str) -> PathBuf {
+    let directory = shell.placed.host.root().join(name);
+    std::fs::create_dir_all(&directory).expect("a directory");
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+            .expect("private");
+    }
+    directory
+}
+
+/// KR-REQ-12.07: the session closed after the launch was admitted and before it went: the
+/// admission ends with the backend at once, its guard giving the instance back, and the launcher,
+/// which is never told its launch is committed, runs what was typed.
+#[test]
+fn kr_req_12_07_a_launch_whose_session_closed_before_it_went_runs_as_typed() {
+    let shell = Shell::new();
+    let answer = shell.establish();
+    let registration = Shell::registration(&answer);
+    // Held past the backend's going deadline, so an admission that outlived its backend would give
+    // the instance back only when that deadline fired.
+    let mut held = shell.launcher(&shell.executable, &Shell::answered(), Some(3000));
+    shell.prepare(&mut held, Some(&answer), "closed", &[]);
+    let held = held.spawn().expect("the launcher starts");
+    eventually("the launch is admitted", || registration.exists());
+    let admitted_at = Instant::now();
+    let instance = Shell::registered_instance(&answer);
+    shell.backends.close();
+    eventually("the admission ends with its backend", || {
+        shell.broker.binding_state(instance).is_err()
+    });
+    assert!(
+        admitted_at.elapsed() < kr_worker::broker::commands::GOING_DEADLINE,
+        "the instance was given back when the backend was retired, not when the launch timed out: \
+         {:?}",
+        admitted_at.elapsed()
+    );
+    let _ = finish(held);
+    assert_typed(
+        &shell.report("closed"),
+        "a launch whose session closed before it went",
+    );
+}
+
+/// KR-REQ-12.07: a backend being launched when its line ends, or when a later line is resolved, is
+/// retired by its rollback rather than handed back unbound, so a retry of the old answer runs as
+/// typed.
+#[test]
+fn kr_req_12_07_a_launch_rolled_back_after_its_line_ended_retires_its_backend() {
+    let shell = Shell::new();
+    for (case, end) in [
+        (
+            "line",
+            Box::new(|shell: &Shell, answer: &CommandBackend| {
+                shell.backends.line_ended(answer.prompt_generation);
+            }) as Box<dyn Fn(&Shell, &CommandBackend)>,
+        ),
+        (
+            "later",
+            Box::new(|shell: &Shell, _: &CommandBackend| {
+                let _ = shell.establish();
+            }),
+        ),
+    ] {
+        let answer = shell.establish();
+        let registration = Shell::registration(&answer);
+        let mut held = shell.launcher(&shell.executable, &Shell::answered(), Some(20_000));
+        shell.prepare(&mut held, Some(&answer), &format!("{case}-held"), &[]);
+        let mut held = held.spawn().expect("the launcher starts");
+        eventually("the launch is admitted", || registration.exists());
+        end(&shell, &answer);
+        let _ = held.kill();
+        let _ = held.wait();
+        eventually("the launch is rolled back", || !registration.exists());
+        let retry = format!("{case}-retry");
+        let _ = finish(shell.launch(&answer, &retry, &[]));
+        assert_typed(
+            &shell.report(&retry),
+            &format!("a retry after its {case} ended"),
+        );
+        assert!(
+            !Shell::directory(&answer).join("credential").exists(),
+            "{case}: the backend was retired"
+        );
+    }
+}
+
+/// KR-REQ-05.09: a hello from a process the program did not start, waiting while the launch is
+/// committed and the process still runs the launcher, cannot decide whether the program executes
+/// what was hashed: it is refused before that is asked, and the program's own hook is admitted.
+#[test]
+fn kr_req_05_09_a_hello_that_is_not_the_program_s_own_decides_nothing() {
+    let shell = Shell::new();
+    let hook = shell.placed.forwarder.display().to_string();
+    let (arrived, release) = shell.backends.pause_before_confirming();
+    let answer = shell.establish();
+    let registration = Shell::registration(&answer);
+    let child = shell.launch(
+        &answer,
+        "own",
+        &[
+            ("HOOK", hook.as_str()),
+            ("HOOK_EVENT", SESSION_START),
+            ("LINGER", "2"),
+        ],
+    );
+    shell
+        .runtime
+        .block_on(async { tokio::time::timeout(LIVENESS, arrived).await })
+        .expect("the launch is committed")
+        .expect("and paused before the launcher is told");
+    // This test's own forwarder: the session's user, with the registration and its credential, and
+    // not started by the program.
+    let mut stranger = shell.placed.command(&["claude-code", "hook"]);
+    stranger.env("KR_REGISTRATION", &registration);
+    let ran = common::run_with_input(stranger, SESSION_START.as_bytes());
+    assert_eq!(
+        ran.code,
+        Some(0),
+        "a refused hook answers neutrally: {}",
+        ran.stderr
+    );
+    let _ = release.send(());
+    let report = shell.report("own");
+    assert_eq!(report["registered"], "yes", "the launch went ahead");
+    let instance = instance_of(&report);
+    hooked(&shell, "own");
+    assert_eq!(
+        selected(&shell, instance).as_deref(),
+        Some(THREAD),
+        "the program's own hook is admitted"
+    );
+    let _ = finish(child);
+}
+
+/// KR-REQ-12.07: an endpoint whose queue is full cannot hold the launcher past its deadline: it runs
+/// what was typed. On Linux a blocking connect would wait for room that never comes; macOS refuses
+/// such a connect at once.
+#[test]
+fn kr_req_12_07_a_full_endpoint_queue_cannot_hold_the_launcher() {
+    let shell = Shell::new();
+    let directory = private(&shell, "f");
+    let endpoint = directory.join("e.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&endpoint).expect("an endpoint");
+    rustix::net::listen(&listener, 0).expect("its queue holds one connection");
+    let _queued = std::os::unix::net::UnixStream::connect(&endpoint).expect("which this takes");
+    let answer = hand_made_backend(&shell, &directory, &endpoint);
+    let started = Instant::now();
+    let (_, said) = finish(shell.launch(&answer, "full", &[]));
+    assert!(
+        started.elapsed() < kr_hook::launch::ADMISSION_DEADLINE + Duration::from_secs(3),
+        "it gave up by its deadline: {:?}, {said}",
+        started.elapsed()
+    );
+    assert_typed(&shell.report("full"), "an endpoint whose queue is full");
+    drop(listener);
+}
+
+/// KR-REQ-12.07: an admission that trickles in a byte at a time cannot hold the launcher past its
+/// deadline: each read is given only the time left, and the launcher runs what was typed.
+#[test]
+fn kr_req_12_07_an_admission_that_trickles_in_cannot_hold_the_launcher() {
+    use std::io::{Read as _, Write as _};
+    let shell = Shell::new();
+    let directory = private(&shell, "t");
+    let endpoint = directory.join("e.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&endpoint).expect("an endpoint");
+    let serving = std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut byte = [0_u8; 1];
+        while matches!(stream.read(&mut byte), Ok(1)) && byte[0] != b'\n' {}
+        for byte in b"{\"kr_launch\":{\"admitted\":true}}\n" {
+            if stream.write_all(&[*byte]).is_err() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    });
+    let answer = hand_made_backend(&shell, &directory, &endpoint);
+    let started = Instant::now();
+    let (_, said) = finish(shell.launch(&answer, "trickle", &[]));
+    let took = started.elapsed();
+    assert!(
+        took < kr_hook::launch::ADMISSION_DEADLINE + Duration::from_secs(3),
+        "it gave up by its deadline, not when the answer was whole: {took:?}, {said}"
+    );
+    assert_typed(&shell.report("trickle"), "an admission that trickled in");
+    let _ = serving.join();
+}
+
+/// KR-REQ-12.07: a launcher stopped before it looked, whose session then closed, runs what was
+/// typed when it is resumed: nothing of the backend is left, and the variable's file name says what
+/// was typed.
+#[test]
+fn kr_req_12_07_a_launcher_resumed_after_its_session_closed_runs_as_typed() {
+    let shell = Shell::new();
+    let answer = shell.establish();
+    let mut stopped = sh(
+        r#"kill -STOP $$; exec "$LAUNCHER" launch -- "$PROGRAM" claude -c "$SCRIPT" "$FLAG" "$VALUE""#,
+    );
+    shell.prepare(&mut stopped, Some(&answer), "orphaned", &[]);
+    stopped
+        .env("LAUNCHER", &shell.placed.forwarder)
+        .env("PROGRAM", &shell.executable)
+        .env("SCRIPT", SCRIPT)
+        .env("FLAG", fixture::FLAGS[0])
+        .env("VALUE", fixture::FLAGS[1]);
+    let child = stopped.spawn().expect("the shell starts");
+    wait_stopped(child.id());
+    shell.backends.close();
+    assert!(
+        !Shell::directory(&answer).exists(),
+        "the session's backends are gone"
+    );
+    let resumed = std::process::Command::new("kill")
+        .arg("-CONT")
+        .arg(child.id().to_string())
+        .status()
+        .expect("the launcher is resumed");
+    assert!(resumed.success());
+    let _ = finish(child);
+    assert_typed(
+        &shell.report("orphaned"),
+        "a launcher resumed after its session closed",
+    );
+}
+
+/// The program for the mapping case: python, which writes the same report as the shell script, maps
+/// the file `MAP_FILE` names read-only, and runs its hook while the mapping is there.
+const MAPPING_PROGRAM: &str = r#"import mmap, os, subprocess, sys, time
+report = os.environ["REPORT"]
+mapped = open(os.environ["MAP_FILE"], "rb")
+view = mmap.mmap(mapped.fileno(), 0, access=mmap.ACCESS_READ)
+registration = os.environ.get("KR_REGISTRATION", "")
+lines = ["pid=%d" % os.getpid()]
+if registration and os.path.isfile(registration):
+    lines.append("registered=yes")
+    lines += ["registration." + line for line in open(registration).read().splitlines()]
+else:
+    lines.append("registered=no")
+lines.append("variable=" + (registration or "none"))
+lines.append("args=" + "|".join(sys.argv))
+with open(report + ".part", "w") as out:
+    out.write("\n".join(lines) + "\n")
+os.rename(report + ".part", report)
+with open(report + ".hook", "w") as out:
+    subprocess.run([os.environ["HOOK"], "claude-code", "hook"], input=os.environ["HOOK_EVENT"].encode(), stdout=out, stderr=out)
+with open(report + ".hooked", "w") as out:
+    out.write("done\n")
+time.sleep(float(os.environ.get("LINGER", "0")))
+"#;
+
+/// The python3 interpreter itself, not a command that finds one: macOS's `/usr/bin/python3` picks
+/// its tool by the name it was run as, which a link named otherwise does not carry.
+fn python3() -> PathBuf {
+    let command = [
+        "/usr/bin/python3",
+        "/usr/local/bin/python3",
+        "/opt/homebrew/bin/python3",
+    ]
+    .into_iter()
+    .find(|candidate| Path::new(candidate).exists())
+    .expect("a python3 for the mapping case");
+    let found = std::process::Command::new(command)
+        .args([
+            "-c",
+            "import os, sys; print(os.path.realpath(sys.executable))",
+        ])
+        .output()
+        .expect("python3 runs");
+    PathBuf::from(String::from_utf8_lossy(&found.stdout).trim())
+}
+
+/// KR-REQ-05.09: a program replaced between its admission and its exec by one that maps the hashed
+/// program as data, and runs its hook while it does, is refused: the kernel's record of what the
+/// process executes decides, not what it maps.
+#[test]
+fn kr_req_05_09_a_replacement_that_maps_the_hashed_program_is_refused() {
+    let shell = Shell::new();
+    let hook = shell.placed.forwarder.display().to_string();
+    let (program, _) = shells();
+    let path = shell.placed.host.root().join("bin").join("mapped");
+    std::os::unix::fs::symlink(program, &path).expect("the program");
+    let typed = vec![
+        "claude".to_owned(),
+        "-c".to_owned(),
+        MAPPING_PROGRAM.to_owned(),
+    ];
+    let answer = shell.establish_with(&path, &typed);
+    let registration = Shell::registration(&answer);
+    let mut held = shell.launcher(&path, &Shell::answered_for(&typed), Some(1000));
+    let mapped = program.display().to_string();
+    shell.prepare(
+        &mut held,
+        Some(&answer),
+        "mapped",
+        &[
+            ("HOOK", hook.as_str()),
+            ("HOOK_EVENT", SESSION_START),
+            ("MAP_FILE", mapped.as_str()),
+            ("LINGER", "2"),
+        ],
+    );
+    let held = held.spawn().expect("the launcher starts");
+    eventually("the launch is admitted", || registration.exists());
+    retarget(&path, &python3());
+    let report = shell.report("mapped");
+    assert_eq!(report["registered"], "yes", "the launch went ahead");
+    let instance = instance_of(&report);
+    hooked(&shell, "mapped");
+    assert_eq!(
+        selected(&shell, instance),
+        None,
+        "the hook of a program that only maps the hashed one moves nothing"
+    );
+    let _ = finish(held);
+}
+
+/// KR-REQ-05.09: on Linux, the program rewritten in place with its own bytes after it was hashed,
+/// its modification time put back, is refused: its change time says it was written since.
+#[cfg(target_os = "linux")]
+#[test]
+fn kr_req_05_09_a_program_rewritten_in_place_after_it_was_hashed_is_refused() {
+    use std::io::Write as _;
+    let shell = Shell::new();
+    let hook = shell.placed.forwarder.display().to_string();
+    let program = shell.placed.host.root().join("bin").join("rewritten");
+    std::fs::copy("/bin/bash", &program).expect("a copy of the program, which Linux runs anywhere");
+    let answer = shell.establish_for(&program);
+    let registration = Shell::registration(&answer);
+    let mut held = shell.launcher(&program, &Shell::answered(), Some(1000));
+    shell.prepare(
+        &mut held,
+        Some(&answer),
+        "rewritten",
+        &[
+            ("HOOK", hook.as_str()),
+            ("HOOK_EVENT", SESSION_START),
+            ("LINGER", "2"),
+        ],
+    );
+    let held = held.spawn().expect("the launcher starts");
+    eventually("the launch is admitted", || registration.exists());
+    let bytes = std::fs::read(&program).expect("the program's bytes");
+    let modified = std::fs::metadata(&program)
+        .and_then(|metadata| metadata.modified())
+        .expect("its modification time");
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&program)
+            .expect("the same inode, opened to write");
+        file.write_all(&bytes).expect("its own bytes written back");
+        file.set_modified(modified)
+            .expect("its modification time put back");
+        file.sync_all().expect("written");
+    }
+    let report = shell.report("rewritten");
+    assert_eq!(report["registered"], "yes", "the launch went ahead");
+    let instance = instance_of(&report);
+    hooked(&shell, "rewritten");
+    assert_eq!(
+        selected(&shell, instance),
+        None,
+        "the hook of a program written since it was hashed moves nothing"
+    );
+    let _ = finish(held);
 }
