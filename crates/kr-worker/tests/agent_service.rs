@@ -49,6 +49,10 @@ struct Host {
     endpoint: kr_ipc::paths::Endpoint,
     environment_id: kr_protocol::ids::EnvironmentId,
     journal_path: std::path::PathBuf,
+    /// The control daemon's identity, to forward a paired device's request as the daemon does.
+    controller: Arc<ControllerIdentity>,
+    /// The boot the daemon proves its generation against.
+    boot: kr_protocol::identity::BootIdentity,
 }
 
 fn build() -> BuildId {
@@ -293,7 +297,7 @@ async fn host() -> Host {
             endpoint.clone(),
             ServiceBinding {
                 environment_id,
-                boot_identity: boot,
+                boot_identity: boot.clone(),
                 controller_public_key: *controller.public_key(),
                 controller_generation: ControllerGeneration::new(1),
                 journal_path: Some(journal_path),
@@ -310,6 +314,8 @@ async fn host() -> Host {
         endpoint,
         environment_id,
         journal_path: journal_path_for_tests,
+        controller,
+        boot,
     }
 }
 
@@ -2486,5 +2492,319 @@ async fn kr_req_09_an_answer_never_acknowledged_is_uncertain_before_its_caller_h
     assert_eq!(
         receipt(&mut client, action_id).await.state,
         ReceiptState::Unknown
+    );
+}
+
+/// Connects as the control daemon and proves the generation this worker accepts.
+async fn daemon(host: &Host) -> LocalClient {
+    let mut daemon = LocalClient::connect(&host.endpoint, LocalClientKind::Controller, build())
+        .await
+        .expect("connects as the daemon");
+    let identity = Arc::clone(&host.controller);
+    let boot = host.boot.clone();
+    daemon
+        .present_generation(move |nonce| {
+            identity
+                .generation_token(ControllerGeneration::new(1), &boot, nonce)
+                .map_err(kr_ipc::IpcError::from)
+        })
+        .await
+        .expect("the worker accepts the generation");
+    daemon
+}
+
+/// One `plugin.action.invoke` of the suite's package on the suite's instance.
+fn plugin_invocation(
+    host: &Host,
+    request_id: u64,
+    action_window_id: kr_protocol::ids::ActionWindowId,
+    action: &str,
+    resource_id: Nullable<kr_protocol::ids::PendingResourceId>,
+    parameters: &[u8],
+) -> MutationRequest {
+    MutationRequest {
+        request_id: RequestId::new(request_id),
+        method: Method::PluginActionInvoke.into(),
+        method_version: MethodVersion::V1,
+        action_id: ActionId::new(kr_ipc::new_uuid()),
+        grant_id: Nullable::null(),
+        target: ActionTarget {
+            environment_id: host.environment_id,
+            session_id: Nullable::some(host.session_id),
+            session_epoch: Nullable::some(SessionEpoch::V1),
+            application_instance_id: Nullable::some(instance()),
+            agent_binding_revision: Nullable::some(AgentBindingRevision::new(1)),
+        },
+        expected: ParamsValue::empty(),
+        action_window_id,
+        requested_ttl_ms: DurationMs::new(60_000),
+        params: ParamsValue::from_typed(&kr_protocol::agent::PluginActionInvokeParams {
+            target: AgentMutationTarget {
+                subject: subject(host.session_id, instance()),
+                binding_revision: AgentBindingRevision::new(1),
+            },
+            plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+            action: kr_protocol::broker::ActionName::new(action).expect("valid"),
+            draft_id: Nullable::null(),
+            resource_id,
+            parameters: kr_protocol::scalars::Bytes::from(parameters.to_vec()),
+        })
+        .expect("encodes"),
+    }
+}
+
+/// Forwards one mutation as the control daemon does for a paired device acting under a grant
+/// that carries `grant_rights`.
+async fn forward_as_device(
+    daemon: &mut LocalClient,
+    mutation: &MutationRequest,
+    grant_rights: &[kr_protocol::rights::ActionRight],
+) -> std::result::Result<ParamsValue, kr_protocol::error::ProtocolError> {
+    let envelope = kr_protocol::actor::ActorEnvelope {
+        actor_id: kr_protocol::ids::ActorId::new("device:a-test-phone").expect("an actor"),
+        ingress: kr_protocol::actor::ActorIngress::PairedDevice,
+        device_id: Nullable::some(kr_protocol::ids::DeviceId::new(Uuid::from_bytes([9; 16]))),
+        grant_id: Nullable::some(kr_protocol::ids::GrantId::new(Uuid::from_bytes([8; 16]))),
+        grant_revision: Nullable::some(kr_protocol::ids::AuthorityRevision::new(1)),
+        controller_generation: ControllerGeneration::new(1),
+        connection_id: kr_protocol::ids::ConnectionId::new(Uuid::from_bytes([7; 16])),
+    };
+    daemon
+        .forward(
+            mutation,
+            &envelope,
+            &grant_rights.iter().copied().collect(),
+            kr_protocol::scalars::U64::new(kr_ipc::clock::boot_elapsed_ms() + 30_000),
+        )
+        .await
+        .expect("the forward reaches the worker")
+}
+
+/// Registers one action of each class a paired device could invoke on the approval tests'
+/// binding, as the package declares them: an answer through the connector table's decision
+/// destination, and a prompt and an attachment its component prepares.
+fn register_class_actions(host: &Host) {
+    let declared = |id: &str, effect: &str, implementation: serde_json::Value| {
+        serde_json::from_value::<kr_plugin_sdk::effect::ActionDeclaration>(serde_json::json!({
+            "id": id,
+            "label": id,
+            "effect": effect,
+            "implementation": implementation,
+            "parameters": { "parameters": [] },
+            "description": format!("{id}, as the package declares it"),
+            "confirmation_required": false,
+        }))
+        .expect("a declaration the manifest format reads")
+    };
+    let refused = host
+        .service
+        .broker()
+        .register_actions(
+            binding(),
+            &[
+                declared(
+                    "request.answer",
+                    "approval.respond",
+                    serde_json::json!({ "type": "decision_destination", "decision": "decision" }),
+                ),
+                declared(
+                    "prompt.send",
+                    "upstream.prompt",
+                    serde_json::json!({ "type": "component" }),
+                ),
+                declared(
+                    "draft.attach",
+                    "upstream.attachment",
+                    serde_json::json!({ "type": "component" }),
+                ),
+            ],
+        )
+        .expect("the actions are registered");
+    assert!(refused.is_empty(), "{refused:?}");
+}
+
+/// Offers one more request on the approval tests' connection, interpreted by their binding.
+fn offer_another(host: &Host, id: u64) -> kr_protocol::ids::PendingResourceId {
+    let broker = host.service.broker();
+    let opaque = broker
+        .forward_native(
+            kr_protocol::ids::GatewayConnectionId::new(1),
+            format!(r#"{{"id":{id},"method":"session/request_permission"}}"#).as_bytes(),
+            TimestampMs::new(4),
+        )
+        .expect("forwarded")
+        .1
+        .expect("it expects a response");
+    broker
+        .interpret(
+            binding(),
+            opaque.resource_id,
+            kr_protocol::broker::DecodedProjection {
+                schema_version: "kr-approval/1".to_owned(),
+                summary: "the agent wants to write a file".to_owned(),
+                decisions: vec![kr_protocol::broker::OfferedDecision {
+                    option_id: "allow".to_owned(),
+                    label: "Allow".to_owned(),
+                }],
+            },
+            None,
+            TimestampMs::new(5),
+        )
+        .expect("interpreted")
+        .resource_id
+}
+
+/// KR-REQ-11.47 and KR-REQ-23.30: `plugin.action.invoke` holds a caller acting under a grant to
+/// the rights its action's declared class needs, as the method's entry says it intersects them: an
+/// answer needs `agent.approval.respond`, a prompt `agent.prompt`, and an attachment `agent.prompt`
+/// and `files.upload`. A paired device whose grant lacks one is refused before the marker, and
+/// nothing is carried. One whose grant holds them passes, and so does the local owner, who acts
+/// under no grant: each answer is admitted and carried, and the prompt and the attachment meet the
+/// refusal every component action meets here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_47_a_forwarded_action_needs_the_rights_of_its_class() {
+    use kr_protocol::rights::ActionRight;
+    let host = host().await;
+    let upstream = Arc::new(CountingUpstream::default());
+    register(
+        &host,
+        Some(Arc::clone(&upstream) as Arc<dyn UpstreamDispatch>),
+    );
+    let first = offer_approval(&host, Arc::clone(&upstream));
+    let second = offer_another(&host, 12);
+    register_class_actions(&host);
+    let mut daemon = daemon(&host).await;
+    let window = || kr_protocol::ids::ActionWindowId::new("forwarded").expect("a window");
+    let every = [
+        ActionRight::AgentApprovalRespond,
+        ActionRight::AgentPrompt,
+        ActionRight::FilesUpload,
+    ];
+    let without = |missing: ActionRight| {
+        every
+            .iter()
+            .copied()
+            .filter(|right| *right != missing)
+            .collect::<Vec<_>>()
+    };
+    let decision = br#"{"decision":"allow"}"#.as_slice();
+
+    for (request_id, action, resource, parameters, missing) in [
+        (
+            100,
+            "request.answer",
+            Nullable::some(first),
+            decision,
+            ActionRight::AgentApprovalRespond,
+        ),
+        (
+            101,
+            "prompt.send",
+            Nullable::null(),
+            b"{}".as_slice(),
+            ActionRight::AgentPrompt,
+        ),
+        (
+            102,
+            "draft.attach",
+            Nullable::null(),
+            b"{}".as_slice(),
+            ActionRight::FilesUpload,
+        ),
+    ] {
+        let refusal = forward_as_device(
+            &mut daemon,
+            &plugin_invocation(&host, request_id, window(), action, resource, parameters),
+            &without(missing),
+        )
+        .await
+        .expect_err(action);
+        assert_eq!(
+            refusal.code,
+            ErrorCode::PermissionDenied,
+            "{action} without {}: {refusal:?}",
+            missing.as_str()
+        );
+    }
+    assert_eq!(
+        upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "nothing was carried"
+    );
+    assert_eq!(
+        host.service
+            .broker()
+            .pending(first)
+            .expect("still held")
+            .state,
+        kr_protocol::gateway::PendingState::Pending,
+        "and the request is still pending"
+    );
+
+    for (request_id, action) in [(110, "prompt.send"), (111, "draft.attach")] {
+        let refusal = forward_as_device(
+            &mut daemon,
+            &plugin_invocation(&host, request_id, window(), action, Nullable::null(), b"{}"),
+            &every,
+        )
+        .await
+        .expect_err("no component's prepared effect reaches this broker");
+        assert_eq!(
+            refusal.code,
+            ErrorCode::UnsupportedCapability,
+            "{action}, with the rights its class needs: {refusal:?}"
+        );
+    }
+    forward_as_device(
+        &mut daemon,
+        &plugin_invocation(
+            &host,
+            112,
+            window(),
+            "request.answer",
+            Nullable::some(first),
+            decision,
+        ),
+        &every,
+    )
+    .await
+    .expect("an answer under a grant with its right is admitted and carried");
+
+    let mut client = cli(&host).await;
+    for (request_id, action) in [(120, "prompt.send"), (121, "draft.attach")] {
+        let mutation = plugin_invocation(
+            &host,
+            request_id,
+            client.action_window().action_window_id.clone(),
+            action,
+            Nullable::null(),
+            b"{}",
+        );
+        let Outcome::Error(refusal) = send(&mut client, mutation).await else {
+            panic!("no component's prepared effect reaches this broker");
+        };
+        assert_eq!(
+            refusal.code,
+            ErrorCode::UnsupportedCapability,
+            "{action}, from the local owner: {refusal:?}"
+        );
+    }
+    let mutation = plugin_invocation(
+        &host,
+        122,
+        client.action_window().action_window_id.clone(),
+        "request.answer",
+        Nullable::some(second),
+        decision,
+    );
+    let outcome = send(&mut client, mutation).await;
+    assert!(
+        matches!(outcome, Outcome::Ok(_)),
+        "the local owner's answer is admitted and carried: {outcome:?}"
+    );
+    assert_eq!(
+        upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the two answers were carried"
     );
 }
