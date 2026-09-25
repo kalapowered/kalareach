@@ -29,6 +29,7 @@
 //!   refused unless it carries the owner's confirmation of that exact installation.
 
 pub(crate) mod files;
+pub mod native_bridge;
 
 use std::sync::Arc;
 
