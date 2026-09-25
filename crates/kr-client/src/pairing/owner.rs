@@ -505,12 +505,12 @@ pub fn reason(subject: &Subject, host_name: &str, now_ms: u64) -> Result<String,
                 candidate,
                 proposed_grant,
             } => format!(
-                "confirm adding {} ({}) to {host}, which may {} {}. It shows {}.",
+                "confirm adding {} ({}) to {host}, which may {} {}. {}",
                 shown(candidate.device_name.as_str(), names),
                 platform(candidate.platform),
                 authority(&proposed_grant.actions).ok_or(CannotCheck::CannotShow)?,
                 duration(&proposed_grant.expiry, now_ms),
-                group_verification_value(&candidate.verification_value)
+                shows_value(&group_verification_value(&candidate.verification_value))
             ),
             Subject::EstablishClock => format!("trust the clock of {host} again"),
             Subject::Described(described) => {
@@ -555,6 +555,14 @@ pub fn reason(subject: &Subject, host_name: &str, now_ms: u64) -> Result<String,
         }
     }
     Err(CannotCheck::CannotShow)
+}
+
+/// The sentence a device confirmation's reason ends with: the value, grouped, that the device being
+/// added shows. An interface that shows the value in a place of its own leaves this sentence out
+/// of the line it shows beside it.
+#[must_use]
+pub fn shows_value(grouped: &str) -> String {
+    format!("It shows {grouped}.")
 }
 
 /// A platform's name as people know it.

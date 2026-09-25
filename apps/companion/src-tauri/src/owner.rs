@@ -22,10 +22,10 @@ use std::time::Duration;
 
 use kr_client::pairing::owner::{
     CannotCheck, Ceremony, CeremonyKind, Listed, OwnerConfirmations, ReviewOutcome, SessionChannel,
-    Subject, reason,
+    Subject, reason, shows_value,
 };
 use kr_client::pairing::paired::PairedHost;
-use kr_protocol::ids::DeviceId;
+use kr_protocol::ids::{ConfirmationId, DeviceId};
 use kr_protocol::pairing::{SensitiveAction, group_verification_value};
 use serde::{Deserialize, Serialize};
 
@@ -58,7 +58,8 @@ pub struct RequestView {
     pub host_name: String,
     /// What it would do, in a few words.
     pub title: String,
-    /// Everything it would authorise, in one line, as the platform's dialog shows it.
+    /// Everything it would authorise, in one line, as the platform's dialog shows it, less the
+    /// value, which has a place of its own.
     pub detail: Option<String>,
     /// The value both devices show, grouped, for a device being added.
     pub value: Option<String>,
@@ -92,6 +93,10 @@ pub struct Owner {
     /// never held across a wait on the network.
     sessions: Mutex<BTreeMap<DeviceId, Arc<OwnerConfirmations>>>,
     entries: Mutex<Vec<Entry>>,
+    /// The reference each challenge is shown by, with when it expires, kept for the challenge's
+    /// whole life: a request that leaves the list while its host is out of contact comes back
+    /// under the same reference, so what the page did with it, such as setting it aside, holds.
+    references: Mutex<BTreeMap<ConfirmationId, (String, u64)>>,
     changed: Box<dyn Fn() + Send + Sync>,
 }
 
@@ -123,6 +128,7 @@ impl Owner {
             ceremony,
             sessions: Mutex::new(BTreeMap::new()),
             entries: Mutex::new(Vec::new()),
+            references: Mutex::new(BTreeMap::new()),
             changed: Box::new(changed),
         })
     }
@@ -288,10 +294,12 @@ impl Owner {
         }
     }
 
-    /// Replaces what is shown for `host` with `listed`, keeping each request's reference.
+    /// Replaces what is shown for `host` with `listed`, each request under its own reference.
     fn show(&self, host: &PairedHost, listed: Vec<Listed>) {
         let host_name = host.name.clone().unwrap_or_else(|| UNNAMED_HOST.to_owned());
         let now = self.device.pairing().clock.wall_clock_ms();
+        let mut references = lock(&self.references);
+        references.retain(|_, (_, expires_at_ms)| *expires_at_ms > now);
         let mut entries = lock(&self.entries);
         let before: Vec<(String, RequestView)> = entries
             .iter()
@@ -300,16 +308,16 @@ impl Owner {
             .collect();
         let mut kept: Vec<Entry> = Vec::new();
         for listed in listed.into_iter().filter(|listed| !listed.answered) {
-            let reference = entries
-                .iter()
-                .find(|entry| {
-                    entry.host == host.host_device_id
-                        && entry.listed.request.confirmation_id == listed.request.confirmation_id
+            let reference = references
+                .entry(listed.request.confirmation_id)
+                .or_insert_with(|| {
+                    (
+                        kr_ipc::new_uuid().to_string(),
+                        listed.request.expires_at_ms.get(),
+                    )
                 })
-                .map_or_else(
-                    || kr_ipc::new_uuid().to_string(),
-                    |entry| entry.reference.clone(),
-                );
+                .0
+                .clone();
             let view = describe(&reference, &host_name, &listed, now);
             kept.push(Entry {
                 reference,
@@ -325,6 +333,7 @@ impl Owner {
         entries.retain(|entry| entry.host != host.host_device_id);
         entries.extend(kept);
         drop(entries);
+        drop(references);
         if before != after {
             (self.changed)();
         }
@@ -368,11 +377,17 @@ fn describe(reference: &str, host_name: &str, listed: &Listed, now_ms: u64) -> R
         }
         _ => None,
     };
+    // The value has a place of its own, where a screen reader spells it out, so the line beside it
+    // leaves it out rather than say it a second time, unspelled.
+    let line = value
+        .as_deref()
+        .and_then(|value| line.strip_suffix(&format!(" {}", shows_value(value))))
+        .unwrap_or(&line);
     RequestView {
         reference: reference.to_owned(),
         host_name: host_name.to_owned(),
         title: title.to_owned(),
-        detail: Some(sentence(&line)),
+        detail: Some(sentence(line)),
         value,
         expires_at_ms,
         checkable: true,
@@ -395,4 +410,70 @@ fn sentence(line: &str) -> String {
         sentence.push('.');
     }
     sentence
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kr_crypto::keys::DeviceKeys;
+    use kr_protocol::invitation::PairCandidateView;
+    use kr_protocol::pairing::{DeviceName, DevicePlatform, OwnerConfirmationRequest};
+    use kr_protocol::scalars::{Digest256, Nonce256, Nullable, TimestampMs, Uuid};
+
+    const NOW: u64 = 1_790_000_000_000;
+
+    /// A device being added, as a host this computer owns lists it.
+    fn a_device_being_added() -> Listed {
+        let keys = DeviceKeys::generate().expect("keys").public_keys();
+        let proposed_grant = kr_pairing::grants::personal_owner_grant();
+        Listed {
+            request: OwnerConfirmationRequest {
+                confirmation_id: ConfirmationId::new(Uuid::from_bytes([1; 16])),
+                action: SensitiveAction::ConfirmDevice,
+                action_digest: Digest256::from_bytes([2; 32]),
+                destination_keys: Nullable::some(keys),
+                destination_rights: proposed_grant.actions.clone(),
+                host_device_id: DeviceId::new(Uuid::from_bytes([3; 16])),
+                host_endpoint_id: keys.transport,
+                nonce: Nonce256::from_bytes([4; 32]),
+                expires_at_ms: TimestampMs::new(NOW + 110_000),
+            },
+            subject: Ok(Subject::ConfirmDevice {
+                candidate: PairCandidateView {
+                    device_name: DeviceName::new("Pixel 8").expect("a name"),
+                    platform: DevicePlatform::Android,
+                    keys,
+                    verification_value: "f3c146fd".to_owned(),
+                },
+                proposed_grant,
+            }),
+            answered: false,
+        }
+    }
+
+    /// KR-REQ-10.06: a device being added is shown with its value in a place of its own, where the
+    /// page spells it out, and the line beside it leaves the value out rather than say it a second
+    /// time, unspelled. The platform's dialog is given the whole line, value included.
+    #[test]
+    fn a_device_being_added_shows_its_value_once() {
+        let listed = a_device_being_added();
+        let view = describe("a reference", "studio", &listed, NOW);
+        assert_eq!(view.value.as_deref(), Some("f3c1 46fd"));
+        let detail = view.detail.expect("a request this computer checked");
+        assert!(!detail.contains("f3c1"), "{detail}");
+        assert!(
+            detail.starts_with("Confirm adding Pixel 8 (Android) to studio, which may"),
+            "{detail}"
+        );
+        assert!(detail.ends_with('.'), "{detail}");
+        let Ok(subject) = &listed.subject else {
+            panic!("checked");
+        };
+        assert!(
+            reason(subject, "studio", NOW)
+                .expect("a line")
+                .ends_with("It shows f3c1 46fd."),
+            "the dialog's line keeps the value"
+        );
+    }
 }
