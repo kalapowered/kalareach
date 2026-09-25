@@ -65,6 +65,13 @@ const EXIT_NOT_A_LAUNCH: u8 = 126;
 
 /// What the backend's launch record says.
 #[derive(Debug, serde::Deserialize)]
+#[cfg_attr(
+    not(unix),
+    expect(
+        dead_code,
+        reason = "a platform with no private socket reads the record and presents nothing to it"
+    )
+)]
 struct Record {
     /// Where the backend's endpoint is.
     endpoint: String,
@@ -123,7 +130,7 @@ pub fn run(
             }
             match go(&mut admitted) {
                 Ok(()) => {
-                    drop(admitted);
+                    close(admitted);
                     exec(&executable, &vector, false)
                 }
                 Err(why) => {
@@ -131,7 +138,7 @@ pub fn run(
                         "the backend did not commit this launch ({why}), so the program runs as \
                          typed"
                     ));
-                    drop(admitted);
+                    close(admitted);
                     exec(&executable, &typed, true)
                 }
             }
@@ -464,7 +471,20 @@ fn present(
     Err("this platform has no private endpoint to present to".to_owned())
 }
 
+/// Closes the admission's connection, before the program runs in this process's place.
+#[cfg(unix)]
+fn close(admitted: std::os::unix::net::UnixStream) {
+    drop(admitted);
+}
+
+/// A platform with no private socket admits nothing, so there is no connection to close.
+#[cfg(not(unix))]
+fn close(admitted: std::convert::Infallible) {
+    match admitted {}
+}
+
 /// Reads the backend's credential, which its record names beside the registration.
+#[cfg(unix)]
 fn read_credential(
     registration: &Path,
     record: &Record,

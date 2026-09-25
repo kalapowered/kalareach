@@ -959,6 +959,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     use std::path::PathBuf;
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn identity_of(path: &Path) -> ExecutableIdentity {
         let cache = HashedFiles::default();
         ExecutableIdentity {
