@@ -80,9 +80,11 @@ answers on the machine's own addresses, so a host with no `bind_addr` hints its 
 on the bound port; a host bound to one address hints that address; an address a relay observed or a
 gateway mapped is added once the endpoint learns it. `0.0.0.0` and `[::]` never appear, because
 they name no machine a peer could reach. The endpoint finds its interface addresses when it binds,
-before the host can issue anything. An invitation therefore hints no direct address only when the
-host is relay-only, or when no interface is up, loopback included; a device then has only the
-selected relay and discovery to reach it by.
+before the host can issue anything, so an invitation carries whatever the endpoint reports then.
+When it reports none, the list is empty: for example on a relay-only host, which has no IP
+transport, or on a host that listens on one address family while every usable address it has is of
+the other. A device then reaches the host only through the selected relay and discovery, and only
+when they are configured and reachable.
 
 The publication filter applies to the publisher, not to the endpoint. An endpoint-wide filter would
 also strip the direct addresses that local network discovery exists to advertise, so the public
