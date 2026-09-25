@@ -304,6 +304,10 @@ fn a_source_outside_the_conventions_is_a_problem_and_keys_no_helper() {
                 "`println` is declared here as the name `as` gives",
             ),
             ("tests/chosen.rs:4", "a `cfg_attr` chooses"),
+            (
+                "tests/escaped.rs:4",
+                "a `path` attribute whose value is written with an escape",
+            ),
             ("tests/innerchosen.rs:3", "a `cfg_attr` chooses"),
             (
                 "tests/elsewhere/deep.rs:2",
@@ -381,12 +385,24 @@ fn a_source_outside_the_conventions_is_a_problem_and_keys_no_helper() {
                 "`assert_eq` is declared here as a macro",
             ),
             (
+                "tests/marked/mod.rs:1",
+                "a first line that starts `#!` without `[` right after it",
+            ),
+            (
+                "tests/marked/mod.rs:1",
+                "is a character outside ASCII outside a comment or a literal",
+            ),
+            (
                 "tests/moved/sub.rs:2",
                 "`println` is declared here as a macro",
             ),
             (
                 "tests/pages/mod.rs:1",
                 "a `path` attribute inside a module's own file",
+            ),
+            (
+                "tests/pages/mod.rs:1",
+                "a first line that starts `#!` without `[` right after it",
             ),
             (
                 "tests/localcore.rs:3",
@@ -484,6 +500,8 @@ fn a_source_outside_the_conventions_is_a_problem_and_keys_no_helper() {
         "KR-REQ-03.66",
         "KR-REQ-03.67",
         "KR-REQ-03.69",
+        "KR-REQ-03.70",
+        "KR-REQ-03.71",
     ] {
         let row = identifier(row);
         assert!(
