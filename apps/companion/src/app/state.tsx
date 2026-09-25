@@ -58,6 +58,9 @@ interface AppValue {
 
 const AppContext = createContext<AppValue | null>(null)
 
+/** The topic of the messages that announce owner confirmations. */
+const CONFIRMATIONS_TOPIC = 'owner-confirmations'
+
 /** Provides the port and the place to everything under it. */
 export function AppProvider({
   port,
@@ -102,18 +105,30 @@ export function AppProvider({
     [openTab]
   )
 
-  // One store for the window's life: a request is announced once, on whichever screen the person
-  // is, and "Review" takes them to it in Attention.
+  // One store for the window's life: requests are announced once, on whichever screen the person
+  // is, and "Review" takes them to the first of them in Attention. A message that is already
+  // announcing requests takes in the ones that arrive after it, in place, so what the person is
+  // using in it stays where it is.
   const [confirmations] = useState(
     () =>
-      new ConfirmationStore(port, (request, review) => {
-        say(`${request.host_name} needs your confirmation`, 'pending', {
+      new ConfirmationStore(port, (arrived, waiting, review) => {
+        const [first] = arrived
+        const text =
+          waiting === 1 && first !== undefined
+            ? `${first.host_name} needs your confirmation`
+            : `${waiting} requests need your confirmation`
+        const action: ToastAction = {
           label: 'Review',
           act: () => {
             go({ view: 'attention' })
             review()
           }
-        })
+        }
+        setToast((current) =>
+          current?.topic === CONFIRMATIONS_TOPIC
+            ? { ...current, text, action }
+            : { id: Date.now() + Math.random(), text, tone: 'pending', action, topic: CONFIRMATIONS_TOPIC }
+        )
       })
   )
 

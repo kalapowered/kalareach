@@ -5,7 +5,7 @@
  * test changes them the way an attempt would. What the page draws is what the person sees.
  */
 
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
@@ -501,6 +501,130 @@ describe("the owner's confirmations", () => {
       expect(row.contains(document.activeElement)).toBe(true)
     })
     expect(screen.getByRole('heading', { name: 'What needs you' })).toBeInTheDocument()
+  })
+
+  it('announces requests that arrive together in one message, and Review focuses the first', async () => {
+    const { controls } = start({ view: 'sessions' })
+    act(() => {
+      controls.setConfirmations({
+        ceremony: 'touch_id',
+        requests: [
+          request({ reference: 'r-1', title: 'Add a device' }),
+          request({ reference: 'r-2', title: 'Issue an invitation', value: null })
+        ]
+      })
+    })
+    const toast = (await screen.findByText('2 requests need your confirmation')).closest<HTMLElement>(
+      '[role="status"]'
+    )
+    expect(toast).not.toBeNull()
+    await userEvent.click(within(toast!).getByRole('button', { name: 'Review' }))
+    const first = (await screen.findByText('Add a device')).closest('li')
+    await waitFor(() => {
+      expect(document.activeElement).toBe(first)
+    })
+  })
+
+  it('adds a request that arrives while the announcement has focus to that message, and keeps focus', async () => {
+    const { controls } = start({ view: 'sessions' })
+    act(() => {
+      controls.setConfirmations({ ceremony: 'touch_id', requests: [request({ reference: 'r-1' })] })
+    })
+    const toast = (await screen.findByText('studio needs your confirmation')).closest<HTMLElement>(
+      '[role="status"]'
+    )
+    const review = within(toast!).getByRole('button', { name: 'Review' })
+    act(() => {
+      review.focus()
+    })
+    act(() => {
+      controls.setConfirmations({
+        ceremony: 'touch_id',
+        requests: [request({ reference: 'r-1' }), request({ reference: 'r-2', host_name: 'build-box' })]
+      })
+    })
+    expect(await screen.findByText('2 requests need your confirmation')).toBeInTheDocument()
+    expect(document.activeElement).toBe(review)
+  })
+
+  it('keeps an announcement while the pointer is on it or focus is in it, in either order', async () => {
+    vi.useFakeTimers()
+    try {
+      const { controls } = start({ view: 'sessions' })
+      await act(async () => {
+        for (let turn = 0; turn < 10; turn++) await Promise.resolve()
+      })
+      act(() => {
+        controls.setConfirmations({ ceremony: 'touch_id', requests: [request({ reference: 'r-1' })] })
+      })
+      const message = 'studio needs your confirmation'
+      const toast = screen.getByText(message).closest<HTMLElement>('[role="status"]')!
+      const review = within(toast).getByRole('button', { name: 'Review' })
+
+      // The pointer rests on it, focus moves in, and the pointer leaves: focus still holds it.
+      fireEvent.pointerEnter(toast)
+      act(() => {
+        review.focus()
+      })
+      fireEvent.pointerLeave(toast)
+      act(() => {
+        vi.advanceTimersByTime(20_000)
+      })
+      expect(screen.queryByText(message)).not.toBeNull()
+
+      // The pointer comes back, and focus leaves: the pointer still holds it.
+      fireEvent.pointerEnter(toast)
+      act(() => {
+        review.blur()
+      })
+      act(() => {
+        vi.advanceTimersByTime(20_000)
+      })
+      expect(screen.queryByText(message)).not.toBeNull()
+
+      // Once both have left, it goes in its own time.
+      fireEvent.pointerLeave(toast)
+      act(() => {
+        vi.advanceTimersByTime(8_100)
+      })
+      expect(screen.queryByText(message)).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('takes a leaving row away at once after keyboard input, and fades it after a pointer', async () => {
+    const { controls } = start({ view: 'attention' })
+    const one = request({ reference: 'r-1', title: 'Add a device' })
+    const two = request({ reference: 'r-2', title: 'Issue an invitation', value: null })
+    const settle = () =>
+      act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30))
+      })
+    try {
+      document.documentElement.dataset.input = 'keyboard'
+      act(() => {
+        controls.setConfirmations({ ceremony: 'touch_id', requests: [one, two] })
+      })
+      await screen.findByText('Add a device')
+      act(() => {
+        controls.setConfirmations({ ceremony: 'touch_id', requests: [two] })
+      })
+      await settle()
+      expect(screen.queryByText('Add a device')).toBeNull()
+
+      document.documentElement.dataset.input = 'pointer'
+      act(() => {
+        controls.setConfirmations({ ceremony: 'touch_id', requests: [] })
+      })
+      await settle()
+      expect(screen.queryByText('Issue an invitation')).not.toBeNull()
+      await waitFor(() => {
+        expect(screen.queryByText('Issue an invitation')).toBeNull()
+      })
+    } finally {
+      delete document.documentElement.dataset.input
+    }
   })
 
   it('keeps a request set aside with Not now until it expires, whatever screen comes between', async () => {
