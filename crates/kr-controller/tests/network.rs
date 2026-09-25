@@ -1481,11 +1481,11 @@ async fn a_narrowing_after_a_failed_widening_fences_the_subscription_the_widenin
 
 /// KR-REQ-26.15: a fence a narrowing owed and could not raise stays owed until one is raised.
 ///
-/// The narrowing comes while another writer holds the registry, so the revision cannot advance
-/// and the edit is not acknowledged. Once the writer finishes, the same document read again moves
-/// nothing, against the document accepted or against the ceiling in force, and the fence it owes
-/// is raised all the same: the revision advances and the subscription admitted under the wider
-/// ceiling ends.
+/// The narrowing comes while the registry refuses the revision's write, so its debt is written and
+/// the ceiling narrows, the revision cannot advance, and the edit is not acknowledged. Once the
+/// write is taken again, the same document read again moves nothing, against the document
+/// accepted or against the ceiling in force, and the fence it owes is raised all the same: the
+/// revision advances and the subscription admitted under the wider ceiling ends.
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fence_a_narrowing_could_not_raise_is_raised_by_the_next_reading() {
@@ -1502,13 +1502,17 @@ async fn a_fence_a_narrowing_could_not_raise_is_raised_by_the_next_reading() {
         .await
         .expect("the revision in force");
 
-    // Another writer takes the registry's write lock and keeps it. Reads go on, because the
-    // registry is a write-ahead log, and the revision cannot advance.
+    // The registry refuses the revision's write, as a full disk would. Every other write goes on,
+    // the ceiling's debt among them, so the ceiling narrows and only its fence cannot be raised.
+    // Locking the whole registry instead would stop the debt, and with it the ceiling, first.
     let blocker = rusqlite::Connection::open(host.paths().registry_database())
         .expect("a second connection to this environment's registry");
     blocker
-        .execute_batch("BEGIN EXCLUSIVE")
-        .expect("another writer holds the registry");
+        .execute_batch(
+            "CREATE TRIGGER refuse_revision BEFORE UPDATE OF authority_revision ON environment
+             BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+        )
+        .expect("the revision's write is refused");
     let unfenced = daemon
         .controller
         .apply_configuration(&Change::GrantRights(Some(without_viewing())))
@@ -1522,8 +1526,8 @@ async fn a_fence_a_narrowing_could_not_raise_is_raised_by_the_next_reading() {
     );
 
     blocker
-        .execute_batch("COMMIT")
-        .expect("the other writer finishes");
+        .execute_batch("DROP TRIGGER refuse_revision;")
+        .expect("the revision's write is taken again");
     drop(blocker);
     let effective = daemon.controller.effective_configuration().await;
     assert!(
