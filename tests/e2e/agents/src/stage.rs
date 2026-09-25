@@ -594,10 +594,13 @@ pub struct AgentProcess {
     pub identity: ProcessStartIdentity,
     /// Its command line, as the process table shows it.
     pub command: String,
+    /// Its parent's number, as the process table shows it.
+    pub parent: u32,
 }
 
 /// Types the agent's command at the session's prompt and waits for its first screen, then returns
-/// the agent's execution: the processes beneath the session's root shell that belong to the build.
+/// the agent's execution: the program the shell started for the command, which is the root shell's
+/// own child whatever it calls itself, and every process beneath it that belongs to the build.
 ///
 /// A process belongs to the build when its command line names one of `marks`, or the file it
 /// executes lies in one of them: the build's own directory, its runtime's, and the run's link to
@@ -621,10 +624,11 @@ pub fn launch(
         .window
         .wait_for_screen(ready, "the agent draws its first screen");
     let started = Instant::now();
+    let shell = u32::try_from(session.root_shell.pid.get()).expect("a process number");
     loop {
         let found: Vec<AgentProcess> = beneath(run, &session.root_shell, "the agent")
             .into_iter()
-            .filter(|process| belongs(process, marks))
+            .filter(|process| process.parent == shell || belongs(process, marks))
             .collect();
         if !found.is_empty() {
             return found;
@@ -674,6 +678,7 @@ pub fn beneath(run: &Run, ancestor: &ProcessStartIdentity, what: &str) -> Vec<Ag
                 found.push(AgentProcess {
                     identity,
                     command: entry.command.clone(),
+                    parent: entry.parent,
                 });
                 parents.push(entry.pid);
             }

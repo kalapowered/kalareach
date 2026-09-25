@@ -598,14 +598,17 @@ fn a_control_daemon_crash_leaves_the_agent_and_its_local_terminal_running() {
             let shell = AgentProcess {
                 identity: agent.session.root_shell.clone(),
                 command: "the root shell".to_owned(),
+                parent: 0,
             };
             let worker = AgentProcess {
                 identity: agent.session.worker.clone(),
                 command: "the worker".to_owned(),
+                parent: 0,
             };
             let terminal = AgentProcess {
                 identity: local.clone(),
                 command: "the local terminal's kr".to_owned(),
+                parent: 0,
             };
             processes.extend([&shell, &worker, &terminal]);
             still_running(&processes)
