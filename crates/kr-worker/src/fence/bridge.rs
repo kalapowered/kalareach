@@ -134,21 +134,24 @@ impl BridgeServer {
                     observed,
                 ));
             }
-            let mut writing = tokio::spawn(write_outbound(writer, receiving, self.holds));
+            let mut writing = tokio::spawn(write_outbound(
+                writer,
+                receiving,
+                Arc::clone(&self.runtime),
+                self.holds,
+            ));
             self.pump(&mut reader, &mut writing).await;
             // The connection has ended. The driver stops queueing for it and the session hears that
             // its integration has gone, before the writer is waited on at all: a peer that has
             // stopped reading its own socket must not be able to hold up the loss that releases
-            // held input and answers the callers waiting on a launch.
-            {
-                let mut session = self.runtime.session();
-                if let Some(driver) = session.fence_mut() {
-                    driver.stop_sending();
-                }
-            }
-            let _ = self
-                .runtime
-                .drive_fence(|driver| driver.integration_lost(IntegrationLoss::BridgeDisconnected));
+            // held input and answers the callers waiting on a launch. Both happen on one step. A
+            // fence the writer never wrote stops holding the input behind it there, and the same
+            // step's loss drops the fence, so that input reaches the terminal only once nothing
+            // claims it was fenced.
+            let _ = self.runtime.drive_fence(|driver| {
+                driver.stop_sending();
+                driver.integration_lost(IntegrationLoss::BridgeDisconnected)
+            });
             writing.abort();
             if self.runtime.state() == kr_protocol::session::SessionState::Closed {
                 return;
@@ -158,20 +161,37 @@ impl BridgeServer {
 
     /// Reads and times one registered connection.
     ///
-    /// Three things happen here and nothing else: a frame arrives, the machine's one timer fires,
-    /// or the writer's task ends. Writing is the other task's, so neither can hold the other up,
-    /// but a writer that has failed is this connection over: a peer can close the side it reads
-    /// from and leave the side it writes to open, and a read that waited for a frame that will
-    /// never come would leave the loss unreported and every caller waiting on a launch unanswered.
+    /// Three things happen here and nothing else: a frame arrives, a timer fires, or the writer's
+    /// task ends. Writing is the other task's, so neither can hold the other up, but a writer that
+    /// has failed is this connection over: a peer can close the side it reads from and leave the
+    /// side it writes to open, and a read that waited for a frame that will never come would leave
+    /// the loss unreported and every caller waiting on a launch unanswered.
+    ///
+    /// There are two timers on one wait. One is the machine's. The other is
+    /// [`FENCE_WRITE_LIMIT`](crate::fence::FENCE_WRITE_LIMIT) on the oldest published fence the
+    /// writer has not written, because the keys behind that fence are waiting for it; a writer
+    /// that is still waiting when it passes is one whose peer is not reading, and the connection
+    /// ends as a failed write would end it.
     async fn pump(&self, reader: &mut BridgeReader, writing: &mut tokio::task::JoinHandle<()>) {
         loop {
-            let (wake, deadline) = {
+            let (wake, machine, fence_write) = {
                 let session = self.runtime.session();
                 let Some(driver) = session.fence() else {
                     return;
                 };
-                (driver.waker(), driver.deadline())
+                (
+                    driver.waker(),
+                    driver.deadline(),
+                    driver.fence_write_deadline(),
+                )
             };
+            if fence_write.is_some_and(|left| left.is_zero()) {
+                reader.finish();
+                return;
+            }
+            // Whichever comes first. The machine's sweep changes nothing when only the write limit
+            // has passed, and the next pass finds that one.
+            let deadline = [machine, fence_write].into_iter().flatten().min();
             // A stimulus stores a permit rather than broadcasting, so a deadline that moved
             // between the reading above and this wait is not missed: the permit is waiting here.
             let notified = wake.notified();
@@ -237,37 +257,43 @@ impl Holds {
         fence: std::time::Duration::ZERO,
     };
 
-    /// Waits for as long as a test asked before `publication` is written.
+    /// Waits for as long as a test asked before a published fence is written.
     #[cfg(feature = "testing")]
-    async fn before(self, publication: &kr_protocol::root::FencePublication) {
-        if matches!(
-            publication,
-            kr_protocol::root::FencePublication::Published(_)
-        ) && !self.fence.is_zero()
-        {
+    async fn before_fence(self) {
+        if !self.fence.is_zero() {
             tokio::time::sleep(self.fence).await;
         }
     }
 }
 
 /// Writes what the driver queues, for as long as the connection lasts.
+///
+/// A published fence is reported to the session once it is written, because the keys the fence
+/// let go of are waiting for it: once it is on the socket the reader has it before it can act on
+/// them.
 async fn write_outbound(
     mut writer: BridgeWriter,
     mut queued: tokio::sync::mpsc::UnboundedReceiver<Outbound>,
+    runtime: Arc<SessionRuntime>,
     #[cfg_attr(not(feature = "testing"), expect(unused_variables))] holds: Holds,
 ) {
-    while let Some(frame) = queued.recv().await {
-        let sent = match frame {
+    while let Some(outbound) = queued.recv().await {
+        let mut fence_frame = None;
+        let sent = match outbound {
             Outbound::Request(request) => {
                 let id = writer.next_request_id();
                 writer.send_request(id, *request).await
             }
             Outbound::EventResult { id, result } => writer.send_event_result(id, *result).await,
-            Outbound::Publication(publication) => {
+            Outbound::Published { fence, frame } => {
                 #[cfg(feature = "testing")]
-                holds.before(&publication).await;
-                writer.send_publication(publication).await
+                holds.before_fence().await;
+                fence_frame = Some(frame);
+                writer
+                    .send_publication(kr_protocol::root::FencePublication::Published(*fence))
+                    .await
             }
+            Outbound::Publication(publication) => writer.send_publication(publication).await,
             Outbound::Revocation {
                 transaction,
                 reason,
@@ -276,9 +302,13 @@ async fn write_outbound(
         if sent.is_err() {
             // The peer has gone or the frame was cut in half. Either way this connection is over.
             // Ending this task is what says so: the read loop is waiting on it as well as on the
-            // socket, because a read already in progress hears nothing from the flag alone.
+            // socket, because a read already in progress hears nothing from the flag alone. A fence
+            // this task did not write is settled by that loss, not here.
             writer.finish();
             return;
+        }
+        if let Some(frame) = fence_frame {
+            let _ = runtime.drive_fence(|driver| driver.fence_written(frame));
         }
     }
 }
@@ -540,6 +570,180 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), pumping)
             .await
             .expect("the read ends with the writer")
+            .expect("the task did not panic");
+
+        runtime
+            .close(kr_protocol::session::ClosureReason::CloseRequested)
+            .1
+            .release();
+        let _ = tokio::time::timeout(Duration::from_secs(30), runtime.wait_closed()).await;
+    }
+
+    /// A published fence the writer has not written within the limit ends the connection.
+    ///
+    /// The keys the fence let go of are waiting for it, and a writer that cannot put it on the
+    /// socket has a peer that is not reading. Here the writer is alive and never writes, and nothing
+    /// arrives to read: the read ends when the limit passes, as it would for a failed write, and not
+    /// before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_read_ends_when_a_published_fence_is_not_written_in_time() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let environment = temp.environment();
+        let clock = Arc::new(ManualClock::new());
+        let mut session = session(&temp, Arc::clone(&clock) as Arc<dyn ContinuousClock>);
+        let session_id = session.id();
+        let (outbound, _unwritten) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let mut requested = kr_protocol::scalars::CanonicalSet::new();
+            requested.insert(kr_protocol::attachment::AttachmentCapability::ObserveTerminal);
+            requested.insert(kr_protocol::attachment::AttachmentCapability::Input);
+            let params = kr_protocol::attachment::SessionAttachParams {
+                session_id,
+                mode: kr_protocol::attachment::AttachMode::Terminal,
+                claim_geometry: false,
+                dimensions: kr_protocol::scalars::Nullable::some(Dimensions::new(80, 24)),
+                terminal_profile_id: kr_protocol::scalars::Nullable::some(
+                    "xterm-256color".to_owned(),
+                ),
+                requested,
+            };
+            let attachment_id = kr_protocol::ids::AttachmentId::new(kr_ipc::new_uuid());
+            session
+                .attach(&params, params.requested.clone(), attachment_id)
+                .expect("attaches");
+            session
+                .acquire_input(
+                    attachment_id,
+                    kr_protocol::ids::ConnectionId::new(kr_ipc::new_uuid()),
+                    None,
+                )
+                .expect("takes the keys");
+            let driver = session.fence_mut().expect("a driver");
+            driver.send_through(outbound);
+            let _ = driver.bridge_event(
+                kr_protocol::ids::RequestId::new(1),
+                &BridgeEvent::HooksActivated(HooksActivated {
+                    session_id,
+                    prompt_generation: PromptGeneration::new(1),
+                }),
+            );
+            let entered = driver.bridge_event(
+                kr_protocol::ids::RequestId::new(2),
+                &BridgeEvent::EditorEnter(RootEditorEnterParams {
+                    session_id,
+                    root_process: kr_ipc::identity::current_process_start_identity()
+                        .expect("this process"),
+                    prompt_generation: PromptGeneration::new(1),
+                    reader_revision: ReaderRevision::new(1),
+                    reader_context: ReaderContext::Primary,
+                    editor: EditorState {
+                        buffer_empty: true,
+                        buffer_revision: EditorBufferRevision::new(1),
+                        keymap: EditorKeymap::Emacs,
+                        pending: PendingReaderInput::NONE,
+                    },
+                    cwd_revision: CwdRevision::new(1),
+                }),
+            );
+            let fence_id = entered
+                .steps
+                .iter()
+                .find_map(|step| match step {
+                    crate::fence::Step::Send(Outbound::Request(request)) => {
+                        match request.as_ref() {
+                            kr_shell_integration::contract::requests::WorkerRequest::Fence(
+                                params,
+                            ) => Some(params.fence_id),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                })
+                .expect("the reader was asked for a fence");
+            let acknowledged = driver.bridge_answer(
+                &kr_shell_integration::contract::requests::BridgeAnswer::Fence(
+                    kr_protocol::root::RootEditorFenceResult::Acknowledged(
+                        kr_protocol::root::FenceAcknowledgement {
+                            fence_id,
+                            reader_context: ReaderContext::Primary,
+                            prompt_generation: PromptGeneration::new(1),
+                            reader_revision: ReaderRevision::new(1),
+                            queues: kr_protocol::root::QueueDrainReport::CLEAR,
+                            snapshot: kr_protocol::root::KeyQueueSnapshot::drained(),
+                            editor: EditorState {
+                                buffer_empty: true,
+                                buffer_revision: EditorBufferRevision::new(1),
+                                keymap: EditorKeymap::Emacs,
+                                pending: PendingReaderInput::NONE,
+                            },
+                            cwd_revision: CwdRevision::new(1),
+                        },
+                    ),
+                ),
+            );
+            // Carried out as the session carries out every step, which hands the fence to a writer
+            // that never writes it.
+            let _ = session.apply_fence_effects(acknowledged);
+            let driver = session.fence().expect("a driver");
+            assert!(driver.unwritten_fence().is_some(), "the fence is unwritten");
+            assert!(driver.deadline().is_none(), "and the machine has no timer");
+        }
+        let runtime = Arc::new(
+            crate::runtime::SessionRuntime::start(
+                session,
+                Arc::new(kr_ipc::clock::SystemSharedClock),
+            )
+            .expect("starts the runtime"),
+        );
+        let endpoint = HostEndpoint::open_for_session(
+            environment.runtime_root(),
+            environment.runtime_dir(),
+            session_id,
+        )
+        .expect("binds the bridge");
+        let address = client_address(&endpoint);
+        let connecting =
+            tokio::spawn(async move { kr_ipc::endpoint::Connection::connect(&address).await });
+        let (served, _peer) = endpoint.listener().accept().await.expect("accepts");
+        let _client = connecting.await.expect("joins").expect("connects");
+        let (mut reader, _writer) = accept(served);
+        let server = BridgeServer::new(
+            Arc::clone(&runtime),
+            endpoint,
+            WorkerExpectation {
+                session_id,
+                root_process: kr_ipc::identity::current_process_start_identity()
+                    .expect("this process"),
+                supported_editor_abis: vec!["zle-5.9".to_owned()],
+                supported_integration_versions: vec!["1".to_owned()],
+                launched_package: None,
+                already_registered: false,
+                gesture: EofGesture::default(),
+            },
+        );
+
+        // A writer that is alive and writes nothing, as one stuck behind a peer that is not
+        // reading is.
+        let mut writing = tokio::spawn(std::future::pending::<()>());
+        let pumping = tokio::spawn(async move {
+            server.pump(&mut reader, &mut writing).await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !pumping.is_finished(),
+            "the read goes on while the fence is within its limit"
+        );
+        // The limit passes on the session's clock, and the connection's task is told to look.
+        clock.advance(crate::fence::FENCE_WRITE_LIMIT);
+        runtime
+            .session()
+            .fence()
+            .expect("a driver")
+            .waker()
+            .notify_one();
+        tokio::time::timeout(Duration::from_secs(5), pumping)
+            .await
+            .expect("the read ends when the fence has waited its limit")
             .expect("the task did not panic");
 
         runtime

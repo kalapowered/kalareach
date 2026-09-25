@@ -1111,6 +1111,117 @@ async fn keys_behind_a_fence_never_written_go_once_the_loss_is_recorded() {
     _serving.abort();
 }
 
+/// KR-REQ-07.79, KR-REQ-07.24: a reader that does not take a published fence within the limit has
+/// its connection ended, and the keys waiting for the fence go once the loss is recorded.
+///
+/// A reader that has stopped reading its own socket must not hold the terminal's input for as long
+/// as it stays away. The writer here never writes the fence, as one stuck behind such a reader
+/// would not, and the limit passes on the session's own clock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_not_written_within_its_limit_ends_the_connection_and_lets_the_keys_go() {
+    let clock = Arc::new(kr_transport::clock::ManualClock::new());
+    let mut wired = wired_holding_fences(&clock, Duration::from_secs(3600)).await;
+    let holder = wired.holder();
+    wired
+        .bridge
+        .send_event(enter(wired.session_id, 1, 1))
+        .await
+        .expect("enters");
+    let fence_id = asked_for_a_fence(&mut wired).await;
+    type_keys(&wired, holder, 0, b"waiting-keys\n");
+    wired
+        .bridge
+        .answer(kr_protocol::ids::RequestId::new(0), drained(1, 1, fence_id))
+        .await
+        .expect("acknowledges");
+    until_fenced(&wired.runtime).await;
+    tokio::time::sleep(WHILE_HELD).await;
+    assert!(
+        !echoed_now(&wired.runtime, b"waiting-keys"),
+        "the keys wait while the fence is within its limit"
+    );
+
+    clock.advance(kr_worker::fence::FENCE_WRITE_LIMIT);
+    wired
+        .runtime
+        .session()
+        .fence()
+        .expect("a driver")
+        .waker()
+        .notify_one();
+    echoed(&wired.runtime, b"waiting-keys").await;
+    {
+        let session = wired.runtime.session();
+        let driver = session.fence().expect("a driver");
+        assert!(
+            driver.fence().is_none(),
+            "the fence went with the connection"
+        );
+        assert_eq!(
+            driver.phase().phase(),
+            kr_shell_integration::contract::qualification::IntegrationPhase::Degraded,
+            "the loss was recorded before the keys went"
+        );
+    }
+    // The bridge finds its connection over.
+    tokio::time::timeout(SOON, async { while wired.bridge.recv().await.is_ok() {} })
+        .await
+        .expect("the connection ended");
+    wired.close().await;
+}
+
+/// KR-REQ-07.79: keys typed with no fence on its way to the reader are handed to the terminal's
+/// writer on the step that accepted them.
+///
+/// Only a published fence the writer has not written holds anything back. Once the writer has
+/// written it, a line typed at the prompt waits for nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keys_typed_behind_a_written_fence_are_not_held() {
+    let clock = Arc::new(kr_transport::clock::ManualClock::new());
+    let mut wired = wired_holding_fences(&clock, Duration::ZERO).await;
+    let holder = wired.holder();
+    let _fence = fenced(&mut wired, 1, 1).await;
+    // The reader has the fence; the writer says so on its own task, just after.
+    tokio::time::timeout(SOON, async {
+        while wired
+            .runtime
+            .session()
+            .fence()
+            .expect("a driver")
+            .unwritten_fence()
+            .is_some()
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the writer reported the fence written");
+
+    let taken = {
+        let mut session = wired.runtime.session();
+        let epoch = session.lease().epoch.get();
+        session
+            .write_input(
+                holder,
+                epoch,
+                0,
+                b"ordinary-keys\n",
+                None,
+                std::time::Instant::now(),
+            )
+            .expect("the keys are accepted");
+        session.take_pending_input()
+    };
+    assert!(
+        taken.iter().any(|batch| matches!(
+            batch,
+            kr_worker::session::InputBatch::Lease { bytes, .. } if bytes == b"ordinary-keys\n"
+        )),
+        "the keys go to the writer at once: {taken:?}"
+    );
+    wired.close().await;
+}
+
 // --------------------------------------------------------------------------------------------
 // KR-REQ-07.78, KR-REQ-07.82: a takeover cancels the reader's incomplete operation, discards the
 // old lease's undelivered input and reports it.

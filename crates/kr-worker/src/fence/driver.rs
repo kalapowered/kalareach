@@ -35,11 +35,32 @@ use kr_transport::clock::{ContinuousClock, ContinuousInstant};
 
 use crate::session::InputBatch;
 
+/// How long a published fence may wait for the connection's writer before the connection is
+/// treated as lost.
+///
+/// The keys the fence released wait behind it, so a reader that has stopped reading its own
+/// socket would otherwise hold the terminal's input for as long as it stayed away. A reader that
+/// is working takes the fence at once: it has just answered the exchange the fence came from, and
+/// it reads its endpoint whenever it waits for a key. So this bound is for one that is not working,
+/// and it is long beside anything a working one takes, because what follows is what follows any
+/// lost bridge: the fence is dropped, the session is degraded, and the keys go to the terminal as
+/// input nothing is attributed to.
+pub const FENCE_WRITE_LIMIT: Duration = Duration::from_secs(5);
+
+/// One published fence, numbered in the order the connection's writer was handed them.
+///
+/// The session puts it in its queue for the terminal where the fence was published, and nothing
+/// queued behind it goes to the terminal until the writer has written the fence or the connection
+/// has ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FenceFrame(u64);
+
 /// What the driver sends the bridge.
 ///
 /// The frames themselves are written by the connection's own task. Queueing them here keeps the
 /// session boundary free of socket writes: a reader that has stopped reading its own socket must
-/// not be able to hold the worker's input path.
+/// not be able to hold the worker's input path. The one thing that waits for the writer is input
+/// behind a published fence, and for no longer than [`FENCE_WRITE_LIMIT`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outbound {
     /// Something the reader thread must decide.
@@ -51,7 +72,16 @@ pub enum Outbound {
         /// The answer.
         result: Box<EventOutcome>,
     },
-    /// Whether a fence was published.
+    /// A published fence, which the writer reports once it has written it.
+    Published {
+        /// The fence.
+        fence: Box<EditorFence>,
+        /// What the writer reports.
+        frame: FenceFrame,
+    },
+    /// That no fence was published, or that the one published has gone.
+    ///
+    /// A published fence travels as [`Outbound::Published`] instead, because keys wait for it.
     Publication(FencePublication),
     /// A launch transaction is over.
     Revocation {
@@ -126,12 +156,20 @@ impl LaunchAnswer {
 /// One thing the machine asked the worker to do.
 ///
 /// A step per action, kept in the order the outcome listed them. The order is the contract's, not
-/// a convenience: input released before the fence that explains why it waited, a revocation before
-/// the interrupt that caused it, and a detach acknowledged only once the attachment is gone.
+/// a convenience: a fence published before the input it lets go of, held input released before the
+/// `editor_busy` event that explains why it waited, a revocation before the interrupt that caused
+/// it, and a detach acknowledged only once the attachment is gone.
 #[derive(Debug)]
 pub enum Step {
     /// Queue a batch for the pseudo-terminal.
     Write(InputBatch),
+    /// Publish a fence to the bridge.
+    ///
+    /// Everything the session queues for the terminal after it waits until the connection's writer
+    /// has written it. A reader takes what is on its endpoint before it acts on a key, and only
+    /// what is there: a key that reached the shell ahead of its fence would be accepted without
+    /// it, and the line it made would run without the capability the fence exists to mint.
+    Publish(Box<EditorFence>),
     /// Deliver an `editor_busy` event to the attachment it names.
     EditorBusy(Box<EditorBusyEvent>),
     /// Remove an attachment.
@@ -272,6 +310,14 @@ pub struct FenceDriver {
     /// session boundary free of socket writes: a reader that has stopped reading its own socket
     /// must not be able to hold the worker's input path or its one timer.
     outbound: Option<tokio::sync::mpsc::UnboundedSender<Outbound>>,
+    /// The published fences the connection's writer has been handed and has not written, oldest
+    /// first, each with the reading it was handed over at.
+    ///
+    /// The writer takes its frames in order, so these are always the newest frames handed over:
+    /// one written is every one before it written too.
+    unwritten: VecDeque<(FenceFrame, ContinuousMs)>,
+    /// How many published fences have been handed to a writer, on any connection.
+    handed: u64,
     /// The fence the bridge currently holds, so an invalidation can name it.
     published: Option<FenceId>,
     /// The transaction the reader is deciding now, and the ones whose callers are still waiting
@@ -314,6 +360,7 @@ impl std::fmt::Debug for FenceDriver {
             .field("phase", &self.phase.phase())
             .field("held", &self.hold.len())
             .field("connected", &self.outbound.is_some())
+            .field("unwritten", &self.unwritten.len())
             .finish()
     }
 }
@@ -336,6 +383,8 @@ impl FenceDriver {
             hold: BTreeMap::new(),
             next_batch: 0,
             outbound: None,
+            unwritten: VecDeque::new(),
+            handed: 0,
             published: None,
             live_launch: None,
             awaiting: VecDeque::new(),
@@ -461,8 +510,14 @@ impl FenceDriver {
     }
 
     /// Stops queueing frames, because the connection they would travel on has ended.
+    ///
+    /// A fence that connection's writer was handed and did not write never will be, so nothing
+    /// waits for it any more. The caller records the connection's loss on the same step, which
+    /// drops the fence: the keys that were waiting then go to the terminal as input of a session
+    /// that has lost its integration, not as input behind a fence.
     pub fn stop_sending(&mut self) {
         self.outbound = None;
+        self.unwritten.clear();
     }
 
     /// Puts one frame on the connection, once everything before it has happened.
@@ -473,6 +528,68 @@ impl FenceDriver {
         if let Some(outbound) = self.outbound.as_ref() {
             let _ = outbound.send(frame);
         }
+    }
+
+    /// Hands a published fence to the connection's writer, and returns the frame everything queued
+    /// for the terminal after it waits for.
+    ///
+    /// Called by the session on the step the machine published it, like [`Self::send`]. Nothing is
+    /// returned when no connection is live, because there is then no reader for the fence to reach
+    /// ahead of anything. A writer that has already ended still counts as handed the fence: its
+    /// connection is over, and the loss that ends it is what lets the keys behind the fence go.
+    pub fn publish(&mut self, fence: EditorFence) -> Option<FenceFrame> {
+        let outbound = self.outbound.as_ref()?;
+        self.handed += 1;
+        let frame = FenceFrame(self.handed);
+        let _ = outbound.send(Outbound::Published {
+            fence: Box::new(fence),
+            frame,
+        });
+        self.unwritten.push_back((frame, self.reading()));
+        // The connection's task times the write as well as the machine, so it looks again.
+        self.waker.notify_one();
+        Some(frame)
+    }
+
+    /// Records that the connection's writer has written `frame`, and so every fence before it.
+    ///
+    /// It returns no effects of its own. What it changes is what the session's queue for the
+    /// terminal may let go of, and the flush that ends every stimulus lets it go.
+    pub fn fence_written(&mut self, frame: FenceFrame) -> Effects {
+        while self
+            .unwritten
+            .front()
+            .is_some_and(|(unwritten, _)| *unwritten <= frame)
+        {
+            self.unwritten.pop_front();
+        }
+        self.waker.notify_one();
+        Effects::default()
+    }
+
+    /// Returns the oldest published fence the connection's writer has not written, if any.
+    ///
+    /// It and every fence handed over after it are unwritten, and every fence before it has been
+    /// written or has gone with its connection.
+    #[must_use]
+    pub fn unwritten_fence(&self) -> Option<FenceFrame> {
+        self.unwritten.front().map(|(frame, _)| *frame)
+    }
+
+    /// Returns how long the oldest unwritten fence may still wait for the writer, when there is one.
+    ///
+    /// Zero once [`FENCE_WRITE_LIMIT`] has passed, and the connection's task then ends the
+    /// connection. It is read on the same clock as the machine's own deadline.
+    #[must_use]
+    pub fn fence_write_deadline(&self) -> Option<Duration> {
+        let (_, handed) = self.unwritten.front()?;
+        let limit = u64::try_from(FENCE_WRITE_LIMIT.as_millis()).unwrap_or(u64::MAX);
+        Some(Duration::from_millis(
+            handed
+                .plus(limit)
+                .get()
+                .saturating_sub(self.reading().get()),
+        ))
     }
 
     /// Returns how long the driver's timer should wait, when it has a deadline.
@@ -950,9 +1067,7 @@ impl FenceDriver {
             }
             Action::PublishFence(fence) => {
                 self.published = Some(fence.fence_id);
-                effects.steps.push(Step::Send(Outbound::Publication(
-                    FencePublication::Published(fence.clone()),
-                )));
+                effects.steps.push(Step::Publish(Box::new(fence.clone())));
             }
             Action::WithholdFence(reason) => {
                 effects.steps.push(Step::Send(Outbound::Publication(
@@ -1279,7 +1394,7 @@ mod tests {
     #[test]
     fn the_steps_stay_in_the_order_the_machine_listed_its_actions() {
         // One list, in the machine's own order. An interrupt that revokes a launch revokes it
-        // first, and held input is released before the publication that explains why it waited.
+        // first.
         let clock = Arc::new(ManualClock::new());
         let mut driver = qualified(&clock);
         let effects = driver.bridge_event(RequestId::new(2), &entered(1, 1));
@@ -1352,5 +1467,109 @@ mod tests {
             "the launch is revoked before the interrupt that revoked it: {:?}",
             effects.steps
         );
+    }
+
+    /// The acknowledged fence and the held keys, as the steps the session carries out.
+    fn acknowledged(driver: &mut FenceDriver) -> Effects {
+        let effects = driver.bridge_event(RequestId::new(2), &entered(1, 1));
+        let fence_id = effects
+            .steps
+            .iter()
+            .find_map(|step| match step {
+                Step::Send(Outbound::Request(request)) => match request.as_ref() {
+                    WorkerRequest::Fence(params) => Some(params.fence_id),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("the reader was asked for a fence");
+        let held = driver.input_arrived(
+            lease().holder.expect("a holder"),
+            InputLeaseEpoch::new(1),
+            InputBatch::Lease {
+                epoch: 1,
+                bytes: b"held".to_vec(),
+                paste: crate::session::PasteTransition::default(),
+                authority_deadline_boot_ms: None,
+            },
+        );
+        assert_eq!(
+            held.held_added, 4,
+            "the keys wait while the reader is asked"
+        );
+        driver.bridge_answer(&BridgeAnswer::Fence(
+            kr_protocol::root::RootEditorFenceResult::Acknowledged(FenceAcknowledgement {
+                fence_id,
+                reader_context: ReaderContext::Primary,
+                prompt_generation: PromptGeneration::new(1),
+                reader_revision: ReaderRevision::new(1),
+                queues: kr_protocol::root::QueueDrainReport::CLEAR,
+                snapshot: KeyQueueSnapshot::drained(),
+                editor: editor(),
+                cwd_revision: CwdRevision::new(1),
+            }),
+        ))
+    }
+
+    #[test]
+    fn a_fence_is_published_before_the_keys_it_lets_go_of_and_waited_for_until_written() {
+        let clock = Arc::new(ManualClock::new());
+        let mut driver = qualified(&clock);
+        let (outbound, mut writer) = tokio::sync::mpsc::unbounded_channel();
+        driver.send_through(outbound);
+
+        let effects = acknowledged(&mut driver);
+        let published = effects
+            .steps
+            .iter()
+            .position(|step| matches!(step, Step::Publish(_)));
+        let released = effects
+            .steps
+            .iter()
+            .position(|step| matches!(step, Step::Write(_)));
+        let (Some(published), Some(released)) = (published, released) else {
+            panic!("both the fence and the keys: {:?}", effects.steps);
+        };
+        assert!(
+            published < released,
+            "the fence is published before the keys it lets go of: {:?}",
+            effects.steps
+        );
+        let fence = driver.fence().cloned().expect("a published fence");
+
+        // Handed to the writer, the fence is numbered and waited for until the writer says it is
+        // written, and for no longer than the limit.
+        let frame = driver
+            .publish(fence.clone())
+            .expect("a live connection takes it");
+        assert_eq!(
+            writer.try_recv().expect("the writer has it"),
+            Outbound::Published {
+                fence: Box::new(fence.clone()),
+                frame,
+            }
+        );
+        assert_eq!(driver.unwritten_fence(), Some(frame));
+        assert_eq!(driver.fence_write_deadline(), Some(FENCE_WRITE_LIMIT));
+        clock.advance(FENCE_WRITE_LIMIT);
+        assert_eq!(driver.fence_write_deadline(), Some(Duration::ZERO));
+        let _ = driver.fence_written(frame);
+        assert_eq!(driver.unwritten_fence(), None);
+        assert_eq!(driver.fence_write_deadline(), None);
+
+        // Written in order, so a later frame written is every earlier one written too.
+        let first = driver.publish(fence.clone()).expect("taken");
+        let second = driver.publish(fence.clone()).expect("taken");
+        assert!(first < second);
+        assert_eq!(driver.unwritten_fence(), Some(first));
+        let _ = driver.fence_written(second);
+        assert_eq!(driver.unwritten_fence(), None);
+
+        // One the connection never writes stops being waited for when the connection ends.
+        let _ = driver.publish(fence.clone()).expect("taken");
+        driver.stop_sending();
+        assert_eq!(driver.unwritten_fence(), None);
+        // With no connection there is no reader for a fence to reach ahead of anything.
+        assert_eq!(driver.publish(fence), None);
     }
 }

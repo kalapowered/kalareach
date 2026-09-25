@@ -215,7 +215,11 @@ pub struct Session {
     application_state: Option<ApplicationState>,
     closing_reason: Option<ClosureReason>,
     created_at_ms: TimestampMs,
-    pending_input: Vec<InputBatch>,
+    /// What is queued for the pseudo-terminal and not yet handed to its writer, in order.
+    ///
+    /// Only [`Session::take_pending_input`] takes from it, and it stops at a published fence the
+    /// bridge's writer has not written yet.
+    pending_input: std::collections::VecDeque<Queued>,
     owned: Option<OwnedProcesses>,
     root_exit: Option<ShellExit>,
     /// The desktop this session is bound to, where it is bound to one.
@@ -296,9 +300,8 @@ pub struct Session {
     /// The host's own answers that have been queued for the application and not yet written.
     ///
     /// The response lane bounds what it holds; this bounds what has left the lane. Counting only
-    /// what is in `pending_input` would count nothing, because every flush hands that vector to
-    /// the writer, so the counter is shared with the writer and comes down as each batch is
-    /// written.
+    /// what is in `pending_input` would miss everything a flush has handed to the writer, so the
+    /// counter is shared with the writer and comes down as each batch is written.
     /// Every byte queued for the pseudo-terminal, across every producer, released by the writer.
     queued_input_bytes: Arc<std::sync::atomic::AtomicUsize>,
     /// The part of that which belongs to the **current** lease, and which a lease change discards.
@@ -530,7 +533,7 @@ impl Session {
             application_state: None,
             closing_reason: None,
             created_at_ms: kr_ipc::now_ms(),
-            pending_input: Vec::new(),
+            pending_input: std::collections::VecDeque::new(),
             owned: None,
             root_exit: None,
             content_scopes: std::collections::BTreeMap::new(),
@@ -685,9 +688,11 @@ impl Session {
     /// Carries out what one fence stimulus left for the session to do.
     ///
     /// One pass over the machine's own action list, front to back, carrying out each step where the
-    /// machine put it. Nothing is grouped and nothing is reordered: released input reaches the
-    /// writer before the fence that explains why it waited, a launch is revoked before the
-    /// interrupt that revoked it, and a detach is acknowledged only after its attachment is gone.
+    /// machine put it. Nothing is grouped and nothing is reordered: a fence goes to the bridge
+    /// before the input it lets go of is queued, a launch is revoked before the interrupt that
+    /// revoked it, and a detach is acknowledged only after its attachment is gone. The fence and
+    /// the input travel on two writers, so the queue also records where the fence was published,
+    /// and nothing behind that point leaves it until the bridge's writer has written the fence.
     pub fn apply_fence_effects(&mut self, effects: crate::fence::Effects) -> FenceOutcome {
         use crate::fence::Step;
 
@@ -713,6 +718,15 @@ impl Session {
         for step in effects.steps {
             match step {
                 Step::Write(batch) => self.queue_input(batch),
+                Step::Publish(fence) => {
+                    if let Some(frame) = self
+                        .fence
+                        .as_mut()
+                        .and_then(|driver| driver.publish(*fence))
+                    {
+                        self.pending_input.push_back(Queued::Fence(frame));
+                    }
+                }
                 Step::EditorBusy(event) => self.hub.publish_event(
                     event.attachment_id,
                     crate::output::OutputDelivery::EditorBusy(event),
@@ -1325,7 +1339,8 @@ impl Session {
             .lease_change_queued
             .swap(true, std::sync::atomic::Ordering::AcqRel)
         {
-            self.pending_input.push(InputBatch::LeaseChanged);
+            self.pending_input
+                .push_back(Queued::Batch(InputBatch::LeaseChanged));
         }
     }
 
@@ -2390,9 +2405,36 @@ impl Session {
         self.interrupt_foreground()
     }
 
-    /// Takes the batches waiting to be written to the pseudo-terminal.
+    /// Takes the batches that may be written to the pseudo-terminal now, in the order they were
+    /// queued.
+    ///
+    /// It stops at a published fence the bridge's writer has not written yet, and leaves it and
+    /// everything behind it queued. A reader takes what is on its endpoint before it acts on a key,
+    /// and only what is already there, so a key that reached the shell ahead of the fence it was
+    /// released under would be accepted without it: the line it made would run without the
+    /// capability the fence exists to mint. This is the only way out of the queue, and every byte
+    /// for the terminal goes through the queue, so nothing reaches the terminal around a fence.
+    ///
+    /// When the writer reports the fence written, or its connection ends and the loss has been
+    /// recorded, the next flush takes what was waiting.
     pub fn take_pending_input(&mut self) -> Vec<InputBatch> {
-        std::mem::take(&mut self.pending_input)
+        let unwritten = self
+            .fence
+            .as_ref()
+            .and_then(crate::fence::FenceDriver::unwritten_fence);
+        let mut taken = Vec::new();
+        while let Some(queued) = self.pending_input.pop_front() {
+            match queued {
+                Queued::Batch(batch) => taken.push(batch),
+                Queued::Fence(frame) if unwritten.is_some_and(|oldest| frame >= oldest) => {
+                    self.pending_input.push_front(Queued::Fence(frame));
+                    break;
+                }
+                // Written, or gone with the connection it was handed to.
+                Queued::Fence(_) => {}
+            }
+        }
+        taken
     }
 
     /// Returns the epoch a batch must carry to still be written.
@@ -2718,7 +2760,7 @@ impl Session {
         if let InputBatch::Lease { epoch, .. } = batch {
             self.queued_lease_bytes.add(epoch, batch.len());
         }
-        self.pending_input.push(batch);
+        self.pending_input.push_back(Queued::Batch(batch));
     }
 
     /// Returns the counter the writer releases as the application takes its input.
@@ -4075,6 +4117,18 @@ pub struct FenceOutcome {
     pub lease_acknowledged: Option<kr_shell_integration::contract::fence::LeaseAcknowledgement>,
     /// The loss that closes the creating session, when one does.
     pub close_session: Option<kr_shell_integration::contract::qualification::IntegrationLoss>,
+}
+
+/// One entry in a session's queue for the pseudo-terminal.
+#[derive(Debug)]
+enum Queued {
+    /// A batch for the writer.
+    Batch(InputBatch),
+    /// A fence published to the bridge at this point.
+    ///
+    /// What is queued behind it waits until the bridge's writer has written the fence, or until the
+    /// connection it was handed to has ended and the session has recorded the loss.
+    Fence(crate::fence::FenceFrame),
 }
 
 /// One ordered batch of input on its way to the pseudo-terminal.
