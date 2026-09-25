@@ -275,7 +275,9 @@ event it could not decode, a refused subscription or a detach, fails the case.
 
 `tests/conformance/applications.lock` pins each program by URL and SHA-256 for each platform. The
 script fetches each release once into a cache outside the repository (`KR_CONFORMANCE_APPLICATIONS`,
-or the platform's cache directory), checks its digest, and writes the cache's `index.json`. A
+or the platform's cache directory), checks its digest, and writes the cache's `index.json`. The cache
+is named by an absolute path without `..`, resolved through its links before anything is made in it,
+and refused inside the repository; a program's place in it that is a link is never used or replaced. A
 program whose project publishes source only is built there from that release's source, with the
 flags the lock records, against the system's own curses library; tmux is built against a pinned
 libevent built the same way. A release that cannot be fetched or built is recorded as not installed,

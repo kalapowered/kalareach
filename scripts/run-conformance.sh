@@ -15,10 +15,11 @@
 #
 # The applications group runs programs this script fetches once, each pinned by URL and SHA-256 in
 # tests/conformance/applications.lock, into a cache outside the repository
-# (KR_CONFORMANCE_APPLICATIONS, or the platform's cache directory). A program whose project
-# publishes source only is built there from that release's source. A release this host cannot
-# fetch or build is recorded as not installed, with the reason, and never taken from the
-# system's package manager.
+# (KR_CONFORMANCE_APPLICATIONS, or the platform's cache directory). The cache is named by an
+# absolute path without `..`, and is refused inside the repository; nothing in it is replaced
+# through a link. A program whose project publishes source only is built there from that
+# release's source. A release this host cannot fetch or build is recorded as not installed, with
+# the reason, and never taken from the system's package manager.
 #
 # Exit status: 0 when the run passed, 1 when it ran and did not, 2 when it was refused before
 # running anything.
@@ -83,6 +84,36 @@ else
     digest() { echo "no-digest-tool"; }
 fi
 
+# The application cache as a real path, or a refusal: an absolute path named without `..`, the
+# part of it that exists resolved through its links, and outside the repository. Nothing is made
+# until it has been judged.
+application_cache() {
+    local wanted="$1"
+    case "$wanted" in
+        /*) ;;
+        *) echo "run-conformance: the application cache $wanted is not an absolute path" >&2; return 1 ;;
+    esac
+    case "/$wanted/" in
+        */../*) echo "run-conformance: the application cache $wanted steps up with .." >&2; return 1 ;;
+    esac
+    local existing="$wanted" rest=""
+    while [ ! -d "$existing" ]; do
+        rest="/$(basename "$existing")$rest"
+        existing="$(dirname "$existing")"
+    done
+    local resolved repository
+    resolved="$(cd "$existing" && pwd -P)$rest"
+    resolved="${resolved/#\/\///}"
+    repository="$(cd "$root" && pwd -P)"
+    case "$resolved/" in
+        "$repository"/*)
+            echo "run-conformance: the application cache $wanted is inside the repository" >&2
+            return 1
+            ;;
+    esac
+    printf '%s\n' "$resolved"
+}
+
 # Fetches, and where the lock says so builds, every application the lock pins for this platform,
 # into the cache, and writes the cache's index. What could not be fetched or built is written into
 # the index as not installed, with the reason, and the matrix reports it as not run here.
@@ -106,11 +137,16 @@ fetch_applications() {
     local lines
     lines="$(python3 - "$lock" "$platform" "$family" <<'PYTHON'
 import json
+import re
 import sys
 
 lock = json.load(open(sys.argv[1]))
 platform, family = sys.argv[2], sys.argv[3]
 for application in lock["applications"]:
+    # Each names a directory of the cache, so each is one plain name.
+    for name in (application["id"], application["version"]):
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
+            sys.exit(f"the lock names {name!r}, which is not a plain directory name")
     chosen = None
     for source in application["sources"]:
         if source["platform"] == platform or (source["platform"] == "unix" and family != "windows"):
@@ -156,6 +192,13 @@ PYTHON
         local target="$cache/$id/$version"
         local stamp="$target.stamp"
         local wanted="$sha $kind $configure $environment"
+        # What is installed, and what a new installation replaces, is only ever a directory of the
+        # cache's own: a link there could take either somewhere else.
+        if [ -L "$cache/$id" ] || [ -L "$target" ] || [ -L "$stamp" ]; then
+            echo "  $id $version: its place in the cache is a link, so nothing is used or replaced there"
+            records+=("$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "$id" "$version" "$role" unavailable "$url" "$sha" "$kind" - "its place in the application cache is a link")")
+            continue
+        fi
         if [ "$url" = "-" ]; then
             echo "  $id $version: $reason"
             records+=("$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "$id" "$version" "$role" unsupported_platform - - "$kind" - "$reason")")
@@ -293,7 +336,8 @@ if selected applications && [ "$family" != windows ]; then
         macos) default_cache="$HOME/Library/Caches/kalareach/conformance-applications" ;;
         *) default_cache="${XDG_CACHE_HOME:-$HOME/.cache}/kalareach/conformance-applications" ;;
     esac
-    export KR_CONFORMANCE_APPLICATIONS="${KR_CONFORMANCE_APPLICATIONS:-$default_cache}"
+    cache="$(application_cache "${KR_CONFORMANCE_APPLICATIONS:-$default_cache}")" || exit 2
+    export KR_CONFORMANCE_APPLICATIONS="$cache"
     echo "run-conformance: applications in $KR_CONFORMANCE_APPLICATIONS"
     fetch_applications "$KR_CONFORMANCE_APPLICATIONS"
     arguments+=(--applications "$KR_CONFORMANCE_APPLICATIONS")
