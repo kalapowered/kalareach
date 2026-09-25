@@ -3378,26 +3378,6 @@ mod write_boundary {
     /// without waiting would otherwise hold the test, and the job running it, for ever.
     const WAIT_BOUND: Duration = Duration::from_secs(30);
 
-    /// Clocks this test moves by hand: a continuous clock, and a wall clock that reads what the
-    /// test last set, from the machine's reading now. A bound on either passes only when the test
-    /// moves it, however long the runner takes between two steps.
-    fn manual_clocks() -> (
-        kr_transport::clock::ManualClock,
-        Arc<std::sync::atomic::AtomicU64>,
-        crate::service::Clocks,
-    ) {
-        let continuous = kr_transport::clock::ManualClock::new();
-        let wall = Arc::new(std::sync::atomic::AtomicU64::new(kr_ipc::now_ms().get()));
-        let clocks = crate::service::Clocks {
-            continuous: Arc::new(continuous.clone()),
-            wall: {
-                let wall = Arc::clone(&wall);
-                crate::service::WallClock::from_fn(move || wall.load(Ordering::SeqCst))
-            },
-        };
-        (continuous, wall, clocks)
-    }
-
     /// How far one frame got at the peer.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Reached {
@@ -3682,7 +3662,7 @@ mod write_boundary {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_batch_held_past_its_decisions_bound_is_not_written() {
         let temp = kr_ipc::testing::TempHost::create();
-        let (continuous, _wall, clocks) = manual_clocks();
+        let (continuous, _wall, clocks) = super::super::tests::manual_clocks();
         let controller = super::super::tests::daemon_on(&temp, clocks).await;
         let stream = HeldStream::new(false);
         let output = output(&controller, &stream);
@@ -3916,7 +3896,7 @@ mod write_boundary {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_moment_the_boundary_reads_holds_for_every_later_decision() {
         let temp = kr_ipc::testing::TempHost::create();
-        let (_continuous, wall, clocks) = manual_clocks();
+        let (_continuous, wall, clocks) = super::super::tests::manual_clocks();
         let controller = super::super::tests::daemon_on(&temp, clocks).await;
         let stream = HeldStream::new(false);
         let output = output(&controller, &stream);
@@ -3983,7 +3963,7 @@ mod write_boundary {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_bound_the_boundary_finds_run_out_is_written_down_outside_the_poll() {
         let temp = kr_ipc::testing::TempHost::create();
-        let (continuous, wall, clocks) = manual_clocks();
+        let (continuous, wall, clocks) = super::super::tests::manual_clocks();
         let controller = super::super::tests::daemon_on(&temp, clocks).await;
         let stream = HeldStream::new(false);
         let output = output(&controller, &stream);

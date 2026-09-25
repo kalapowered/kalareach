@@ -1818,6 +1818,28 @@ pub(super) mod tests {
         .expect("the daemon starts")
     }
 
+    /// Clocks this test moves by hand: a continuous clock, and a wall clock that reads what the
+    /// test last set, from the machine's reading now. A bound on either passes only when the test
+    /// moves it, however long the runner takes between two steps.
+    pub(super) fn manual_clocks() -> (
+        kr_transport::clock::ManualClock,
+        Arc<std::sync::atomic::AtomicU64>,
+        crate::service::Clocks,
+    ) {
+        let continuous = kr_transport::clock::ManualClock::new();
+        let wall = Arc::new(std::sync::atomic::AtomicU64::new(kr_ipc::now_ms().get()));
+        let clocks = crate::service::Clocks {
+            continuous: Arc::new(continuous.clone()),
+            wall: {
+                let wall = Arc::clone(&wall);
+                crate::service::WallClock::from_fn(move || {
+                    wall.load(std::sync::atomic::Ordering::SeqCst)
+                })
+            },
+        };
+        (continuous, wall, clocks)
+    }
+
     /// What a test daemon is started with, in the boot `boot_identity` names.
     fn setup(
         temp: &kr_ipc::testing::TempHost,
@@ -2609,22 +2631,9 @@ pub(super) mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_offline_bound_runs_out_on_the_clock_it_was_anchored_on() {
         let temp = kr_ipc::testing::TempHost::create();
-        let continuous = kr_transport::clock::ManualClock::new();
-        let synchronised = kr_ipc::now_ms().get();
-        let wall = Arc::new(std::sync::atomic::AtomicU64::new(synchronised));
-        let controller = daemon_on(
-            &temp,
-            crate::service::Clocks {
-                continuous: Arc::new(continuous.clone()),
-                wall: {
-                    let wall = Arc::clone(&wall);
-                    crate::service::WallClock::from_fn(move || {
-                        wall.load(std::sync::atomic::Ordering::SeqCst)
-                    })
-                },
-            },
-        )
-        .await;
+        let (continuous, wall, clocks) = manual_clocks();
+        let synchronised = wall.load(std::sync::atomic::Ordering::SeqCst);
+        let controller = daemon_on(&temp, clocks).await;
         let revision = controller.policy().authority_revision();
         choose_offline_bound(&controller, synchronised, 200);
         let (lasting, lasting_record) = granted(GrantExpiry::Never, revision);
@@ -2766,16 +2775,17 @@ pub(super) mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_shorter_offline_bound_after_a_rollback_never_ends_later() {
         let temp = kr_ipc::testing::TempHost::create();
-        let controller = daemon(&temp).await;
+        let (continuous, wall, clocks) = manual_clocks();
+        let controller = daemon_on(&temp, clocks).await;
         let revision = controller.policy().authority_revision();
-        let synchronised = kr_ipc::now_ms().get();
+        let synchronised = wall.load(std::sync::atomic::Ordering::SeqCst);
         choose_offline_bound(&controller, synchronised, 400);
         let (lasting, lasting_record) = granted(GrantExpiry::Never, revision);
         controller
             .decide_for_device(&lasting, &lasting_record, listing(&temp, synchronised))
             .expect("inside the bound");
 
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        continuous.advance(std::time::Duration::from_millis(300));
         // The request's reading is wound back two hundred milliseconds, and the owner shortens the
         // bound to a quarter of a second without a synchronisation. Three hundred milliseconds
         // have passed, which is more than the shorter bound allows.
@@ -2798,16 +2808,17 @@ pub(super) mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_offline_lapse_the_continuous_clock_found_is_written_down_once_storage_takes_it() {
         let temp = kr_ipc::testing::TempHost::create();
-        let controller = daemon(&temp).await;
+        let (continuous, wall, clocks) = manual_clocks();
+        let controller = daemon_on(&temp, clocks).await;
         let revision = controller.policy().authority_revision();
-        let synchronised = kr_ipc::now_ms().get();
+        let synchronised = wall.load(std::sync::atomic::Ordering::SeqCst);
         choose_offline_bound(&controller, synchronised, 200);
         let (lasting, lasting_record) = granted(GrantExpiry::Never, revision);
         controller
             .decide_for_device(&lasting, &lasting_record, listing(&temp, synchronised))
             .expect("inside the bound");
 
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        continuous.advance(std::time::Duration::from_millis(300));
         let registry = refuse_offline_time_writes(&temp);
         let floor = controller.policy().utc_floor_ms();
         offline_lapsed(
@@ -2835,8 +2846,8 @@ pub(super) mod tests {
             "the time spent is written down once storage takes it"
         );
 
-        drop(controller);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // A daemon on the machine's own clocks reads the time spent from the record.
+        stopped(controller).await;
         let controller = daemon(&temp).await;
         offline_lapsed(
             controller.decide_for_device(
