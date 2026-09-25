@@ -21,11 +21,15 @@ use kr_protocol::catalogue::{
 };
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::ids::{
-    AgentBindingRevision, AgentTurnId, ApplicationInstanceId, PendingResourceId, PluginId,
-    SessionEpoch, SessionId,
+    AgentBindingRevision, AgentTurnId, ApplicationInstanceId, DraftId, DraftRevision,
+    PendingResourceId, PluginId, SessionEpoch, SessionId, TransferId,
 };
 use kr_protocol::method::Method;
-use kr_protocol::scalars::{Bytes, Nullable};
+use kr_protocol::scalars::{Bytes, Nullable, U64};
+use kr_protocol::transfer::{
+    AgentDraftAddAttachmentParams, AgentDraftAddAttachmentResult, AttachmentContribution,
+    InsertionMethod,
+};
 use serde_json::json;
 
 use crate::stage::events_snapshot;
@@ -191,6 +195,10 @@ fn answer<R>(call: String, outcome: Result<R, kr_e2e_m1b::device::RequestError>)
 /// Sends every typed agent action, and each of the package's actions, for `session_id`, naming an
 /// application instance and a binding revision the host never announced, and reads the agent's
 /// capabilities and commands the same way. Returns what the host answered each with.
+///
+/// The attachment request names a draft and an upload that are well formed and exist nowhere: a
+/// paired device's connection carries no draft or upload request to the service that keeps them,
+/// so a device cannot make real ones on this host, and what the host answers is recorded as it is.
 #[must_use]
 pub fn typed_actions(
     remote: &Remote,
@@ -261,6 +269,28 @@ pub fn typed_actions(
     ));
     answers.push(answer(
         Method::AgentApprovalRespond.as_str().to_owned(),
+        sent,
+    ));
+    let sent = runtime.block_on(remote.mutate::<_, AgentDraftAddAttachmentResult>(
+        Method::AgentDraftAddAttachment,
+        envelope.clone(),
+        &AgentDraftAddAttachmentParams {
+            draft_id: DraftId::new(kr_ipc::new_uuid()),
+            expected_revision: DraftRevision::new(1),
+            transfer_id: TransferId::new(kr_ipc::new_uuid()),
+            contribution: AttachmentContribution {
+                operation_id: "prompt".to_owned(),
+                accepted_media_types: vec!["image/png".to_owned()],
+                max_byte_len: U64::new(1 << 20),
+                max_count: U64::new(1),
+                insertion_method: InsertionMethod::TypedSubmission,
+                external_destination: Nullable::null(),
+                model_media_capability: true,
+            },
+        },
+    ));
+    answers.push(answer(
+        Method::AgentDraftAddAttachment.as_str().to_owned(),
         sent,
     ));
     let parameters = kr_cbor::to_canonical_vec(&json!({})).expect("empty parameters");

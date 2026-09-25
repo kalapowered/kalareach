@@ -19,10 +19,10 @@ use kr_e2e_m1b::catalogue::{copy_tree, directory_url, enrol};
 use kr_e2e_m1b::ceremony;
 use kr_e2e_m1b::device::{Device, PairedHost, Remote};
 use kr_e2e_m1b::host::{Host, document};
-use kr_e2e_m1b::run::{Run, ended_within, output_within, process_table, signal};
+use kr_e2e_m1b::run::{Run, describe, ended_within, output_within, process_table, signal};
 use kr_e2e_m1b::shells::ManagedShell;
 use kr_e2e_m1b::window::{Window, answered};
-use kr_ipc::identity::{ProcessQuery, query_process};
+use kr_ipc::identity::{ProcessQuery, ProcessState, process_state, query_process};
 use kr_protocol::catalogue::{
     CatalogueKind, CatalogueListParams, CatalogueListResult, PluginInstallParams,
     PluginInstallResult,
@@ -35,7 +35,7 @@ use kr_protocol::recovery::{EventsSnapshotParams, EventsSnapshotResult};
 use kr_protocol::scalars::{CanonicalSet, Nullable};
 
 use crate::build::Build;
-use crate::provenance::{PATH_FILE, Provenance};
+use crate::provenance::{Expected, PATH_FILE, Provenance};
 
 /// The prompt the run's own startup file sets, so a part knows the shell reads.
 pub const PROMPT: &str = "kr-agents$ ";
@@ -395,6 +395,14 @@ pub fn session_variables(
     // terminal that supplies it. The session's own TERM is the host's, whatever this names.
     variables.push(("TERM".to_owned(), Keyboard::PROFILE.to_owned()));
     variables.push(("PATH".to_owned(), session_path(host.run())));
+    // What a program in the session unpacks for itself lands in the run, not the system's own
+    // temporary directory.
+    let temporary = host.run().root().join("tmp");
+    if !temporary.is_dir() {
+        kr_ipc::paths::create_private_tree(host.run().root(), &temporary)
+            .expect("the run's temporary directory");
+    }
+    variables.push(("TMPDIR".to_owned(), temporary.display().to_string()));
     variables.push(("ZDOTDIR".to_owned(), home));
     variables.push(("SHELL".to_owned(), shell.executable.display().to_string()));
     variables.push(("LANG".to_owned(), "en_US.UTF-8".to_owned()));
@@ -438,9 +446,21 @@ pub fn prepare_home(host: &Host<'_>, variables: &[(String, String)]) {
     );
 }
 
-/// Starts a session the way a person does, `kr new` at a terminal, with `home` as the session's
-/// home and no agent, reads the default keychain its shell sees with `security default-keychain`,
-/// which changes nothing, ends the session, and returns the line `security` printed.
+/// What a session a person starts with their own home reads as its default keychain.
+#[derive(Clone, Debug)]
+pub struct OwnHome {
+    /// The line `security default-keychain` printed in the session.
+    pub default_keychain: String,
+    /// The execution context the host chose for the session, as `kr list --json` names it.
+    pub worker_profile: serde_json::Value,
+    /// Whether the host named a desktop the session is bound to.
+    pub bound_to_a_desktop: bool,
+}
+
+/// Starts a session the way a person does, `kr new` at a terminal with no choice of execution
+/// context, so the host gives it the one it gives every session, with `home` as the session's home
+/// and no agent; reads the default keychain its shell sees with `security default-keychain`, which
+/// changes nothing; and ends the session.
 ///
 /// The session's shell reads the run's own startup file, not the person's, so nothing of theirs
 /// runs; what the keychain search depends on, the home the session names, is theirs.
@@ -449,7 +469,11 @@ pub fn prepare_home(host: &Host<'_>, variables: &[(String, String)]) {
 ///
 /// Panics when the session does not start, or `security` prints no keychain.
 #[must_use]
-pub fn default_keychain_of_a_session(host: &Host<'_>, shell: &ManagedShell, home: &Path) -> String {
+pub fn default_keychain_of_a_session(
+    host: &Host<'_>,
+    shell: &ManagedShell,
+    home: &Path,
+) -> OwnHome {
     let run = host.run();
     let mut variables: Vec<(String, String)> = host
         .variables()
@@ -469,6 +493,11 @@ pub fn default_keychain_of_a_session(host: &Host<'_>, shell: &ManagedShell, home
     }
     let work = run.work().display().to_string();
     let executable = shell.executable.display().to_string();
+    let before: Vec<String> = host
+        .live_sessions()
+        .iter()
+        .map(|session| session["session_id"].to_string())
+        .collect();
     let mut window = Window::open(
         run,
         "a session with the person's own home",
@@ -476,7 +505,6 @@ pub fn default_keychain_of_a_session(host: &Host<'_>, shell: &ManagedShell, home
         &[
             "new",
             "--attach",
-            "--headless",
             "--shell",
             &executable,
             "--shell-mode",
@@ -491,6 +519,12 @@ pub fn default_keychain_of_a_session(host: &Host<'_>, shell: &ManagedShell, home
     );
     answered(&window, window.answer_capability_queries(0));
     let _ = window.wait_for_screen(PROMPT.trim_end(), "the managed shell reads at its terminal");
+    let created: Vec<serde_json::Value> = host
+        .live_sessions()
+        .into_iter()
+        .filter(|session| !before.contains(&session["session_id"].to_string()))
+        .collect();
+    assert_eq!(created.len(), 1, "one new live session: {created:?}");
     window.type_text(b"/usr/bin/security default-keychain\r");
     let rows = window.wait_for_screen(".keychain", "security names the default keychain");
     let named = rows
@@ -500,7 +534,11 @@ pub fn default_keychain_of_a_session(host: &Host<'_>, shell: &ManagedShell, home
         .expect("a keychain row");
     window.type_text(b"exit\r");
     let _ = window.exit_code(LIVENESS);
-    named
+    OwnHome {
+        default_keychain: named,
+        worker_profile: created[0]["worker_profile"].clone(),
+        bound_to_a_desktop: created[0]["desktop"]["desktop_session_id"].is_string(),
+    }
 }
 
 /// One managed session on a terminal of its own: `kr new --attach` in a window.
@@ -692,15 +730,17 @@ pub struct AgentProcess {
 /// unpacks into its home and runs for a moment, is recorded with the run all the same, and ended
 /// with it, but it is not the execution a part watches.
 ///
-/// Before the command is typed, the PATH the shell searches is checked, and once the agent draws
-/// its first screen the image every process beneath the shell runs is recorded and checked
-/// ([`Provenance`]).
+/// The screen must not show `ready` before the command is typed, so a screen left from an earlier
+/// program is never read as this one's. Before the command is typed, the PATH the shell searches is
+/// checked; once the agent draws its first screen, the image every process beneath the shell maps
+/// is recorded and checked, the launch must have run `expected`, and the session is watched from
+/// then to the end of the part ([`Provenance`]).
 ///
 /// # Panics
 ///
-/// Panics when the agent does not draw `ready`, nothing of the build runs beneath the shell, or
-/// the session searched or ran anything but the build under test, its runtime, the run's own and
-/// the system's.
+/// Panics when the screen already shows `ready`, the agent does not draw it, nothing of the build
+/// runs beneath the shell, or the session searched or ran anything but the build under test, its
+/// runtime, the run's own and the system's.
 #[must_use]
 pub fn launch(
     run: &Run,
@@ -708,7 +748,16 @@ pub fn launch(
     line: &str,
     ready: &str,
     provenance: &Provenance,
+    expected: &Expected,
 ) -> Vec<AgentProcess> {
+    assert!(
+        !session
+            .window
+            .screen()
+            .iter()
+            .any(|row| row.contains(ready)),
+        "the screen already shows {ready:?} before `{line}` is typed"
+    );
     let command = line.split_whitespace().next().expect("a command");
     provenance
         .check_path(command)
@@ -730,6 +779,10 @@ pub fn launch(
             provenance
                 .record(&everything)
                 .unwrap_or_else(|why| panic!("{why}"));
+            provenance
+                .verify_launch(&found, session.root_shell.pid.get(), expected, line)
+                .unwrap_or_else(|why| panic!("{why}"));
+            provenance.watch(session.root_shell.clone());
             return found;
         }
         assert!(
@@ -760,6 +813,11 @@ fn belongs(process: &AgentProcess, marks: &[PathBuf]) -> bool {
 
 /// Every process beneath `ancestor` now, each recorded with the run by its start identity.
 ///
+/// A number in the process table can name another process by the time it is looked up, so a
+/// process is taken only as the run's own search takes it: its start identity is read, its parent
+/// is read again while that start holds the number, and the parent it was found under must still
+/// be the process it was. Anything else is passed over, never recorded, and so never ended.
+///
 /// # Panics
 ///
 /// Panics when the search does not finish, which the run's closing check would also fail on.
@@ -769,18 +827,45 @@ pub fn beneath(run: &Run, ancestor: &ProcessStartIdentity, what: &str) -> Vec<Ag
         .unwrap_or_else(|why| panic!("the processes beneath {what}: {why}"));
     let table = process_table().unwrap_or_else(|why| panic!("{why}"));
     let mut found = Vec::new();
-    let mut parents = vec![u32::try_from(ancestor.pid.get()).expect("a process number")];
-    while let Some(parent) = parents.pop() {
-        for entry in table.iter().filter(|entry| entry.parent == parent) {
-            if let ProcessQuery::Present(identity) = query_process(entry.pid) {
-                run.record(identity.clone(), &format!("{what}: {}", entry.command));
-                found.push(AgentProcess {
-                    identity,
-                    command: entry.command.clone(),
-                    parent: entry.parent,
-                });
-                parents.push(entry.pid);
+    let mut under = vec![ancestor.clone()];
+    while let Some(parent) = under.pop() {
+        let parent_pid = u32::try_from(parent.pid.get()).expect("a process number");
+        for entry in table.iter().filter(|entry| entry.parent == parent_pid) {
+            let identity = match query_process(entry.pid) {
+                ProcessQuery::Present(identity) => identity,
+                ProcessQuery::Gone => continue,
+                ProcessQuery::CannotEstablish(error) => {
+                    panic!(
+                        "process {} beneath {what} could not be identified: {error}",
+                        entry.pid
+                    )
+                }
+            };
+            let Some(described) = describe(&identity)
+                .unwrap_or_else(|why| panic!("the processes beneath {what}: {why}"))
+            else {
+                continue;
+            };
+            match process_state(&parent) {
+                ProcessState::Running => {}
+                ProcessState::Ended => continue,
+                ProcessState::Unknown { detail } => {
+                    panic!(
+                        "whether the parent of process {} runs is not established: {detail}",
+                        entry.pid
+                    )
+                }
             }
+            if described.parent != parent_pid {
+                continue;
+            }
+            run.record(identity.clone(), &format!("{what}: {}", described.command));
+            found.push(AgentProcess {
+                identity: identity.clone(),
+                command: described.command,
+                parent: parent_pid,
+            });
+            under.push(identity);
         }
     }
     found
@@ -1068,7 +1153,7 @@ impl Keyboard {
         remote: &Remote,
         runtime: &tokio::runtime::Runtime,
         text: &str,
-    ) -> Result<kr_protocol::input::InputWriteResult, String> {
+    ) -> Result<kr_protocol::input::InputWriteResult, InputRefusal> {
         let params = kr_protocol::input::InputWriteParams {
             session_id: self.session_id,
             attachment_id: self.attachment_id,
@@ -1078,17 +1163,41 @@ impl Keyboard {
         };
         let written = runtime
             .block_on(remote.session().write_input(&params))
-            .map_err(|error| format!("input.write: {error}"))?;
+            .map_err(|error| InputRefusal {
+                code: match &error {
+                    kr_client::error::ClientError::Host(refusal) => Some(refusal.code),
+                    _ => None,
+                },
+                detail: format!("input.write: {error}"),
+            })?;
         let length = u64::try_from(text.len()).unwrap_or(u64::MAX);
         if written.sequence.get() != self.next || written.forwarded_bytes.get() != length {
-            return Err(format!(
-                "input {} of {length} bytes was acknowledged as {} with {} bytes forwarded",
-                self.next,
-                written.sequence.get(),
-                written.forwarded_bytes.get()
-            ));
+            return Err(InputRefusal {
+                code: None,
+                detail: format!(
+                    "input {} of {length} bytes was acknowledged as {} with {} bytes forwarded",
+                    self.next,
+                    written.sequence.get(),
+                    written.forwarded_bytes.get()
+                ),
+            });
         }
         self.next += 1;
         Ok(written)
+    }
+}
+
+/// Why typed input was not taken.
+#[derive(Clone, Debug)]
+pub struct InputRefusal {
+    /// The code the host refused it with, when the host answered with a refusal.
+    pub code: Option<kr_protocol::error::ErrorCode>,
+    /// What happened, in words.
+    pub detail: String,
+}
+
+impl std::fmt::Display for InputRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
     }
 }

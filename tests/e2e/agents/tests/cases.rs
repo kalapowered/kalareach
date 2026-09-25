@@ -22,7 +22,7 @@ use kr_e2e_agents::observe::{
     TYPED_PROMPT, announced, capability_states, live_bindings, typed_actions,
 };
 use kr_e2e_agents::outcome::Outcome;
-use kr_e2e_agents::provenance::Provenance;
+use kr_e2e_agents::provenance::{Expected, Provenance, StopSampling};
 use kr_e2e_agents::stage::{
     AgentProcess, Installation, Installed, Keyboard, Owner, PROMPT, Replacement, Session,
     closed_port, default_keychain_of_a_session, events_snapshot, free_port, inode_of, install,
@@ -41,6 +41,7 @@ use kr_protocol::error::ErrorCode;
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{InputLeaseEpoch, InputSequence};
 use kr_protocol::input::InputWriteParams;
+use kr_protocol::method::Method;
 use kr_protocol::scalars::Bytes;
 use serde_json::json;
 
@@ -105,7 +106,7 @@ fn on_stage(part: &str, body: impl FnOnce(&mut Stage<'_, '_>) -> Ending) {
     let run = Run::start(&format!("part {part}"));
     // Before anything starts in the run's home: a keychain of its own, its default there.
     let keychain = RunKeychain::create(&run.home());
-    let provenance = Provenance::new(&inputs.build, &run, &shell);
+    let provenance = Provenance::new(&inputs.build, &run, &shell, part);
     place_forwarder(&run);
     let host = Host::start(
         &run,
@@ -121,7 +122,11 @@ fn on_stage(part: &str, body: impl FnOnce(&mut Stage<'_, '_>) -> Ending) {
         &inputs.generation,
         &inputs.build.package,
     );
-    let ending = {
+    // The sessions an agent is launched in are watched from the launch to the end of the part, by
+    // a thread of their own; it stops when the part ends, however it ends.
+    let ending = std::thread::scope(|scope| {
+        let _stop = StopSampling(&provenance);
+        let _sampler = scope.spawn(|| provenance.sample_until_stopped());
         let mut stage = Stage {
             build: &inputs.build,
             run: &run,
@@ -133,7 +138,7 @@ fn on_stage(part: &str, body: impl FnOnce(&mut Stage<'_, '_>) -> Ending) {
             provenance: &provenance,
         };
         body(&mut stage)
-    };
+    });
     for session in &ending.sessions {
         session.remote.close();
     }
@@ -155,9 +160,19 @@ fn on_stage(part: &str, body: impl FnOnce(&mut Stage<'_, '_>) -> Ending) {
         .unwrap_or_else(|left| panic!("still running after part {part}: {left}"));
     println!("{checked}");
     drop(keychain);
+    provenance.finish().unwrap_or_else(|why| panic!("{why}"));
     let mut outcome = ending.outcome;
     if let Some(evidence) = outcome.evidence.as_object_mut() {
         evidence.insert("provenance".to_owned(), provenance.evidence());
+        evidence.insert(
+            "installed".to_owned(),
+            json!({
+                "plugin_id": installed.plugin_id.to_string(),
+                "version": installed.version,
+                "manifest_digest": installed.package_digest,
+                "grant": installed.grant,
+            }),
+        );
     }
     outcome.append(&inputs.result);
 }
@@ -236,6 +251,7 @@ fn start_agent(stage: &Stage<'_, '_>, variables: &[(String, String)], what: &str
             &words.join(" "),
             &server.ready,
             stage.provenance,
+            &Expected::pinned(stage.build),
         );
         (session, processes)
     });
@@ -253,6 +269,7 @@ fn start_agent(stage: &Stage<'_, '_>, variables: &[(String, String)], what: &str
         &stage.build.command_line(port),
         &stage.build.ready,
         stage.provenance,
+        &Expected::pinned(stage.build),
     );
     Agent {
         session,
@@ -527,18 +544,24 @@ fn an_agent_on_its_terminal_route_is_advertised_no_typed_capability_and_every_ty
         assert_eq!(bindings, 0, "no live binding holds the installed package");
         for answer in &answers {
             // A device is not served the agent reads on this host; a mutation and a plugin action
-            // name an instance the host does not hold.
-            let wanted = if answer.call.starts_with("agent.capabilities")
+            // name an instance the host does not hold. The attachment request is refused before
+            // any instance is looked at: the method's selectors name an application instance and
+            // its parameters carry none, so no device request for it passes on this host.
+            let (wanted, because) = if answer.call.starts_with("agent.capabilities")
                 || answer.call.starts_with("agent.commands")
             {
-                ErrorCode::InvalidArgument.as_str()
+                (ErrorCode::InvalidArgument.as_str(), "")
+            } else if answer.call == Method::AgentDraftAddAttachment.as_str() {
+                (
+                    ErrorCode::InvalidArgument.as_str(),
+                    "names no application instance in its parameters",
+                )
             } else {
-                ErrorCode::StaleSession.as_str()
+                (ErrorCode::StaleSession.as_str(), "")
             };
-            assert_eq!(
-                answer.refused.as_deref(),
-                Some(wanted),
-                "{} is refused with {wanted}: {}",
+            assert!(
+                answer.refused.as_deref() == Some(wanted) && answer.detail.contains(because),
+                "{} is refused with {wanted} {because:?}: {}",
                 answer.call,
                 answer.detail
             );
@@ -560,7 +583,13 @@ fn an_agent_on_its_terminal_route_is_advertised_no_typed_capability_and_every_ty
             "capability_states": states,
             "live_bindings": bindings,
             "answers": answers.iter().map(kr_e2e_agents::observe::Answer::evidence).collect::<Vec<_>>(),
-            "control": { "what": "terminal input under the lease from the same device", "result": control },
+            "attachment_request": "refused before any instance is looked at: agent.draft.add_attachment names an application instance in its selectors and carries none in its parameters, so this refusal says nothing about the terminal route",
+            "control": {
+                "what": "terminal input under the lease from the same device and connection, which the host accepts where it refuses the typed actions",
+                "breaks_property": false,
+                "why_not": "only a bound connector can advertise a typed capability or accept a typed action, and this host binds none",
+                "result": control,
+            },
         });
         Ending::new(Outcome::passed("2b", TEST, evidence), agent.sessions())
     });
@@ -647,7 +676,7 @@ fn a_control_daemon_crash_leaves_the_agent_and_its_local_terminal_running() {
             "agent_processes": agent.every_process().iter().map(|process| process.command.clone()).collect::<Vec<_>>(),
             "local_terminal_input": keys.shows,
             "restarted_daemon": replacement.identity().pid.get(),
-            "control": { "what": "the agent ended with a second daemon kill", "check": control.err() },
+            "control": { "what": "the agent ended with a second daemon kill", "breaks_property": true, "check": control.err() },
         });
         Ending {
             outcome: Outcome::passed("5a", TEST, evidence),
@@ -704,6 +733,7 @@ fn a_running_agent_keeps_its_build_through_an_upgrade_and_the_newer_build_gets_t
             &stage.build.command_line(free_port()),
             &newer.ready,
             stage.provenance,
+            &Expected::newer(stage.build, &newer),
         );
         let newer_file =
             std::fs::canonicalize(newer.prefix.join(&newer.pinned)).expect("the newer file");
@@ -754,32 +784,73 @@ fn a_running_agent_keeps_its_build_through_an_upgrade_and_the_newer_build_gets_t
         }
 
         // The control: the property broken on purpose. The first agent is ended and started again
-        // in the same session, which now resolves the newer build.
+        // in the same session, which now resolves the newer build, and the same check applied to
+        // the agent that session now runs must fail, because it runs the newer image. The screen
+        // is cleared first, so the relaunch's first screen is read from what it draws.
         end_agent(&first.every_process());
         let _ = first
             .session
             .window
             .wait_for_screen(PROMPT.trim_end(), "the first session's shell reads again");
+        first
+            .session
+            .window
+            .type_text(b"printf '\\033[?1049l\\033[H\\033[2J\\033[3J'\r");
+        let cleared = std::time::Instant::now();
+        while first
+            .session
+            .window
+            .screen()
+            .iter()
+            .any(|row| row.contains(&newer.ready) || row.contains(&stage.build.ready))
+        {
+            assert!(
+                cleared.elapsed() < LIVENESS,
+                "the first session's screen is cleared before the relaunch:\n{}",
+                first.session.window.screen().join("\n")
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
         let relaunched = launch(
             stage.run,
             &first.session,
             &stage.build.command_line(free_port()),
             &newer.ready,
             stage.provenance,
-        );
-        let control = runs_its_build(&running_first, &pinned, pinned_inode);
-        assert!(
-            control.is_err(),
-            "the check fails once the agent was relaunched from the upgraded installation"
+            &Expected::newer(stage.build, &newer),
         );
         let relaunched_refs: Vec<&AgentProcess> = relaunched.iter().collect();
-        let relaunched_runs_newer = executing(&relaunched_refs, &newer_file).is_some();
+        let (relaunched_process, relaunched_inode) = executing(&relaunched_refs, &newer_file)
+            .unwrap_or_else(|| {
+                panic!(
+                    "a process of the relaunched agent runs {}",
+                    newer_file.display()
+                )
+            });
+        assert_eq!(
+            relaunched_inode, newer_inode,
+            "the relaunched agent runs the newer build"
+        );
+        let control = runs_its_build(&relaunched_process, &pinned, pinned_inode);
+        assert!(
+            running(&relaunched_process)
+                && control
+                    .as_ref()
+                    .is_err_and(|why| why.contains(&format!("(inode {newer_inode})"))),
+            "the check fails for the relaunched agent because it runs the newer image: {control:?}"
+        );
         let evidence = json!({
             "pinned": { "file": pinned, "inode": pinned_inode },
             "newer": { "version": newer.version, "file": newer_file, "inode": newer_inode },
             "first_agent_process": running_first.pid.get(),
             "second_session_answers": answers.iter().map(kr_e2e_agents::observe::Answer::evidence).collect::<Vec<_>>(),
-            "control": { "what": "the agent relaunched after the upgrade", "check": control.err(), "relaunched_runs_newer": relaunched_runs_newer },
+            "control": {
+                "what": "the agent relaunched in the first session after the upgrade",
+                "breaks_property": true,
+                "relaunched_process": relaunched_process.pid.get(),
+                "relaunched_runs": { "file": newer_file, "inode": relaunched_inode },
+                "check": control.err(),
+            },
         });
         let mut sessions = first.sessions();
         sessions.push(second_session);
@@ -1053,8 +1124,15 @@ fn forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_unchanged
                 json!({ "session_id": target, "transcript_path": transcript, "cwd": work, "hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": { "command": "true" }, "tool_response": { "stdout": "" } }),
             ),
         ];
+        // Where each registration stops the forwarder, as its first line on standard error says.
+        let stage_of = |registration_name: &str| match registration_name {
+            "none" => None,
+            "absent" => Some("could not be reached"),
+            _ => Some("closed the connection without admitting this bridge"),
+        };
         let mut probes = Vec::new();
         for (registration_name, registration) in &registrations {
+            let stopped_at = stage_of(registration_name);
             for (event_name, event) in &hook_events {
                 let name = format!("hook-{registration_name}-{event_name}");
                 let result = probe(
@@ -1084,6 +1162,11 @@ fn forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_unchanged
                         .is_some_and(|ms| (0..=500).contains(&ms)),
                     "the forwarder answers {name} within 500 ms: {result}"
                 );
+                let said = result["stderr_first_line"].as_str().unwrap_or_default();
+                assert!(
+                    stopped_at.map_or(said.is_empty(), |stage| said.contains(stage)),
+                    "the forwarder stops {name} where its registration leads: {result}"
+                );
                 probes.push(result);
                 unchanged(stage, &format!("the forged hook input {name}"));
             }
@@ -1103,13 +1186,37 @@ fn forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_unchanged
                     claim: &target,
                 },
             );
-            assert!(
-                !result["stdout"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .contains("claude/channel"),
-                "the forged channel declares nothing for {name}: {result}"
-            );
+            let stdout = result["stdout"].as_str().unwrap_or_default();
+            let said = result["stderr_first_line"].as_str().unwrap_or_default();
+            match stopped_at {
+                // With no registration the channel answers the handshake with no capability at all,
+                // declares nothing and takes no permission, and ends cleanly.
+                None => {
+                    let lines: Vec<serde_json::Value> = stdout
+                        .lines()
+                        .map(|line| {
+                            serde_json::from_str(line).unwrap_or_else(|error| {
+                                panic!("the channel writes JSON for {name}: {error}: {result}")
+                            })
+                        })
+                        .collect();
+                    assert!(
+                        result["exit"] == 0
+                            && lines.len() == 1
+                            && lines[0]["id"] == 1
+                            && lines[0]["result"]["capabilities"] == json!({})
+                            && said.is_empty(),
+                        "the forged channel answers the handshake with no capability and nothing \
+                         else for {name}: {result}"
+                    );
+                }
+                // With a forged registration it stops where the registration leads and writes
+                // nothing to the agent.
+                Some(stage) => assert!(
+                    result["exit"] == 1 && stdout.is_empty() && said.contains(stage),
+                    "the forged channel stops at {stage:?} and writes nothing for {name}: {result}"
+                ),
+            }
             probes.push(result);
             unchanged(stage, &format!("the forged channel {name}"));
         }
@@ -1159,7 +1266,12 @@ fn forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_unchanged
                 bytes: Bytes::new(stage.build.harmless.input.as_bytes().to_vec()),
             }));
         let viewer_refusal = match &refused {
-            Err(error) => error.to_string(),
+            Err(kr_client::error::ClientError::Host(error))
+                if error.code == ErrorCode::PermissionDenied =>
+            {
+                error.to_string()
+            }
+            Err(error) => panic!("a view-only device's input is refused as not permitted: {error}"),
             Ok(written) => panic!("a view-only device's input is refused: {written:?}"),
         };
         let mut keyboard = keyboard(stage, &agent.session);
@@ -1169,7 +1281,13 @@ fn forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_unchanged
         stage.runtime.block_on(viewer.close());
         let evidence = json!({
             "steps": steps,
-            "control": { "what": "a view-only device's input refused where the owner device's is admitted", "viewer": viewer_refusal, "owner": admitted },
+            "control": {
+                "what": "a view-only device's input refused as not permitted where the owner device's is admitted",
+                "breaks_property": false,
+                "why_not": "a forgery that changes the host's state needs a registration the host issued, which this host issues to no connector",
+                "viewer": viewer_refusal,
+                "owner": admitted,
+            },
         });
         let mut sessions = agent.sessions();
         sessions.push(forging);
@@ -1212,7 +1330,8 @@ fn a_path_typed_at_the_agent_is_terminal_input_that_reaches_its_composer() {
         )
         .unwrap_or_else(|why| panic!("the device's keyboard attaches: {why}"));
         let control = match keyboard.type_text(&agent.session.remote, stage.runtime, &typed) {
-            Err(refusal) => refusal,
+            Err(refusal) if refusal.code == Some(ErrorCode::LeaseLost) => refusal.detail,
+            Err(refusal) => panic!("input without the lease is refused with LEASE_LOST: {refusal}"),
             Ok(written) => panic!("input without the lease is refused: {written:?}"),
         };
         assert!(
@@ -1265,7 +1384,7 @@ fn a_path_typed_at_the_agent_is_terminal_input_that_reaches_its_composer() {
             "forwarded_bytes": written.forwarded_bytes.get(),
             "composer_row": rows.iter().find(|row| row.contains(SHOT)),
             "announced": seen.evidence(),
-            "control": { "what": "the same input without the lease", "refused": control },
+            "control": { "what": "the same input without the lease", "breaks_property": true, "refused": control },
         });
         Ending::new(Outcome::passed("14.03a", TEST, evidence), agent.sessions())
     });
@@ -1314,7 +1433,8 @@ fn a_session_started_with_a_persons_own_home_keeps_their_login_keychain_as_its_d
             shell_packages: Some(shell.prefix.clone()),
         },
     );
-    let named = default_keychain_of_a_session(&host, &shell, &home);
+    let own = default_keychain_of_a_session(&host, &shell, &home);
+    let named = own.default_keychain.clone();
     host.stop()
         .unwrap_or_else(|why| panic!("the host did not stop cleanly: {why}"));
     let checked = run
@@ -1334,7 +1454,12 @@ fn a_session_started_with_a_persons_own_home_keeps_their_login_keychain_as_its_d
     Outcome::passed(
         "own-home",
         TEST,
-        json!({ "home": home, "default_keychain": named }),
+        json!({
+            "home": home,
+            "default_keychain": named,
+            "worker_profile": own.worker_profile,
+            "bound_to_a_desktop": own.bound_to_a_desktop,
+        }),
     )
     .append(&result);
 }
