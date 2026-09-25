@@ -3,9 +3,10 @@
 //! Each tree under `tests/fixtures/` is a Cargo workspace of its own, so the repository's
 //! workspace never builds it: `forms` keys rows in every form the report reads, ignores nothing
 //! and has a documentation test, `outcomes` has a test that passes, one that fails and ones that
-//! are ignored, `known` has a test that records a known difference, and `refused` names a row past
-//! the end of section 21's table and a bare section. The runs build into a target directory of
-//! their own under the platform's temporary directory.
+//! are ignored, `known` has a test that records a known difference, `refused` names a row past the
+//! end of section 21's table and a bare section, and `expansions`, which is read and never built,
+//! calls cases through macros and attributes the report cannot see into. The runs build into a
+//! target directory of their own under the platform's temporary directory.
 //!
 //! KR-REQ-29.01.
 
@@ -173,6 +174,45 @@ fn every_comment_form_and_a_case_table_key_their_tests() {
         ],
     );
     assert_eq!(keyed.len(), 10, "and nothing else: {keyed:?}");
+}
+
+#[test]
+fn a_call_a_macro_or_attribute_may_rewrite_move_or_rename_keys_nothing() {
+    // The tree is read and never built: the macros and crates its tests name are not there.
+    let map = map_of("expansions", false);
+    assert!(map.refused.is_empty(), "{:?}", map.refused);
+    assert!(map.problems.is_empty(), "{:?}", map.problems);
+    for (row, context) in [
+        ("KR-REQ-03.11", "which no test calls"),
+        ("KR-REQ-03.12", "which no test calls"),
+        ("KR-REQ-03.13", "which no test calls"),
+        ("KR-REQ-03.15", "which no test calls"),
+        ("KR-REQ-03.16", "which no test calls"),
+        ("KR-REQ-03.17", "which an attribute may rewrite"),
+        ("KR-REQ-03.18", "which an attribute may rewrite"),
+        ("KR-REQ-03.19", "which no test calls"),
+    ] {
+        let row = identifier(row);
+        assert!(
+            !map.keys.contains_key(&row),
+            "{row}: {:?}",
+            map.keys.get(&row)
+        );
+        assert!(
+            map.references.get(&row).is_some_and(|references| references
+                .iter()
+                .any(|reference| reference.context.contains(context))),
+            "{row}: {:?}",
+            map.references.get(&row)
+        );
+    }
+    assert_eq!(
+        keyed(&map).get("KR-REQ-03.14"),
+        Some(&vec![(
+            "flow calls_the_case_plainly".to_owned(),
+            Binding::CalledFunction
+        )])
+    );
 }
 
 #[test]

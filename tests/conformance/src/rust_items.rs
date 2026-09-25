@@ -89,8 +89,13 @@ pub struct Test {
     pub uses: BTreeSet<String>,
     /// Every function its body calls, as the path it is called by: `helper()` is `[helper]` and
     /// `shellpkg::helper()` is `[shellpkg, helper]`. A method call, a macro, a name that is not
-    /// called and a call whose first name the body may bind for itself are left out.
+    /// called and a call whose first name the body may bind for itself are left out, and so is
+    /// every call of a body a macro or attribute this reading cannot see into may rewrite.
     pub calls: BTreeSet<Vec<String>>,
+    /// The macro and attribute names the reading of it took on trust as the standard library's (or,
+    /// for `tokio::test`, as the Tokio crate's, written `tokio::`): its calls are proved only while
+    /// its target neither defines nor imports any of them.
+    pub assumes: BTreeSet<String>,
     /// The names its body's own `use` declarations bring in.
     pub imports: Vec<Import>,
     /// Who may name it.
@@ -134,6 +139,8 @@ pub struct Item {
     pub imports: Vec<Import>,
     /// Who may name it.
     pub visibility: Visibility,
+    /// Whether an attribute of its own may be a macro that rewrites it.
+    pub rewritable: bool,
 }
 
 /// One module: a file, or an inline `mod` block.
@@ -150,6 +157,14 @@ pub struct Module {
     pub docs: Vec<Comment>,
     /// Its entries, in source order.
     pub entries: Vec<Entry>,
+    /// The macros its `macro_rules!` items define, by name.
+    pub macros: Vec<String>,
+    /// Whether it brings in names its source does not list: an item under `#[macro_use]`, an
+    /// `extern crate`, or a macro invoked among its items, whose expansion may define anything.
+    pub unlisted_names: bool,
+    /// Whether an attribute on it, on the `mod` that declares it or on an enclosing module's, may be
+    /// a macro that rewrites everything in it.
+    pub rewritable: bool,
 }
 
 /// Why a crate could not be read.
@@ -213,6 +228,7 @@ pub fn scan_target(
             path: Vec::new(),
             directory,
             test_code: test_target,
+            rewritable: false,
         },
         &mut modules,
         &mut warnings,
@@ -226,6 +242,7 @@ struct FileModule {
     /// The directory its child modules' files are in.
     directory: PathBuf,
     test_code: bool,
+    rewritable: bool,
 }
 
 fn relative(root: &Path, path: &Path) -> String {
@@ -259,7 +276,7 @@ fn scan_file(
         &tokens,
         &context,
         &module.path,
-        module.test_code,
+        (module.test_code, module.rewritable),
         &module.directory,
         &mut parsed,
     );
@@ -301,6 +318,7 @@ fn scan_file(
                         path: declaration.path.clone(),
                         directory,
                         test_code: declaration.test_code,
+                        rewritable: declaration.rewritable,
                     },
                     modules,
                     warnings,
@@ -325,6 +343,7 @@ struct Declaration {
     path: Vec<String>,
     candidates: Vec<PathBuf>,
     test_code: bool,
+    rewritable: bool,
 }
 
 enum Parsed {
@@ -340,27 +359,33 @@ struct Attribute {
 }
 
 impl Attribute {
-    /// Whether the attribute is taken to define and bind nothing: the built-in lint, test,
-    /// documentation and configuration attributes, the tool attributes, `tokio::test`, which runs a
-    /// test's body as written on a runtime, and a `derive` of the standard library's traits, which
-    /// adds implementations only. Any other attribute may be a macro that defines items where the
-    /// source cannot show them.
-    fn inert(&self) -> bool {
+    /// The names this attribute is taken on trust by, when it leaves what it is on as written, and
+    /// `None` when it may rewrite or add to it. The built-in attributes, whose names no macro may
+    /// take, and the tool attributes need no trust. `#[test]` and `#[derive]` are macros of the
+    /// standard library's prelude, a derive of the standard library's traits adds implementations
+    /// only, and `#[tokio::test]` runs the test's block as written on a runtime; each is trusted by
+    /// the names it is known by, which the map holds against what the target defines and imports.
+    /// Any other attribute may be a macro that rewrites what it is on.
+    fn trusted(&self) -> Option<Vec<String>> {
         const BUILT_IN: &[&str] = &[
             "allow",
             "cfg",
             "cold",
             "deny",
+            "deprecated",
             "doc",
             "expect",
             "forbid",
             "ignore",
             "inline",
+            "macro_export",
+            "macro_use",
             "must_use",
             "non_exhaustive",
+            "path",
+            "recursion_limit",
             "repr",
             "should_panic",
-            "test",
             "track_caller",
             "warn",
         ];
@@ -377,14 +402,27 @@ impl Attribute {
         ];
         let path: Vec<&str> = self.path.iter().map(String::as_str).collect();
         match path.as_slice() {
-            ["derive"] => self
-                .arguments
-                .iter()
-                .filter_map(Token::ident)
-                .all(|name| DERIVES.contains(&name)),
-            [name] => BUILT_IN.contains(name),
-            ["tokio", "test"] | ["rustfmt" | "clippy", ..] => true,
-            _ => false,
+            [name] if BUILT_IN.contains(name) => Some(Vec::new()),
+            ["rustfmt" | "clippy", ..] => Some(Vec::new()),
+            ["test"] => Some(vec!["test".to_owned()]),
+            ["tokio", "test"] => Some(vec!["tokio::".to_owned()]),
+            ["derive"] => {
+                let derived: Vec<String> = self
+                    .arguments
+                    .iter()
+                    .filter_map(Token::ident)
+                    .map(str::to_owned)
+                    .collect();
+                derived
+                    .iter()
+                    .all(|name| DERIVES.contains(&name.as_str()))
+                    .then(|| {
+                        std::iter::once("derive".to_owned())
+                            .chain(derived)
+                            .collect()
+                    })
+            }
+            _ => None,
         }
     }
 
@@ -416,11 +454,13 @@ impl Attribute {
     }
 }
 
+/// Reads one module's tokens; `(test_code, rewritable)` say whether it is test code and whether an
+/// attribute on it or an enclosing module may rewrite it.
 fn parse_module(
     tokens: &[Token],
     context: &Context,
     path: &[String],
-    test_code: bool,
+    (test_code, rewritable): (bool, bool),
     directory: &Path,
     out: &mut Vec<Parsed>,
 ) {
@@ -430,6 +470,9 @@ fn parse_module(
         test_code,
         docs: Vec::new(),
         entries: Vec::new(),
+        macros: Vec::new(),
+        unlisted_names: false,
+        rewritable,
     };
     let mut children = Vec::new();
     let mut pending: Vec<&Token> = Vec::new();
@@ -471,6 +514,7 @@ fn parse_module(
                     if attribute.is_cfg_test() {
                         module.test_code = true;
                     }
+                    module.rewritable |= attribute.trusted().is_none();
                 } else {
                     attributes.push(attribute);
                 }
@@ -488,6 +532,28 @@ fn parse_module(
                 let end = item_end(tokens, at);
                 let item = &tokens[at..end];
                 let cfg_test = attributes.iter().any(Attribute::is_cfg_test);
+                let keyword = head(item);
+                let word = |offset: usize| item.get(keyword + offset).and_then(Token::ident);
+                let bang =
+                    |offset: usize| item.get(keyword + offset).is_some_and(|t| t.is_punct('!'));
+                let invoked = item
+                    .get(keyword..)
+                    .and_then(|rest| {
+                        rest.iter()
+                            .position(|t| !t.is_punct(':') && t.ident().is_none())
+                    })
+                    .is_some_and(|stop| bang(stop) && stop > 0);
+                if word(0) == Some("macro_rules")
+                    && bang(1)
+                    && let Some(defined) = word(2)
+                {
+                    module.macros.push(defined.to_owned());
+                } else if invoked {
+                    module.unlisted_names = true;
+                }
+                module.unlisted_names |= (word(0) == Some("extern") && word(1) == Some("crate"))
+                    || attributes.iter().any(|a| a.path == ["macro_use"]);
+                let rewrites = rewritable || attributes.iter().any(|a| a.trusted().is_none());
                 let entry = classify(item, &attributes, attached, token.line);
                 match entry {
                     Classified::Test(test) => module.entries.push(Entry::Test(test)),
@@ -500,7 +566,7 @@ fn parse_module(
                             &item[body.0..body.1],
                             context,
                             &child_path,
-                            test_code || cfg_test,
+                            (test_code || cfg_test, rewrites),
                             &child_directory,
                             &mut children,
                         );
@@ -522,6 +588,7 @@ fn parse_module(
                             path: child_path,
                             candidates,
                             test_code: test_code || cfg_test,
+                            rewritable: rewrites,
                         }));
                     }
                 }
@@ -741,9 +808,9 @@ fn classify(
                     .filter_map(|t| t.ident().map(str::to_owned))
                     .collect()
             });
-            let opaque = !attributes.iter().all(Attribute::inert);
-            let calls =
-                body.map_or_else(BTreeSet::new, |(from, to)| calls(&tokens[from..to], opaque));
+            let read = body.map_or_else(Read::default, |(from, to)| {
+                calls(&tokens[from..to], attributes)
+            });
             let imports = body.map_or_else(Vec::new, |(from, to)| body_imports(&tokens[from..to]));
             Classified::Test(Test {
                 name: name.unwrap_or_default(),
@@ -751,7 +818,8 @@ fn classify(
                 attached,
                 inside: comments_in(body),
                 uses,
-                calls,
+                calls: read.calls,
+                assumes: read.assumes,
                 imports,
                 visibility: visibility(&tokens[..at]),
             })
@@ -780,6 +848,7 @@ fn classify(
                 covers: range.map_or_else(Vec::new, |(from, to)| covers(&tokens[from..to])),
                 imports: Vec::new(),
                 visibility: visibility(&tokens[..at]),
+                rewritable: attributes.iter().any(|a| a.trusted().is_none()),
             })
         }
         _ => {
@@ -807,6 +876,7 @@ fn classify(
                     Vec::new()
                 },
                 visibility: visibility(&tokens[..at]),
+                rewritable: attributes.iter().any(|a| a.trusted().is_none()),
             })
         }
     }
@@ -886,49 +956,121 @@ fn use_tree(tokens: &[Token], mut at: usize, prefix: &[String], found: &mut Vec<
     }
 }
 
-/// Every function call in `tokens`, a function's body, that may reach a function of the module, as
-/// the path it is called by.
+/// What the reading of a test's body proves it calls, and the names it took on trust to prove it.
+#[derive(Debug, Default)]
+struct Read {
+    calls: BTreeSet<Vec<String>>,
+    assumes: BTreeSet<String>,
+}
+
+/// The standard library's macros whose arguments run as they are written, as expressions or format
+/// arguments, in a scope their expansion adds no name to.
+const RUN_AS_WRITTEN: &[&str] = &[
+    "assert",
+    "assert_eq",
+    "assert_ne",
+    "dbg",
+    "debug_assert",
+    "debug_assert_eq",
+    "debug_assert_ne",
+    "eprint",
+    "eprintln",
+    "format",
+    "format_args",
+    "matches",
+    "panic",
+    "print",
+    "println",
+    "todo",
+    "unimplemented",
+    "unreachable",
+    "vec",
+    "write",
+    "writeln",
+];
+
+/// The standard library's macros whose arguments are no code that runs: configuration, literals,
+/// and `stringify!`, whose tokens become text.
+const NO_CODE: &[&str] = &[
+    "cfg",
+    "column",
+    "compile_error",
+    "concat",
+    "env",
+    "file",
+    "include_bytes",
+    "include_str",
+    "line",
+    "module_path",
+    "option_env",
+    "stringify",
+];
+
+/// Every function call a test's body, `body`, makes that may reach a function of the module, as the
+/// path it is called by, with the macro and attribute names the reading took on trust; `attributes`
+/// are the test's own.
 ///
 /// A call is a name followed by an opening parenthesis, or by a turbofish and then one, with the
-/// `::`-joined names before it as its path. A name after a full stop is a method, a name before `!`
-/// is a macro, and the name a definition gives after `fn`, `struct` or `macro_rules!` is what it
-/// defines; none of them is a call of a free function.
+/// `::`-joined names before it as its path. A name after a full stop (not a `..` range) is a
+/// method, a name before `!` is a macro, and the name a definition gives after `fn` or `struct` is
+/// what it defines; none of them is a call of a free function. Comments are passed over.
 ///
-/// A call is resolved from the body's own scope unless its path starts at `crate`, `self` or
-/// `super`, and such a call is kept only when nothing in the body can bind its first name:
+/// A macro's expansion is out of sight, so a call is proved only where every macro and attribute of
+/// the test is known to add no name to, and rewrite nothing of, the code it is on: the standard
+/// library's macros by their bare names, [`RUN_AS_WRITTEN`] ones with their arguments read as code
+/// and [`NO_CODE`] ones passed over, and the attributes [`Attribute::trusted`] names. The names
+/// they are taken on trust by are returned, for the map to hold against what the target defines
+/// and imports. Any other macro, a macro the body defines, or any other attribute, in the body or
+/// on the test, may rewrite or re-scope any call, so none is kept. The definition of a macro in the
+/// body is passed over: it runs only where the macro is invoked.
 ///
-/// * The body shows that name nowhere but in calls and paths. Whatever binds a name in a body
-///   shows it in a place no call has: a `let` of any pattern, an `if let` or `while let`, a
-///   `match` arm, a `for`, a closure's parameters, a nested function's name or parameters, a
-///   nested module, type or constant. So no form of binding needs reading one by one. Where the
-///   name shows after a full stop or `::`, or before `::` or `!`, it is a method, a field, part of
-///   a path or a macro, which binds nothing, and it does not count; a type annotation that starts
-///   at the root (`name: ::std::...`) is no path and counts.
-/// * Neither the body nor the test's own attributes invoke a macro but those [`transparent`] names
-///   and the attributes [`Attribute::inert`] names, because any other expansion, a derive's or an
-///   attribute macro's included, may define an item of that name where the source cannot show it.
-///
-/// So a call the body may have bound for itself is never taken for a function of the module. A
-/// body's `use` declarations are the map's to read.
-fn calls(tokens: &[Token], opaque: bool) -> BTreeSet<Vec<String>> {
+/// A path that starts at `crate`, `self` or `super` passes over the body's own scope. Any other
+/// call is kept only when the body shows its first name nowhere but in calls, methods, paths and
+/// macro names: whatever binds a name in a body shows it elsewhere, in a `let` of any pattern, an
+/// `if let` or `while let`, a `match` arm, a `for`, a closure's or nested function's parameters, a
+/// nested function, module, type or constant, or a type annotation, so no form of binding needs
+/// reading one by one. A path from the root (`::name`) or after a qualifier (`<T>::name`) is not
+/// followed. A body's `use` declarations, and the attributes of the modules around it, are the map's
+/// to read.
+fn calls(body: &[Token], attributes: &[Attribute]) -> Read {
+    let mut read = Read::default();
+    for attribute in attributes {
+        match attribute.trusted() {
+            Some(names) => read.assumes.extend(names),
+            None => return Read::default(),
+        }
+    }
+    let tokens: Vec<Token> = body
+        .iter()
+        .filter(|token| !token.is_comment())
+        .cloned()
+        .collect();
     let mut found = BTreeSet::new();
     // Every name the body shows other than in a call, a method, a path or a macro.
     let mut elsewhere: BTreeSet<&str> = BTreeSet::new();
-    // Whether a macro, the test's own attributes included, may bind a name out of sight.
-    let mut opaque = opaque;
-    // The end of an attribute being passed over.
+    let mut defined_here: BTreeSet<&str> = BTreeSet::new();
+    let mut opaque = false;
     let mut skip_to = 0;
     for (index, token) in tokens.iter().enumerate() {
         if index < skip_to {
             continue;
         }
+        let punct = |at: Option<usize>, c: char| {
+            at.and_then(|at| tokens.get(at))
+                .is_some_and(|token| token.is_punct(c))
+        };
+        let before = |back: usize| index.checked_sub(back);
+        let after = |ahead: usize| Some(index + ahead);
+        let opens = |at: Option<usize>| ['(', '[', '{'].into_iter().any(|c| punct(at, c));
         if token.is_punct('#') {
-            let open =
-                index + usize::from(tokens.get(index + 1).is_some_and(|t| t.is_punct('!'))) + 1;
-            if tokens.get(open).is_some_and(|t| t.is_punct('['))
-                && let Some(close) = matching(tokens, open)
+            let open = index + if punct(after(1), '!') { 2 } else { 1 };
+            if punct(Some(open), '[')
+                && let Some(close) = matching(&tokens, open)
             {
-                opaque |= !attribute(&tokens[open + 1..close], token.line).inert();
+                match attribute(&tokens[open + 1..close], token.line).trusted() {
+                    Some(names) => read.assumes.extend(names),
+                    None => opaque = true,
+                }
                 skip_to = close + 1;
             }
             continue;
@@ -936,45 +1078,58 @@ fn calls(tokens: &[Token], opaque: bool) -> BTreeSet<Vec<String>> {
         let Some(name) = token.ident() else {
             continue;
         };
-        let punct_before = |back: usize, c: char| {
-            index
-                .checked_sub(back)
-                .is_some_and(|at| tokens[at].is_punct(c))
-        };
-        let punct_after = |ahead: usize, c: char| {
-            tokens
-                .get(index + ahead)
-                .is_some_and(|token| token.is_punct(c))
-        };
-        if punct_before(1, '.') {
+        if name == "macro_rules" && punct(after(1), '!') {
+            if let Some(defined) = tokens.get(index + 2).and_then(Token::ident) {
+                defined_here.insert(defined);
+            }
+            if opens(after(3)) {
+                skip_to = matching(&tokens, index + 3).map_or(tokens.len(), |close| close + 1);
+            }
             continue;
         }
-        if punct_after(1, '!') && ['(', '[', '{'].into_iter().any(|c| punct_after(2, c)) {
-            opaque |= !transparent(&path_to(tokens, index).0);
+        if punct(after(1), '!') && opens(after(2)) {
+            let standard = path_to(&tokens, index).0.len() == 1 && !defined_here.contains(name);
+            if standard && RUN_AS_WRITTEN.contains(&name) {
+                read.assumes.insert(name.to_owned());
+            } else if standard && NO_CODE.contains(&name) {
+                read.assumes.insert(name.to_owned());
+                skip_to = matching(&tokens, index + 2).map_or(tokens.len(), |close| close + 1);
+            } else {
+                opaque = true;
+            }
             continue;
         }
-        let before = index.checked_sub(1).and_then(|at| tokens[at].ident());
-        let defined = matches!(before, Some("fn" | "struct"))
-            || (punct_before(1, '!')
-                && index.checked_sub(2).and_then(|at| tokens[at].ident()) == Some("macro_rules"));
-        if !defined && called_after(tokens, index + 1) {
-            let (path, start) = path_to(tokens, index);
-            if start > 0 && tokens[start - 1].is_punct('.') {
+        if punct(before(1), '.') && !punct(before(2), '.') {
+            continue;
+        }
+        let defined = matches!(
+            before(1).and_then(|at| tokens[at].ident()),
+            Some("fn" | "struct")
+        );
+        if !defined && called_after(&tokens, index + 1) {
+            let (path, start) = path_to(&tokens, index);
+            let led = start.checked_sub(1);
+            if punct(led, ':') || (punct(led, '.') && !punct(start.checked_sub(2), '.')) {
                 continue;
             }
             found.insert(path);
-        } else if !(punct_before(1, ':') && punct_before(2, ':'))
-            && !(punct_after(1, ':') && punct_after(2, ':') && !punct_after(3, ':'))
-            && !punct_after(1, '!')
+        } else if !(punct(before(1), ':') && punct(before(2), ':'))
+            && !(punct(after(1), ':') && punct(after(2), ':') && !punct(after(3), ':'))
+            && !punct(after(1), '!')
         {
             elsewhere.insert(name);
         }
     }
-    found.retain(|path| {
-        matches!(path[0].as_str(), "crate" | "self" | "super")
-            || !(opaque || elsewhere.contains(path[0].as_str()))
-    });
-    found
+    if !opaque {
+        read.calls = found
+            .into_iter()
+            .filter(|path| {
+                matches!(path[0].as_str(), "crate" | "self" | "super")
+                    || !elsewhere.contains(path[0].as_str())
+            })
+            .collect();
+    }
+    read
 }
 
 /// The path that ends at the name at `index`, the name and the `segment ::` pairs before it, and
@@ -995,68 +1150,6 @@ fn path_to(tokens: &[Token], index: usize) -> (Vec<String>, usize) {
         at -= 3;
     }
     (path, at)
-}
-
-/// Whether the macro `path` names is taken to bind nothing in a body beyond what its arguments
-/// show, and to define no item a test's helper could be named after: the standard library's
-/// macros that expand to an expression or to items named in their arguments, by name or by their
-/// `std`, `core` or `alloc` path, and the pinned crates' of that kind the tests invoke by path.
-fn transparent(path: &[String]) -> bool {
-    const STANDARD: &[&str] = &[
-        "assert",
-        "assert_eq",
-        "assert_ne",
-        "cfg",
-        "column",
-        "compile_error",
-        "concat",
-        "dbg",
-        "debug_assert",
-        "debug_assert_eq",
-        "debug_assert_ne",
-        "env",
-        "eprint",
-        "eprintln",
-        "file",
-        "format",
-        "format_args",
-        "include_bytes",
-        "include_str",
-        "line",
-        "matches",
-        "module_path",
-        "option_env",
-        "panic",
-        "print",
-        "println",
-        "stringify",
-        "thread_local",
-        "todo",
-        "unimplemented",
-        "unreachable",
-        "vec",
-        "write",
-        "writeln",
-    ];
-    const BY_PATH: &[&str] = &[
-        "core::mem::offset_of",
-        "core::pin::pin",
-        "rusqlite::params",
-        "serde_json::json",
-        "std::mem::offset_of",
-        "std::pin::pin",
-        "tokio::join",
-        "tokio::pin",
-        "tokio::select",
-        "tokio::try_join",
-    ];
-    match path {
-        [name] => STANDARD.contains(&name.as_str()),
-        [root, name] if matches!(root.as_str(), "std" | "core" | "alloc") => {
-            STANDARD.contains(&name.as_str())
-        }
-        _ => BY_PATH.contains(&path.join("::").as_str()),
-    }
 }
 
 /// Whether the tokens from `at` open a call's arguments: `(`, or a turbofish `::<...>` and then `(`.
@@ -1263,7 +1356,7 @@ mod tests {
 
     #[test]
     fn a_name_the_body_binds_for_itself_is_no_call_of_a_function_of_the_module() {
-        let read = |body: &str| calls(&lex(body).expect("lexes"), false);
+        let read = |body: &str| calls(&lex(body).expect("lexes"), &[]).calls;
         let shared = vec!["shared".to_owned()];
         for body in [
             "let shared = || 1; shared();",
@@ -1284,21 +1377,30 @@ mod tests {
             "const shared: fn() = other; shared();",
             "let shared: ::std::boxed::Box<dyn Fn()> = Box::new(|| {}); shared();",
             "let run = |shared: ::std::boxed::Box<dyn Fn()>| shared();",
-            // A macro other than those taken to bind nothing out of sight may define it.
+            // A macro other than the standard library's by its bare name may define it, or rewrite
+            // the call, however the invocation is spelt.
             "defines_it!(); shared();",
             "shared!(1); shared();",
             "helpers::defines_it! {} shared();",
+            "defines_it /* a gap */ !(); shared();",
+            "defines_it! /* a gap */ (); shared();",
+            "let _ = 0..captures!(shared());",
             "include!(\"cases.rs\"); shared();",
-            "std::include!(\"cases.rs\"); shared();",
+            "std::println!(\"x\"); shared();",
+            "let value = serde_json::json!({ \"a\": 1 }); shared();",
+            "tokio::select! { _ = first => {} } shared();",
+            "macro_rules! println { () => {} } println!(); shared();",
             // So may an attribute macro or a derive other than the standard library's.
             "#[make_shared] struct Fixture; shared();",
             "#[derive(Debug, helpers::Shared)] struct Fixture; shared();",
             "#[cfg_attr(unix, make_shared)] fn inner() {} shared();",
             "#![make_shared] shared();",
+            "# /* a gap */ [make_shared] struct Fixture; shared();",
         ] {
             assert!(!read(body).contains(&shared), "{body}: {:?}", read(body));
         }
-        // The same holds for the first name of a path, which a nested module or type can bind.
+        // The same holds for the first name of a path, which a nested module or type can bind; and
+        // a path from the root or after a qualifier is not followed.
         let nested = vec!["cases".to_owned(), "brought_up".to_owned()];
         for body in [
             "mod cases { pub fn brought_up() {} } cases::brought_up();",
@@ -1308,26 +1410,36 @@ mod tests {
             assert!(!read(body).contains(&nested), "{body}: {:?}", read(body));
         }
         assert!(read("cases::brought_up();").contains(&nested));
-        // A path that starts at the crate, the module or its parent passes over the body's scope.
-        let anchored = read(
-            "defines_it!(); let shared = 1; crate::shared(); self::shared(); super::shared();",
-        );
+        for body in [
+            "::cases::brought_up();",
+            "Container::<u8>::brought_up();",
+            "<Container as Cases>::brought_up();",
+        ] {
+            assert!(read(body).is_empty(), "{body}: {:?}", read(body));
+        }
+        // A path that starts at the crate, the module or its parent passes over the body's own
+        // bindings, but not a macro or attribute that may rewrite it.
+        let anchored = read("let shared = 1; crate::shared(); self::shared(); super::shared();");
         for root in ["crate", "self", "super"] {
             assert!(
                 anchored.contains(&vec![root.to_owned(), "shared".to_owned()]),
                 "{root}: {anchored:?}"
             );
         }
-        // What a definition names is no call of it.
+        assert!(read("in_module!(self::shared()); crate::shared();").is_empty());
+        // What a definition names is no call of it, and a macro the body defines and never
+        // invokes calls nothing.
         for body in [
             "fn shared() {}",
             "struct shared(u8);",
             "macro_rules! shared (() => {});",
+            "macro_rules! unused { () => { shared() }; }",
         ] {
             assert!(!read(body).contains(&shared), "{body}: {:?}", read(body));
         }
-        // A method, a segment of a path, a `use` declaration's included, and a turbofish bind
-        // nothing in the body.
+        // A method, a segment of a path, a `use` declaration's included, a turbofish, a range and
+        // comments bind nothing in the body, and the standard library's macros and attributes add
+        // nothing to it.
         for body in [
             "value.shared(); shared();",
             "let f = other::shared; shared();",
@@ -1335,39 +1447,94 @@ mod tests {
             "use other::shared as renamed; shared();",
             "shared(); shared(2);",
             "let f = shared::<u8>; shared();",
-            // The standard library's macros and the pinned crates' taken by path bind nothing out
-            // of sight.
+            "let r = 0..shared();",
+            "/* first */ shared /* then */ ();",
             "assert_eq!(shared(), 1); println!(\"{}\", 1);",
-            "let v = vec![1]; std::println!(\"{v:?}\"); shared();",
-            "let value = serde_json::json!({ \"a\": 1 }); shared();",
-            "tokio::select! { _ = first => {} } shared();",
-            "let pinned = std::pin::pin!(future); shared();",
-            // Built-in and tool attributes, and a derive of the standard library's traits, bind
-            // nothing either.
+            "let v = vec![1]; println!(\"{v:?}\"); shared();",
             "#![allow(unused)] #[derive(Debug, Clone)] struct Fixture; shared();",
             "#[cfg(unix)] #[rustfmt::skip] let x = 1; #[expect(clippy::no_effect)] shared();",
         ] {
             assert!(read(body).contains(&shared), "{body}: {:?}", read(body));
         }
+        // The arguments of a macro that are no code are passed over.
+        assert!(
+            read("let text = stringify!(shared()); let on = cfg!(any(unix, windows));").is_empty()
+        );
+        // What the reading took on trust is returned with the calls.
+        let trusted = calls(
+            &lex("assert_eq!(shared(), 1); #[derive(Clone)] struct F; let t = stringify!(x);")
+                .expect("lexes"),
+            &[],
+        )
+        .assumes;
+        let names: BTreeSet<String> = ["assert_eq", "derive", "Clone", "stringify"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(trusted, names);
     }
 
     #[test]
-    fn a_test_whose_own_attributes_may_be_macros_keeps_only_the_calls_that_pass_over_its_body() {
+    fn a_test_whose_own_attributes_may_be_macros_keeps_no_call() {
         let modules = scan_text(
-            "#[tokio::test(flavor = \"multi_thread\")]\n#[ignore = \"needs a device\"]\nasync fn plain() { shared(); }\n\n#[test]\n#[make_shared]\nfn wrapped() { shared(); crate::shared(); }\n",
+            "#[tokio::test(flavor = \"multi_thread\")]\n#[ignore = \"needs a device\"]\nasync fn plain() { shared(); }\n\n#[test]\n#[make_shared]\nfn wrapped() { shared(); crate::shared(); }\n\n#[test]\nfn ordinary() { shared(); }\n",
             true,
         );
         let tests = tests_of(&modules[0]);
         let shared = vec!["shared".to_owned()];
         assert!(tests[0].calls.contains(&shared), "{:?}", tests[0].calls);
-        assert!(!tests[1].calls.contains(&shared), "{:?}", tests[1].calls);
-        assert!(
-            tests[1]
-                .calls
-                .contains(&vec!["crate".to_owned(), "shared".to_owned()]),
-            "{:?}",
-            tests[1].calls
+        assert_eq!(tests[0].assumes, BTreeSet::from(["tokio::".to_owned()]));
+        assert!(tests[1].calls.is_empty(), "{:?}", tests[1].calls);
+        assert!(tests[2].calls.contains(&shared), "{:?}", tests[2].calls);
+        assert_eq!(tests[2].assumes, BTreeSet::from(["test".to_owned()]));
+    }
+
+    #[test]
+    fn a_module_records_the_macros_it_defines_and_the_names_it_cannot_list() {
+        let modules = scan_text(
+            "macro_rules! assert_eq { () => {} }\n#[macro_use]\nmod other {}\n",
+            true,
         );
+        assert_eq!(modules[0].macros, ["assert_eq"]);
+        assert!(modules[0].unlisted_names);
+        for text in [
+            "extern crate core as other;\nfn plain() {}\n",
+            "make_items!();\nfn plain() {}\n",
+            "helpers::make_items! { a }\nfn plain() {}\n",
+        ] {
+            assert!(scan_text(text, true)[0].unlisted_names, "{text}");
+        }
+        assert!(!scan_text("fn plain() {}\nconst X: u8 = 1;\n", true)[0].unlisted_names);
+    }
+
+    #[test]
+    fn an_attribute_that_may_be_a_macro_marks_what_it_may_rewrite() {
+        let modules = scan_text(
+            "#[rewrite_all]\nmod inside {\n    mod deeper {}\n    fn case() {}\n}\n#[cfg(test)]\n#[path = \"x.rs\"]\nmod plain {}\n#[rename]\nfn renamed() {}\n#[allow(dead_code)]\nfn kept() {}\n",
+            true,
+        );
+        let module = |path: &[&str]| {
+            modules
+                .iter()
+                .find(|module| module.path == path)
+                .expect("the module")
+        };
+        assert!(!module(&[]).rewritable);
+        assert!(module(&["inside"]).rewritable);
+        assert!(module(&["inside", "deeper"]).rewritable);
+        assert!(!module(&["plain"]).rewritable);
+        let item = |name: &str| {
+            module(&[])
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    Entry::Item(item) if item.name.as_deref() == Some(name) => Some(item),
+                    _ => None,
+                })
+                .expect("the item")
+        };
+        assert!(item("renamed").rewritable);
+        assert!(!item("kept").rewritable);
     }
 
     #[test]

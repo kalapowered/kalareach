@@ -1,0 +1,10 @@
+# A tree the conformance report's own tests read and never build: its tests invoke macros and
+# name crates the tree does not have, and the reading needs only their source. It is a workspace of
+# its own, so the repository's workspace never builds it either.
+[package]
+name = "expansions"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
