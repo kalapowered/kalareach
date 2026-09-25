@@ -95,10 +95,11 @@ impl NetworkTransport {
     /// # Errors
     ///
     /// Returns a transport failure, including the host's refusal when the handshake fails. When the
-    /// attempt timed out without a connection while a relay on the route had turned this device
-    /// away, or the device had nothing but refusing relays to try, the failure is
-    /// [`kr_transport::TransportError::RelayRefused`], naming the relay, what it said and what may
-    /// still work, rather than a host that did not answer.
+    /// attempt ran out without a connection while the relay status still showed a relay on the
+    /// route refusing this device, the failure is [`kr_transport::TransportError::RelayRefused`]:
+    /// it names that relay, what it said and what may still work, rather than a host that did not
+    /// answer. A device with nothing but relays to try ends the attempt as soon as the status shows
+    /// every relay on its route refusing it or its upgrade.
     pub async fn connect(
         endpoint: &Endpoint,
         host_addr: impl Into<EndpointAddr>,

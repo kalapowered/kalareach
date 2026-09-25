@@ -27,8 +27,10 @@ pub enum TransportError {
     /// that is not a [`Self::RelayRefused`].
     #[error("the connection could not be established: {0}")]
     Connect(String),
-    /// A relay on the route had turned this endpoint away when the attempt to reach the peer timed
-    /// out without a connection, or when it had nothing but refusing relays to try.
+    /// The attempt to reach the peer ran out without a connection while the relay status still
+    /// showed a relay on the route refusing this endpoint, and the failure names that relay. An
+    /// endpoint with nothing but relays to try ends the attempt as soon as the status shows every
+    /// relay on its route refusing it or its upgrade, rather than at its deadline.
     ///
     /// Section 17: an exhausted bootstrap route is reported as what it is, with what may still
     /// work, and never as a peer that went away.
