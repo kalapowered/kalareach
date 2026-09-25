@@ -47,6 +47,33 @@ fn has_a_local_of_the_same_name() {
     assert_eq!(shared(), 4);
 }
 
+#[test]
+fn binds_the_same_name_in_a_pattern() {
+    let (shared,) = (|| 4,);
+    assert_eq!(shared(), 4);
+}
+
+#[test]
+fn binds_the_same_name_in_a_match_arm() {
+    if let Some(shared) = Some(|| 4) {
+        assert_eq!(shared(), 4);
+    }
+}
+
+#[test]
+fn takes_the_same_name_as_a_closure_parameter() {
+    let run = |shared: fn() -> u8| shared();
+    assert_eq!(run(|| 4), 4);
+}
+
+#[test]
+fn defines_a_function_of_the_same_name_in_its_body() {
+    fn shared() -> u8 {
+        4
+    }
+    assert_eq!(shared(), 4);
+}
+
 mod other {
     /// A case of this module's own, which names no row.
     fn shared() -> u8 {

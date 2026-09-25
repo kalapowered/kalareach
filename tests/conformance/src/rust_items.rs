@@ -836,48 +836,70 @@ fn use_tree(tokens: &[Token], mut at: usize, prefix: &[String], found: &mut Vec<
     }
 }
 
-/// Every function call in `tokens`, as the path it is called by.
+/// Every function call in `tokens`, a function's body, as the path it is called by.
 ///
 /// A call is a name followed by an opening parenthesis, or by a turbofish and then one, with the
-/// `::`-joined names before it as its path. A name after a full stop is a method, and a name before
-/// `!` is a macro; neither is a call of a free function. A single name that a `let` in the same
-/// body binds is a local, a closure say, and calling it calls no function of the module.
+/// `::`-joined names before it as its path. A name after a full stop is a method, a name before `!`
+/// is a macro, and the name a definition gives after `fn`, `struct` or `macro_rules!` is what it
+/// defines; none of them is a call of a free function.
+///
+/// A call by a single name is kept only when the body shows that name nowhere but in calls of it.
+/// Whatever can bind a name in a body, and so make a call of it a call of something of the body's
+/// own, shows the name in a place no call has: a `let` of any pattern, an `if let` or `while
+/// let`, a `match` arm, a `for`, a closure's parameters, a nested function's name or parameters,
+/// a nested tuple struct or constant. So a call the body may have bound for itself is never taken
+/// for a function of the module, and no form of binding needs reading one by one. Where the name
+/// shows after a full stop or `::`, or before `::` or `!`, it is a method, a field, part of a
+/// path or a macro, which binds nothing, and it does not count.
 fn calls(tokens: &[Token]) -> BTreeSet<Vec<String>> {
-    let locals: BTreeSet<&str> = tokens
-        .windows(3)
-        .filter(|window| window[0].ident() == Some("let"))
-        .filter_map(|window| match window[1].ident() {
-            Some("mut") => window[2].ident(),
-            name => name,
-        })
-        .collect();
     let mut found = BTreeSet::new();
+    // Every name the body shows other than in a call, a method, a path or a macro.
+    let mut elsewhere: BTreeSet<&str> = BTreeSet::new();
     for (index, token) in tokens.iter().enumerate() {
         let Some(name) = token.ident() else {
             continue;
         };
-        if !called_after(tokens, index + 1) {
+        let punct_before = |back: usize, c: char| {
+            index
+                .checked_sub(back)
+                .is_some_and(|at| tokens[at].is_punct(c))
+        };
+        let punct_after = |ahead: usize, c: char| {
+            tokens
+                .get(index + ahead)
+                .is_some_and(|token| token.is_punct(c))
+        };
+        if punct_before(1, '.') {
             continue;
         }
-        let mut path = vec![name.to_owned()];
-        let mut at = index;
-        // Walk back over `segment ::` pairs.
-        while at >= 3
-            && tokens[at - 1].is_punct(':')
-            && tokens[at - 2].is_punct(':')
-            && let Some(segment) = tokens[at - 3].ident()
+        let before = index.checked_sub(1).and_then(|at| tokens[at].ident());
+        let defined = matches!(before, Some("fn" | "struct"))
+            || (punct_before(1, '!')
+                && index.checked_sub(2).and_then(|at| tokens[at].ident()) == Some("macro_rules"));
+        if !defined && called_after(tokens, index + 1) {
+            let mut path = vec![name.to_owned()];
+            let mut at = index;
+            // Walk back over `segment ::` pairs.
+            while at >= 3
+                && tokens[at - 1].is_punct(':')
+                && tokens[at - 2].is_punct(':')
+                && let Some(segment) = tokens[at - 3].ident()
+            {
+                path.insert(0, segment.to_owned());
+                at -= 3;
+            }
+            if at > 0 && tokens[at - 1].is_punct('.') {
+                continue;
+            }
+            found.insert(path);
+        } else if !(punct_before(1, ':') && punct_before(2, ':'))
+            && !(punct_after(1, ':') && punct_after(2, ':'))
+            && !punct_after(1, '!')
         {
-            path.insert(0, segment.to_owned());
-            at -= 3;
+            elsewhere.insert(name);
         }
-        if at > 0 && tokens[at - 1].is_punct('.') {
-            continue;
-        }
-        if path.len() == 1 && locals.contains(name) {
-            continue;
-        }
-        found.insert(path);
     }
+    found.retain(|path| !matches!(path.as_slice(), [name] if elsewhere.contains(name.as_str())));
     found
 }
 
@@ -1081,6 +1103,52 @@ mod tests {
         .into_iter()
         .collect();
         assert_eq!(calls, &expected);
+    }
+
+    #[test]
+    fn a_name_the_body_binds_for_itself_is_no_call_of_a_function_of_the_module() {
+        let read = |body: &str| calls(&lex(body).expect("lexes"));
+        let shared = vec!["shared".to_owned()];
+        for body in [
+            "let shared = || 1; shared();",
+            "let mut shared = || 1; shared();",
+            "let (shared,) = (|| 1,); shared();",
+            "let Pair { first: shared, .. } = pair; shared();",
+            "let [shared] = [|| 1]; shared();",
+            "let ref shared = other; shared();",
+            "if let Some(shared) = maybe { shared(); }",
+            "while let Some(shared) = next() { shared(); }",
+            "match maybe { Some(shared) => shared(), None => 0 };",
+            "for shared in all { shared(); }",
+            "let run = |shared: fn()| shared();",
+            "all.iter().for_each(|shared| shared());",
+            "fn shared() {} shared();",
+            "fn inner(shared: fn()) { shared() }",
+            "struct shared(u8); shared(1);",
+            "const shared: fn() = other; shared();",
+        ] {
+            assert!(!read(body).contains(&shared), "{body}: {:?}", read(body));
+        }
+        // What a definition names is no call of it.
+        for body in [
+            "fn shared() {}",
+            "struct shared(u8);",
+            "macro_rules! shared (() => {});",
+        ] {
+            assert!(!read(body).contains(&shared), "{body}: {:?}", read(body));
+        }
+        // A method, a segment of a path, a `use` declaration's included, and a macro bind nothing
+        // in the body.
+        for body in [
+            "value.shared(); shared();",
+            "let f = other::shared; shared();",
+            "shared::inner(); shared();",
+            "shared!(1); shared();",
+            "use other::shared as renamed; shared();",
+            "shared(); shared(2);",
+        ] {
+            assert!(read(body).contains(&shared), "{body}: {:?}", read(body));
+        }
     }
 
     #[test]
