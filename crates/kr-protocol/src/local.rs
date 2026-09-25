@@ -117,6 +117,66 @@ pub struct LocalHelloAck {
     pub max_receive: ReceiveLimits,
 }
 
+/// The capability a worker states when it reads the UTC deadline beside each forwarded copy's
+/// continuous one, and a control daemon offers when it writes it.
+///
+/// A worker survives an upgrade of the daemon, and the forwarded frames are closed schemas, so a
+/// worker of an earlier build refuses a frame with a field it does not know. The daemon reads this
+/// in the worker's answer to its hello before it sends such a frame.
+pub const FORWARDED_UTC_DEADLINE: &str = "forwarded.utc-deadline/1";
+
+/// What a worker's statement of the clock floor it maps starts with. The rest is the floor's
+/// identity, as 32 lowercase hexadecimal digits.
+pub const UTC_FLOOR_PREFIX: &str = "utc-floor/";
+
+/// The capability that states the clock floor a worker maps, by the floor's identity.
+///
+/// # Panics
+///
+/// Never: the statement is 42 characters, well inside what a capability identifier holds.
+#[must_use]
+pub fn utc_floor_capability(identity: &[u8; 16]) -> CapabilityId {
+    let mut text = String::with_capacity(UTC_FLOOR_PREFIX.len() + 32);
+    text.push_str(UTC_FLOOR_PREFIX);
+    for byte in identity {
+        text.push_str(&format!("{byte:02x}"));
+    }
+    CapabilityId::new(text).expect("a clock floor statement fits a capability identifier")
+}
+
+/// The identity of the clock floor a set of capabilities states, when it states exactly one.
+///
+/// A statement that is not 32 lowercase hexadecimal digits states nothing, and neither do two.
+#[must_use]
+pub fn stated_utc_floor(capabilities: &CanonicalSet<CapabilityId>) -> Option<[u8; 16]> {
+    let mut stated = capabilities
+        .iter()
+        .filter_map(|capability| capability.as_str().strip_prefix(UTC_FLOOR_PREFIX));
+    let digits = stated.next()?;
+    if stated.next().is_some() || digits.len() != 32 {
+        return None;
+    }
+    let mut identity = [0_u8; 16];
+    for (index, pair) in digits.as_bytes().chunks_exact(2).enumerate() {
+        let value = |digit: u8| match digit {
+            b'0'..=b'9' => Some(digit - b'0'),
+            b'a'..=b'f' => Some(digit - b'a' + 10),
+            _ => None,
+        };
+        identity[index] = (value(pair[0])? << 4) | value(pair[1])?;
+    }
+    Some(identity)
+}
+
+/// Whether a set of capabilities states the forwarded frames' UTC deadlines
+/// ([`FORWARDED_UTC_DEADLINE`]).
+#[must_use]
+pub fn states_utc_deadlines(capabilities: &CanonicalSet<CapabilityId>) -> bool {
+    capabilities
+        .iter()
+        .any(|capability| capability.as_str() == FORWARDED_UTC_DEADLINE)
+}
+
 /// A mutation the host admitted for a caller, passed to the component that owns its subject.
 ///
 /// The control daemon owns admission: it authenticates the caller, stamps the freshness window,
@@ -249,6 +309,39 @@ mod tests {
     use crate::envelope::{ControlFrame, ParamsValue, Request};
     use crate::ids::RequestId;
     use crate::method::{Method, MethodVersion};
+
+    #[test]
+    fn a_worker_states_the_clock_floor_it_maps_by_its_identity() {
+        use crate::ids::CapabilityId;
+        use crate::scalars::CanonicalSet;
+
+        let identity = [0xa5_u8; 16];
+        let stated = super::utc_floor_capability(&identity);
+        assert_eq!(
+            stated.as_str(),
+            "utc-floor/a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5"
+        );
+        let frame_shape =
+            CapabilityId::new(super::FORWARDED_UTC_DEADLINE).expect("a capability identifier");
+        let capabilities: CanonicalSet<CapabilityId> =
+            [stated.clone(), frame_shape].into_iter().collect();
+        assert_eq!(super::stated_utc_floor(&capabilities), Some(identity));
+        assert!(super::states_utc_deadlines(&capabilities));
+
+        // A worker of an earlier build states nothing, and a statement this build cannot read
+        // states no floor.
+        assert_eq!(super::stated_utc_floor(&CanonicalSet::new()), None);
+        assert!(!super::states_utc_deadlines(&CanonicalSet::new()));
+        let upper: CanonicalSet<CapabilityId> =
+            [CapabilityId::new("utc-floor/A5A5A5A5A5A5A5A5A5A5A5A5A5A5A5A5").expect("text")]
+                .into_iter()
+                .collect();
+        assert_eq!(super::stated_utc_floor(&upper), None);
+        let two: CanonicalSet<CapabilityId> = [stated, super::utc_floor_capability(&[1_u8; 16])]
+            .into_iter()
+            .collect();
+        assert_eq!(super::stated_utc_floor(&two), None, "two floors state none");
+    }
 
     #[test]
     fn a_local_control_frame_round_trips_through_the_canonical_encoding() {

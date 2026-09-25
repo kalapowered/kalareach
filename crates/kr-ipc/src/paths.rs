@@ -278,6 +278,15 @@ impl EnvironmentPaths {
         }
     }
 
+    /// Returns the file that holds this environment's clock floor for the current boot.
+    ///
+    /// In the runtime directory, beside the endpoints and the descriptors: it is owner-only, it is
+    /// on the internal disk, and like them it describes this boot and no other ([`crate::floor`]).
+    #[must_use]
+    pub fn utc_floor_file(&self) -> PathBuf {
+        self.runtime_dir.join("utc-floor")
+    }
+
     /// Returns the directory holding published worker descriptors.
     #[must_use]
     pub fn descriptors_dir(&self) -> PathBuf {
