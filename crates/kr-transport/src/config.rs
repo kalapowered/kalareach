@@ -222,15 +222,21 @@ impl std::fmt::Display for ProxyUrl {
 /// Whether `value` names a user or a password before its host, even an empty one, which is where a
 /// URL carries a credential.
 ///
-/// The authority is read as a URL parser reads it: after the scheme's colon and every `/` or `\`
+/// The authority is read as a URL parser reads it: without the control characters and spaces around
+/// the address or the tabs and line breaks inside it, after the scheme's colon and every `/` or `\`
 /// that follows it, up to the next `/`, `\`, `?` or `#`, whatever the scheme. So an `@` in a path or
-/// a query is not mistaken for one, and extra slashes do not hide one. The host configuration
-/// document refuses a proxy by the same rule.
+/// a query is not mistaken for one, and neither extra slashes nor whitespace hide one. The host
+/// configuration document refuses a proxy by the same rule.
 fn names_user_information(value: &str) -> bool {
+    let value: String = value
+        .trim_matches(|character: char| character <= ' ')
+        .chars()
+        .filter(|character| !matches!(character, '\t' | '\n' | '\r'))
+        .collect();
     let after_scheme = value
         .split_once(':')
         .filter(|(scheme, _)| is_scheme(scheme))
-        .map_or(value, |(_, rest)| rest);
+        .map_or(value.as_str(), |(_, rest)| rest);
     after_scheme
         .trim_start_matches(['/', '\\'])
         .split(['/', '?', '#', '\\'])
@@ -566,6 +572,15 @@ mod tests {
             ),
             (
                 format!("https:\\\\user:{secret}@proxy.example.com"),
+                ProxyUrlError::Credentials,
+            ),
+            // Nor do the spaces and control characters the URL parser drops.
+            (
+                format!(" http://@{secret}.example.com"),
+                ProxyUrlError::Credentials,
+            ),
+            (
+                format!("http://us\ter:{secret}@proxy.example.com"),
                 ProxyUrlError::Credentials,
             ),
             (

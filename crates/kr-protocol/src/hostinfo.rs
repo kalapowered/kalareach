@@ -3203,10 +3203,17 @@ pub mod configuration {
     /// Whether `value` names a user or a password before its host, even an empty one, which is
     /// where a URL carries a credential.
     ///
-    /// The authority is read as a URL parser reads it: after the scheme's colon and every `/` or
-    /// `\` that follows it, up to the next `/`, `\`, `?` or `#`, whatever the scheme. So an `@` in a
-    /// path or a query is not mistaken for one, and extra slashes do not hide one.
+    /// The authority is read as a URL parser reads it: without the control characters and spaces
+    /// around the address or the tabs and line breaks inside it, after the scheme's colon and
+    /// every `/` or `\` that follows it, up to the next `/`, `\`, `?` or `#`, whatever the scheme.
+    /// So an `@` in a path or a query is not mistaken for one, and neither extra slashes nor
+    /// whitespace hide one.
     fn carries_user_information(value: &str) -> bool {
+        let value: String = value
+            .trim_matches(|character: char| character <= ' ')
+            .chars()
+            .filter(|character| !matches!(character, '\t' | '\n' | '\r'))
+            .collect();
         let after_scheme = value
             .split_once(':')
             .filter(|(scheme, _)| {
@@ -3215,7 +3222,7 @@ pub mod configuration {
                         character.is_ascii_alphanumeric() || "+-.".contains(character)
                     })
             })
-            .map_or(value, |(_, rest)| rest);
+            .map_or(value.as_str(), |(_, rest)| rest);
         after_scheme
             .trim_start_matches(['/', '\\'])
             .split(['/', '?', '#', '\\'])
@@ -6999,6 +7006,8 @@ mod tests {
             format!("http:///@{secret}.example.com"),
             format!("http:///:@{secret}.example.com"),
             format!("https:\\\\user:{secret}@proxy.example.com"),
+            format!(" http://@{secret}.example.com"),
+            format!("http://us\ter:{secret}@proxy.example.com"),
         ];
         let not_origins = [
             format!("socks5://{secret}.example.com:1080"),
