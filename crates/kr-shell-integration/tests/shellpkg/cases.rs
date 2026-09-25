@@ -181,6 +181,14 @@ impl Session {
     }
 
     /// Takes the reader to a fenced empty prompt and returns the entry and the fence.
+    ///
+    /// A key typed after this returns is judged against the fence, whichever of the endpoint and
+    /// the terminal the reader notices first. The publication is whole on the endpoint before
+    /// this returns, and each package takes a frame already there before it acts on a key: Zsh and
+    /// Fish read the mailbox at every key-sequence boundary, before that sequence's binding runs;
+    /// Bash's reader reads it before every byte it takes from the terminal; the PowerShell editor
+    /// is given a step as the frame is written, and its end-of-file decision reads the mailbox
+    /// again before it decides.
     pub fn fenced_prompt(&mut self, index: u8) -> (RootEditorEnterParams, EditorFence) {
         let mut entry = self.next_prompt();
         // One deadline covers the exchanges and the waits between them, so asking the reader again
