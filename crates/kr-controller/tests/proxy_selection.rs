@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use connect_proxy::ConnectProxy;
 use kr_controller::push::transport::{DeliveryTransports, ManagedTransports};
+use kr_controller::service::net::NetworkSetup;
 use kr_controller::service::net::rendezvous::Rendezvous;
 use kr_controller::service::net::rendezvous_https::HttpsRendezvous;
 use kr_crypto::secret::SymmetricKey;
@@ -97,6 +98,70 @@ async fn a_host_reaches_its_rendezvous_through_the_proxy_it_selected() {
     .await
     .expect("the reservation ends")
     .expect_err("the proxy refuses the tunnel");
+    assert_eq!(
+        refused.code(),
+        ErrorCode::RendezvousUnavailable,
+        "{refused}"
+    );
+
+    let attached = tokio::time::timeout(
+        WATCHDOG,
+        rendezvous.attach(&origin, &locator, &SymmetricKey::from_bytes([3; 32])),
+    )
+    .await
+    .expect("the attachment ends");
+    let refused = attached.expect_err("the proxy refuses the tunnel");
+    assert_eq!(
+        refused.code(),
+        ErrorCode::RendezvousUnavailable,
+        "{refused}"
+    );
+
+    let tunnel = format!("CONNECT {authority} HTTP/1.1");
+    assert_eq!(proxy.asked(), vec![tunnel.clone(), tunnel]);
+    heard_nothing(&service).await;
+}
+
+/// KR-REQ-26.14: the rendezvous client a host's network setup builds from its document goes through
+/// the proxy that document selects, as the endpoint does: its reservations, and its room.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_network_setup_reaches_its_rendezvous_through_the_proxy_its_document_selects() {
+    let proxy = ConnectProxy::refusing(403).await;
+    let host = kr_ipc::testing::TempHost::create();
+    let mut network = ConfigurationDocument::empty().network;
+    network.enabled = Nullable::some(true);
+    network.proxy_url = Nullable::some(proxy.url.clone());
+    let setup = NetworkSetup::from_configuration(
+        &network,
+        &host.environment(),
+        kr_crypto::store::StoreSelection::File,
+    )
+    .expect("a usable selection")
+    .expect("a host on the network");
+    let rendezvous = setup.rendezvous.expect("a rendezvous client");
+    let (origin, authority, service) = unreached().await;
+    let origin = RendezvousOrigin::new(origin).expect("an origin");
+    let locator = Locator::new("abcd").expect("a locator");
+
+    // A reservation blocks on the rendezvous client's own runtime, so it is made off this one.
+    let reserving = std::sync::Arc::clone(&rendezvous);
+    let (at, named) = (origin.clone(), locator.clone());
+    let reserved = tokio::time::timeout(
+        WATCHDOG,
+        tokio::task::spawn_blocking(move || {
+            reserving.reserve_locator(
+                &at,
+                &named,
+                InvitationId::new(Uuid::from_bytes([1; 16])),
+                TimestampMs::new(1_764_003_600_000),
+                Digest256::from_bytes([2; 32]),
+            )
+        }),
+    )
+    .await
+    .expect("the reservation ends")
+    .expect("the reservation's thread");
+    let refused = reserved.expect_err("the proxy refuses the tunnel");
     assert_eq!(
         refused.code(),
         ErrorCode::RendezvousUnavailable,
