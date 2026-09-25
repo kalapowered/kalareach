@@ -344,8 +344,16 @@ mod tests {
         let child = inside.join("new").join("evidence");
         assert!(check_directory(&child).is_ok());
         assert!(child.is_dir(), "an accepted directory is made");
+        // The temporary directory itself holds no evidence. A TMPDIR inside `/tmp`, as a host
+        // that gives each job a directory of its own has, is inside the temporary directory and
+        // may; `/tmp` itself never may.
+        let base = if cfg!(unix) {
+            PathBuf::from("/tmp")
+        } else {
+            std::env::temp_dir()
+        };
         assert!(
-            check_directory(&std::env::temp_dir()).is_err(),
+            check_directory(&base).is_err(),
             "the temporary directory itself"
         );
         assert!(
