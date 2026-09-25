@@ -471,14 +471,19 @@ impl Provenance {
                     let ProcessQuery::Present(identity) = query_process(entry.pid) else {
                         continue;
                     };
+                    // A number read from the table can name another process by the time it is
+                    // looked up: a process not looked at before is taken as this session's only
+                    // once its parent, read again under its own start identity, is the one it was
+                    // found under, and that parent still runs. Its image is read after that, so
+                    // what it maps is its own.
                     if seen.processes.get(&identity) != Some(&entry.command) {
-                        let found = self.inspect(&mut seen, &identity, &entry.command).and_then(
-                            |executed| executed.map_or(Ok(()), |executed| elsewhere(&executed)),
-                        );
-                        // A number that names another process by now is not this session's: the
-                        // finding stands only while the process is still beneath its parent.
-                        if let Err(why) = found
-                            && still_beneath(&identity, &parent)
+                        if !still_beneath(&identity, &parent) {
+                            continue;
+                        }
+                        if let Err(why) =
+                            self.inspect(&mut seen, &identity, &entry.command).and_then(
+                                |executed| executed.map_or(Ok(()), |executed| elsewhere(&executed)),
+                            )
                         {
                             problem(&mut seen, why);
                         }
