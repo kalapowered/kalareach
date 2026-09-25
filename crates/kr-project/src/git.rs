@@ -900,51 +900,27 @@ fn record(profile: &cap_std::fs::Dir, line: &str) -> Result<()> {
     }
 }
 
-/// Makes a directory's own list of names durable.
+/// Makes a directory's own list of names durable, after the record's name was created or replaced
+/// in it.
 ///
 /// The handle this service holds on a directory is not one a kernel will synchronise, so another is
-/// taken from it — `.` opened through the handle itself rather than resolved from a path, so that
-/// what is synchronised is the object the record was written in and not whatever now holds its
-/// name.
+/// taken from it, opened through the handle itself rather than resolved from a path, so that what
+/// is synchronised is the object the record was written in and not whatever now holds its name. The
+/// record is a file, so on Windows the second handle holds the right to add a file and no more.
 ///
 /// # Errors
 ///
 /// Returns [`ProjectError::StagingUnavailable`] when the directory cannot be synchronised.
-#[cfg(unix)]
 fn durable(directory: &cap_std::fs::Dir) -> Result<()> {
-    use rustix::fs::{Mode, OFlags};
-
-    rustix::fs::openat(
-        directory,
-        ".",
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(std::io::Error::from)
-    .and_then(|handle| std::fs::File::from(handle).sync_all())
-    .map_err(|error| ProjectError::StagingUnavailable {
-        detail: format!(
-            "this host's record of its own temporary directory could not be made durable: {error}"
-        )
-        .into(),
+    kr_flush::flush_held_directory(directory, kr_flush::NameKind::File).map_err(|error| {
+        ProjectError::StagingUnavailable {
+            detail: format!(
+                "this host's record of its own temporary directory could not be made durable: \
+                 {error}"
+            )
+            .into(),
+        }
     })
-}
-
-/// Leaves a directory's own list of names as the platform left it.
-///
-/// This platform has no ordinary open of a directory to synchronise, and it runs no repository
-/// operation through Git: an invocation makes its temporary directory and writes the record, and
-/// then the boundary refuses before Git exists. Git itself is still started at startup, to say
-/// which Git this host has, and the record is still read and rewritten when the service starts.
-/// What is not done here is making the record's *name* survive a power failure, and that is the
-/// difference to close when this platform runs a repository operation.
-///
-/// # Errors
-///
-/// Never returns an error on this platform.
-#[cfg(not(unix))]
-fn durable(_directory: &cap_std::fs::Dir) -> Result<()> {
-    Ok(())
 }
 
 /// Reads the record back, or answers that it cannot be trusted.
@@ -3302,6 +3278,48 @@ fn parse_version(reported: &str) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The record's first line gives the record its name in the profile's directory, which is then
+    /// flushed through a handle opened again from the one this service holds, holding the right to
+    /// add a file. While a handle that shares no writing holds the directory, that flush is refused
+    /// and the line is reported as not durable, where a flush that did nothing would report it
+    /// durable. With nothing held, a first line is recorded and its name flushed.
+    #[cfg(windows)]
+    #[test]
+    fn a_record_whose_directory_cannot_be_flushed_is_not_reported_durable() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        };
+
+        let root = tempfile::tempdir().expect("a directory for two profiles");
+        let profile = |name: &str| {
+            let path = root.path().join(name).join(PROFILE_DIRECTORY);
+            std::fs::create_dir_all(&path).expect("the profile's own directory");
+            let opened = cap_std::fs::Dir::open_ambient_dir(&path, cap_std::ambient_authority())
+                .expect("the profile's own directory opens");
+            (path, opened)
+        };
+
+        let (held_path, held) = profile("held");
+        let holding = std::fs::OpenOptions::new()
+            .access_mode(FILE_LIST_DIRECTORY)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&held_path)
+            .expect("the directory is held without shared writing");
+        let refused = record(&held, "making first aaaa")
+            .expect_err("a first line whose name cannot be flushed is not durable");
+        assert!(
+            matches!(refused, ProjectError::StagingUnavailable { .. }),
+            "{refused}"
+        );
+        drop(holding);
+        durable(&held).expect("once it is let go, the directory is flushed");
+
+        let (_, free) = profile("free");
+        record(&free, "making first bbbb").expect("with nothing held, a first line is recorded");
+    }
 
     #[test]
     fn no_text_holding_what_a_url_is_made_of_survives_a_message() {
