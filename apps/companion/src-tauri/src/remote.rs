@@ -239,4 +239,109 @@ mod tests {
         let imported = import("https://example.org/a.jpg", &fetcher).expect("an image");
         assert_eq!(imported.media_type, "image/jpeg");
     }
+
+    /// Where the child finds the image address its parent listens at.
+    const IMAGE: &str = "IMAGE_PROXY_TEST_ADDRESS";
+
+    /// A loopback listener that counts the connections it takes, and drops each one.
+    struct Counting {
+        port: u16,
+        taken: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Counting {
+        fn start() -> Self {
+            use std::sync::atomic::Ordering;
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+            listener
+                .set_nonblocking(true)
+                .expect("a listener that polls");
+            let port = listener.local_addr().expect("an address").port();
+            let taken = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (counted, stopped) = (taken.clone(), stop.clone());
+            let thread = std::thread::spawn(move || {
+                while !stopped.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok(_) => {
+                            counted.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                    }
+                }
+            });
+            Self {
+                port,
+                taken,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        fn taken(&mut self) -> usize {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+            self.taken.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// The child half of [`no_proxy_variable_moves_an_image_import`].
+    ///
+    /// It is ignored in an ordinary run because it means nothing without the environment the
+    /// other test builds around it, and that test runs it by name.
+    #[test]
+    #[ignore = "no_proxy_variable_moves_an_image_import runs this one"]
+    fn the_child_of_the_image_proxy_test() {
+        let address = std::env::var(IMAGE).expect("the parent names its address");
+        // Nothing answers TLS at the address, so the import fails either way. Where it went is
+        // what the parent reads.
+        let fetched = HttpsFetcher::new().fetch(&address, MAX_IMPORT_BYTES);
+        assert!(fetched.is_err(), "nothing answers at the image's address");
+    }
+
+    /// KR-REQ-26.14: no proxy variable moves an image a person imports. In a process whose
+    /// `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY` name a listener that counts connections, the
+    /// fetch goes to the image's own address and the listener is never reached.
+    #[test]
+    fn no_proxy_variable_moves_an_image_import() {
+        let mut proxy = Counting::start();
+        let mut image = Counting::start();
+        let variables = format!("http://127.0.0.1:{}", proxy.port);
+        let ran = std::process::Command::new(std::env::current_exe().expect("this test binary"))
+            .args([
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "remote::tests::the_child_of_the_image_proxy_test",
+            ])
+            .env(IMAGE, format!("https://127.0.0.1:{}/image.png", image.port))
+            .env("HTTPS_PROXY", &variables)
+            .env("HTTP_PROXY", &variables)
+            .env("ALL_PROXY", &variables)
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy")
+            .current_dir(std::env::temp_dir())
+            .output()
+            .expect("the child");
+        assert!(
+            ran.status.success() && String::from_utf8_lossy(&ran.stdout).contains("1 passed"),
+            "{}{}",
+            String::from_utf8_lossy(&ran.stdout),
+            String::from_utf8_lossy(&ran.stderr)
+        );
+        assert_eq!(
+            proxy.taken(),
+            0,
+            "the import went to the proxy the environment names"
+        );
+        assert!(
+            image.taken() > 0,
+            "the import went to the image's own address"
+        );
+    }
 }
