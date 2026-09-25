@@ -17,8 +17,16 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
-# Each tree a test runs the report over gets an evidence directory of its own.
+# The application matrix runs each program as the root of a real session: a worker's own session,
+# pseudo-terminal and runtime, attached to over the worker's own endpoint with the product's client.
+kr-crypto.workspace = true
+kr-ipc = { workspace = true, features = ["testing"] }
+kr-protocol.workspace = true
+kr-worker.workspace = true
+# Each tree a test runs the report over, and each application a case starts, gets a directory of
+# its own.
 tempfile.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true
