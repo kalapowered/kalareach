@@ -176,6 +176,9 @@ pub struct Module {
     /// Whether an attribute on it, on the `mod` that declares it or on an enclosing module's, may be
     /// a macro that rewrites everything in it.
     pub rewritable: bool,
+    /// Whether a `cfg` on it, on the `mod` that declares it or on an enclosing module's, may leave it
+    /// out of a build; the crate root's own `cfg` leaves nothing else to build, and does not count.
+    pub conditional: bool,
 }
 
 /// Why a crate could not be read.
@@ -240,6 +243,7 @@ pub fn scan_target(
             directory,
             test_code: test_target,
             rewritable: false,
+            conditional: false,
         },
         &mut modules,
         &mut warnings,
@@ -254,6 +258,7 @@ struct FileModule {
     directory: PathBuf,
     test_code: bool,
     rewritable: bool,
+    conditional: bool,
 }
 
 fn relative(root: &Path, path: &Path) -> String {
@@ -287,7 +292,7 @@ fn scan_file(
         &tokens,
         &context,
         &module.path,
-        (module.test_code, module.rewritable),
+        (module.test_code, module.rewritable, module.conditional),
         &module.directory,
         &mut parsed,
     );
@@ -333,6 +338,7 @@ fn scan_file(
                         directory,
                         test_code: declaration.test_code,
                         rewritable: declaration.rewritable,
+                        conditional: declaration.conditional,
                     },
                     modules,
                     warnings,
@@ -358,6 +364,7 @@ struct Declaration {
     candidates: Vec<PathBuf>,
     test_code: bool,
     rewritable: bool,
+    conditional: bool,
 }
 
 enum Parsed {
@@ -454,9 +461,15 @@ impl Attribute {
         self.trusted().is_some_and(|names| names.is_empty())
     }
 
-    /// Whether it is a `cfg` or a `cfg_attr`, which may leave what it is on out of a build.
+    /// Whether it is a `cfg` or a `cfg_attr`, which may leave what it is on out of a build; `cfg(test)`
+    /// holds in every build of tests.
     fn is_conditional(&self) -> bool {
-        matches!(self.path.as_slice(), [name] if name == "cfg" || name == "cfg_attr")
+        let only_test = self.arguments.len() == 1 && self.arguments[0].ident() == Some("test");
+        match self.path.as_slice() {
+            [name] if name == "cfg" => !only_test,
+            [name] => name == "cfg_attr",
+            _ => false,
+        }
     }
 
     fn is_test(&self) -> bool {
@@ -487,13 +500,14 @@ impl Attribute {
     }
 }
 
-/// Reads one module's tokens; `(test_code, rewritable)` say whether it is test code and whether an
-/// attribute on it or an enclosing module may rewrite it.
+/// Reads one module's tokens; `(test_code, rewritable, conditional)` say whether it is test code,
+/// whether an attribute on it or an enclosing module may rewrite it, and whether a `cfg` there may
+/// leave it out of a build.
 fn parse_module(
     tokens: &[Token],
     context: &Context,
     path: &[String],
-    (test_code, rewritable): (bool, bool),
+    (test_code, rewritable, conditional): (bool, bool, bool),
     directory: &Path,
     out: &mut Vec<Parsed>,
 ) {
@@ -508,6 +522,7 @@ fn parse_module(
         unlisted_names: false,
         assumes: BTreeSet::new(),
         rewritable,
+        conditional,
     };
     let mut children = Vec::new();
     let mut pending: Vec<&Token> = Vec::new();
@@ -554,6 +569,7 @@ fn parse_module(
                         module.test_code = true;
                     }
                     module.rewritable |= !attribute.inert();
+                    module.conditional |= attribute.is_conditional() && !path.is_empty();
                 } else {
                     attributes.push(attribute);
                 }
@@ -602,6 +618,7 @@ fn parse_module(
                     }
                 }
                 let rewrites = module.rewritable || attributes.iter().any(|a| !a.inert());
+                let absent = module.conditional || attributes.iter().any(Attribute::is_conditional);
                 let entry = classify(item, &attributes, attached, token.line);
                 match entry {
                     Classified::Test(test) => module.entries.push(Entry::Test(test)),
@@ -614,7 +631,7 @@ fn parse_module(
                             &item[body.0..body.1],
                             context,
                             &child_path,
-                            (test_code || cfg_test, rewrites),
+                            (test_code || cfg_test, rewrites, absent),
                             &child_directory,
                             &mut children,
                         );
@@ -637,6 +654,7 @@ fn parse_module(
                             candidates,
                             test_code: test_code || cfg_test,
                             rewritable: rewrites,
+                            conditional: absent,
                         }));
                     }
                 }
@@ -1046,12 +1064,34 @@ fn next_significant(tokens: &[Token], from: usize) -> Option<usize> {
 /// written in the arguments of a standard macro whose arguments are no code ([`NO_CODE`]).
 fn macro_definitions(tokens: &[Token]) -> (Vec<String>, Vec<String>) {
     let tokens = significant(tokens);
+    // A macro this reading does not know may do anything with its arguments, `stringify!` in them
+    // included: nothing inside one is text.
+    let mut unknown = vec![false; tokens.len()];
+    for index in 0..tokens.len() {
+        let Some(name) = tokens[index].ident() else {
+            continue;
+        };
+        let opens = tokens
+            .get(index + 2)
+            .is_some_and(|t| t.is_punct('(') || t.is_punct('[') || t.is_punct('{'));
+        if !(tokens.get(index + 1).is_some_and(|t| t.is_punct('!')) && opens) {
+            continue;
+        }
+        let bare =
+            !(index >= 2 && tokens[index - 1].is_punct(':') && tokens[index - 2].is_punct(':'));
+        if bare && (RUN_AS_WRITTEN.contains(&name) || NO_CODE.contains(&name)) {
+            continue;
+        }
+        let close = matching(&tokens, index + 2).unwrap_or(tokens.len() - 1);
+        unknown[index + 2..=close].fill(true);
+    }
     let mut code = Vec::new();
     let mut text = Vec::new();
     let mut text_to = 0;
     for index in 0..tokens.len() {
         let in_text = index < text_to;
         if !in_text
+            && !unknown[index]
             && tokens[index].ident() != Some("macro_rules")
             && let Some(end) = passed_over(&tokens, index)
         {
@@ -1152,6 +1192,25 @@ fn use_tree(tokens: &[Token], mut at: usize, prefix: &[String], found: &mut Vec<
         }
     }
 }
+
+/// The prelude's traits that a type may write like a call (`dyn Send + Fn(u8)`), whatever comes
+/// before them: a call by one of these names is never taken for a function's.
+const FN_TRAITS: &[&str] = &[
+    "AsyncFn",
+    "AsyncFnMut",
+    "AsyncFnOnce",
+    "Fn",
+    "FnMut",
+    "FnOnce",
+];
+
+/// The language's keywords, which no function is named by.
+const KEYWORDS: &[&str] = &[
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
+    "false", "fn", "for", "gen", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut",
+    "pub", "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
+    "unsafe", "use", "where", "while", "yield",
+];
 
 /// serde's derives, trusted by name where a `use serde::...` brings them in under their own names.
 pub const SERDE_DERIVES: &[&str] = &["Deserialize", "Serialize"];
@@ -1328,6 +1387,11 @@ fn calls(body: &[Token], attributes: &[Attribute]) -> Read {
         ) || punct(before(1), '?');
         if !defined && !in_type && called_after(&tokens, index + 1) {
             let (path, start) = path_to(&tokens, index);
+            // `Fn(...)` and its kin in a type are the prelude's traits, written like a call, and a
+            // keyword before a parenthesis (`dyn (`, `if (`) is no function's name.
+            if path.len() == 1 && (FN_TRAITS.contains(&name) || KEYWORDS.contains(&name)) {
+                continue;
+            }
             let led = start.checked_sub(1);
             if punct(led, ':') || (punct(led, '.') && !punct(start.checked_sub(2), '.')) {
                 continue;
@@ -1626,6 +1690,14 @@ mod tests {
         ] {
             assert!(!read(body).contains(&shared), "{body}: {:?}", read(body));
         }
+        // The prelude's `Fn` traits written like a call, wherever in a type, are never calls.
+        for body in [
+            "let _: Option<Box<dyn Send + Fn()>> = None;",
+            "let _: Option<&dyn (FnMut(u8) -> u8)> = None;",
+            "Fn(); FnOnce(); AsyncFn(); AsyncFnMut(); AsyncFnOnce();",
+        ] {
+            assert!(read(body).is_empty(), "{body}: {:?}", read(body));
+        }
         // The same holds for the first name of a path, which a nested module or type can bind; and
         // a path from the root or after a qualifier is not followed.
         let nested = vec!["cases".to_owned(), "brought_up".to_owned()];
@@ -1770,11 +1842,12 @@ mod tests {
     #[test]
     fn a_macro_definition_written_as_text_is_kept_apart() {
         let (code, text) = macro_definitions(
-            &lex("let _ = stringify!(macro_rules! println { () => {} }); macro_rules! real { () => {} } std::stringify!(macro_rules! pathed { () => {} });")
+            &lex("let _ = stringify!(macro_rules! println { () => {} }); macro_rules! real { () => {} } std::stringify!(macro_rules! pathed { () => {} }); emit!(stringify!(macro_rules! emitted { () => {} })); assert!(!stringify!(macro_rules! checked { () => {} }).is_empty());")
                 .expect("lexes"),
         );
-        assert_eq!(code, ["real", "pathed"]);
-        assert_eq!(text, ["println"]);
+        // Text only in a standard `stringify!` that no macro this reading does not know holds.
+        assert_eq!(code, ["real", "pathed", "emitted"]);
+        assert_eq!(text, ["println", "checked"]);
     }
 
     #[test]
@@ -1788,6 +1861,29 @@ mod tests {
         let end = item_end(&tokens, 0);
         assert!(tokens[end - 1].is_punct(';'), "{:?}", tokens[end - 1]);
         assert_eq!(tokens[end].ident(), Some("fn"));
+    }
+
+    #[test]
+    fn a_cfg_other_than_the_tests_own_may_leave_a_module_out() {
+        let modules = scan_text(
+            "#![cfg(unix)]\n#[cfg(windows)]\nmod a {\n    mod b {}\n}\n#[cfg(test)]\nmod t {}\nmod c {\n    #![cfg_attr(unix, allow(unused))]\n}\n",
+            true,
+        );
+        let conditional = |path: &[&str]| {
+            modules
+                .iter()
+                .find(|module| module.path == path)
+                .expect("the module")
+                .conditional
+        };
+        assert!(!conditional(&[]), "the crate root's own cfg");
+        assert!(conditional(&["a"]));
+        assert!(conditional(&["a", "b"]));
+        assert!(
+            !conditional(&["t"]),
+            "cfg(test) holds in every build of tests"
+        );
+        assert!(conditional(&["c"]));
     }
 
     #[test]

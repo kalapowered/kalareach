@@ -209,9 +209,15 @@ fn a_call_a_macro_or_attribute_may_rewrite_move_or_rename_keys_nothing() {
             "KR-REQ-03.35",
             "which its module defines or brings in more than once",
         ),
-        ("KR-REQ-03.36", "whose module is declared more than once"),
+        ("KR-REQ-03.36", "which a cfg may leave out of a build"),
         ("KR-REQ-03.37", "which no test is proved to call"),
         ("KR-REQ-03.38", "which no test is proved to call"),
+        ("KR-REQ-03.39", "which no test is proved to call"),
+        ("KR-REQ-03.40", "which no test is proved to call"),
+        ("KR-REQ-03.41", "which no test is proved to call"),
+        ("KR-REQ-03.42", "which no test is proved to call"),
+        ("KR-REQ-03.43", "which no test is proved to call"),
+        ("KR-REQ-03.44", "which a cfg may leave out of a build"),
     ] {
         let row = identifier(row);
         assert!(
