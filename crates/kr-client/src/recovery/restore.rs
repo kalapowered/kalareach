@@ -89,7 +89,8 @@ impl ServiceAccess {
 
 impl std::fmt::Debug for ServiceAccess {
     /// The policy and the origin as a diagnostic names one: an address may carry a user name and
-    /// a password in front of its host.
+    /// a password in front of its host. Not the reader, which is how the access reaches the
+    /// service rather than what it is.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ServiceAccess")
@@ -98,7 +99,7 @@ impl std::fmt::Debug for ServiceAccess {
                 "service_origin",
                 &crate::shown::Shown::address(&self.service_origin),
             )
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

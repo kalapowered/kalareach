@@ -991,7 +991,7 @@ mod cases {
         );
         renders_only(
             &access,
-            "ServiceAccess{policy:Account,service_origin:\"<notprinted>\"}",
+            "ServiceAccess{policy:Account,service_origin:\"<notprinted>\",..}",
         );
         renders_only(
             &painted,
