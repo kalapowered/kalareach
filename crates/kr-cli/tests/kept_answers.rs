@@ -57,6 +57,8 @@ enum Behaviour {
     RefusesReads,
     /// Refuses every read with `UNKNOWN_SESSION`, as though its session were not its own.
     DisownsItsSession,
+    /// Answers every read, and lists no question.
+    ListsNoQuestions,
     /// Replies to an answer with a frame that is not a message, and takes nothing.
     RepliesWithGarbage,
     /// Refuses an answer with `OUTCOME_UNKNOWN`: it cannot say what became of it.
@@ -557,6 +559,12 @@ async fn serve_one(
                             ErrorCode::UnknownSession,
                             "this worker has no such session",
                         ))
+                    }
+                    "question.read" if behaviour == Behaviour::ListsNoQuestions => {
+                        ParamsValue::from_typed(&QuestionReadResult {
+                            questions: Vec::new(),
+                        })
+                        .map_err(|error| refusal(&error.to_string()))
                     }
                     "question.read" => read(&state, &request.params),
                     other => Err(refusal(&format!("this worker answers no {other}"))),
@@ -1124,6 +1132,49 @@ async fn a_worker_that_disowns_its_session_retires_nothing() {
     assert_eq!(status, Some(0), "{document}");
     assert_eq!(document["drafts"][0]["state"], "offered", "{document}");
     assert_eq!(host.answers_received(), 0, "nothing was sent");
+}
+
+/// KR-REQ-11.63: a live session that no longer lists a kept answer's question has not said the
+/// session ended; only its environment's daemon says that. The answer is neither retired nor sent
+/// while the daemon holds the session live or cannot be asked, by `kr question drafts` or by
+/// `kr question send`. The control is a daemon that records the session closed, which retires it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kept_answer_whose_question_is_not_listed_is_retired_only_on_the_daemons_word() {
+    for (registry, retired) in [
+        (Some(Registry::Live), false),
+        (None, false),
+        (Some(Registry::Closed), true),
+    ] {
+        let host = kept_answer().await;
+        let question = host.question();
+        host.behave(Behaviour::ListsNoQuestions);
+        let daemon = registry.map(|registry| host.daemon(registry));
+        let (status, document) = host.json(&["question", "drafts"]);
+        if retired {
+            assert_eq!(status, Some(0), "{registry:?}: {document}");
+            assert_eq!(document["drafts"][0]["state"], "retired", "{document}");
+            assert_eq!(document["drafts"][0]["reason_code"], "UNKNOWN_SESSION");
+            assert!(
+                !host.kept().exists(),
+                "a closed session's answer is retired"
+            );
+        } else {
+            assert!(
+                host.kept().is_file(),
+                "{registry:?}: drafts retires nothing: {document}"
+            );
+            let (status, document) = host.json(&["question", "send", &question]);
+            assert_ne!(status, Some(0), "{registry:?}: {document}");
+            assert!(
+                host.kept().is_file(),
+                "{registry:?}: send retires nothing: {document}"
+            );
+        }
+        assert_eq!(host.answers_received(), 0, "{registry:?}: nothing was sent");
+        if let Some(daemon) = daemon {
+            daemon.abort();
+        }
+    }
 }
 
 /// KR-REQ-11.63: a descriptor directory that cannot be trusted says nothing about whether a

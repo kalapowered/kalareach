@@ -346,6 +346,33 @@ async fn a_kept_answer_is_never_sent_to_a_question_that_ended_meanwhile() {
     assert!(host.answers().is_empty());
 }
 
+/// KR-REQ-11.63: a question its session no longer lists does not say the session ended; only the
+/// host's own record of the session says that. While the session is held, a kept answer whose
+/// question is not listed is neither retired by a reconnect nor by a send, and nothing is sent.
+#[tokio::test]
+async fn a_kept_answer_whose_question_is_not_listed_is_not_retired_while_its_session_is_held() {
+    let (_directory, drafts) = store();
+    let kept = answer_offline(&drafts, &question(15)).await;
+    // The session is held and lists no question.
+    let host = Host::with(Vec::new());
+
+    let reconciled = reconcile(&host, &drafts).await.expect("reconciles");
+    assert!(
+        !reconciled
+            .iter()
+            .any(|item| matches!(item, Reconciled::Retired { .. })),
+        "{reconciled:?}"
+    );
+    assert_eq!(drafts.drafts().expect("reads"), vec![kept.clone()]);
+
+    let refused = send(&host, &drafts, &kept)
+        .await
+        .expect_err("there is no question to send it to");
+    assert!(!matches!(refused, AnswerError::Retired(_)), "{refused:?}");
+    assert_eq!(drafts.drafts().expect("reads"), vec![kept]);
+    assert!(host.answers().is_empty(), "nothing was sent");
+}
+
 /// KR-REQ-11.63: an offered answer reaches the host only when the person sends it, exactly once,
 /// naming the revision the person answered; a second send is refused without reaching the host.
 #[tokio::test]
