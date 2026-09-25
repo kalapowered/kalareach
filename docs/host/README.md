@@ -3794,10 +3794,35 @@ eventually read as permission.
 ### Decoding trust
 
 An installed connector is a semantic trust boundary, and the record that says so names the package
-identifier, the publisher, the digest of the exact component bytes, the upstream methods it covers,
-the projection schema versions it may write against and how many decisions one projection may
-offer. Trust granted to one package is never another's: a binding whose package, publisher or
-digest differs from the record is refused when it is bound, not when it first decodes something.
+identifier, the publisher, the installed package's hash (the digest of its manifest, which names the
+component and every other file of the package by digest), the upstream methods it covers, the
+projection schema versions it may write against, how many decisions one projection may offer and
+whether it may encode an answer. Trust granted to one package is never another's: a binding whose
+package, publisher or digest differs from the record is refused when it is bound, not when it first
+decodes something.
+
+The record is derived from what the installation granted and from the installed package's own
+connector table, never from anything a component reports. Without `approval.decode` there is none.
+The methods are the routes that carry, towards this host, the requests the table's decision
+destination answers; a projection offers at most the decisions the destination maps; the schema
+versions are `kalareach.decision/1`, and `kalareach.plugin.decoded-request/<WIT version>` as well
+for a package that ships a component; and the record encodes an answer only with `approval.respond`.
+A request whose method the record does not cover stays recorded and opaque, and the native client
+answers it. A table with no decision destination gives no trust at all. That includes a protocol
+whose answer is a response to the request itself, such as the Agent Client Protocol's permission
+request, which a decision destination cannot name: its requests are recorded, forwarded and
+answered by the native client alone.
+
+A request belongs to the package whose table recorded it, and that package is kept with the
+request's source, so a connection that closes, or whose identifier is restored under another
+package's tables, changes nothing about whose request it is. Only a binding of that package, at the
+same bytes, interprets it, and an answer to it goes out only on a connection that reads that
+package's table.
+
+Narrowing an installation's grants narrows the record where it is written. `approval.respond`
+leaving takes the answer away and leaves the decoding; `approval.decode` leaving withdraws the
+interpreter grant and the record with it. What was already interpreted stays visible, and an answer
+to it is refused at the claim.
 
 The ledger retains, for every request a decoder interpreted: the package and its publisher, the
 digest of its bytes, the upstream method and request identifier, the original source bytes whole,

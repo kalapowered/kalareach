@@ -339,7 +339,11 @@ component fault disables rich meaning without stalling or discarding valid nativ
 - **Decision destination:** for a table that answers approvals, the method that carries an answer,
   the method whose requests it answers, where the answer repeats the request's identifier and puts
   the decision, and the application's own value for each decision. A table that answers none says
-  `null`.
+  `null`. The destination is also what an installation's `approval.decode` grant trusts a package
+  to interpret: exactly the requests it answers, whether the table's own reading or the package's
+  component interprets them. A table that answers none gives its package no such trust, so a
+  protocol whose answer is a response to the request itself, rather than a request of its own, is
+  answered by the native client alone.
 - **Protocol pin:** the upstream protocol name, the versions the table was qualified against and
   the exact version the publisher tested.
 
