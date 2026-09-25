@@ -358,7 +358,10 @@ if [ "${#unfinished[@]}" -ne 0 ]; then
   echo
   echo "what to look at, in $evidence:"
   for what in "${unfinished[@]}"; do
-    echo "  $what"
+    case "$what" in
+      restore) echo "  restore-1.log, restore-2.log, restore-3.log and driver.log, as far as the leg got" ;;
+      *) echo "  $what.log" ;;
+    esac
   done
 fi
 exit 1
