@@ -112,21 +112,23 @@ pub const BACKUP_RESTORE_SCOPE: &str = "backup.restore";
 /// returns, and a refresh token that survives a restart, which the kept grant is renewed with.
 pub const IDENTITY_SCOPES: [&str; 4] = ["openid", "profile", "email", "offline_access"];
 
-/// The scopes this build knows by name: the ones an application sign-in asks for.
-const KNOWN_SCOPES: [&str; 8] = REQUESTED_SCOPES;
+/// The scopes this build knows by name beside the ones an application sign-in asks for: the ones
+/// an authorisation for one purpose asks for.
+const PURPOSE_SCOPES: [&str; 2] = [BACKUP_WRITE_SCOPE, BACKUP_RESTORE_SCOPE];
 
-/// One scope as a diagnostic names it: by name when this build knows it.
+/// A scope this build knows, as this build's own name for it: one an application sign-in or an
+/// authorisation for one purpose asks for.
 ///
-/// A scope is text a service or a stored file supplied, so one this build does not know is not
-/// repeated: it is counted, which is what an operator checking an import needs.
+/// A scope is text a service or a stored file supplied, so a diagnostic names one only through
+/// this, and one this build does not know is not repeated: a summary counts it, and a refusal says
+/// that it is one.
 #[must_use]
-pub fn scope_shown(scope: &str) -> Shown {
-    KNOWN_SCOPES
+pub(crate) fn known_scope(scope: &str) -> Option<&'static str> {
+    REQUESTED_SCOPES
         .iter()
-        .find(|known| **known == scope)
-        .map_or(Shown::said("a scope this build does not know"), |known| {
-            Shown::said(known)
-        })
+        .chain(&PURPOSE_SCOPES)
+        .copied()
+        .find(|known| *known == scope)
 }
 
 /// What a set of stored scopes says: the ones this build knows, by name and in the order they
@@ -147,8 +149,8 @@ pub fn scope_names(scopes: &[String]) -> (Vec<&'static str>, usize) {
     let mut known = Vec::new();
     let mut unknown = 0_usize;
     for scope in scopes {
-        match KNOWN_SCOPES.iter().find(|name| **name == scope.as_str()) {
-            Some(name) if !known.contains(name) => known.push(*name),
+        match known_scope(scope) {
+            Some(name) if !known.contains(&name) => known.push(name),
             Some(_) => {}
             None => unknown += 1,
         }
@@ -2255,14 +2257,14 @@ fn generation(grant: &StoredGrant) -> String {
         .collect()
 }
 
-/// The refusal for a scope this sign-in does not carry.
+/// The refusal for a scope this sign-in does not carry, naming it when this build knows it.
 fn not_granted(scope: &str) -> ClientError {
     ClientError::refusal(
         ErrorCode::PermissionDenied,
-        crate::shown!(
-            "this sign-in was not granted the {} scope",
-            scope_shown(scope)
-        ),
+        match known_scope(scope) {
+            Some(name) => crate::shown!("this sign-in was not granted the {} scope", name),
+            None => Shown::said("this sign-in was not granted a scope this build does not know"),
+        },
     )
 }
 
@@ -2626,5 +2628,112 @@ mod tests {
             let refused = account.token(other).await.expect_err("not this grant's");
             assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{other}");
         }
+    }
+
+    /* ---------------------------------------------------------------------- */
+    /* What a diagnostic says of a scope                                       */
+    /* ---------------------------------------------------------------------- */
+
+    /// The scopes an authorisation for one purpose asks for are named as the application's own
+    /// are: a restore grant's scopes, and the refusal for a scope a grant was not given, say
+    /// `backup.restore` and `backup.write` by name. A scope this build does not know is counted in
+    /// a summary, said to be one in a refusal, and never repeated; so is a resource an
+    /// authorisation cannot ask for.
+    #[test]
+    fn the_backup_scopes_are_named_and_a_scope_this_build_does_not_know_is_never_repeated() {
+        use crate::shown::marker::{
+            MARKER, NEUTRAL, assert_unmarked, debug_renderings, failure_renderings,
+        };
+
+        // The neutral control: a restore grant's own scopes, every one of them named.
+        let restore: Vec<String> = IDENTITY_SCOPES
+            .iter()
+            .chain([&BACKUP_RESTORE_SCOPE])
+            .map(|scope| (*scope).to_owned())
+            .collect();
+        assert_eq!(
+            scope_summary(&restore).as_str(),
+            "openid, profile, email, offline_access, backup.restore"
+        );
+
+        // The negative control: the stored scopes hold the marker, which the summary counts.
+        let stored: Vec<String> = [
+            MARKER,
+            "openid",
+            BACKUP_RESTORE_SCOPE,
+            BACKUP_WRITE_SCOPE,
+            "openid",
+        ]
+        .iter()
+        .map(|scope| (*scope).to_owned())
+        .collect();
+        assert!(stored.iter().any(|scope| scope == MARKER));
+        assert_eq!(
+            scope_names(&stored),
+            (vec!["openid", BACKUP_RESTORE_SCOPE, BACKUP_WRITE_SCOPE], 1)
+        );
+        let summary = scope_summary(&stored).into_string();
+        assert_eq!(
+            summary,
+            "openid, backup.restore, backup.write and 1 scope(s) this build does not know"
+        );
+        assert_unmarked("stored scopes", &[summary]);
+        let mut grant =
+            StoredGrant::new(issued("a-refresh"), Client::Desktop, "a-nonce", 0).expect("a grant");
+        grant.scopes = stored;
+        assert_unmarked("a stored grant", &debug_renderings(&grant));
+
+        for (scope, said) in [
+            (
+                BACKUP_WRITE_SCOPE,
+                "PERMISSION_DENIED: this sign-in was not granted the backup.write scope",
+            ),
+            (
+                BACKUP_RESTORE_SCOPE,
+                "PERMISSION_DENIED: this sign-in was not granted the backup.restore scope",
+            ),
+            (
+                MARKER,
+                "PERMISSION_DENIED: this sign-in was not granted a scope this build does not know",
+            ),
+            (
+                NEUTRAL,
+                "PERMISSION_DENIED: this sign-in was not granted a scope this build does not know",
+            ),
+        ] {
+            let refused = not_granted(scope);
+            assert_eq!(refused.to_string(), said);
+            assert_unmarked(scope, &failure_renderings(refused));
+        }
+
+        for resource in [
+            format!("{MARKER} {MARKER}"),
+            format!("{MARKER}\"{MARKER}"),
+            format!("{MARKER}\\{MARKER}"),
+            format!("{MARKER}\u{e9}"),
+        ] {
+            let refused = AuthorisationRequest::asking(
+                Client::Desktop,
+                Redirect::Loopback,
+                &[resource.as_str()],
+            )
+            .expect_err("not a scope a request carries");
+            assert_eq!(
+                refused.to_string(),
+                "INVALID_ARGUMENT: a scope is printable ASCII with no space, quotation mark or \
+                 backslash"
+            );
+            assert_unmarked(&resource, &failure_renderings(refused));
+        }
+        let twice =
+            AuthorisationRequest::asking(Client::Desktop, Redirect::Loopback, &[MARKER, MARKER])
+                .expect_err("one scope asked for twice");
+        assert_unmarked("a scope asked for twice", &failure_renderings(twice));
+        // A scope this build does not know is still one a request carries, and the request's
+        // rendering holds none of what it asks for.
+        let request = AuthorisationRequest::asking(Client::Desktop, Redirect::Loopback, &[MARKER])
+            .expect("a scope a request carries");
+        assert_eq!(request.scopes().last().map(String::as_str), Some(MARKER));
+        assert_unmarked("an authorisation request", &debug_renderings(&request));
     }
 }

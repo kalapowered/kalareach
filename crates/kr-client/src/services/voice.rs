@@ -45,7 +45,7 @@ use kr_protocol::error::ErrorCode;
 use serde::{Deserialize, Serialize};
 
 use super::ServiceFuture;
-use super::account::{AccountToken, AccountTokenSource, scope_shown, scope_summary};
+use super::account::{AccountToken, AccountTokenSource, known_scope, scope_summary};
 pub use super::{ServiceHttp, ServiceHttpAnswer};
 use crate::error::{ClientError, Result};
 use crate::retry::UserAction;
@@ -1657,10 +1657,16 @@ impl AccountTokenSource for AccountTokenFile {
             if !stored.carries(scope) {
                 return Err(ClientError::refusal(
                     ErrorCode::PermissionDenied,
-                    crate::shown!(
-                        "the imported account token was not issued with the {} scope",
-                        scope_shown(scope)
-                    ),
+                    match known_scope(scope) {
+                        Some(name) => crate::shown!(
+                            "the imported account token was not issued with the {} scope",
+                            name
+                        ),
+                        None => Shown::said(
+                            "the imported account token was not issued with a scope this build \
+                             does not know",
+                        ),
+                    },
                 ));
             }
             Ok(stored.access_token)
