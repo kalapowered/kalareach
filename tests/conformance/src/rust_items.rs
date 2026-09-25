@@ -159,13 +159,6 @@ pub struct Module {
     pub docs: Vec<Comment>,
     /// Its entries, in source order.
     pub entries: Vec<Entry>,
-    /// The macros a `macro_rules!` anywhere in its file defines, by name, those inside functions
-    /// included: a file's top module holds them all.
-    pub macros: Vec<String>,
-    /// The macros a `macro_rules!` written in the arguments of a standard macro whose arguments
-    /// are no code (`stringify!(macro_rules! ...)`) would define: text, unless the target gives
-    /// that macro's name another meaning.
-    pub macros_in_text: Vec<String>,
     /// Whether it brings in names its source does not list: an item under `#[macro_use]`, an
     /// `extern crate`, a macro invoked among its items, or an item under an attribute that may be
     /// a macro, whose expansion may define anything.
@@ -296,9 +289,6 @@ fn scan_file(
         &module.directory,
         &mut parsed,
     );
-    if let Some(Parsed::Module(top)) = parsed.first_mut() {
-        (top.macros, top.macros_in_text) = macro_definitions(&tokens);
-    }
     for entry in parsed {
         match entry {
             Parsed::Module(scanned) => modules.push(scanned),
@@ -413,17 +403,6 @@ impl Attribute {
             "track_caller",
             "warn",
         ];
-        const DERIVES: &[&str] = &[
-            "Clone",
-            "Copy",
-            "Debug",
-            "Default",
-            "Eq",
-            "Hash",
-            "Ord",
-            "PartialEq",
-            "PartialOrd",
-        ];
         let path: Vec<&str> = self.path.iter().map(String::as_str).collect();
         match path.as_slice() {
             [name] if BUILT_IN.contains(name) => Some(Vec::new()),
@@ -517,8 +496,6 @@ fn parse_module(
         test_code,
         docs: Vec::new(),
         entries: Vec::new(),
-        macros: Vec::new(),
-        macros_in_text: Vec::new(),
         unlisted_names: false,
         assumes: BTreeSet::new(),
         rewritable,
@@ -1060,60 +1037,6 @@ fn next_significant(tokens: &[Token], from: usize) -> Option<usize> {
     (from..tokens.len()).find(|&at| !tokens[at].is_comment())
 }
 
-/// Every macro a `macro_rules!` in `tokens` defines, by name, wherever it stands; and apart, those
-/// written in the arguments of a standard macro whose arguments are no code ([`NO_CODE`]).
-fn macro_definitions(tokens: &[Token]) -> (Vec<String>, Vec<String>) {
-    let tokens = significant(tokens);
-    // A macro this reading does not know may do anything with its arguments, `stringify!` in them
-    // included: nothing inside one is text.
-    let mut unknown = vec![false; tokens.len()];
-    for index in 0..tokens.len() {
-        let Some(name) = tokens[index].ident() else {
-            continue;
-        };
-        let opens = tokens
-            .get(index + 2)
-            .is_some_and(|t| t.is_punct('(') || t.is_punct('[') || t.is_punct('{'));
-        if !(tokens.get(index + 1).is_some_and(|t| t.is_punct('!')) && opens) {
-            continue;
-        }
-        let bare =
-            !(index >= 2 && tokens[index - 1].is_punct(':') && tokens[index - 2].is_punct(':'));
-        if bare && (RUN_AS_WRITTEN.contains(&name) || NO_CODE.contains(&name)) {
-            continue;
-        }
-        let close = matching(&tokens, index + 2).unwrap_or(tokens.len() - 1);
-        unknown[index + 2..=close].fill(true);
-    }
-    let mut code = Vec::new();
-    let mut text = Vec::new();
-    let mut text_to = 0;
-    for index in 0..tokens.len() {
-        let in_text = index < text_to;
-        if !in_text
-            && !unknown[index]
-            && tokens[index].ident() != Some("macro_rules")
-            && let Some(end) = passed_over(&tokens, index)
-        {
-            text_to = end;
-            continue;
-        }
-        if tokens[index].ident() == Some("macro_rules")
-            && tokens.get(index + 1).is_some_and(|t| t.is_punct('!'))
-            && let Some(name) = tokens.get(index + 2).and_then(Token::ident)
-            && tokens
-                .get(index + 3)
-                .is_some_and(|t| t.is_punct('(') || t.is_punct('[') || t.is_punct('{'))
-        {
-            let names = if in_text { &mut text } else { &mut code };
-            if !names.iter().any(|known| known == name) {
-                names.push(name.to_owned());
-            }
-        }
-    }
-    (code, text)
-}
-
 /// The inner attributes (`#![...]`) a body opens with.
 fn inner_attributes(body: &[Token]) -> Vec<Attribute> {
     let tokens = significant(body);
@@ -1193,9 +1116,9 @@ fn use_tree(tokens: &[Token], mut at: usize, prefix: &[String], found: &mut Vec<
     }
 }
 
-/// The prelude's traits that a type may write like a call (`dyn Send + Fn(u8)`), whatever comes
-/// before them: a call by one of these names is never taken for a function's.
-const FN_TRAITS: &[&str] = &[
+/// The prelude's traits that a type writes like a call (`dyn Send + Fn(u8)`): a keyed helper of
+/// one of these names could not be told apart from the trait in a type, so none may take one.
+pub const FN_TRAITS: &[&str] = &[
     "AsyncFn",
     "AsyncFnMut",
     "AsyncFnOnce",
@@ -1204,16 +1127,40 @@ const FN_TRAITS: &[&str] = &[
     "FnOnce",
 ];
 
-/// The language's keywords, which no function is named by.
-const KEYWORDS: &[&str] = &[
-    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
-    "false", "fn", "for", "gen", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut",
-    "pub", "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
-    "unsafe", "use", "where", "while", "yield",
+/// The language's keywords and reserved words, which a function is named by only as a raw
+/// identifier (`r#type`), and which the lexer gives without its `r#`: no keyed helper may take one.
+pub const KEYWORDS: &[&str] = &[
+    "abstract", "as", "async", "await", "become", "box", "break", "const", "continue", "crate",
+    "do", "dyn", "else", "enum", "extern", "false", "final", "fn", "for", "gen", "if", "impl",
+    "in", "let", "loop", "macro", "match", "mod", "move", "mut", "override", "priv", "pub", "ref",
+    "return", "self", "Self", "static", "struct", "super", "trait", "true", "try", "type",
+    "typeof", "unsafe", "unsized", "use", "virtual", "where", "while", "yield",
 ];
 
 /// serde's derives, trusted by name where a `use serde::...` brings them in under their own names.
 pub const SERDE_DERIVES: &[&str] = &["Deserialize", "Serialize"];
+
+/// The standard library's derives, which add implementations only.
+const DERIVES: &[&str] = &[
+    "Clone",
+    "Copy",
+    "Debug",
+    "Default",
+    "Eq",
+    "Hash",
+    "Ord",
+    "PartialEq",
+    "PartialOrd",
+];
+
+/// The standard library's crates, which a path's first name may start at.
+pub const STANDARD_ROOTS: &[&str] = &["alloc", "core", "std"];
+
+/// The crates and tools whose attributes the reading trusts by the root of their path.
+const TRUSTED_ROOTS: &[&str] = &["clippy", "rustfmt", "serde", "tokio"];
+
+/// The standard library's attribute macros the reading trusts.
+const ATTRIBUTE_MACROS: &[&str] = &["derive", "test"];
 
 /// What the reading of a test's body proves it calls, and the names it took on trust to prove it.
 #[derive(Debug, Default)]
@@ -1387,11 +1334,6 @@ fn calls(body: &[Token], attributes: &[Attribute]) -> Read {
         ) || punct(before(1), '?');
         if !defined && !in_type && called_after(&tokens, index + 1) {
             let (path, start) = path_to(&tokens, index);
-            // `Fn(...)` and its kin in a type are the prelude's traits, written like a call, and a
-            // keyword before a parenthesis (`dyn (`, `if (`) is no function's name.
-            if path.len() == 1 && (FN_TRAITS.contains(&name) || KEYWORDS.contains(&name)) {
-                continue;
-            }
             let led = start.checked_sub(1);
             if punct(led, ':') || (punct(led, '.') && !punct(start.checked_sub(2), '.')) {
                 continue;
@@ -1498,6 +1440,405 @@ fn covers(tokens: &[Token]) -> Vec<Covers> {
         }
     }
     found
+}
+
+/// A place where the source of a target with keyed helpers steps outside the conventions a
+/// helper key relies on.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Breach {
+    /// The file, relative to the scan's root.
+    pub file: String,
+    /// The line.
+    pub line: usize,
+    /// What the source does there.
+    pub what: String,
+}
+
+impl std::fmt::Display for Breach {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}: {}", self.file, self.line, self.what)
+    }
+}
+
+/// Where one file of a target whose keyed helpers are named `helpers` steps outside the
+/// conventions a helper key relies on.
+///
+/// The check reads tokens and nothing else, so it over-approximates: text in `stringify!`, a
+/// macro's definition and a function's body count as much as a module's items do. It reports:
+///
+/// * a keyed helper's name written other than as a function's name among a module's items, a
+///   call (the name or a path's last name, then its arguments, perhaps after a turbofish), or the
+///   last name of a plain `use` among a module's items, which the map then follows;
+/// * a declaration of a name the reading trusts (a standard crate root, a crate or tool root of a
+///   trusted attribute, a standard macro, `test`, `derive` or a trusted derive): a `mod`, a macro,
+///   a type named after a root, the name `as` gives to something else, or a plain `use` of
+///   something else by that name;
+/// * a module file declared anywhere but among a module's items, which the reading does not read;
+/// * a character outside ASCII anywhere but in a comment or a literal: the compiler compares
+///   identifiers once it has normalised them, and the reading compares them as written.
+///
+/// # Errors
+///
+/// Returns the file when it cannot be read or lexed.
+pub fn breaches(
+    sources: &mut Sources,
+    root: &Path,
+    file: &str,
+    helpers: &BTreeSet<String>,
+) -> Result<Vec<Breach>, ScanError> {
+    let tokens = sources.tokens(&root.join(file)).map_err(|what| ScanError {
+        file: file.to_owned(),
+        what,
+    })?;
+    Ok(conventions(tokens, helpers)
+        .into_iter()
+        .map(|(line, what)| Breach {
+            file: file.to_owned(),
+            line,
+            what,
+        })
+        .collect())
+}
+
+/// The breaches in one file's tokens, each as its line and what it is; see [`breaches`].
+fn conventions(tokens: &[Token], helpers: &BTreeSet<String>) -> Vec<(usize, String)> {
+    let tokens = significant(tokens);
+    let level = module_levels(&tokens);
+    let uses = use_declarations(&tokens, &level);
+    let mut found = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        let name = match &token.tok {
+            Tok::Ident(name) => name.as_str(),
+            Tok::Punct(c) if !c.is_ascii() => {
+                found.push((
+                    token.line,
+                    format!("`{c}` is a character outside ASCII outside a comment or a literal, which the reading does not read as the compiler does"),
+                ));
+                continue;
+            }
+            _ => continue,
+        };
+        if !name.is_ascii() {
+            found.push((
+                token.line,
+                format!("`{name}` is an identifier outside ASCII: the compiler compares identifiers once it has normalised them, and the reading compares them as written"),
+            ));
+            continue;
+        }
+        let around = Around {
+            tokens: &tokens,
+            index,
+        };
+        let declaration = uses
+            .iter()
+            .find(|declaration| declaration.from <= index && index < declaration.to);
+        if name == "mod" && !level[index] && around.declares_a_module_file() {
+            found.push((
+                token.line,
+                "a module file declared inside a function, a block, an implementation or a macro, which the reading does not read".to_owned(),
+            ));
+        }
+        if helpers.contains(name)
+            && let Some(what) = helper_occurrence(&around, &level, declaration)
+        {
+            found.push((
+                token.line,
+                format!("`{name}`, a keyed helper's name, is written here as {what}, where a helper key allows only its definition, a call or a plain `use` of it"),
+            ));
+        }
+        if let Some(meaning) = trusted_meaning(name)
+            && let Some(how) = trusted_declaration(&around, name, declaration)
+        {
+            found.push((
+                token.line,
+                format!("`{name}` is declared here as {how}, where the reading trusts it to mean {meaning}"),
+            ));
+        }
+    }
+    found
+}
+
+/// For each token, whether it stands among a module's items: every group around it is the body of
+/// a `mod`.
+fn module_levels(tokens: &[Token]) -> Vec<bool> {
+    let mut groups: Vec<bool> = Vec::new();
+    let mut level = Vec::with_capacity(tokens.len());
+    for (index, token) in tokens.iter().enumerate() {
+        level.push(groups.iter().all(|module| *module));
+        match token.tok {
+            Tok::Punct('(' | '[') => groups.push(false),
+            Tok::Punct('{') => groups.push(
+                index >= 2
+                    && tokens[index - 1].ident().is_some()
+                    && tokens[index - 2].ident() == Some("mod"),
+            ),
+            Tok::Punct(')' | ']' | '}') => {
+                groups.pop();
+            }
+            _ => {}
+        }
+    }
+    level
+}
+
+/// A `use` declaration: the tokens of its tree, what it brings in, and whether it stands among a
+/// module's items.
+struct UseDeclaration {
+    from: usize,
+    to: usize,
+    module_level: bool,
+    imports: Vec<Import>,
+}
+
+/// Every `use` declaration in `tokens`, wherever it stands.
+fn use_declarations(tokens: &[Token], level: &[bool]) -> Vec<UseDeclaration> {
+    tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, token)| token.ident() == Some("use"))
+        .map(|(index, _)| {
+            let mut imports = Vec::new();
+            let to = use_tree(tokens, index + 1, &[], &mut imports);
+            UseDeclaration {
+                from: index + 1,
+                to,
+                module_level: level[index],
+                imports,
+            }
+        })
+        .collect()
+}
+
+/// A name among a file's significant tokens, and what stands around it.
+struct Around<'a> {
+    tokens: &'a [Token],
+    index: usize,
+}
+
+impl Around<'_> {
+    fn before(&self, back: usize) -> Option<&Token> {
+        self.index
+            .checked_sub(back)
+            .and_then(|at| self.tokens.get(at))
+    }
+
+    fn after(&self, ahead: usize) -> Option<&Token> {
+        self.tokens.get(self.index + ahead)
+    }
+
+    fn word_before(&self, back: usize) -> Option<&str> {
+        self.before(back).and_then(Token::ident)
+    }
+
+    fn word_after(&self, ahead: usize) -> Option<&str> {
+        self.after(ahead).and_then(Token::ident)
+    }
+
+    fn punct_before(&self, back: usize, c: char) -> bool {
+        self.before(back).is_some_and(|token| token.is_punct(c))
+    }
+
+    fn punct_after(&self, ahead: usize, c: char) -> bool {
+        self.after(ahead).is_some_and(|token| token.is_punct(c))
+    }
+
+    /// Whether a macro definition names it: `macro_rules! name` or `macro name`.
+    fn defines_a_macro(&self) -> bool {
+        (self.punct_before(1, '!') && self.word_before(2) == Some("macro_rules"))
+            || self.word_before(1) == Some("macro")
+    }
+
+    /// Whether it ends a path in a `use` tree: nothing but `;`, `,` or `}` follows it.
+    fn ends_a_use_path(&self) -> bool {
+        self.after(1)
+            .is_none_or(|token| token.is_punct(';') || token.is_punct(',') || token.is_punct('}'))
+    }
+
+    /// Whether this `mod` declares a module file (`mod name;`, or `mod $name;` in a macro).
+    fn declares_a_module_file(&self) -> bool {
+        if self.word_after(1).is_some() {
+            return self.punct_after(2, ';');
+        }
+        self.punct_after(1, '$') && self.word_after(2).is_some() && self.punct_after(3, ';')
+    }
+
+    /// Whether what leads the path this name ends makes its arguments no call's: a definition, a
+    /// binding, a type or a bound, a method, a macro's definition or metavariable, or an attribute.
+    fn led_as_other_than_a_call(&self) -> bool {
+        let (_, start) = path_to(self.tokens, self.index);
+        let at = |back: usize| start.checked_sub(back).and_then(|at| self.tokens.get(at));
+        let word = |back: usize| at(back).and_then(Token::ident);
+        let punct = |back: usize, c: char| at(back).is_some_and(|token| token.is_punct(c));
+        matches!(
+            word(1),
+            Some(
+                "as" | "const"
+                    | "dyn"
+                    | "enum"
+                    | "fn"
+                    | "for"
+                    | "impl"
+                    | "let"
+                    | "macro"
+                    | "mod"
+                    | "mut"
+                    | "ref"
+                    | "static"
+                    | "struct"
+                    | "trait"
+                    | "type"
+                    | "union"
+                    | "use"
+                    | "where"
+            )
+        ) || (punct(1, '.') && !punct(2, '.'))
+            || punct(1, '?')
+            || punct(1, '$')
+            || (punct(1, '!') && word(2) == Some("macro_rules"))
+            || (punct(1, '[') && (punct(2, '#') || (punct(2, '!') && punct(3, '#'))))
+    }
+
+    /// What a keyed helper's name is written as here, for a breach to say.
+    fn written_as(&self) -> &'static str {
+        match self.word_before(1) {
+            Some("struct" | "enum" | "union" | "trait" | "type") => return "a type or a trait",
+            Some("mod") => return "a module",
+            Some("const" | "static") => return "a constant or a static",
+            Some("let" | "mut" | "ref") => return "a binding",
+            Some("as") => return "the name `as` gives to something else",
+            Some("dyn" | "impl") => return "a trait in a type",
+            _ => {}
+        }
+        if self.defines_a_macro() {
+            "a macro"
+        } else if self.punct_after(1, '!') {
+            "a macro's invocation"
+        } else if self.word_after(1) == Some("as") {
+            "a rename or a cast of it"
+        } else if self.punct_after(1, ':') && self.punct_after(2, ':') {
+            "a path through it"
+        } else if self.punct_before(1, '.') && !self.punct_before(2, '.') {
+            "a method or a field"
+        } else if self.punct_before(1, '?') {
+            "a trait in a type"
+        } else if self.punct_before(1, '$') {
+            "a macro's metavariable"
+        } else if self.punct_before(1, '[')
+            && (self.punct_before(2, '#') || self.punct_before(2, '!'))
+        {
+            "an attribute"
+        } else {
+            "a binding, a parameter, a field or a value"
+        }
+    }
+}
+
+/// What an occurrence of a keyed helper's name is written as, when it is none of the forms a helper
+/// key allows: a function's name among a module's items, a call, or the last name of a plain `use`
+/// among a module's items (which the map then follows to a function).
+fn helper_occurrence(
+    around: &Around<'_>,
+    level: &[bool],
+    declaration: Option<&UseDeclaration>,
+) -> Option<&'static str> {
+    if let Some(declaration) = declaration {
+        return if around.word_before(1) == Some("as") {
+            Some("the name `as` gives to something else")
+        } else if around.word_after(1) == Some("as") {
+            Some("a `use` that renames it")
+        } else if !around.ends_a_use_path() {
+            Some("a path through it")
+        } else if !declaration.module_level {
+            Some("a `use` inside a function, a block or a macro")
+        } else {
+            None
+        };
+    }
+    if around.word_before(1) == Some("fn") {
+        return (!level[around.index]).then_some(
+            "a function inside a function, a block, an implementation, a trait or a macro",
+        );
+    }
+    if called_after(around.tokens, around.index + 1) && !around.led_as_other_than_a_call() {
+        return None;
+    }
+    Some(around.written_as())
+}
+
+/// What the reading trusts `name` to mean, when it trusts it at all.
+fn trusted_meaning(name: &str) -> Option<&'static str> {
+    if STANDARD_ROOTS.contains(&name) {
+        Some("the standard library")
+    } else if matches!(name, "clippy" | "rustfmt") {
+        Some("the tool of that name")
+    } else if TRUSTED_ROOTS.contains(&name) {
+        Some("the crates.io crate of that name")
+    } else if RUN_AS_WRITTEN.contains(&name) || NO_CODE.contains(&name) {
+        Some("the standard library's macro")
+    } else if ATTRIBUTE_MACROS.contains(&name) {
+        Some("the standard library's attribute")
+    } else if DERIVES.contains(&name) {
+        Some("the standard library's derive")
+    } else if SERDE_DERIVES.contains(&name) {
+        Some("serde's derive")
+    } else {
+        None
+    }
+}
+
+/// How this occurrence of the trusted `name` declares it, when it does: a module, a macro, a type
+/// named after a root, the name `as` gives to something else, or a plain `use` of anything but what
+/// the reading trusts by that name.
+fn trusted_declaration(
+    around: &Around<'_>,
+    name: &str,
+    declaration: Option<&UseDeclaration>,
+) -> Option<&'static str> {
+    let root = STANDARD_ROOTS.contains(&name) || TRUSTED_ROOTS.contains(&name);
+    if around.word_before(1) == Some("mod") {
+        return Some("a module");
+    }
+    if around.defines_a_macro() {
+        return Some("a macro");
+    }
+    if around.word_before(1) == Some("as") {
+        return Some("the name `as` gives to something else");
+    }
+    if root
+        && matches!(
+            around.word_before(1),
+            Some("struct" | "enum" | "union" | "trait" | "type")
+        )
+    {
+        return Some("a type, which a path that starts at that name would reach");
+    }
+    let declaration = declaration?;
+    if !around.ends_a_use_path() || around.word_after(1) == Some("as") {
+        return None;
+    }
+    declaration
+        .imports
+        .iter()
+        .any(|import| match import {
+            Import::Name { name: bound, path } if bound == name && path.last() == Some(bound) => {
+                !trusted_import(name, path)
+            }
+            _ => false,
+        })
+        .then_some("a `use` of something other than what the reading trusts by that name")
+}
+
+/// Whether a plain `use` of the trusted `name` from `path` brings in what the reading trusts: a
+/// crate root by itself, one of serde's derives from `serde`, and anything else from the standard
+/// library.
+fn trusted_import(name: &str, path: &[String]) -> bool {
+    if STANDARD_ROOTS.contains(&name) || TRUSTED_ROOTS.contains(&name) {
+        path.len() == 1
+    } else if SERDE_DERIVES.contains(&name) {
+        path.len() == 2 && path[0] == "serde"
+    } else {
+        path.len() > 1 && STANDARD_ROOTS.contains(&path[0].as_str())
+    }
 }
 
 #[cfg(test)]
@@ -1690,14 +2031,6 @@ mod tests {
         ] {
             assert!(!read(body).contains(&shared), "{body}: {:?}", read(body));
         }
-        // The prelude's `Fn` traits written like a call, wherever in a type, are never calls.
-        for body in [
-            "let _: Option<Box<dyn Send + Fn()>> = None;",
-            "let _: Option<&dyn (FnMut(u8) -> u8)> = None;",
-            "Fn(); FnOnce(); AsyncFn(); AsyncFnMut(); AsyncFnOnce();",
-        ] {
-            assert!(read(body).is_empty(), "{body}: {:?}", read(body));
-        }
         // The same holds for the first name of a path, which a nested module or type can bind; and
         // a path from the root or after a qualifier is not followed.
         let nested = vec!["cases".to_owned(), "brought_up".to_owned()];
@@ -1803,14 +2136,9 @@ mod tests {
     }
 
     #[test]
-    fn a_module_records_the_macros_it_defines_and_the_names_it_cannot_list() {
-        let modules = scan_text(
-            "macro_rules! assert_eq { () => {} }\n#[macro_use]\nmod other {}\n",
-            true,
-        );
-        assert_eq!(modules[0].macros, ["assert_eq"]);
-        assert!(modules[0].unlisted_names);
+    fn a_module_records_the_names_it_cannot_list() {
         for text in [
+            "macro_rules! assert_eq { () => {} }\n#[macro_use]\nmod other {}\n",
             "extern crate core as other;\nfn plain() {}\n",
             "make_items!();\nfn plain() {}\n",
             "helpers::make_items! { a }\nfn plain() {}\n",
@@ -1818,13 +2146,6 @@ mod tests {
             assert!(scan_text(text, true)[0].unlisted_names, "{text}");
         }
         assert!(!scan_text("fn plain() {}\nconst X: u8 = 1;\n", true)[0].unlisted_names);
-        // Every definition in the file counts, inside functions and past comments too, and an
-        // invocation of a macro named `macro_rules` is none.
-        let modules = scan_text(
-            "fn f() {\n    #[macro_export]\n    macro_rules! println { () => {} }\n}\nmacro_rules /* a gap */ ! assert_eq { () => {} }\nfn g() { r#macro_rules!(); }\n",
-            true,
-        );
-        assert_eq!(modules[0].macros, ["println", "assert_eq"]);
         // An import is read past comments.
         let modules = scan_text("use std::stringify /* a gap */ as println;\n", true);
         let Entry::Item(item) = &modules[0].entries[0] else {
@@ -1839,15 +2160,172 @@ mod tests {
         );
     }
 
+    /// The breaches of a file whose one keyed helper is `shared`.
+    fn breached(text: &str) -> Vec<(usize, String)> {
+        conventions(
+            &lex(text).expect("lexes"),
+            &BTreeSet::from(["shared".to_owned()]),
+        )
+    }
+
     #[test]
-    fn a_macro_definition_written_as_text_is_kept_apart() {
-        let (code, text) = macro_definitions(
-            &lex("let _ = stringify!(macro_rules! println { () => {} }); macro_rules! real { () => {} } std::stringify!(macro_rules! pathed { () => {} }); emit!(stringify!(macro_rules! emitted { () => {} })); assert!(!stringify!(macro_rules! checked { () => {} }).is_empty());")
-                .expect("lexes"),
+    fn a_helpers_name_is_written_only_as_its_definition_a_call_or_a_plain_use() {
+        for text in [
+            // Bindings and parameters of any form.
+            "fn t() { let shared = 1; }",
+            "fn t() { let (shared,) = (1,); }",
+            "fn t() { let S(shared) = x; }",
+            "fn t() { if let Some(shared) = x {} }",
+            "fn t() { match x { shared => {} } }",
+            "fn t() { for shared in all {} }",
+            "fn t() { let run = |shared: u8| 1; }",
+            "fn t(shared: u8) {}",
+            // A field, a method, a value and a cast.
+            "fn t() { let _ = S { shared: 1 }; }",
+            "fn t() { value.shared(); }",
+            "fn t() { let _ = value.shared; }",
+            "fn t() { let f = shared; }",
+            "fn t() { let _ = shared as fn(); }",
+            "fn t() { let _ = stringify!(shared); }",
+            // A path through the name, a rename either way, and a `use` in a body.
+            "fn t() { shared::inner(); }",
+            "use shared::inner;",
+            "use a::shared as other;",
+            "use a::other as shared;",
+            "fn t() { use a::shared; }",
+            // Items of the name, and functions of it where no module's items are.
+            "mod shared {}",
+            "mod shared;",
+            "struct shared;",
+            "enum E { shared }",
+            "trait shared {}",
+            "type shared = u8;",
+            "const shared: u8 = 1;",
+            "static shared: u8 = 1;",
+            "impl S { fn shared() {} }",
+            "trait T { fn shared(); }",
+            "fn outer() { fn shared() {} }",
+            "extern \"C\" { fn shared(); }",
+            "macro_rules! m { () => { fn shared() {} }; }",
+            // Macros, metavariables, attributes and traits of the name.
+            "macro_rules! shared { () => {} }",
+            "fn t() { shared!(); }",
+            "macro_rules! m { ($shared:expr) => {}; }",
+            "#[shared] fn t() {}",
+            "#[shared(x)] fn t() {}",
+            "fn t() { let _: &dyn shared() = x; }",
+            "fn t(run: impl shared()) {}",
+            "fn t<T: ?shared>() {}",
+        ] {
+            let found = breached(text);
+            assert!(!found.is_empty(), "{text}");
+            assert!(
+                found.iter().all(|(_, what)| what.contains("`shared`")),
+                "{text}: {found:?}"
+            );
+        }
+        for text in [
+            "fn shared() {}",
+            "pub(crate) async fn shared() {}",
+            "mod m { pub fn shared() {} }",
+            "#[cfg(test)]\nmod tests {\n    fn shared() {}\n}",
+            "fn t() { shared(); }",
+            "fn t() { a::b::shared(1); }",
+            "fn t() { crate::shared::<u8>(); }",
+            "fn t() { let _ = 0..shared(); }",
+            "fn t() { assert!(!shared()); }",
+            "fn t() { assert_eq!(shared(), 3); }",
+            "fn t() { let _ = <T>::shared(); }",
+            "use a::shared;",
+            "pub use a::{b, shared};",
+            "mod m { use super::shared; }",
+            "// shared\nfn t() { let _ = \"shared\"; }",
+        ] {
+            assert_eq!(breached(text), [], "{text}");
+        }
+        // Each breach is on its own line.
+        let found = breached("fn shared() {}\n\nfn t() {\n    let shared = 1;\n    shared();\n}\n");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, 4);
+    }
+
+    #[test]
+    fn a_trusted_name_is_never_declared() {
+        for (text, name) in [
+            ("mod core {}", "core"),
+            ("mod std;", "std"),
+            ("fn t() { mod alloc {} }", "alloc"),
+            ("extern crate foo as core;", "core"),
+            ("use foo as std;", "std"),
+            ("use foo::core;", "core"),
+            ("use crate::a::{self as alloc};", "alloc"),
+            ("struct std;", "std"),
+            ("enum core {}", "core"),
+            ("macro_rules! assert { () => {} }", "assert"),
+            ("fn t() { macro_rules! vec { () => {} } }", "vec"),
+            ("macro format() {}", "format"),
+            ("use foo::println;", "println"),
+            ("use std::stringify as println;", "println"),
+            ("use custom::Clone;", "Clone"),
+            ("use tokio::test;", "test"),
+            ("use foo as tokio;", "tokio"),
+            ("mod serde {}", "serde"),
+            ("use x as rustfmt;", "rustfmt"),
+            ("use foo::derive;", "derive"),
+            ("use serde_derive::Serialize;", "Serialize"),
+            // A definition written as text is one all the same: the check reads tokens.
+            (
+                "const _: &str = stringify!(macro_rules! line { () => {} });",
+                "line",
+            ),
+        ] {
+            let found = breached(text);
+            assert_eq!(found.len(), 1, "{text}: {found:?}");
+            assert!(
+                found[0].1.contains(&format!("`{name}` is declared")),
+                "{text}: {found:?}"
+            );
+        }
+        for text in [
+            "use std::println;",
+            "use core::fmt::Debug;",
+            "use std::{fmt::{self, Debug}, hash::Hash};",
+            "use std::fmt::Debug as Printed;",
+            "use serde::{Deserialize, Serialize};",
+            "use tokio;",
+            "extern crate alloc;",
+            "#[derive(Debug, Clone, serde::Serialize)] struct S;",
+            "#[test] fn t() { println!(\"{}\", file!()); std::println!(); }",
+            "fn t() { let file = 1; let line = 2; }",
+            "fn line() {}",
+            "impl Default for S {}",
+            "fn t<T: Clone>() {}",
+            "#[tokio::test] async fn t() {}",
+            "#[rustfmt::skip] fn t() {}",
+            "fn t() { let _ = stringify!(use external::*;); }",
+        ] {
+            assert_eq!(breached(text), [], "{text}");
+        }
+    }
+
+    #[test]
+    fn a_character_outside_ascii_and_a_module_file_the_reading_does_not_read_are_breaches() {
+        let found = breached("fn t() { let \u{212A}elvin = 1; }");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].1.contains("outside ASCII"), "{found:?}");
+        // A combining mark, which the lexer does not take into the identifier before it.
+        assert_eq!(breached("fn t() { let x\u{301} = 1; }").len(), 1);
+        let found = breached("fn t() {\n    #[path = \"x.rs\"]\n    mod x;\n}\n");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, 3);
+        assert!(found[0].1.contains("module file"), "{found:?}");
+        assert_eq!(
+            breached("macro_rules! m { ($n:ident) => { mod $n; }; }").len(),
+            1
         );
-        // Text only in a standard `stringify!` that no macro this reading does not know holds.
-        assert_eq!(code, ["real", "pathed", "emitted"]);
-        assert_eq!(text, ["println", "checked"]);
+        for text in ["mod x;", "mod m { mod x; }", "#[cfg(test)]\nmod tests;"] {
+            assert_eq!(breached(text), [], "{text}");
+        }
     }
 
     #[test]

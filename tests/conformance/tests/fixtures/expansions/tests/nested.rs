@@ -1,4 +1,4 @@
-//! Cases an inner attribute, a module inside a test, a `cfg` or a second definition hide.
+//! Cases an inner attribute, a `cfg` or a second definition hide.
 
 mod outer {
     #![rewrite_all]
@@ -25,21 +25,6 @@ fn rewritten() -> u8 {
 #[test]
 fn calls_a_case_with_an_inner_attribute() {
     assert_eq!(rewritten(), 3);
-}
-
-/// KR-REQ-03.28: a case a module inside a test's body has another of.
-fn shared() {}
-
-#[test]
-fn calls_a_case_of_a_module_it_declares() {
-    mod inner {
-        fn shared() {}
-
-        pub fn run() {
-            self::shared();
-        }
-    }
-    inner::run();
 }
 
 /// KR-REQ-03.29: a case a `cfg` may compile out of the build.

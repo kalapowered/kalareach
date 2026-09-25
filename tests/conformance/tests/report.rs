@@ -4,9 +4,10 @@
 //! workspace never builds it: `forms` keys rows in every form the report reads, ignores nothing
 //! and has a documentation test, `outcomes` has a test that passes, one that fails and ones that
 //! are ignored, `known` has a test that records a known difference, `refused` names a row past the
-//! end of section 21's table and a bare section, and `expansions`, which is read and never built,
-//! calls cases through macros and attributes the report cannot see into. The runs build into a
-//! target directory of their own under the platform's temporary directory.
+//! end of section 21's table and a bare section, `expansions`, which is read and never built,
+//! calls cases through macros and attributes the report cannot see into, and `conventions`, read
+//! and never built as well, steps outside the conventions a helper key relies on. The runs build
+//! into a target directory of their own under the platform's temporary directory.
 //!
 //! KR-REQ-29.01.
 
@@ -178,43 +179,25 @@ fn every_comment_form_and_a_case_table_key_their_tests() {
 
 #[test]
 fn a_call_a_macro_or_attribute_may_rewrite_move_or_rename_keys_nothing() {
-    // The tree is read and never built: the macros and crates its tests name are not there.
+    // The tree is read and never built: the macros and crates its tests name are not there. It
+    // keeps to the conventions a helper key relies on, so the reading declines these keys itself.
     let map = map_of("expansions", false);
     assert!(map.refused.is_empty(), "{:?}", map.refused);
     assert!(map.problems.is_empty(), "{:?}", map.problems);
     for (row, context) in [
         ("KR-REQ-03.11", "which no test is proved to call"),
-        ("KR-REQ-03.12", "which no test is proved to call"),
-        ("KR-REQ-03.13", "which no test is proved to call"),
-        ("KR-REQ-03.15", "which no test is proved to call"),
         ("KR-REQ-03.16", "which no test is proved to call"),
         ("KR-REQ-03.17", "which an attribute may rewrite"),
         ("KR-REQ-03.18", "which an attribute may rewrite"),
         ("KR-REQ-03.19", "which no test is proved to call"),
-        ("KR-REQ-03.20", "which no test is proved to call"),
-        ("KR-REQ-03.21", "which no test is proved to call"),
-        ("KR-REQ-03.22", "which no test is proved to call"),
-        ("KR-REQ-03.23", "which no test is proved to call"),
-        ("KR-REQ-03.24", "which no test is proved to call"),
-        ("KR-REQ-03.25", "which no test is proved to call"),
         ("KR-REQ-03.26", "which an attribute may rewrite"),
         ("KR-REQ-03.27", "which an attribute may rewrite"),
-        ("KR-REQ-03.28", "which no test is proved to call"),
         ("KR-REQ-03.29", "which no test is proved to call"),
         ("KR-REQ-03.30", "which a cfg may leave out of a build"),
         ("KR-REQ-03.32", "which no test is proved to call"),
         ("KR-REQ-03.33", "which a cfg may leave out of a build"),
-        ("KR-REQ-03.34", "which a cfg may leave out of a build"),
-        (
-            "KR-REQ-03.35",
-            "which its module defines or brings in more than once",
-        ),
         ("KR-REQ-03.36", "which a cfg may leave out of a build"),
-        ("KR-REQ-03.37", "which no test is proved to call"),
         ("KR-REQ-03.38", "which no test is proved to call"),
-        ("KR-REQ-03.39", "which no test is proved to call"),
-        ("KR-REQ-03.40", "which no test is proved to call"),
-        ("KR-REQ-03.41", "which no test is proved to call"),
         ("KR-REQ-03.42", "which no test is proved to call"),
         ("KR-REQ-03.43", "which no test is proved to call"),
         ("KR-REQ-03.44", "which a cfg may leave out of a build"),
@@ -241,8 +224,7 @@ fn a_call_a_macro_or_attribute_may_rewrite_move_or_rename_keys_nothing() {
             Binding::CalledFunction
         )])
     );
-    // A `use` or a macro definition written as text defines and imports nothing, so it leaves
-    // the rest of its target proved.
+    // A `use` written as text imports nothing, so it leaves the rest of its target proved.
     assert_eq!(
         keyed.get("KR-REQ-03.31"),
         Some(&vec![
@@ -256,6 +238,198 @@ fn a_call_a_macro_or_attribute_may_rewrite_move_or_rename_keys_nothing() {
             ),
         ])
     );
+}
+
+/// The problems a map found, each matched to one expected `(file:line, words)`; none is left over.
+fn expect_problems(map: &Map, expected: &[(&str, &str)]) {
+    let mut unmatched: Vec<&String> = map.problems.iter().collect();
+    for (at, words) in expected {
+        let found = unmatched
+            .iter()
+            .position(|problem| problem.starts_with(&format!("{at}: ")) && problem.contains(words));
+        match found {
+            Some(index) => {
+                unmatched.remove(index);
+            }
+            None => panic!(
+                "no problem at {at} saying {words:?} among {:#?}",
+                map.problems
+            ),
+        }
+    }
+    assert!(
+        unmatched.is_empty(),
+        "problems not expected: {unmatched:#?}"
+    );
+}
+
+#[test]
+fn a_source_outside_the_conventions_is_a_problem_and_keys_no_helper() {
+    // The tree is read and never built. Each target steps outside the conventions a helper key
+    // relies on, as the compiler would build it: the report names the file and the line, and the
+    // helpers of that target key nothing.
+    let map = map_of("conventions", false);
+    assert!(map.refused.is_empty(), "{:?}", map.refused);
+    let helper = "a keyed helper's name, is written here as";
+    expect_problems(
+        &map,
+        &[
+            (
+                "tests/aliased.rs:3",
+                "`println` is declared here as the name `as` gives",
+            ),
+            (
+                "tests/emitcore.rs:13",
+                "`core` is declared here as a module",
+            ),
+            (
+                "tests/emitcore.rs:14",
+                "`println` is declared here as the name `as` gives",
+            ),
+            (
+                "tests/emitted.rs:11",
+                "`println` is declared here as a macro",
+            ),
+            (
+                "tests/emitted.rs:11",
+                "`shared`, a keyed helper's name, is written here as a function inside",
+            ),
+            (
+                "tests/exported.rs:14",
+                "`println` is declared here as a macro",
+            ),
+            (
+                "tests/exported.rs:16",
+                "`case`, a keyed helper's name, is written here as a function inside",
+            ),
+            (
+                "tests/exported.rs:31",
+                "`assert_eq` is declared here as a macro",
+            ),
+            (
+                "tests/exported.rs:33",
+                "`other_case`, a keyed helper's name, is written here as a function inside",
+            ),
+            (
+                "tests/flow.rs:3",
+                "`Clone` is declared here as a `use` of something other",
+            ),
+            ("tests/flow.rs:12", helper),
+            ("tests/flow.rs:26", helper),
+            ("tests/flow.rs:41", helper),
+            ("tests/gapped.rs:3", "`println` is declared here as a macro"),
+            ("tests/gapped.rs:5", helper),
+            (
+                "tests/hidden.rs:6",
+                "a module file declared inside a function",
+            ),
+            (
+                "tests/identity.rs:3",
+                "`assert` is declared here as a macro",
+            ),
+            (
+                "tests/identity.rs:13",
+                "`core` is declared here as a module",
+            ),
+            (
+                "tests/identity.rs:16",
+                "`println` is declared here as a macro",
+            ),
+            ("tests/identity.rs:17", helper),
+            (
+                "tests/imported.rs:4",
+                "a `use` of `shared`, a keyed helper's name, that the reading does not follow",
+            ),
+            ("tests/inner.rs:9", "a function inside a function"),
+            (
+                "tests/localcore.rs:3",
+                "`core` is declared here as a module",
+            ),
+            ("tests/localcore.rs:6", helper),
+            (
+                "tests/localcore.rs:10",
+                "`println` is declared here as the name `as` gives",
+            ),
+            (
+                "tests/qualified.rs:9",
+                "the keyed helper `Fn` has the name of a trait a type writes like a call",
+            ),
+            ("tests/raw.rs:5", helper),
+            (
+                "tests/renamed.rs:4",
+                "`shared`, a keyed helper's name, is written here as the name `as` gives",
+            ),
+            (
+                "tests/shadowed.rs:8",
+                "`println` is declared here as a macro",
+            ),
+            ("tests/shadowed.rs:10", helper),
+            (
+                "tests/sugar.rs:5",
+                "the keyed helper `Fn` has the name of a trait a type writes like a call",
+            ),
+            ("tests/taken.rs:8", "a constant or a static"),
+            (
+                "tests/taken.rs:19",
+                "`imported`, a keyed helper's name, is written here as the name `as` gives",
+            ),
+            ("tests/taken.rs:23", "a trait in a type"),
+            ("tests/text.rs:10", "`println` is declared here as a macro"),
+            (
+                "tests/tools.rs:3",
+                "`clippy` is declared here as the name `as` gives",
+            ),
+            ("tests/traits.rs:10", "a type or a trait"),
+            ("tests/unicode.rs:12", "is an identifier outside ASCII"),
+            ("vintage/tests/old.rs:1", "the 2015 edition"),
+        ],
+    );
+    assert!(
+        map.keys
+            .values()
+            .flat_map(BTreeMap::values)
+            .all(|key| key.binding != Binding::CalledFunction),
+        "{:?}",
+        keyed(&map)
+    );
+    for row in [
+        "KR-REQ-03.12",
+        "KR-REQ-03.13",
+        "KR-REQ-03.15",
+        "KR-REQ-03.20",
+        "KR-REQ-03.21",
+        "KR-REQ-03.22",
+        "KR-REQ-03.23",
+        "KR-REQ-03.24",
+        "KR-REQ-03.25",
+        "KR-REQ-03.28",
+        "KR-REQ-03.34",
+        "KR-REQ-03.35",
+        "KR-REQ-03.37",
+        "KR-REQ-03.39",
+        "KR-REQ-03.40",
+        "KR-REQ-03.41",
+        "KR-REQ-03.45",
+        "KR-REQ-03.46",
+        "KR-REQ-03.47",
+        "KR-REQ-03.48",
+        "KR-REQ-03.49",
+        "KR-REQ-03.51",
+        "KR-REQ-03.52",
+        "KR-REQ-03.53",
+        "KR-REQ-03.54",
+    ] {
+        let row = identifier(row);
+        assert!(
+            map.references
+                .get(&row)
+                .is_some_and(|references| references.iter().all(|reference| reference
+                    .context
+                    .contains("steps outside the conventions a helper key relies on"))),
+            "{row}: {:?}",
+            map.references.get(&row)
+        );
+    }
 }
 
 #[test]
@@ -276,7 +450,7 @@ fn a_tree_with_nothing_ignored_reports_every_identifier_as_run() {
     // The module comment of the test file keys every test in it, each by its own name, and a test
     // its own comment keys as well is recorded once, by that comment.
     let module = &document.identifiers["KR-REQ-03.01"].tests;
-    assert_eq!(module.len(), 25);
+    assert_eq!(module.len(), 15);
     let commented: Vec<_> = module
         .iter()
         .filter(|test| test.test == "forms --test flow commented")

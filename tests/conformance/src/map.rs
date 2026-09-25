@@ -14,8 +14,11 @@
 //!   module;
 //! * in test code, a comment on a function keys every test of the same target whose body calls it,
 //!   which is how a case that thin per-shell or per-platform tests share is keyed where it is
-//!   written; a call keys it only where the target's own source proves the compiler resolves the
-//!   call to it, visibility included, and a call the reading cannot prove keys nothing;
+//!   written. Such a helper key holds only inside a boundary the report checks: every file of the
+//!   target keeps to conventions `rust_items::breaches` reads on tokens, and a target that breaks
+//!   one stops the report and keys nothing through a helper. Inside it, a call keys the helper only
+//!   where the target's own source proves the compiler resolves the call to it, visibility
+//!   included, and a call the reading cannot prove keys nothing;
 //! * a `const` or `static` case table names identifiers in its `covers` fields, and those key every
 //!   test of the same package whose body names the table.
 //!
@@ -34,7 +37,9 @@ use serde::Serialize;
 
 use crate::id::{self, Identifier, Refusal};
 use crate::plan::{CaseTable, Lane, matches};
-use crate::rust_items::{self, Entry, Import, Module, NO_CODE, SERDE_DERIVES, Sources, Visibility};
+use crate::rust_items::{
+    self, Breach, Entry, FN_TRAITS, Import, KEYWORDS, Module, STANDARD_ROOTS, Sources, Visibility,
+};
 use crate::typescript::{self, FileFacts, Keys, TsBinding};
 use crate::workspace::{self, Package, TargetId, TargetKind};
 
@@ -251,6 +256,7 @@ struct Table {
 struct Helper {
     name: String,
     file: String,
+    line: usize,
     module: Vec<String>,
     mentions: Vec<(Identifier, String)>,
     /// Whether a `cfg` of its own may leave it out of a build.
@@ -391,6 +397,29 @@ fn rust_package(map: &mut Map, sources: &mut Sources, root: &Path, package: &Pac
                 }
             }
         }
+        // A helper key relies on conventions the target's source keeps to; a target that breaks
+        // one keys no test through a helper, and the report stops.
+        if !helpers.is_empty() {
+            let found = breaches(sources, root, package, target, &modules, &scope, &helpers);
+            if !found.is_empty() {
+                for breach in found {
+                    let text = breach.to_string();
+                    if !map.problems.contains(&text) {
+                        map.problems.push(text);
+                    }
+                }
+                for helper in helpers {
+                    let context = format!(
+                        "a comment on fn {} in {}, in a target whose source steps outside the conventions a helper key relies on",
+                        helper.name, helper.file
+                    );
+                    for (identifier, source) in helper.mentions {
+                        map.reference(identifier, source, &context);
+                    }
+                }
+                continue;
+            }
+        }
         // A keyed function of test code keys the tests of this target that call it: a case a
         // family of thin tests shares, one per shell or per platform, is keyed where it is written.
         // A helper keys only where every build has it and nothing else of its name: not under a
@@ -430,15 +459,14 @@ fn rust_package(map: &mut Map, sources: &mut Sources, root: &Path, package: &Pac
             }
         }
         let helpers = kept;
-        // A test's calls prove nothing where the target may give a macro or attribute its reading
-        // took on trust another meaning.
-        let (claimed, unlisted) = claimed_names(&modules, &scope, package);
+        // A test's calls prove nothing where the target brings in names its source does not list,
+        // or where a crate or tool root its reading took on trust is not what the package makes it.
+        let unlisted = unlisted_names(&modules, &scope);
         for helper in helpers {
             let callers: Vec<String> = uses[first_use..]
                 .iter()
                 .filter(|test| {
                     !unlisted
-                        && test.assumes.is_disjoint(&claimed)
                         && crates_named(&test.assumes, package)
                         && modules
                             .iter()
@@ -762,90 +790,156 @@ impl Scope {
     }
 }
 
-/// The names a target binds for itself that a macro or attribute name taken on trust could be: a
-/// macro its source defines, a name a `use` brings in other than a standard library item under its
-/// own name, and a module (as `name::`, a path's first name); and whether it brings in names its
-/// source does not list, through `#[macro_use]`, an `extern crate`, or a glob from outside the
-/// crate and the standard library. Macros are looked up by name through a crate's own definitions
-/// and imports before the standard library's prelude, so while none of these can give a trusted
-/// name another meaning, each such name is the one the reading took it for.
-fn claimed_names(modules: &[Module], scope: &Scope, package: &Package) -> (BTreeSet<String>, bool) {
-    // `std`, `core` and `alloc` are the standard library's only where no module, `use` or
-    // dependency of the target takes their names.
-    let shadowed = |root: &str| {
-        package.dependency_names.contains(root)
-            || modules.iter().any(|module| {
-                module.path.last().is_some_and(|name| name == root)
-                    || module.entries.iter().any(|entry| {
-                        let imports = match entry {
-                            Entry::Item(item) => item.imports.as_slice(),
-                            Entry::Test(test) => test.imports.as_slice(),
-                            Entry::Section(_) => &[],
-                        };
-                        imports.iter().any(
-                            |import| matches!(import, Import::Name { name, .. } if name == root),
-                        )
-                    })
-            })
-    };
-    let roots: BTreeSet<&str> = ["std", "core", "alloc"]
-        .into_iter()
-        .filter(|root| !shadowed(root))
-        .collect();
-    let standard = |root: &str| roots.contains(root);
-    let mut claimed = BTreeSet::new();
-    let mut unlisted = false;
-    for module in modules {
-        claimed.extend(module.macros.iter().cloned());
-        unlisted |= module.unlisted_names;
-        if let Some(name) = module.path.last() {
-            claimed.insert(format!("{name}::"));
-        }
-        let imports = module.entries.iter().flat_map(|entry| match entry {
-            Entry::Item(item) => item.imports.as_slice(),
-            Entry::Test(test) => test.imports.as_slice(),
-            Entry::Section(_) => &[],
-        });
-        for import in imports {
-            match import {
-                Import::Name { name, path } => {
-                    // A standard library item, or one of serde's derives, under its own name is
-                    // the one trusted by that name; `serde::` is then held to the package's serde.
-                    let own = path.last() == Some(name)
-                        && (path.first().is_some_and(|root| standard(root))
-                            || (path.len() == 2
-                                && path[0] == "serde"
-                                && SERDE_DERIVES.contains(&name.as_str())));
-                    if !own {
-                        claimed.insert(name.clone());
-                        claimed.insert(format!("{name}::"));
-                    }
-                }
-                Import::Glob { path } => {
+/// Whether the target brings in names its source does not list: through `#[macro_use]`, an
+/// `extern crate`, a macro invoked among a module's items, an item under an attribute that may be a
+/// macro, or a glob from outside the crate and the standard library. A name the target declares for
+/// itself that a trusted macro or attribute name could be is a breach of the conventions instead.
+fn unlisted_names(modules: &[Module], scope: &Scope) -> bool {
+    modules.iter().any(|module| {
+        module.unlisted_names
+            || module
+                .entries
+                .iter()
+                .flat_map(|entry| match entry {
+                    Entry::Item(item) => item.imports.as_slice(),
+                    Entry::Test(test) => test.imports.as_slice(),
+                    Entry::Section(_) => &[],
+                })
+                .any(|import| {
+                    let Import::Glob { path } = import else {
+                        return false;
+                    };
                     let root = path.first().map_or("", String::as_str);
                     let mut child = module.path.clone();
                     child.push(root.to_owned());
-                    let inside = matches!(root, "crate" | "self" | "super")
-                        || standard(root)
-                        || scope.modules.contains(&child);
-                    unlisted |= !inside;
+                    !(matches!(root, "crate" | "self" | "super")
+                        || STANDARD_ROOTS.contains(&root)
+                        || scope.modules.contains(&child))
+                })
+    })
+}
+
+/// Where a target with keyed helpers steps outside the conventions a helper key relies on: its
+/// files as [`rust_items::breaches`] reads them; a helper named like a keyword or like a trait a type
+/// writes like a call; a plain `use` of a helper's name among a module's items that the reading
+/// does not follow to a function of that name; a target of the 2015 edition, whose paths start
+/// elsewhere; and a package that names a dependency after a standard crate.
+fn breaches(
+    sources: &mut Sources,
+    root: &Path,
+    package: &Package,
+    target: &workspace::Target,
+    modules: &[Module],
+    scope: &Scope,
+    helpers: &[Helper],
+) -> Vec<Breach> {
+    let names: BTreeSet<String> = helpers.iter().map(|helper| helper.name.clone()).collect();
+    let mut found = Vec::new();
+    let mut files: Vec<&str> = Vec::new();
+    for module in modules {
+        if !files.contains(&module.file.as_str()) {
+            files.push(&module.file);
+        }
+    }
+    for file in files {
+        match rust_items::breaches(sources, root, file, &names) {
+            Ok(breaches) => found.extend(breaches),
+            Err(error) => found.push(Breach {
+                file: error.file,
+                line: 1,
+                what: error.what,
+            }),
+        }
+    }
+    for helper in helpers {
+        let named = if KEYWORDS.contains(&helper.name.as_str()) {
+            Some("a keyword, which the reading cannot tell from the keyword itself")
+        } else if FN_TRAITS.contains(&helper.name.as_str()) {
+            Some(
+                "a trait a type writes like a call, which the reading cannot tell from a call of it",
+            )
+        } else {
+            None
+        };
+        if let Some(named) = named {
+            found.push(Breach {
+                file: helper.file.clone(),
+                line: helper.line,
+                what: format!("the keyed helper `{}` has the name of {named}", helper.name),
+            });
+        }
+    }
+    for module in modules {
+        for entry in &module.entries {
+            let Entry::Item(item) = entry else {
+                continue;
+            };
+            for import in &item.imports {
+                let Import::Name { name, path } = import else {
+                    continue;
+                };
+                if !names.contains(name) || path.last() != Some(name) {
+                    continue;
+                }
+                let followed = path.len() > 1
+                    && scope
+                        .module(&module.path, &path[..path.len() - 1], &[], 0)
+                        .is_some_and(|at| {
+                            matches!(
+                                scope.offered(&at, name, &module.path, &module.path, 0),
+                                Found::Function(_)
+                            )
+                        });
+                if !followed {
+                    found.push(Breach {
+                        file: module.file.clone(),
+                        line: item.line,
+                        what: format!("a `use` of `{name}`, a keyed helper's name, that the reading does not follow to a function of that name"),
+                    });
                 }
             }
         }
     }
-    // A definition written in `stringify!(...)` is text, unless the target gives that macro's
-    // name another meaning, when its arguments may be code after all.
-    if NO_CODE.iter().any(|name| claimed.contains(*name)) {
-        for module in modules {
-            claimed.extend(module.macros_in_text.iter().cloned());
-        }
+    if let Some(crate_root) = modules.first()
+        && target.edition == "2015"
+    {
+        found.push(Breach {
+            file: crate_root.file.clone(),
+            line: 1,
+            what: "the target is of the 2015 edition, whose paths start where the reading does not follow them".to_owned(),
+        });
     }
-    // The attributes of items are trusted as the tests' are; one the target gives another meaning
-    // may add items anywhere.
-    unlisted |= modules
+    found.extend(standard_dependencies(root, package));
+    found
+}
+
+/// Where the package names a dependency after a standard crate (`std`, `core` or `alloc`), which
+/// the reading takes those names for: its manifest and the line that names it.
+fn standard_dependencies(root: &Path, package: &Package) -> Vec<Breach> {
+    let manifest = package
+        .manifest
+        .strip_prefix(root)
+        .unwrap_or(&package.manifest)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let text = std::fs::read_to_string(&package.manifest).unwrap_or_default();
+    STANDARD_ROOTS
         .iter()
-        .any(|module| !module.assumes.is_disjoint(&claimed));
-    (claimed, unlisted)
+        .filter(|standard| package.dependency_names.contains(**standard))
+        .map(|standard| Breach {
+            file: manifest.clone(),
+            line: text
+                .lines()
+                .position(|line| {
+                    let line = line.trim_start();
+                    line.strip_prefix(standard)
+                        .is_some_and(|rest| rest.trim_start().starts_with('='))
+                        || line.contains(&format!("dependencies.{standard}]"))
+                })
+                .map_or(1, |at| at + 1),
+            what: format!("the package names a dependency `{standard}`, a name the reading takes for the standard library's"),
+        })
+        .collect()
 }
 
 /// Whether every root a trusted name starts at is what the reading took it for: the tool roots
@@ -869,10 +963,11 @@ fn crates_named(assumes: &BTreeSet<String>, package: &Package) -> bool {
 /// `use` that keeps the item's own name, and globs, each judged by who may name what it brings
 /// in. It gives up at a renaming `use`, at a name or glob the calling body brings in for itself, at
 /// a module with macro-made items, at a glob it cannot follow and at a visibility it cannot work
-/// out, and a call it gives up on keys nothing. So a key is never one the compiler would not make;
-/// a call the reading cannot follow leaves the helper's identifiers as references, which the result
-/// lists. A call whose first name the calling body may bind for itself never comes here: the
-/// reading of the body leaves it out.
+/// out, and a call it gives up on keys nothing: the helper's identifiers stay references, which the
+/// result lists. It answers only for a target that keeps to the conventions a helper key relies on
+/// (see `breaches`), which is what lets it read names as the compiler resolves them. A call whose
+/// first name the calling body may bind for itself never comes here: the reading of the body
+/// leaves it out.
 fn reaches(
     path: &[String],
     from: &[String],
@@ -1069,6 +1164,7 @@ fn rust_module(
                         helpers.push(Helper {
                             name,
                             file: module.file.clone(),
+                            line: item.line,
                             module: module.path.clone(),
                             mentions: found,
                             conditional: item.conditional || module.conditional,
@@ -1341,7 +1437,7 @@ pub fn walk(root: &Path, directory: &str, keep: &dyn Fn(&str) -> bool) -> Vec<St
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::crates_named;
+    use super::{crates_named, standard_dependencies};
     use crate::workspace::Package;
 
     fn package(registry: &[&str], dependencies: &[&str]) -> Package {
@@ -1372,5 +1468,25 @@ mod tests {
         // A crate the package does not take from crates.io under that name is not the one meant.
         let elsewhere = package(&[], &["tokio"]);
         assert!(!crates_named(&names(&["tokio::"]), &elsewhere));
+    }
+
+    #[test]
+    fn a_dependency_named_after_a_standard_crate_is_a_breach_at_its_line() {
+        let root = tempfile::tempdir().expect("a directory");
+        let manifest = root.path().join("Cargo.toml");
+        std::fs::write(
+            &manifest,
+            "[package]\nname = \"p\"\n\n[dependencies]\ntokio = \"1\"\ncore = { package = \"other\", path = \"other\" }\n",
+        )
+        .expect("writes");
+        let named = |names: &[&str]| Package {
+            manifest: manifest.clone(),
+            ..package(&[], names)
+        };
+        let found = standard_dependencies(root.path(), &named(&["tokio", "core"]));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!((found[0].file.as_str(), found[0].line), ("Cargo.toml", 6));
+        assert!(found[0].what.contains("`core`"), "{found:?}");
+        assert!(standard_dependencies(root.path(), &named(&["tokio"])).is_empty());
     }
 }

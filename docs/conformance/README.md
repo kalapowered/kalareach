@@ -115,43 +115,88 @@ row that does not exist.
 | A test function whose name spells an identifier in snake case: `kr_req_11_07_...`, `kr_acc_004_...` | That test. A name that spells no accepted form is only a name |
 | A module comment (`//!`) of test code | Every test in that module and the modules inside it |
 | In test code, a comment block with a blank line after it | Every test from there to the next such block, or the end of the module |
-| In test code, a comment on a function | Every test of the same target whose body calls that function, where the report proves from the target's own source that the compiler resolves the call to it (below) |
+| In test code, a comment on a function | Every test of the same target whose body calls that function, inside the boundary below and where the report proves from the target's own source that the compiler resolves the call to it |
 | A `covers` field of a `const` or `static` case table | Every test of the same package whose body names the table |
 
 Test code is a test or bench target, or a module compiled under `cfg(test)`. A comment on product
 code (a module's documentation, a function, a constant) is a reference: it is listed with the
 identifier and it is never a test.
 
-A call keys a function only where the report proves, from the target's own source, that the
-compiler resolves it to that function in every build. It follows module definitions, `crate`,
-`self` and `super`, a `use` that keeps the item's own name, and globs, each judged by who may name
-what it brings in. Where it cannot prove the call, the call keys nothing, and the function's
+#### Helper keys and their boundary
+
+A function of test code whose comment names identifiers is a helper: the tests that call it are
+keyed to them. The report reads those calls from the source, not from the compiler, so it keys a
+helper only inside a boundary that it checks. A target outside the boundary stops the report; it
+never earns a key.
+
+These conventions hold in every file of a target that has a helper, which is every file the target
+compiles:
+
+- A helper's name is written only as a function's name among a module's items, as a call
+  (`helper(...)` or `path::helper(...)`, with or without a turbofish), or as the last name of a
+  plain `use` among a module's items that the report follows to a function of that name. Anywhere
+  else is a problem: a binding or a parameter, a field, a method or a value, a rename with `as` to
+  or from the name, a type, trait, module, constant, static or macro of that name, a function of
+  that name inside a function, a block, an implementation, a trait or a macro, a path through the
+  name (`helper::...`), a `use` of it anywhere but among a module's items, or the name after `dyn`,
+  `impl` or `?`.
+- No helper is named like a keyword or like one of the traits a type writes like a call (`Fn`,
+  `FnMut`, `FnOnce`, `AsyncFn`, `AsyncFnMut`, `AsyncFnOnce`).
+- The names the report trusts keep their meaning: `std`, `core` and `alloc`; `serde`, `tokio`,
+  `rustfmt` and `clippy`; the standard library's macros the report reads through (`assert`,
+  `assert_eq`, `assert_ne`, `dbg`, `debug_assert`, `debug_assert_eq`, `debug_assert_ne`, `eprint`,
+  `eprintln`, `format`, `format_args`, `matches`, `panic`, `print`, `println`, `todo`,
+  `unimplemented`, `unreachable`, `vec`, `write`, `writeln`) or passes over (`cfg`, `column`,
+  `compile_error`, `concat`, `env`, `file`, `include_bytes`, `include_str`, `line`, `module_path`,
+  `option_env`, `stringify`); the attributes `test` and `derive`; the standard library's derives
+  (`Clone`, `Copy`, `Debug`, `Default`, `Eq`, `Hash`, `Ord`, `PartialEq`, `PartialOrd`) and serde's
+  (`Serialize`, `Deserialize`). No file declares one of them: no `mod`, `macro_rules!` or `macro`
+  of that name, no `as` that gives the name to something else, no type named `std`, `core`,
+  `alloc`, `serde`, `tokio`, `rustfmt` or `clippy`, and no `use` that brings in anything else by
+  it. A `use` of the standard library's own item (`use std::fmt::Debug`), of serde's derive from
+  `serde`, or of one of those crates by itself (`use tokio;`) is fine. The package names no
+  dependency `std`, `core` or `alloc`.
+- Everything outside comments, literals and lifetimes is ASCII, identifiers included: the compiler
+  compares identifiers once it has normalised them, and the report compares them as written.
+- The report reads every file the target compiles: no module file is declared anywhere but among a
+  module's items, such as inside a function, where the report does not follow it.
+- The target is of the 2018 edition or later.
+
+The report checks these on tokens and nothing else, so it errs towards a problem: text inside
+`stringify!` counts, as does a macro's definition. Each problem names the file and the line. A
+target with one keys no test through a helper, and the report stops before it runs anything.
+
+The report does not model build scripts, `include!`, procedural macros other than the trusted
+derives and `tokio::test`, the expansion of any macro, or `cfg`. None of them earns a key: the
+conventions cover what could let one through unseen, and the rules below decline the rest.
+
+Inside the boundary, a call keys a helper only where the report proves, from the target's own
+source, that the compiler resolves it to that helper in every build. It follows module definitions,
+`crate`, `self` and `super`, a `use` that keeps the item's own name, and globs, each judged by who
+may name what it brings in. Where it cannot prove the call, the call keys nothing, and the helper's
 identifiers stay references that the result lists with the reason. That happens when:
 
-- the calling body may bind the call's first name itself: the name shows in the body other than in
-  calls, methods and paths (a local of any kind, a closure's parameter, a nested item, a module the
-  body declares), or a `use` or glob in the body brings it in;
-- a macro or attribute may rewrite or re-scope the call. That is any macro in the test's body, any
-  attribute on the test or in its body, and any attribute on a module around it, except the
-  standard library's macros by their bare names, the built-in attributes, `#[test]`, the standard
-  library's and serde's derives with serde's helper attributes, the `rustfmt` and `clippy` tool
-  attributes and `tokio::test`. A `cfg` in the body counts as well, since it may compile the call
-  out;
-- one of those trusted names may mean something else in the target: the target defines it (a
-  `macro_rules!` anywhere in its files) or imports it; it brings in names its source does not list,
-  through `#[macro_use]`, `extern crate`, a macro among a module's items, an item under any other
-  attribute or derive, or a glob from outside the crate; a dependency takes a tool's name; or
-  `serde` or `tokio` is not the crates.io crate the package depends on under that name, as the
-  lockfile resolves it. `std`, `core` and `alloc` count as the standard library only where nothing
-  in the target or its dependencies takes those names;
-- the function is under a `cfg` of its own or of a module around it, or its module takes its name
+- the calling body may bind the call's first name itself: a local of any kind, a closure's
+  parameter, a nested item, a module the body declares, or a `use` or glob in the body;
+- a macro or attribute in or on the test may rewrite or re-scope the call: a macro in the body other
+  than the standard library's above by their bare names, a `cfg` in the body, which may compile the
+  call out, and an attribute on the test or in its body other than a built-in one, `#[test]`, a
+  derive of the trusted ones with serde's helper attribute, a `rustfmt` or `clippy` tool attribute
+  and `#[tokio::test]`. `tokio::test` is trusted only where the package takes `tokio` from
+  crates.io under that name, as its lockfile resolves it, and the tool attributes only where no
+  dependency takes the tool's name;
+- an attribute on the helper, on its module or on a module around it or around the test is other
+  than a built-in one: there, a tool's attribute counts as one that may rewrite what it is on;
+- the target brings in names its source does not list: an item under `#[macro_use]`, an
+  `extern crate`, a macro invoked among a module's items (`include!` among them), an item under an
+  attribute other than the trusted ones, or a glob from outside the crate and the standard library;
+- the helper is under a `cfg` of its own or of a module around it, other than exactly `cfg(test)`
+  and the crate root's own `cfg`, or its module takes its name twice, or its module is declared
   twice;
 - a module on the way takes a name the path follows twice or under a `cfg`, or takes the called
   name for something other than a function or a named `use`;
 - the call goes through a renaming `use`, a glob the report cannot follow or a visibility it cannot
-  work out, starts at the root (`::name`), comes after a qualifier (`<T>::name`), or is a keyword;
-- the name follows `dyn`, `impl` or `?`, or is a prelude trait written like a call
-  (`dyn Send + Fn()`): in a type, that is a trait, not a call.
+  work out, starts at the root (`::name`), or comes after a qualifier (`<T>::name`).
 
 The report reads each target's crate root as Cargo describes it and follows every `mod`
 declaration, `#[path]` included, so a test is named exactly as the test harness names it.

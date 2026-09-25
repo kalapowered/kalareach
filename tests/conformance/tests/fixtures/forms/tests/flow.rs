@@ -41,69 +41,6 @@ fn calls_the_shared_case() {
     assert_eq!(shared(), 3);
 }
 
-#[test]
-fn has_a_local_of_the_same_name() {
-    let shared = || 4;
-    assert_eq!(shared(), 4);
-}
-
-#[test]
-fn binds_the_same_name_in_a_pattern() {
-    let (shared,) = (|| 4,);
-    assert_eq!(shared(), 4);
-}
-
-#[test]
-fn binds_the_same_name_in_a_match_arm() {
-    if let Some(shared) = Some(|| 4) {
-        assert_eq!(shared(), 4);
-    }
-}
-
-#[test]
-fn takes_the_same_name_as_a_closure_parameter() {
-    let run = |shared: fn() -> u8| shared();
-    assert_eq!(run(|| 4), 4);
-}
-
-#[test]
-fn defines_a_function_of_the_same_name_in_its_body() {
-    fn shared() -> u8 {
-        4
-    }
-    assert_eq!(shared(), 4);
-}
-
-#[test]
-fn annotates_the_same_name_with_a_type_from_the_root() {
-    let shared: ::std::boxed::Box<dyn Fn() -> u8> = ::std::boxed::Box::new(|| 4);
-    assert_eq!(shared(), 4);
-}
-
-macro_rules! a_case_of_the_same_name {
-    () => {
-        fn shared() -> u8 {
-            4
-        }
-    };
-}
-
-#[test]
-fn has_a_macro_define_a_function_of_the_same_name() {
-    a_case_of_the_same_name!();
-    assert_eq!(shared(), 4);
-}
-
-#[test]
-fn calls_through_a_module_of_its_own_by_the_same_path() {
-    mod cases {
-        pub fn brought_up() -> u8 {
-            4
-        }
-    }
-    assert_eq!(cases::brought_up(), 4);
-}
-
 mod other {
     /// A case of this module's own, which names no row.
     fn shared() -> u8 {
@@ -137,21 +74,6 @@ mod imported {
     }
 }
 
-#[test]
-fn imports_a_case_of_the_same_name_inside_its_body() {
-    use elsewhere::shared;
-    assert_eq!(shared(), 7);
-}
-
-mod renamed {
-    use super::cases::other_case as brought_up;
-
-    #[test]
-    fn calls_another_case_by_a_keyed_cases_name() {
-        assert_eq!(brought_up(), 9);
-    }
-}
-
 mod plain {
     /// A case of this module's own, which names no row.
     pub fn brought_up() -> u8 {
@@ -182,17 +104,12 @@ mod sealed {
     pub use self::inner::*;
 }
 
-mod actual {
+mod facade {
     /// A case of this module's own, which names no row.
-    pub fn other() {}
+    pub fn check() {}
 
     /// Another, which names no row either.
-    pub fn another() {}
-}
-
-mod facade {
-    pub use crate::actual::another as probe;
-    pub use crate::actual::other as check;
+    pub fn probe() {}
 }
 
 #[allow(unused_imports)]
@@ -216,11 +133,6 @@ mod cases {
         /// KR-REQ-03.08: the same case, written in a child module.
         pub fn brought_up() -> u8 {
             6
-        }
-
-        /// A case of this module's own, which names no row.
-        pub fn other_case() -> u8 {
-            9
         }
     }
 
