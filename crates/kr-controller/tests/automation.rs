@@ -2764,24 +2764,32 @@ impl Drop for DaemonProcess {
 }
 
 /// Waits for a daemon process to answer on its control endpoint.
+///
+/// One deadline covers the whole wait, each connection and its hello included, so a daemon that
+/// takes the connection and never answers ends the wait at the deadline like one that is not there.
 #[cfg(unix)]
 async fn answering(
     endpoint: &kr_ipc::paths::Endpoint,
     temp: &kr_ipc::testing::TempHost,
 ) -> LocalClient {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    loop {
-        if let Ok(client) = LocalClient::connect(endpoint, LocalClientKind::Cli, build()).await {
-            return client;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+    let answered = tokio::time::timeout_at(deadline, async {
+        loop {
+            if let Ok(client) = LocalClient::connect(endpoint, LocalClientKind::Cli, build()).await
+            {
+                return client;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
+    })
+    .await;
+    answered.unwrap_or_else(|_| {
+        panic!(
             "the daemon did not answer within two minutes, and its log says: {}",
             std::fs::read_to_string(temp.root().join("daemon.log"))
                 .unwrap_or_else(|error| format!("<unreadable: {error}>"))
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+        )
+    })
 }
 
 /// Writes one live grant into the registry of a daemon running as a process, as a person sharing
@@ -3107,37 +3115,42 @@ async fn mutually_triggering_workflows_exhaust_one_budget_across_a_daemon_proces
     // A new process on the same state goes on with the same chain.
     let _second = DaemonProcess::start(&program, &temp);
     let mut control = answering(&endpoint, &temp).await;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    let read = loop {
-        let read: WorkflowReadResult = typed(
-            &control
-                .request(
-                    Method::WorkflowRead,
-                    &WorkflowReadParams {
-                        workflow_id: Nullable::null(),
-                        revision: Nullable::null(),
-                        run_id: Nullable::null(),
-                        causal_root_id: Nullable::some(root),
-                    },
-                )
-                .await
-                .expect("the call reaches the daemon")
-                .expect("workflow.read succeeds"),
-        );
-        if read
-            .remaining_causal_budget
-            .0
-            .as_ref()
-            .is_some_and(|budget| budget.exhausted)
-        {
-            break read;
+    // One deadline for the whole wait, each read included.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+    let mut last = None;
+    let exhausted = tokio::time::timeout_at(deadline, async {
+        loop {
+            let read: WorkflowReadResult = typed(
+                &control
+                    .request(
+                        Method::WorkflowRead,
+                        &WorkflowReadParams {
+                            workflow_id: Nullable::null(),
+                            revision: Nullable::null(),
+                            run_id: Nullable::null(),
+                            causal_root_id: Nullable::some(root),
+                        },
+                    )
+                    .await
+                    .expect("the call reaches the daemon")
+                    .expect("workflow.read succeeds"),
+            );
+            if read
+                .remaining_causal_budget
+                .0
+                .as_ref()
+                .is_some_and(|budget| budget.exhausted)
+            {
+                return read;
+            }
+            last = Some(read);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the chain exhausted its budget within two minutes of the restart: {read:?}"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    };
+    })
+    .await;
+    let read = exhausted.unwrap_or_else(|_| {
+        panic!("the chain exhausted its budget within two minutes of the restart: {last:?}")
+    });
 
     let budget = read.remaining_causal_budget.0.expect("the chain's budget");
     assert!(budget.paused, "{budget:?}");
@@ -3170,34 +3183,34 @@ async fn mutually_triggering_workflows_exhaust_one_budget_across_a_daemon_proces
         "the second process ran part of the chain"
     );
 
-    // One attention item for the exhausted chain.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    loop {
-        let inbox: kr_protocol::attention::AttentionReadResult = typed(
-            &control
-                .request(
-                    Method::AttentionRead,
-                    &kr_protocol::attention::AttentionReadParams {
-                        session_id: Nullable::null(),
-                        include_acknowledged: true,
-                        max_items: U64::new(50),
-                        after: Nullable::null(),
-                    },
-                )
-                .await
-                .expect("the call reaches the daemon")
-                .expect("attention.read succeeds"),
-        );
-        if !inbox.items.is_empty() {
-            assert_eq!(inbox.items.len(), 1, "{:?}", inbox.items);
-            break;
+    // One attention item for the exhausted chain, with one deadline for the whole wait.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    let raised = tokio::time::timeout_at(deadline, async {
+        loop {
+            let inbox: kr_protocol::attention::AttentionReadResult = typed(
+                &control
+                    .request(
+                        Method::AttentionRead,
+                        &kr_protocol::attention::AttentionReadParams {
+                            session_id: Nullable::null(),
+                            include_acknowledged: true,
+                            max_items: U64::new(50),
+                            after: Nullable::null(),
+                        },
+                    )
+                    .await
+                    .expect("the call reaches the daemon")
+                    .expect("attention.read succeeds"),
+            );
+            if !inbox.items.is_empty() {
+                return inbox.items;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the exhausted chain raised its attention item within a minute"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the exhausted chain raised its attention item within a minute"));
+    assert_eq!(raised.len(), 1, "{raised:?}");
 }
 
 /// Rule C for a workflow: a stored grant is anchored once in this boot and decided on both of its
