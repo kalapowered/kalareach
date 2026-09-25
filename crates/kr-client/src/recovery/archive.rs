@@ -33,6 +33,11 @@
 //! whose publication was never answered. [`SettingsArchive::unsettled`] lists them, so they can be
 //! shown and removed; nothing here removes them.
 //!
+//! Each change of the record holds a lock beside it from the read to the rename, so two changes,
+//! from one process or two, cannot each write over what the other added. The record is written
+//! within the bounds it is read back under: a change that would take it past them is refused, and
+//! no object leaves without its identity written down.
+//!
 //! # What leaves this device
 //!
 //! Ciphertext, the public descriptor and the records the owner and the writer sign. The settings
@@ -102,8 +107,8 @@ pub struct SettingsCollection {
     /// The recovery recipient's public key, which every generation's manifest key is wrapped for.
     pub recovery: StoredEnvelopeKey,
     /// The directory this device keeps its recovery state in, which has to exist already. One
-    /// archive's record of what its generations sent is kept there, named after the archive, and
-    /// one device makes an archive's generations from one place at a time.
+    /// archive's record of what its generations sent is kept there, named after the archive, with
+    /// the lock each change of it holds.
     pub records: PathBuf,
 }
 
@@ -443,13 +448,7 @@ impl SettingsArchive {
     }
 
     fn journal(&self) -> Journal {
-        Journal {
-            directory: self.collection.records.clone(),
-            path: self.collection.records.join(format!(
-                "settings-archive-{}.sent",
-                self.collection.archive_id
-            )),
-        }
+        Journal::of(&self.collection.records, self.collection.archive_id)
     }
 
     /// Uploads one object of a generation whole, in the parts its table cuts.
@@ -668,10 +667,14 @@ fn kept_here() -> ClientError {
     ))
 }
 
+/// The bounds the record of sent objects is written within and read back under.
+const RECORD_LIMITS: kr_cbor::Limits = kr_cbor::Limits::DEFAULT;
+
 /// The record of what one archive's generations sent, in the collection's records directory.
 struct Journal {
     directory: PathBuf,
     path: PathBuf,
+    lock: PathBuf,
 }
 
 /// What the record holds.
@@ -690,13 +693,46 @@ struct SentGeneration {
     objects: Vec<BackupObjectId>,
 }
 
+/// The lock one change of the record holds, released when it is dropped.
+struct Held(std::fs::File);
+
+impl Drop for Held {
+    /// Releases the lock itself rather than leaving it to the file's closing, which a descriptor
+    /// copied into a child process would delay.
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 impl Journal {
+    fn of(records: &std::path::Path, archive_id: ArchiveId) -> Self {
+        Self {
+            directory: records.to_path_buf(),
+            path: records.join(format!("settings-archive-{archive_id}.sent")),
+            lock: records.join(format!("settings-archive-{archive_id}.sent-lock")),
+        }
+    }
+
+    /// Takes the lock one change of the record holds, waiting for another change to finish.
+    fn hold(&self) -> Result<Held> {
+        let storage = |source| RecoveryError::Storage {
+            path: Shown::root(&self.lock),
+            fault: IoFault::from(source),
+        };
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&self.lock)
+            .map_err(storage)?;
+        file.lock().map_err(storage)?;
+        Ok(Held(file))
+    }
+
     fn read(&self) -> Result<Sent> {
         match std::fs::read(&self.path) {
-            Ok(bytes) => Ok(kr_cbor::from_canonical_slice(
-                &bytes,
-                &kr_cbor::Limits::DEFAULT,
-            )?),
+            Ok(bytes) => Ok(kr_cbor::from_canonical_slice(&bytes, &RECORD_LIMITS)?),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Sent::default()),
             Err(source) => Err(RecoveryError::Storage {
                 path: Shown::root(&self.path),
@@ -706,9 +742,12 @@ impl Journal {
     }
 
     /// Writes the record whole, through a partial file renamed into place and flushed, so a stop
-    /// at any point leaves the old record or the new one.
+    /// at any point leaves the old record or the new one. The caller holds the lock.
+    ///
+    /// A record past the bounds it is read back under is refused here, before anything is
+    /// replaced, so the record on the disk stays one this build reads.
     fn write(&self, sent: &Sent) -> Result<()> {
-        let bytes = kr_cbor::to_canonical_vec(sent)?;
+        let bytes = kr_cbor::to_canonical_vec_within(sent, &RECORD_LIMITS)?;
         let partial = self.path.with_extension("sent-partial");
         let written = (|| {
             let mut file = std::fs::File::create(&partial)?;
@@ -728,6 +767,7 @@ impl Journal {
 
     /// Writes down that one object of a generation is about to leave, before it does.
     fn note_leaving(&self, generation: BackupGeneration, object_id: BackupObjectId) -> Result<()> {
+        let _held = self.hold()?;
         let mut sent = self.read()?;
         match sent
             .generations
@@ -746,6 +786,7 @@ impl Journal {
 
     /// Strikes one generation off. Returns whether it was listed.
     fn settle(&self, generation: BackupGeneration) -> Result<bool> {
+        let _held = self.hold()?;
         let mut sent = self.read()?;
         let before = sent.generations.len();
         sent.generations
@@ -812,4 +853,95 @@ fn contrary(what: &str) -> ClientError {
         ErrorCode::OutcomeUnknown,
         format!("the service answered {what}"),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kr_protocol::scalars::Uuid;
+
+    fn object(seed: u16, index: u16) -> BackupObjectId {
+        let mut bytes = [0_u8; 16];
+        bytes[..2].copy_from_slice(&seed.to_be_bytes());
+        bytes[2..4].copy_from_slice(&index.to_be_bytes());
+        BackupObjectId::new(Uuid::from_bytes(bytes))
+    }
+
+    fn archive() -> ArchiveId {
+        ArchiveId::new(Uuid::from_bytes([0x5e; 16]))
+    }
+
+    /// Changes made at once, from separate holders of the record, all land: none writes over what
+    /// another added.
+    #[test]
+    fn changes_made_at_once_keep_every_generation() {
+        let records = tempfile::tempdir().expect("a directory on the internal disk");
+        let writers: Vec<_> = (0..4_u16)
+            .map(|writer| {
+                let records = records.path().to_path_buf();
+                std::thread::spawn(move || {
+                    let journal = Journal::of(&records, archive());
+                    for generation in 0..8_u16 {
+                        let number = u64::from(writer * 100 + generation + 1);
+                        journal
+                            .note_leaving(BackupGeneration::new(number), object(writer, generation))
+                            .expect("the record takes the object");
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().expect("a writer");
+        }
+        let sent = Journal::of(records.path(), archive())
+            .read()
+            .expect("the record");
+        assert_eq!(sent.generations.len(), 32, "every generation stays listed");
+        for generation in &sent.generations {
+            assert_eq!(generation.objects.len(), 1);
+        }
+    }
+
+    /// A record at its bound takes no further generation, and stays one this build reads; the
+    /// generations it lists can still take objects and be struck off.
+    #[test]
+    fn a_record_at_its_bound_refuses_another_generation_and_stays_readable() {
+        let records = tempfile::tempdir().expect("a directory on the internal disk");
+        let journal = Journal::of(records.path(), archive());
+        let full = Sent {
+            generations: (1..=4_096_u16)
+                .map(|generation| SentGeneration {
+                    backup_generation: BackupGeneration::new(u64::from(generation)),
+                    objects: vec![object(generation, 0)],
+                })
+                .collect(),
+        };
+        {
+            let _held = journal.hold().expect("the lock");
+            journal.write(&full).expect("a record at its bound");
+        }
+
+        let refused = journal.note_leaving(BackupGeneration::new(4_097), object(4_097, 0));
+        assert!(
+            matches!(refused, Err(RecoveryError::Cbor(_))),
+            "{refused:?}"
+        );
+        assert_eq!(
+            journal.read().expect("still readable").generations.len(),
+            4_096
+        );
+
+        journal
+            .note_leaving(BackupGeneration::new(1), object(1, 1))
+            .expect("a listed generation takes another object");
+        assert!(
+            journal
+                .settle(BackupGeneration::new(1))
+                .expect("struck off")
+        );
+        journal
+            .note_leaving(BackupGeneration::new(4_097), object(4_097, 0))
+            .expect("room for one more");
+        assert_eq!(journal.read().expect("readable").generations.len(), 4_096);
+    }
 }
