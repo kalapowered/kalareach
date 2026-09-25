@@ -1,16 +1,16 @@
 //! Writes the generated JSON Schema, the method table and the cross-language vectors.
 //!
-//! Two output roots, because the two are consumed differently: the schema and the method table
-//! feed the TypeScript build, and the vectors are conformance material both languages read. The
-//! check also reads the documentation root, and fails when a method in the table is named in no
-//! document there.
+//! Three output roots, because the three are consumed differently: the schema and the method table
+//! feed the TypeScript build, the vectors are conformance material both languages read, and the
+//! method index is documentation. The check also fails when a method in the table is named in no
+//! document, or when an index link no longer lands on its section.
 //!
 //! ```text
 //! kr-protocol-gen                   write the files
 //! kr-protocol-gen --check           fail when the committed files differ or a method is undocumented
 //! kr-protocol-gen --out-dir P       write the schema to P instead of packages/protocol/schema
 //! kr-protocol-gen --fixtures-dir P  write the vectors to P instead of fixtures
-//! kr-protocol-gen --docs-dir P      read the documentation from P instead of docs
+//! kr-protocol-gen --docs-dir P      write the index to, and read the documentation from, P
 //! ```
 
 mod method_index;
@@ -102,6 +102,10 @@ fn main() -> ExitCode {
                 .into_iter()
                 .map(|(relative, contents)| (fixtures_dir.join(relative), contents)),
         )
+        .chain(std::iter::once((
+            docs_dir.join(method_index::INDEX_PATH),
+            method_index::render(),
+        )))
         .collect();
 
     if check {
@@ -153,7 +157,17 @@ fn run_check(files: &[(PathBuf, String)], docs_dir: &Path) -> ExitCode {
             eprintln!("  {name}");
         }
     }
-    if differences > 0 || !undocumented.is_empty() {
+    let broken = method_index::broken_links(docs_dir);
+    if !broken.is_empty() {
+        eprintln!(
+            "{} method index links do not land on their section:",
+            broken.len()
+        );
+        for description in &broken {
+            eprintln!("  {description}");
+        }
+    }
+    if differences > 0 || !undocumented.is_empty() || !broken.is_empty() {
         return ExitCode::FAILURE;
     }
     println!("generated files are up to date and every method is documented");
