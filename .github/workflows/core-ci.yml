@@ -393,6 +393,137 @@ jobs:
           & "$env:ProgramFiles\Git\usr\bin\sh.exe" -c 'echo the POSIX shell the test scripts use is here'
           whoami /priv
 
+      # Temporary: the job this runner's steps run in and whether a start may break away from it,
+      # and what a directory narrowed to reading answers an open that asks to add a file.
+      - name: Diagnose the job and a narrowed directory
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Add-Type -TypeDefinition @'
+          using System;
+          using System.Runtime.InteropServices;
+          using Microsoft.Win32.SafeHandles;
+          public static class KrDiag {
+            [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+            public static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr sa, uint disposition, uint flags, IntPtr template);
+            [DllImport("kernel32.dll", SetLastError=true)]
+            public static extern bool FlushFileBuffers(SafeFileHandle handle);
+            [DllImport("kernel32.dll", SetLastError=true)]
+            public static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool result);
+            [DllImport("kernel32.dll")]
+            public static extern IntPtr GetCurrentProcess();
+            [StructLayout(LayoutKind.Sequential)]
+            public struct BASIC { public long a; public long b; public uint LimitFlags; public UIntPtr c; public UIntPtr d; public uint e; public UIntPtr f; public uint g; public uint h; }
+            [StructLayout(LayoutKind.Sequential)]
+            public struct IOC { public ulong a, b, c, d, e, f; }
+            [StructLayout(LayoutKind.Sequential)]
+            public struct EXT { public BASIC Basic; public IOC Io; public UIntPtr p1, p2, p3, p4; }
+            [DllImport("kernel32.dll", SetLastError=true)]
+            public static extern bool QueryInformationJobObject(IntPtr job, int cls, ref EXT info, uint size, out uint ret);
+            [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+            public struct SI { public uint cb; public string r, d, t; public uint x, y, xs, ys, xc, yc, fill, flags; public ushort show, r2; public IntPtr r3, i, o, e; }
+            [StructLayout(LayoutKind.Sequential)]
+            public struct PI { public IntPtr p, t; public uint pid, tid; }
+            [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+            public static extern bool CreateProcessW(string app, System.Text.StringBuilder cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string cwd, ref SI si, out PI pi);
+            [DllImport("kernel32.dll")]
+            public static extern bool CloseHandle(IntPtr h);
+            public static string Job() {
+              bool inJob;
+              if (!IsProcessInJob(GetCurrentProcess(), IntPtr.Zero, out inJob)) return "IsProcessInJob failed " + Marshal.GetLastWin32Error();
+              if (!inJob) return "in no job";
+              EXT info = new EXT(); uint ret;
+              if (!QueryInformationJobObject(IntPtr.Zero, 9, ref info, (uint)Marshal.SizeOf(typeof(EXT)), out ret)) return "in a job; its limits could not be read: " + Marshal.GetLastWin32Error();
+              uint f = info.Basic.LimitFlags;
+              return String.Format("in a job; limit flags 0x{0:x}: breakaway_ok={1} silent_breakaway_ok={2} kill_on_job_close={3}", f, (f & 0x800) != 0, (f & 0x1000) != 0, (f & 0x2000) != 0);
+            }
+            public static string Breakaway() {
+              SI si = new SI(); si.cb = (uint)Marshal.SizeOf(typeof(SI)); PI pi;
+              var cmd = new System.Text.StringBuilder("cmd.exe /d /c exit 0");
+              uint flags = 0x01000000 | 0x00000200 | 0x00000008;
+              if (!CreateProcessW(null, cmd, IntPtr.Zero, IntPtr.Zero, false, flags, IntPtr.Zero, null, ref si, out pi)) return "a start that breaks away is refused: error " + Marshal.GetLastWin32Error();
+              CloseHandle(pi.p); CloseHandle(pi.t);
+              return "a start that breaks away succeeds";
+            }
+            public static string Open(string path, uint access, uint share) {
+              using (var h = CreateFileW(path, access, share, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero)) {
+                if (h.IsInvalid) return "open refused: error " + Marshal.GetLastWin32Error();
+                if (!FlushFileBuffers(h)) return "opened; flush refused: error " + Marshal.GetLastWin32Error();
+                return "opened and flushed";
+              }
+            }
+            [DllImport("kernel32.dll", SetLastError=true)]
+            public static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+            public static string InJob(int pid) {
+              IntPtr p = OpenProcess(0x1000, false, pid);
+              if (p == IntPtr.Zero) return "cannot be asked: error " + Marshal.GetLastWin32Error();
+              bool inJob; bool asked = IsProcessInJob(p, IntPtr.Zero, out inJob); CloseHandle(p);
+              if (!asked) return "cannot be asked: error " + Marshal.GetLastWin32Error();
+              return inJob ? "in a job" : "in no job";
+            }
+            public static SafeFileHandle Hold(string path, uint access, uint share) {
+              return CreateFileW(path, access, share, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);
+            }
+          }
+          '@
+          function Sddl($path) { (Get-Acl -LiteralPath $path).Sddl }
+          '== context: ' + [KrDiag]::Job()
+          '== context start: ' + [KrDiag]::Breakaway()
+          '== account: ' + (whoami /user /fo csv /nh)
+          '== logged on:'
+          quser 2>&1
+          foreach ($name in 'explorer', 'sshd', 'sshd-session', 'taskhostw', 'svchost', 'pwsh', 'cargo') {
+            foreach ($p in @(Get-Process -Name $name -ErrorAction SilentlyContinue | Select-Object -First 3)) {
+              "== process $name $($p.Id) session $($p.SessionId): " + [KrDiag]::InJob($p.Id)
+            }
+          }
+          $me = Get-CimInstance Win32_Process -Filter "ProcessId = $PID"
+          $chain = @()
+          $cursor = $me
+          while ($cursor -and $chain.Count -lt 8) {
+            $chain += "$($cursor.Name)($($cursor.ProcessId)): " + [KrDiag]::InJob([int]$cursor.ProcessId)
+            $cursor = Get-CimInstance Win32_Process -Filter "ProcessId = $($cursor.ParentProcessId)"
+          }
+          '== this process and its parents: ' + ($chain -join ' <- ')
+          '== temp: ' + $env:TEMP
+          '== temp list: ' + (Sddl $env:TEMP)
+          $root = Join-Path $env:TEMP ('kr-t-win2-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+          New-Item -ItemType Directory -Path $root | Out-Null
+          '== root list: ' + (Sddl $root)
+          $sid = ((whoami /user /fo csv /nh) -split ',')[-1].Trim('"')
+
+          # The narrowing the removed store test made, under a parent that inherits normally.
+          $fixed = Join-Path $root 'fixed'
+          New-Item -ItemType Directory -Path (Join-Path $fixed 'inner') | Out-Null
+          icacls (Join-Path $fixed 'inner') /inheritance:d | Out-Null
+          icacls $fixed /inheritance:r /grant:r "*${sid}:(RX)" | Out-Null
+          '== ordinary parent, narrowed list: ' + (Sddl $fixed)
+          '== ordinary parent, FILE_ADD_FILE: ' + [KrDiag]::Open($fixed, 0x2, 7)
+          '== ordinary parent, FILE_ADD_SUBDIRECTORY: ' + [KrDiag]::Open($fixed, 0x4, 7)
+
+          '== privileges:'
+          whoami /priv /fo csv /nh
+          '== groups:'
+          whoami /groups /fo csv /nh
+
+          # Which operations a handle on a directory that shares no writing stops.
+          $held = Join-Path $root 'held'
+          New-Item -ItemType Directory -Path $held | Out-Null
+          [IO.File]::WriteAllText((Join-Path $held 'before'), 'x')
+          $handle = [KrDiag]::Hold($held, 0x1, 5)
+          '== held with list-directory access, sharing reading and deletion: invalid=' + $handle.IsInvalid
+          try { [IO.File]::WriteAllText((Join-Path $held 'created'), 'x'); '== create a file: done' } catch { '== create a file: ' + $_.Exception.Message }
+          try { [IO.File]::Move((Join-Path $held 'created'), (Join-Path $held 'renamed')); '== rename within it: done' } catch { '== rename within it: ' + $_.Exception.Message }
+          try { [IO.File]::Move((Join-Path $held 'renamed'), (Join-Path $held 'before'), $true); '== rename over a file in it: done' } catch { '== rename over a file in it: ' + $_.Exception.Message }
+          try { [IO.File]::Delete((Join-Path $held 'before')); '== delete in it: done' } catch { '== delete in it: ' + $_.Exception.Message }
+          '== flush with FILE_ADD_FILE while held: ' + [KrDiag]::Open($held, 0x2, 7)
+          '== flush with FILE_ADD_SUBDIRECTORY while held: ' + [KrDiag]::Open($held, 0x4, 7)
+          $handle.Dispose()
+          '== flush with FILE_ADD_FILE once let go: ' + [KrDiag]::Open($held, 0x2, 7)
+
+          icacls $fixed /grant "*${sid}:(OI)(CI)F" | Out-Null
+          Remove-Item -LiteralPath $root -Recurse -Force
+          '== removed: ' + (-not (Test-Path -LiteralPath $root))
+
       # Everything the workspace compiles for this target, including the test targets: a test that
       # only builds on Unix is a Windows failure, and this is where it is caught.
       - name: Compile the workspace and its tests
