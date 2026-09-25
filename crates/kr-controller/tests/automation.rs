@@ -1015,34 +1015,45 @@ async fn a_grant_the_host_policy_refuses_installs_no_workflow() {
     host.clients.abort();
 }
 
-/// Reads the runs of one workflow until one appears or ten seconds have passed.
+/// Reads the runs of one workflow until one appears, and fails when none has within ten seconds.
+///
+/// One deadline covers the whole wait, each read included, so a daemon that takes a request and
+/// never answers ends the wait at the deadline too.
 async fn first_run_of(
     control: &mut LocalClient,
     document: &WorkflowDefinition,
-) -> Option<kr_protocol::automation::WorkflowRunSummary> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while std::time::Instant::now() < deadline {
-        let read: WorkflowReadResult = typed(
-            &control
-                .request(
-                    Method::WorkflowRead,
-                    &WorkflowReadParams {
-                        workflow_id: Nullable::some(document.workflow_id),
-                        revision: Nullable::some(document.revision),
-                        run_id: Nullable::null(),
-                        causal_root_id: Nullable::null(),
-                    },
-                )
-                .await
-                .expect("the call reaches the daemon")
-                .expect("workflow.read succeeds"),
-        );
-        if let Some(run) = read.runs.into_iter().next() {
-            return Some(run);
+) -> kr_protocol::automation::WorkflowRunSummary {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let appeared = tokio::time::timeout_at(deadline, async {
+        loop {
+            let read: WorkflowReadResult = typed(
+                &control
+                    .request(
+                        Method::WorkflowRead,
+                        &WorkflowReadParams {
+                            workflow_id: Nullable::some(document.workflow_id),
+                            revision: Nullable::some(document.revision),
+                            run_id: Nullable::null(),
+                            causal_root_id: Nullable::null(),
+                        },
+                    )
+                    .await
+                    .expect("the call reaches the daemon")
+                    .expect("workflow.read succeeds"),
+            );
+            if let Some(run) = read.runs.into_iter().next() {
+                return run;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    None
+    })
+    .await;
+    appeared.unwrap_or_else(|_| {
+        panic!(
+            "the daemon started no run of workflow {} within ten seconds",
+            document.workflow_id
+        )
+    })
 }
 
 /// KR-REQ-25.15: a workflow triggered by another's node descends from that node, and the daemon,
@@ -1095,9 +1106,7 @@ async fn a_triggered_workflow_descends_from_the_node_that_triggered_it() {
         "{captured:?}"
     );
 
-    let descendant = first_run_of(&mut control, &tests)
-        .await
-        .expect("the daemon started the triggered workflow");
+    let descendant = first_run_of(&mut control, &tests).await;
     assert_eq!(descendant.causal_root_id, captured.causal_root_id);
     assert_eq!(descendant.depth.get(), 2);
     assert_eq!(descendant.parent_run_id.0, Some(captured.run_id));
