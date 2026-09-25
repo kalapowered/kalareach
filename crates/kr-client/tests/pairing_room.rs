@@ -472,6 +472,111 @@ async fn a_proxy_that_cannot_be_reached_is_not_gone_around() {
     room_heard_nothing(&room).await;
 }
 
+/// A proxy reached at an `https` address is verified like a room: the tunnel is a TLS connection
+/// to the proxy, with the room's own TLS inside it, and the socket opens through both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_opens_its_room_through_a_proxy_it_reaches_over_tls() {
+    let authority = Authority::new("rendezvous test authority");
+    let room = LoopbackRoom::start(&authority).await;
+    let proxy = ConnectProxy::tunnelling_over_tls(authority.acceptor_for("127.0.0.1")).await;
+    assert!(proxy.url.starts_with("https://"), "{}", proxy.url);
+    let connector = authority.trusted_by().through(Some(
+        proxy.url.parse::<ProxyUrl>().expect("a proxy address"),
+    ));
+    let token = token();
+    let (_socket, path, presented, _end) =
+        open_while(&connector, &room, RoomRole::Host(&token)).await;
+    assert_eq!(path, "/api/pair/room/abcd/host");
+    assert!(presented.is_some(), "the host presented its token");
+    assert_eq!(
+        proxy.asked(),
+        vec![format!("CONNECT 127.0.0.1:{} HTTP/1.1", port_of(&room))]
+    );
+}
+
+/// A proxy whose certificate the connector does not trust is refused before it is asked anything,
+/// and the room hears nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_proxy_whose_certificate_is_not_trusted_is_refused() {
+    let authority = Authority::new("rendezvous test authority");
+    let room = LoopbackRoom::start(&authority).await;
+    let stranger = Authority::new("an authority nobody trusts");
+    let proxy = ConnectProxy::tunnelling_over_tls(stranger.acceptor_for("127.0.0.1")).await;
+    let connector = authority.trusted_by().through(Some(
+        proxy.url.parse::<ProxyUrl>().expect("a proxy address"),
+    ));
+    let opened = tokio::time::timeout(
+        WATCHDOG,
+        connector.open(&room.origin, &locator(), RoomRole::Candidate),
+    )
+    .await
+    .expect("the attempt ends");
+    assert!(
+        matches!(
+            &opened,
+            Err(RoomError::Unreachable { reason, .. })
+                if reason.contains("TLS handshake with the proxy")
+        ),
+        "{opened:?}"
+    );
+    assert!(proxy.asked().is_empty(), "the proxy was asked nothing");
+    room_heard_nothing(&room).await;
+}
+
+/// A room at an IPv6 address is asked for as `[address]:port`, the form a `CONNECT` names one in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tunnel_to_an_ipv6_room_names_it_in_brackets() {
+    let Ok(listener) = TcpListener::bind("[::1]:0").await else {
+        eprintln!("this machine has no IPv6 loopback, so there is no IPv6 room to reach");
+        return;
+    };
+    let authority = Authority::new("rendezvous test authority");
+    let port = listener.local_addr().expect("an address").port();
+    let room = LoopbackRoom {
+        origin: RendezvousOrigin::new(format!("https://[::1]:{port}")).expect("an origin"),
+        listener,
+        acceptor: authority.acceptor_for("::1"),
+    };
+    let proxy = ConnectProxy::tunnelling().await;
+    let connector = authority.trusted_by().through(Some(
+        proxy.url.parse::<ProxyUrl>().expect("a proxy address"),
+    ));
+    let (_socket, path, _presented, _end) =
+        open_while(&connector, &room, RoomRole::Candidate).await;
+    assert_eq!(path, "/api/pair/room/abcd/candidate");
+    assert_eq!(
+        proxy.asked(),
+        vec![format!("CONNECT [::1]:{port} HTTP/1.1")]
+    );
+}
+
+/// A proxy whose answer to the tunnel request does not end is read only as far as
+/// `MAX_TUNNEL_ANSWER_BYTES`, and the attempt ends there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tunnel_answer_that_does_not_end_is_refused_at_its_bound() {
+    let authority = Authority::new("rendezvous test authority");
+    let room = LoopbackRoom::start(&authority).await;
+    let proxy = ConnectProxy::answering_without_end().await;
+    let connector = authority.trusted_by().through(Some(
+        proxy.url.parse::<ProxyUrl>().expect("a proxy address"),
+    ));
+    let opened = tokio::time::timeout(
+        WATCHDOG,
+        connector.open(&room.origin, &locator(), RoomRole::Candidate),
+    )
+    .await
+    .expect("the attempt ends");
+    assert!(
+        matches!(
+            &opened,
+            Err(RoomError::Unreachable { reason, .. })
+                if reason.contains("longer than an answer may be")
+        ),
+        "{opened:?}"
+    );
+    room_heard_nothing(&room).await;
+}
+
 /// An upgrade answered with any other status is refused with that status, whatever the body:
 /// a route the origin does not have, a plain page, a refusal and a failure in front of the
 /// service. What the status means for a person is the caller's to decide.

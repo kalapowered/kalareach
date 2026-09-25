@@ -1,9 +1,11 @@
 //! An HTTP proxy on loopback that records what it is asked.
 //!
-//! It opens a `CONNECT` tunnel to whatever it is asked for, or refuses every request with one
-//! status, and it keeps each request's first line. For a plain `http` destination a client sends
-//! the whole request to the proxy instead of a `CONNECT`; the proxy records that line too and
-//! answers it with its status, or with 502 when it tunnels, because it forwards nothing but tunnels.
+//! It opens a `CONNECT` tunnel to whatever it is asked for, refuses every request with one status,
+//! or answers with a head that never ends, and it keeps each request's first line. It listens in
+//! the clear, or behind TLS when a test gives it an acceptor, which makes its address an `https`
+//! one. For a plain `http` destination a client sends the whole request to the proxy instead of a
+//! `CONNECT`; the proxy records that line too and answers it with its status, or with 502 when it
+//! tunnels, because it forwards nothing but tunnels.
 //!
 //! Suites in other crates include this module by its path rather than keep a copy of their own.
 
@@ -15,9 +17,10 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
+use tokio_rustls::TlsAcceptor;
 
 /// How the proxy answers.
 #[derive(Clone, Copy, Debug)]
@@ -26,6 +29,8 @@ enum Answer {
     Tunnel,
     /// Refuses every request with this status.
     Refuse(u16),
+    /// Answers with a status line and then header lines, without end.
+    Endless,
 }
 
 /// The proxy, and what it has been asked so far.
@@ -39,28 +44,50 @@ pub struct ConnectProxy {
 impl ConnectProxy {
     /// A proxy that opens every tunnel it is asked for.
     pub async fn tunnelling() -> Self {
-        Self::start(Answer::Tunnel).await
+        Self::start(Answer::Tunnel, None).await
+    }
+
+    /// A proxy that opens every tunnel it is asked for, reached over TLS with `acceptor`.
+    pub async fn tunnelling_over_tls(acceptor: TlsAcceptor) -> Self {
+        Self::start(Answer::Tunnel, Some(acceptor)).await
     }
 
     /// A proxy that refuses every request with `status`.
     pub async fn refusing(status: u16) -> Self {
-        Self::start(Answer::Refuse(status)).await
+        Self::start(Answer::Refuse(status), None).await
     }
 
-    async fn start(answer: Answer) -> Self {
+    /// A proxy whose answer to every request is a head that never ends.
+    pub async fn answering_without_end() -> Self {
+        Self::start(Answer::Endless, None).await
+    }
+
+    async fn start(answer: Answer, tls: Option<TlsAcceptor>) -> Self {
         let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
             .await
             .expect("a loopback port");
         let port = listener.local_addr().expect("an address").port();
+        let scheme = if tls.is_some() { "https" } else { "http" };
         let asked = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&asked);
         let serving = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                tokio::spawn(serve(stream, answer, Arc::clone(&recorded)));
+                let recorded = Arc::clone(&recorded);
+                let tls = tls.clone();
+                tokio::spawn(async move {
+                    match tls {
+                        Some(acceptor) => {
+                            if let Ok(stream) = acceptor.accept(stream).await {
+                                serve(stream, answer, recorded).await;
+                            }
+                        }
+                        None => serve(stream, answer, recorded).await,
+                    }
+                });
             }
         });
         Self {
-            url: format!("http://127.0.0.1:{port}"),
+            url: format!("{scheme}://127.0.0.1:{port}"),
             asked,
             serving,
         }
@@ -82,7 +109,10 @@ impl Drop for ConnectProxy {
 }
 
 /// Reads one request's head, records its first line, and answers it.
-async fn serve(mut client: TcpStream, answer: Answer, asked: Arc<Mutex<Vec<String>>>) {
+async fn serve<S>(mut client: S, answer: Answer, asked: Arc<Mutex<Vec<String>>>)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut head = Vec::new();
     while !head.ends_with(b"\r\n\r\n") {
         match client.read_u8().await {
@@ -127,6 +157,21 @@ async fn serve(mut client: TcpStream, answer: Answer, asked: Arc<Mutex<Vec<Strin
                     format!("HTTP/1.1 {status} Refused\r\ncontent-length: 0\r\n\r\n").as_bytes(),
                 )
                 .await;
+        }
+        (Answer::Endless, _) => {
+            if client
+                .write_all(b"HTTP/1.1 200 Connection established\r\n")
+                .await
+                .is_err()
+            {
+                return;
+            }
+            // Until the client stops reading, which ends this write.
+            while client
+                .write_all(b"x-filler: 0123456789abcdef\r\n")
+                .await
+                .is_ok()
+            {}
         }
     }
 }
