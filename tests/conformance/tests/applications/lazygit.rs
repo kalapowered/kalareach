@@ -58,8 +58,8 @@ fn launch(repository: &Path, configuration: &Path) -> Launch {
         .after("printf 'kr-after-lazygit\\n'; read -r _")
 }
 
-fn no_query_reached_the_terminal(session: &Session) {
-    let reached = queries::find(&session.received());
+async fn no_query_reached_the_terminal(session: &Session) {
+    let reached = queries::find(&session.received().await);
     assert!(
         reached.is_empty(),
         "a query reached the attached terminal: {}",
@@ -99,7 +99,7 @@ async fn lazygit_draws_its_panels_on_the_alternate_screen_and_leaves_it() {
         !screen.shows("kr-first"),
         "lazygit's screen stayed on the primary screen:\n{screen}"
     );
-    no_query_reached_the_terminal(&session);
+    no_query_reached_the_terminal(&session).await;
 }
 
 /// KR-ACC-004, KR-REQ-27.04: lazygit turns mouse reporting on, and a click on the commit in its
@@ -137,5 +137,5 @@ async fn a_click_on_a_commit_shows_it() {
         })
         .await;
     assert!(screen.shows("conformance@example.invalid"), "{screen}");
-    no_query_reached_the_terminal(&session);
+    no_query_reached_the_terminal(&session).await;
 }

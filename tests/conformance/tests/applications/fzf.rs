@@ -28,8 +28,8 @@ async fn chosen(session: &Session, path: &Path) -> String {
     std::fs::read_to_string(path).expect("fzf's choice")
 }
 
-fn no_query_reached_the_terminal(session: &Session) {
-    let reached = queries::find(&session.received());
+async fn no_query_reached_the_terminal(session: &Session) {
+    let reached = queries::find(&session.received().await);
     assert!(
         reached.is_empty(),
         "a query reached the attached terminal: {}",
@@ -68,7 +68,7 @@ async fn a_typed_query_narrows_the_list_and_chooses_the_item_left() {
         !screen.shows("中文テキスト"),
         "fzf's list stayed on the primary screen:\n{screen}"
     );
-    no_query_reached_the_terminal(&session);
+    no_query_reached_the_terminal(&session).await;
 }
 
 /// KR-ACC-004, KR-REQ-27.04: fzf turns bracketed paste on, and a pasted CJK query narrows the list
@@ -93,7 +93,7 @@ async fn a_pasted_cjk_query_chooses_the_cjk_item() {
         .await;
     session.type_bytes(b"\r");
     assert_eq!(chosen(&session, &path).await, "中文テキスト\n");
-    no_query_reached_the_terminal(&session);
+    no_query_reached_the_terminal(&session).await;
 }
 
 /// KR-ACC-004, KR-REQ-27.04: fzf turns mouse reporting on, and a click on an item moves its
@@ -125,5 +125,5 @@ async fn a_click_on_an_item_makes_it_the_choice() {
     // it prints is what says where the click put it.
     session.type_bytes(b"\r");
     assert_eq!(chosen(&session, &path).await, "gamma\n");
-    no_query_reached_the_terminal(&session);
+    no_query_reached_the_terminal(&session).await;
 }

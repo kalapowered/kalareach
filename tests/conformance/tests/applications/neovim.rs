@@ -39,13 +39,13 @@ fn ruler(screen: &Screen) -> Option<(u64, u64)> {
 
 /// Shows that the program asked its terminal questions and that none of them reached the typing
 /// terminal.
-fn no_query_reached_the_terminal(session: &Session) {
+async fn no_query_reached_the_terminal(session: &Session) {
     let asked = queries::find(&session.written());
     assert!(
         !asked.is_empty(),
         "Neovim asked its terminal nothing, so this case shows nothing about queries"
     );
-    let reached = queries::find(&session.received());
+    let reached = queries::find(&session.received().await);
     assert!(
         reached.is_empty(),
         "the queries Neovim asked reached the attached terminal: {}",
@@ -96,7 +96,7 @@ async fn the_alternate_screen_holds_the_file_and_leaves_the_shells_screen_as_it_
         !screen.shows("plain ascii line"),
         "the file stayed on the primary screen:\n{screen}"
     );
-    no_query_reached_the_terminal(&session);
+    no_query_reached_the_terminal(&session).await;
 }
 
 /// Lines of text in a script, each followed by an ASCII marker whose column says how wide
@@ -216,7 +216,7 @@ async fn a_pasted_line_of_every_script_lands_where_neovim_puts_it() {
         }
     }
     assert!(disagreements.is_empty(), "{}", disagreements.join("\n"));
-    no_query_reached_the_terminal(&session);
+    no_query_reached_the_terminal(&session).await;
 }
 
 /// KR-ACC-004, KR-REQ-27.04: an emoji sequence Neovim clusters is a known difference between
@@ -281,7 +281,7 @@ async fn an_emoji_sequence_neovim_clusters_is_drawn_per_codepoint_as_the_profile
             ),
         );
     }
-    no_query_reached_the_terminal(&session);
+    no_query_reached_the_terminal(&session).await;
 }
 
 /// KR-ACC-004, KR-REQ-27.04: Neovim turns on button-event tracking in SGR form, and a click on a
@@ -311,7 +311,7 @@ async fn a_click_in_sgr_form_moves_the_cursor_to_the_wide_character_it_was_on() 
         })
         .await;
     assert_eq!(screen.cursor, (8, 1), "{screen}");
-    no_query_reached_the_terminal(&session);
+    no_query_reached_the_terminal(&session).await;
 }
 
 /// KR-ACC-004, KR-REQ-27.04: Neovim asks for the Kitty keyboard protocol on its screen, the
@@ -348,7 +348,7 @@ async fn keys_in_the_kitty_protocol_neovim_asks_for_do_what_they_mean() {
         .wait_for("the incremented number", |screen| screen.line(0) == "42")
         .await;
     assert_eq!(screen.line(0), "42", "{screen}");
-    no_query_reached_the_terminal(&session);
+    no_query_reached_the_terminal(&session).await;
 }
 
 /// KR-ACC-004, KR-REQ-27.04: a character whose UTF-8 bytes arrive in two writes reaches Neovim as
@@ -389,5 +389,5 @@ async fn a_character_split_between_two_writes_arrives_whole() {
         Some(2),
         "{screen}"
     );
-    no_query_reached_the_terminal(&session);
+    no_query_reached_the_terminal(&session).await;
 }

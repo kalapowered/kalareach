@@ -86,8 +86,8 @@ fn rows(screen: &Screen) -> Vec<String> {
     (0..screen.rows.len()).map(|row| screen.line(row)).collect()
 }
 
-fn no_query_reached_the_terminal(session: &Session) {
-    let reached = queries::find(&session.received());
+async fn no_query_reached_the_terminal(session: &Session) {
+    let reached = queries::find(&session.received().await);
     assert!(
         reached.is_empty(),
         "a query reached the attached terminal: {}",
@@ -129,5 +129,5 @@ async fn the_window_screen_holds_is_the_grid_the_worker_holds() {
         Some(12),
         "{screen}"
     );
-    no_query_reached_the_terminal(&session);
+    no_query_reached_the_terminal(&session).await;
 }

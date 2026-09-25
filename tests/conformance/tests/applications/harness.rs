@@ -7,7 +7,8 @@
 //! * the terminal: attached at the session's own size, so it is served the byte stream directly,
 //!   holding the input lease, and typing through the session's input path exactly as a keystroke
 //!   from a socket is handled. Everything it is sent is kept, because what it must never be sent is
-//!   a query the application asked;
+//!   a query the application asked. Its capture is only read once it provably holds the whole
+//!   stream up to the application's last query: see [`Session::received`];
 //! * a snapshot: a terminal of another size, attached for the moment it is needed and projected, so
 //!   what it is sent is the worker's own snapshot of the canonical grid rather than bytes. That is
 //!   what every case compares with the screen the application should be showing.
@@ -27,18 +28,20 @@ use kr_protocol::attachment::{
     AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult,
     TerminalPresentationMode,
 };
-use kr_protocol::envelope::{ActionTarget, ControlFrame};
+use kr_protocol::envelope::{ActionTarget, ControlFrame, Outcome, ParamsValue, Request};
 use kr_protocol::hello::PROTOCOL_VERSION;
 use kr_protocol::identity::{DesktopBinding, WorkerProfile};
 use kr_protocol::ids::{
     ActionId, AttachmentId, BuildId, ControllerGeneration, EnvironmentId, InputLeaseEpoch,
-    SessionEpoch, SessionId,
+    RequestId, SessionEpoch, SessionId,
 };
 use kr_protocol::input::{InputAcquireParams, InputAcquireResult};
 use kr_protocol::local::LocalClientKind;
-use kr_protocol::method::Method;
+use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::projection::{
-    ProjectedBuffer, ProjectedRow, ProjectionRowPage, ProjectionSnapshot,
+    PROJECTION_DELTA_EVENT, PROJECTION_RESET_EVENT, PROJECTION_ROWS_EVENT,
+    PROJECTION_SNAPSHOT_EVENT, ProjectedBuffer, ProjectedRow, ProjectionDelta, ProjectionReset,
+    ProjectionRowPage, ProjectionSnapshot,
 };
 use kr_protocol::recovery::{EventStream, EventsSubscribeParams, OutputEvent};
 use kr_protocol::scalars::{CanonicalSet, Nullable};
@@ -224,8 +227,28 @@ pub struct Session {
     _home: tempfile::TempDir,
     size: (u16, u16),
     keys: Keys,
-    received: Arc<Mutex<Vec<u8>>>,
+    capture: Arc<Mutex<Capture>>,
     reader: tokio::task::JoinHandle<()>,
+}
+
+/// What the typing terminal has been sent, and what stopped it being sent the whole stream.
+#[derive(Default)]
+struct Capture {
+    /// The bytes, in the order they came.
+    bytes: Vec<u8>,
+    /// The greatest stream position an event it was sent names: where an output span starts, or
+    /// the position a projected screen describes. One connection delivers in order, so every span
+    /// that starts before it has already arrived.
+    latest: Option<u64>,
+    /// How many events of each type it was sent, which a failure reports.
+    seen: std::collections::BTreeMap<String, u64>,
+    /// How many times the worker told the terminal its view was no longer continuous, which the
+    /// terminal answers as the product's own client does: by subscribing again, for a fresh screen.
+    resynchronised: u64,
+    /// Why the capture stopped being everything the terminal was sent, once it did: the connection
+    /// ended, an event could not be decoded, a new subscription was refused, or the terminal was
+    /// detached.
+    broken: Option<String>,
 }
 
 struct Keys {
@@ -400,8 +423,13 @@ impl Session {
             .to_typed()
             .expect("decodes");
         subscribe(&mut client, session_id, attachment_id).await;
-        let received = Arc::new(Mutex::new(Vec::new()));
-        let reader = tokio::spawn(keep_output(client, Arc::clone(&received)));
+        let capture = Arc::new(Mutex::new(Capture::default()));
+        let reader = tokio::spawn(keep_output(
+            client,
+            Arc::clone(&capture),
+            session_id,
+            attachment_id,
+        ));
         let mut started = Self {
             _temp: temp,
             _service: service,
@@ -416,7 +444,7 @@ impl Session {
                 epoch: acquired.lease.epoch,
                 sequence: 0,
             },
-            received,
+            capture,
             reader,
         };
         started.type_bytes(b"\n");
@@ -479,21 +507,56 @@ impl Session {
         }
     }
 
-    /// Everything the typing terminal has been sent so far.
+    /// Everything the typing terminal has been sent, once it holds the whole stream up to where the
+    /// application's last query ends.
+    ///
+    /// The worker keeps what the application wrote, queries included, and delivers the typing
+    /// terminal what it may be sent, each span with the cursor it starts at, in order over one
+    /// connection. Once a span that starts at or past the end of the last query has arrived, every
+    /// span before it has too, so a query that reached this terminal is in what this returns. A
+    /// terminal told to resynchronise is sent a fresh screen at the session's cursor and nothing
+    /// in between, so what it was never sent cannot have reached it either. A query already in the
+    /// capture is returned at once, for the case to report.
     ///
     /// # Panics
     ///
-    /// Panics when the reader's lock was poisoned.
-    #[must_use]
-    pub fn received(&self) -> Vec<u8> {
-        self.received.lock().expect("the reader's buffer").clone()
+    /// Panics when the capture broke (the connection ended, an event could not be decoded, a new
+    /// subscription was refused, or the terminal was detached), or when no such span arrives in
+    /// time.
+    pub async fn received(&self) -> Vec<u8> {
+        let boundary = crate::queries::find(&self.written())
+            .last()
+            .map_or(0, |query| (query.at + query.bytes.len()) as u64);
+        let started = tokio::time::Instant::now();
+        loop {
+            let resynchronised = {
+                let capture = self.capture.lock().expect("the reader's capture");
+                if let Some(broken) = &capture.broken {
+                    panic!("the typing terminal's capture is not the whole stream: {broken}");
+                }
+                if capture.latest.is_some_and(|latest| latest >= boundary)
+                    || !crate::queries::find(&capture.bytes).is_empty()
+                {
+                    return capture.bytes.clone();
+                }
+                (capture.resynchronised, capture.seen.clone())
+            };
+            assert!(
+                started.elapsed() < LIVENESS,
+                "the typing terminal was never sent output past {boundary}, where the \
+                 application's last query ends (it was resynchronised {} times, and sent {:?})",
+                resynchronised.0,
+                resynchronised.1
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
-    /// Everything the application has written, as the session retained it.
+    /// Everything the application has written, as the session retained it from its first byte.
     ///
     /// # Panics
     ///
-    /// Panics when the history cannot be read.
+    /// Panics when the history cannot be read, or no longer starts at the first byte.
     #[must_use]
     pub fn written(&self) -> Vec<u8> {
         let session = self.runtime.session();
@@ -503,6 +566,11 @@ impl Session {
             let page = session
                 .history_page(cursor, 1024 * 1024)
                 .expect("reads the retained output");
+            assert!(
+                !page.gap.is_present(),
+                "the session no longer retains all the application wrote: {:?}",
+                page.gap
+            );
             if page.bytes.as_slice().is_empty() {
                 break;
             }
@@ -618,16 +686,121 @@ async fn subscribe(client: &mut LocalClient, session_id: SessionId, attachment_i
         .expect("the subscription succeeds");
 }
 
-/// Keeps every byte the typing terminal is sent until the session ends.
-async fn keep_output(mut client: LocalClient, received: Arc<Mutex<Vec<u8>>>) {
-    while let Ok(frame) = client.recv().await {
-        if let ControlFrame::Notification(notification) = frame
-            && notification.event_type.as_str() == "session.output"
-            && let Ok(event) = notification.payload.to_typed::<OutputEvent>()
-            && let Ok(mut kept) = received.lock()
-        {
-            kept.extend_from_slice(event.bytes.as_slice());
+/// Keeps every byte the typing terminal is sent until the session ends, and records what stopped
+/// the capture being everything it was sent, if anything did.
+///
+/// A resynchronisation is answered as the product's own client answers it: by subscribing again,
+/// on this connection, so the worker sends a fresh screen and the stream from there.
+async fn keep_output(
+    mut client: LocalClient,
+    capture: Arc<Mutex<Capture>>,
+    session_id: SessionId,
+    attachment_id: AttachmentId,
+) {
+    // Far above the identifiers the client numbers its own calls with, so the two never meet.
+    let mut next_request = 1_u64 << 48;
+    let mut asked: Vec<RequestId> = Vec::new();
+    let broken = loop {
+        let frame = match client.recv().await {
+            Ok(frame) => frame,
+            Err(error) => break format!("its connection ended: {error}"),
+        };
+        let ControlFrame::Notification(notification) = frame else {
+            if let ControlFrame::Response(response) = frame
+                && asked.contains(&response.request_id)
+                && let Outcome::Error(error) = response.outcome
+            {
+                break format!("a new subscription was refused: {error:?}");
+            }
+            continue;
+        };
+        let kind = notification.event_type.as_str().to_owned();
+        if let Ok(mut kept) = capture.lock() {
+            *kept.seen.entry(kind.clone()).or_default() += 1;
         }
+        // Where in the stream the event is: an output span's start, or the position a projected
+        // screen, a page of its rows, a change to it or its reset describes. A terminal the worker
+        // has moved to a projection is sent no bytes at all until it is moved back.
+        let position = match kind.as_str() {
+            "session.output" => notification
+                .payload
+                .to_typed::<OutputEvent>()
+                .map(|event| {
+                    if let Ok(mut kept) = capture.lock() {
+                        kept.bytes.extend_from_slice(event.bytes.as_slice());
+                    }
+                    Some(event.cursor.get())
+                })
+                .map_err(|error| error.to_string()),
+            PROJECTION_SNAPSHOT_EVENT => notification
+                .payload
+                .to_typed::<ProjectionSnapshot>()
+                .map(|snapshot| Some(snapshot.output_cursor.get()))
+                .map_err(|error| error.to_string()),
+            PROJECTION_ROWS_EVENT => notification
+                .payload
+                .to_typed::<ProjectionRowPage>()
+                .map(|page| Some(page.output_cursor.get()))
+                .map_err(|error| error.to_string()),
+            PROJECTION_DELTA_EVENT => notification
+                .payload
+                .to_typed::<ProjectionDelta>()
+                .map(|delta| Some(delta.next_cursor.get()))
+                .map_err(|error| error.to_string()),
+            PROJECTION_RESET_EVENT => notification
+                .payload
+                .to_typed::<ProjectionReset>()
+                .map(|reset| Some(reset.cursor.get()))
+                .map_err(|error| error.to_string()),
+            _ => Ok(None),
+        };
+        match position {
+            Ok(Some(position)) => {
+                if let Ok(mut kept) = capture.lock() {
+                    kept.latest = Some(kept.latest.map_or(position, |latest| latest.max(position)));
+                }
+            }
+            Ok(None) => {}
+            Err(error) => break format!("a {kind} event could not be decoded: {error}"),
+        }
+        match kind.as_str() {
+            "session.resync" => {
+                let mut streams = CanonicalSet::new();
+                streams.insert(EventStream::Output);
+                let Ok(params) = ParamsValue::from_typed(&EventsSubscribeParams {
+                    session_id,
+                    attachment_id,
+                    streams,
+                    from_cursor: Nullable::null(),
+                }) else {
+                    break "a new subscription could not be encoded".to_owned();
+                };
+                let request_id = RequestId::new(next_request);
+                next_request += 1;
+                let request = Request {
+                    request_id,
+                    method: Method::EventsSubscribe.into(),
+                    method_version: MethodVersion::V1,
+                    params,
+                };
+                if let Err(error) = client
+                    .writer()
+                    .write_message(&ControlFrame::Request(request))
+                    .await
+                {
+                    break format!("a new subscription could not be sent: {error}");
+                }
+                asked.push(request_id);
+                if let Ok(mut kept) = capture.lock() {
+                    kept.resynchronised += 1;
+                }
+            }
+            "session.detached" => break "the worker detached it".to_owned(),
+            _ => {}
+        }
+    };
+    if let Ok(mut kept) = capture.lock() {
+        kept.broken.get_or_insert(broken);
     }
 }
 
