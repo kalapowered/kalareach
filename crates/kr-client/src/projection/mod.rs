@@ -46,10 +46,7 @@ pub struct Base {
     pub generation: u64,
 }
 
-/// One screen, as a client holds it.
-///
-/// The rows are held per buffer and keyed by their stable identifiers, because that is what every
-/// update names. A scroll moves which identifiers the viewport holds without changing a row, so/// Whether an event type belongs to the projection stream.
+/// Whether an event type belongs to the projection stream.
 #[must_use]
 pub const fn is_projection_event(event_type: &str) -> bool {
     matches!(
@@ -94,6 +91,10 @@ pub fn decode(
     }
 }
 
+/// One screen, as a client holds it.
+///
+/// The rows are held per buffer and keyed by their stable identifiers, because that is what every
+/// update names. A scroll moves which identifiers the viewport holds without changing a row, so
 /// the two are kept apart: [`Screen::rows`] is what exists, [`Screen::viewport`] is what is shown.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Screen {
