@@ -102,55 +102,25 @@ pub fn carries(kind: StreamKind, method: Option<Method>) -> bool {
 pub struct TransferModule {
     service: Arc<TransferService>,
     tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
-    /// Where a test stops a sweep: see [`StorePause`].
-    #[cfg(test)]
-    before_the_store_sweep: Arc<StorePause>,
 }
 
-/// A place a test stops a sweep: where its store work begins, once the daemon has answered it.
+/// Where a test stops one sweep: where its store work begins, once the daemon has answered it.
 ///
-/// Unarmed, it lets every sweep through. It exists only in test builds.
+/// A sweep carries one only when a test asked for that sweep ([`TransferModule::sweep_paused`]),
+/// so the daemon's own sweeps never stop. It exists only in test builds.
 #[cfg(test)]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct StorePause {
-    armed: std::sync::Mutex<
-        Option<(
-            tokio::sync::oneshot::Sender<()>,
-            std::sync::mpsc::Receiver<()>,
-        )>,
-    >,
+    arrived: tokio::sync::oneshot::Sender<()>,
+    go: std::sync::mpsc::Receiver<()>,
 }
 
 #[cfg(test)]
 impl StorePause {
-    /// Stops the next sweep that gets here: the receiver hears that it has arrived, and the
-    /// sender lets it go on.
-    fn arm(
-        &self,
-    ) -> (
-        tokio::sync::oneshot::Receiver<()>,
-        std::sync::mpsc::Sender<()>,
-    ) {
-        let (arrived, arrival) = tokio::sync::oneshot::channel();
-        let (go, going) = std::sync::mpsc::channel();
-        *self
-            .armed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, going));
-        (arrival, go)
-    }
-
-    /// Stops here, on the sweep's own blocking thread, when a test has armed the pause.
-    fn wait(&self) {
-        let armed = self
-            .armed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some((arrived, going)) = armed {
-            let _ = arrived.send(());
-            let _ = going.recv();
-        }
+    /// Says the sweep has arrived, and waits on its blocking thread until the test lets it go.
+    fn wait(self) {
+        let _ = self.arrived.send(());
+        let _ = self.go.recv();
     }
 }
 
@@ -193,8 +163,6 @@ impl TransferModule {
         Ok(Self {
             service: Arc::new(service),
             tasks: std::sync::Mutex::new(Vec::new()),
-            #[cfg(test)]
-            before_the_store_sweep: Arc::default(),
         })
     }
 
@@ -595,14 +563,44 @@ impl TransferModule {
         &self,
         daemon: &Weak<Controller>,
     ) -> impl Future<Output = Answer<Sweep>> + Send + use<> {
+        self.queue_sweep(
+            daemon,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    /// Queues a sweep as [`TransferModule::sweep`] does, one that stops where its store work
+    /// begins until the test lets it go: the receiver hears it arrive there, and the sender lets it
+    /// go on.
+    #[cfg(test)]
+    fn sweep_paused(
+        &self,
+        daemon: &Weak<Controller>,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+        impl Future<Output = Answer<Sweep>> + Send + use<>,
+    ) {
+        let (arrived, arrival) = tokio::sync::oneshot::channel();
+        let (go, going) = std::sync::mpsc::channel();
+        let pause = StorePause { arrived, go: going };
+        (arrival, go, self.queue_sweep(daemon, Some(pause)))
+    }
+
+    /// Queues the sweep [`TransferModule::sweep`] describes. In a test build it carries the
+    /// pause a test asked for, if any, and stops there.
+    fn queue_sweep(
+        &self,
+        daemon: &Weak<Controller>,
+        #[cfg(test)] pause: Option<StorePause>,
+    ) -> impl Future<Output = Answer<Sweep>> + Send + use<> {
         // The registry scan and the sweep are both storage work, so both run on the same blocking
         // task. Reading the registry means holding its lock, and that lock is a task-aware one, so
         // it is taken in its blocking form *inside* the blocking task rather than awaited on the
         // reactor and handed over.
         let daemon = Weak::clone(daemon);
         let service = Arc::clone(&self.service);
-        #[cfg(test)]
-        let pause = Arc::clone(&self.before_the_store_sweep);
         answer(tokio::task::spawn_blocking(move || {
             let owner = daemon.upgrade().ok_or_else(|| {
                 ProtocolError::new(
@@ -616,7 +614,9 @@ impl TransferModule {
                 .archive_retention()
                 .map_err(|error| error.to_protocol_error())?;
             #[cfg(test)]
-            pause.wait();
+            if let Some(pause) = pause {
+                pause.wait();
+            }
             let swept = service.sweep(&retention).map_err(Into::into);
             // Only now may the daemon go, and its environment with it.
             drop(owner);
@@ -863,16 +863,12 @@ mod tests {
         let controller = daemon(&temp).await;
         let held = Arc::downgrade(&controller);
 
-        // The next sweep to begin stops where its store work starts, and says so.
-        let (arrived, go) = controller.transfer().before_the_store_sweep.arm();
-        let swept = {
-            let transfer = Arc::clone(controller.transfer());
-            let daemon = Weak::clone(&held);
-            tokio::spawn(async move { transfer.sweep(&daemon).await })
-        };
+        // A sweep that stops where its store work starts, and says so. The daemon's own sweeps
+        // never stop there, so the sweep that arrives is this one.
+        let (arrived, go, swept) = controller.transfer().sweep_paused(&held);
         tokio::time::timeout(std::time::Duration::from_secs(30), arrived)
             .await
-            .expect("a sweep reaches its store work in time")
+            .expect("the sweep reaches its store work in time")
             .expect("the sweep says it has arrived");
 
         // The daemon is let go while that sweep works on the store.
@@ -891,10 +887,7 @@ mod tests {
 
         // Once the sweep ends, its daemon goes, and another daemon takes the environment.
         let _ = go.send(());
-        swept
-            .await
-            .expect("the sweep's task ends")
-            .expect("the sweep runs");
+        swept.await.expect("the sweep runs");
         drop(started(|| Controller::start(setup(&temp, boot_identity.clone()))).await);
     }
 
