@@ -150,9 +150,8 @@ export function MobileHosts({ surface }: { readonly surface: Surface }): ReactNo
             </li>
           ))}
         </ul>
-      ) : (
-        <p className="m-empty">Reading the hosts…</p>
-      )}
+      ) : null}
+      {!rows && !error ? <p className="m-empty">Reading the hosts…</p> : null}
     </>
   )
 }

@@ -699,24 +699,54 @@ describe("the phone's lists show their newest read", () => {
     expect(screen.queryByText('The sessions could not be read')).toBeNull()
   })
 
-  it('takes nothing in from a session read that answers after the list has gone', async () => {
-    for (const ending of ['answer', 'failure'] as const) {
-      const { port } = fakeHost()
-      const late = settledByHand<SessionListResult>()
-      const { unmount } = render(sessionsThrough({ ...port, sessionList: late.read }))
-      await waitFor(() => {
-        expect(late.asked()).toBe(true)
-      })
-      unmount()
+  it('keeps the newer failure over an older session list that answers after it', async () => {
+    const { port, controls } = fakeHost()
+    const held = controls.hold('sessionList')
+    const { rerender } = render(sessionsThrough(port))
+    await made(held, 1)
+    act(() => {
+      controls.setConnected(false)
+    })
+    rerender(sessionsThrough({ ...port }))
+    await made(held, 2)
 
-      const answered = watched<SessionListResult>({ sessions: [] })
-      const refused = watched({ code: 'RESOURCE_UNAVAILABLE', message: 'Gone.', user_action: 'retry' })
-      await settle(() => {
-        if (ending === 'answer') late.resolve(answered.value)
-        else late.reject(refused.value)
-      })
-      expect(answered.read() || refused.read()).toBe(false)
-    }
+    await answer(held, 1)
+    expect(screen.getByText('The sessions could not be read')).toBeInTheDocument()
+    await answer(held, 0)
+    expect(screen.getByText('The sessions could not be read')).toBeInTheDocument()
+    expect(titles()).toEqual([])
+  })
+
+  it('takes nothing in from a session list that answers after the list has gone', async () => {
+    const { port } = fakeHost()
+    const late = settledByHand<SessionListResult>()
+    const { unmount } = render(sessionsThrough({ ...port, sessionList: late.read }))
+    await waitFor(() => {
+      expect(late.asked()).toBe(true)
+    })
+    unmount()
+
+    const answered = watched<SessionListResult>({ sessions: [] })
+    await settle(() => {
+      late.resolve(answered.value)
+    })
+    expect(answered.read()).toBe(false)
+  })
+
+  it('takes nothing in from a session read that fails after the list has gone', async () => {
+    const { port } = fakeHost()
+    const late = settledByHand<SessionListResult>()
+    const { unmount } = render(sessionsThrough({ ...port, sessionList: late.read }))
+    await waitFor(() => {
+      expect(late.asked()).toBe(true)
+    })
+    unmount()
+
+    const refused = watched({ code: 'RESOURCE_UNAVAILABLE', message: 'Gone.', user_action: 'retry' })
+    await settle(() => {
+      late.reject(refused.value)
+    })
+    expect(refused.read()).toBe(false)
   })
 
   it('shows the sessions it read when nothing overtook the read', async () => {
@@ -760,24 +790,56 @@ describe("the phone's lists show their newest read", () => {
     expect(screen.queryByText('The hosts could not be read')).toBeNull()
   })
 
-  it('takes nothing in from a host read that answers after the list has gone', async () => {
-    for (const ending of ['answer', 'failure'] as const) {
-      const { port } = fakeHost()
-      const late = settledByHand<EnvironmentListResult>()
-      const { unmount } = render(hostsThrough({ ...port, environmentList: late.read }))
-      await waitFor(() => {
-        expect(late.asked()).toBe(true)
-      })
-      unmount()
+  it('keeps the newer failure over an older host list that answers after it', async () => {
+    const { port, controls } = fakeHost()
+    const held = controls.hold('environmentList')
+    const { rerender } = render(hostsThrough(port))
+    await made(held, 1)
+    act(() => {
+      controls.setConnected(false)
+    })
+    rerender(hostsThrough({ ...port }))
+    await made(held, 2)
 
-      const answered = watched<EnvironmentListResult>({ environments: [] })
-      const refused = watched({ code: 'RESOURCE_UNAVAILABLE', message: 'Gone.', user_action: 'retry' })
-      await settle(() => {
-        if (ending === 'answer') late.resolve(answered.value)
-        else late.reject(refused.value)
-      })
-      expect(answered.read() || refused.read()).toBe(false)
-    }
+    await answer(held, 1)
+    expect(screen.getByText('The hosts could not be read')).toBeInTheDocument()
+    await answer(held, 0)
+    expect(screen.getByText('The hosts could not be read')).toBeInTheDocument()
+    expect(titles()).toEqual([])
+    // A read that failed is not a read still under way.
+    expect(screen.queryByText('Reading the hosts…')).toBeNull()
+  })
+
+  it('takes nothing in from a host list that answers after the list has gone', async () => {
+    const { port } = fakeHost()
+    const late = settledByHand<EnvironmentListResult>()
+    const { unmount } = render(hostsThrough({ ...port, environmentList: late.read }))
+    await waitFor(() => {
+      expect(late.asked()).toBe(true)
+    })
+    unmount()
+
+    const answered = watched<EnvironmentListResult>({ environments: [] })
+    await settle(() => {
+      late.resolve(answered.value)
+    })
+    expect(answered.read()).toBe(false)
+  })
+
+  it('takes nothing in from a host read that fails after the list has gone', async () => {
+    const { port } = fakeHost()
+    const late = settledByHand<EnvironmentListResult>()
+    const { unmount } = render(hostsThrough({ ...port, environmentList: late.read }))
+    await waitFor(() => {
+      expect(late.asked()).toBe(true)
+    })
+    unmount()
+
+    const refused = watched({ code: 'RESOURCE_UNAVAILABLE', message: 'Gone.', user_action: 'retry' })
+    await settle(() => {
+      late.reject(refused.value)
+    })
+    expect(refused.read()).toBe(false)
   })
 
   it('shows the hosts it read when nothing overtook the read', async () => {
