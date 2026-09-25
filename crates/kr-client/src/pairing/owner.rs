@@ -631,7 +631,7 @@ pub struct Listed {
 pub enum ReviewOutcome {
     /// The person completed the ceremony and the host has the proof.
     Confirmed,
-    /// The person did not complete the ceremony, or the host could not take the proof.
+    /// The person did not complete the ceremony, or the host refused the proof.
     NotConfirmed,
     /// The challenge expired first.
     Expired,
@@ -639,6 +639,9 @@ pub enum ReviewOutcome {
     CannotCheck,
     /// This device has no ceremony, so it signs nothing.
     NoCeremony,
+    /// The answer was sent, and the host has not said whether it took it: it did not reply in
+    /// time, or the connection ended first. What the host lists next shows whether it did.
+    Unknown,
 }
 
 /// One paired host's owner confirmations, answered by this device.
@@ -744,13 +747,33 @@ impl OwnerConfirmations {
         let sent = tokio::time::timeout(ANSWER_WITHIN, self.channel.complete(&params)).await;
         match sent {
             Ok(Ok(())) => ReviewOutcome::Confirmed,
-            Ok(Err(ClientError::Host(error) | ClientError::Refused { error, .. }))
+            // The host's own refusal: it did not take the answer.
+            Ok(Err(ClientError::Host(error) | ClientError::Refused { error, .. })) => {
                 if error.code == ErrorCode::OwnerConfirmationRequired
-                    && self.clock.wall_clock_ms() >= expires_at_ms =>
-            {
-                ReviewOutcome::Expired
+                    && self.clock.wall_clock_ms() >= expires_at_ms
+                {
+                    ReviewOutcome::Expired
+                } else {
+                    ReviewOutcome::NotConfirmed
+                }
             }
-            Ok(Err(_)) | Err(_) => ReviewOutcome::NotConfirmed,
+            // No reply, or none from the host: it may have taken the answer all the same.
+            Ok(Err(_)) | Err(_) => self.settled(&listed.request).await,
+        }
+    }
+
+    /// Whether the host took an answer it gave no reply to, from what it lists now: a challenge it
+    /// lists as answered was taken, and anything else leaves the outcome unknown.
+    async fn settled(&self, request: &OwnerConfirmationRequest) -> ReviewOutcome {
+        match tokio::time::timeout(ANSWER_WITHIN, self.channel.pending()).await {
+            Ok(Ok(listed))
+                if listed.pending.iter().any(|pending| {
+                    pending.answered && pending.request.confirmation_id == request.confirmation_id
+                }) =>
+            {
+                ReviewOutcome::Confirmed
+            }
+            _ => ReviewOutcome::Unknown,
         }
     }
 }
@@ -949,6 +972,8 @@ mod tests {
         completions: AtomicUsize,
         /// Takes every answer and never says anything back.
         silent: std::sync::atomic::AtomicBool,
+        /// Takes every answer, lists its challenge as answered, and never says anything back.
+        takes_silently: std::sync::atomic::AtomicBool,
     }
 
     impl OwnerChannel for Listing {
@@ -962,7 +987,13 @@ mod tests {
             _params: &'a OwnerConfirmationCompleteParams,
         ) -> BoxFuture<'a, Result<(), ClientError>> {
             self.completions.fetch_add(1, Ordering::SeqCst);
-            let silent = self.silent.load(Ordering::SeqCst);
+            let takes = self.takes_silently.load(Ordering::SeqCst);
+            if takes {
+                for pending in self.pending.lock().expect("the listing").iter_mut() {
+                    pending.answered = true;
+                }
+            }
+            let silent = takes || self.silent.load(Ordering::SeqCst);
             Box::pin(async move {
                 if silent {
                     std::future::pending::<()>().await;
@@ -1047,6 +1078,7 @@ mod tests {
             }]),
             completions: AtomicUsize::new(0),
             silent: std::sync::atomic::AtomicBool::new(false),
+            takes_silently: std::sync::atomic::AtomicBool::new(false),
         });
         let confirmations = OwnerConfirmations::new(
             host,
@@ -1116,9 +1148,10 @@ mod tests {
     }
 
     /// KR-REQ-10.06: a host that takes an answer and says nothing holds the review for
-    /// [`ANSWER_WITHIN`] and no longer. The answer was sent once; the review then ends not
-    /// confirmed, rather than holding its connection, and the page that asked, for as long as the
-    /// host keeps the connection open.
+    /// [`ANSWER_WITHIN`] and no longer. The answer was sent once. The host may have taken it, and
+    /// what it lists afterwards does not show that it did, so the review ends as unknown, never as
+    /// not confirmed, rather than holding its connection, and the page that asked, for as long as
+    /// the host keeps the connection open.
     #[tokio::test(start_paused = true)]
     async fn a_host_that_never_answers_a_completion_holds_the_review_for_a_bound() {
         let (confirmations, listing) = listed_device(
@@ -1133,12 +1166,32 @@ mod tests {
             tokio::time::timeout(ANSWER_WITHIN * 3, confirmations.review(&listed[0], &asked))
                 .await
                 .expect("the review ends");
-        assert_eq!(outcome, ReviewOutcome::NotConfirmed);
+        assert_eq!(outcome, ReviewOutcome::Unknown);
         let took = started.elapsed();
         assert!(
             took >= ANSWER_WITHIN && took < ANSWER_WITHIN + Duration::from_secs(1),
             "{took:?}"
         );
+        assert_eq!(listing.completions.load(Ordering::SeqCst), 1);
+    }
+
+    /// KR-REQ-10.06: a host that takes the proof and withholds its reply has still taken it. The
+    /// review asks the host what it holds once the reply is overdue, finds the challenge answered,
+    /// and says the confirmation went through.
+    #[tokio::test(start_paused = true)]
+    async fn a_proof_the_host_took_without_replying_is_confirmed_from_what_it_lists() {
+        let (confirmations, listing) = listed_device(
+            candidate("Pixel 8"),
+            grant(&[ActionRight::SessionView], an_hour()),
+        );
+        listing.takes_silently.store(true, Ordering::SeqCst);
+        let listed = confirmations.pending().await.expect("the listing");
+        let asked = Asked(Mutex::new(Vec::new()));
+        let outcome =
+            tokio::time::timeout(ANSWER_WITHIN * 3, confirmations.review(&listed[0], &asked))
+                .await
+                .expect("the review ends");
+        assert_eq!(outcome, ReviewOutcome::Confirmed);
         assert_eq!(listing.completions.load(Ordering::SeqCst), 1);
     }
 }

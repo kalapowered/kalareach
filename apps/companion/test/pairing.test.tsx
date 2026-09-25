@@ -441,6 +441,21 @@ describe("the owner's confirmations", () => {
     expect(await screen.findByText('Confirmed. studio can go ahead.')).toBeInTheDocument()
   })
 
+  it('says a review whose answer the host never acknowledged is not known, not that nothing changed', async () => {
+    const { controls } = start({ view: 'attention' })
+    controls.setReviewOutcome('unknown')
+    act(() => {
+      controls.setConfirmations({ ceremony: 'touch_id', requests: [request()] })
+    })
+    await userEvent.click(await screen.findByTestId('confirm-request'))
+    expect(
+      await screen.findByText(
+        'studio did not say whether it took the confirmation. While the request is listed here, it is not confirmed.'
+      )
+    ).toBeInTheDocument()
+    expect(screen.queryByText('Not confirmed. Nothing changed.')).toBeNull()
+  })
+
   it('hides a request with Not now, without answering it', async () => {
     const { controls } = start({ view: 'attention' })
     act(() => {

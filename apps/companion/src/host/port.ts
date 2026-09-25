@@ -269,8 +269,17 @@ export interface OwnerView {
   readonly requests: readonly ConfirmationRequest[]
 }
 
-/** How a review ended. */
-export type ReviewOutcome = 'confirmed' | 'not_confirmed' | 'expired' | 'cannot_check' | 'no_ceremony'
+/**
+ * How a review ended. `unknown` is an answer the host was sent and never acknowledged: it may have
+ * taken it, and whether it did shows in what it lists next.
+ */
+export type ReviewOutcome =
+  | 'confirmed'
+  | 'not_confirmed'
+  | 'expired'
+  | 'cannot_check'
+  | 'no_ceremony'
+  | 'unknown'
 
 /* ---- Voice ------------------------------------------------------------------------------------
  *
