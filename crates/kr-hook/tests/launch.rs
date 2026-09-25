@@ -250,6 +250,20 @@ impl Shell {
         }
     }
 
+    /// Waits until the launch the confirmation pause holds is committed, its launcher waiting to be
+    /// told.
+    ///
+    /// That is the one point between a launch's admission and its program's exec at which a test
+    /// can change the program whatever the machine's load: the launcher execs only on the word the
+    /// pause holds back, and it waits for that word for the commit deadline, which the change takes
+    /// a small part of.
+    fn at_the_confirmation(&self, arrived: tokio::sync::oneshot::Receiver<()>) {
+        self.runtime
+            .block_on(async { tokio::time::timeout(LIVENESS, arrived).await })
+            .expect("the launch is committed")
+            .expect("and paused before the launcher is told");
+    }
+
     /// The next announcement about an agent instance the session's view is sent.
     fn announcement(&self) -> kr_protocol::projection::AgentInstanceEvent {
         let view = self.view.as_ref().expect("a shell with a view");
@@ -839,14 +853,16 @@ fn kr_req_11_34_the_launched_program_s_hook_moves_the_binding_and_a_replaced_one
     });
     let _ = finish(child);
 
-    // Replaced while the launcher holds after its admission, and put back once it runs.
+    // Replaced while the launcher waits to be told its launch is committed, and put back once it
+    // runs.
     let (program, another) = shells();
     let swapped = shell.placed.host.root().join("bin").join("swapped");
     std::os::unix::fs::symlink(program, &swapped).expect("the program");
     let answer = shell.establish_for(&swapped);
     let go = shell.placed.host.root().join("go-swapped");
     let go_text = go.display().to_string();
-    let mut held = shell.launcher(&swapped, &Shell::answered(), Some(1000));
+    let (arrived, release) = shell.backends.pause_before_confirming();
+    let mut held = shell.launcher(&swapped, &Shell::answered(), None);
     shell.prepare(
         &mut held,
         Some(&answer),
@@ -859,9 +875,9 @@ fn kr_req_11_34_the_launched_program_s_hook_moves_the_binding_and_a_replaced_one
         ],
     );
     let held = held.spawn().expect("the launcher starts");
-    let registration = Shell::registration(&answer);
-    eventually("the launch is admitted", || registration.exists());
+    shell.at_the_confirmation(arrived);
     retarget(&swapped, another);
+    release.send(()).expect("the launch goes on");
     let report = shell.report("swapped");
     assert_eq!(report["registered"], "yes", "the launch went ahead");
     retarget(&swapped, program);
@@ -1282,9 +1298,12 @@ fn kr_req_05_09_a_replacement_that_maps_the_hashed_program_is_refused() {
         "-c".to_owned(),
         MAPPING_PROGRAM.to_owned(),
     ];
+    // Found before anything starts: it runs a program of its own, which on a loaded machine can take
+    // longer than a launcher waits.
+    let python = python3();
     let answer = shell.establish_with(&path, &typed);
-    let registration = Shell::registration(&answer);
-    let mut held = shell.launcher(&path, &Shell::answered_for(&typed), Some(1000));
+    let (arrived, release) = shell.backends.pause_before_confirming();
+    let mut held = shell.launcher(&path, &Shell::answered_for(&typed), None);
     let mapped = program.display().to_string();
     shell.prepare(
         &mut held,
@@ -1298,8 +1317,9 @@ fn kr_req_05_09_a_replacement_that_maps_the_hashed_program_is_refused() {
         ],
     );
     let held = held.spawn().expect("the launcher starts");
-    eventually("the launch is admitted", || registration.exists());
-    retarget(&path, &python3());
+    shell.at_the_confirmation(arrived);
+    retarget(&path, &python);
+    release.send(()).expect("the launch goes on");
     let report = shell.report("mapped");
     assert_eq!(report["registered"], "yes", "the launch went ahead");
     let instance = instance_of(&report);
@@ -1324,8 +1344,8 @@ fn kr_req_05_09_a_program_rewritten_in_place_after_it_was_hashed_is_refused() {
     let program = shell.placed.host.root().join("bin").join("rewritten");
     std::fs::copy("/bin/bash", &program).expect("a copy of the program, which Linux runs anywhere");
     let answer = shell.establish_for(&program);
-    let registration = Shell::registration(&answer);
-    let mut held = shell.launcher(&program, &Shell::answered(), Some(1000));
+    let (arrived, release) = shell.backends.pause_before_confirming();
+    let mut held = shell.launcher(&program, &Shell::answered(), None);
     shell.prepare(
         &mut held,
         Some(&answer),
@@ -1337,7 +1357,7 @@ fn kr_req_05_09_a_program_rewritten_in_place_after_it_was_hashed_is_refused() {
         ],
     );
     let held = held.spawn().expect("the launcher starts");
-    eventually("the launch is admitted", || registration.exists());
+    shell.at_the_confirmation(arrived);
     let mut bytes = std::fs::read(&program).expect("the program's bytes");
     // The file's last byte, in its section headers, which nothing reads to run it.
     if let Some(last) = bytes.last_mut() {
@@ -1357,6 +1377,7 @@ fn kr_req_05_09_a_program_rewritten_in_place_after_it_was_hashed_is_refused() {
             .expect("its modification time put back");
         file.sync_all().expect("written");
     }
+    release.send(()).expect("the launch goes on");
     let report = shell.report("rewritten");
     assert_eq!(report["registered"], "yes", "the launch went ahead");
     let instance = instance_of(&report);
@@ -1507,8 +1528,8 @@ fn kr_req_05_09_a_code_directory_copied_into_changed_code_vouches_for_nothing() 
     let path = shell.placed.host.root().join("bin").join("stale");
     std::os::unix::fs::symlink(&changed, &path).expect("the program");
     let answer = shell.establish_for(&path);
-    let registration = Shell::registration(&answer);
-    let mut held = shell.launcher(&path, &Shell::answered(), Some(1000));
+    let (arrived, release) = shell.backends.pause_before_confirming();
+    let mut held = shell.launcher(&path, &Shell::answered(), None);
     shell.prepare(
         &mut held,
         Some(&answer),
@@ -1520,8 +1541,9 @@ fn kr_req_05_09_a_code_directory_copied_into_changed_code_vouches_for_nothing() 
         ],
     );
     let held = held.spawn().expect("the launcher starts");
-    eventually("the launch is admitted", || registration.exists());
+    shell.at_the_confirmation(arrived);
     retarget(&path, program);
+    release.send(()).expect("the launch goes on");
     let report = shell.report("stale");
     assert_eq!(report["registered"], "yes", "the launch went ahead");
     let instance = instance_of(&report);
