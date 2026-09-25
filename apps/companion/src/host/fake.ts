@@ -2038,7 +2038,8 @@ function sessionSnapshot(
   session: SessionListResult['sessions'][number],
   attachments: readonly AttachmentSummary[]
 ): EventsSnapshotResult {
-  const state = {
+  return {
+    agent_instances: { instances: [], sequence: '1' },
     agent_resources: {
       continue_after: null,
       cursor: '40',
@@ -2046,14 +2047,14 @@ function sessionSnapshot(
       snapshot_id: '1',
       stream_generation: '1'
     },
+    attachments: [...attachments],
     cursor: '40',
     geometry: { dimensions: { columns: '120', rows: '40' }, epoch: '1', owner: null },
-    lease: { connection_id: null, epoch: '1', holder: null },
+    lease: { connection_id: null, epoch: '1', holder: null, next_sequence: '1' },
     oldest_retained_cursor: '1',
     session,
     taken_at_ms: String(FAKE_NOW_MS)
-  } as unknown as Omit<EventsSnapshotResult, 'attachments'>
-  return { ...state, attachments: [...attachments] }
+  }
 }
 
 /* ---- First-start setup --------------------------------------------------------------------- */
