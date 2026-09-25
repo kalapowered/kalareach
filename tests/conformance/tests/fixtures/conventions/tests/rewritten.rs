@@ -43,3 +43,23 @@ fn measures_a_vector() {
 fn example() {
     assert_eq!(len(), 0);
 }
+
+macro_rules! source {
+    ($name:ident) => {
+        mod holder {
+            pub mod $name {}
+        }
+    };
+}
+
+macro_rules! importing {
+    ($keyword:tt) => {
+        $keyword holder::{core::self};
+    };
+}
+
+#[test]
+fn imports_a_module() {
+    source!(core);
+    importing!(use);
+}
