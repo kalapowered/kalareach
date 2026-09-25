@@ -13,10 +13,11 @@ outside Wasmtime. The package's installation grant says so before anything is in
 
 ## What the package installs
 
-Two files under the user's own Gemini CLI directory, and no settings key:
+Three files under the user's own Gemini CLI directory, and no settings key:
 
-| File | What it registers |
+| File | What it holds |
 | --- | --- |
+| `extensions/kalareach/.gemini-extension-install.json` | The extension's install record: `~/.gemini/extensions/kalareach` as a `local` source |
 | `extensions/kalareach/gemini-extension.json` | The extension `kalareach`: a name, a version and a description, and nothing it could load |
 | `extensions/kalareach/hooks/hooks.json` | `kr-hook gemini-cli hook` for `SessionStart` and `Notification` with a timeout of 5000 milliseconds, and for `SessionEnd` with 1000 |
 
@@ -24,15 +25,26 @@ Gemini CLI loads every extension in that directory for every project and every l
 unless the person disables it, and runs an extension's hooks beside the hooks in the person's own
 settings files, whether or not the person trusts the folder. A hook in a settings file, the
 person's own included, runs only in a trusted folder, and a hooks key there would hold the person's
-own hooks for the same event; that is why the bridge is an extension. Removing it deletes the two
-files. Gemini CLI then warns at every start about the empty `extensions/kalareach/` directory, so
-whatever removes the files also removes the directories the installation created once they are
-empty.
+own hooks for the same event; that is why the bridge is an extension.
 
-The core repository keeps a copy of both files in `fixtures/bridges/gemini-cli/`, pinned by the
+The install record matters only where the person's settings list allowed extensions in
+`security.allowedExtensions`. There Gemini CLI refuses to start at all while any extension has no
+record, and it loads an extension only when a listed pattern matches the source its record names.
+It does not expand the `~`: it tests the patterns against that path taken from the session's
+working directory, so a pattern that matches its end, such as `/\.gemini/extensions/kalareach$`,
+allows this extension. Without one, Gemini CLI skips the extension with a warning and the session
+runs without its hooks. The record is installed before the other two files and removed after them,
+so a recipe stopped part way never leaves the manifest without it.
+
+Removing the extension deletes the three files. Gemini CLI then warns at every start about the empty
+`extensions/kalareach/` directory, so whatever removes the files also removes the directories the
+installation created once they are empty.
+
+The core repository keeps a copy of all three files in `fixtures/bridges/gemini-cli/`, pinned by the
 SHA-256 digests the package's recipe records, and `crates/kr-hook/tests/fixtures.rs` checks that
 every hook starts the forwarder's `gemini-cli hook` invocation as a command of plain words, for
-exactly the events the forwarder reports, with a timeout its deadline fits inside.
+exactly the events the forwarder reports, with a timeout its deadline fits inside, and that the
+record names the extension's own directory.
 
 ## How Gemini CLI starts the forwarder
 
@@ -83,11 +95,12 @@ selects the session's thread. With `GEMINI_CLI_NO_RELAUNCH=true` in the launch's
 launched process starts the hooks itself, and it gives up the heap sizing and the restart. No
 package can declare the environment a command integration sets yet, so today no launch sets it.
 
-An interactive Gemini CLI runs its `SessionEnd` hooks twice when it exits, with the same session and
-reason, and prints three lines of its own about the hooks it ran; the worker's second report of an
-ended thread changes nothing.
+An interactive Gemini CLI runs its `SessionEnd` hooks more than once when it exits, with the same
+session and reason (twice in one run, three times in two others), and prints three lines of its own
+about the hooks it ran; the worker's later reports of an ended thread change nothing.
 
-These facts were read from Gemini CLI 0.60.0 with no account signed in and no model turn: a session
-starting and ending, the hooks' parent and their environment on the binary, and the notification
-and tool behaviour from the build's own code and the hook reference it ships. The host admits no
-bridge on Windows, because it writes a launch's credential file only on Unix.
+These facts were read from Gemini CLI 0.60.0 with no account signed in and no model turn. A session
+starting and ending, the hooks' parent and their environment, and the install record with and
+without an allow list were checked on the binary; the notification and tool behaviour comes from
+the build's own code and the hook reference it ships. The host admits no bridge on Windows,
+because it writes a launch's credential file only on Unix.

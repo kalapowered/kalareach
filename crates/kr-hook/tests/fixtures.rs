@@ -8,10 +8,11 @@
 //! the digests together, and this suite then checks that the forwarder still answers what the new
 //! files invoke.
 //!
-//! The Gemini CLI connector package installs an extension, two files, into the user's own Gemini
-//! CLI directory. Their copies under `fixtures/bridges/gemini-cli/` are the bytes the package
-//! publishes (the plugins repository at `84e85407a7929834cf67356713325efbfca467b1`,
-//! `plugins/kalareach/gemini-cli/bridge/`), pinned the same way.
+//! The Gemini CLI connector package installs an extension, three files, into the user's own Gemini
+//! CLI directory: its manifest, its hooks and its install record. Their copies under
+//! `fixtures/bridges/gemini-cli/` are the bytes the package publishes (the plugins repository at
+//! `d8a5c3cad6ec09175fe8a7116932422961a552eb`, `plugins/kalareach/gemini-cli/bridge/`), pinned the
+//! same way.
 //!
 //! Qoder CLI reads its hooks from the settings its launch is given, so nothing is installed for it:
 //! its registration is the two elements a launch adds to Qoder CLI's argument vector, `--settings`
@@ -278,6 +279,10 @@ fn the_gemini_cli_bridge_files_are_the_bytes_the_package_publishes() {
             "hooks.json",
             "3ea3470d1d88d3f0d828668bcd98bacfa37b20fd638b6f5b38b7ddd58f55c0ba",
         ),
+        (
+            "gemini-extension-install.json",
+            "3dcf39eedad95d7210e792a0bcfcc06506ccf3e01c1ab0cec320083948b3d081",
+        ),
     ] {
         assert_eq!(sha256(&fixture("gemini-cli", name)), digest, "{name}");
     }
@@ -288,6 +293,9 @@ fn the_gemini_cli_bridge_files_are_the_bytes_the_package_publishes() {
 /// notification (no matcher), in the order Gemini CLI chooses (no `sequential`), each as a command
 /// of plain words, which bash runs in its own process, and each with a timeout in milliseconds that
 /// the forwarder's deadline fits inside. The manifest names the extension and nothing it could load.
+/// The install record names the extension's own directory as a local source and nothing else: where
+/// a person's settings list allowed extensions, Gemini CLI refuses to start while an extension has
+/// no record, and tests the list's patterns against the source a record names.
 #[test]
 fn the_gemini_cli_extension_registers_its_three_events_as_plain_words() {
     let hooks = json("gemini-cli", "hooks.json");
@@ -358,4 +366,11 @@ fn the_gemini_cli_extension_registers_its_three_events_as_plain_words() {
     let manifest = json("gemini-cli", "gemini-extension.json");
     assert_eq!(members(&manifest), ["description", "name", "version"]);
     assert_eq!(manifest["name"], "kalareach");
+
+    let record = json("gemini-cli", "gemini-extension-install.json");
+    assert_eq!(
+        record,
+        serde_json::json!({"source": "~/.gemini/extensions/kalareach", "type": "local"}),
+        "the install record names the extension's own directory as a local source"
+    );
 }
