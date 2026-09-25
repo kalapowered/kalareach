@@ -526,22 +526,36 @@ impl TransferModule {
 
     /// Expires everything whose retention has run out, under the archive's view of its sessions.
     ///
+    /// The daemon is asked one question, which sessions its registry still knows about, and is
+    /// held for that and for nothing else: not while the sweep waits for a blocking thread, and not
+    /// while the store sweeps. The sweep is the daemon's own background work, and it must never be
+    /// what keeps a daemon, and its environment's lock, alive once the daemon's owner has let it go.
+    ///
     /// # Errors
     ///
-    /// Returns the refusal the service decided.
-    pub async fn sweep(&self, controller: &Arc<Controller>) -> Answer<Sweep> {
+    /// Returns the refusal the service decided, and [`ErrorCode::ResourceUnavailable`] when the
+    /// daemon has gone before the sweep could ask it.
+    pub async fn sweep(&self, daemon: &Weak<Controller>) -> Answer<Sweep> {
         // The registry scan and the sweep are both storage work, so both run on the same blocking
         // task. Reading the registry means holding its lock, and that lock is a task-aware one, so
         // it is taken in its blocking form *inside* the blocking task rather than awaited on the
         // reactor and handed over.
-        let owner = Arc::clone(controller);
+        let daemon = Weak::clone(daemon);
         let service = Arc::clone(&self.service);
         blocking(move || {
             // The archive is the authority on what a session keeps. The sweep still asks one
             // question through one interface; what changed is which store answers it.
-            let retention = owner
-                .archive_retention()
-                .map_err(|error| error.to_protocol_error())?;
+            let retention = {
+                let owner = daemon.upgrade().ok_or_else(|| {
+                    ProtocolError::new(
+                        ErrorCode::ResourceUnavailable,
+                        "the daemon this sweep was for has stopped",
+                    )
+                })?;
+                owner
+                    .archive_retention()
+                    .map_err(|error| error.to_protocol_error())?
+            };
             service.sweep(&retention).map_err(Into::into)
         })
         .await
@@ -604,10 +618,11 @@ impl Controller {
     }
 }
 
-/// Starts the environment's attachment-chunk endpoint and its expiry sweep.
+/// Starts the environment's expiry sweep.
 ///
-/// Both tasks hold a weak reference to the daemon, so neither keeps it alive and both stop when it
-/// goes. The endpoint sits beside the control endpoint in the same owner-only runtime directory.
+/// The sweep holds the daemon weakly and asks it only the one question it needs answered
+/// ([`TransferModule::sweep`]), so it never keeps the daemon alive, and it stops when the daemon
+/// goes. The attachment-chunk endpoint is served by whoever runs the daemon ([`serve_chunks`]).
 ///
 /// # Errors
 ///
@@ -674,14 +689,20 @@ pub async fn serve_chunks(controller: Weak<Controller>, listener: Listener) {
 }
 
 /// Sweeps expired transfers until the daemon goes.
-async fn sweep_forever(controller: Weak<Controller>) {
+///
+/// What it holds through a sweep is the transfer module, never the daemon: a daemon let go while a
+/// sweep waits or runs is gone at once, and the sweep finds it gone when it asks.
+async fn sweep_forever(daemon: Weak<Controller>) {
     let mut interval = tokio::time::interval(SWEEP_INTERVAL);
     loop {
         interval.tick().await;
-        let Some(controller) = controller.upgrade() else {
+        let Some(transfer) = daemon
+            .upgrade()
+            .map(|controller| Arc::clone(controller.transfer()))
+        else {
             return;
         };
-        let _ = controller.transfer().sweep(&controller).await;
+        let _ = transfer.sweep(&daemon).await;
     }
 }
 
