@@ -12,7 +12,9 @@
 //!
 //! Every run is bounded by [`HOOK_DEADLINE`], well inside the shortest timeout any registration
 //! names (one second, for a session ending). When the deadline passes, the answer is written and
-//! the process ends, whatever is still in flight.
+//! the process ends, whatever is still in flight. The answer goes before anything the run says
+//! about itself: a diagnostic goes to standard error after it, in what remains of the deadline, so
+//! a standard error nobody reads can hold neither the answer nor the end.
 
 use std::time::Duration;
 
@@ -22,7 +24,8 @@ use crate::registration::{Bridge, Paths, Registration};
 /// The surface every hook declares itself to the worker as.
 pub const SURFACE: &str = "hook";
 
-/// How long one hook run may take, from start to answer.
+/// How long one hook run may take, from its start to its answer, and to its end with whatever it
+/// says on standard error after the answer.
 ///
 /// Every registration gives a session ending one second and every other event five. An
 /// application cancels a hook that reaches its timeout and discards its output, and Gemini CLI
@@ -123,15 +126,22 @@ pub fn run(application: &'static Application) -> std::process::ExitCode {
     std::thread::spawn(move || {
         let _ = finished.send(observe(application, started));
     });
-    match outcome.recv_timeout(HOOK_DEADLINE) {
-        Ok(Ok(())) => {}
-        Ok(Err(failure)) => crate::report(&failure),
-        Err(_) => crate::report(&format!(
+    let failure = match outcome.recv_timeout(HOOK_DEADLINE) {
+        Ok(Ok(())) => None,
+        Ok(Err(failure)) => Some(failure),
+        Err(_) => Some(format!(
             "the hook did not finish within {} ms, and answered anyway",
             HOOK_DEADLINE.as_millis()
         )),
+    };
+    // The application waits for the answer, and a standard error nobody reads can hold a write to
+    // it for as long as nobody reads it. So the answer goes first, and the diagnostic gets what
+    // remains of the deadline and no more.
+    answer();
+    if let Some(failure) = failure {
+        crate::report_within(&failure, HOOK_DEADLINE.saturating_sub(started.elapsed()));
     }
-    answer()
+    std::process::ExitCode::SUCCESS
 }
 
 /// Reads the event the application wrote and, inside a launch, reaches the worker with it.
@@ -432,13 +442,13 @@ impl<'de> serde::de::Visitor<'de> for RequestIdIn {
     }
 }
 
-/// Writes the neutral answer and ends with the code that blocks nothing.
-fn answer() -> std::process::ExitCode {
+/// Writes the neutral answer and flushes it, so the application has it before anything else the
+/// run does.
+fn answer() {
     use std::io::Write as _;
     let mut output = std::io::stdout().lock();
     let _ = writeln!(output, "{NEUTRAL_ANSWER}");
     let _ = output.flush();
-    std::process::ExitCode::SUCCESS
 }
 
 #[cfg(test)]
