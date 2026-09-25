@@ -1040,11 +1040,15 @@ fn excluded_states() -> Vec<DetachExclusion> {
 /// KR-REQ-07.73's package half, and `veof-change`, `veof-disabled`.
 pub fn the_gesture_follows_the_line_discipline(kind: ShellKind) {
     let speech = dialect(kind);
+    // An editor whose gesture is a chord the worker configures, rather than the line discipline's
+    // own character, is not one this case is for: `psreadline-chord-gesture` is the scenario for
+    // that, and a suite that named this case for such an editor would pass it without a check.
     let (Some(change), Some(disable)) = (speech.veof_change, speech.veof_disable) else {
-        // This editor's gesture is a chord the worker configures rather than the line discipline's
-        // own character, which `psreadline-chord-gesture` is the scenario for.
-        println!("skipped: {} follows a configured chord", kind.as_str());
-        return;
+        panic!(
+            "{} follows a configured chord rather than the terminal's end-of-file character, so \
+             this case is not one of its",
+            kind.as_str()
+        );
     };
     let Some(package) = Package::found(kind) else {
         return;
@@ -1662,14 +1666,15 @@ pub fn a_lost_bridge_does_not_restore_a_native_empty_prompt_end_of_file(kind: Sh
 
 /// `takeover-partial-escape` and `takeover-quoted-insertion`: the cancellation the contract needs.
 pub fn a_takeover_ends_a_pending_key_wait_and_keeps_the_buffer(kind: ShellKind) {
-    let Some(package) = Package::found(kind) else {
-        return;
-    };
-    let Some(wait) = pending_wait(kind) else {
-        println!(
-            "skipped: {} has no key wait a takeover can end",
+    // A reader with no key wait a takeover can end is not one this case is for, and a suite that
+    // named it for one would pass it without a check.
+    let wait = pending_wait(kind).unwrap_or_else(|| {
+        panic!(
+            "{} has no key wait a takeover can end, so this case is not one of its",
             kind.as_str()
-        );
+        )
+    });
+    let Some(package) = Package::found(kind) else {
         return;
     };
     let mut session = Session::start(&package);
@@ -1881,8 +1886,8 @@ pub fn a_cancellation_that_ends_nothing_leaves_the_next_sequence_alone(kind: She
     // finish rather than something that cancellation takes away.
     let Some(wait) = wait else {
         // Nothing of this package's runs on this reader's thread while the editor is inside one of
-        // its own nested reads, so there is no part-read sequence to leave alone.
-        println!("skipped: {} has no key wait to leave alone", kind.as_str());
+        // its own nested reads, so there is no part-read sequence to leave alone, and the half
+        // above is the whole of this case for it.
         return;
     };
     session.type_bytes(wait.enter);
@@ -1926,18 +1931,10 @@ pub fn a_cancellation_that_ends_nothing_leaves_the_next_sequence_alone(kind: She
 
 /// KR-REQ-07.72: the person's own IGNORE_EOF setting is left as they set it.
 pub fn the_ignore_eof_setting_is_left_as_the_person_set_it(kind: ShellKind) {
-    if dialect(kind).ignore_eof_on.is_none() {
-        println!(
-            "skipped: {} has no end-of-file setting of its own",
-            kind.as_str()
-        );
-        return;
-    }
-    let Some(package) = Package::found(kind) else {
-        return;
-    };
     // The report puts its answer together out of pieces, so the word appears on the screen because
-    // the setting was still on and not because the line that asked was echoed back.
+    // the setting was still on and not because the line that asked was echoed back. A shell with no
+    // end-of-file setting of its own is not one this case is for, and a suite that named it for one
+    // would pass it without a check.
     let (turn_on, report) = match kind {
         ShellKind::Zsh => (
             "setopt ignoreeof; printf '%s%s\\n' kr-ignoreeof- set",
@@ -1947,13 +1944,13 @@ pub fn the_ignore_eof_setting_is_left_as_the_person_set_it(kind: ShellKind) {
             "set -o ignoreeof; printf '%s%s\\n' kr-ignoreeof- set",
             "[[ -o ignoreeof ]] && printf '%s%s\\n' kr-ignoreeof= on",
         ),
-        _ => {
-            println!(
-                "skipped: {} has no end-of-file setting of its own",
-                kind.as_str()
-            );
-            return;
-        }
+        ShellKind::Fish | ShellKind::PowerShell => panic!(
+            "{} has no end-of-file setting of its own, so this case is not one of its",
+            kind.as_str()
+        ),
+    };
+    let Some(package) = Package::found(kind) else {
+        return;
     };
     let mut session = Session::start(&package);
     session.first_prompt();

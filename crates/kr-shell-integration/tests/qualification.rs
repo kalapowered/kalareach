@@ -2492,7 +2492,7 @@ fn the_upstream_register_agrees_with_the_pins_and_with_what_is_installed() {
             "fish" => ShellKind::Fish,
             other => panic!("the register names a package called {other}"),
         };
-        let Ok(installed) = Package::find(kind) else {
+        let Some(installed) = Package::found(kind) else {
             continue;
         };
         let record = &installed.record;
@@ -2645,13 +2645,22 @@ fn a_live_session_keeps_the_package_it_started_with() {
     let Some(installed) = Package::found(ShellKind::Zsh) else {
         return;
     };
-    let Some(index) = installed_stacks() else {
-        return;
-    };
     let case = cases()
         .into_iter()
         .find(|case| case.id == "zsh-plain")
         .expect("the plain Zsh case is committed");
+    // The plain case installs no customisation, so it resolves against an index with none in it,
+    // and it runs whether or not any customisation has been fetched here.
+    assert!(
+        case.requires.is_empty(),
+        "the plain Zsh case requires {:?}, and this check starts it with no customisation",
+        case.requires
+    );
+    let index = StackIndex {
+        platform: host_platform(),
+        lock_sha256: String::new(),
+        stacks: Vec::new(),
+    };
 
     // Two installations of one package is what a person has after an update, so this needs two
     // builds. They cannot be made by copying one under another name: a package declares the build
