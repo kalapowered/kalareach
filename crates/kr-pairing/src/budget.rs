@@ -36,6 +36,7 @@ use std::sync::Arc;
 
 use kr_crypto::secret::SymmetricKey;
 use kr_crypto::store::{SecretName, SecretStore};
+use kr_ipc::paths::{NameKind, flush_directory};
 use kr_protocol::scalars::Mac256;
 use serde::{Deserialize, Serialize};
 
@@ -130,7 +131,7 @@ impl DurableClientBudgetStore {
                 .and_then(|file| file.sync_all())
                 .map_err(|error| io_error("create", &path, &error))?;
         }
-        sync_directory(&store.directory)?;
+        sync_directory(&store.directory, NameKind::File)?;
         Ok(store)
     }
 
@@ -534,7 +535,7 @@ fn flush_resolution(path: &Path) -> Result<()> {
             reached.pop();
             continue;
         }
-        sync_directory(&reached)?;
+        sync_directory(&reached, NameKind::Directory)?;
         let next = reached.join(&name);
         let metadata =
             std::fs::symlink_metadata(&next).map_err(|error| io_error("inspect", &next, &error))?;
@@ -562,11 +563,15 @@ fn flush_resolution(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Windows has no directory handle to flush. The slots are created once, flushed as files, and
-/// never renamed, so no copy's durability rests on a directory entry changing.
+/// Flushes each directory in which an entry is looked up to find `path` again, and the directory
+/// itself, through the host's own walk of a path.
+///
+/// That walk resolves the path the way this platform does, following a junction to where it leads,
+/// and passes over a directory on the way that this account may not add to, which holds no name
+/// this account made.
 #[cfg(not(unix))]
-fn flush_resolution(_path: &Path) -> Result<()> {
-    Ok(())
+fn flush_resolution(path: &Path) -> Result<()> {
+    kr_ipc::paths::flush_path_names(path).map_err(|error| io_error("flush", path, &error))
 }
 
 /// Options that create a file only its owner can read and write.
@@ -594,21 +599,14 @@ fn reject_link(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Flushes a directory's entries to the device, so a file created in it survives a crash.
-#[cfg(unix)]
-fn sync_directory(directory: &Path) -> Result<()> {
-    #[cfg(test)]
+/// Flushes a directory's entries to the device, so a name created in it survives a crash.
+///
+/// `kind` is the name that was created, a file's or a directory's, which is the right the flush's
+/// handle asks for on Windows.
+fn sync_directory(directory: &Path, kind: NameKind) -> Result<()> {
+    #[cfg(all(test, unix))]
     tests::flushed(directory);
-    File::open(directory)
-        .and_then(|handle| handle.sync_all())
-        .map_err(|error| io_error("flush", directory, &error))
-}
-
-/// Windows has no directory handle to flush. The slots are created once, flushed as files, and
-/// never renamed, so no copy's durability rests on a directory entry changing.
-#[cfg(not(unix))]
-fn sync_directory(_directory: &Path) -> Result<()> {
-    Ok(())
+    flush_directory(directory, kind).map_err(|error| io_error("flush", directory, &error))
 }
 
 fn io_error(what: &str, path: &Path, error: &std::io::Error) -> PairingError {
@@ -1341,5 +1339,74 @@ mod tests {
             DurableClientBudgetStore::open(&directory, memory(), "client"),
             Err(PairingError::Store { .. })
         ));
+    }
+
+    /// Holds a directory open through a handle that shares no writing with any other.
+    ///
+    /// A name can still be created in the directory while it is held, since that opens the name
+    /// rather than the directory, but nothing can open the directory itself with a right to add to
+    /// it, which is what a flush of it has to do on Windows.
+    #[cfg(windows)]
+    fn hold_without_shared_writing(directory: &Path) -> File {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        /// The right to list a directory, which is all the handle holds.
+        const FILE_LIST_DIRECTORY: u32 = 0x0001;
+        /// Reading is shared with other handles.
+        const FILE_SHARE_READ: u32 = 0x0001;
+        /// Deleting is shared; writing is not.
+        const FILE_SHARE_DELETE: u32 = 0x0004;
+        /// What lets a program open a directory at all.
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+        OpenOptions::new()
+            .access_mode(FILE_LIST_DIRECTORY)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(directory)
+            .expect("the directory is held")
+    }
+
+    /// KR-REQ-10.32: opening the budget flushes the directory that names it and the directory
+    /// itself, here through a handle on each that may add to it. While a handle that shares no
+    /// writing holds either one, the budget does not open, so no charge is recorded in a directory
+    /// a crash could take away; once it is let go, the same budget opens and records a charge.
+    #[cfg(windows)]
+    #[test]
+    fn a_budget_whose_directories_cannot_be_flushed_does_not_open() {
+        let scratch = Scratch::new("held");
+        let secrets = memory();
+        let directory = scratch.0.join("budget");
+        std::fs::create_dir(&directory).expect("the budget's directory");
+        for held in [&directory, &scratch.0] {
+            let holding = hold_without_shared_writing(held);
+            let opened = DurableClientBudgetStore::open(&directory, Arc::clone(&secrets), "client");
+            drop(holding);
+            let Err(refused) = opened else {
+                panic!(
+                    "the budget opened while {} could not be flushed",
+                    held.display()
+                );
+            };
+            assert!(matches!(refused, PairingError::Store { .. }), "{refused}");
+        }
+        let store = DurableClientBudgetStore::open(&directory, secrets, "client")
+            .expect("with nothing held, the budget opens");
+        assert_eq!(charge(&store, &TestClock::new(), 1), 1);
+    }
+
+    /// The flush that makes the lock and the slots durable once the open has created them asks for
+    /// a handle on their directory that may add a file to it, so a handle that shares no writing
+    /// stops it, and it is made once that handle is let go.
+    #[cfg(windows)]
+    #[test]
+    fn the_names_made_in_the_budget_directory_are_flushed_into_it() {
+        let scratch = Scratch::new("slots");
+        let holding = hold_without_shared_writing(&scratch.0);
+        let refused = sync_directory(&scratch.0, NameKind::File)
+            .expect_err("the flush is refused while the directory is held");
+        assert!(matches!(refused, PairingError::Store { .. }), "{refused}");
+        drop(holding);
+        sync_directory(&scratch.0, NameKind::File).expect("and made once it is let go");
     }
 }
