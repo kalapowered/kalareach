@@ -692,11 +692,19 @@ async fn every_plugin_operation_reaches_its_method() {
 /// What a scripted daemon was asked, method by method.
 type Asked = Arc<Mutex<Vec<String>>>;
 
-/// Serves local callers on `temp`'s endpoint, answering every mutation with `answer` and recording
-/// the name of every method it is asked.
+/// What a scripted daemon answers one method with.
+type Script = Box<dyn Fn(&str) -> Result<ParamsValue, ProtocolError> + Send + Sync>;
+
+/// A script that answers every method the same way.
+fn always(answer: Result<ParamsValue, ProtocolError>) -> Script {
+    Box::new(move |_| answer.clone())
+}
+
+/// Serves local callers on `temp`'s endpoint, answering every request and mutation as `script`
+/// says for its method and recording the name of every method it is asked.
 fn scripted_daemon(
     temp: &kr_ipc::testing::TempHost,
-    answer: Result<ParamsValue, ProtocolError>,
+    script: Script,
 ) -> (Asked, tokio::task::JoinHandle<()>) {
     let endpoint = temp
         .environment()
@@ -753,11 +761,11 @@ fn scripted_daemon(
                     }
                     _ => continue,
                 };
-                recorded.lock().expect("the record").push(method);
-                let outcome = match &answer {
-                    Ok(value) => Outcome::Ok(value.clone()),
-                    Err(error) => Outcome::Error(error.clone()),
+                let outcome = match script(&method) {
+                    Ok(value) => Outcome::Ok(value),
+                    Err(error) => Outcome::Error(error),
                 };
+                recorded.lock().expect("the record").push(method);
                 let response = ControlFrame::Response(Response {
                     request_id,
                     outcome,
@@ -796,10 +804,10 @@ async fn an_installation_that_needs_the_owners_confirmation_is_sent_to_an_owner_
     let temp = kr_ipc::testing::TempHost::create();
     let (asked, serving) = scripted_daemon(
         &temp,
-        Err(ProtocolError::new(
+        always(Err(ProtocolError::new(
             ErrorCode::OwnerConfirmationRequired,
             "the installation may do more than its repository permits by itself",
-        )),
+        ))),
     );
     let (status, refused) = json(&temp, &install_line());
     assert_eq!(status, Some(8), "{refused}");
@@ -835,7 +843,7 @@ async fn an_installation_that_needs_the_owners_confirmation_is_sent_to_an_owner_
     };
     let (asked, serving) = scripted_daemon(
         &temp,
-        Ok(ParamsValue::from_typed(&installed).expect("a result")),
+        always(Ok(ParamsValue::from_typed(&installed).expect("a result"))),
     );
     let (status, document) = json(&temp, &install_line());
     assert_eq!(status, Some(0), "{document}");
@@ -886,7 +894,7 @@ async fn an_apply_the_daemon_did_not_finish_is_a_failure_with_its_whole_result()
     };
     let (asked, serving) = scripted_daemon(
         &temp,
-        Ok(ParamsValue::from_typed(&interrupted).expect("a result")),
+        always(Ok(ParamsValue::from_typed(&interrupted).expect("a result"))),
     );
     let change_set = change_set.to_string();
     let line = [
@@ -927,6 +935,99 @@ async fn an_apply_the_daemon_did_not_finish_is_a_failure_with_its_whole_result()
     assert_eq!(
         *asked.lock().expect("the record"),
         ["diff.apply", "diff.apply"]
+    );
+    serving.abort();
+}
+
+/// KR-REQ-07.47 and section 9's barrier: a revocation some affected session's worker has not
+/// fenced yet is pending, not a success. The command says which worker it waits for and why, exits
+/// with a status other than zero, and keeps the whole result in its document. A real daemon waits
+/// on a live session's worker that has not answered, which this suite has none of, so a scripted
+/// one answers here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revocation_a_worker_has_not_fenced_is_pending_and_not_a_success() {
+    use kr_protocol::action::{BarrierState, RevocationBarrier, WorkerBarrier};
+    use kr_protocol::sharing::{DeviceListResult, DeviceSummary, RevocationResult};
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let device = DeviceId::new(Uuid::from_bytes([0xd4; 16]));
+    let session = kr_protocol::ids::SessionId::new(Uuid::from_bytes([0x5e; 16]));
+    let listed = DeviceListResult {
+        devices: vec![DeviceSummary {
+            device_id: device,
+            display_name: "phone".to_owned(),
+            grant_id: GrantId::new(Uuid::from_bytes([0x61; 16])),
+            paired_at_ms: TimestampMs::new(1_000),
+            acknowledged_revision: Nullable::null(),
+            acknowledged_at_ms: Nullable::null(),
+            revoked: false,
+            keys: Nullable::null(),
+            manages_host: false,
+        }],
+        authority_revision: AuthorityRevision::new(1),
+        feed_synchronised_at_ms: Nullable::null(),
+        feed_stale: false,
+    };
+    let revoked = RevocationResult {
+        authority_revision: AuthorityRevision::new(2),
+        revoked_grants: [GrantId::new(Uuid::from_bytes([0x61; 16]))]
+            .into_iter()
+            .collect(),
+        barrier: RevocationBarrier {
+            authority_revision: AuthorityRevision::new(2),
+            workers: vec![WorkerBarrier {
+                session_id: session,
+                state: BarrierState::Pending,
+                acknowledged_revision: Nullable::null(),
+                rejected_actions: Vec::new(),
+                possibly_executed: Vec::new(),
+                omitted_actions: kr_protocol::scalars::U64::new(0),
+                names_pending: kr_protocol::scalars::U64::new(0),
+                detail: "the worker has not answered yet".to_owned(),
+            }],
+        },
+    };
+    let listed = ParamsValue::from_typed(&listed).expect("a listing");
+    let revoked = ParamsValue::from_typed(&revoked).expect("a revocation");
+    let (asked, serving) = scripted_daemon(
+        &temp,
+        Box::new(move |method| match method {
+            "device.list" => Ok(listed.clone()),
+            "device.revoke" => Ok(revoked.clone()),
+            other => Err(ProtocolError::new(
+                ErrorCode::InvalidArgument,
+                format!("this daemon answers no {other}"),
+            )),
+        }),
+    );
+    let device = device.to_string();
+    let (status, document) = json(&temp, &["device", "revoke", &device]);
+    assert_eq!(status, Some(1), "{document}");
+    assert_eq!(document["ok"], Value::Bool(false), "{document}");
+    assert_eq!(document["code"], "RESOURCE_UNAVAILABLE", "{document}");
+    assert_eq!(
+        document["barrier"]["workers"][0]["state"], "pending",
+        "the per-worker status is kept: {document}"
+    );
+    let output = run_kr(&temp, &["device", "revoke", &device]);
+    assert_eq!(output.status.code(), Some(1));
+    let said = String::from_utf8_lossy(&output.stdout);
+    assert!(said.contains("is pending"), "{said}");
+    assert!(!said.contains("Revoked device"), "{said}");
+    assert!(
+        said.contains(&format!(
+            "session {session}: pending (the worker has not answered yet)"
+        )),
+        "{said}"
+    );
+    assert_eq!(
+        *asked.lock().expect("the record"),
+        [
+            "device.list",
+            "device.revoke",
+            "device.list",
+            "device.revoke"
+        ]
     );
     serving.abort();
 }

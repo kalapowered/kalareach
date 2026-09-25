@@ -911,8 +911,11 @@ paired is refused with `RESOURCE_UNAVAILABLE` and nothing is sent; a device alre
 with its revocation as it stands.
 
 A revocation is complete when every affected session's worker has fenced it, so the command says
-how far they have got. A worker that has not is named with the reason the host gives, and so is
-any action a worker could not show did not run before the revocation reached it.
+how far they have got. Until then it is pending, not a success: the command names each worker it
+waits for with the reason the host gives, and exits with 1 and `RESOURCE_UNAVAILABLE`; its `--json`
+document is the host's whole result with the failure beside it. Running it again reports how far
+the revocation has got. A worker that has fenced it but whose evidence has not all arrived is named
+too, and so is any action a worker could not show did not run before the revocation reached it.
 
 ## `kr plugin`
 
