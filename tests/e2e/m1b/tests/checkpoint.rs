@@ -142,7 +142,7 @@ fn the_site_answers_and_a_host_reserves_its_invitations_there() {
         .unwrap_or_else(|why| panic!("the room could not be asked: {why}"));
     assert!(
         !served,
-        "a withdrawn invitation's locator is released: its room serves no record"
+        "once the invitation is withdrawn, its locator's room serves no record"
     );
 
     let closing = close(&run, &host);
@@ -150,8 +150,8 @@ fn the_site_answers_and_a_host_reserves_its_invitations_there() {
     checkpoint.left(
         LEG,
         &format!(
-            "nothing: locator {} was reserved for one invitation and released when it was \
-             withdrawn, and its room serves no record",
+            "nothing that a new candidate is served: locator {} was reserved for one \
+             invitation, and once the invitation was withdrawn its room served no record",
             locator.as_str()
         ),
     );
@@ -279,7 +279,7 @@ fn a_device_pairs_by_code_through_the_site_and_by_direct_qr_over_loopback() {
         .unwrap_or_else(|why| panic!("the room could not be asked: {why}"));
     assert!(
         !served,
-        "a consumed invitation's locator is released: its room serves no record"
+        "once the invitation is consumed, its locator's room serves no record"
     );
 
     // A direct invitation on a host with an owner: each owner step is the first device's.
@@ -364,8 +364,9 @@ fn a_device_pairs_by_code_through_the_site_and_by_direct_qr_over_loopback() {
     checkpoint.left(
         LEG,
         &format!(
-            "nothing: locator {} was reserved for one invitation, reached by two candidate \
-             sockets, and released when the pairing committed; its room serves no record",
+            "nothing that a new candidate is served: locator {} was reserved for one \
+             invitation and reached by two candidate sockets, and once the pairing committed its \
+             room served no record",
             locator.as_str()
         ),
     );
