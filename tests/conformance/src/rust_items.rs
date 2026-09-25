@@ -88,8 +88,8 @@ pub struct Test {
     /// Every identifier its body uses, which is how a case table's consumers are found.
     pub uses: BTreeSet<String>,
     /// Every function its body calls, as the path it is called by: `helper()` is `[helper]` and
-    /// `shellpkg::helper()` is `[shellpkg, helper]`. A method call, a macro and a name that is
-    /// not called are not calls.
+    /// `shellpkg::helper()` is `[shellpkg, helper]`. A method call, a macro, a name that is not
+    /// called and a call whose first name the body may bind for itself are left out.
     pub calls: BTreeSet<Vec<String>>,
     /// The names its body's own `use` declarations bring in.
     pub imports: Vec<Import>,
@@ -836,25 +836,35 @@ fn use_tree(tokens: &[Token], mut at: usize, prefix: &[String], found: &mut Vec<
     }
 }
 
-/// Every function call in `tokens`, a function's body, as the path it is called by.
+/// Every function call in `tokens`, a function's body, that may reach a function of the module, as
+/// the path it is called by.
 ///
 /// A call is a name followed by an opening parenthesis, or by a turbofish and then one, with the
 /// `::`-joined names before it as its path. A name after a full stop is a method, a name before `!`
 /// is a macro, and the name a definition gives after `fn`, `struct` or `macro_rules!` is what it
 /// defines; none of them is a call of a free function.
 ///
-/// A call by a single name is kept only when the body shows that name nowhere but in calls of it.
-/// Whatever can bind a name in a body, and so make a call of it a call of something of the body's
-/// own, shows the name in a place no call has: a `let` of any pattern, an `if let` or `while
-/// let`, a `match` arm, a `for`, a closure's parameters, a nested function's name or parameters,
-/// a nested tuple struct or constant. So a call the body may have bound for itself is never taken
-/// for a function of the module, and no form of binding needs reading one by one. Where the name
-/// shows after a full stop or `::`, or before `::` or `!`, it is a method, a field, part of a
-/// path or a macro, which binds nothing, and it does not count.
+/// A call is resolved from the body's own scope unless its path starts at `crate`, `self` or
+/// `super`, and such a call is kept only when nothing in the body can bind its first name:
+///
+/// * The body shows that name nowhere but in calls and paths. Whatever binds a name in a body
+///   shows it in a place no call has: a `let` of any pattern, an `if let` or `while let`, a
+///   `match` arm, a `for`, a closure's parameters, a nested function's name or parameters, a
+///   nested module, type or constant. So no form of binding needs reading one by one. Where the
+///   name shows after a full stop or `::`, or before `::` or `!`, it is a method, a field, part of
+///   a path or a macro, which binds nothing, and it does not count; a type annotation that starts
+///   at the root (`name: ::std::...`) is no path and counts.
+/// * The body invokes no macro but those [`transparent`] names, because any other expansion may
+///   define an item of that name where the body cannot show it.
+///
+/// So a call the body may have bound for itself is never taken for a function of the module. A
+/// body's `use` declarations are the map's to read.
 fn calls(tokens: &[Token]) -> BTreeSet<Vec<String>> {
     let mut found = BTreeSet::new();
     // Every name the body shows other than in a call, a method, a path or a macro.
     let mut elsewhere: BTreeSet<&str> = BTreeSet::new();
+    // Whether the body invokes a macro whose expansion may bind a name out of sight.
+    let mut opaque = false;
     for (index, token) in tokens.iter().enumerate() {
         let Some(name) = token.ident() else {
             continue;
@@ -872,35 +882,114 @@ fn calls(tokens: &[Token]) -> BTreeSet<Vec<String>> {
         if punct_before(1, '.') {
             continue;
         }
+        if punct_after(1, '!') && ['(', '[', '{'].into_iter().any(|c| punct_after(2, c)) {
+            opaque |= !transparent(&path_to(tokens, index).0);
+            continue;
+        }
         let before = index.checked_sub(1).and_then(|at| tokens[at].ident());
         let defined = matches!(before, Some("fn" | "struct"))
             || (punct_before(1, '!')
                 && index.checked_sub(2).and_then(|at| tokens[at].ident()) == Some("macro_rules"));
         if !defined && called_after(tokens, index + 1) {
-            let mut path = vec![name.to_owned()];
-            let mut at = index;
-            // Walk back over `segment ::` pairs.
-            while at >= 3
-                && tokens[at - 1].is_punct(':')
-                && tokens[at - 2].is_punct(':')
-                && let Some(segment) = tokens[at - 3].ident()
-            {
-                path.insert(0, segment.to_owned());
-                at -= 3;
-            }
-            if at > 0 && tokens[at - 1].is_punct('.') {
+            let (path, start) = path_to(tokens, index);
+            if start > 0 && tokens[start - 1].is_punct('.') {
                 continue;
             }
             found.insert(path);
         } else if !(punct_before(1, ':') && punct_before(2, ':'))
-            && !(punct_after(1, ':') && punct_after(2, ':'))
+            && !(punct_after(1, ':') && punct_after(2, ':') && !punct_after(3, ':'))
             && !punct_after(1, '!')
         {
             elsewhere.insert(name);
         }
     }
-    found.retain(|path| !matches!(path.as_slice(), [name] if elsewhere.contains(name.as_str())));
+    found.retain(|path| {
+        matches!(path[0].as_str(), "crate" | "self" | "super")
+            || !(opaque || elsewhere.contains(path[0].as_str()))
+    });
     found
+}
+
+/// The path that ends at the name at `index`, the name and the `segment ::` pairs before it, and
+/// the index of its first segment.
+fn path_to(tokens: &[Token], index: usize) -> (Vec<String>, usize) {
+    let mut path: Vec<String> = tokens[index]
+        .ident()
+        .map(str::to_owned)
+        .into_iter()
+        .collect();
+    let mut at = index;
+    while at >= 3
+        && tokens[at - 1].is_punct(':')
+        && tokens[at - 2].is_punct(':')
+        && let Some(segment) = tokens[at - 3].ident()
+    {
+        path.insert(0, segment.to_owned());
+        at -= 3;
+    }
+    (path, at)
+}
+
+/// Whether the macro `path` names is taken to bind nothing in a body beyond what its arguments
+/// show, and to define no item a test's helper could be named after: the standard library's
+/// macros that expand to an expression or to items named in their arguments, by name or by their
+/// `std`, `core` or `alloc` path, and the pinned crates' of that kind the tests invoke by path.
+fn transparent(path: &[String]) -> bool {
+    const STANDARD: &[&str] = &[
+        "assert",
+        "assert_eq",
+        "assert_ne",
+        "cfg",
+        "column",
+        "compile_error",
+        "concat",
+        "dbg",
+        "debug_assert",
+        "debug_assert_eq",
+        "debug_assert_ne",
+        "env",
+        "eprint",
+        "eprintln",
+        "file",
+        "format",
+        "format_args",
+        "include_bytes",
+        "include_str",
+        "line",
+        "matches",
+        "module_path",
+        "option_env",
+        "panic",
+        "print",
+        "println",
+        "stringify",
+        "thread_local",
+        "todo",
+        "unimplemented",
+        "unreachable",
+        "vec",
+        "write",
+        "writeln",
+    ];
+    const BY_PATH: &[&str] = &[
+        "core::mem::offset_of",
+        "core::pin::pin",
+        "rusqlite::params",
+        "serde_json::json",
+        "std::mem::offset_of",
+        "std::pin::pin",
+        "tokio::join",
+        "tokio::pin",
+        "tokio::select",
+        "tokio::try_join",
+    ];
+    match path {
+        [name] => STANDARD.contains(&name.as_str()),
+        [root, name] if matches!(root.as_str(), "std" | "core" | "alloc") => {
+            STANDARD.contains(&name.as_str())
+        }
+        _ => BY_PATH.contains(&path.join("::").as_str()),
+    }
 }
 
 /// Whether the tokens from `at` open a call's arguments: `(`, or a turbofish `::<...>` and then `(`.
@@ -1126,8 +1215,36 @@ mod tests {
             "fn inner(shared: fn()) { shared() }",
             "struct shared(u8); shared(1);",
             "const shared: fn() = other; shared();",
+            "let shared: ::std::boxed::Box<dyn Fn()> = Box::new(|| {}); shared();",
+            "let run = |shared: ::std::boxed::Box<dyn Fn()>| shared();",
+            // A macro other than those taken to bind nothing out of sight may define it.
+            "defines_it!(); shared();",
+            "shared!(1); shared();",
+            "helpers::defines_it! {} shared();",
+            "include!(\"cases.rs\"); shared();",
+            "std::include!(\"cases.rs\"); shared();",
         ] {
             assert!(!read(body).contains(&shared), "{body}: {:?}", read(body));
+        }
+        // The same holds for the first name of a path, which a nested module or type can bind.
+        let nested = vec!["cases".to_owned(), "brought_up".to_owned()];
+        for body in [
+            "mod cases { pub fn brought_up() {} } cases::brought_up();",
+            "enum cases {} cases::brought_up();",
+            "defines_it!(); cases::brought_up();",
+        ] {
+            assert!(!read(body).contains(&nested), "{body}: {:?}", read(body));
+        }
+        assert!(read("cases::brought_up();").contains(&nested));
+        // A path that starts at the crate, the module or its parent passes over the body's scope.
+        let anchored = read(
+            "defines_it!(); let shared = 1; crate::shared(); self::shared(); super::shared();",
+        );
+        for root in ["crate", "self", "super"] {
+            assert!(
+                anchored.contains(&vec![root.to_owned(), "shared".to_owned()]),
+                "{root}: {anchored:?}"
+            );
         }
         // What a definition names is no call of it.
         for body in [
@@ -1137,15 +1254,22 @@ mod tests {
         ] {
             assert!(!read(body).contains(&shared), "{body}: {:?}", read(body));
         }
-        // A method, a segment of a path, a `use` declaration's included, and a macro bind nothing
-        // in the body.
+        // A method, a segment of a path, a `use` declaration's included, and a turbofish bind
+        // nothing in the body.
         for body in [
             "value.shared(); shared();",
             "let f = other::shared; shared();",
             "shared::inner(); shared();",
-            "shared!(1); shared();",
             "use other::shared as renamed; shared();",
             "shared(); shared(2);",
+            "let f = shared::<u8>; shared();",
+            // The standard library's macros and the pinned crates' taken by path bind nothing out
+            // of sight.
+            "assert_eq!(shared(), 1); println!(\"{}\", 1);",
+            "let v = vec![1]; std::println!(\"{v:?}\"); shared();",
+            "let value = serde_json::json!({ \"a\": 1 }); shared();",
+            "tokio::select! { _ = first => {} } shared();",
+            "let pinned = std::pin::pin!(future); shared();",
         ] {
             assert!(read(body).contains(&shared), "{body}: {:?}", read(body));
         }
