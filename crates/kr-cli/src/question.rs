@@ -522,8 +522,8 @@ fn answer_words(answer: &QuestionAnswer) -> String {
 ///
 /// A session's worker is found by its descriptor and proved against it before anything is sent to
 /// it, as every command that reaches a worker proves it, and one connection to it is kept for the
-/// length of the command. What became of the last answer that was not taken is remembered, so the
-/// person can be told why it was kept.
+/// length of the command. What the attempt to send an answer established is recorded step by step,
+/// and why it failed beside it, so the person is told what is known of the answer and no more.
 pub struct Workers {
     paths: HostPaths,
     build_id: BuildId,
@@ -621,9 +621,9 @@ impl Workers {
     ///
     /// A session ends only when its environment's daemon says so: a closure its registry keeps, or
     /// no record at all of a session whose descriptor is proved absent. That, and nothing else, is
-    /// the host's own `UNKNOWN_SESSION`, which retires a kept answer as gone. A descriptor that is
-    /// missing, a descriptor or directory that cannot be read or trusted, and a worker that cannot
-    /// be reached, say nothing about whether the session ended; each is a failure that retires
+    /// the host's own `UNKNOWN_SESSION`, which retires a kept answer as gone. On their own, a
+    /// descriptor that is missing, a descriptor or directory that cannot be read or trusted, and a
+    /// worker that cannot be reached say nothing about whether the session ended, and retire
     /// nothing.
     async fn open(&self, session_id: SessionId) -> std::result::Result<LocalClient, ClientError> {
         let Some(descriptor) = self.descriptor(session_id)? else {
