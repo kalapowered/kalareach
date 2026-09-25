@@ -197,6 +197,14 @@ impl Host {
         self.state().behaviour = behaviour;
     }
 
+    /// Makes the store of kept answers read-only, creating it first when `kr` has not.
+    fn lock_store(&self) {
+        let store = self.state().store.clone();
+        std::fs::create_dir_all(&store).expect("the store");
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o500))
+            .expect("the store is read-only");
+    }
+
     /// Lets `kr` write to the store of kept answers again.
     fn unlock_store(&self) {
         let store = self.state().store.clone();
@@ -732,6 +740,32 @@ async fn an_answer_the_worker_could_not_take_is_kept_and_nothing_is_sent() {
     assert_eq!(document["state"], "answered", "{document}");
     assert_eq!(host.answers_received(), 1);
     assert!(!host.kept().exists(), "an answer that went is not kept");
+}
+
+/// KR-REQ-11.63: an answer its worker could not take that cannot be kept on this device either is
+/// reported as both, so the person knows it is in neither place, and it is never called unsent
+/// when it may have arrived.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_that_can_be_neither_taken_nor_kept_says_so() {
+    let host = Host::start(Behaviour::EndsAfterTheRead).await;
+    let question = host.question();
+    host.lock_store();
+    let (status, document) = host.json(&["question", "answer", &question, "--choice", "left"]);
+    host.unlock_store();
+    assert_eq!(status, Some(1), "{document}");
+    assert!(document.get("kept").is_none(), "{document}");
+    let message = document["message"].as_str().expect("a message");
+    assert!(
+        message.contains("could not be kept on this device"),
+        "{message}"
+    );
+    assert!(
+        message.contains("this command did not send it") || message.contains("is not known"),
+        "{message}"
+    );
+    assert!(!message.contains("was not sent"), "{message}");
+    assert!(!host.kept().exists(), "nothing is kept");
+    assert_eq!(host.answers_received(), 0, "nothing was taken");
 }
 
 /// KR-REQ-11.63: a kept answer whose question is still pending at the revision it answered is

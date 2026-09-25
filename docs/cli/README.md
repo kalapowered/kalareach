@@ -544,9 +544,10 @@ What the command says of the answer is what its attempt established, step by ste
 send it, that the worker did not take it, or that whether the worker took it is not known, which it
 never calls unsent. A reply that is not a message is the worker's own answer rather than a lost
 connection, so it is shown as a refusal that says the answer's fate is not known, and nothing is
-kept. A worker that replied that it took the answer took it: when that reply cannot be read, or the
-copy kept on this device cannot be removed afterwards, the command says the worker took the answer
-and exits with 1, and the next `kr question drafts` retires any copy still kept.
+kept. An answer that can be neither taken nor kept is reported as both, with exit status 1. A worker
+that replied that it took the answer took it: when that reply cannot be read, or the copy kept on
+this device cannot be removed afterwards, the command says the worker took the answer and exits with
+1, and the next `kr question drafts` retires any copy still kept.
 
 `kr question drafts` reads each kept answer's question again. An answer whose question is still
 pending at the revision it answered is offered, and stays kept. Any other is retired: its question

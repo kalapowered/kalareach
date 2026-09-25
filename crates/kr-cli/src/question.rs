@@ -148,8 +148,8 @@ pub async fn answer(
         Ok(Answered::Kept(draft)) => Err(kept(&workers, draft.question_id, "was kept")),
         // What the failure says of the answer is what the attempt established, not what the
         // failure's kind suggests.
-        Err(error) => Err(match workers.delivery() {
-            Delivery::Taken => {
+        Err(error) => Err(match (workers.delivery(), error) {
+            (Delivery::Taken, error) => {
                 let still_kept = kept_draft(&drafts, question_id)?.is_some();
                 taken(
                     &workers,
@@ -159,8 +159,12 @@ pub async fn answer(
                     still_kept,
                 )
             }
-            Delivery::Unknown => unkept(&workers, question_id, error),
-            Delivery::NotSent | Delivery::NotTaken => answer_failure(error),
+            // Keeping it was the fallback, and it failed too.
+            (_, error @ (AnswerError::Store { .. } | AnswerError::Unreadable { .. })) => {
+                lost(&workers, question_id, &error)
+            }
+            (Delivery::Unknown, error) => unkept(&workers, question_id, error),
+            (Delivery::NotSent | Delivery::NotTaken, error) => answer_failure(error),
         }),
     }
 }
@@ -168,8 +172,8 @@ pub async fn answer(
 /// Reads the questions of every kept answer again, and says of each whether it can still be sent.
 ///
 /// A kept answer whose question is still pending at the revision it answers is offered and stays
-/// kept. Any other is retired: this sends nothing, and it is no longer kept. Nothing is sent, however often
-/// this runs.
+/// kept. Any other is retired: this sends nothing, and it is no longer kept. Nothing is sent,
+/// however often this runs.
 ///
 /// # Errors
 ///
@@ -340,6 +344,21 @@ fn unkept(workers: &Workers, question_id: QuestionId, error: AnswerError) -> Cli
             "{why}. The answer was not kept: `kr question show {question_id}` says whether its \
              question was answered"
         ),
+    ))
+}
+
+/// The failure reported for an answer its worker did not take, or may not have taken, that could
+/// not be kept on this device either, so the person knows it is in neither place.
+fn lost(workers: &Workers, question_id: QuestionId, error: &AnswerError) -> CliError {
+    let retention =
+        format!("the answer to question {question_id} could not be kept on this device ({error})");
+    let why = workers.failure().map_or_else(
+        || "its session's worker could not take it".to_owned(),
+        |failure| failure.why,
+    );
+    CliError::Other(format!(
+        "{}: {why}",
+        retained(workers.delivery(), &retention)
     ))
 }
 
