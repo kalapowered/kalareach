@@ -645,14 +645,19 @@ device serves it nothing on a new unpaired connection, so the old connection is 
 to learn what the device became. The device keeps its last question there while fresh connections
 fail, and asks it at the last call. A question that would leave the host's window no room at the
 call is kept for the call instead, so the window always has room for the last question when the call
-comes. Ten seconds before the attempt's own deadline every answer is final, and from then on the
-device asks the connection it holds at its usual pace and looks for no other. A commit made after
-the last question on the last connection opened before it, while no new connection opens, is one the
-device cannot learn of by itself, and the attempt ends as `approval_unknown`. A change of connection
-is not a lost connection, and the device does not show it as one. A host that turns a question away
-as too soon keeps the connection. It counts the questions it refuses as well, so the device waits
-twice as long after each refusal in a row, however long that grows, up to the attempt's own deadline
-and the connection's last call.
+comes. The device waits at most ten seconds for an answer, so in the last ten seconds before the
+call it asks nothing there but the kept question, and every other step it takes before the call ends
+by then: it is free when the call comes. A look for a fresh connection takes time, so after one that
+fails the device plans its next step again from when the look ended. A device that is late for the
+call all the same, by more than a second, lets the connection go instead of asking a question the
+host may no longer be there to answer. Ten seconds before the attempt's own deadline every answer is
+final, and from then on the device asks the connection it holds at its usual pace and looks for no
+other. A commit made after the last question on the last connection opened before it, while no new
+connection opens, is one the device cannot learn of by itself, and the attempt ends as
+`approval_unknown`. A change of connection is not a lost connection, and the device does not show it
+as one. A host that turns a question away as too soon keeps the connection. It counts the questions
+it refuses as well, so the device waits twice as long after each refusal in a row, however long that
+grows, up to the attempt's own deadline and the connection's last call.
 
 `owner` is the owner device's half. It reads `owner.confirmation.pending` over the device's
 authorised session, checks each challenge against what it would authorise, and describes it in one
