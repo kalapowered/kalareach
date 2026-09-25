@@ -98,16 +98,33 @@ fn observe(started: std::time::Instant) -> Result<(), String> {
     runtime
         .block_on(async {
             let mut exchange = Exchange::open(&registration, BRIDGE).await?;
-            exchange.send(&observation).await?;
-            exchange.admitted(HOOK_DEADLINE).await?;
-            // The worker closes the connection once it has applied the observation.
-            while exchange.receive().await?.is_some() {}
-            Ok::<(), crate::exchange::ExchangeError>(())
+            deliver(&mut exchange, &observation).await
         })
         .map_err(|error| error.to_string())?;
     if reports_thread(&input) {
         std::thread::sleep(THREAD_REPORT_LINGER.saturating_sub(started.elapsed()));
     }
+    Ok(())
+}
+
+/// Delivers one observation over an exchange whose hello has just been written, and waits until the
+/// worker has applied it.
+///
+/// The observation goes straight behind the hello. A worker that refuses the hello closes the
+/// connection without reading anything past it, and that close can land before the observation is
+/// written, so the write then finds the connection gone. That is the refusal arriving first, not a
+/// failure of the write's own: what the worker answered is read before the write's outcome counts,
+/// so a refusal is reported as one, and a write that failed on a connection the worker admitted is
+/// still reported as the failure it is.
+async fn deliver(
+    exchange: &mut Exchange,
+    observation: &serde_json::Value,
+) -> Result<(), crate::exchange::ExchangeError> {
+    let sent = exchange.send(observation).await;
+    exchange.admitted(HOOK_DEADLINE).await?;
+    sent?;
+    // The worker closes the connection once it has applied the observation.
+    while exchange.receive().await?.is_some() {}
     Ok(())
 }
 
@@ -500,6 +517,64 @@ mod tests {
         assert_eq!(
             reported["detail"].as_str().expect("detail").len(),
             MAX_DETAIL_BYTES
+        );
+    }
+
+    /// A worker that refuses a hello closes the connection without reading what follows it, and
+    /// that close can land before the observation behind the hello is written. The write then
+    /// finds the connection gone, and the hook still says the worker refused it rather than that
+    /// the write failed.
+    ///
+    /// The order is made here rather than waited for: the worker's end reads the hello and closes
+    /// before the observation is delivered at all.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refusal_that_closes_before_the_observation_is_written_is_reported_as_one() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use tokio::io::AsyncBufReadExt as _;
+
+        let host = kr_ipc::testing::TempHost::create();
+        let endpoint = host.root().join("endpoint");
+        let listener = tokio::net::UnixListener::bind(&endpoint).expect("the endpoint binds");
+        let paths = crate::registration::Paths {
+            registration: host.root().join("registration"),
+        };
+        let credential = host.root().join("credential");
+        std::fs::write(&credential, "0".repeat(64)).expect("the credential");
+        std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o600))
+            .expect("the credential is the owner's alone");
+        std::fs::write(
+            &paths.registration,
+            format!(
+                "endpoint={}\nprofile=p\ninstance=i\npid=1\nstart=1\ncredential={}\n\
+                 framing=json_lines\n",
+                endpoint.display(),
+                credential.display()
+            ),
+        )
+        .expect("the registration");
+        let registration =
+            Registration::read(&paths, Duration::from_secs(5)).expect("the registration reads");
+
+        let mut exchange = Exchange::open(&registration, BRIDGE)
+            .await
+            .expect("the hook connects and writes its hello");
+        let (worker, _) = listener.accept().await.expect("the worker accepts");
+        let mut worker = tokio::io::BufReader::new(worker);
+        let mut hello = Vec::new();
+        worker
+            .read_until(b'\n', &mut hello)
+            .await
+            .expect("the hello arrives");
+        assert!(hello.starts_with(br#"{"kr_hello":"#), "{hello:?}");
+        // Refused: closed without a word, before anything behind the hello is read.
+        drop(worker);
+
+        let observation = serde_json::json!({"kr_observation": {"event": "thread_started"}});
+        let delivered = deliver(&mut exchange, &observation).await;
+        assert!(
+            matches!(delivered, Err(crate::exchange::ExchangeError::Refused)),
+            "the hook reports a refusal as a refusal: {delivered:?}"
         );
     }
 }
