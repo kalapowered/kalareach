@@ -207,6 +207,17 @@ pub struct KnownDifferenceEntry {
     pub difference: KnownDifference,
 }
 
+/// One terminal of section 27's matrix.
+#[derive(Clone, Debug, Serialize)]
+pub struct TerminalRecord {
+    /// The terminal.
+    pub terminal: String,
+    /// Its outcome.
+    pub outcome: Outcome,
+    /// Why.
+    pub reason: String,
+}
+
 /// The run's identities.
 #[derive(Clone, Debug, Serialize)]
 pub struct RunRecordHeader {
@@ -231,6 +242,8 @@ pub struct RunRecordHeader {
     pub applications: Option<Vec<ApplicationRecord>>,
     /// The groups this run selected.
     pub selection: Vec<String>,
+    /// Whether the run was asked for the whole terminal matrix.
+    pub all_terminals: bool,
     /// Where the evidence is.
     pub evidence_directory: String,
 }
@@ -275,6 +288,9 @@ pub struct Document {
     pub known_differences: Vec<KnownDifferenceEntry>,
     /// What makes this result incomplete, such as evidence a test wrote that could not be read.
     pub problems: Vec<String>,
+    /// Section 27's terminal matrix, when the run was asked for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminals: Option<Vec<TerminalRecord>>,
     /// What the map noted and carried on past.
     pub warnings: Vec<String>,
     /// The totals.
@@ -283,13 +299,18 @@ pub struct Document {
 
 impl Document {
     /// Whether the run passed: no identifier failed, every step exited 0 and was read, no test
-    /// failed outside an identifier, and nothing a test recorded went unread.
+    /// failed outside an identifier, and, when the whole terminal matrix was asked for, every
+    /// terminal ran.
     #[must_use]
     pub fn passed(&self) -> bool {
         self.summary.failed == 0
             && self.summary.failed_steps.is_empty()
             && self.failures_outside_identifiers.is_empty()
             && self.problems.is_empty()
+            && self
+                .terminals
+                .as_ref()
+                .is_none_or(|terminals| terminals.iter().all(|t| t.outcome == Outcome::Passed))
     }
 }
 
@@ -302,6 +323,8 @@ pub struct Options {
     pub evidence: PathBuf,
     /// The groups selected, or `None` for every group.
     pub selection: Option<Vec<Group>>,
+    /// Whether the whole terminal matrix was asked for.
+    pub all_terminals: bool,
     /// The platform.
     pub platform: Platform,
     /// The data-file case tables.
@@ -630,6 +653,7 @@ pub fn assemble(
             packages,
             applications: options.applications.clone(),
             selection: groups.iter().map(|group| group.name().to_owned()).collect(),
+            all_terminals: options.all_terminals,
             evidence_directory: options.evidence.to_string_lossy().replace('\\', "/"),
         },
         steps: executed
@@ -656,6 +680,16 @@ pub fn assemble(
         failures_outside_identifiers,
         known_differences,
         problems,
+        terminals: options.all_terminals.then(|| {
+            plan::TERMINALS
+                .iter()
+                .map(|terminal| TerminalRecord {
+                    terminal: (*terminal).to_owned(),
+                    outcome: Outcome::NotRun,
+                    reason: plan::TERMINAL_REASON.to_owned(),
+                })
+                .collect()
+        }),
         warnings: map.warnings.clone(),
         summary,
     }

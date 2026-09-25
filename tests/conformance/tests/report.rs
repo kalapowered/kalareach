@@ -76,6 +76,7 @@ fn run(name: &str) -> Result<(Document, tempfile::TempDir), Stopped> {
         evidence: kr_conformance::evidence::check_directory(evidence.path())
             .expect("inside the temporary directory"),
         selection: Some(vec![Group::Rust]),
+        all_terminals: false,
         platform: Platform::current(),
         case_tables: &[],
         lanes: &[],
@@ -338,6 +339,7 @@ fn an_evidence_directory_that_holds_an_earlier_report_is_refused() {
         root: tree("forms"),
         evidence: kr_conformance::evidence::check_directory(evidence.path()).expect("inside"),
         selection: Some(vec![Group::Rust]),
+        all_terminals: false,
         platform: Platform::current(),
         case_tables: &[],
         lanes: &[],
@@ -368,6 +370,7 @@ fn a_target_no_step_runs_is_not_run_with_the_reason() {
         root: tree("forms"),
         evidence: kr_conformance::evidence::check_directory(evidence.path()).expect("inside"),
         selection: None,
+        all_terminals: false,
         platform: Platform::current(),
         case_tables: &[],
         lanes: &[],
@@ -400,7 +403,63 @@ fn a_target_no_step_runs_is_not_run_with_the_reason() {
     assert!(document.identifiers.contains_key("KR-ACC-001"));
     assert!(document.identifiers.contains_key("KR-PERF-010"));
     assert_eq!(document.identifiers["KR-ACC-001"].verdict, Verdict::NotRun);
+    assert!(document.terminals.is_none(), "no terminal was asked for");
     assert!(document.passed(), "a test no step runs fails nothing");
+}
+
+#[test]
+fn a_run_asked_for_every_terminal_names_each_one_as_not_run_and_fails_until_its_runs_exist() {
+    let evidence = tempfile::tempdir().expect("an evidence directory");
+    let target = std::env::temp_dir().join("kr-conformance-fixture-target-forms-lib");
+    let options = Options {
+        root: tree("forms"),
+        evidence: kr_conformance::evidence::check_directory(evidence.path()).expect("inside"),
+        selection: None,
+        all_terminals: true,
+        platform: Platform::current(),
+        case_tables: &[],
+        lanes: &[],
+        applications: None,
+        steps: Some(vec![Step::cargo(
+            Group::Rust,
+            "the library's tests",
+            &["test", "--locked", "--lib"],
+        )]),
+        environment: vec![(
+            "CARGO_TARGET_DIR".to_owned(),
+            target.to_string_lossy().into_owned(),
+        )],
+    };
+    let document = report::run(&options, &mut |_| {}).expect("runs");
+    let terminals = document.terminals.as_ref().expect("the matrix");
+    let named: Vec<&str> = terminals
+        .iter()
+        .map(|terminal| terminal.terminal.as_str())
+        .collect();
+    assert_eq!(
+        named,
+        [
+            "iTerm2",
+            "Terminal.app",
+            "Ghostty",
+            "WezTerm",
+            "Windows Terminal",
+            "a VTE-based Linux terminal",
+            "the VS Code terminal"
+        ]
+    );
+    assert!(
+        terminals
+            .iter()
+            .all(|terminal| terminal.outcome == Outcome::NotRun && !terminal.reason.is_empty())
+    );
+    // Everything else of the run passed: the matrix alone fails it.
+    assert_eq!(document.summary.failed, 0);
+    assert!(document.summary.failed_steps.is_empty());
+    assert!(
+        !document.passed(),
+        "a run asked for every terminal fails until they have run"
+    );
 }
 
 #[test]
@@ -411,6 +470,7 @@ fn a_test_a_steps_own_flags_leave_out_is_not_run_rather_than_not_built() {
         root: tree("outcomes"),
         evidence: kr_conformance::evidence::check_directory(evidence.path()).expect("inside"),
         selection: Some(vec![Group::Rust]),
+        all_terminals: false,
         platform: Platform::current(),
         case_tables: &[],
         lanes: &[],

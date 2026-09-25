@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! kr-conformance run --root <repository> --evidence <directory> [--group <name>]...
-//!                    [--applications <cache>]
+//!                    [--applications <cache>] [--all-terminals]
 //! kr-conformance map --root <repository> [--typescript]
 //! ```
 //!
@@ -24,7 +24,8 @@ fn usage(problem: &str) -> ExitCode {
     eprintln!("kr-conformance: {problem}");
     eprintln!(
         "usage: kr-conformance run --root <repository> --evidence <directory> [--group <name>]... \
-         [--applications <cache>]\n       kr-conformance map --root <repository> [--typescript]"
+         [--applications <cache>] [--all-terminals]\n       kr-conformance map --root <repository> \
+         [--typescript]"
     );
     ExitCode::from(2)
 }
@@ -38,6 +39,7 @@ fn main() -> ExitCode {
     let mut evidence_directory = None;
     let mut groups = Vec::new();
     let mut applications = None;
+    let mut all_terminals = false;
     let mut typescript = false;
     let mut rest = arguments[1..].iter();
     while let Some(argument) = rest.next() {
@@ -52,6 +54,7 @@ fn main() -> ExitCode {
                     return usage(&format!("--group takes one of {}", names.join(", ")));
                 }
             },
+            "--all-terminals" => all_terminals = true,
             "--typescript" => typescript = true,
             other => return usage(&format!("{other} is not an option")),
         }
@@ -65,7 +68,13 @@ fn main() -> ExitCode {
             let Some(evidence_directory) = evidence_directory else {
                 return usage("--evidence is required");
             };
-            run(root, &evidence_directory, groups, applications)
+            run(
+                root,
+                &evidence_directory,
+                groups,
+                applications,
+                all_terminals,
+            )
         }
         other => usage(&format!("{other} is not a command")),
     }
@@ -80,6 +89,7 @@ fn map(root: PathBuf, typescript: bool) -> ExitCode {
         } else {
             vec![Group::Rust]
         }),
+        all_terminals: false,
         platform: Platform::current(),
         case_tables: plan::CASE_TABLES,
         lanes: plan::LANES,
@@ -120,6 +130,7 @@ fn run(
     evidence_directory: &std::path::Path,
     groups: Vec<Group>,
     applications: Option<PathBuf>,
+    all_terminals: bool,
 ) -> ExitCode {
     let evidence = match evidence::check_directory(evidence_directory) {
         Ok(evidence) => evidence,
@@ -159,6 +170,7 @@ fn run(
         root,
         evidence: evidence.clone(),
         selection,
+        all_terminals,
         platform: Platform::current(),
         case_tables: plan::CASE_TABLES,
         lanes: plan::LANES,
@@ -243,6 +255,14 @@ fn run(
     }
     for failure in &document.failures_outside_identifiers {
         println!("failed outside any identifier: {failure}");
+    }
+    if let Some(terminals) = &document.terminals {
+        for terminal in terminals
+            .iter()
+            .filter(|terminal| terminal.outcome != report::Outcome::Passed)
+        {
+            println!("not run: {}: {}", terminal.terminal, terminal.reason);
+        }
     }
     println!("result: {}", path.display());
     if document.passed() {

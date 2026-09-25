@@ -7,6 +7,9 @@
 #   scripts/run-conformance.sh --group <name>     one group; repeat it for several. The groups are
 #                                                 rust, end-to-end, performance, typescript and
 #                                                 applications
+#   scripts/run-conformance.sh --all-terminals    every group, and then section 27's terminal
+#                                                 matrix, which fails naming each terminal until
+#                                                 its runs exist
 #
 # The evidence directory is KR_TEST_ARTIFACTS_DIR, or a new directory under the platform's
 # temporary directory when that is not set. The report refuses one outside the temporary
@@ -30,6 +33,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 
 groups=()
+all_terminals=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --group)
@@ -37,14 +41,20 @@ while [ $# -gt 0 ]; do
             groups+=("$2")
             shift
             ;;
+        --all-terminals) all_terminals=1 ;;
         -h|--help)
-            sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            sed -n '2,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
             exit 2
             ;;
         *) echo "run-conformance: unknown argument $1" >&2; exit 2 ;;
     esac
     shift
 done
+
+if [ "$all_terminals" -eq 1 ] && [ ${#groups[@]} -gt 0 ]; then
+    echo "run-conformance: --all-terminals runs every group, so it takes no --group" >&2
+    exit 2
+fi
 
 selected() {
     local wanted="$1" group
@@ -330,6 +340,7 @@ if [ ${#groups[@]} -gt 0 ]; then
         arguments+=(--group "$group")
     done
 fi
+[ "$all_terminals" -eq 1 ] && arguments+=(--all-terminals)
 
 if selected applications && [ "$family" != windows ]; then
     case "$family" in

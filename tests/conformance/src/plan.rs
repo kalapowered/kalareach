@@ -806,6 +806,20 @@ pub const LANES: &[Lane] = &[
     },
 ];
 
+/// Section 27's terminal conformance matrix.
+pub const TERMINALS: &[&str] = &[
+    "iTerm2",
+    "Terminal.app",
+    "Ghostty",
+    "WezTerm",
+    "Windows Terminal",
+    "a VTE-based Linux terminal",
+    "the VS Code terminal",
+];
+
+/// Why a terminal of the matrix is not run by this report.
+pub const TERMINAL_REASON: &str = "the physical terminal matrix runs on the terminal matrix hosts and virtual machines; this run recorded no run of it";
+
 /// Whether `path` matches a pattern of `*` (one component) and `**` (any number).
 #[must_use]
 pub fn matches(pattern: &str, path: &str) -> bool {

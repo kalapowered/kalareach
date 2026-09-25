@@ -14,6 +14,7 @@ a test moves its key with it, and a row nobody keys shows up as one with no test
 ```sh
 scripts/run-conformance.sh                    # every group this platform runs
 scripts/run-conformance.sh --group rust       # one group; repeat --group for several
+scripts/run-conformance.sh --all-terminals    # every group, and then section 27's terminal matrix
 ```
 
 The script fetches what the applications group needs, installs the TypeScript packages when that
@@ -58,6 +59,14 @@ the log never ran, and a log that cannot be read are each the step's error.
 
 A test that no selected group runs on this platform is reported as not run, with the reason. It is
 never reported as passed.
+
+### The terminal matrix
+
+`--all-terminals` runs every group this platform runs, and then takes section 27's terminal matrix:
+iTerm2, Terminal.app, Ghostty, WezTerm, Windows Terminal, a VTE-based Linux terminal and the VS Code
+terminal. Those terminals are qualified on the terminal matrix hosts and virtual machines, not by
+this report, so the result records each one as not run, with that reason, the report names each on
+its output, and the run exits 1. `--all-terminals` takes no `--group`.
 
 ## How a test names what it proves
 
@@ -196,6 +205,7 @@ identifier's `references` and `figures`.
     "packages": [ { "name": "kr-term", "version": "0.1.0" }, { "name": "@kalareach/protocol", "version": "0.34.0" } ],
     "applications": [ { "id": "neovim", "version": "0.12.5", "status": "installed", "url": "https://...", "sha256": "...", "build": "release", "reason": null } ],
     "selection": ["rust", "end-to-end", "performance", "typescript", "applications"],
+    "all_terminals": false,
     "evidence_directory": "/tmp/kr-test-artifacts"
   },
   "steps": [
@@ -238,7 +248,7 @@ identifier's `references` and `figures`.
 
 | Field | Meaning |
 | --- | --- |
-| `run` | What was tested, with what, where: the commit (and whether tracked files differed from it), the toolchain, the machine, the terminal profile from its committed fixture, every package's version, the applications and how each was installed, and the groups selected |
+| `run` | What was tested, with what, where: the commit (and whether tracked files differed from it), the toolchain, the machine, the terminal profile from its committed fixture, every package's version, the applications and how each was installed, the groups selected, and whether the whole terminal matrix was asked for (`all_terminals`) |
 | `steps` | Every command the run ran, as run, with its exit status, how long it took and its log, relative to the evidence directory. `needs` names the variables a step reads from the environment |
 | `identifiers` | Every identifier a test or a reference names and, in a run of every group, every row of section 21's and section 27's tables whether named or not |
 | `tests[].test` | The package, target and test name, or the TypeScript file and its titles as the run gave them, joined by ` > ` |
@@ -250,6 +260,7 @@ identifier's `references` and `figures`.
 | `figures` | The figures the identifier's measurements recorded in this run |
 | `failures_outside_identifiers` | Tests that failed in a step and name no identifier; any one fails the run |
 | `known_differences` | Every known difference, with the identifiers of the test that recorded it |
+| `terminals` | Present when `--all-terminals` asked for section 27's terminal matrix: each terminal, its outcome and why. A terminal that did not pass fails the run |
 | `problems` | What makes the result incomplete, such as a record a test wrote that could not be read; any one fails the run |
 | `warnings` | What the report noted and carried on past, such as a declared module whose file is not there |
 
