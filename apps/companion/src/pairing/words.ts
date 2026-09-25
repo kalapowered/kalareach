@@ -136,6 +136,15 @@ export function failureSentence(failure: PairingFailure, service: string): strin
   return `${sentence} ${tries} left on this device.`
 }
 
+/**
+ * Whether a failure's next action tries the same code again: fixing a character, trying again, or
+ * trying it through another service. Only then does the typed code stay in its field; after any
+ * other ending it is spent, and the page lets it go.
+ */
+export function triesTheCodeAgain(action: NextAction): boolean {
+  return action === 'fix_code' || action === 'try_again' || action === 'change_service'
+}
+
 /** The label of the button that does a failure's next action. */
 export function actionLabel(action: NextAction): string {
   switch (action) {
