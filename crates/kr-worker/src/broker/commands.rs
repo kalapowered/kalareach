@@ -145,7 +145,10 @@ impl Lifecycle {
     /// Runs `confirm` under the lock while the backend is still committed, and nothing otherwise.
     fn confirm<T>(&self, confirm: impl FnOnce() -> T) -> Option<T> {
         let _held = self.held();
-        matches!(*self.state.borrow(), BackendState::Committed(_)).then(confirm)
+        // The state is read and let go before `confirm` runs: what keeps retirement out while it
+        // does is the lifecycle lock, and nothing else.
+        let committed = matches!(*self.state.borrow(), BackendState::Committed(_));
+        committed.then(confirm)
     }
 
     /// Marks the backend retired, under the lock.
