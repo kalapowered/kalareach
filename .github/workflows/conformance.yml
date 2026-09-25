@@ -8,6 +8,8 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "37 2 * * *"
+  push:
+    branches: ["task/*-conformance-run"]
 
 permissions:
   contents: read
