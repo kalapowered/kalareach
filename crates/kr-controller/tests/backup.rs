@@ -6722,6 +6722,44 @@ async fn a_publication_that_lands_after_a_newer_generation_is_refused_and_hides_
     }
 }
 
+/// An older generation this host is still publishing when the service already holds a newer one of
+/// the same archive can never be published, since the service takes no generation at or below the
+/// newest it has held. It ends once, naming the newer generation that carries its content, and its
+/// publication is not sent again.
+#[tokio::test]
+async fn an_older_generation_the_service_has_passed_ends_once_and_is_not_sent_again() {
+    let host = Host::open();
+    host.admit(1, &[TWO_PARTS]);
+    host.admit(2, &[64]);
+    // The older generation's second part does not arrive, so the newer one is published first.
+    host.web.fail(Kind::Part, 2, Fault::Dropped);
+    let mut uploader = host.uploader(10_000);
+    let steps = passes(&mut uploader, 10_000).await;
+    assert_eq!(host.generation(2).remote, Remote::Published);
+    let Some(Stepped::Stopped { reason, .. }) = steps.last() else {
+        panic!("the older generation did not end: {steps:?}");
+    };
+    assert!(
+        reason.contains(&format!("generation 2 of archive {}", archive_id())),
+        "{reason}"
+    );
+    assert!(reason.contains("carries its content"), "{reason}");
+
+    let record = host.generation(1);
+    assert_eq!(record.production, Production::Cancelled);
+    assert_ne!(record.remote, Remote::Published);
+    assert!(host.service.outbox().expect("a read").is_empty());
+    assert!(host.web.publication(1).is_none());
+    assert_eq!(host.web.newest(), host.web.publication(2));
+    assert_eq!(
+        host.web
+            .count(|asked| *asked == Asked::Publish(BackupGeneration::new(1))),
+        1,
+        "refused once and not sent again"
+    );
+    assert!(passes(&mut uploader, 11_000).await.is_empty());
+}
+
 /// A process can also stop while an answer is on its way back. The request it had sent is asked
 /// for again, or found, and the service stores nothing twice.
 #[tokio::test]

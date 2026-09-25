@@ -2445,8 +2445,11 @@ identity this host never learned and refuses another creation until the upload's
 out, and a pass after that creates it again.
 
 A publication is signed at the instant its generation was admitted, so one the service refused,
-or one refused on this host before it left, goes again as the same bytes. One that may have left
-without an answer is never sent again. The uploader fetches the generation instead and records it
+or one refused on this host before it left, goes again as the same bytes. The exception is a
+refusal from a service that already holds a generation of the archive at or above it. The backup
+manifest takes no generation at or below the newest it has held, so the attempt stops, and the
+report names that generation as the one that carries its content. One that may have left without
+an answer is never sent again. The uploader fetches the generation instead and records it
 as published if the service holds it. If the service still does not hold it two freshness windows
 after the send, the uploader stops waiting: the attempt stops, the outcome is written down as
 unknown, the generation's production ends, and the next generation carries the backup. That a

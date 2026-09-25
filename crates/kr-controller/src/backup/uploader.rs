@@ -50,10 +50,14 @@
 //!
 //! The writer signs the generation's descriptor at the instant the generation was admitted, and an
 //! Ed25519 signature over the same bytes is the same signature, so a publication refused by an
-//! answer, or refused on this host before it left, is sent again as the same publication. One that
-//! may have left without an answer is never sent again: section 23 retries no outcome that is
-//! unknown, and nothing the service offers can prove that a request it admitted will not still run.
-//! The uploader fetches the generation instead. The service holding its descriptor under this
+//! answer, or refused on this host before it left, is sent again as the same publication. The one
+//! exception is a refusal from a service that already holds a generation of the archive at or
+//! above this one. It takes no generation at or below the newest it has held, so this one is never
+//! published, and its attempt stops naming the generation that carries its content.
+//!
+//! One that may have left without an answer is never sent again: section 23 retries no outcome that
+//! is unknown, and nothing the service offers can prove that a request it admitted will not still
+//! run. The uploader fetches the generation instead. The service holding its descriptor under this
 //! writer is the answer. One that still does not hold it two freshness windows after the send is
 //! given up on: the attempt stops, which writes down that this host cannot establish what the
 //! service holds and ends the generation's production, and the next generation carries the backup.
@@ -1016,10 +1020,11 @@ impl Uploader {
         }
     }
 
-    /// Ends an upload attempt whose generation can never be sent, and the generation with it.
+    /// Ends an attempt whose generation can never be sent or published, and the generation with
+    /// it.
     ///
-    /// Production is cancelled first, so a stop in between leaves nothing that would be given
-    /// another attempt at the same staged object.
+    /// Production is cancelled first, with the reason, so a stop in between leaves nothing that
+    /// would be given another attempt at the same staged object or the same publication.
     fn give_up(
         &self,
         attempt: &Attempt,
@@ -1178,10 +1183,23 @@ impl Uploader {
                     reason: format!("the publication was not sent: {error}"),
                 })
             }
-            // The service answered and published nothing, so the same publication sent again is
-            // the first one that can land.
+            // The service answered and published nothing. One that already holds a generation of
+            // the archive at or above this one never takes it, whatever the refusal said, so the
+            // attempt ends there; otherwise the same publication sent again is the first one that
+            // can land.
             Err(error @ ClientError::Refused { .. }) => {
                 self.unanswered.remove(&sequence);
+                if let Some(held) = self.passed_by(generation).await {
+                    let reason = format!(
+                        "the service already holds generation {} of archive {} and takes no \
+                         generation at or below it, so this one is never published and it is not \
+                         sent again. Generation {} carries its content",
+                        held.get(),
+                        generation.archive_id,
+                        held.get()
+                    );
+                    return self.give_up(attempt, generation, reason, now);
+                }
                 Ok(Stepped::Waiting {
                     reason: format!("the service did not publish the generation: {error}"),
                 })
@@ -1227,6 +1245,27 @@ impl Uploader {
             fetched.publication.payload.descriptor == descriptor
                 && fetched.publication.payload.writer_key_id == generation.writer_key_id
         }))
+    }
+
+    /// The newest generation the service holds of `generation`'s archive, when that is another
+    /// publication at or above this generation.
+    ///
+    /// The service takes no generation at or below the newest it has held, so this generation is
+    /// then never published. None when the service holds nothing that high, when its newest is
+    /// this very publication, or when it cannot say now.
+    async fn passed_by(&self, generation: &GenerationRecord) -> Option<BackupGeneration> {
+        let newest = self
+            .manifest
+            .fetch(generation.archive_id, None, None)
+            .await
+            .ok()
+            .flatten()?;
+        let payload = &newest.publication.payload;
+        let this_one = descriptor_of(generation).is_some_and(|descriptor| {
+            payload.descriptor == descriptor && payload.writer_key_id == generation.writer_key_id
+        });
+        let held = payload.descriptor.backup_generation;
+        (held >= generation.backup_generation && !this_one).then_some(held)
     }
 
     /// The generation's publication, made the same way every time: the writer's signature over its
