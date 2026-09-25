@@ -336,6 +336,93 @@ async fn a_relay_only_attempt_whose_upgrade_is_refused_says_so() {
     host.endpoint.close().await;
 }
 
+/// KR-REQ-10.02: a network that alters certificate trust. A proxy that intercepts TLS answers for
+/// the relay with a certificate its own authority issued. A client that trusts only the relay's
+/// own anchor refuses it: the relay handshake its TLS configuration makes through the proxy fails
+/// certificate validation as `UnknownIssuer`, and the client never gets onto the relay. With the
+/// proxy's authority named among its trust anchors, as an owner names one in
+/// `network.relay_trust_anchors`, the same kind of client reaches the relay through the proxy and
+/// connects to the host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_intercepting_proxy_is_trusted_only_when_its_authority_is_named() {
+    let relay = LocalRelay::spawn().await;
+    let host = support::side(&relay_only(&relay.url, &relay.ca_roots), 1, true).await;
+    online(&host, "the host reaches its relay").await;
+    let proxy = HttpProxy::intercepting(&relay.ca_roots);
+    let through_proxy = |ca_roots: Vec<Vec<u8>>| EndpointConfig {
+        proxy_url: Some(proxy.url.clone()),
+        ..relay_only(&relay.url, &ca_roots)
+    };
+    // One relay handshake through the proxy, with the TLS configuration `endpoint` uses for relays.
+    let handshake = |endpoint: &Endpoint| {
+        iroh_relay::client::ClientBuilder::new(
+            relay.url.clone(),
+            iroh::SecretKey::generate(),
+            iroh::dns::DnsResolver::new(),
+        )
+        .tls_client_config(endpoint.tls_config().clone())
+        .proxy_url(proxy.url.as_url().clone())
+    };
+
+    let untrusting = support::side(&through_proxy(relay.ca_roots.clone()), 2, false).await;
+    let Err(refusal) = handshake(&untrusting.endpoint).connect().await else {
+        panic!("the relay handshake completed with a certificate nothing trusts");
+    };
+    let iroh_relay::client::ConnectError::Tls { source, .. } = &refusal else {
+        panic!("the relay handshake failed for another reason: {refusal:?}");
+    };
+    let reason = source
+        .get_ref()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    assert!(
+        reason.contains("invalid peer certificate") && reason.contains("UnknownIssuer"),
+        "the relay handshake failed certificate validation: {reason}"
+    );
+    // The trusting client below is on the relay through the same proxy within a second or two.
+    assert!(
+        tokio::time::timeout(AT_ONCE, untrusting.endpoint.online())
+            .await
+            .is_err(),
+        "a client that does not trust the proxy's authority never gets onto the relay"
+    );
+    untrusting.endpoint.close().await;
+
+    let trusting = support::side(
+        &through_proxy([relay.ca_roots.clone(), proxy.ca_roots.clone()].concat()),
+        3,
+        false,
+    )
+    .await;
+    handshake(&trusting.endpoint)
+        .connect()
+        .await
+        .expect("with the proxy's authority named, the relay handshake completes");
+    online(
+        &trusting,
+        "the trusting client reaches its relay through the proxy",
+    )
+    .await;
+    let accepting = accept_one(&host);
+    let connection = dial(
+        &trusting,
+        EndpointAddr::new(host.endpoint.id()).with_relay_url(relay.url.clone()),
+    )
+    .await
+    .expect("the relay carries the connection through the intercepting proxy");
+    let accepted = accepting.await.expect("the host task");
+    assert_eq!(accepted.remote_id(), trusting.endpoint.id());
+    assert!(
+        proxy.tunnels().contains(&authority(&relay.url)),
+        "{:?}",
+        proxy.tunnels()
+    );
+
+    drop(connection);
+    trusting.endpoint.close().await;
+    host.endpoint.close().await;
+}
+
 /// Everything the endpoint's lookup services found for `id`, once each has answered.
 async fn found(endpoint: &Endpoint, id: EndpointId) -> Vec<iroh::address_lookup::Item> {
     let services = endpoint.address_lookup().expect("the lookup services");

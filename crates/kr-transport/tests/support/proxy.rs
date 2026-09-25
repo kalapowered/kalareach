@@ -7,6 +7,11 @@
 //! Every request is recorded with its method and target before anything is done with it, so a
 //! test can tell what an endpoint asked the proxy to reach.
 //!
+//! An intercepting proxy stands for a network that inspects TLS. It answers `CONNECT` as any proxy
+//! does, then answers the client's TLS itself, with a certificate for the host the client asked
+//! for that the proxy's own authority issued, and carries what it reads over TLS of its own to that
+//! host. A client that does not trust the proxy's authority refuses the certificate.
+//!
 //! It runs on a runtime of its own, so nothing about it depends on the runtime the endpoints run
 //! on. Stopping it closes its port and every connection it holds, which leaves a client that was
 //! told to use it nowhere to go.
@@ -18,6 +23,9 @@ use std::time::{Duration, Instant};
 use kr_transport::config::{ProxyUrl, Url};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+use super::tls::{Authority, client_config, server_name};
 
 /// The longest request or response head the proxy reads.
 const MAX_HEAD: usize = 16 * 1024;
@@ -33,10 +41,29 @@ pub struct Asked {
     pub target: String,
 }
 
+/// What a proxy does with a tunnel it is asked for.
+enum Mode {
+    /// Splices the client to the destination.
+    Forwarding,
+    /// Answers the client's TLS itself and reaches the destination over TLS of its own.
+    Intercepting(Box<Interception>),
+}
+
+/// What an intercepting proxy answers a client's TLS with, and reaches a destination with.
+struct Interception {
+    /// The authority the certificates it presents are issued by.
+    authority: Authority,
+    /// TLS that trusts what the proxy was told to trust at the destination.
+    upstream: TlsConnector,
+}
+
 /// A proxy on a free loopback port.
 pub struct HttpProxy {
     /// Where an endpoint that selects this proxy sends its requests.
     pub url: ProxyUrl,
+    /// The authority an intercepting proxy issues its certificates from, which an endpoint names
+    /// among its trust anchors to accept them. Empty for a proxy that does not intercept.
+    pub ca_roots: Vec<Vec<u8>>,
     addr: SocketAddr,
     asked: Arc<Mutex<Vec<Asked>>>,
     runtime: Option<tokio::runtime::Runtime>,
@@ -45,6 +72,22 @@ pub struct HttpProxy {
 impl HttpProxy {
     /// Starts a proxy that tunnels and forwards whatever it is asked to.
     pub fn forwarding() -> Self {
+        Self::start(Mode::Forwarding, Vec::new())
+    }
+
+    /// Starts a proxy that intercepts the TLS of every tunnel, and reaches each destination
+    /// trusting `trusted`.
+    pub fn intercepting(trusted: &[Vec<u8>]) -> Self {
+        let authority = Authority::new("intercepting proxy");
+        let ca_roots = vec![authority.der.clone()];
+        let mode = Mode::Intercepting(Box::new(Interception {
+            authority,
+            upstream: TlsConnector::from(client_config(trusted)),
+        }));
+        Self::start(mode, ca_roots)
+    }
+
+    fn start(mode: Mode, ca_roots: Vec<Vec<u8>>) -> Self {
         let listener =
             std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a proxy listener");
         listener
@@ -58,14 +101,16 @@ impl HttpProxy {
             .expect("the proxy's runtime");
         let asked = Arc::new(Mutex::new(Vec::new()));
         let recording = Arc::clone(&asked);
+        let mode = Arc::new(mode);
         runtime.spawn(async move {
             let listener = TcpListener::from_std(listener).expect("the proxy listener");
             while let Ok((stream, _)) = listener.accept().await {
-                tokio::spawn(serve(stream, Arc::clone(&recording)));
+                tokio::spawn(serve(stream, Arc::clone(&recording), Arc::clone(&mode)));
             }
         });
         Self {
             url: format!("http://{addr}").parse().expect("a proxy URL"),
+            ca_roots,
             addr,
             asked,
             runtime: Some(runtime),
@@ -123,7 +168,7 @@ pub fn authority(url: &Url) -> String {
 }
 
 /// Takes one request from `stream` and does what it asks.
-async fn serve(stream: TcpStream, asked: Arc<Mutex<Vec<Asked>>>) {
+async fn serve(stream: TcpStream, asked: Arc<Mutex<Vec<Asked>>>, mode: Arc<Mode>) {
     let mut client = BufReader::new(stream);
     let Some(head) = read_head(&mut client).await else {
         return;
@@ -141,10 +186,12 @@ async fn serve(stream: TcpStream, asked: Arc<Mutex<Vec<Asked>>>) {
             method: method.clone(),
             target: target.clone(),
         });
-    if method == "CONNECT" {
-        tunnel(client, &target).await;
-    } else {
-        forward(client, &head, &target).await;
+    match (method.as_str(), mode.as_ref()) {
+        ("CONNECT", Mode::Forwarding) => tunnel(client, &target).await,
+        ("CONNECT", Mode::Intercepting(interception)) => {
+            intercept(client, &target, interception).await;
+        }
+        _ => forward(client, &head, &target).await,
     }
 }
 
@@ -169,6 +216,42 @@ async fn tunnel(mut client: BufReader<TcpStream>, target: &str) {
     }
     let mut client = client.into_inner();
     let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+}
+
+/// Opens a tunnel to `target` whose TLS the proxy answers itself, and carries what it reads there
+/// over TLS of its own to `target`.
+async fn intercept(mut client: BufReader<TcpStream>, target: &str, interception: &Interception) {
+    let host = target
+        .rsplit_once(':')
+        .map_or(target, |(host, _)| host)
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let Ok(destination) = TcpStream::connect(target).await else {
+        let _ = client.get_mut().write_all(BAD_GATEWAY).await;
+        return;
+    };
+    if client
+        .get_mut()
+        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        .await
+        .is_err()
+    {
+        return;
+    }
+    // The reader is handed over whole, so the start of the client's TLS is not lost if it arrived
+    // with the request.
+    let acceptor = TlsAcceptor::from(interception.authority.server_config(host));
+    let Ok(mut client) = acceptor.accept(client).await else {
+        return;
+    };
+    let Ok(mut destination) = interception
+        .upstream
+        .connect(server_name(host), destination)
+        .await
+    else {
+        return;
+    };
+    let _ = tokio::io::copy_bidirectional(&mut client, &mut destination).await;
 }
 
 /// Sends the request whose head is `head` to the server `target` names, and relays its answer.
