@@ -471,6 +471,89 @@ describe("the owner's confirmations", () => {
     expect(await screen.findByTestId('confirmation-row')).toBeInTheDocument()
   })
 
+  it('announces a new request on any screen, and Review opens it in Attention with focus on it', async () => {
+    const { controls } = start({ view: 'sessions' })
+    act(() => {
+      controls.setConfirmations({ ceremony: 'touch_id', requests: [request()] })
+    })
+    const toast = (await screen.findByText('studio needs your confirmation')).closest<HTMLElement>(
+      '[role="status"]'
+    )
+    expect(toast).not.toBeNull()
+    await userEvent.click(within(toast!).getByRole('button', { name: 'Review' }))
+    const row = await screen.findByTestId('confirmation-row')
+    await waitFor(() => {
+      expect(row.contains(document.activeElement)).toBe(true)
+    })
+    expect(screen.getByRole('heading', { name: 'What needs you' })).toBeInTheDocument()
+  })
+
+  it('keeps a request set aside with Not now until it expires, whatever screen comes between', async () => {
+    const { controls } = start({ view: 'attention' })
+    act(() => {
+      controls.setConfirmations({ ceremony: 'touch_id', requests: [request()] })
+    })
+    await userEvent.click(await screen.findByTestId('not-now'))
+    await waitFor(() => {
+      expect(screen.queryByTestId('confirmation-row')).toBeNull()
+    })
+    await userEvent.click(screen.getByRole('button', { name: 'Sessions' }))
+    await userEvent.click(screen.getByRole('button', { name: /^Attention/ }))
+    expect(await screen.findByRole('heading', { name: 'What needs you' })).toBeInTheDocument()
+    expect(screen.queryByTestId('confirmation-row')).toBeNull()
+    expect(screen.queryByLabelText(/waiting for confirmation/)).toBeNull()
+  })
+
+  it('says the owner’s value one character at a time to a screen reader, and once', async () => {
+    const { controls } = start({ view: 'attention' })
+    act(() => {
+      controls.setConfirmations({ ceremony: 'touch_id', requests: [request()] })
+    })
+    const row = await screen.findByTestId('confirmation-row')
+    const value = within(row).getByTestId('confirmation-value')
+    expect(value.textContent).toContain('f 3 c 1, 4 6 f d')
+    expect(within(value).getByText('f3c1 46fd').getAttribute('aria-hidden')).toBe('true')
+    // Everything a screen reader reads in the row says the value only spelled.
+    const read = [...row.querySelectorAll('*')]
+      .filter((element) => element.closest('[aria-hidden="true"]') === null)
+      .map((element) =>
+        [...element.childNodes]
+          .filter((node) => node.nodeType === Node.TEXT_NODE)
+          .map((node) => node.textContent)
+          .join('')
+      )
+      .join(' ')
+    expect(read).not.toContain('f3c1')
+  })
+
+  it('fades a request that went in its own row, and takes it away whatever arrives meanwhile', async () => {
+    const { controls } = start({ view: 'attention' })
+    const first = request({ reference: 'r-1', title: 'Add a device' })
+    const second = request({ reference: 'r-2', title: 'Issue an invitation', value: null })
+    act(() => {
+      controls.setConfirmations({ ceremony: 'touch_id', requests: [first, second] })
+    })
+    const leaving = (await screen.findByText('Add a device')).closest('li')
+    expect(leaving).not.toBeNull()
+    act(() => {
+      controls.setConfirmations({ ceremony: 'touch_id', requests: [second] })
+    })
+    // The same row fades: it keeps its place and its identity while it leaves.
+    expect(leaving?.isConnected).toBe(true)
+    expect(leaving?.getAttribute('data-leaving')).toBe('true')
+    // Another update arrives while it fades; it still goes.
+    act(() => {
+      controls.setConfirmations({
+        ceremony: 'touch_id',
+        requests: [{ ...second, expires_at_ms: second.expires_at_ms - 1000 }]
+      })
+    })
+    await waitFor(() => {
+      expect(screen.queryByText('Add a device')).toBeNull()
+    })
+    expect(screen.getByText('Issue an invitation')).toBeInTheDocument()
+  })
+
   it('counts waiting confirmations beside Attention', async () => {
     const { controls } = start({ view: 'attention' })
     act(() => {
