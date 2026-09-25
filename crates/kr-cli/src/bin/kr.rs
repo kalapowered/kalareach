@@ -149,11 +149,12 @@ async fn run(cli: Cli) -> Result<Completion> {
             if let Some(started) = started
                 && !cli.json
             {
-                eprintln!(
+                report::say(&shown!(
                     "kr: started the control daemon for environment {} (process {}) under the \
                      standalone start",
-                    environment.environment_id, started.pid
-                );
+                    environment.environment_id,
+                    started.pid
+                ));
             }
             // The execution context is this host's own unless the command chose one. The
             // presentation is not consulted: an invisible session runs where a visible one would,

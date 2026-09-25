@@ -835,4 +835,61 @@ mod tests {
         std::os::unix::fs::symlink(&log, &link).expect("links the log");
         assert!(Log::open(&link).is_err(), "a link is not followed");
     }
+
+    /// The last line of a daemon's log is said only when it is the daemon's own refusal of an
+    /// environment another daemon holds, which names that environment by its identifier. Any other
+    /// line is replaced.
+    #[cfg(unix)]
+    #[test]
+    fn a_daemons_last_line_is_said_only_when_it_is_its_own_refusal() {
+        use crate::shown::marker::{MARKER, assert_unmarked};
+
+        let environment = kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid());
+        let held =
+            format!("kr-controller: another control daemon already owns environment {environment}");
+        assert_eq!(
+            last_line_said(&held).as_str(),
+            format!("the last line its log holds since it started is: {held}")
+        );
+        for line in [
+            MARKER.to_owned(),
+            format!("kr-controller: {MARKER}"),
+            format!("kr-controller: another control daemon already owns environment {MARKER}"),
+            format!("{held} {MARKER}"),
+        ] {
+            let said = last_line_said(&line);
+            assert_eq!(
+                said.as_str(),
+                "its log holds a line since it started, which is not repeated here",
+                "{line}"
+            );
+            assert_unmarked("a daemon's last line", &[said.into_string()]);
+        }
+    }
+
+    /// A way of starting this build does not know is refused by naming the ones it does, and what
+    /// was typed is not repeated.
+    #[test]
+    fn a_way_of_starting_this_build_does_not_know_is_not_repeated() {
+        use crate::shown::marker::{MARKER, assert_unmarked, failure_renderings};
+
+        let host = kr_ipc::testing::TempHost::create();
+        let refused = run(
+            host.paths(),
+            &StartupArguments {
+                set: Some(MARKER.to_owned()),
+                clear: false,
+            },
+            false,
+        )
+        .expect_err("no such way of starting");
+        assert_eq!(
+            refused.to_string(),
+            "the value given is not a way of starting the control daemon: choose standalone"
+        );
+        assert_unmarked(
+            "a way of starting this build does not know",
+            &failure_renderings(refused),
+        );
+    }
 }
