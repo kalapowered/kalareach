@@ -4293,6 +4293,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kr-backup-integration"
+version = "0.1.0"
+dependencies = [
+ "kr-client",
+ "kr-crypto",
+ "kr-protocol",
+ "kr-sync-integration",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "kr-cbor"
 version = "0.1.0"
 dependencies = [
