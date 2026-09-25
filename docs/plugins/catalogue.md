@@ -379,11 +379,13 @@ Each change is noted in the package's journal before it is made: a file or a dir
 temporary name it is about to be made under, then with the identity of what was made there, then as
 in place once its directory has been flushed. A daemon that stops part way leaves notes the next run
 settles from what is on disk. What is still at its temporary name with the recorded identity was
-never put in place, and is removed. A destination holding that identity is the host's, whatever is
-at the temporary name now, and is recorded as in place only after its directory is flushed. An
-absence is flushed before its record goes too, so a removal a stopped run made is durable before it
-is forgotten, and a record goes only once what it names is gone from its own directory and that is
-flushed, with the document synced too where the record is a key. Anything else is left alone.
+never put in place, and is removed. A destination that is the object staged, by device and inode, is
+the host's, whatever is at the temporary name now and whatever has been written to it since, and is
+recorded as in place only after its directory is flushed; the removal then finds what changed and
+leaves it. An absence is flushed before its record goes too, so a removal a stopped run made is
+durable before it is forgotten, and a record goes only once what it names is gone from its own
+directory and that is flushed, with the document synced too where the record is a key. Anything else
+is left alone.
 
 Two things can be the host's without the host being able to show it: something at a temporary name
 when the run stopped before recording what it made there, and a key whose document was replaced

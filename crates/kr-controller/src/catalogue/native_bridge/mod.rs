@@ -296,10 +296,9 @@ enum Settlement {
 
 /// What was at a staged object's temporary name.
 enum Cleared {
-    /// Nothing, and its directory is flushed, so no removal an earlier run made there is lost.
-    Absent,
-    /// The object this host staged, now removed and its directory flushed.
-    Removed,
+    /// Nothing is there now: there was nothing, or it was the object this host staged and is
+    /// removed. Either way its directory is flushed, so no removal is lost.
+    Gone,
     /// Something this host cannot show it staged, or a directory something was put in. It is
     /// left, and why.
     Left(String),
@@ -1256,7 +1255,7 @@ impl NativeBridges {
                     .unresolved
                     .push(unproven_at(root, path, temporary, reason));
             }
-            Ok(Cleared::Absent | Cleared::Removed) => {}
+            Ok(Cleared::Gone) => {}
             Err(fault) => return fault,
         }
         refused(root, path, &unstaged.error)
@@ -1299,7 +1298,7 @@ impl NativeBridges {
             // Its record goes only once that removal is durable.
             Object::Absent => {
                 self.flush(directory).map_err(halted)?;
-                Ok(Cleared::Absent)
+                Ok(Cleared::Gone)
             }
             Object::Found(found) if staged.is_some_and(|staged| same(kind, &staged, &found)) => {
                 match kind {
@@ -1324,7 +1323,7 @@ impl NativeBridges {
                     }
                 }
                 self.flush(directory).map_err(halted)?;
-                Ok(Cleared::Removed)
+                Ok(Cleared::Gone)
             }
             Object::Found(_) | Object::Other => Ok(Cleared::Left(unproven())),
         }
@@ -1475,15 +1474,17 @@ impl NativeBridges {
         // the staged object may be there as a second link to what was renamed into place.
         let beside = match self.clear_staged(directory, temporary, kind, staged)? {
             Cleared::Left(reason) => Some(reason),
-            Cleared::Removed | Cleared::Absent => None,
+            Cleared::Gone => None,
         };
         // Only a staged object is ever renamed into place.
         let Some(staged) = staged else {
             return Ok((Settlement::Absent, beside));
         };
         match object_at(directory, name, kind).map_err(halted)? {
-            Object::Found(found) if same(kind, &staged, &found) => {
-                // The rename happened. It is recorded only once its directory is flushed.
+            // The destination is the object staged, by device and inode, so the rename happened,
+            // whatever has been written to it since: what was changed is the removal's to find and
+            // leave. It is recorded only once its directory is flushed.
+            Object::Found(found) if staged.same_object(&found) => {
                 self.flush(directory).map_err(halted)?;
                 Ok((Settlement::Placed(staged), beside))
             }

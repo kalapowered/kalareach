@@ -2806,6 +2806,58 @@ fn a_second_link_at_a_temporary_name_does_not_hide_what_was_published() {
     }
 }
 
+/// A file somebody changed in place after this host renamed it into place, and before the host
+/// recorded doing so, is still the file this host placed: recovery records it, the removal leaves it
+/// as changed and names it, and a refusal is not reported as clean while it is there. The
+/// directories on the way are there already, so no directory of the host's is left to say so.
+#[test]
+fn a_file_changed_between_its_rename_and_its_record_is_still_the_hosts() {
+    use std::io::Write as _;
+    let prepare = |site: &Site| {
+        for directory in [
+            "skills/kalareach-channels/.claude-plugin",
+            "skills/kalareach-channels/hooks",
+        ] {
+            std::fs::create_dir_all(site.application().join(directory)).expect("a directory");
+        }
+    };
+    let apply =
+        |site: &Site, bridges: &NativeBridges| bridges.reconcile(&plugin(), Some(&site.release()));
+    let rename = |site: &Site| format!("rename {}", site.application().join(HOOKS_PATH).display());
+    let stopped = (1..)
+        .map_while(|step| stopped_at(step, &prepare, &apply))
+        .find(|stopped| stopped.steps.last() == Some(&rename(&stopped.site)))
+        .expect("the hooks file's rename was reached");
+    let site = &stopped.site;
+    let hooks = site.application().join(HOOKS_PATH);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&hooks)
+        .and_then(|mut file| file.write_all(b"\n"))
+        .expect("somebody appends to it in place");
+    let changed = std::fs::read(&hooks).expect("reads");
+
+    let restarted = site.bridges();
+    let settled = restarted
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("reconciles");
+
+    assert!(
+        !matches!(settled, Settled::Refused(_) | Settled::Applied),
+        "{settled:?}"
+    );
+    assert_eq!(std::fs::read(&hooks).expect("left"), changed);
+    let reports = restarted.reports().expect("reads");
+    assert_ne!(reports[0].state, "refused", "{reports:?}");
+    assert!(
+        reports[0]
+            .notes
+            .iter()
+            .any(|note| note.starts_with("left in place") && note.contains(HOOKS_PATH)),
+        "{reports:?}"
+    );
+}
+
 /// A key somebody else took out of the document is recorded as gone only once the document as it
 /// is now, and its directory, are durable.
 #[test]
