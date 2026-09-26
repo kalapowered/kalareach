@@ -70,7 +70,7 @@ use kr_protocol::recovery::{
 };
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{CanonicalSet, Digest256, Nullable, TimestampMs, U64, Uuid};
-use kr_protocol::session::{ClosureReason, Dimensions, DisplayNumber, ShellMode};
+use kr_protocol::session::{ClosureReason, Dimensions, DisplayNumber, Durability, ShellMode};
 use kr_worker::broker::{
     BrokerError, BrokerTransport, Credential, ManagedProcess, MutationAdmission, Observations,
     PendingTransmission, TransportHandle, UpstreamDispatch, UpstreamOutcome, UpstreamRequest,
@@ -1341,19 +1341,20 @@ async fn kr_req_10_51_a_recovered_transition_is_held_to_the_same_rule() {
 }
 
 /// KR-REQ-10.51: a snapshot too large for one page is filtered before it is paged, so no page
-/// carries a resource the grant does not reach and the pages are the resources it does. A resource
-/// on a later page is shown from the moment the snapshot was taken: when it ends before the device
-/// has read the page that carries it, the device is told, and the page still carries it as the copy
-/// had it. The owner's pages carry every resource.
+/// carries a resource the grant does not reach and the pages are the resources it does. What the
+/// device was shown is the whole snapshot and not the page it has read: an approval its grant
+/// names that ends before the device has read the page carrying it is told about, though its end
+/// alone would be withheld, and the page still carries it as the copy had it. The owner's pages
+/// carry every resource.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kr_req_10_51_a_shown_resource_that_ends_before_its_page_is_read_is_told_about() {
+async fn kr_req_10_51_a_shown_approval_that_ends_before_its_page_is_read_is_told_about() {
     let mut host = host().await;
     let old: Vec<PendingResourceId> = (0..8).map(|_| offer(&host, BEFORE)).collect();
-    let reached: Vec<PendingResourceId> = (0..kr_worker::broker::MAX_SNAPSHOT_RESOURCES + 20)
-        .map(|_| arrive(&host, AFTER))
+    let named: Vec<PendingResourceId> = (0..kr_worker::broker::MAX_SNAPSHOT_RESOURCES + 20)
+        .map(|_| offer(&host, BEFORE))
         .collect();
 
-    let mut phone = Viewer::device(&host, Some(reach(Some(BOUND), &[]))).await;
+    let mut phone = Viewer::device(&host, Some(reach(Some(BOUND), &named))).await;
     phone.attach(&host).await;
     let first = phone.subscribe(&host).await;
     assert!(
@@ -1361,7 +1362,7 @@ async fn kr_req_10_51_a_shown_resource_that_ends_before_its_page_is_read_is_told
         "the snapshot takes more than one page"
     );
     host.deliver();
-    let on_a_later_page = *reached
+    let on_a_later_page = *named
         .iter()
         .find(|resource_id| {
             !first
@@ -1369,16 +1370,22 @@ async fn kr_req_10_51_a_shown_resource_that_ends_before_its_page_is_read_is_told
                 .iter()
                 .any(|held| held.resource_id == **resource_id)
         })
-        .expect("a resource the first page does not carry");
+        .expect("an approval the first page does not carry");
     withdraw(&host, on_a_later_page);
-    let told = phone
-        .told_until(|event| {
-            event.resource_id == on_a_later_page && event.state == PendingState::Cancelled
-        })
-        .await;
+    let last = marker(&host);
+    let told = phone.told_through(last).await;
+    assert_eq!(
+        about(&told, on_a_later_page)
+            .iter()
+            .map(|event| event.state)
+            .collect::<Vec<_>>(),
+        [PendingState::Cancelled],
+        "the end of an approval on a page the device has not read yet: {:?}",
+        summary(&told)
+    );
     assert_eq!(
         resources_in(&told),
-        [on_a_later_page].into_iter().collect(),
+        [on_a_later_page, last].into_iter().collect(),
         "{:?}",
         summary(&told)
     );
@@ -1386,7 +1393,7 @@ async fn kr_req_10_51_a_shown_resource_that_ends_before_its_page_is_read_is_told
     let pages = phone.whole(&host, &first).await;
     assert_eq!(
         sorted(&carried(&pages)),
-        sorted(&reached),
+        sorted(&named),
         "the pages are what the grant reaches"
     );
     assert_eq!(
@@ -1405,7 +1412,8 @@ async fn kr_req_10_51_a_shown_resource_that_ends_before_its_page_is_read_is_told
         .expect("a snapshot is answered");
     let owners = owner.whole(&host, &owners_first).await;
     let mut every = old;
-    every.extend(reached);
+    every.extend(named);
+    every.push(last);
     assert_eq!(sorted(&carried(&owners)), sorted(&every));
     host.finish();
 }
@@ -1579,7 +1587,7 @@ async fn kr_req_10_51_a_transition_while_the_journal_is_faulted_is_judged_the_sa
     assert!(
         about(&phone, recent)
             .iter()
-            .all(|event| event.durability == kr_protocol::session::Durability::Volatile),
+            .all(|event| event.durability == Durability::Volatile),
         "announced and not recorded"
     );
     assert_eq!(
