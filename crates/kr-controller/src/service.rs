@@ -3173,8 +3173,13 @@ impl Controller {
             }
             other => kr_automation::AutomationError::AuthorityUnavailable(other.to_string()),
         })?;
+        // The decision stands on a reading no older than the lock it is taken under: the caller's,
+        // carried forward by the time it waited on the continuous clock, and never earlier than
+        // the wall clock read now.
         let waited = self.clock.now().saturating_duration_since(read_at);
-        let now_ms = now_ms.saturating_add(u64::try_from(waited.as_millis()).unwrap_or(u64::MAX));
+        let now_ms = now_ms
+            .saturating_add(u64::try_from(waited.as_millis()).unwrap_or(u64::MAX))
+            .max(self.wall_now_ms());
         let decided = crate::grants::standing_at_dispatch(
             record,
             &mut policy,
@@ -14497,6 +14502,46 @@ mod a_floor_owed_its_record {
             .issue(&record, || Ok(()))
             .expect("the grant is written");
         record
+    }
+
+    /// A workflow's grant is decided at a reading no older than the policy's lock it is decided
+    /// under: the caller's reading carried forward by the time it waited, and never earlier than
+    /// the wall clock read once the lock is held. With the wall clock past the grant's expiry and
+    /// the caller's reading short of it, the node is refused. The control: with the wall clock
+    /// short of the expiry, it is permitted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_workflow_decision_reads_the_wall_clock_once_its_lock_is_held() {
+        for passed in [false, true] {
+            let temp = kr_ipc::testing::TempHost::create();
+            let (_continuous, wall, clocks) = crate::service::net::tests::manual_clocks();
+            let controller = crate::service::net::tests::daemon_on(&temp, clocks).await;
+            let now = wall.load(std::sync::atomic::Ordering::SeqCst);
+            let expiring = held(
+                &controller,
+                GrantExpiry::At {
+                    expires_at_ms: TimestampMs::new(now + 60_000),
+                },
+            );
+            controller
+                .decide_for_workflow(
+                    &expiring,
+                    ActorIngress::PairedDevice,
+                    now,
+                    controller.continuous_now(),
+                )
+                .expect("anchored and in force");
+            if passed {
+                wall.store(now + 60_000, std::sync::atomic::Ordering::SeqCst);
+            }
+            let decided = controller.decide_for_workflow(
+                &expiring,
+                ActorIngress::PairedDevice,
+                now,
+                controller.continuous_now(),
+            );
+            assert_eq!(decided.is_err(), passed, "{decided:?}");
+            drop(controller);
+        }
     }
 
     /// While the floor is owed its record, a workflow's grant that reads the clock is not decided,

@@ -1843,7 +1843,7 @@ pub(crate) mod tests {
     }
 
     /// Starts a daemon as [`daemon`] does, on clocks this test moves by hand.
-    pub(super) async fn daemon_on(
+    pub(in crate::service) async fn daemon_on(
         temp: &kr_ipc::testing::TempHost,
         clocks: crate::service::Clocks,
     ) -> Arc<Controller> {
@@ -1890,7 +1890,7 @@ pub(crate) mod tests {
     /// Clocks this test moves by hand: a continuous clock, and a wall clock that reads what the
     /// test last set, from the machine's reading now. A bound on either passes only when the test
     /// moves it, however long the runner takes between two steps.
-    pub(super) fn manual_clocks() -> (
+    pub(in crate::service) fn manual_clocks() -> (
         kr_transport::clock::ManualClock,
         Arc<std::sync::atomic::AtomicU64>,
         crate::service::Clocks,
