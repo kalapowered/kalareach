@@ -14,7 +14,7 @@ import type { ITheme, Terminal } from '@xterm/xterm'
 import type { CellRendition, PaletteState, Rgb10 } from '@kalareach/protocol'
 
 import type { TerminalLine, TerminalScreen } from '../host/port'
-import { cellsOf } from './widths'
+import { cellsOf, standsAlone } from './widths'
 
 /** The stand-in for a control character a piece should never have carried. */
 export const REPLACEMENT = '\u{FFFD}'
@@ -139,7 +139,7 @@ interface Written {
   readonly column: number
   readonly text: string
   readonly rendition: CellRendition
-  /** Whether the piece had text the renderer could not fit in its cells, so it is blank. */
+  /** Whether the piece had text that could not be drawn in its cells alone, so it is blank. */
   readonly leftBlank: boolean
 }
 
@@ -150,12 +150,15 @@ interface Written {
  * The renderer lays text out with the view's own cell table (`widths.ts`), and each piece is
  * written straight after its own cursor placement and rendition, where the renderer has forgotten
  * the character before. So `cellsOf` says exactly how many cells the renderer will give a piece's
- * text, and a piece is written as its text followed by blank cells to its last cell when the text
- * fits, and as blank cells alone when it does not or when its first character takes no cell. Every
- * character then lands in the piece's own cells: none is drawn past them, none is dropped at the
- * window's edge, no mark joins a character of another piece, and no cell of no width moves the
- * rest of the line. A piece that starts inside the one before it is left out, as native code never
- * sends one, and a piece is cut at the window's edge.
+ * text. A piece is written as its text followed by blank cells to its last cell when the text fits
+ * and the browser draws it without touching its neighbours (`standsAlone`), and as blank cells
+ * alone otherwise, or when it is invisible: the renderer measures invisible text by its glyphs and
+ * draws it as spaces, which would move the rest of the line. Every character then lands in the
+ * piece's own cells in the buffer and on the screen: none is drawn past them, none is dropped at
+ * the window's edge, no mark joins a character of another piece, no cell of no width is made, and
+ * no piece is joined to or reordered with another as the browser draws the line. A piece that
+ * starts inside the one before it is left out, as native code never sends one, and a piece is cut
+ * at the window's edge.
  */
 function writtenOf(line: TerminalLine, columns: number): Written[] {
   const written: Written[] = []
@@ -169,7 +172,11 @@ function writtenOf(line: TerminalLine, columns: number): Written[] {
     free = column + cells
     if (cells === 0) continue
     const text = drawableText(piece.text)
-    const laid = text.length === 0 ? null : cellsOf(text)
+    if (piece.rendition.invisible) {
+      written.push({ column, text: ' '.repeat(cells), rendition: piece.rendition, leftBlank: false })
+      continue
+    }
+    const laid = text.length === 0 || !standsAlone(text) ? null : cellsOf(text)
     written.push(
       laid === null || laid > cells
         ? { column, text: ' '.repeat(cells), rendition: piece.rendition, leftBlank: text.length > 0 }

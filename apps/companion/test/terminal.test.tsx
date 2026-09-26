@@ -259,7 +259,9 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
           row: '1',
           soft_wrapped: false,
           truncated: false,
-          // A symbol an older table calls a mark, and a mark with no letter before it.
+          // An Arabic symbol an older table calls a mark, and a mark with no letter before it: the
+          // first is of a script the browser may join or reorder, the second would be a cell of
+          // no width, and both are drawn as blank cells.
           pieces: [
             piece(0, 'x'),
             { ...piece(1, '\u{6de}'), cells: 1 },
@@ -275,7 +277,7 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
       controls.terminalViews[0]?.show(line)
     })
     const terminal = renderer(opened)
-    expect((await drawn(terminal))[0]).toBe('x\u{6de} y')
+    expect((await drawn(terminal))[0]).toBe('x  y')
     const row = terminal.buffer.active.getLine(0)
     expect([0, 1, 2, 3].map((column) => row?.getCell(column)?.getWidth())).toEqual([1, 1, 1, 1])
     opened.mockRestore()

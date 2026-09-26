@@ -465,32 +465,37 @@ test.describe('the raw terminal', () => {
         underline_colour: 'default',
         vertical_align: 'baseline'
       } as const
-      const at = (column: number, cells: number, text: string, bold = false) => ({
+      const at = (column: number, cells: number, text: string, bold = false, invisible = false) => ({
         column,
         cells,
         text,
-        rendition: { ...plain, bold },
+        rendition: { ...plain, bold, invisible },
         hyperlink: null
       })
       window.krTestHost?.terminalViews[0]?.show({
-        dimensions: { columns: '12', rows: '1' },
-        window: { columns: 12, rows: 1 },
+        dimensions: { columns: '16', rows: '1' },
+        window: { columns: 16, rows: 1 },
         lines: [
           {
             row: '1',
             soft_wrapped: false,
             truncated: false,
             // A symbol an older table calls a mark, a mark with nothing before it, a wide
-            // character and an emoji shown as a picture, then a bold e the renderer draws in a
-            // run of its own.
+            // character, an emoji shown as a picture, a man and a joiner then a laptop as native
+            // code places a man technologist, an invisible wide character and a Hebrew letter,
+            // then a bold e the renderer draws in a run of its own.
             pieces: [
               at(0, 1, 'x'),
               at(1, 1, '\u{6de}'),
               at(2, 1, '\u{301}'),
               at(3, 2, '\u{4e2d}'),
               at(5, 2, '\u{1f44d}'),
-              at(7, 1, 'e', true),
-              at(8, 1, 'y')
+              at(7, 2, '\u{1f468}\u{200d}'),
+              at(9, 2, '\u{1f4bb}'),
+              at(11, 2, '\u{4e2d}', false, true),
+              at(13, 1, '\u{5e9}'),
+              at(14, 1, 'e', true),
+              at(15, 1, 'y')
             ]
           }
         ],
@@ -499,8 +504,8 @@ test.describe('the raw terminal', () => {
     })
     const row = surface.locator('.xterm-rows > div').first()
     await expect(row).toContainText('y')
-    // How far the run holding the bold e starts from seven cells right of x, in a renderer twelve
-    // cells wide. The renderer measures a glyph it has not drawn before after drawing it once and
+    // How far the run holding the bold e starts from fourteen cells right of x, in a renderer
+    // sixteen cells wide. The renderer measures a glyph it has not drawn before after drawing it once and
     // then draws the line again, so this is read until the line has settled.
     const offset = () =>
       row.evaluate((element) => {
@@ -511,9 +516,9 @@ test.describe('the raw terminal', () => {
         if (screenBox === undefined || first === undefined || bold === undefined) {
           return Number.POSITIVE_INFINITY
         }
-        const cell = screenBox.width / 12
+        const cell = screenBox.width / 16
         return Math.abs(
-          bold.getBoundingClientRect().left - first.getBoundingClientRect().left - 7 * cell
+          bold.getBoundingClientRect().left - first.getBoundingClientRect().left - 14 * cell
         )
       })
     await expect.poll(offset).toBeLessThan(1)

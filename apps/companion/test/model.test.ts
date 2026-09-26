@@ -47,7 +47,7 @@ import {
 import { emptyControlState, evaluate, isRendered, visibilityOf } from '../src/model/controls'
 import { leftBlankOnPhone, stretchesOf, styleOf } from '../src/terminal/cells'
 import { drawableText, frameOf, leftBlank, paint, REPLACEMENT, sgr } from '../src/terminal/frame'
-import { CELL_TABLE, cellsOf } from '../src/terminal/widths'
+import { CELL_TABLE, cellsOf, standsAlone } from '../src/terminal/widths'
 import {
   clipping,
   describeProvenance,
@@ -518,6 +518,74 @@ describe('the raw terminal', () => {
     // A mark with nothing before it would be a cell of no width: the text cannot be placed.
     expect(cellsOf('\u{301}')).toBeNull()
     expect(cellsOf('\u{301}a')).toBeNull()
+  })
+
+  it('draws only text the browser cannot join to, or reorder with, the text beside it', () => {
+    const alone = [
+      'abc',
+      '\u{e9}',
+      'e\u{301}',
+      '\u{4e2d}\u{6587}',
+      '\u{d55c}',
+      '\u{2014}',
+      '\u{26a0}\u{fe0f}',
+      '\u{1f468}\u{200d}\u{1f4bb}',
+      '\u{1f1ff}\u{1f1e6}'
+    ]
+    expect(alone.filter((text) => !standsAlone(text))).toEqual([])
+    const joining = [
+      // A joiner at the end joins the next cell's character.
+      '\u{1f468}\u{200d}',
+      // A skin tone or a sound mark at the start joins the cell before; one regional indicator
+      // makes a flag with the next.
+      '\u{1f3fb}',
+      '\u{ff9e}',
+      '\u{1f1ff}',
+      // Right-to-left and joining scripts, and characters that change the text's direction.
+      '\u{5e9}',
+      '\u{633}',
+      '\u{915}',
+      'a\u{202e}b',
+      // A jamo that composes with the jamo in the next cell.
+      '\u{1100}'
+    ]
+    expect(joining.filter((text) => standsAlone(text))).toEqual([])
+  })
+
+  it('draws a piece that would join its neighbour, or is invisible, as blank cells', () => {
+    const whole = terminalScreen('8a7b6c50-22bb-4c3d-8e4f-000000000101', { columns: 80, rows: 8 })
+    const at = (column: number, cells: number, text: string, invisible = false) => ({
+      column,
+      cells,
+      text,
+      rendition: { ...PLAIN, invisible },
+      hyperlink: null
+    })
+    const screen = {
+      ...whole,
+      window: { columns: 9, rows: 1 },
+      lines: [
+        {
+          row: '1',
+          soft_wrapped: false,
+          truncated: false,
+          // Native code's placement of a man technologist: the man and the joiner, then the laptop.
+          pieces: [
+            at(0, 2, '\u{1f468}\u{200d}'),
+            at(2, 2, '\u{1f4bb}'),
+            at(4, 2, '\u{4e2d}', true),
+            at(6, 1, 'x')
+          ]
+        }
+      ],
+      cursor: null
+    }
+    const written = frameOf(screen)
+    expect(written).toContain('\u{1b}[1;1H\u{1b}[0m  \u{1b}')
+    expect(written).toContain('\u{1b}[1;3H\u{1b}[0m\u{1f4bb}\u{1b}')
+    expect(written).toContain('\u{1b}[1;5H\u{1b}[0;8m  \u{1b}')
+    // The man is counted as left blank; the invisible character was never going to be seen.
+    expect(leftBlank(screen)).toBe(1)
   })
 
   it('draws a piece its text does not fit as blank cells, and counts it', () => {
