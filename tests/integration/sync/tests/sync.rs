@@ -22,6 +22,15 @@
 //! | KR-REQ-18.05 | `kr_req_18_05_a_setting_is_stored_sealed_in_a_declared_bucket` |
 //! | KR-REQ-24.28 | `kr_req_24_28_a_client_fenced_by_privacy_mode_publishes_nothing_and_keeps_its_pinned_labels` |
 //!
+//! # What the lost-answer leg takes as proof
+//!
+//! Only a write the service accepted whose answer was lost on the way back. A `503` with
+//! `SERVICE_UNAVAILABLE` is the service declining to decide, which proves nothing, so the leg sends
+//! that request again under the same identity with the same bytes, a bounded number of times, and
+//! fails when no send is accepted. Two checks hold that step to this against a stand-in, with no
+//! deployment: `the_lost_answer_leg_takes_no_503_for_an_accepted_write` and
+//! `the_lost_answer_leg_sends_a_declined_write_again_until_it_is_accepted`.
+//!
 //! # What a leg leaves
 //!
 //! Each leg gives back what the service lets it give back, whether it passed or failed. Every
@@ -37,6 +46,7 @@ use std::fmt;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use kr_client::ClientError;
 use kr_client::drafts::{
@@ -59,6 +69,7 @@ use kr_protocol::ids::{DeviceId, SessionId, SyncObjectId};
 use kr_protocol::mailbox::mailbox_size_bucket;
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{TimestampMs, Uuid};
+use kr_protocol::service::GatewayOrigin;
 use kr_protocol::sync::{SealedSyncObject, SyncObjectKind};
 use kr_sync_integration::{Deployment, RunKey, fresh_uuid, now_ms, proved};
 
@@ -195,10 +206,17 @@ impl Run {
     /// The run's installation, or nothing when this run was given no deployment.
     fn open() -> Option<Self> {
         let deployment = Deployment::from_environment()?;
+        let inner = deployment.transport();
+        Some(Self::over(deployment, inner))
+    }
+
+    /// A run whose requests leave through `inner`, which for every leg is the deployment's own
+    /// transport and for a check of a leg's rules is a stand-in that answers in its place.
+    fn over(deployment: Deployment, inner: Arc<dyn ServiceHttp>) -> Self {
         let key = RunKey::installation();
         let reached = Arc::new(Reached::default());
         let transport = Arc::new(Recording {
-            inner: deployment.transport(),
+            inner,
             reached: Arc::clone(&reached),
             sent: AtomicUsize::new(0),
             lose_the_next_answer: AtomicBool::new(false),
@@ -213,7 +231,7 @@ impl Run {
         let key_name = fresh_uuid().to_string();
         keys.draw(&key_name, 1)
             .expect("a collection key for the run");
-        Some(Self {
+        Self {
             sealer: Arc::new(CollectionSealer::new(keys, &key_name, 1)),
             deployment,
             key,
@@ -221,7 +239,7 @@ impl Run {
             reached,
             service,
             directory: tempfile::tempdir().expect("a directory for the devices' stores"),
-        })
+        }
     }
 
     /// One device: a store of its own and the shared service client.
@@ -430,6 +448,107 @@ where
             }
             std::panic::resume_unwind(failed.into_panic());
         }
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* What the lost-answer leg takes as proof                                     */
+/* -------------------------------------------------------------------------- */
+
+/// How many times the lost-answer leg sends its first write: once, and twice more when the service
+/// declines to decide it.
+const FIRST_WRITE_SENDS: usize = 3;
+
+/// The longest the leg waits before it sends the first write again, whatever the service asked.
+const LONGEST_WAIT_TO_SEND_AGAIN: Duration = Duration::from_secs(5);
+
+/// Publishes one object with its answer lost on the way back, and returns that answer once it is
+/// the answer to a write the service accepted.
+///
+/// The lost-answer leg needs a write the service applied whose answer never reached the device. A
+/// `503` with `SERVICE_UNAVAILABLE` is the service saying it has decided nothing it can report: it
+/// names no position and proves nothing. So that answer is lost as well, and after the wait it asks
+/// for, the same request is sent again as a device that lost an answer sends it: the identity, the
+/// bytes and the expected position the device recorded before its first send. The service runs the
+/// request once or answers it from its receipt, and the leg holds what comes back here to being an
+/// accepted write, exactly as it would have held the first answer.
+///
+/// # Errors
+///
+/// Returns why there is no accepted write: no answer at all, an answer that is neither an accepted
+/// write nor a `503 SERVICE_UNAVAILABLE`, or [`FIRST_WRITE_SENDS`] of those `503`s. None of them is
+/// the answer the leg means.
+async fn drop_an_accepted_write(
+    run: &Run,
+    client: &SyncClient,
+    object_id: SyncObjectId,
+) -> Result<ServiceHttpAnswer, String> {
+    run.transport
+        .lose_the_next_answer
+        .store(true, Ordering::SeqCst);
+    if client.publish(object_id, now()).await.is_ok() {
+        return Err("a write whose answer was lost was reported as answered".to_owned());
+    }
+    let mut sent = 1;
+    loop {
+        let answer = run
+            .transport
+            .lost
+            .lock()
+            .expect("the lost answer")
+            .take()
+            .ok_or_else(|| "the service did not answer the write".to_owned())?;
+        if answer.status == 200 {
+            return Ok(answer);
+        }
+        let envelope: serde_json::Value = serde_json::from_slice(&answer.body).unwrap_or_default();
+        if answer.status != 503 || envelope["error"]["code"] != "SERVICE_UNAVAILABLE" {
+            return Err(format!(
+                "the service answered the write {} {}, which is not a write it accepted",
+                answer.status, envelope["error"]["code"]
+            ));
+        }
+        if sent == FIRST_WRITE_SENDS {
+            return Err(format!(
+                "the service answered the write 503 SERVICE_UNAVAILABLE {sent} times, and a write it declined to decide proves nothing"
+            ));
+        }
+        let asked = envelope["error"]["retryAfterSeconds"]
+            .as_u64()
+            .map_or(Duration::from_secs(1), Duration::from_secs);
+        tokio::time::sleep(asked.min(LONGEST_WAIT_TO_SEND_AGAIN)).await;
+
+        // The record the device wrote before its first send is the request: sent again from it,
+        // the service is asked the same thing under the same identity.
+        let staged = client
+            .store()
+            .requests()
+            .map_err(|error| format!("the device's requests could not be read: {error}"))?
+            .items
+            .into_iter()
+            .find(|record| record.dispatched())
+            .ok_or_else(|| "the device holds no record of the write it sent".to_owned())?;
+        let collection = staged.collection();
+        let ciphertext = staged
+            .ciphertext()
+            .ok_or_else(|| "a sent record carries its bytes".to_owned())?;
+        run.transport
+            .lose_the_next_answer
+            .store(true, Ordering::SeqCst);
+        let again = run
+            .service
+            .compare_exchange(
+                &collection,
+                staged.work_id,
+                now_ms(),
+                staged.expected.as_ref().copied(),
+                ciphertext,
+            )
+            .await;
+        if again.is_ok() {
+            return Err("a write whose answer was lost was reported as answered".to_owned());
+        }
+        sent += 1;
     }
 }
 
@@ -884,25 +1003,15 @@ async fn kr_req_20_13_an_answer_lost_in_flight_is_settled_from_the_receipt_and_a
             .expect("stored");
 
         // The service applies the write and the answer is lost on its way back.
-        run.transport
-            .lose_the_next_answer
-            .store(true, Ordering::SeqCst);
-        client
-            .publish(object_id, now())
-            .await
-            .expect_err("the answer never came back");
-        assert_eq!(client.outstanding().expect("a count"), 1);
-
+        //
         // What was lost is the answer this leg means: the service applied the write, at a place
-        // the leg reads from that answer. An exchange that failed before it arrived, or one the
-        // service refused, would look the same to the device and prove nothing below.
-        let lost = run
-            .transport
-            .lost
-            .lock()
-            .expect("the lost answer")
-            .take()
-            .expect("the service answered the write");
+        // the leg reads from that answer. An exchange that failed before it arrived, one the
+        // service refused and one it declined to decide would look the same to the device and
+        // prove nothing below.
+        let lost = drop_an_accepted_write(&run, &client, object_id)
+            .await
+            .unwrap_or_else(|why| panic!("{why}"));
+        assert_eq!(client.outstanding().expect("a count"), 1);
         assert_eq!(lost.status, 200);
         let lost: serde_json::Value =
             serde_json::from_slice(&lost.body).expect("the service's envelope");
@@ -1151,4 +1260,175 @@ async fn kr_req_18_05_a_setting_is_stored_sealed_in_a_declared_bucket() {
         "a setting is stored as a sealed object in the bucket the padding rule declares, the service counts that bucket and never holds the setting in the clear, and it opens again under the collection key".to_owned()
     })
     .await;
+}
+
+/* -------------------------------------------------------------------------- */
+/* The lost-answer leg's proof, against a stand-in                             */
+/* -------------------------------------------------------------------------- */
+
+/// A settings-sync service that declines every exchange it is sent with `503 SERVICE_UNAVAILABLE`,
+/// until the one it is told to accept, and keeps what each exchange asked for.
+///
+/// It stands where the deployment stands for the lost-answer leg's first write, so the rule that
+/// step keeps is checked on every run of this suite, deployment or none: nothing leaves this
+/// machine.
+#[derive(Debug)]
+struct Declining {
+    /// Which exchange, counted from one, it answers as an accepted write; none, if it never does.
+    accepts: Option<usize>,
+    /// What each exchange it was sent asked for, in the order they came.
+    exchanges: Mutex<Vec<serde_json::Value>>,
+}
+
+impl Declining {
+    fn new(accepts: Option<usize>) -> Arc<Self> {
+        Arc::new(Self {
+            accepts,
+            exchanges: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// What each exchange it was sent asked for.
+    fn exchanges(&self) -> Vec<serde_json::Value> {
+        self.exchanges.lock().expect("the exchanges").clone()
+    }
+}
+
+impl ServiceHttp for Declining {
+    fn post_json<'a>(
+        &'a self,
+        _url: &'a str,
+        body: &'a [u8],
+        _headers: &'a [(&'a str, &'a str)],
+    ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+        Box::pin(async move {
+            let request: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+            let sent = {
+                let mut exchanges = self.exchanges.lock().expect("the exchanges");
+                exchanges.push(request["body"]["exchange"].clone());
+                exchanges.len()
+            };
+            let (status, answer) = if self.accepts == Some(sent) {
+                (
+                    200,
+                    serde_json::json!({
+                        "ok": true,
+                        "data": {
+                            "state": "written",
+                            "current_revision": fresh_uuid().to_string(),
+                            "current_write_sequence": "1",
+                            "recovery_id": null,
+                        },
+                    }),
+                )
+            } else {
+                (
+                    503,
+                    serde_json::json!({
+                        "ok": false,
+                        "error": {
+                            "code": "SERVICE_UNAVAILABLE",
+                            "message": "The collection could not finish that request. Send it again shortly.",
+                            "retryAfterSeconds": 0,
+                        },
+                    }),
+                )
+            };
+            Ok(ServiceHttpAnswer {
+                status,
+                body: serde_json::to_vec(&answer).expect("an answer"),
+            })
+        })
+    }
+}
+
+/// A run whose every request goes to `service` and nowhere else.
+fn run_against(service: &Arc<Declining>) -> Run {
+    let origin = GatewayOrigin::new("https://stand-in.example").expect("an origin");
+    Run::over(
+        Deployment::at(origin),
+        Arc::clone(service) as Arc<dyn ServiceHttp>,
+    )
+}
+
+/// One device holding one settings object to publish, as the lost-answer leg's device does.
+fn one_object(run: &Run) -> (SyncClient, SyncObjectId) {
+    let client = run.device("one");
+    let object_id = fresh_object_id().expect("an identity");
+    client
+        .store()
+        .put_object(&settings_object(
+            object_id,
+            1,
+            settings(&[("theme", "dark")], &[]),
+            now_ms(),
+        ))
+        .expect("stored");
+    (client, object_id)
+}
+
+/// Holds every exchange a stand-in was sent to being one request: one identity, one set of bytes and
+/// one comparison.
+fn one_request(exchanges: &[serde_json::Value]) {
+    let first = &exchanges[0];
+    assert!(
+        first["request_id"].is_string(),
+        "the write names its request"
+    );
+    for exchange in exchanges {
+        assert_eq!(
+            exchange["request_id"], first["request_id"],
+            "the same identity"
+        );
+        assert_eq!(exchange["object"], first["object"], "the same bytes");
+        assert_eq!(
+            exchange["expected_revision"], first["expected_revision"],
+            "the same comparison"
+        );
+    }
+}
+
+/// KR-REQ-20.13: the lost-answer leg's first write, against a service that declines it every
+/// time. It is sent the bounded number of times, as one request, and no accepted write comes of
+/// it, so the leg does not pass.
+#[tokio::test]
+async fn the_lost_answer_leg_takes_no_503_for_an_accepted_write() {
+    let service = Declining::new(None);
+    let run = run_against(&service);
+    let (client, object_id) = one_object(&run);
+
+    let why = drop_an_accepted_write(&run, &client, object_id)
+        .await
+        .expect_err("a 503 is not an accepted write");
+    assert!(why.contains("503 SERVICE_UNAVAILABLE"), "{why}");
+    let exchanges = service.exchanges();
+    assert_eq!(exchanges.len(), FIRST_WRITE_SENDS);
+    one_request(&exchanges);
+    assert_eq!(
+        client.outstanding().expect("a count"),
+        1,
+        "the request stays outstanding"
+    );
+}
+
+/// KR-REQ-20.13: the same first write, against a service that declines the first send and accepts
+/// the next. The accepted write is what comes back, from the second send of the same request.
+#[tokio::test]
+async fn the_lost_answer_leg_sends_a_declined_write_again_until_it_is_accepted() {
+    let service = Declining::new(Some(2));
+    let run = run_against(&service);
+    let (client, object_id) = one_object(&run);
+
+    let accepted = drop_an_accepted_write(&run, &client, object_id)
+        .await
+        .expect("the second send was accepted");
+    assert_eq!(accepted.status, 200);
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&accepted.body).expect("the service's envelope");
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["data"]["state"], "written");
+    let exchanges = service.exchanges();
+    assert_eq!(exchanges.len(), 2);
+    one_request(&exchanges);
+    assert_eq!(client.outstanding().expect("a count"), 1);
 }
