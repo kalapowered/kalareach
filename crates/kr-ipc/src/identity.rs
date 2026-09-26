@@ -1299,9 +1299,11 @@ mod boot_records {
     pub(super) fn boot_count() -> u32 {
         let address = SHARED_USER_DATA + std::mem::offset_of!(KUSER_SHARED_DATA, BootId);
         // SAFETY: the kernel maps `KUSER_SHARED_DATA` readable at `SHARED_USER_DATA` into every
-        // process for the whole of its life, and `BootId` is a four-byte field at the offset the
-        // SDK declares for it, which is four-byte aligned. The read is volatile because the kernel,
-        // not this program, writes the page.
+        // process for the whole of its life, outside any allocation this program makes, and
+        // `BootId` is a four-byte field at the offset the SDK declares for it, which is four-byte
+        // aligned. The kernel writes the field before this process starts and not while it runs,
+        // so the read races with no write; it is volatile because the page is the kernel's, not
+        // memory this program owns.
         unsafe { std::ptr::read_volatile(std::ptr::with_exposed_provenance::<u32>(address)) }
     }
 }
@@ -1413,12 +1415,16 @@ mod windows_boot {
     pub(super) const ENTRY_CREATED: usize = 32;
     /// The length in bytes of the image name, a counted UTF-16 string: two bytes.
     pub(super) const ENTRY_NAME_LENGTH: usize = 56;
+    /// The capacity in bytes the kernel gives the image name, which its length cannot exceed.
+    pub(super) const ENTRY_NAME_CAPACITY: usize = 58;
     /// The address of the image name's characters, which the kernel writes into the same list.
     pub(super) const ENTRY_NAME_ADDRESS: usize = 64;
     /// The process's identifier: eight bytes.
     pub(super) const ENTRY_PROCESS: usize = 80;
     /// The bytes of an entry read here, through the identifier. No entry is shorter.
     pub(super) const ENTRY_READ: usize = 88;
+    /// The boundary every entry begins on, that of the entry's eight-byte fields.
+    pub(super) const ENTRY_ALIGNMENT: usize = 8;
 
     // The offsets above are the SDK's own on the target this is built for.
     #[cfg(windows)]
@@ -1434,10 +1440,15 @@ mod windows_boot {
             offset_of!(Entry, ImageName) + offset_of!(UNICODE_STRING, Length) == ENTRY_NAME_LENGTH
         );
         assert!(
+            offset_of!(Entry, ImageName) + offset_of!(UNICODE_STRING, MaximumLength)
+                == ENTRY_NAME_CAPACITY
+        );
+        assert!(
             offset_of!(Entry, ImageName) + offset_of!(UNICODE_STRING, Buffer) == ENTRY_NAME_ADDRESS
         );
         assert!(offset_of!(Entry, UniqueProcessId) == ENTRY_PROCESS);
         assert!(offset_of!(Entry, UniqueProcessId) + size_of::<usize>() == ENTRY_READ);
+        assert!(align_of::<Entry>() == ENTRY_ALIGNMENT);
     };
 
     /// The kernel's answer that a buffer is too short for its process list,
@@ -1529,27 +1540,26 @@ mod windows_boot {
     /// Returns the creation time the kernel recorded for the System process, from `list`, the
     /// bytes of its process list, which it wrote at the address `base`.
     ///
-    /// Every entry must hold the fields read from it before any is read, and the next entry must
-    /// lie after them. The System process is the entry for identifier 4, and it must carry the
-    /// System process's name, a counted string that must lie inside the list; its creation time
-    /// must be a time. Anything else establishes nothing, and says why.
+    /// The whole list is checked, not only the part before the System process. Every entry must
+    /// hold the fields read from it; each next entry must begin on an eight-byte boundary, after
+    /// this entry's fields and inside the list; and the last entry names no next one. Exactly one
+    /// entry carries identifier 4, and it must carry the System process's name, a counted string
+    /// inside the list and within the capacity the entry states, and a creation time that is a
+    /// time. Anything else establishes nothing, and says why.
     pub(super) fn system_process_created(list: &[u8], base: usize) -> Result<u64> {
         let refused =
             |why: String| unavailable("boot identity", format!("the kernel's process list {why}"));
+        let mut created = None;
         let mut at = 0_usize;
         loop {
             let entry = list.get(at..).unwrap_or_default();
             if entry.len() < ENTRY_READ {
                 return Err(refused(format!("ends inside the entry at byte {at}")));
             }
-            let next =
-                usize::try_from(u32::from_le_bytes(field(entry, ENTRY_NEXT))).unwrap_or(usize::MAX);
-            if next != 0 && next < ENTRY_READ {
-                return Err(refused(format!(
-                    "has an entry at byte {at} that the next one overlaps"
-                )));
-            }
             if u64::from_le_bytes(field(entry, ENTRY_PROCESS)) == SYSTEM_PROCESS {
+                if created.is_some() {
+                    return Err(refused(format!("lists process {SYSTEM_PROCESS} twice")));
+                }
                 let name = image_name(list, base, entry)
                     .map_err(|why| refused(format!("gives process {SYSTEM_PROCESS} {why}")))?;
                 if name != SYSTEM_PROCESS_NAME {
@@ -1557,24 +1567,37 @@ mod windows_boot {
                         "names process {SYSTEM_PROCESS} {name:?}, not the System process"
                     )));
                 }
-                let created = i64::from_le_bytes(field(entry, ENTRY_CREATED));
-                return u64::try_from(created)
-                    .ok()
-                    .filter(|created| *created > 0)
-                    .ok_or_else(|| {
-                        refused(format!(
-                            "gives the System process a creation time of {created}"
-                        ))
-                    });
+                let time = i64::from_le_bytes(field(entry, ENTRY_CREATED));
+                created = Some(
+                    u64::try_from(time)
+                        .ok()
+                        .filter(|time| *time > 0)
+                        .ok_or_else(|| {
+                            refused(format!(
+                                "gives the System process a creation time of {time}"
+                            ))
+                        })?,
+                );
             }
+            let next =
+                usize::try_from(u32::from_le_bytes(field(entry, ENTRY_NEXT))).unwrap_or(usize::MAX);
             if next == 0 {
-                return Err(refused(format!("has no process {SYSTEM_PROCESS}")));
+                return created.ok_or_else(|| refused(format!("has no process {SYSTEM_PROCESS}")));
             }
-            at = at.checked_add(next).ok_or_else(|| {
-                refused(format!(
-                    "has an entry at byte {at} whose next one lies past any list"
-                ))
-            })?;
+            if next < ENTRY_READ || next % ENTRY_ALIGNMENT != 0 {
+                return Err(refused(format!(
+                    "has an entry at byte {at} whose next one, {next} bytes on, overlaps it or is \
+                     misaligned"
+                )));
+            }
+            at = at
+                .checked_add(next)
+                .filter(|next_at| *next_at < list.len())
+                .ok_or_else(|| {
+                    refused(format!(
+                        "has an entry at byte {at} whose next one lies past its end"
+                    ))
+                })?;
         }
     }
 
@@ -1586,9 +1609,15 @@ mod windows_boot {
     }
 
     /// Reads an entry's image name: a counted string of UTF-16 characters, which the kernel writes
-    /// into the list itself and points to by address.
+    /// into the list itself and points to by address, no longer than the capacity it states.
     fn image_name(list: &[u8], base: usize, entry: &[u8]) -> std::result::Result<String, String> {
         let length = usize::from(u16::from_le_bytes(field(entry, ENTRY_NAME_LENGTH)));
+        let capacity = usize::from(u16::from_le_bytes(field(entry, ENTRY_NAME_CAPACITY)));
+        if length > capacity {
+            return Err(format!(
+                "a name of {length} bytes in a capacity of {capacity}"
+            ));
+        }
         let address = u64::from_le_bytes(field(entry, ENTRY_NAME_ADDRESS));
         let characters = usize::try_from(address)
             .ok()
@@ -2115,7 +2144,8 @@ mod tests {
         /// Adds an entry for `process`, named `name`, created at `created`.
         fn entry(mut self, process: u64, name: &str, created: i64) -> Self {
             use windows_boot::{
-                ENTRY_CREATED, ENTRY_NAME_ADDRESS, ENTRY_NAME_LENGTH, ENTRY_NEXT, ENTRY_PROCESS,
+                ENTRY_CREATED, ENTRY_NAME_ADDRESS, ENTRY_NAME_CAPACITY, ENTRY_NAME_LENGTH,
+                ENTRY_NEXT, ENTRY_PROCESS,
             };
             let start = self.bytes.len();
             if let Some(last) = self.last {
@@ -2130,13 +2160,18 @@ mod tests {
                 u64::try_from(LIST_BASE + start + ENTRY_FIXED).expect("an address")
             };
             let length = u16::try_from(characters.len()).expect("a name this short");
+            // The kernel gives a name room for a terminator after its characters.
+            let capacity = if characters.is_empty() { 0 } else { length + 2 };
             let mut entry = vec![0_u8; ENTRY_FIXED];
             entry[ENTRY_CREATED..ENTRY_CREATED + 8].copy_from_slice(&created.to_le_bytes());
             entry[ENTRY_NAME_LENGTH..ENTRY_NAME_LENGTH + 2].copy_from_slice(&length.to_le_bytes());
+            entry[ENTRY_NAME_CAPACITY..ENTRY_NAME_CAPACITY + 2]
+                .copy_from_slice(&capacity.to_le_bytes());
             entry[ENTRY_NAME_ADDRESS..ENTRY_NAME_ADDRESS + 8]
                 .copy_from_slice(&address.to_le_bytes());
             entry[ENTRY_PROCESS..ENTRY_PROCESS + 8].copy_from_slice(&process.to_le_bytes());
             entry.extend(&characters);
+            entry.resize(entry.len() + usize::from(capacity - length), 0);
             entry.resize(entry.len().next_multiple_of(8), 0);
             self.bytes.extend(entry);
             self.last = Some(start);
@@ -2235,6 +2270,12 @@ mod tests {
             .entry(4, "", SYSTEM_CREATED)
             .bytes();
         assert!(created_in(&unnamed).is_err(), "process 4 with no name");
+        let twice = BuiltList::new()
+            .entry(0, "", 0)
+            .entry(4, "System", SYSTEM_CREATED)
+            .entry(4, "System", SYSTEM_CREATED + 1)
+            .bytes();
+        assert!(created_in(&twice).is_err(), "process 4 listed twice");
         for created in [0, -1, i64::MIN] {
             assert!(
                 created_in(&host_list(created, 1)).is_err(),
@@ -2254,7 +2295,7 @@ mod tests {
 
     #[test]
     fn a_process_list_that_points_outside_itself_names_no_boot() {
-        use windows_boot::{ENTRY_NAME_LENGTH, ENTRY_NEXT, ENTRY_READ};
+        use windows_boot::{ENTRY_NAME_CAPACITY, ENTRY_NAME_LENGTH, ENTRY_NEXT, ENTRY_READ};
 
         let list = host_list(SYSTEM_CREATED, 1);
         assert!(created_in(&list).is_ok());
@@ -2267,13 +2308,40 @@ mod tests {
         assert!(created_in(&[]).is_err());
         assert!(created_in(&list[..ENTRY_READ - 1]).is_err());
         assert!(created_in(&list[..SYSTEM_ENTRY + ENTRY_READ - 1]).is_err());
-        // A next entry that overlaps this one's fields, or lies past the end.
-        assert!(created_in(&with(ENTRY_NEXT, &8_u32.to_le_bytes())).is_err());
-        assert!(created_in(&with(ENTRY_NEXT, &u32::MAX.to_le_bytes())).is_err());
-        // A name whose length is odd, or runs past the end of the list.
+        // A next entry that overlaps an entry's fields, begins off an eight-byte boundary, or lies
+        // past the end: before the System process, at it, and after it, since the whole list is
+        // checked.
+        let system_next = u32::from_le_bytes(
+            list[SYSTEM_ENTRY + ENTRY_NEXT..SYSTEM_ENTRY + ENTRY_NEXT + 4]
+                .try_into()
+                .expect("four bytes"),
+        );
+        let last = SYSTEM_ENTRY + usize::try_from(system_next).expect("an offset");
+        for entry in [0, SYSTEM_ENTRY, last] {
+            for next in [8, system_next + 4, u32::MAX] {
+                assert!(
+                    created_in(&with(entry + ENTRY_NEXT, &next.to_le_bytes())).is_err(),
+                    "the entry at byte {entry} naming its next {next} bytes on"
+                );
+            }
+        }
+        assert!(
+            created_in(&with(last + ENTRY_NEXT, &1_024_u32.to_le_bytes())).is_err(),
+            "a last entry naming a next one past the end"
+        );
+        // A name whose length is odd, exceeds the capacity its entry states, or runs past the end
+        // of the list.
         let name_length = SYSTEM_ENTRY + ENTRY_NAME_LENGTH;
         assert!(created_in(&with(name_length, &11_u16.to_le_bytes())).is_err());
-        assert!(created_in(&with(name_length, &65_534_u16.to_le_bytes())).is_err());
+        assert!(
+            created_in(&with(
+                SYSTEM_ENTRY + ENTRY_NAME_CAPACITY,
+                &10_u16.to_le_bytes()
+            ))
+            .is_err()
+        );
+        let beyond = [65_534_u16.to_le_bytes(), u16::MAX.to_le_bytes()].concat();
+        assert!(created_in(&with(name_length, &beyond)).is_err());
     }
 
     #[test]
