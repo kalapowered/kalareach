@@ -239,3 +239,78 @@ pub fn install<R: tauri::Runtime>(
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A registry holding one view, numbered 1, whose task is the test: it receives the view's
+    /// commands itself.
+    fn holding_one() -> (
+        TerminalViews,
+        tokio::sync::mpsc::UnboundedReceiver<view::Command>,
+    ) {
+        let views = TerminalViews::with(Arc::new(|| Err("no host".to_owned())));
+        let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (_ending, ended) = tokio::sync::watch::channel(false);
+        views.lock().insert(
+            1,
+            Held {
+                page: "main".to_owned(),
+                commands,
+                ended,
+            },
+        );
+        (views, receiver)
+    }
+
+    fn take() -> Input {
+        Input::Take { number: 1 }
+    }
+
+    /// A view's task that ends with an input taken from its commands but never answered drops the
+    /// answer: the input is refused as taken by nothing, never reported taken.
+    #[tokio::test]
+    async fn an_input_whose_task_ends_before_answering_is_refused() {
+        let (views, mut receiver) = holding_one();
+        let asked = views.input("1", take());
+        let ending = async {
+            match receiver.recv().await {
+                Some(view::Command::Input(_, answer)) => drop(answer),
+                _ => panic!("the input reaches the view's task"),
+            }
+        };
+        let (answer, ()) = tokio::join!(asked, ending);
+        assert_eq!(answer, Err(input::ENDED.to_owned()));
+    }
+
+    /// A view whose task has stopped taking commands, and one never opened, refuse the input.
+    #[tokio::test]
+    async fn an_input_for_a_task_that_takes_no_commands_or_for_no_view_is_refused() {
+        let (views, receiver) = holding_one();
+        drop(receiver);
+        assert_eq!(views.input("1", take()).await, Err(input::ENDED.to_owned()));
+        assert_eq!(views.input("2", take()).await, Err(input::ENDED.to_owned()));
+        assert_eq!(
+            views.input("not a view", take()).await,
+            Err(input::ENDED.to_owned())
+        );
+    }
+
+    /// An answer the task gives is the input's answer.
+    #[tokio::test]
+    async fn an_answered_input_has_its_tasks_answer() {
+        let (views, mut receiver) = holding_one();
+        let asked = views.input("1", take());
+        let answering = async {
+            match receiver.recv().await {
+                Some(view::Command::Input(_, answer)) => {
+                    let _ = answer.send(Ok(()));
+                }
+                _ => panic!("the input reaches the view's task"),
+            }
+        };
+        let (answer, ()) = tokio::join!(asked, answering);
+        assert_eq!(answer, Ok(()));
+    }
+}
