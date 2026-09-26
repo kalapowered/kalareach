@@ -375,7 +375,7 @@ pub use self::windows::{
 };
 
 #[cfg(all(windows, any(test, feature = "testing")))]
-pub use self::windows::Job;
+pub use self::windows::{Job, end_process};
 
 /// The calls into the operating system: the launch pipe, the facts of a process, and the child a
 /// starter creates.
@@ -1605,6 +1605,82 @@ mod windows {
         }
         // SAFETY: the call above returned a new handle that nothing else owns.
         Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
+    }
+
+    /// Ends the process `identity` names, for a test that had the Task Scheduler start it and
+    /// must not leave it running.
+    ///
+    /// The process is opened and its creation time read from that handle, and it is ended through
+    /// the same handle only when that is the identity's: a process that has taken the identifier
+    /// since is never ended. Returns whether the process `identity` names is gone, ended here or
+    /// ended before.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating system's error when the process cannot be opened or read.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn end_process(identity: &ProcessStartIdentity) -> io::Result<bool> {
+        use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
+        use windows_sys::Win32::System::Threading::{PROCESS_SYNCHRONIZE, PROCESS_TERMINATE};
+
+        let Ok(pid) = u32::try_from(identity.pid.get()) else {
+            return Ok(true);
+        };
+        // SAFETY: three plain values; the call returns a new handle or null.
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                pid,
+            )
+        };
+        if handle.is_null() {
+            let error = io::Error::last_os_error();
+            // No process holds the identifier: the one named has ended.
+            return if code(&error) == Some(ERROR_INVALID_PARAMETER) {
+                Ok(true)
+            } else {
+                Err(error)
+            };
+        }
+        // SAFETY: the call above returned a new handle that nothing else owns.
+        let process = unsafe { OwnedHandle::from_raw_handle(handle) };
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        // SAFETY: the handle is open with the right to query it, and each out parameter is a live
+        // local of the type the call writes.
+        let read = unsafe {
+            GetProcessTimes(
+                process.as_raw_handle(),
+                &raw mut creation,
+                &raw mut exit,
+                &raw mut kernel,
+                &raw mut user,
+            )
+        };
+        if read == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let created =
+            (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+        match windows_answer(pid, WindowsReading::Created(created), filetime_now()) {
+            ProcessQuery::Present(current) if current.matches(identity) => {}
+            // Another process holds the identifier now, or none does: the one named has ended.
+            ProcessQuery::Present(_) | ProcessQuery::Gone => return Ok(true),
+            ProcessQuery::CannotEstablish(error) => {
+                return Err(io::Error::other(error.to_string()));
+            }
+        }
+        // What decides is the wait, not the termination's own answer: a process that has already
+        // ended cannot be terminated again, and is gone all the same.
+        // SAFETY: the handle is open with the rights to terminate the process and to wait for it.
+        let ended = unsafe {
+            TerminateProcess(process.as_raw_handle(), 1);
+            WaitForSingleObject(process.as_raw_handle(), END_BOUND_MS) == WAIT_OBJECT_0
+        };
+        Ok(ended)
     }
 
     /// The executable an opened process runs, as Windows names it.

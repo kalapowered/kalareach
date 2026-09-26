@@ -584,12 +584,23 @@ fn powershell() -> String {
     candidate.display().to_string()
 }
 
-/// The processes running `image` whose command line names `root`: one test's own daemons and
-/// workers, since every one of them is told the test's own tree.
-fn processes(image: &str, root: &Path) -> Vec<u32> {
+/// A process of one test's tree, as the process list describes it.
+struct Listed {
+    pid: u32,
+    /// When it was created, as a `FILETIME`, to the microsecond the list gives.
+    created: u64,
+    /// Whether it is a starter the task ran, rather than a daemon or a worker.
+    starter: bool,
+}
+
+/// The processes running `image` whose command line names `root`: one test's own starters, daemons
+/// and workers, since every one of them is told the test's own tree.
+fn listed(image: &str, root: &Path) -> Vec<Listed> {
     let script = format!(
         "Get-CimInstance Win32_Process -Filter \"Name = '{image}'\" | Where-Object {{ \
-         $_.CommandLine -and $_.CommandLine.Contains('{}') }} | ForEach-Object {{ $_.ProcessId }}",
+         $_.CommandLine -and $_.CommandLine.Contains('{}') }} | ForEach-Object {{ '{{0}} {{1}} \
+         {{2}}' -f $_.ProcessId, $_.CreationDate.ToFileTimeUtc(), \
+         [int]$_.CommandLine.Contains(' --starter ') }}",
         root.display()
     );
     let output = Command::new(system32("WindowsPowerShell\\v1.0\\powershell.exe"))
@@ -598,26 +609,86 @@ fn processes(image: &str, root: &Path) -> Vec<u32> {
         .expect("the processes are listed");
     String::from_utf8_lossy(&output.stdout)
         .lines()
-        .filter_map(|line| line.trim().parse().ok())
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            Some(Listed {
+                pid: words.next()?.parse().ok()?,
+                created: words.next()?.parse().ok()?,
+                starter: words.next()? == "1",
+            })
+        })
         .collect()
 }
 
-/// Ends the daemon the task started for this tree, every worker it started, and removes the keys it
-/// kept in this account's credential store, when the test ends however it ends. Only what names
-/// this test's own tree is ended.
+/// The daemons, or the workers, running `image` for `root`: the starters the task ran are not
+/// counted.
+fn processes(image: &str, root: &Path) -> Vec<u32> {
+    listed(image, root)
+        .into_iter()
+        .filter(|process| !process.starter)
+        .map(|process| process.pid)
+        .collect()
+}
+
+/// Ends one listed process, through a handle that is checked to be the process the list described:
+/// an identifier that has passed to another process since is left alone.
+fn end(process: &Listed) {
+    /// The Unix epoch as a `FILETIME`.
+    const UNIX_EPOCH_AS_FILETIME: u64 = 116_444_736_000_000_000;
+    let Ok(identity) = kr_ipc::identity::process_start_identity(process.pid) else {
+        return;
+    };
+    // The identity counts hundreds of nanoseconds since the Unix epoch, and the list gives the
+    // creation time to the microsecond.
+    let listed = process.created.saturating_sub(UNIX_EPOCH_AS_FILETIME);
+    if identity.start_value.get().abs_diff(listed) >= 10 {
+        return;
+    }
+    let _ = kr_ipc::starter::end_process(&identity);
+}
+
+/// Ends what the task started for this tree when the test ends however it ends, in the order that
+/// lets nothing start again behind it, and then removes the keys the daemon kept in this account's
+/// credential store. Only what names this test's own tree is ended.
 struct EndsWhatItStarted<'a> {
     host: &'a Host,
 }
 
 impl Drop for EndsWhatItStarted<'_> {
     fn drop(&mut self) {
-        for image in ["kr-worker.exe", "kr-controller.exe"] {
-            for pid in processes(image, self.host.temp.root()) {
-                let _ = Command::new(system32("taskkill.exe"))
-                    .args(["/PID", &pid.to_string(), "/F"])
-                    .output();
+        let root = self.host.temp.root();
+        let environment = self.host.environment();
+        // No starter runs from here on, and one already running takes nothing: the task goes, and
+        // every request left for a starter is withdrawn.
+        let _ = scheduled::remove(&self.host.definition());
+        for request in self.host.claims().iter().filter_map(|name| {
+            name.strip_suffix(".claim")
+                .and_then(|request| request.parse().ok())
+        }) {
+            let _ = kr_ipc::starter::withdraw_claim(&environment, request);
+        }
+        // A starter ends once it has found nothing to take, or has started what it took.
+        let settled = Instant::now();
+        while listed("kr-controller.exe", root)
+            .iter()
+            .any(|process| process.starter)
+            && settled.elapsed() < LIVENESS_DEADLINE
+        {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        // Then the daemons, which start workers, and then the workers.
+        for image in ["kr-controller.exe", "kr-worker.exe"] {
+            let ending = Instant::now();
+            loop {
+                let left = listed(image, root);
+                if left.is_empty() || ending.elapsed() > LIVENESS_DEADLINE {
+                    break;
+                }
+                left.iter().for_each(end);
+                std::thread::sleep(Duration::from_millis(200));
             }
         }
+        // Only now the keys: nothing that writes them is left.
         if let Ok(store) =
             kr_crypto::store::PlatformStore::open(kr_ipc::verify::CONTROLLER_SECRET_SERVICE)
         {
@@ -634,6 +705,26 @@ impl Drop for EndsWhatItStarted<'_> {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Commands a test started and has not collected yet. One still here when the test ends is ended
+/// and collected, so none of them runs the task behind the test's cleanup.
+struct Commands(Vec<std::process::Child>);
+
+impl Commands {
+    /// Collects the next command, waiting for it as [`finish`] does.
+    fn next(&mut self, what: &str) -> Output {
+        finish(self.0.remove(0), what)
+    }
+}
+
+impl Drop for Commands {
+    fn drop(&mut self) {
+        for child in &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 }
@@ -815,14 +906,18 @@ fn three_first_invocations_at_once_leave_one_daemon_that_serves_every_caller() {
     let chose = host.kr(&["--json", "host", "startup", "--set", "standalone"]);
     assert!(chose.status.success(), "{}", document(&chose, "the choice"));
 
-    let running: Vec<std::process::Child> = (0..3)
-        .map(|_| host.new_session().spawn().expect("kr new starts"))
+    let mut running = Commands(
+        (0..3)
+            .map(|_| host.new_session().spawn().expect("kr new starts"))
+            .collect(),
+    );
+    let outputs: Vec<Output> = (0..3)
+        .map(|index| running.next(&format!("kr new {index}")))
         .collect();
     let log = host.environment().state_dir().join("controller.log");
     let mut sessions = Vec::new();
-    for (index, child) in running.into_iter().enumerate() {
+    for (index, output) in outputs.into_iter().enumerate() {
         let what = format!("kr new {index}");
-        let output = finish(child, &what);
         let created = document(&output, &what);
         assert!(
             output.status.success(),
@@ -933,6 +1028,10 @@ fn a_kr_new_in_the_job_its_parent_built() {
         .lock()
         .read_line(&mut word)
         .expect("the parent's word that the job is in place");
+    // A parent that ended before it gave the word closes this input: nothing is run then.
+    if word.trim() != "go" {
+        return;
+    }
     let host_root = std::env::var_os("KR_STARTUP_TEST_ROOT").expect("the tree's root");
     let shell = powershell();
     let output = Command::new(&kr)
