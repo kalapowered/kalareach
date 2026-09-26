@@ -4916,15 +4916,14 @@ impl WorkerService {
         })
     }
 
-    /// Returns the broker caller for one verified actor.
     /// Refuses a plugin action whose declared class needs a right the caller's grant does not
     /// carry.
     ///
-    /// The one caller not held to a grant is the local owner, on this worker's own socket and
-    /// naming no grant: its peer credentials proved it is this user, as they do for an
-    /// attachment's capabilities. Every other caller holds exactly the rights its grant was
-    /// checked against, a caller that reached the host some other way and named no grant
-    /// included, which then holds none.
+    /// The one caller not held to a grant is the local owner, the operating-system user a local
+    /// listener authenticated, naming no grant: its peer credentials proved it is this user, as
+    /// they do for an attachment's capabilities. Every other caller holds exactly the rights its
+    /// grant was checked against, whichever socket it came in on, a caller that reached the host
+    /// some other way and named no grant included, which then holds none.
     fn check_action_rights(
         caller: &Caller,
         action: &kr_protocol::broker::ActionName,
@@ -4951,6 +4950,7 @@ impl WorkerService {
         }
     }
 
+    /// Returns the broker caller for one verified actor.
     fn broker_caller(caller: &Caller) -> crate::broker::Caller {
         crate::broker::Caller {
             actor_id: caller.actor_id.clone(),
