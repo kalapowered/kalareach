@@ -1680,6 +1680,72 @@ fn kr_req_11_13_rows_go_with_the_process_that_held_them_and_with_a_native_exit()
     drop(packages);
 }
 
+/// Section 5: a package that ships a component binds for its declarative parts, whose actions it
+/// registers and whose rich admissions it makes, and the worker's report on its admissions says
+/// the component's capabilities are temporarily unavailable, and why. The same package with no
+/// component is reported for nothing.
+#[test]
+fn kr_req_11_13_a_package_with_a_component_binds_its_declarative_parts_and_reports_the_component_unavailable()
+ {
+    let reported = |worker: &Worker, package: Digest256| {
+        worker
+            .admissions
+            .report(
+                session(),
+                worker.broker.live_bindings(),
+                &worker.broker.action_refusals(),
+            )
+            .expect("a report")
+            .iter()
+            .flat_map(|part| part.refusals.iter())
+            .filter(|refusal| refusal.package_digest == package)
+            .map(|refusal| refusal.detail.clone())
+            .collect::<Vec<_>>()
+    };
+
+    let worker = Worker::open();
+    let source = worker.package(&fixture::Shape {
+        component: true,
+        ..fixture::Shape::claude_code()
+    });
+    let frame = worker.admit(1, vec![testing::admitted(&source)]);
+    worker.register(1);
+    let refused = worker
+        .bind(1, 1, source.package_digest, frame)
+        .expect("the package binds for its declarative parts");
+    assert!(refused.is_empty(), "{refused:?}");
+    for action in ["prompt.send", "approval.answer"] {
+        assert!(
+            worker
+                .broker
+                .registered_action(binding(1), &ActionName::new(action).expect("valid"))
+                .expect("the binding is held")
+                .is_some(),
+            "{action} is registered"
+        );
+    }
+    worker
+        .rich_admission(1, 1)
+        .expect("a declared action is admitted");
+    let details = reported(&worker, source.package_digest);
+    assert_eq!(details.len(), 1, "{details:?}");
+    assert!(
+        details[0].contains("component's capabilities are temporarily unavailable")
+            && details[0].contains("the plugin runtime is not running on this host"),
+        "{}",
+        details[0]
+    );
+
+    let worker = Worker::open();
+    let source = worker.claude_code();
+    let frame = worker.admit(1, vec![testing::admitted(&source)]);
+    worker.register(1);
+    worker
+        .bind(1, 1, source.package_digest, frame)
+        .expect("the package binds");
+    assert!(reported(&worker, source.package_digest).is_empty());
+}
+
 /// KR-REQ-11.13: a package's declared actions that this host cannot register are refused by name
 /// when it is bound, and the worker's report on its admissions names them against the package.
 #[test]

@@ -247,7 +247,7 @@ pub struct LiveBinding {
     pub component: Nullable<ComponentReport>,
 }
 
-/// An admitted package a worker would not read or bind, and why.
+/// An admitted package a worker would not read or bind, or would use only in part, and why.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PackageRefusal {
@@ -275,7 +275,7 @@ pub struct PluginAdmissionsAck {
     pub parts: u32,
     /// This part's share of the live bindings.
     pub bindings: Vec<LiveBinding>,
-    /// This part's share of the refused packages.
+    /// This part's share of the packages refused or used only in part.
     pub refusals: Vec<PackageRefusal>,
 }
 

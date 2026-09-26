@@ -4437,7 +4437,9 @@ impl WorkerService {
                     self.broker.admit_presentation(binding_id, &params)?;
                     return Ok(Some(Prepared::Presentation(params.action)));
                 }
-                let answers = registered.is_some_and(|registered| registered.decision.is_some());
+                let answers = registered
+                    .as_ref()
+                    .is_some_and(|registered| registered.decision.is_some());
                 if answers {
                     self.wait_before_admission();
                     let admitted = self.broker.admit_plugin_answer(
@@ -4471,19 +4473,30 @@ impl WorkerService {
                         kr_ipc::now_ms(),
                     )?;
                 }
-                // And the refusal this host makes whatever the caller does: the effect the
-                // component prepares does not reach this broker yet, and the broker will not
-                // transmit one nobody validated against the invocation it was prepared under. It
-                // is decided here, before the marker, so it is a rejection rather than an outcome
-                // nobody can establish.
-                Err(crate::broker::BrokerError::UnsupportedCapability {
-                    detail: format!(
-                        "{} is admitted, and the effect its component prepares does not reach \
-                         this broker yet, so nothing is transmitted for it",
+                // And the refusal this host makes whatever the caller does. It is decided here,
+                // before the marker, so it is a rejection rather than an outcome nobody can
+                // establish. An action the package's component prepares needs a component this
+                // host does not run; any other such action needs an upstream method this host does
+                // not send for a plugin, and the broker transmits nothing it has not validated
+                // against the invocation it was prepared under.
+                let detail = if registered
+                    .as_ref()
+                    .is_some_and(|registered| registered.component)
+                {
+                    format!(
+                        "{} is prepared by its package's component, whose capabilities are \
+                         temporarily unavailable: {}, so nothing is transmitted for it",
+                        params.action,
+                        crate::broker::catalogue::NO_COMPONENT_RUNS
+                    )
+                } else {
+                    format!(
+                        "{} is admitted, and this host does not send the upstream method it \
+                         declares yet, so nothing is transmitted for it",
                         params.action
-                    ),
-                }
-                .into())
+                    )
+                };
+                Err(crate::broker::BrokerError::UnsupportedCapability { detail }.into())
             }
             Method::ActionCancel => {
                 let params: kr_protocol::receipt::ActionCancelParams = parse(&mutation.params)?;

@@ -58,8 +58,8 @@ impl Controller {
 
     /// The catalogue's evidence for the doctor: each enrolled repository, each installation the
     /// admissions in force leave out for a reason other than being disabled, each package a worker
-    /// said it would not read or bind, with its session, and each set of admissions this daemon
-    /// could not hand over.
+    /// said it would not read, bind or use in full, with its session, and each set of admissions
+    /// this daemon could not hand over.
     pub(crate) async fn catalogue_evidence(&self) -> crate::catalogue::evidence::Evidence {
         let start = tokio::time::Instant::now();
         let deadline = start + WORKER_EXCHANGE;
@@ -87,7 +87,7 @@ impl Controller {
         }
         for (session_id, refusal) in self.plugin_bridge.refusals() {
             warnings.push(format!(
-                "session {session_id} did not use the package {}: {}{}",
+                "session {session_id} could not use all of the package {}: {}{}",
                 kr_plugin_sdk::digest::PayloadDigest::from_bytes(
                     *refusal.package_digest.as_bytes()
                 ),

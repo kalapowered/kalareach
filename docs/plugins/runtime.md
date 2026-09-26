@@ -428,7 +428,10 @@ upstream action from `upstream.action`; and the approval interpreter from `appro
 the right to answer only where `approval.respond` is granted beside it. The decoding trust comes
 from the admitted package's connector table, and the actions from its verified manifest's
 declarations. A package with a component binds for its declarative parts, and the binder does not
-register the component with the plugin host yet.
+register the component with the plugin host yet. Until it does, the worker's report on its
+admissions says the component's capabilities are temporarily unavailable because the plugin runtime
+is not running on the host, which the doctor's catalogue check carries, and an action the component
+prepares is refused before anything is sent, with the same reason.
 
 The broker lives in `crates/kr-worker/src/broker`. Its way to a component is the plugin host,
 through the client in `crates/kr-plugin-service`: register a binding, offer events to its queue,

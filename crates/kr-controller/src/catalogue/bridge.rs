@@ -84,7 +84,7 @@ pub struct Report {
     pub report_seq: u64,
     /// Every live binding.
     pub bindings: Vec<LiveBinding>,
-    /// Every package the worker would not read or bind.
+    /// Every package the worker would not read or bind, or would use only in part.
     pub refusals: Vec<PackageRefusal>,
 }
 

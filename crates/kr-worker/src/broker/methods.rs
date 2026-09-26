@@ -776,6 +776,8 @@ pub struct RegisteredAction {
     /// it is admitted on its class's right and answered with its receipt, and nothing leaves the
     /// host.
     pub presentation: bool,
+    /// True for an action the package's component prepares, which nothing on this host runs.
+    pub component: bool,
 }
 
 impl RegisteredAction {
@@ -878,6 +880,7 @@ impl RegisteredAction {
                 declaration.implementation,
                 ActionImplementation::Presentation {}
             ),
+            component: declaration.implementation.needs_component(),
         })
     }
 }

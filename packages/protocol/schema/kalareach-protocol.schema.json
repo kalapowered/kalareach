@@ -19646,7 +19646,7 @@
     },
     "PackageRefusal": {
       "additionalProperties": false,
-      "description": "An admitted package a worker would not read or bind, and why.",
+      "description": "An admitted package a worker would not read or bind, or would use only in part, and why.",
       "properties": {
         "detail": {
           "description": "Why, cut to the report's bound.",
@@ -21236,7 +21236,7 @@
           "type": "integer"
         },
         "refusals": {
-          "description": "This part's share of the refused packages.",
+          "description": "This part's share of the packages refused or used only in part.",
           "items": {
             "$ref": "#/$defs/PackageRefusal"
           },

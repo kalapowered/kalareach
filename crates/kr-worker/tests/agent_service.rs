@@ -1963,6 +1963,18 @@ async fn plugin_answer(
     request_id: u64,
     resource_id: Nullable<kr_protocol::ids::PendingResourceId>,
 ) -> (ErrorCode, ReceiptState) {
+    let (error, action_id) = plugin_refusal(client, host, request_id, resource_id).await;
+    (error.code, receipt(client, action_id).await.state)
+}
+
+/// Sends one `plugin.action.invoke` naming a pending resource, or none, and returns its refusal
+/// and the action it was.
+async fn plugin_refusal(
+    client: &mut LocalClient,
+    host: &Host,
+    request_id: u64,
+    resource_id: Nullable<kr_protocol::ids::PendingResourceId>,
+) -> (kr_protocol::error::ProtocolError, ActionId) {
     let mutation = MutationRequest {
         request_id: RequestId::new(request_id),
         method: Method::PluginActionInvoke.into(),
@@ -1997,7 +2009,36 @@ async fn plugin_answer(
     let Outcome::Error(error) = outcome else {
         panic!("this host transmits no plugin action: {outcome:?}");
     };
-    (error.code, receipt(client, action_id).await.state)
+    (error, action_id)
+}
+
+/// Section 5: an action the package's component prepares is admitted as any other, and refused
+/// before its dispatch marker because the component's capabilities are temporarily unavailable,
+/// with the reason: the plugin runtime is not running on this host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_action_the_component_prepares_is_refused_as_temporarily_unavailable() {
+    let host = host().await;
+    let upstream = Arc::new(CountingUpstream::default());
+    register(
+        &host,
+        Some(Arc::clone(&upstream) as Arc<dyn UpstreamDispatch>),
+    );
+    register_answer_action(&host);
+    let mut client = cli(&host).await;
+    let (error, action_id) = plugin_refusal(&mut client, &host, 40, Nullable::null()).await;
+    assert_eq!(error.code, ErrorCode::UnsupportedCapability);
+    assert!(
+        error.message.contains("temporarily unavailable")
+            && error
+                .message
+                .contains("the plugin runtime is not running on this host"),
+        "{}",
+        error.message
+    );
+    assert_eq!(
+        receipt(&mut client, action_id).await.state,
+        ReceiptState::Rejected
+    );
 }
 
 /// KR-REQ-12.18 and section 9: a plugin action that names a pending resource is checked against

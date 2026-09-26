@@ -62,6 +62,10 @@ impl ReadPackage {
     }
 }
 
+/// Why nothing on this host runs a package's component: a package that ships one is bound for
+/// its declarative parts, and its component's capabilities are temporarily unavailable.
+pub const NO_COMPONENT_RUNS: &str = "the plugin runtime is not running on this host";
+
 /// Whether a snapshot was applied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Applied {
@@ -391,20 +395,28 @@ impl Admissions {
             .iter()
             .filter_map(|(digest, read)| match read {
                 Err(why) => Some((*digest, why.clone())),
-                // A package read and bound whose declared actions could not all be registered is
-                // named too, with each action refused.
-                Ok(_) => action_refusals
-                    .get(digest)
-                    .filter(|refused| !refused.is_empty())
-                    .map(|refused| {
-                        (
-                            *digest,
-                            format!(
-                                "some of its declared actions were not registered: {}",
-                                refused.join("; ")
-                            ),
-                        )
-                    }),
+                // A package read is named too for the parts of it this worker does not use: a
+                // component, which nothing here runs, and each declared action that could not be
+                // registered.
+                Ok(read) => {
+                    let mut unused = Vec::new();
+                    if read.manifest().has_component() {
+                        unused.push(format!(
+                            "its component's capabilities are temporarily unavailable: \
+                             {NO_COMPONENT_RUNS}"
+                        ));
+                    }
+                    if let Some(refused) = action_refusals
+                        .get(digest)
+                        .filter(|refused| !refused.is_empty())
+                    {
+                        unused.push(format!(
+                            "some of its declared actions were not registered: {}",
+                            refused.join("; ")
+                        ));
+                    }
+                    (!unused.is_empty()).then(|| (*digest, unused.join("; ")))
+                }
             })
             .map(|(digest, why)| {
                 let (detail, detail_cut) = cut(&why, MAX_REPORT_DETAIL_BYTES);
