@@ -139,9 +139,14 @@ impl Held {
         self.reached.lock().expect("the record").clone()
     }
 
-    /// The hold the next exchange in `collection` meets, when a leg asked for one.
+    /// The hold an exchange in `collection` meets as it leaves, when a leg asked for one.
+    ///
+    /// Taken when the request leaves rather than when its answer arrives, so the hold goes to the
+    /// exchange that was next, not to whichever answer came back first. A hold whose handle was
+    /// dropped before its exchange left is gone rather than waiting to catch a later one.
     fn take_hold(&self, collection: &str) -> Option<Pending> {
         let mut pending = self.pending.lock().expect("the holds");
+        pending.retain(|hold| !hold.answered.is_closed());
         let index = pending
             .iter()
             .position(|hold| hold.collection == collection)?;
@@ -157,11 +162,13 @@ impl ServiceHttp for Held {
         headers: &'a [(&'a str, &'a str)],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         Box::pin(async move {
-            // Before the request leaves, so one whose answer never comes back is written down.
+            // Before the request leaves, so one whose answer never comes back is written down, and
+            // so the hold this exchange meets is decided in the order the exchanges left.
             let exchange = self.reached.lock().expect("the record").note(body);
+            let hold = exchange.and_then(|collection| self.take_hold(&collection));
             self.sent.fetch_add(1, Ordering::SeqCst);
             let answer = self.inner.post_json(url, body, headers).await;
-            if let Some(hold) = exchange.and_then(|collection| self.take_hold(&collection)) {
+            if let Some(hold) = hold {
                 // The service has answered. The leg hears that, and the answer goes no further
                 // until the leg says so or drops its handle.
                 let _ = hold.answered.send(());
@@ -231,6 +238,61 @@ mod tests {
             reached.identities.get("one"),
             Some(&("settings/a".to_owned(), 10, 20))
         );
+    }
+
+    /// A transport that answers every request at once with an empty success.
+    #[derive(Debug)]
+    struct Answers;
+
+    impl ServiceHttp for Answers {
+        fn post_json<'a>(
+            &'a self,
+            _url: &'a str,
+            _body: &'a [u8],
+            _headers: &'a [(&'a str, &'a str)],
+        ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+            Box::pin(async {
+                Ok(ServiceHttpAnswer {
+                    status: 200,
+                    body: b"{}".to_vec(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hold_meets_the_next_exchange_to_leave_and_a_dropped_one_meets_none() {
+        let object = Uuid::from_bytes([7; 16]);
+        let held = Held::over(Arc::new(Answers));
+        let request = exchange(&object.to_string(), "one", 1);
+
+        // A handle dropped before its exchange left holds nothing, and the hold after it meets the
+        // next exchange rather than being passed over.
+        drop(held.hold_the_next_exchange(object));
+        let mut holding = held.hold_the_next_exchange(object);
+        let sending = tokio::spawn({
+            let held = Arc::clone(&held);
+            let request = request.clone();
+            async move { held.post_json("http://127.0.0.1:1/", &request, &[]).await }
+        });
+        holding.answered().await;
+        assert!(
+            !sending.is_finished(),
+            "the answer waits until it is released"
+        );
+        holding.release();
+        assert_eq!(
+            sending.await.expect("the task").expect("an answer").status,
+            200
+        );
+
+        // With no hold left, the next exchange passes straight through.
+        assert!(
+            held.post_json("http://127.0.0.1:1/", &request, &[])
+                .await
+                .is_ok()
+        );
+        assert_eq!(held.sent(), 2);
     }
 
     #[test]
