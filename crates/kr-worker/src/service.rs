@@ -5195,10 +5195,11 @@ impl WorkerService {
                 // would let bytes already handed to the writer reach the application after the
                 // attachment that sent them had gone.
                 self.runtime.flush_locked(session);
-                // The attachment itself is gone either way too: a succession the kernel refused
-                // leaves the geometry where it was, not the attachment. So this connection and the
-                // fence stop holding it before the result is looked at, or a failed succession
-                // would leave both naming an attachment the session no longer has.
+                // Whatever the result, the attachment is no longer the session's: an error is either
+                // an attachment the session did not have, or a succession the kernel refused, which
+                // puts the size back and never the attachment. So this connection and the fence
+                // stop holding it before the result is looked at, or a failed succession would
+                // leave both naming an attachment the session no longer has.
                 state.remove_attachment(attachment_id);
                 self.forget_granted_attachment(attachment_id);
                 let result = outcome?;
