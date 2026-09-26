@@ -222,3 +222,36 @@ async fn a_report_of_more_parts_than_the_bound_is_refused() {
         "{outcome:?}"
     );
 }
+
+/// A worker that sends only its subscription's events never moves the part it owes: the exchange
+/// ends within about one part's time however many events come.
+#[tokio::test]
+async fn events_do_not_extend_the_time_a_part_has() {
+    let pace = PER_PART / 4;
+    let events: Vec<(Duration, ControlFrame)> = (0..40).map(|n| (pace, event(n))).collect();
+    let worker = Worker::start(1, events);
+    let mut client = worker.client().await;
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(
+        LIVENESS_DEADLINE,
+        client.exchange_admissions(snapshot(), PER_PART),
+    )
+    .await
+    .expect("the exchange ended");
+    assert!(
+        matches!(outcome, Err(IpcError::IdentityUnavailable { .. })),
+        "{outcome:?}"
+    );
+    assert!(started.elapsed() < PER_PART * 3, "{:?}", started.elapsed());
+}
+
+/// One event on this connection's subscription.
+fn event(sequence: u64) -> ControlFrame {
+    ControlFrame::Notification(kr_protocol::envelope::Notification {
+        stream_id: kr_protocol::ids::StreamId::new("session.output").expect("a stream name"),
+        sequence: kr_protocol::ids::EventSequence::new(sequence + 1),
+        event_type: kr_protocol::ids::EventType::new("session.output").expect("an event type"),
+        payload: kr_protocol::envelope::ParamsValue::from_typed(&"x".repeat(64))
+            .expect("a payload"),
+    })
+}

@@ -494,8 +494,11 @@ impl LocalClient {
             .map_err(|_| late())??;
         }
         let mut report: Vec<kr_protocol::admission::PluginAdmissionsAck> = Vec::new();
+        // The part expected next is due by one time, whatever arrives on the subscription
+        // before it; only a part of the report moves it.
+        let mut due = tokio::time::Instant::now() + per_part;
         loop {
-            let frame = tokio::time::timeout(per_part, self.read_socket_frame())
+            let frame = tokio::time::timeout_at(due, self.read_socket_frame())
                 .await
                 .map_err(|_| late())??;
             match frame {
@@ -521,6 +524,7 @@ impl LocalClient {
                     if done {
                         return Ok(report);
                     }
+                    due = tokio::time::Instant::now() + per_part;
                 }
                 // This connection's subscription, not an answer to the snapshot. It is kept in
                 // arrival order and handed back afterwards.
