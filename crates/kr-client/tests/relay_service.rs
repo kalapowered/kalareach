@@ -560,8 +560,8 @@ async fn a_refusal_arrives_as_the_code_the_service_named() {
 /// KR-REQ-04.11: a lease answer that something in front of the service lost is an unknown outcome.
 /// The service has the request, and may have issued and installed a lease, when a gateway answers
 /// 502 or 504 with a page of its own, so nothing asks again by itself. The same holds for a
-/// revocation. The service's own fault arrives in its envelope and stays transient, and a success
-/// this client cannot read stays an unknown outcome.
+/// revocation. The service's own answer arrives in its envelope and is read by the code it names,
+/// whatever the status, and a success this client cannot read stays an unknown outcome.
 #[tokio::test]
 async fn a_lease_answer_a_gateway_lost_is_an_unknown_outcome() {
     let http = Recorder::new(&granted_answer());
@@ -607,20 +607,21 @@ async fn a_lease_answer_a_gateway_lost_is_an_unknown_outcome() {
         assert_eq!(error.code(), ErrorCode::OutcomeUnknown, "{status}");
     }
 
-    // The controls. The service's own fault is its envelope, and a caller waits and asks again.
+    // The controls. A gateway status that carries the service's own envelope is not an answer the
+    // gateway lost: it is the service's, read by the code it names.
     http.answer_with(
-        500,
+        502,
         &serde_json::json!({
             "ok": false,
-            "error": { "code": "INTERNAL", "message": "The request could not be completed." }
+            "error": { "code": "RATE_LIMITED", "message": "Too many requests from this network." }
         })
         .to_string(),
     );
     let error = service
         .issue(&issue_request())
         .await
-        .expect_err("the service's own fault");
-    assert_eq!(error.code(), ErrorCode::UpstreamUnavailable);
+        .expect_err("the service's own refusal");
+    assert_eq!(error.code(), ErrorCode::RateLimited);
     assert_eq!(error.code().retry_category(), RetryCategory::Transient);
 
     // A success this client cannot read.
@@ -667,8 +668,9 @@ async fn a_revocation_reports_what_the_reservation_settled() {
 
     assert_eq!(ending.lease_id, lease_id);
     assert_eq!(ending.revision.get(), 2);
-    assert_eq!(ending.settlement.basis, "receipts");
-    assert_eq!(ending.settlement.bytes_settled.get(), 1_048_576);
+    let settlement = ending.settlement.as_ref().expect("the charge is settled");
+    assert_eq!(settlement.basis, "receipts");
+    assert_eq!(settlement.bytes_settled.get(), 1_048_576);
 
     let (url, sent) = http.last();
     assert_eq!(url, "https://reach.kala.to/api/relay/lease/revoke");
@@ -724,7 +726,10 @@ async fn a_revocation_whose_charge_is_not_known_yet_ends_the_lease_without_a_set
         .as_ref()
         .expect("the relay confirmed the revocation");
     assert_eq!(relay.state, RelayLeaseState::Revoked);
-    assert_eq!(format!("{:?}", ending.settlement), "Nullable(None)");
+    assert!(
+        !ending.settlement.is_present(),
+        "the charge is not known yet"
+    );
 }
 
 /// KR-REQ-04.11: the service's own failure while it handled a lease request leaves the request's
