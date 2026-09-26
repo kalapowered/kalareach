@@ -50,6 +50,24 @@ mod teardown;
 /// none of these is timed by the product itself.
 const PATIENCE: Duration = Duration::from_secs(40);
 
+/// The variable that makes a placed copy of this binary a program a person starts in a session:
+/// it sleeps for as many seconds as it names.
+const STAND_IN: &str = "KR_BINDING_STAND_IN";
+
+/// The variable that names a file the stand-in writes its process identifier to once it runs.
+const STAND_IN_RUNNING: &str = "KR_BINDING_STAND_IN_RUNNING";
+
+/// The stand-in program's body. Run by the test harness with nothing set, it does nothing.
+#[test]
+fn the_stand_in_program() {
+    if let Ok(seconds) = std::env::var(STAND_IN) {
+        if let Some(running) = std::env::var_os(STAND_IN_RUNNING) {
+            std::fs::write(running, std::process::id().to_string()).expect("says it is running");
+        }
+        std::thread::sleep(Duration::from_secs(seconds.parse().unwrap_or(60)));
+    }
+}
+
 fn build() -> BuildId {
     BuildId::new("kr-test/0").expect("a build identifier")
 }
@@ -398,6 +416,90 @@ impl Hosted {
             .find(|summary| summary.plugin_id == plugin())
             .expect("the example package is installed")
             .live_bindings
+    }
+
+    /// Asks `plugin.list` until it counts `wanted` live bindings, or until the patience runs out,
+    /// and returns the last count.
+    async fn counted_as(&self, wanted: u64) -> Nullable<U64> {
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        loop {
+            let counted = self.counted().await;
+            if counted == Nullable::some(U64::new(wanted))
+                || tokio::time::Instant::now() >= deadline
+            {
+                return counted;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Types `line` into a session's terminal as a person at an attached terminal does: an
+    /// attachment that may type, on the session's own worker, the input lease, and the bytes.
+    /// Returns the connection, which holds the attachment.
+    async fn type_into(&self, created: &SessionCreateResult, line: &str) -> LocalClient {
+        let session = &created.session;
+        let endpoint = self
+            .tree
+            .environment()
+            .worker_endpoint(session.display_number)
+            .expect("the worker's endpoint");
+        let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("connects to the session's worker");
+        let target = self.target(Some((session.session_id, session.session_epoch)));
+        let mut requested = kr_protocol::scalars::CanonicalSet::new();
+        requested.insert(kr_protocol::attachment::AttachmentCapability::ObserveTerminal);
+        requested.insert(kr_protocol::attachment::AttachmentCapability::Input);
+        let attached: kr_protocol::attachment::SessionAttachResult = client
+            .mutate(
+                Method::SessionAttach,
+                ActionId::new(kr_ipc::new_uuid()),
+                target.clone(),
+                &kr_protocol::attachment::SessionAttachParams {
+                    session_id: session.session_id,
+                    mode: kr_protocol::attachment::AttachMode::Terminal,
+                    claim_geometry: false,
+                    dimensions: Nullable::some(kr_protocol::session::Dimensions::new(80, 24)),
+                    terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                    requested,
+                },
+            )
+            .await
+            .expect("reaches the worker")
+            .expect("the attachment is accepted")
+            .to_typed()
+            .expect("decodes");
+        let acquired: kr_protocol::input::InputAcquireResult = client
+            .mutate(
+                Method::InputAcquire,
+                ActionId::new(kr_ipc::new_uuid()),
+                target,
+                &kr_protocol::input::InputAcquireParams {
+                    session_id: session.session_id,
+                    attachment_id: attached.attachment.attachment_id,
+                    expected_epoch: Nullable::null(),
+                },
+            )
+            .await
+            .expect("reaches the worker")
+            .expect("the lease is acquired")
+            .to_typed()
+            .expect("decodes");
+        client
+            .request(
+                Method::InputWrite,
+                &kr_protocol::input::InputWriteParams {
+                    session_id: session.session_id,
+                    attachment_id: attached.attachment.attachment_id,
+                    epoch: acquired.lease.epoch,
+                    sequence: kr_protocol::ids::InputSequence::new(0),
+                    bytes: kr_protocol::scalars::Bytes::new(line.as_bytes().to_vec()),
+                },
+            )
+            .await
+            .expect("reaches the worker")
+            .expect("the line reaches the terminal");
+        client
     }
 
     /// The members a reclaim that needs room would wait for now.
@@ -1013,5 +1115,67 @@ async fn a_lowered_package_limit_comes_into_force_with_its_revision_in_one_step(
             .packages
             .iter()
             .all(|package| package.plugin_id != plugin())
+    );
+}
+
+/// A worker reconciled with an empty report adopts a program a person started in its session,
+/// with no change to the catalogue: the program is the one the example package recognises, which
+/// has no connector table, so it is adopted by the package's match rule alone and bound. The next
+/// `plugin.list` counts that binding, and once the program has exited the next one counts none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_program_adopted_with_no_catalogue_change_is_counted_while_it_runs() {
+    let hosted = Hosted::start().await;
+    let created = hosted.session().await;
+    assert_eq!(
+        hosted.counted_once_known().await,
+        Nullable::some(U64::new(0)),
+        "reconciled with an empty report"
+    );
+
+    // The program the example package recognises, placed on the internal disk and started once
+    // where nothing is timed.
+    let program = hosted.tree.root().join("example-agent");
+    kr_ipc::testing::place_and_start_once(
+        &std::env::current_exe().expect("this test's own binary"),
+        &program,
+        &["--exact", "the_stand_in_program", "--test-threads", "1"],
+    );
+    let running = hosted.tree.root().join("stand-in-running");
+    let _typing = hosted
+        .type_into(
+            &created,
+            &format!(
+                "{STAND_IN}=60 {STAND_IN_RUNNING}='{}' '{}' --exact the_stand_in_program \
+                 --test-threads 1\n",
+                running.display(),
+                program.display()
+            ),
+        )
+        .await;
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    let pid = loop {
+        if let Ok(said) = std::fs::read_to_string(&running)
+            && let Ok(pid) = said.trim().parse::<u32>()
+        {
+            break pid;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the program the line started runs"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let started = kr_ipc::identity::process_start_identity(pid).expect("the program is identified");
+
+    assert_eq!(
+        hosted.counted_as(1).await,
+        Nullable::some(U64::new(1)),
+        "the adopted program's binding is counted"
+    );
+    end(&started).await;
+    assert_eq!(
+        hosted.counted_as(0).await,
+        Nullable::some(U64::new(0)),
+        "and once it has exited, none is"
     );
 }
