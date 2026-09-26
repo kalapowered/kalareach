@@ -828,6 +828,18 @@ impl Asked {
     }
 }
 
+/// How far a Task Scheduler command that failed got.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// It could not be started, so it did nothing.
+    NotStarted,
+    /// It was started and its end was not seen: it did not finish within its bound, or it could
+    /// not be waited for. What it did is not known.
+    Unseen,
+    /// It ended, with the exit code it gave where it gave one.
+    Ended(Option<i32>),
+}
+
 /// Why a look at, or a change to, an environment's task did not happen.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TaskError {
@@ -837,8 +849,8 @@ pub enum TaskError {
     Scheduler {
         /// What it was asked.
         asked: Asked,
-        /// The exit code it gave, when it ran and gave one.
-        code: Option<i32>,
+        /// How far the command got.
+        outcome: Outcome,
         /// What went wrong, in the Task Scheduler's own words where it gave any.
         detail: String,
     },
@@ -860,11 +872,17 @@ pub enum TaskError {
 
 impl TaskError {
     /// Whether the task is as it was before the call that failed: a refusal before any change,
-    /// or a change that was undone.
+    /// or a change that was undone. A change the Task Scheduler was asked for and whose end was
+    /// not seen may have been made.
     #[must_use]
     pub const fn changed_nothing(&self) -> bool {
         match self {
             Self::ReadBack { undone, .. } => *undone,
+            Self::Scheduler {
+                asked: Asked::Register | Asked::Remove,
+                outcome: Outcome::Unseen,
+                ..
+            } => false,
             Self::Foreign(_) | Self::Scheduler { .. } | Self::Locked(_) | Self::Unwritten(_) => {
                 true
             }
@@ -1037,7 +1055,7 @@ pub use self::platform::{
 #[cfg(windows)]
 mod platform {
     use super::{
-        Asked, Foreign, ForeignReason, LastResult, RegisteredTask, Standing, TaskChange,
+        Asked, Foreign, ForeignReason, LastResult, Outcome, RegisteredTask, Standing, TaskChange,
         TaskDefinition, TaskError, decode_output, last_result_in,
     };
     use crate::supervision::{RunFailure, SERVICE_MANAGER_BOUND, command_within};
@@ -1063,7 +1081,10 @@ mod platform {
         )
         .map_err(|failure| TaskError::Scheduler {
             asked,
-            code: None,
+            outcome: match failure {
+                RunFailure::NotRun(_) => Outcome::NotStarted,
+                RunFailure::Failed(_) => Outcome::Unseen,
+            },
             detail: failure.detail(),
         })
     }
@@ -1072,7 +1093,7 @@ mod platform {
     fn refused(asked: Asked, what: &str, output: &std::process::Output) -> TaskError {
         TaskError::Scheduler {
             asked,
-            code: output.status.code(),
+            outcome: Outcome::Ended(output.status.code()),
             detail: format!("{what}: {}", decode_output(&output.stderr).trim()),
         }
     }
@@ -1421,7 +1442,7 @@ mod platform {
             .and_then(last_result_in)
             .ok_or_else(|| TaskError::Scheduler {
                 asked: Asked::Query,
-                code: None,
+                outcome: Outcome::Ended(output.status.code()),
                 detail: format!(
                     "the Task Scheduler's list of {} has no last result",
                     definition.name
@@ -2404,6 +2425,40 @@ mod tests {
         );
     }
 
+    /// A change the Task Scheduler was asked for and whose end was not seen may have been made, so
+    /// it is not said to have changed nothing. A change it refused, one whose command never
+    /// started, and every look at a task, changed nothing.
+    #[test]
+    fn only_a_change_whose_end_was_not_seen_may_have_changed_the_task() {
+        let failed = |asked, outcome| TaskError::Scheduler {
+            asked,
+            outcome,
+            detail: String::new(),
+        };
+        for asked in [Asked::Register, Asked::Remove] {
+            assert!(
+                !failed(asked, Outcome::Unseen).changed_nothing(),
+                "{asked:?}"
+            );
+            for outcome in [
+                Outcome::NotStarted,
+                Outcome::Ended(Some(1)),
+                Outcome::Ended(None),
+            ] {
+                assert!(
+                    failed(asked, outcome).changed_nothing(),
+                    "{asked:?} {outcome:?}"
+                );
+            }
+        }
+        for asked in [Asked::Query, Asked::List] {
+            assert!(
+                failed(asked, Outcome::Unseen).changed_nothing(),
+                "{asked:?}"
+            );
+        }
+    }
+
     /// A change that reads back as asked is the change. One that reads back otherwise, or that
     /// cannot be read back at all, is undone as far as it can be, and the refusal says what was
     /// found and whether the undoing worked, which is whether anything is left changed.
@@ -2427,7 +2482,7 @@ mod tests {
             TaskChange::Registered,
             Err(TaskError::Scheduler {
                 asked: Asked::Query,
-                code: None,
+                outcome: Outcome::Unseen,
                 detail: "the query timed out".to_owned(),
             }),
             |change| {

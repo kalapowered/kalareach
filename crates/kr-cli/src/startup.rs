@@ -1043,7 +1043,8 @@ pub(crate) mod task {
     use kr_client::shown;
     use kr_client::shown::Shown;
     use kr_controller::supervision::windows::{
-        Difference, ForeignReason, LastResult, LogonType, ReadBack, Standing, TaskError, task_name,
+        Difference, ForeignReason, LastResult, LogonType, Outcome, ReadBack, Standing, TaskError,
+        task_name,
     };
     use kr_protocol::ids::EnvironmentId;
 
@@ -1124,7 +1125,7 @@ pub(crate) mod task {
             ),
             TaskError::Scheduler {
                 asked,
-                code: Some(code),
+                outcome: Outcome::Ended(Some(code)),
                 ..
             } => shown!(
                 "the Task Scheduler did not {} the scheduled task {} (exit code {}); schtasks \
@@ -1135,10 +1136,35 @@ pub(crate) mod task {
                 name
             ),
             TaskError::Scheduler {
-                asked, code: None, ..
+                asked,
+                outcome: Outcome::Ended(None),
+                ..
+            } => shown!(
+                "the Task Scheduler did not {} the scheduled task {}; schtasks /Query /TN {} shows \
+                 what it holds",
+                asked.as_str(),
+                name,
+                name
+            ),
+            TaskError::Scheduler {
+                asked,
+                outcome: Outcome::NotStarted,
+                ..
             } => shown!(
                 "the Task Scheduler could not be asked to {} the scheduled task {}",
                 asked.as_str(),
+                name
+            ),
+            TaskError::Scheduler {
+                asked,
+                outcome: Outcome::Unseen,
+                ..
+            } => shown!(
+                "the Task Scheduler was asked to {} the scheduled task {} and did not answer in \
+                 time, so whether it did cannot be told; schtasks /Query /TN {} shows what it \
+                 holds",
+                asked.as_str(),
+                name,
                 name
             ),
             TaskError::ReadBack { found, undone, .. } => {
@@ -2078,7 +2104,7 @@ mod tests {
     fn a_task_is_reported_whose_valid_and_available_apart() {
         use crate::shown::marker::{MARKER, assert_unmarked};
         use kr_controller::supervision::windows::{
-            Asked, Foreign, ForeignReason, LastResult, Standing, TaskError,
+            Asked, Foreign, ForeignReason, LastResult, Outcome, Standing, TaskError,
         };
 
         let environment_id = kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid());
@@ -2224,12 +2250,22 @@ mod tests {
         for error in [
             TaskError::Scheduler {
                 asked: Asked::Register,
-                code: Some(1),
+                outcome: Outcome::Ended(Some(1)),
                 detail: MARKER.to_owned(),
             },
             TaskError::Scheduler {
                 asked: Asked::Query,
-                code: None,
+                outcome: Outcome::NotStarted,
+                detail: MARKER.to_owned(),
+            },
+            TaskError::Scheduler {
+                asked: Asked::Register,
+                outcome: Outcome::Unseen,
+                detail: MARKER.to_owned(),
+            },
+            TaskError::Scheduler {
+                asked: Asked::Remove,
+                outcome: Outcome::Ended(None),
                 detail: MARKER.to_owned(),
             },
             TaskError::ReadBack {
@@ -2275,7 +2311,7 @@ mod tests {
             task::error(
                 &TaskError::Scheduler {
                     asked: Asked::Remove,
-                    code: Some(5),
+                    outcome: Outcome::Ended(Some(5)),
                     detail: MARKER.to_owned(),
                 },
                 environment_id
