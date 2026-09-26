@@ -77,6 +77,22 @@ pub fn variable(name: &str) -> Option<String> {
     Some(value)
 }
 
+/// The line a leg prints once it has given back everything it took.
+///
+/// `scripts/e2e-privacy.sh` says a leg's collections were emptied only when it finds this line, so a
+/// leg that stopped before it could give anything back is never reported as having done so.
+pub const GAVE_BACK: &str = "this leg gave back everything it took";
+
+/// Reports what a leg could not give back, one line each, or that it gave back everything.
+pub fn report_left(left: &[String]) {
+    if left.is_empty() {
+        println!("{GAVE_BACK}");
+    }
+    for what in left {
+        println!("{}", not_given_back(what));
+    }
+}
+
 /// One line of what a leg could not give back, as `scripts/e2e-privacy.sh` collects it.
 ///
 /// One line whatever the failure said: the script reads a leg's output line by line, so a line

@@ -22,7 +22,7 @@
 //! HTTPS offers neither, so the leg runs against a local deployment only.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use kr_client::drafts::DraftSealer;
 use kr_client::services::StorageService as _;
@@ -41,7 +41,7 @@ use kr_privacy_integration::giveback::give_back;
 use kr_privacy_integration::held::Held;
 use kr_privacy_integration::local::{Account, LocalStack, Site};
 use kr_privacy_integration::push::{Gateway, notification};
-use kr_privacy_integration::{RunKey, fresh_uuid, not_given_back, now_ms, proved};
+use kr_privacy_integration::{RunKey, fresh_uuid, now_ms, proved, report_left};
 use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId, DeviceId};
 use kr_protocol::push::PushDeliveryState;
 use kr_protocol::scalars::{Digest256, TimestampMs, Uuid};
@@ -54,8 +54,48 @@ const NOTIFICATION_LIFETIME_MS: u64 = 60 * 60 * 1000;
 /// inside what keeps the gateway retrying: twelve attempts take at least three quarters of an hour.
 const NOTIFICATION_STEPS: Duration = Duration::from_secs(60);
 
+/// A day, in milliseconds.
+const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+
 fn now() -> TimestampMs {
     TimestampMs::new(now_ms())
+}
+
+/// An instant the console writes, `2026-09-26T01:50:32.672Z`, in milliseconds since the epoch.
+fn epoch_ms(instant: &str) -> i64 {
+    let (date, time) = instant
+        .strip_suffix('Z')
+        .and_then(|utc| utc.split_once('T'))
+        .expect("an instant in UTC");
+    let number = |text: &str| text.parse::<i64>().expect("a number");
+    let date: Vec<i64> = date.split('-').map(number).collect();
+    let (clock, fraction) = time.split_once('.').unwrap_or((time, "0"));
+    let clock: Vec<i64> = clock.split(':').map(number).collect();
+    assert!(date.len() == 3 && clock.len() == 3, "an instant: {instant}");
+    let millis = number(&format!("{fraction:0<3}")[..3]);
+    // Days since the epoch of a proleptic Gregorian date, counting years from March so that the
+    // leap day falls at the end of one.
+    let (month, day) = (date[1], date[2]);
+    let year = if month <= 2 { date[0] - 1 } else { date[0] };
+    let era = year.div_euclid(400);
+    let of_era = year - era * 400;
+    let of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let days = era * 146_097 + of_era * 365 + of_era / 4 - of_era / 100 + of_year - 719_468;
+    (((days * 24 + clock[0]) * 60 + clock[1]) * 60 + clock[2]) * 1000 + millis
+}
+
+#[test]
+fn an_instant_reads_as_milliseconds_since_the_epoch() {
+    assert_eq!(epoch_ms("1970-01-01T00:00:00.000Z"), 0);
+    assert_eq!(epoch_ms("2000-03-01T00:00:00Z"), 951_868_800_000);
+    assert_eq!(
+        epoch_ms("2026-10-03T01:50:32.672Z") - epoch_ms("2026-09-26T01:50:32.672Z"),
+        7 * DAY_MS
+    );
+    assert_eq!(
+        epoch_ms("2024-03-01T00:00:00.5Z") - epoch_ms("2024-02-28T00:00:00Z"),
+        2 * DAY_MS + 500
+    );
 }
 
 /// One collection as the account console lists it, or nothing when it is not listed.
@@ -168,188 +208,197 @@ async fn kr_req_24_29_what_is_at_the_services_stays_until_its_own_authorised_act
     kept(&stack, &owner, a).await;
     kept(&stack, &owner, b).await;
 
-    // 3. A notification the gateway holds: K registers a push token and authorises two hosts, and
-    // host H delivers through its own gateway client. No provider answers, so the gateway retries.
-    let gateway = Gateway::of(deployment);
-    gateway.register(&k, &stack).await;
-    let h = RunKey::host();
-    let h2 = RunKey::host();
-    let credential = gateway.authorise(&k, &h).await;
-    let another = gateway.authorise(&k, &h2).await;
-    let n = notification(
-        credential.sender_record_id,
-        now_ms() + NOTIFICATION_LIFETIME_MS,
-    );
-    let delivered = Instant::now();
-    let SendOutcome::Decided(ack) = gateway.deliver(&credential, &n).await else {
-        panic!("the gateway decided about the delivery");
-    };
-    assert_eq!(
-        ack.state,
-        PushDeliveryState::Retrying,
-        "the gateway holds it and keeps trying"
-    );
+    // Steps 3 to 7 hold a notification at the gateway and ask about it. They run within a bound well
+    // inside what keeps the gateway retrying, or the leg fails rather than waits.
+    let held = tokio::time::timeout(NOTIFICATION_STEPS, async {
+        // 3. A notification the gateway holds: K registers a push token and authorises two hosts, and
+        // host H delivers through its own gateway client. No provider answers, so the gateway retries.
+        let gateway = Gateway::of(deployment);
+        gateway.register(&k, &stack).await;
+        let h = RunKey::host();
+        let h2 = RunKey::host();
+        let credential = gateway.authorise(&k, &h).await;
+        let another = gateway.authorise(&k, &h2).await;
+        let n = notification(
+            credential.sender_record_id,
+            now_ms() + NOTIFICATION_LIFETIME_MS,
+        );
+        let SendOutcome::Decided(ack) = gateway.deliver(&credential, &n).await else {
+            panic!("the gateway decided about the delivery");
+        };
+        assert_eq!(
+            ack.state,
+            PushDeliveryState::Retrying,
+            "the gateway holds it and keeps trying"
+        );
 
-    // 4. K's own client enables privacy mode, with a write of its own published and one in flight.
-    let held = Held::over(deployment.transport());
-    let service = Arc::new(ManagedSyncService::new(
-        stack.origin().clone(),
-        Arc::clone(&held) as Arc<dyn ServiceHttp>,
-        Arc::clone(&k) as Arc<dyn ServiceSigner>,
-    ));
-    let keys = Arc::new(MemoryCollectionKeys::new());
-    let key_name = fresh_uuid().to_string();
-    keys.draw(&key_name, 1).expect("a collection key");
-    let directory = tempfile::tempdir().expect("a directory for the device's store");
-    let client = Arc::new(SyncClient::new(
-        Arc::clone(&service) as Arc<dyn SyncBackupService>,
-        Arc::new(CollectionSealer::new(keys, &key_name, 1)) as Arc<dyn DraftSealer>,
-        SyncStore::open(directory.path().join("device")).expect("a store"),
-    ));
-    let settings = |value: &str| SyncObject {
-        object_id: fresh_object_id().expect("an identity"),
-        revision: fresh_revision().expect("a revision"),
-        device_id: DeviceId::new(Uuid::from_bytes([1; 16])),
-        updated_at_ms: now(),
-        body: SyncBody::Settings(SyncSettings {
-            values: [("theme".to_owned(), SettingValue::Text(value.to_owned()))]
-                .into_iter()
-                .collect(),
-            pinned_labels: std::collections::BTreeSet::new(),
-        }),
-    };
-    let published = settings("dark");
-    client.store().put_object(&published).expect("stored");
-    assert!(matches!(
+        // 4. K's own client enables privacy mode, with a write of its own published and one in flight.
+        let held = Held::over(deployment.transport());
+        let service = Arc::new(ManagedSyncService::new(
+            stack.origin().clone(),
+            Arc::clone(&held) as Arc<dyn ServiceHttp>,
+            Arc::clone(&k) as Arc<dyn ServiceSigner>,
+        ));
+        let keys = Arc::new(MemoryCollectionKeys::new());
+        let key_name = fresh_uuid().to_string();
+        keys.draw(&key_name, 1).expect("a collection key");
+        let directory = tempfile::tempdir().expect("a directory for the device's store");
+        let client = Arc::new(SyncClient::new(
+            Arc::clone(&service) as Arc<dyn SyncBackupService>,
+            Arc::new(CollectionSealer::new(keys, &key_name, 1)) as Arc<dyn DraftSealer>,
+            SyncStore::open(directory.path().join("device")).expect("a store"),
+        ));
+        let settings = |value: &str| SyncObject {
+            object_id: fresh_object_id().expect("an identity"),
+            revision: fresh_revision().expect("a revision"),
+            device_id: DeviceId::new(Uuid::from_bytes([1; 16])),
+            updated_at_ms: now(),
+            body: SyncBody::Settings(SyncSettings {
+                values: [("theme".to_owned(), SettingValue::Text(value.to_owned()))]
+                    .into_iter()
+                    .collect(),
+                pinned_labels: std::collections::BTreeSet::new(),
+            }),
+        };
+        let published = settings("dark");
+        client.store().put_object(&published).expect("stored");
+        assert!(matches!(
+            client
+                .publish(published.object_id, now())
+                .await
+                .expect("published"),
+            Published::Accepted { .. }
+        ));
+        let in_flight = settings("light");
+        client.store().put_object(&in_flight).expect("stored");
+        let mut holding = held.hold_the_next_exchange(in_flight.object_id.get());
+        let publishing = tokio::spawn({
+            let client = Arc::clone(&client);
+            let object_id = in_flight.object_id;
+            async move { client.publish(object_id, now()).await }
+        });
+        holding.answered().await;
+        client.fence(1).expect("fenced");
         client
-            .publish(published.object_id, now())
+            .cancel_undispatched(1, now())
             .await
-            .expect("published"),
-        Published::Accepted { .. }
-    ));
-    let in_flight = settings("light");
-    client.store().put_object(&in_flight).expect("stored");
-    let mut holding = held.hold_the_next_exchange(in_flight.object_id.get());
-    let publishing = tokio::spawn({
-        let client = Arc::clone(&client);
-        let object_id = in_flight.object_id;
-        async move { client.publish(object_id, now()).await }
+            .expect("cancelled");
+        client.remove_retained(1, now()).await.expect("removed");
+        holding.release();
+        assert!(matches!(
+            publishing.await.expect("the task").expect("answered"),
+            Published::Discarded { .. }
+        ));
+        assert_eq!(
+            client.outstanding().expect("a count"),
+            0,
+            "privacy mode is complete"
+        );
+
+        // 5. Nothing at the services went.
+        kept(&stack, &owner, a).await;
+        kept(&stack, &owner, b).await;
+        let StatusAnswer::Recorded(ack) = gateway.status(&credential, n.notification_id).await
+        else {
+            panic!("the gateway still has the notification");
+        };
+        assert_eq!(ack.state, PushDeliveryState::Retrying);
+
+        // 6. The console's deletion of A, refused without its authorisation.
+        let refused = stack.delete_collection(None, Site::This, a).await;
+        assert_eq!(
+            (refused.status, refused.code()),
+            (401, Some("UNAUTHENTICATED")),
+            "{refused:?}"
+        );
+        kept(&stack, &owner, a).await;
+        let refused = stack
+            .delete_collection(Some(&owner), Site::Another, a)
+            .await;
+        assert_eq!(
+            (refused.status, refused.code()),
+            (403, Some("FORBIDDEN")),
+            "{refused:?}"
+        );
+        kept(&stack, &owner, a).await;
+        let refused = stack
+            .delete_collection(Some(&stranger), Site::This, a)
+            .await;
+        assert_eq!(refused.code(), Some("NOT_FOUND"), "{refused:?}");
+        kept(&stack, &owner, a).await;
+        // And with it.
+        let deleted = stack.delete_collection(Some(&owner), Site::This, a).await;
+        assert_eq!(deleted.status, 200, "{deleted:?}");
+        let entry = &deleted.body["data"];
+        assert_eq!(entry["state"], "deleted", "{entry}");
+        assert_eq!(entry["awaitingRemoval"]["objects"], 1, "{entry}");
+        let (deleted_at, due) = (
+            entry["deletedAt"].as_str().expect("when it was deleted"),
+            entry["removalDueAt"].as_str().expect("when its objects go"),
+        );
+        assert_eq!(
+            epoch_ms(due) - epoch_ms(deleted_at),
+            7 * DAY_MS,
+            "its objects are removed seven days after the deletion, not now: {entry}"
+        );
+        let listing = stack.collections(Some(&owner)).await;
+        assert_eq!(listing.body["data"]["tombstoneDays"], 7);
+        let listed_a = listed(&stack, &owner, a).await.expect("still listed");
+        assert_eq!(listed_a["state"], "deleted", "{listed_a}");
+        assert_eq!(
+            listed_a["removalDueAt"], entry["removalDueAt"],
+            "{listed_a}"
+        );
+        kept(&stack, &owner, b).await;
+
+        // 7. The gateway's forget of N, refused without its authorisation.
+        let refused = gateway.forget(None, &[n.notification_id]).await;
+        assert_eq!(
+            (refused.status, refused.code()),
+            (401, Some("UNAUTHENTICATED")),
+            "{refused:?}"
+        );
+        let reached = gateway.forget(Some(&another), &[n.notification_id]).await;
+        assert_eq!(reached.status, 200, "{reached:?}");
+        assert_eq!(
+            forgot(&reached, &n.notification_id.to_string()),
+            ("none".to_owned(), false),
+            "another authorisation reaches nothing"
+        );
+        let StatusAnswer::Recorded(ack) = gateway.status(&credential, n.notification_id).await
+        else {
+            panic!("the gateway still has the notification");
+        };
+        assert_eq!(ack.state, PushDeliveryState::Retrying);
+        // And with it.
+        let removed = gateway
+            .forget(Some(&credential), &[n.notification_id])
+            .await;
+        assert_eq!(removed.status, 200, "{removed:?}");
+        assert_eq!(
+            forgot(&removed, &n.notification_id.to_string()),
+            ("queued".to_owned(), true)
+        );
+        let note = removed.body["data"]["note"]
+            .as_str()
+            .expect("the service's note");
+        assert!(note.contains("recalls nothing"), "{note}");
+        assert!(matches!(
+            gateway.status(&credential, n.notification_id).await,
+            StatusAnswer::NoRecord { .. }
+        ));
+        held
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the notification's steps took longer than {NOTIFICATION_STEPS:?}, past what the \
+             gateway is certain to keep retrying"
+        )
     });
-    holding.answered().await;
-    client.fence(1).expect("fenced");
-    client
-        .cancel_undispatched(1, now())
-        .await
-        .expect("cancelled");
-    client.remove_retained(1, now()).await.expect("removed");
-    holding.release();
-    assert!(matches!(
-        publishing.await.expect("the task").expect("answered"),
-        Published::Discarded { .. }
-    ));
-    assert_eq!(
-        client.outstanding().expect("a count"),
-        0,
-        "privacy mode is complete"
-    );
-
-    // 5. Nothing at the services went.
-    kept(&stack, &owner, a).await;
-    kept(&stack, &owner, b).await;
-    let StatusAnswer::Recorded(ack) = gateway.status(&credential, n.notification_id).await else {
-        panic!("the gateway still has the notification");
-    };
-    assert_eq!(ack.state, PushDeliveryState::Retrying);
-
-    // 6. The console's deletion of A, refused without its authorisation.
-    let refused = stack.delete_collection(None, Site::This, a).await;
-    assert_eq!(
-        (refused.status, refused.code()),
-        (401, Some("UNAUTHENTICATED")),
-        "{refused:?}"
-    );
-    kept(&stack, &owner, a).await;
-    let refused = stack
-        .delete_collection(Some(&owner), Site::Another, a)
-        .await;
-    assert_eq!(
-        (refused.status, refused.code()),
-        (403, Some("FORBIDDEN")),
-        "{refused:?}"
-    );
-    kept(&stack, &owner, a).await;
-    let refused = stack
-        .delete_collection(Some(&stranger), Site::This, a)
-        .await;
-    assert_eq!(refused.code(), Some("NOT_FOUND"), "{refused:?}");
-    kept(&stack, &owner, a).await;
-    // And with it.
-    let deleted = stack.delete_collection(Some(&owner), Site::This, a).await;
-    assert_eq!(deleted.status, 200, "{deleted:?}");
-    let entry = &deleted.body["data"];
-    assert_eq!(entry["state"], "deleted", "{entry}");
-    assert_eq!(entry["awaitingRemoval"]["objects"], 1, "{entry}");
-    let (deleted_at, due) = (
-        entry["deletedAt"].as_str().expect("when it was deleted"),
-        entry["removalDueAt"].as_str().expect("when its objects go"),
-    );
-    assert!(
-        due > deleted_at,
-        "its objects are removed later, not now: {entry}"
-    );
-    let listing = stack.collections(Some(&owner)).await;
-    assert_eq!(listing.body["data"]["tombstoneDays"], 7);
-    assert_eq!(
-        listed(&stack, &owner, a).await.expect("still listed")["state"],
-        "deleted"
-    );
-    kept(&stack, &owner, b).await;
-
-    // 7. The gateway's forget of N, refused without its authorisation.
-    let refused = gateway.forget(None, &[n.notification_id]).await;
-    assert_eq!(
-        (refused.status, refused.code()),
-        (401, Some("UNAUTHENTICATED")),
-        "{refused:?}"
-    );
-    let reached = gateway.forget(Some(&another), &[n.notification_id]).await;
-    assert_eq!(reached.status, 200, "{reached:?}");
-    assert_eq!(
-        forgot(&reached, &n.notification_id.to_string()),
-        ("none".to_owned(), false),
-        "another authorisation reaches nothing"
-    );
-    let StatusAnswer::Recorded(ack) = gateway.status(&credential, n.notification_id).await else {
-        panic!("the gateway still has the notification");
-    };
-    assert_eq!(ack.state, PushDeliveryState::Retrying);
-    // And with it.
-    let removed = gateway
-        .forget(Some(&credential), &[n.notification_id])
-        .await;
-    assert_eq!(removed.status, 200, "{removed:?}");
-    assert_eq!(
-        forgot(&removed, &n.notification_id.to_string()),
-        ("queued".to_owned(), true)
-    );
-    let note = removed.body["data"]["note"]
-        .as_str()
-        .expect("the service's note");
-    assert!(note.contains("recalls nothing"), "{note}");
-    assert!(matches!(
-        gateway.status(&credential, n.notification_id).await,
-        StatusAnswer::NoRecord { .. }
-    ));
-    assert!(
-        delivered.elapsed() < NOTIFICATION_STEPS,
-        "the notification's steps took {:?}, longer than the gateway is certain to keep retrying",
-        delivered.elapsed()
-    );
 
     let left = give_back(deployment, &k, &held.reached()).await;
-    for what in &left {
-        println!("{}", not_given_back(what));
-    }
+    report_left(&left);
     assert!(
         left.is_empty(),
         "this leg did not give back what it took: {left:?}"

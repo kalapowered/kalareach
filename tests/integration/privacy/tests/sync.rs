@@ -42,7 +42,7 @@ use kr_client::sync::{
 };
 use kr_privacy_integration::giveback::give_back;
 use kr_privacy_integration::held::{Held, Holding};
-use kr_privacy_integration::{Deployment, RunKey, fresh_uuid, not_given_back, now_ms, proved};
+use kr_privacy_integration::{Deployment, RunKey, fresh_uuid, now_ms, proved, report_left};
 use kr_protocol::ids::{DeviceId, DraftRevision, SessionId, SyncObjectId};
 use kr_protocol::scalars::{TimestampMs, Uuid};
 use kr_protocol::sync::SyncObjectKind;
@@ -155,9 +155,7 @@ where
     let run = Arc::new(run);
     let outcome = tokio::spawn(body(Arc::clone(&run))).await;
     let left = give_back(&run.deployment, &run.key, &run.held.reached()).await;
-    for what in &left {
-        println!("{}", not_given_back(what));
-    }
+    report_left(&left);
     match outcome {
         Ok(what) => {
             assert!(
@@ -280,7 +278,15 @@ async fn kr_req_24_28_privacy_enabled_while_a_settings_write_and_a_draft_publica
             publishing.await.expect("the task").expect("answered"),
             Published::Accepted { .. }
         ));
-        assert!(one.store().checkpoint(c).expect("a note").is_some());
+        assert_eq!(
+            one.store()
+                .checkpoint(c)
+                .expect("a note")
+                .expect("held")
+                .position
+                .write_sequence,
+            1
+        );
         let control = run
             .held_in(&sync_collection(SyncObjectKind::Settings, c))
             .await;
@@ -299,7 +305,22 @@ async fn kr_req_24_28_privacy_enabled_while_a_settings_write_and_a_draft_publica
             publishing.await.expect("the task").expect("answered"),
             DraftPublished::Accepted { .. }
         ));
-        assert!(drafts.checkpoint(e.draft_id).expect("a note").is_some());
+        assert_eq!(
+            drafts
+                .checkpoint(e.draft_id)
+                .expect("a note")
+                .expect("held")
+                .position
+                .write_sequence,
+            1
+        );
+        let control = run.held_in(&draft_collection(e.draft_id)).await;
+        assert_eq!(control.objects.len(), 1);
+        assert_eq!(
+            run.opened_draft(&control.objects[0].ciphertext).text,
+            e.text,
+            "with privacy mode off, the draft is published as written"
+        );
 
         // 2. Before privacy mode: a settings copy and a draft copy on this device, and a copy the
         // service kept of a refused write.
@@ -383,6 +404,7 @@ async fn kr_req_24_28_privacy_enabled_while_a_settings_write_and_a_draft_publica
             .await
             .expect("fetched");
         assert_eq!(fetched.copy.conflict_of.as_ref().copied(), Some(d.draft_id));
+        assert_eq!(fetched.copy.text, theirs.text);
         let d_note = drafts
             .checkpoint(d.draft_id)
             .expect("a note")
@@ -412,13 +434,8 @@ async fn kr_req_24_28_privacy_enabled_while_a_settings_write_and_a_draft_publica
         let (d_holding, d_publishing) = held_draft(&run, &one_drafts, &drafts, &edited_d).await;
         let u = fresh_object_id().expect("an identity");
         let u_collection = sync_collection(SyncObjectKind::Settings, u);
-        one.store()
-            .put_object(&settings_object(
-                u,
-                1,
-                settings(&[("editor", "plain")], &[]),
-            ))
-            .expect("stored");
+        let u_object = settings_object(u, 1, settings(&[("editor", "plain")], &[]));
+        one.store().put_object(&u_object).expect("stored");
         let sealer = Arc::clone(&run.sealer);
         one.store()
             .admit(u, |object| {
@@ -502,6 +519,19 @@ async fn kr_req_24_28_privacy_enabled_while_a_settings_write_and_a_draft_publica
             2,
             "not complete while both are out"
         );
+        // The ciphertext any record of an object carries, whatever state the record is in.
+        let ciphertext_held = |object_id: SyncObjectId| {
+            one.store()
+                .requests()
+                .expect("requests")
+                .items
+                .iter()
+                .any(|record| record.object_id == object_id && record.ciphertext().is_some())
+        };
+        assert!(
+            !ciphertext_held(u),
+            "the write that never left is gone with its ciphertext"
+        );
 
         let removed = one.remove_retained(1, now()).await.expect("removed");
         assert!(removed.records > 0 && removed.bytes > 0);
@@ -524,14 +554,21 @@ async fn kr_req_24_28_privacy_enabled_while_a_settings_write_and_a_draft_publica
             Some(d_note),
             "a draft's note stays on the device"
         );
-        assert!(
+        assert_eq!(
             drafts
                 .list()
                 .expect("a listing")
                 .drafts
-                .iter()
-                .any(|draft| draft.conflict_of.as_ref().copied() == Some(d.draft_id)),
-            "the copy kept beside a draft stays on the device"
+                .into_iter()
+                .filter(|draft| draft.conflict_of.as_ref().copied() == Some(d.draft_id))
+                .collect::<Vec<_>>(),
+            vec![fetched.copy.clone()],
+            "the copy kept beside a draft stays on the device as it came down"
+        );
+        assert_eq!(
+            one.store().object(u).expect("read"),
+            Some(u_object.clone()),
+            "the setting whose write was taken back is still the device's own"
         );
         assert!(
             one.store()
@@ -542,8 +579,9 @@ async fn kr_req_24_28_privacy_enabled_while_a_settings_write_and_a_draft_publica
             "a pinned label stays until the person clears it"
         );
         assert_eq!(
-            pinned(&one.store().object(s).expect("read").expect("held")),
-            vec!["deploys".to_owned()]
+            one.store().object(s).expect("read"),
+            Some(edited_s.clone()),
+            "the settings stay as the device holds them, labels and all"
         );
         assert_eq!(one.outstanding().expect("a count"), 2);
 
@@ -565,6 +603,10 @@ async fn kr_req_24_28_privacy_enabled_while_a_settings_write_and_a_draft_publica
             }
         );
         assert_eq!((in_flight(s), in_flight(d_object)), (0, 0));
+        assert!(
+            !ciphertext_held(s) && !ciphertext_held(d_object),
+            "settling what was sent removes its ciphertext"
+        );
         assert_eq!(one.outstanding().expect("a count"), 0, "complete only now");
         assert!(one.store().checkpoint(s).expect("a note").is_none());
         assert_eq!(drafts.checkpoint(d.draft_id).expect("a note"), Some(d_note));
@@ -652,6 +694,8 @@ async fn kr_req_24_28_privacy_enabled_while_a_settings_write_and_a_draft_publica
         assert!(one.store().checkpoint(s).expect("a note").is_none());
         assert!(one.store().conflicts(s).expect("copies").items.is_empty());
         assert_eq!(one.outstanding().expect("a count"), 0);
+        assert!(!ciphertext_held(s) && !ciphertext_held(d_object) && !ciphertext_held(u));
+        assert_eq!(drafts.load(d.draft_id).expect("the draft"), edited_d);
         assert!(export_settings(one.store(), c).is_ok());
         let n = fresh_object_id().expect("an identity");
         let publishable = one.settings_to_publish(&labelled).expect("a filter");
