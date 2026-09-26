@@ -1,15 +1,25 @@
-//! Readings of this machine for [`crate::other_work`]: its processors' busy time and every process
+//! Readings of this machine for [`crate::other_work`]: its processors' idle time and every process
 //! on it.
 //!
-//! Linux keeps both in `/proc`: the busy time on the first line of `/proc/stat`, and each process
-//! in `/proc/<pid>/stat`, where its time with its collected children's is counted too. macOS keeps
-//! each processor's busy time in the kernel's processor load counters, and `ps` lists the
-//! processes; it does not count a collected child's time, so a process there is its own time only.
-//! Both count in hundredths of a second. Elsewhere nothing is read and every reading fails.
+//! Linux keeps the processors' idle time on the first line of `/proc/stat`, and a kernel that stops
+//! the clock tick on an idle processor counts that time exactly, including the idle time of a
+//! processor that is idle as it is read. A process's time, in `/proc/<pid>/stat`, is the kernel's
+//! exact account of it, brought up to date for a running thread at every clock tick, so it trails
+//! by at most a tick for each thread running as it is read. Both are printed in hundredths of a
+//! second. A kernel that keeps a processor's clock tick running while it is idle, or stops it while
+//! a thread runs, gives neither guarantee, and the machine is not read.
+//!
+//! macOS keeps each processor's idle time in the kernel's processor load counters, in ticks of a
+//! hundredth of a second, and brings an idle processor's up to date as it is read. A process's
+//! time, from the kernel's task information, is exact, and a running thread's is brought up to date
+//! at least once in each scheduling quantum. The task information of another user's process cannot
+//! be read, and that process's row is listed as unread.
+//!
+//! Elsewhere nothing is read and every reading fails.
 
 use std::time::Instant;
 
-use crate::other_work::{Process, Reading};
+use crate::other_work::{Reading, Row};
 
 /// This machine, ready to be read.
 pub struct Machine {
@@ -22,8 +32,8 @@ impl Machine {
     ///
     /// # Errors
     ///
-    /// Where this platform cannot be read, or cannot be read whole: on Linux, from a process
-    /// namespace of its own, whose process table is not the machine's.
+    /// Where this platform cannot be read, or cannot be read whole and exactly: on Linux, from a
+    /// process namespace of its own, or on a kernel that does not count idle time exactly.
     pub fn open() -> Result<Self, String> {
         Ok(Self {
             clock: Instant::now(),
@@ -31,42 +41,52 @@ impl Machine {
         })
     }
 
-    /// Reads the machine: the busy count, every process, and the busy count again, each within the
-    /// reading's two times.
+    /// Reads the machine: the idle count, every process, and the idle count again, between two
+    /// moments on a monotonic clock.
     ///
     /// # Errors
     ///
-    /// When a count or the process table cannot be read, or reads in a form this does not know.
+    /// When a count or the process table cannot be read, reads in a form this does not know, or the
+    /// number of processors changes while it is read.
     pub fn reading(&mut self) -> Result<Reading, String> {
         let began = self.clock.elapsed().as_secs_f64();
-        let busy_before = self.counts.busy()?;
-        let processes = self.counts.processes()?;
-        let busy_after = self.counts.busy()?;
+        let (idle_before, processors) = self.counts.idle()?;
+        let rows = self.counts.rows(processors)?;
+        let (idle_after, processors_after) = self.counts.idle()?;
+        let ended = self.clock.elapsed().as_secs_f64();
+        if processors_after != processors {
+            return Err(format!(
+                "the machine went from {processors} processors to {processors_after} while it was \
+                 read"
+            ));
+        }
         Ok(Reading {
             began,
-            busy_before,
-            processes,
-            busy_after,
-            busy_resolution: self.counts.resolution(),
-            ended: self.clock.elapsed().as_secs_f64(),
+            processors,
+            idle_before,
+            rows,
+            idle_after,
+            ended,
+            idle_resolution: self.counts.idle_resolution(processors),
+            time_resolution: self.counts.time_resolution(),
         })
     }
 }
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use super::Process;
+    use super::Row;
+    use crate::other_work::Process;
 
     /// The initial process namespace's identifier, which the kernel fixes.
     const WHOLE_MACHINE: &str = "pid:[4026531836]";
 
-    /// The busy states on `/proc/stat`'s first line, by position after the label: user, nice,
-    /// system, interrupts and deferred interrupts. A hypervisor's share is counted apart, and a
-    /// guest's time is inside the user and nice counts already.
-    const BUSY: [usize; 5] = [0, 1, 2, 5, 6];
-
     pub struct Counts {
+        /// The rate `/proc` prints times in.
         ticks_per_second: f64,
+        /// The rate the kernel's clock ticks at, which is how often a running thread's time is
+        /// brought up to date.
+        clock_rate: f64,
     }
 
     impl Counts {
@@ -80,55 +100,109 @@ mod platform {
                     namespace.display()
                 ));
             }
+            let configuration = kernel_configuration()?;
+            let setting = |name: &str| {
+                configuration.lines().find_map(|line| {
+                    line.strip_prefix(name)
+                        .and_then(|rest| rest.strip_prefix('='))
+                        .map(str::to_owned)
+                })
+            };
+            if setting("CONFIG_NO_HZ_COMMON").as_deref() != Some("y") {
+                return Err(
+                    "this kernel keeps the clock tick running on an idle processor, so it counts \
+                     idle time by sampling it"
+                        .to_owned(),
+                );
+            }
+            let command_line = std::fs::read_to_string("/proc/cmdline")
+                .map_err(|error| format!("read the kernel's command line: {error}"))?;
+            if command_line
+                .split_whitespace()
+                .any(|word| word == "nohz=off")
+            {
+                return Err(
+                    "this kernel was started with nohz=off, so it counts idle time by sampling it"
+                        .to_owned(),
+                );
+            }
+            match std::fs::read_to_string("/sys/devices/system/cpu/nohz_full") {
+                Ok(processors) if !matches!(processors.trim(), "" | "(null)") => {
+                    return Err(format!(
+                        "processors {} stop the clock tick while a thread runs, so a running \
+                         thread's time can trail by more than a tick",
+                        processors.trim()
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("read the tickless processors: {error}")),
+            }
+            let clock_rate = setting("CONFIG_HZ")
+                .and_then(|rate| rate.parse::<u32>().ok())
+                .filter(|rate| *rate > 0)
+                .ok_or("the kernel's configuration names no clock rate")?;
             #[expect(
                 clippy::cast_precision_loss,
                 reason = "a clock rate is a small integer"
             )]
             let ticks_per_second = rustix::param::clock_ticks_per_second() as f64;
-            Ok(Self { ticks_per_second })
+            Ok(Self {
+                ticks_per_second,
+                clock_rate: f64::from(clock_rate),
+            })
         }
 
-        /// Each busy state is counted apart and rounded down, so the count of their sum can fall
-        /// short by a tick for each.
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "a count of busy states is a small integer"
-        )]
-        pub fn resolution(&self) -> f64 {
-            BUSY.len() as f64 / self.ticks_per_second
+        /// The idle and waiting counts are each rounded down.
+        pub fn idle_resolution(&self, _processors: u32) -> f64 {
+            2.0 / self.ticks_per_second
         }
 
-        pub fn busy(&mut self) -> Result<f64, String> {
+        /// A process's user and system times are each rounded down.
+        pub fn time_resolution(&self) -> f64 {
+            2.0 / self.ticks_per_second
+        }
+
+        /// All processors' idle time, with the time spent idle waiting for a disk, and how many
+        /// processors there are.
+        pub fn idle(&mut self) -> Result<(f64, u32), String> {
             let stat = std::fs::read_to_string("/proc/stat")
                 .map_err(|error| format!("read the processors' counts: {error}"))?;
-            let line = stat
+            let unread = || "the processors' counts are not in the form this reads".to_owned();
+            let total = stat
                 .lines()
                 .find(|line| line.starts_with("cpu "))
-                .ok_or("the processors' counts have no total line")?;
-            let counts: Vec<u64> = line
+                .ok_or_else(unread)?;
+            let counts: Vec<u64> = total
                 .split_whitespace()
                 .skip(1)
                 .map(str::parse)
                 .collect::<Result<_, _>>()
-                .map_err(|_| format!("the processors' total line reads `{line}`"))?;
-            let mut busy: u64 = 0;
-            for state in BUSY {
-                busy += counts
-                    .get(state)
-                    .ok_or_else(|| format!("the processors' total line reads `{line}`"))?;
-            }
+                .map_err(|_| unread())?;
+            // User, nice, system, idle and waiting come first, in that order.
+            let (Some(idle), Some(waiting)) = (counts.get(3), counts.get(4)) else {
+                return Err(unread());
+            };
+            let processors = stat
+                .lines()
+                .filter(|line| {
+                    line.strip_prefix("cpu")
+                        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+                })
+                .count();
+            let processors = u32::try_from(processors).map_err(|_| unread())?;
             #[expect(
                 clippy::cast_precision_loss,
                 reason = "a tick count is far inside f64's exact range"
             )]
-            let seconds = busy as f64 / self.ticks_per_second;
-            Ok(seconds)
+            let seconds = (idle + waiting) as f64 / self.ticks_per_second;
+            Ok((seconds, processors))
         }
 
-        pub fn processes(&self) -> Result<Vec<Process>, String> {
+        pub fn rows(&self, processors: u32) -> Result<Vec<Row>, String> {
             let entries = std::fs::read_dir("/proc")
                 .map_err(|error| format!("list the process table: {error}"))?;
-            let mut processes = Vec::new();
+            let mut rows = Vec::new();
             for entry in entries {
                 let entry = entry.map_err(|error| format!("list the process table: {error}"))?;
                 let Some(pid) = entry
@@ -140,7 +214,7 @@ mod platform {
                 };
                 let status = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
                     Ok(status) => status,
-                    // The process ended after the table was listed.
+                    // The process ended and was collected after the table was listed.
                     Err(error)
                         if error.kind() == std::io::ErrorKind::NotFound
                             || error.raw_os_error()
@@ -150,19 +224,16 @@ mod platform {
                     }
                     Err(error) => return Err(format!("read process {pid}'s status: {error}")),
                 };
-                if let Some(process) = self.status(pid, &status)? {
-                    processes.push(process);
-                }
+                rows.push(Row::Read(self.status(pid, &status, processors)?));
             }
-            Ok(processes)
+            Ok(rows)
         }
 
         /// A process's status line. The command name is the second field and may hold spaces and
         /// parentheses, so the fields are counted from after the last parenthesis, which ends it:
-        /// the state is field 3, the parent 4, the process's own user and system ticks 14 and 15,
-        /// its collected children's 16 and 17, and its start, in ticks since the machine started,
-        /// 22.
-        fn status(&self, pid: u32, status: &str) -> Result<Option<Process>, String> {
+        /// the parent is field 4, the process's user and system ticks 14 and 15, its threads 20,
+        /// and its start, in ticks since the machine started, 22.
+        fn status(&self, pid: u32, status: &str, processors: u32) -> Result<Process, String> {
             let unread = || format!("process {pid}'s status reads `{}`", status.trim_end());
             let fields: Vec<&str> = status
                 .rsplit_once(')')
@@ -170,30 +241,51 @@ mod platform {
                 .1
                 .split_whitespace()
                 .collect();
-            let field = |number: usize| fields.get(number - 3).copied().ok_or_else(unread);
             let count = |number: usize| -> Result<u64, String> {
-                field(number)?.parse().map_err(|_| unread())
+                fields
+                    .get(number - 3)
+                    .and_then(|field| field.parse().ok())
+                    .ok_or_else(unread)
             };
-            // An ended process not yet collected: what it used is its parent's once collected.
-            if matches!(field(3)?, "Z" | "X" | "x") {
-                return Ok(None);
-            }
             let parent = u32::try_from(count(4)?).map_err(|_| unread())?;
+            let threads = u32::try_from(count(20)?).unwrap_or(u32::MAX);
             #[expect(
                 clippy::cast_precision_loss,
                 reason = "a tick count is far inside f64's exact range"
             )]
-            let seconds = |ticks: u64| ticks as f64 / self.ticks_per_second;
-            let own = seconds(count(14)? + count(15)?);
-            let collected = seconds(count(16)? + count(17)?);
-            Ok(Some(Process {
+            let own = (count(14)? + count(15)?) as f64 / self.ticks_per_second;
+            Ok(Process {
                 pid,
                 parent,
-                start: field(22)?.to_owned(),
+                start: count(22)?,
                 own,
-                with_collected: own + collected,
-            }))
+                lag: f64::from(threads.min(processors)) / self.clock_rate,
+            })
         }
+    }
+
+    /// The running kernel's build configuration, from `/boot` or, where the kernel keeps it,
+    /// `/proc/config.gz`.
+    fn kernel_configuration() -> Result<String, String> {
+        let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .map_err(|error| format!("read the kernel's release: {error}"))?;
+        if let Ok(configuration) =
+            std::fs::read_to_string(format!("/boot/config-{}", release.trim()))
+        {
+            return Ok(configuration);
+        }
+        let output = std::process::Command::new("gzip")
+            .args(["-dc", "/proc/config.gz"])
+            .output()
+            .map_err(|error| format!("read the kernel's configuration: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "the kernel's configuration is in neither /boot/config-{} nor /proc/config.gz",
+                release.trim()
+            ));
+        }
+        String::from_utf8(output.stdout)
+            .map_err(|_| "the kernel's configuration is not text".to_owned())
     }
 }
 
@@ -201,47 +293,60 @@ mod platform {
 mod platform {
     use std::process::Command;
 
-    use super::Process;
+    use libproc::libproc::proc_pid::pidinfo;
+    use libproc::libproc::task_info::TaskAllInfo;
+    use libproc::processes::{ProcFilter, pids_by_type};
 
-    /// The load counters' states, by position: user, system, idle and nice.
-    const USER: usize = 0;
-    const SYSTEM: usize = 1;
-    const NICE: usize = 3;
+    use super::Row;
+    use crate::other_work::Process;
+
+    /// The load counters' idle state, by position among user, system, idle and nice.
+    const IDLE: usize = 2;
+
+    /// The scheduler's quantum for ordinary threads: a running thread's time is brought up to date
+    /// at least this often, and so is a processor's count.
+    const QUANTUM: f64 = 0.01;
+
+    /// A process that has ended and waits to be collected, as the kernel's task information names
+    /// it.
+    const ENDED: u32 = 5;
 
     pub struct Counts {
         host: libc::mach_port_t,
         seconds_per_tick: f64,
+        seconds_per_unit: f64,
         /// Each processor's counters at the last count. They are 32 bits wide and wrap, so the
-        /// busy count is kept here, from their differences.
+        /// idle count is kept here, from their differences.
         last: Vec<[u32; 4]>,
-        busy_ticks: u64,
+        idle_ticks: u64,
     }
 
     impl Counts {
         pub fn open() -> Result<Self, String> {
-            let host = load::host();
-            let last = load::processor_ticks(host)?;
+            let host = kernel::host();
+            let last = kernel::processor_ticks(host)?;
+            let (numerator, denominator) = kernel::time_base()?;
             Ok(Self {
                 host,
                 seconds_per_tick: 1.0 / clock_rate()?,
+                seconds_per_unit: f64::from(numerator) / f64::from(denominator) / 1e9,
                 last,
-                busy_ticks: 0,
+                idle_ticks: 0,
             })
         }
 
-        /// Each processor's user, system and nice time is counted apart and rounded down, so the
-        /// count of their sum can fall short by a tick for each.
-        pub fn resolution(&self) -> f64 {
-            #[expect(
-                clippy::cast_precision_loss,
-                reason = "a count of processors is a small integer"
-            )]
-            let counters = (3 * self.last.len()) as f64;
-            counters * self.seconds_per_tick
+        /// Each processor's idle time is rounded down to a tick, and can trail by one quantum.
+        pub fn idle_resolution(&self, processors: u32) -> f64 {
+            f64::from(processors) * (self.seconds_per_tick + QUANTUM)
         }
 
-        pub fn busy(&mut self) -> Result<f64, String> {
-            let now = load::processor_ticks(self.host)?;
+        /// A process's time is kept in the processor's own time units, which this reads exactly.
+        pub fn time_resolution(&self) -> f64 {
+            self.seconds_per_unit
+        }
+
+        pub fn idle(&mut self) -> Result<(f64, u32), String> {
+            let now = kernel::processor_ticks(self.host)?;
             if now.len() != self.last.len() {
                 return Err(format!(
                     "the machine went from {} processors to {} while it was read",
@@ -250,57 +355,54 @@ mod platform {
                 ));
             }
             for (now, last) in now.iter().zip(&self.last) {
-                for state in [USER, SYSTEM, NICE] {
-                    self.busy_ticks += u64::from(now[state].wrapping_sub(last[state]));
-                }
+                self.idle_ticks += u64::from(now[IDLE].wrapping_sub(last[IDLE]));
             }
             self.last = now;
             #[expect(
                 clippy::cast_precision_loss,
                 reason = "a tick count is far inside f64's exact range"
             )]
-            let seconds = self.busy_ticks as f64 * self.seconds_per_tick;
-            Ok(seconds)
+            let seconds = self.idle_ticks as f64 * self.seconds_per_tick;
+            let processors = u32::try_from(self.last.len())
+                .map_err(|_| "the machine counts more processors than this reads".to_owned())?;
+            Ok((seconds, processors))
         }
 
-        /// Every process `ps` lists, with its start, which `ps` gives to the second and the system
-        /// never reuses an identifier within, and its own processor time. A process that has ended
-        /// or is ending is left out, because `ps` reads its time as nothing.
-        pub fn processes(&self) -> Result<Vec<Process>, String> {
-            let output = Command::new("ps")
-                .env("LC_ALL", "C")
-                .args(["-A", "-o", "pid=,ppid=,stat=,lstart=,time="])
-                .output()
-                .map_err(|error| format!("read the process table: {error}"))?;
-            if !output.status.success() {
-                return Err(format!(
-                    "reading the process table ended with {}",
-                    output.status
-                ));
-            }
-            let mut processes = Vec::new();
-            for line in String::from_utf8_lossy(&output.stdout).lines() {
-                let unread = || format!("the process table has a line that reads `{line}`");
-                let fields: Vec<&str> = line.split_whitespace().collect();
-                let [pid, parent, state, start @ .., time] = fields.as_slice() else {
-                    return Err(unread());
+        /// Every process the kernel lists, read one at a time in the order listed. A process whose
+        /// task information cannot be read, another user's or one that has ended, is listed as
+        /// unread.
+        pub fn rows(&self, processors: u32) -> Result<Vec<Row>, String> {
+            let pids = pids_by_type(ProcFilter::All)
+                .map_err(|error| format!("list the process table: {error}"))?;
+            let mut rows = Vec::with_capacity(pids.len());
+            for pid in pids {
+                let Ok(signed) = i32::try_from(pid) else {
+                    return Err(format!("the process table lists process {pid}"));
                 };
-                if start.len() != 5 {
-                    return Err(unread());
-                }
-                if state.contains('Z') || state.contains('E') {
-                    continue;
-                }
-                let own = crate::process::processor_time(time).ok_or_else(unread)?;
-                processes.push(Process {
-                    pid: pid.parse().map_err(|_| unread())?,
-                    parent: parent.parse().map_err(|_| unread())?,
-                    start: start.join(" "),
-                    own,
-                    with_collected: own,
-                });
+                let row = match pidinfo::<TaskAllInfo>(signed, 0) {
+                    Ok(info) if info.pbsd.pbi_status != ENDED => {
+                        let running = u32::try_from(info.ptinfo.pti_numrunning).unwrap_or(0);
+                        #[expect(
+                            clippy::cast_precision_loss,
+                            reason = "a processor time count is far inside f64's exact range"
+                        )]
+                        let own = (info.ptinfo.pti_total_user + info.ptinfo.pti_total_system)
+                            as f64
+                            * self.seconds_per_unit;
+                        Row::Read(Process {
+                            pid,
+                            parent: info.pbsd.pbi_ppid,
+                            start: info.pbsd.pbi_start_tvsec * 1_000_000
+                                + info.pbsd.pbi_start_tvusec,
+                            own,
+                            lag: f64::from(running.min(processors)) * QUANTUM,
+                        })
+                    }
+                    Ok(_) | Err(_) => Row::Unread { pid },
+                };
+                rows.push(row);
             }
-            Ok(processes)
+            Ok(rows)
         }
     }
 
@@ -323,11 +425,11 @@ mod platform {
             .ok_or_else(|| format!("the clock rate reads `{}`", text.trim()))
     }
 
-    mod load {
+    mod kernel {
         #![expect(
             unsafe_code,
-            reason = "macOS gives each processor's busy and idle time only through \
-                      host_processor_info, which has no safe interface"
+            reason = "macOS gives each processor's idle time and the unit of a task's processor \
+                      time only through interfaces that have no safe binding"
         )]
 
         /// The host port the load counters are read through.
@@ -339,6 +441,22 @@ mod platform {
         pub fn host() -> libc::mach_port_t {
             // SAFETY: the call has no preconditions and returns a send right to this host's port.
             unsafe { libc::mach_host_self() }
+        }
+
+        /// The ratio that turns the kernel's time units into nanoseconds.
+        #[expect(
+            deprecated,
+            reason = "the libc crate points to a crate this workspace does not use for the same \
+                      call"
+        )]
+        pub fn time_base() -> Result<(u32, u32), String> {
+            let mut base = libc::mach_timebase_info { numer: 0, denom: 0 };
+            // SAFETY: the pointer is to a live local of exactly the type the call writes.
+            let status = unsafe { libc::mach_timebase_info(&raw mut base) };
+            if status != libc::KERN_SUCCESS || base.numer == 0 || base.denom == 0 {
+                return Err(format!("reading the kernel's time base returned {status}"));
+            }
+            Ok((base.numer, base.denom))
         }
 
         /// Each processor's user, system, idle and nice ticks.
@@ -414,7 +532,7 @@ mod platform {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod platform {
-    use super::Process;
+    use super::Row;
 
     pub struct Counts;
 
@@ -425,15 +543,19 @@ mod platform {
             Err(NOT_READ.to_owned())
         }
 
-        pub fn resolution(&self) -> f64 {
+        pub fn idle_resolution(&self, _processors: u32) -> f64 {
             0.0
         }
 
-        pub fn busy(&mut self) -> Result<f64, String> {
+        pub fn time_resolution(&self) -> f64 {
+            0.0
+        }
+
+        pub fn idle(&mut self) -> Result<(f64, u32), String> {
             Err(NOT_READ.to_owned())
         }
 
-        pub fn processes(&self) -> Result<Vec<Process>, String> {
+        pub fn rows(&self, _processors: u32) -> Result<Vec<Row>, String> {
             Err(NOT_READ.to_owned())
         }
     }

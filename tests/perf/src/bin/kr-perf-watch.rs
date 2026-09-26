@@ -7,10 +7,10 @@
 //! It reads the whole machine, creates the `--ready` file, and reads the machine again every
 //! `--every` seconds, two by default, until `--for` seconds have passed or the `--until` file
 //! exists, and then once more. It then prints `<bound> <average>`: the most processors' worth of
-//! work that anything outside the run can have done in any five seconds from the first reading to
-//! the last, and the average over that time. Where the readings cannot show that, it prints
-//! `unread: <why>` instead. The run is process `--run` and every process descended from it; a run
-//! whose process has gone is unread, so a watcher whose run was stopped stops too.
+//! processor time the machine can have spent on anything but the run in any five seconds from the
+//! first reading to the last, and over all of that time. Where the readings cannot show that, it
+//! prints `unread: <why>` instead. The run is process `--run` and every process descended from it;
+//! a run whose process has gone is unread, so a watcher whose run was stopped stops too.
 
 use std::path::PathBuf;
 use std::process::ExitCode;

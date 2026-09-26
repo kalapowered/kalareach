@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use kr_perf::machine::Machine;
-use kr_perf::other_work::Reading;
+use kr_perf::other_work::{Process, Reading, Row};
 
 const WATCH: &str = env!("CARGO_BIN_EXE_kr-perf-watch");
 
@@ -37,13 +37,15 @@ fn burn_for(length: Duration) {
     });
 }
 
-fn own_time(reading: &Reading, pid: u32) -> f64 {
+fn row(reading: &Reading, pid: u32) -> &Process {
     reading
-        .processes
+        .rows
         .iter()
-        .find(|process| process.pid == pid)
-        .unwrap_or_else(|| panic!("the reading does not hold process {pid}"))
-        .own
+        .find_map(|row| match row {
+            Row::Read(process) if process.pid == pid => Some(process),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("the reading cannot read process {pid}"))
 }
 
 /// A process outside this one's work, standing for a run.
@@ -64,37 +66,57 @@ fn summary(output: &str) -> (f64, f64) {
 }
 
 #[test]
-fn the_machine_counts_at_least_this_processs_own_work_in_seconds() {
+fn the_machine_counts_this_processs_work_as_busy_in_seconds() {
     let pid = std::process::id();
     let mut machine = Machine::open().expect("open this machine for reading");
     let before = machine.reading().expect("read this machine");
-    burn_for(Duration::from_millis(1500));
-    let after = machine.reading().expect("read this machine");
+    let mut child = stand_in("30");
+    // Half a second of this process's own time, however long a busy machine takes to give it.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let after = loop {
+        burn_for(Duration::from_millis(500));
+        let after = machine.reading().expect("read this machine");
+        if row(&after, pid).own - row(&before, pid).own >= 0.5 || Instant::now() >= deadline {
+            break after;
+        }
+    };
+    let child_pid = child.id();
+    let child_row = row(&after, child_pid).clone();
+    child.kill().ok();
+    child.wait().ok();
     for reading in [&before, &after] {
         assert!(
-            reading.processes.iter().any(|process| process.pid == 1),
-            "the reading does not hold the system's first process"
+            reading.rows.iter().any(|row| row.pid() == 1),
+            "the reading does not list the system's first process"
         );
     }
-    let own = own_time(&after, pid) - own_time(&before, pid);
-    let busy = after.busy_after - before.busy_before + after.busy_resolution;
-    let elapsed = after.ended - before.began;
-    assert!(
-        own >= 1.0,
-        "this process used {own} s while it burned 1.5 s"
+    assert_eq!(
+        child_row.parent, pid,
+        "the child's row names this process as its parent"
     );
-    // The machine's count holds this process's work, and cannot hold more than every processor
-    // busy for the whole time: a count in the wrong unit fails one or the other.
+    assert!(
+        child_row.start >= row(&after, pid).start,
+        "the child started no earlier than this process"
+    );
+    let own = row(&after, pid).own - row(&before, pid).own;
+    let elapsed = after.ended - before.began;
+    let all = f64::from(after.processors) * elapsed;
+    let idle = after.idle_after - before.idle_before;
+    let busy = all - idle + after.idle_resolution;
+    assert!(
+        own >= 0.5,
+        "this process used {own} s in the thirty seconds it burned"
+    );
+    // The idle count cannot exceed every processor idle for the whole time, and what it leaves
+    // busy holds this process's work: a count in the wrong unit fails one or the other.
+    assert!(
+        (0.0..=all + after.idle_resolution).contains(&idle),
+        "the machine counted {idle} s idle in {elapsed} s on {} processors",
+        after.processors
+    );
     assert!(
         busy >= own,
         "the machine counted {busy} s busy while this process used {own} s"
-    );
-    let processors = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-    let most =
-        elapsed * f64::from(u32::try_from(processors).unwrap_or(u32::MAX)) + after.busy_resolution;
-    assert!(
-        busy <= most,
-        "the machine counted {busy} s busy in {elapsed} s"
     );
 }
 

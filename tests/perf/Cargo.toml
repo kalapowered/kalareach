@@ -25,8 +25,10 @@ path = "src/bin/kr-perf-watch.rs"
 rustix = { workspace = true, features = ["param"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# macOS gives each processor's busy time only through the kernel's host interface.
+# macOS gives each processor's idle time only through the kernel's host interface, and each
+# process's time, parent and start through its task information.
 libc.workspace = true
+libproc.workspace = true
 
 [dev-dependencies]
 # The stress run's host: the daemon in this process, starting real workers, and the plugin host
@@ -45,9 +47,9 @@ serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 
-# The workspace forbids unsafe code, which the one reading of macOS's processor load counters cannot
-# honour. This crate denies it instead and allows it in exactly one module, `machine`'s `load`, which
-# makes that call. Nothing else in this crate may relax the rule.
+# The workspace forbids unsafe code, which the reading of macOS's processor load counters and time
+# base cannot honour. This crate denies it instead and allows it in exactly one module, `machine`'s
+# `kernel`, which makes those calls. Nothing else in this crate may relax the rule.
 [lints.rust]
 missing_docs = "warn"
 unsafe_code = "deny"
