@@ -175,6 +175,19 @@ pub enum Step {
     Done(Box<AttachmentHandle>),
 }
 
+impl std::fmt::Debug for Step {
+    /// Which step it is, never what it sends: a step carries a file's name and media type, or its
+    /// bytes.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Begin(_) => formatter.write_str("Begin(..)"),
+            Self::Chunk(_) => formatter.write_str("Chunk(..)"),
+            Self::Finish(_) => formatter.write_str("Finish(..)"),
+            Self::Done(_) => formatter.write_str("Done(..)"),
+        }
+    }
+}
+
 /// What one sent step answered with.
 #[derive(Clone)]
 pub enum Answer {
@@ -1108,6 +1121,24 @@ mod tests {
             Digest256::from_bytes(kr_cbor::sha256(&content[..CHUNK_LEN]))
         );
         assert_eq!(first.bytes.as_slice(), &content[..CHUNK_LEN]);
+    }
+
+    #[test]
+    fn a_step_names_itself_and_nothing_it_sends() {
+        let mut upload = Upload::new(subject(), Box::new(Held::new(b"hello".to_vec())));
+        let begin = upload.next().expect("a step");
+        assert_eq!(format!("{begin:?}"), "Begin(..)");
+        let answer = begun(&upload, 1, &ChunkBitmap::empty(1));
+        upload.accept(answer).expect("the reservation folds in");
+        let chunk = upload.next().expect("a step");
+        assert_eq!(format!("{chunk:?}"), "Chunk(..)");
+        assert_eq!(format!("{chunk:#?}"), "Chunk(..)");
+
+        let mut empty = Upload::new(subject(), Box::new(Held::new(Vec::new())));
+        let answer = begun(&empty, 0, &ChunkBitmap::empty(0));
+        empty.accept(answer).expect("the reservation folds in");
+        let finish = empty.next().expect("a step");
+        assert_eq!(format!("{finish:?}"), "Finish(..)");
     }
 
     #[test]

@@ -796,6 +796,14 @@ async fn a_lane_refuses_another_transfers_chunk_before_sending_it() {
         .await
         .expect("a lane");
     assert_eq!(lane.transfer_id(), reserved.transfer_id);
+    assert_eq!(
+        format!("{lane:?}"),
+        format!(
+            "ChunkLane {{ transfer_id: {:?}, .. }}",
+            reserved.transfer_id
+        ),
+        "a lane names its transfer and nothing of its connection"
+    );
 
     let other = TransferId::new(Uuid::from_bytes([9; 16]));
     let refused = lane
