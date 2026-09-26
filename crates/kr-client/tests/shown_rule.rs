@@ -869,6 +869,17 @@ fn use_tree(
     found.push((segments, renamed));
 }
 
+/// A source file's name, as a finding gives it and as the rule's constants spell it: its path's
+/// components below the workspace joined with `/`, whatever separator the platform or a join used.
+fn source_name(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Reads one file into its production tokens, its scopes, imports and definitions, and the modules
 /// it declares.
 fn read_source(
@@ -878,11 +889,7 @@ fn read_source(
     crate_name: &str,
     module: Vec<String>,
 ) -> Result<Source, String> {
-    let name = path
-        .strip_prefix(root)
-        .unwrap_or(path)
-        .display()
-        .to_string();
+    let name = source_name(root, path);
     let text = std::fs::read_to_string(path).map_err(|error| format!("{name}: {error}"))?;
     let all = lex(&text).map_err(|error| format!("{name}: {error}"))?;
     let mut source = Source {
@@ -2577,6 +2584,23 @@ fn test_code_is_passed_over_wherever_it_is_declared() {
         "only the item compiled outside tests is held: {findings:?}"
     );
     assert_eq!(findings[0].line, 5, "{findings:?}");
+}
+
+/// A file is named by its path's components, so the files the rule names are the same files on a
+/// platform whose separator is not `/`, and whichever separator joined the path.
+#[test]
+fn a_file_is_named_the_same_way_on_every_platform() {
+    let root = std::env::temp_dir().join("kr-shown-rule-names");
+    let joined = root
+        .join("crates")
+        .join("kr-client")
+        .join("src")
+        .join("shown.rs");
+    assert_eq!(source_name(&root, &joined), SHOWN_FILES[0]);
+    let mixed = root.join("crates/kr-cli/src").join("shown.rs");
+    assert_eq!(source_name(&root, &mixed), SHOWN_FILES[1]);
+    let nested = root.join("crates/kr-cli/src").join("report.rs");
+    assert_eq!(source_name(&root, &nested), REPORTER_FILE);
 }
 
 /// A literal's escapes are decoded, so a hole spelled with them is a hole.

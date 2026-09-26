@@ -762,6 +762,18 @@ fn windows() -> Vec<Step> {
         ),
         Step::cargo(
             Group::Rust,
+            "the client and the command line held to the rendering rule",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-client",
+                "--test",
+                "shown_rule",
+            ],
+        ),
+        Step::cargo(
+            Group::Rust,
             "the shared directory flush",
             &["test", "--locked", "-p", "kr-flush"],
         ),
