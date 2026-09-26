@@ -155,6 +155,36 @@ pub fn count() -> Result<usize, String> {
         .count())
 }
 
+/// Whether a process is running: in the process table and not an ended one waiting to be collected.
+#[must_use]
+pub fn running(pid: u32) -> bool {
+    ps_column(&[pid], "stat")
+        .is_ok_and(|state| state.get(&pid).is_some_and(|state| !state.starts_with('Z')))
+}
+
+/// The processor time the calling thread has used, in seconds, where the platform keeps it per
+/// thread in a form this reads: Linux's `/proc/thread-self/stat`.
+#[must_use]
+pub fn thread_processor_seconds() -> Option<f64> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/thread-self/stat").ok()?;
+        let fields: Vec<&str> = status.rsplit_once(')')?.1.split_whitespace().collect();
+        let ticks = |field: usize| fields.get(field - 3)?.parse::<u64>().ok();
+        let used = ticks(14)? + ticks(15)?;
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a tick count over one measurement is far inside f64's exact range"
+        )]
+        let seconds = used as f64 / rustix::param::clock_ticks_per_second() as f64;
+        Some(seconds)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 /// The processes whose parent is `pid`.
 #[must_use]
 pub fn children_of(pid: u32) -> Vec<u32> {

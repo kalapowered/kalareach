@@ -10,7 +10,7 @@
 //!
 //! * memory: every process's resident size, sampled through the window, with the product's own
 //!   processes (the daemon and the workers) apart from the applications (the shells and their
-//!   programs), and the whole host with the plugin host serving a fixture package beside them;
+//!   programs), and the whole product with the plugin host serving a fixture package beside them;
 //! * processor: each process's processor time over the window, by kind, and what the adoption
 //!   watch costs while a command holds the terminal, from two probe sessions that differ only in
 //!   that;
@@ -21,7 +21,7 @@
 //!
 //! Each figure is recorded in `kr-perf-stress.md` under `KR_TEST_ARTIFACTS_DIR`, headed by the
 //! identifier it bears on, before anything is asserted. Nothing runs the description model here,
-//! and the whole-host record says so.
+//! and the whole-product record says so.
 //!
 //! The worker and the plugin host are the release build's own programs, found beside this test in
 //! the build directory, so the workspace's release profile is built first; `scripts/bench-all.sh`
@@ -160,6 +160,17 @@ fn milliseconds(duration: Duration) -> String {
     format!("{:.3} ms", duration.as_secs_f64() * 1000.0)
 }
 
+/// Waits for `future` for at most [`LIVENESS`], so a host that holds a connection open without
+/// answering ends this measurement with a named failure and its cleanup still runs.
+async fn within<T>(
+    what: &str,
+    future: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    tokio::time::timeout(LIVENESS, future)
+        .await
+        .map_err(|_| format!("{what} did not answer within {LIVENESS:?}"))?
+}
+
 /// Finds one of the release build's programs beside this test.
 fn built(name: &str) -> PathBuf {
     let mut directory = std::env::current_exe().expect("this test's own path");
@@ -277,36 +288,41 @@ impl Run {
     /// Creates a session whose root program is `shell`, recording it before anything else is done
     /// with it.
     async fn create(&mut self, host: &Host, shell: &str) -> Result<SessionCreateResult, String> {
-        let mut client = LocalClient::connect(&host.daemon()?, LocalClientKind::Cli, build())
-            .await
-            .map_err(|error| format!("connect to the daemon: {error}"))?;
-        let created: SessionCreateResult = client
-            .mutate(
-                Method::SessionCreate,
-                ActionId::new(kr_ipc::new_uuid()),
-                ActionTarget::environment(host.environment_id),
-                &SessionCreateParams {
-                    environment_id: host.environment_id,
-                    presentation: Presentation::Invisible,
-                    shell: Nullable::some(shell.to_owned()),
-                    shell_mode: ShellMode::NativeCompat,
-                    cwd: Nullable::some(host.temp.root().display().to_string()),
-                    dimensions: Nullable::null(),
-                    worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
-                    palette: Nullable::null(),
-                    environment_snapshot: vec![kr_protocol::session::EnvironmentVariable {
-                        name: "PATH".to_owned(),
-                        value: "/usr/bin:/bin".to_owned(),
-                    }],
-                    launch_profile: kr_protocol::session::LaunchProfile::default(),
-                    terminal: Nullable::null(),
-                },
-            )
-            .await
-            .map_err(|error| format!("the create call: {error}"))?
-            .map_err(|error| format!("the daemon refused a create: {error}"))?
-            .to_typed()
-            .map_err(|error| format!("the create result: {error}"))?;
+        let endpoint = host.daemon()?;
+        // A create that never answers may still have made a session; the host tree ends it.
+        let created: SessionCreateResult = within("a session create", async {
+            let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+                .await
+                .map_err(|error| format!("connect to the daemon: {error}"))?;
+            client
+                .mutate(
+                    Method::SessionCreate,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    ActionTarget::environment(host.environment_id),
+                    &SessionCreateParams {
+                        environment_id: host.environment_id,
+                        presentation: Presentation::Invisible,
+                        shell: Nullable::some(shell.to_owned()),
+                        shell_mode: ShellMode::NativeCompat,
+                        cwd: Nullable::some(host.temp.root().display().to_string()),
+                        dimensions: Nullable::null(),
+                        worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+                        palette: Nullable::null(),
+                        environment_snapshot: vec![kr_protocol::session::EnvironmentVariable {
+                            name: "PATH".to_owned(),
+                            value: "/usr/bin:/bin".to_owned(),
+                        }],
+                        launch_profile: kr_protocol::session::LaunchProfile::default(),
+                        terminal: Nullable::null(),
+                    },
+                )
+                .await
+                .map_err(|error| format!("the create call: {error}"))?
+                .map_err(|error| format!("the daemon refused a create: {error}"))?
+                .to_typed()
+                .map_err(|error| format!("the create result: {error}"))
+        })
+        .await?;
         self.sessions.push(created.session.session_id);
         Ok(created)
     }
@@ -321,7 +337,7 @@ impl Run {
         let endpoint = host.daemon()?;
         let mut refused = Vec::new();
         for &session_id in &self.sessions {
-            let closed = async {
+            let closed = within("a session close", async {
                 let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
                     .await
                     .map_err(|error| format!("connect: {error}"))?;
@@ -336,7 +352,7 @@ impl Run {
                     .map_err(|error| format!("the close call: {error}"))?
                     .map_err(|error| format!("the daemon refused: {error}"))
                     .map(|_| ())
-            }
+            })
             .await;
             if let Err(failure) = closed {
                 refused.push(format!("{session_id}: {failure}"));
@@ -344,7 +360,7 @@ impl Run {
         }
         let deadline = Instant::now() + LIVENESS;
         loop {
-            let open: Vec<SessionId> = listed(&endpoint, true)
+            let open: Vec<SessionId> = within("the daemon's session list", listed(&endpoint, true))
                 .await?
                 .into_iter()
                 .filter(|(session_id, state)| {
@@ -439,6 +455,19 @@ impl View {
         session_id: SessionId,
         input: bool,
     ) -> Result<Self, String> {
+        within(
+            "an attachment",
+            Self::attach_unbounded(endpoint, target, session_id, input),
+        )
+        .await
+    }
+
+    async fn attach_unbounded(
+        endpoint: &Endpoint,
+        target: ActionTarget,
+        session_id: SessionId,
+        input: bool,
+    ) -> Result<Self, String> {
         let mut client = LocalClient::connect(endpoint, LocalClientKind::Cli, build())
             .await
             .map_err(|error| format!("connect to a worker: {error}"))?;
@@ -476,7 +505,7 @@ impl View {
             lease: None,
             sequence: 0,
         };
-        view.subscribe().await?;
+        view.subscribe_unbounded().await?;
         if input {
             let acquired: InputAcquireResult = view
                 .client
@@ -503,6 +532,10 @@ impl View {
     /// Subscribes to output from wherever the session is now, which is also how a view answers a
     /// resynchronisation.
     async fn subscribe(&mut self) -> Result<(), String> {
+        within("a subscription", self.subscribe_unbounded()).await
+    }
+
+    async fn subscribe_unbounded(&mut self) -> Result<(), String> {
         let mut streams = CanonicalSet::new();
         streams.insert(EventStream::Output);
         self.client
@@ -534,12 +567,15 @@ impl View {
             bytes: Bytes::new(bytes.to_vec()),
         };
         self.sequence += 1;
-        self.client
-            .request(Method::InputWrite, &params)
-            .await
-            .map_err(|error| format!("the write call: {error}"))?
-            .map_err(|error| format!("the write was refused: {error}"))
-            .map(|_| ())
+        within("an input write", async {
+            self.client
+                .request(Method::InputWrite, &params)
+                .await
+                .map_err(|error| format!("the write call: {error}"))?
+                .map_err(|error| format!("the write was refused: {error}"))
+                .map(|_| ())
+        })
+        .await
     }
 }
 
@@ -703,16 +739,20 @@ impl PluginHost {
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
             .unwrap_or_default();
-        let deadline = Instant::now() + LIVENESS;
-        let client = loop {
-            match PluginClient::connect(&environment).await {
-                Ok(client) => break client,
-                Err(error) if Instant::now() >= deadline => {
-                    return Err(format!(
-                        "the plugin host never accepted a connection: {error}"
-                    ));
+        let client = within("the plugin host's first connection", async {
+            loop {
+                if let Ok(client) = PluginClient::connect(&environment).await {
+                    return Ok(client);
                 }
-                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        let client = match client {
+            Ok(client) => client,
+            Err(failure) => {
+                end_plugin_host(&environment, pid, &label);
+                return Err(failure);
             }
         };
         let started = Self {
@@ -721,60 +761,11 @@ impl PluginHost {
             _client: client,
             _fence: fence,
         };
-        let binding = new_binding_id();
-        let plugin_id = PluginId::new(format!("kalareach/{COMPONENT}"))
-            .map_err(|error| format!("a plugin identifier: {error}"))?;
-        started
-            ._client
-            .register(
-                binding,
-                &PluginIdentity::new(
-                    plugin_id,
-                    PackageVersion::parse("1.0.0")
-                        .map_err(|error| format!("a version: {error}"))?,
-                    source.digest,
-                    RepositoryGeneration::new(1),
-                ),
-                &BindingFacts {
-                    plugin_id: format!("kalareach/{COMPONENT}"),
-                    binding_revision: 1,
-                    activity: BindingActivity::Running,
-                    thread_id: None,
-                    turn_id: None,
-                    updated_at_ms: 0,
-                    held_rights: Vec::new(),
-                },
-                "/bin/sh",
-                &source,
-            )
-            .await
-            .map_err(|error| format!("the fixture package's binding: {error}"))?;
-        for index in 0..8 {
-            let handle = SourceEventHandle::new(format!("se-{index}"))
-                .map_err(|error| format!("an event handle: {error}"))?;
-            started
-                ._client
-                .deliver(
-                    binding,
-                    &ScopedSourceEvent::new(
-                        handle,
-                        SourceProvenance::TerminalScrape,
-                        0,
-                        None,
-                        b"output".to_vec(),
-                    ),
-                )
-                .await
-                .map_err(|error| format!("an event for the binding: {error}"))?;
-        }
-        let answered = started
-            ._client
-            .snapshot(binding, Duration::from_secs(5))
-            .await
-            .map_err(|error| format!("the binding's snapshot: {error}"))?
-            .answered();
-        if !answered {
-            return Err("the fixture package's binding did not answer a snapshot".to_owned());
+        // Whatever fails from here, the plugin host this started is ended before the failure is
+        // reported.
+        if let Err(failure) = started.serve_the_fixture(&source).await {
+            started.end(&environment);
+            return Err(failure);
         }
         Ok(Ok((
             started,
@@ -784,21 +775,88 @@ impl PluginHost {
         )))
     }
 
-    /// Ends the plugin host by the process identifier this run recorded, and what the service
-    /// manager keeps of it.
-    fn end(self, environment: &EnvironmentPaths) {
-        let _ = std::process::Command::new("/bin/kill")
-            .arg("-KILL")
-            .arg(self.pid.to_string())
-            .status();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while process::resident_kib(&[self.pid]).is_ok() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
+    /// Registers one binding of the fixture package, sends it eight events and has it answer a
+    /// snapshot, each call bounded.
+    async fn serve_the_fixture(&self, source: &ComponentSource) -> Result<(), String> {
+        let binding = new_binding_id();
+        let plugin_id = PluginId::new(format!("kalareach/{COMPONENT}"))
+            .map_err(|error| format!("a plugin identifier: {error}"))?;
+        let identity = PluginIdentity::new(
+            plugin_id,
+            PackageVersion::parse("1.0.0").map_err(|error| format!("a version: {error}"))?,
+            source.digest,
+            RepositoryGeneration::new(1),
+        );
+        let facts = BindingFacts {
+            plugin_id: format!("kalareach/{COMPONENT}"),
+            binding_revision: 1,
+            activity: BindingActivity::Running,
+            thread_id: None,
+            turn_id: None,
+            updated_at_ms: 0,
+            held_rights: Vec::new(),
+        };
+        within("the fixture package's binding", async {
+            self._client
+                .register(binding, &identity, &facts, "/bin/sh", source)
+                .await
+                .map(|_| ())
+                .map_err(|error| format!("the fixture package's binding: {error}"))
+        })
+        .await?;
+        for index in 0..8 {
+            let handle = SourceEventHandle::new(format!("se-{index}"))
+                .map_err(|error| format!("an event handle: {error}"))?;
+            let event = ScopedSourceEvent::new(
+                handle,
+                SourceProvenance::TerminalScrape,
+                0,
+                None,
+                b"output".to_vec(),
+            );
+            within("an event for the binding", async {
+                self._client
+                    .deliver(binding, &event)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| format!("an event for the binding: {error}"))
+            })
+            .await?;
         }
-        let _ =
-            kr_controller::supervision::retire_service_job(&environment.jobs_dir(), &self.label);
-        let _ = launcher::retire_descriptor(environment);
+        let answered = within("the binding's snapshot", async {
+            self._client
+                .snapshot(binding, Duration::from_secs(5))
+                .await
+                .map_err(|error| format!("the binding's snapshot: {error}"))
+        })
+        .await?
+        .answered();
+        if answered {
+            Ok(())
+        } else {
+            Err("the fixture package's binding did not answer a snapshot".to_owned())
+        }
     }
+
+    /// Ends the plugin host, and what the service manager keeps of it.
+    fn end(self, environment: &EnvironmentPaths) {
+        end_plugin_host(environment, self.pid, &self.label);
+    }
+}
+
+/// Ends a plugin host by the process identifier this run recorded, waiting up to ten seconds for it
+/// to go, and retires its job and its descriptor.
+fn end_plugin_host(environment: &EnvironmentPaths, pid: u32, label: &str) {
+    let _ = std::process::Command::new("/bin/kill")
+        .arg("-KILL")
+        .arg(pid.to_string())
+        .status();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while process::running(pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = kr_controller::supervision::retire_service_job(&environment.jobs_dir(), label);
+    let _ = launcher::retire_descriptor(environment);
 }
 
 /// The processes of the host, by what they are.
@@ -806,10 +864,11 @@ impl PluginHost {
 struct Processes {
     /// Each writing session's worker, the one the slow observer is attached to first.
     workers: Vec<u32>,
-    /// Each writing session's shell and the program it runs.
+    /// The workers of the echoing session and the two probes.
+    other_workers: Vec<u32>,
+    /// Every session's root program and what it runs: the writing sessions' shells and programs,
+    /// the echoing program, and the probes' shells and their command.
     applications: Vec<u32>,
-    /// The workers and root programs of the echoing session and the two probes.
-    others: Vec<u32>,
     /// The probe at its prompt, and the probe whose shell runs a command.
     at_prompt: u32,
     holding: u32,
@@ -818,11 +877,17 @@ struct Processes {
 }
 
 impl Processes {
-    fn all(&self, plugin_host: Option<u32>) -> Vec<u32> {
-        let mut all: Vec<u32> = std::iter::once(std::process::id())
+    /// The product's own processes: this one, which is the daemon, and every worker.
+    fn product(&self) -> impl Iterator<Item = u32> + '_ {
+        std::iter::once(std::process::id())
             .chain(self.workers.iter().copied())
+            .chain(self.other_workers.iter().copied())
+    }
+
+    fn all(&self, plugin_host: Option<u32>) -> Vec<u32> {
+        let mut all: Vec<u32> = self
+            .product()
             .chain(self.applications.iter().copied())
-            .chain(self.others.iter().copied())
             .chain(plugin_host)
             .collect();
         all.sort_unstable();
@@ -1099,9 +1164,9 @@ async fn stress(host: &Host, run: &mut Run) -> Result<Figures, String> {
     }
     for created in [&echoing, &at_prompt, &holding] {
         let (root, worker) = root_and_worker(created)?;
-        processes.others.push(root);
-        processes.others.push(worker);
-        processes.others.extend(process::children_of(root));
+        processes.other_workers.push(worker);
+        processes.applications.push(root);
+        processes.applications.extend(process::children_of(root));
     }
     processes.at_prompt = root_and_worker(&at_prompt)?.1;
     processes.holding = root_and_worker(&holding)?.1;
@@ -1137,9 +1202,8 @@ async fn stress(host: &Host, run: &mut Run) -> Result<Figures, String> {
     while started.elapsed() < WINDOW {
         tokio::time::sleep(SAMPLE.min(WINDOW.saturating_sub(started.elapsed()))).await;
         let resident = process::resident_kib(&all)?;
-        let product: u64 = std::iter::once(std::process::id())
-            .chain(processes.workers.iter().copied())
-            .chain(processes.others.iter().copied())
+        let product: u64 = processes
+            .product()
             .filter_map(|pid| resident.get(&pid))
             .sum();
         product_peak = product_peak.max(product);
@@ -1196,19 +1260,26 @@ async fn stress(host: &Host, run: &mut Run) -> Result<Figures, String> {
 
     // What one look through a foreground's processes costs on this host now, as the adoption
     // watch would read it, timed by enumerating one writing session's foreground group.
+    // The processor time is this thread's own where the platform keeps it per thread; elsewhere the
+    // wall time is given, which bounds it from above.
     let look = processes.foreground_group.map(|group| {
+        let spent_before = process::thread_processor_seconds();
         let timed = Instant::now();
         let mut read = 0;
         for _ in 0..LOOKS {
             read = kr_ipc::identity::processes_in_group(group).map_or(0, |found| found.len());
         }
-        (timed.elapsed() / LOOKS, read)
+        let wall = timed.elapsed() / LOOKS;
+        let processor = spent_before
+            .zip(process::thread_processor_seconds())
+            .map(|(before, after)| Duration::from_secs_f64((after - before).max(0.0)) / LOOKS);
+        (wall, processor, read)
     });
     let on_host = process::count().unwrap_or_default();
 
     // Every session still live, and every reading view still reading.
     let not_live: Vec<SessionId> = {
-        let listed = listed(&host.daemon()?, false).await?;
+        let listed = within("the daemon's session list", listed(&host.daemon()?, false)).await?;
         run.sessions
             .iter()
             .copied()
@@ -1331,7 +1402,7 @@ async fn stress(host: &Host, run: &mut Run) -> Result<Figures, String> {
     let workers_now: u64 = processes
         .workers
         .iter()
-        .chain(processes.others.iter())
+        .chain(processes.other_workers.iter())
         .filter_map(|pid| last_resident.get(pid))
         .sum();
     let plugin_now = plugin_pid.and_then(|pid| last_resident.get(&pid).copied());
@@ -1391,9 +1462,9 @@ async fn stress(host: &Host, run: &mut Run) -> Result<Figures, String> {
         per_second(delivered, elapsed)
     ));
     lines.push(format!(
-        "  processor         workers {:.3} of one core in all ({:.4} the median worker, {:.4} the \
-         busiest); shells and their programs {:.3}; this process {:.3}, which is the daemon and \
-         also every reading view's client end",
+        "  processor         the writing sessions' workers {:.3} of one core in all ({:.4} the \
+         median worker, {:.4} the busiest); every session's shell and program {:.3}; this process \
+         {:.3}, which is the daemon and also every reading view's client end",
         cores(in_workers),
         cores(
             per_worker
@@ -1414,15 +1485,33 @@ async fn stress(host: &Host, run: &mut Run) -> Result<Figures, String> {
         watch * SESSIONS as f64
     ));
     lines.push(match look {
-        Some((each, read)) => format!(
-            "  a look's reading  enumerating one foreground group ({read} process{}) takes {} of \
-             wall time here, with {on_host} processes on the host; a worker that holds a \
-             connector reads it four times a second while a command has the terminal, which in \
-             each of {SESSIONS} sessions would be {:.3} of one core",
-            if read == 1 { "" } else { "es" },
-            milliseconds(each),
-            each.as_secs_f64() * 4.0 * SESSIONS as f64
-        ),
+        Some((wall, processor, read)) => {
+            // Four looks a second in each session: the share of one core that would take.
+            let cores = |each: Duration| each.as_secs_f64() * 4.0 * SESSIONS as f64;
+            let spent = match processor {
+                Some(processor) => format!(
+                    "{} of processor time ({} of wall time); a worker that holds a connector \
+                     reads it four times a second while a command has the terminal, which in each \
+                     of {SESSIONS} sessions would take {:.3} of one core",
+                    milliseconds(processor),
+                    milliseconds(wall),
+                    cores(processor)
+                ),
+                None => format!(
+                    "{} of wall time, which bounds its processor time from above; a worker that \
+                     holds a connector reads it four times a second while a command has the \
+                     terminal, which in each of {SESSIONS} sessions would take at most {:.3} of \
+                     one core",
+                    milliseconds(wall),
+                    cores(wall)
+                ),
+            };
+            format!(
+                "  a look's reading  enumerating one foreground group ({read} process{}) takes \
+                 {spent}, with {on_host} processes on the host",
+                if read == 1 { "" } else { "es" }
+            )
+        }
         None => "  a look's reading  not read: no writing session's program was found".to_owned(),
     });
     lines.push(format!(
@@ -1448,7 +1537,8 @@ async fn stress(host: &Host, run: &mut Run) -> Result<Figures, String> {
 
     let mut lines = conditions.lines();
     lines.push(format!(
-        "  measurement       every process of the host at the end of the stress window: {configuration}"
+        "  measurement       every process of the product and of the sessions it hosts, at the end \
+         of the stress window, and no other process on the machine: {configuration}"
     ));
     lines.push(format!(
         "  resident          {} in all, peak {}: this process (the daemon and the views' client \
@@ -1468,7 +1558,7 @@ async fn stress(host: &Host, run: &mut Run) -> Result<Figures, String> {
     );
     record::report(
         RECORD,
-        "KR-PERF-003 whole host with the plugin host serving, under the 50-session stress",
+        "KR-PERF-003 whole product with the plugin host serving, under the 50-session stress",
         &lines,
     );
 

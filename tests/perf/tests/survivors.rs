@@ -49,7 +49,7 @@ impl Planted {
         let _ = Command::new("/bin/kill").arg(self.0.to_string()).status();
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if !running(self.0) {
+            if !kr_perf::process::running(self.0) {
                 return true;
             }
             if Instant::now() >= deadline {
@@ -64,18 +64,6 @@ impl Drop for Planted {
     fn drop(&mut self) {
         let _ = self.end();
     }
-}
-
-/// Whether a process is running: in the process table and not waiting to be collected.
-fn running(pid: u32) -> bool {
-    Command::new("ps")
-        .args(["-o", "stat=", "-p", &pid.to_string()])
-        .output()
-        .is_ok_and(|output| {
-            let state = String::from_utf8_lossy(&output.stdout);
-            let state = state.trim();
-            !state.is_empty() && !state.starts_with('Z')
-        })
 }
 
 fn repository() -> PathBuf {
