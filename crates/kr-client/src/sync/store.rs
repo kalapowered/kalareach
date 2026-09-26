@@ -3520,7 +3520,7 @@ impl SyncStore {
             })?
         ));
         write_whole(&partial, bytes).map_err(|source| storage(stored(&partial), source))?;
-        if let Err(source) = std::fs::rename(&partial, path) {
+        if let Err(source) = kr_flush::retry_while_held(|| std::fs::rename(&partial, path)) {
             let _ = std::fs::remove_file(&partial);
             return Err(storage(stored(path), source));
         }

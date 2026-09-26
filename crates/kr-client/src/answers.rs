@@ -398,7 +398,7 @@ impl AnswerDrafts {
             .directory
             .join(format!(".{}.{unique}.partial", draft.question_id));
         crate::drafts::write_whole(&partial, &bytes).map_err(store)?;
-        if let Err(error) = std::fs::rename(&partial, &path) {
+        if let Err(error) = kr_flush::retry_while_held(|| std::fs::rename(&partial, &path)) {
             let _ = std::fs::remove_file(&partial);
             return Err(store(error));
         }

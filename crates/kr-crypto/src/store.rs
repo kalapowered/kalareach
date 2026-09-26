@@ -381,7 +381,7 @@ impl SecretStore for FileStore {
         ));
         write_owner_only(&staging, secret)?;
         // Rename replaces atomically, so a reader sees the old secret or the new one.
-        let renamed = std::fs::rename(&staging, &path);
+        let renamed = kr_flush::retry_while_held(|| std::fs::rename(&staging, &path));
         if renamed.is_err() {
             let _ = std::fs::remove_file(&staging);
         }
@@ -1128,7 +1128,8 @@ fn record_kind(directory: &Path, kind: StoreKind) -> Result<()> {
         STAGING_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     write_owner_only(&staging, text.as_bytes())?;
-    let renamed = std::fs::rename(&staging, directory.join(STORE_KIND_MARKER));
+    let renamed =
+        kr_flush::retry_while_held(|| std::fs::rename(&staging, directory.join(STORE_KIND_MARKER)));
     if renamed.is_err() {
         let _ = std::fs::remove_file(&staging);
     }

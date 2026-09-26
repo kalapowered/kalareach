@@ -247,7 +247,9 @@ impl RecordFile {
             .map_err(|source| storage(stored(&self.partial), source))?;
         // A rename within one directory replaces the name in one step, so a reader finds the old
         // record or the new one and never a record half written.
-        if let Err(source) = std::fs::rename(&self.partial, &self.path) {
+        if let Err(source) =
+            kr_flush::retry_while_held(|| std::fs::rename(&self.partial, &self.path))
+        {
             let _ = std::fs::remove_file(&self.partial);
             return Err(storage(stored(&self.path), source));
         }

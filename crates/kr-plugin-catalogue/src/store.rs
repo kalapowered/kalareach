@@ -1866,7 +1866,9 @@ impl StagedPackage {
             let (into, _) = package
                 .parent_of(relative, true)
                 .map_err(|error| stopped(&replaced, error))?;
-            if let Err(source) = from.dir.rename(&file, &into.dir, &file) {
+            if let Err(source) =
+                kr_flush::retry_while_held(|| from.dir.rename(&file, &into.dir, &file))
+            {
                 return Err(stopped(
                     &replaced,
                     CatalogueError::storage(&target, &source),
@@ -2093,13 +2095,12 @@ fn rename_into_place(
     file.sync_all()
         .map_err(|source| CatalogueError::storage(&written, &source))?;
     drop(file);
-    staging
-        .dir
-        .rename(&temporary, &directory.dir, &name)
-        .map_err(|source| {
+    kr_flush::retry_while_held(|| staging.dir.rename(&temporary, &directory.dir, &name)).map_err(
+        |source| {
             let _ = staging.dir.remove_file(&temporary);
             CatalogueError::storage(&directory.path.join(&name), &source)
-        })?;
+        },
+    )?;
     Ok(directory)
 }
 
