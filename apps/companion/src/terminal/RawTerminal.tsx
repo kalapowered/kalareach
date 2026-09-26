@@ -329,7 +329,9 @@ export function RawTerminal({
 
   /**
    * Sends the whole cells a drag has crossed, and draws the frame at its new place before the next
-   * paint, so the frame and the drag's part on its own layer never show out of step.
+   * paint, so the frame and the drag's part on its own layer never show out of step. Drawing it may
+   * draw a change of the view that was waiting, whose effects end or begin again the drag, so a
+   * handler calls this last, once the drag and its part are stored.
    */
   const sendDragged = (cells: Cells) => {
     flushSync(() => {
@@ -530,9 +532,9 @@ export function RawTerminal({
               width: element.clientWidth || (frame?.window.columns ?? 0) * held.cell.width,
               height: element.clientHeight || (frame?.window.rows ?? 0) * held.cell.height
             })
-            if (moves(step.send)) sendDragged(step.send)
             dragging.current = { ...held, drag: step.drag, last: at }
             drawDrag(step.offset)
+            if (moves(step.send)) sendDragged(step.send)
           }}
           onPointerUp={(event) => {
             const held = dragging.current

@@ -795,17 +795,7 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
 
   it('begins a drag again at each zoom step, one back to the size it began at included', async () => {
     const person = userEvent.setup()
-    // A cell two thirds of the type size wide and four thirds of it high: 8 by 16 at first.
-    const rects = vi
-      .spyOn(Element.prototype, 'getBoundingClientRect')
-      .mockImplementation(function (this: Element) {
-        const text = this.textContent ?? ''
-        const size = parseFloat(this.parentElement?.style.fontSize ?? '')
-        if (this.getAttribute('aria-hidden') !== 'true' || !/^M+$/.test(text) || !(size > 0)) {
-          return new DOMRect()
-        }
-        return DOMRect.fromRect({ x: 0, y: 0, width: (text.length * size * 2) / 3, height: (size * 4) / 3 })
-      })
+    const rects = cellsFromTypeSize()
     try {
       const { port, controls } = fakeHost()
       controls.holdTerminalMoves()
@@ -824,6 +814,32 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
       // A row from where the pointer was: one row goes, and nothing is left to round on release.
       pointer('pointermove', 100, 124)
       expect(gridShift()).toEqual({ x: 0, y: 16 })
+      pointer('pointerup', 100, 124)
+      expect(controls.terminalViews[0]?.moves).toEqual([{ number: 1, across: 0, down: -1 }])
+    } finally {
+      rects.mockRestore()
+    }
+  })
+
+  it('begins a drag again from the pointer when the row it sends draws a zoom step still to be drawn', async () => {
+    const person = userEvent.setup()
+    const rects = cellsFromTypeSize()
+    try {
+      const { port, controls } = fakeHost()
+      controls.holdTerminalMoves()
+      open(port)
+      await screen.findByTestId('palette-provenance')
+      await person.click(screen.getByRole('tab', { name: 'View' }))
+      pointer('pointerdown', 100, 100)
+      // A zoom step is taken and not yet drawn when the pointer crosses a row and a half. Sending
+      // the row draws the zoom step with it, and the drag begins again from the pointer in the
+      // larger cell, with no part of the smaller one left.
+      act(() => {
+        const host = screen.getByTestId('terminal-surface').firstElementChild
+        host?.dispatchEvent(new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: -100, ctrlKey: true }))
+        host?.dispatchEvent(pointerEvent('pointermove', 100, 124))
+      })
+      expect(gridShift()).toEqual({ x: 0, y: 18 })
       pointer('pointerup', 100, 124)
       expect(controls.terminalViews[0]?.moves).toEqual([{ number: 1, across: 0, down: -1 }])
     } finally {
@@ -897,24 +913,38 @@ function wheel(init: WheelEventInit): WheelEvent {
   return event
 }
 
+/** Pointer `id`'s `type` at `x`, `y`: the primary one unless told. */
+function pointerEvent(type: string, x: number, y: number, id = 1): PointerEvent {
+  return new PointerEvent(type, {
+    bubbles: true,
+    cancelable: true,
+    pointerId: id,
+    pointerType: 'mouse',
+    isPrimary: id === 1,
+    button: 0,
+    buttons: type === 'pointerup' ? 0 : 1,
+    clientX: x,
+    clientY: y
+  })
+}
+
 /** Sends pointer `id`'s `type` over the terminal at `x`, `y`: the primary one unless told. */
 function pointer(type: string, x: number, y: number, id = 1): void {
   act(() => {
-    screen
-      .getByTestId('terminal-surface')
-      .firstElementChild?.dispatchEvent(
-        new PointerEvent(type, {
-          bubbles: true,
-          cancelable: true,
-          pointerId: id,
-          pointerType: 'mouse',
-          isPrimary: id === 1,
-          button: 0,
-          buttons: type === 'pointerup' ? 0 : 1,
-          clientX: x,
-          clientY: y
-        })
-      )
+    screen.getByTestId('terminal-surface').firstElementChild?.dispatchEvent(pointerEvent(type, x, y, id))
+  })
+}
+
+/**
+ * Lays a cell out from the type size its probe is set in, as a browser would: two thirds of it wide
+ * and four thirds of it high, so 8 by 16 pixels before any zoom step. Returns the spy to restore.
+ */
+function cellsFromTypeSize() {
+  return vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (this: Element) {
+    const text = this.textContent ?? ''
+    const size = parseFloat(this.parentElement?.style.fontSize ?? '')
+    if (this.getAttribute('aria-hidden') !== 'true' || !/^M+$/.test(text) || !(size > 0)) return new DOMRect()
+    return DOMRect.fromRect({ x: 0, y: 0, width: (text.length * size * 2) / 3, height: (size * 4) / 3 })
   })
 }
 

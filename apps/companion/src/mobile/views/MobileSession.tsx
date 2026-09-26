@@ -736,7 +736,9 @@ function RawTerminal({
 
   /**
    * Sends the whole cells a drag has crossed, and draws the screen at its new place before the next
-   * paint, so the screen and the drag's part on its own layer never show out of step.
+   * paint, so the screen and the drag's part on its own layer never show out of step. Drawing it may
+   * draw a change of the view that was waiting, whose effects end or begin again the drag, so a
+   * handler calls this last, once the drag and its part are stored.
    */
   const sendDragged = (cells: Cells) => {
     if (cells.across === 0 && cells.down === 0) return
@@ -854,9 +856,9 @@ function RawTerminal({
           width: element.clientWidth,
           height: element.clientHeight
         })
-        sendDragged(step.send)
         dragging.current = { ...held, drag: step.drag, last: at }
         drawDrag(step.offset)
+        sendDragged(step.send)
       }}
       onPointerUp={(event) => {
         if (!pointers.current.has(event.pointerId)) return

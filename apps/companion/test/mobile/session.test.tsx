@@ -399,16 +399,17 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
   })
 
   /**
-   * Gives the phone's view the measurements jsdom does not take: cells of 8 by 16 pixels, and a
-   * surface 336 pixels wide in a pane 420 high. Returns what puts them back.
+   * Gives the phone's view the measurements jsdom does not take: cells of `cell`, 8 by 16 pixels
+   * unless told, read at each measure, and a surface 336 pixels wide in a pane 420 high. Returns
+   * what puts them back.
    */
-  function measured(): () => void {
+  function measured(cell: { width: number; height: number } = { width: 8, height: 16 }): () => void {
     const rects = vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (
       this: Element
     ) {
       const text = this.textContent ?? ''
       if (this.getAttribute('aria-hidden') !== 'true' || !/^M+$/.test(text)) return new DOMRect()
-      return DOMRect.fromRect({ x: 0, y: 0, width: text.length * 8, height: 16 })
+      return DOMRect.fromRect({ x: 0, y: 0, width: text.length * cell.width, height: cell.height })
     })
     const widths = vi.spyOn(Element.prototype, 'clientWidth', 'get').mockImplementation(function (
       this: Element
@@ -429,12 +430,15 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     }
   }
 
+  /** One finger's `type` at `x`, `y`. */
+  function fingerEvent(type: string, pointerId: number, x: number, y: number): PointerEvent {
+    return new PointerEvent(type, { bubbles: true, pointerId, pointerType: 'touch', clientX: x, clientY: y })
+  }
+
   /** One finger's `type` on the phone's terminal at `x`, `y`. */
   function finger(type: string, pointerId: number, x: number, y: number): void {
     act(() => {
-      screen.getByTestId('mobile-terminal').dispatchEvent(
-        new PointerEvent(type, { bubbles: true, pointerId, pointerType: 'touch', clientX: x, clientY: y })
-      )
+      screen.getByTestId('mobile-terminal').dispatchEvent(fingerEvent(type, pointerId, x, y))
     })
   }
 
@@ -483,6 +487,35 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
       // Taking control brings the window back to the live screen, behind the moves made.
       await person.click(screen.getByRole('button', { name: 'Take control' }))
       expect(controls.terminalViews[0]?.moves.at(-1)).toEqual({ number: 3, live: true })
+    } finally {
+      restore()
+    }
+  })
+
+  it('begins a drag again from the finger when the row it sends draws a screen laid out in a new cell', async () => {
+    const cell = { width: 8, height: 16 }
+    const restore = measured(cell)
+    try {
+      const { port, controls } = fakeHost()
+      controls.holdTerminalMoves()
+      const person = await onTerminal(port)
+      await waitFor(() => {
+        expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
+      })
+      await person.click(screen.getByRole('button', { name: 'Look around' }))
+      finger('pointerdown', 1, 100, 100)
+      // A screen laid out in a larger cell has come and is not yet drawn when the finger crosses a
+      // row and a half. Sending the row draws it, and the drag begins again from the finger in the
+      // larger cell, with no part of the smaller one left.
+      act(() => {
+        cell.width = 9
+        cell.height = 18
+        controls.terminalViews[0]?.show()
+        screen.getByTestId('mobile-terminal').dispatchEvent(fingerEvent('pointermove', 1, 100, 124))
+      })
+      expect(gridShift()).toEqual({ x: 0, y: 18 })
+      finger('pointerup', 1, 100, 124)
+      expect(controls.terminalViews[0]?.moves).toEqual([{ number: 1, across: 0, down: -1 }])
     } finally {
       restore()
     }
