@@ -692,7 +692,7 @@ impl GrantDirectory {
             connection
                 .query_row(
                     "SELECT grant, session_id, issued_at_ms, revoked_at_ms, revoked_by_parent,
-             activated_at_ms
+             activated_at_ms, grant_id
                      FROM grants WHERE grant_id = ?1",
                     params![key],
                     |row| Ok(read_row(row)),
@@ -711,7 +711,7 @@ impl GrantDirectory {
         let rows: Vec<Row> = self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT grant, session_id, issued_at_ms, revoked_at_ms, revoked_by_parent,
-             activated_at_ms
+             activated_at_ms, grant_id
                  FROM grants ORDER BY grant_id",
             )?;
             let rows = statement
@@ -732,7 +732,7 @@ impl GrantDirectory {
         let rows: Vec<Row> = self.with(|connection| {
             let mut statement = connection.prepare(
                 "SELECT grant, session_id, issued_at_ms, revoked_at_ms, revoked_by_parent,
-             activated_at_ms
+             activated_at_ms, grant_id
                  FROM grants WHERE recipient_device_id = ?1 ORDER BY grant_id",
             )?;
             let rows = statement
@@ -1087,7 +1087,7 @@ impl GrantDirectory {
             connection
                 .query_row(
                     "SELECT preview, issuer_device_id, state, redeemed_by, issued_at_ms,
-                            grant_id, recipient_device_id
+                            grant_id, recipient_device_id, invitation_id
                      FROM session_invitations WHERE invitation_id = ?1",
                     params![key],
                     |row| Ok(read_invitation(row)),
@@ -2009,7 +2009,7 @@ fn read_invitation_within(
     let row: Option<Result<InvitationRecord>> = connection
         .query_row(
             "SELECT preview, issuer_device_id, state, redeemed_by, issued_at_ms,
-                    grant_id, recipient_device_id
+                    grant_id, recipient_device_id, invitation_id
              FROM session_invitations WHERE invitation_id = ?1",
             params![invitation_id.get().as_bytes().as_slice()],
             |row| Ok(read_invitation(row)),
@@ -2329,11 +2329,20 @@ fn refusal(detail: &str) -> ControllerError {
     }
 }
 
+/// Reads one session invitation row. A preview this build cannot read is refused with its table and
+/// the invitation its key column names, read apart from the payload, so the row can be found and
+/// removed.
 fn read_invitation(row: &rusqlite::Row<'_>) -> Result<InvitationRecord> {
     let encoded: Vec<u8> = row.get(0).map_err(ControllerError::registry)?;
     let preview: InvitationPreview =
-        kr_cbor::from_canonical_slice(&encoded, &kr_cbor::Limits::DEFAULT)
-            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        kr_cbor::from_canonical_slice(&encoded, &kr_cbor::Limits::DEFAULT).map_err(|error| {
+            let key: Option<Vec<u8>> = row.get(7).ok();
+            let named = key.as_deref().and_then(uuid_of).map(InvitationId::new);
+            ControllerError::InvalidArgument(format!(
+                "the session_invitations row of invitation {} cannot be read: {error}",
+                named.map_or_else(|| "with a malformed key".to_owned(), |id| id.to_string())
+            ))
+        })?;
     let issuer: Vec<u8> = row.get(1).map_err(ControllerError::registry)?;
     let state: String = row.get(2).map_err(ControllerError::registry)?;
     let redeemed: Option<Vec<u8>> = row.get(3).map_err(ControllerError::registry)?;
@@ -2364,7 +2373,7 @@ fn read_one(connection: &Connection, grant_id: GrantId) -> Result<Option<GrantRe
     let row: Option<Row> = connection
         .query_row(
             "SELECT grant, session_id, issued_at_ms, revoked_at_ms, revoked_by_parent,
-             activated_at_ms
+             activated_at_ms, grant_id
              FROM grants WHERE grant_id = ?1",
             params![grant_id.get().as_bytes().as_slice()],
             |row| Ok(read_row(row)),
@@ -2379,7 +2388,7 @@ fn read_all(connection: &Connection) -> Result<Vec<GrantRecord>> {
     let mut statement = connection
         .prepare(
             "SELECT grant, session_id, issued_at_ms, revoked_at_ms, revoked_by_parent,
-             activated_at_ms
+             activated_at_ms, grant_id
              FROM grants ORDER BY grant_id",
         )
         .map_err(ControllerError::registry)?;
@@ -2396,7 +2405,7 @@ fn read_for_device(connection: &Connection, device_id: DeviceId) -> Result<Vec<G
     let mut statement = connection
         .prepare(
             "SELECT grant, session_id, issued_at_ms, revoked_at_ms, revoked_by_parent,
-             activated_at_ms
+             activated_at_ms, grant_id
              FROM grants WHERE recipient_device_id = ?1 ORDER BY grant_id",
         )
         .map_err(ControllerError::registry)?;
@@ -2443,10 +2452,19 @@ fn subtree_within(connection: &Connection, grant_id: GrantId) -> Result<Vec<Gran
     Ok(found)
 }
 
+/// Reads one grant row. A grant this build cannot read is refused with its table and the grant its
+/// key column names, read apart from the payload, so the row can be found and removed.
 fn read_row(row: &rusqlite::Row<'_>) -> Row {
     let encoded: Vec<u8> = row.get(0).map_err(ControllerError::registry)?;
-    let grant: Grant = kr_cbor::from_canonical_slice(&encoded, &kr_cbor::Limits::DEFAULT)
-        .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+    let grant: Grant =
+        kr_cbor::from_canonical_slice(&encoded, &kr_cbor::Limits::DEFAULT).map_err(|error| {
+            let key: Option<Vec<u8>> = row.get(6).ok();
+            let named = key.as_deref().and_then(uuid_of).map(GrantId::new);
+            ControllerError::InvalidArgument(format!(
+                "the grants row of grant {} cannot be read: {error}",
+                named.map_or_else(|| "with a malformed key".to_owned(), |id| id.to_string())
+            ))
+        })?;
     let session: Option<Vec<u8>> = row.get(1).map_err(ControllerError::registry)?;
     let issued: i64 = row.get(2).map_err(ControllerError::registry)?;
     let revoked: Option<i64> = row.get(3).map_err(ControllerError::registry)?;
