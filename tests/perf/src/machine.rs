@@ -5,8 +5,10 @@
 //! in `/proc/<pid>/stat`; macOS keeps each processor's idle time in its load counters and each
 //! process's time in its task information, which another user's process does not open to this
 //! reader, so that process's row is listed as unread. What this reads rests on four things each
-//! kernel does by design, which hold on the reference hosts; each comes with an allowance the
-//! bound includes, and the reader checks what it can:
+//! kernel does by design, which hold on the reference hosts. A reference figure rests on them only
+//! in a run on a host set aside for it, with nothing else scheduled there; each comes with an
+//! allowance the bound includes, which is none for the last two, and the reader checks what it
+//! can:
 //!
 //! 1. Idle time is counted as it passes. Linux counts it exactly on a kernel that stops the clock
 //!    tick on an idle processor, which distribution kernels for x86-64 and ARM64 are built to do on
@@ -26,10 +28,13 @@
 //!    stretch (Linux, when a task waiting for a disk is woken elsewhere) or count it twice (macOS);
 //!    each count is therefore taken three times, and the largest is kept where it starts a stretch,
 //!    since a count that falls short would add idle time from before it, and the smallest where it
-//!    ends one, since a count that runs over would add idle time that did not happen.
-//! 4. A process identifier and start name one process. Linux gives the start in hundredths of a
-//!    second and macOS to the microsecond, and both hand identifiers out in turn, so one returns to
-//!    use only after every other has been used.
+//!    ends one, since a count that runs over would add idle time that did not happen. Allowance:
+//!    none, and nothing checks that one of the three is right.
+//! 4. A process identifier and start name one process: no identifier is given to a new process
+//!    within the hundredth of a second Linux gives the start in (macOS gives it to the
+//!    microsecond). Both hand identifiers out in turn, Linux up to its `pid_max` and macOS up to
+//!    99,999, so one returns to use only after every other has been used. Allowance: none, and
+//!    nothing checks it.
 //!
 //! Elsewhere nothing is read and every reading fails.
 

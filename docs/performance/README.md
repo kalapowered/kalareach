@@ -47,17 +47,20 @@ operating system reports it is a little less than the memory installed, so a mac
 ### What the reading assumes
 
 The reader cannot see inside a kernel's accounting, so the bound rests on four things each kernel
-does by design. They hold on the reference hosts, and the reader checks what it can. Each one comes
-with an allowance, which the reader adds to the bound, and every conditions section gives how much
-of its bound the allowances make up. Section 27's figures are far coarser than any of them: the
-gate itself allows one processor's worth, five processor-seconds, in any five seconds.
+does by design. They hold on the reference hosts, and the reader checks what it can. A figure is a
+reference figure on these grounds only from a run on a host set aside for it, with nothing else
+scheduled there.
+Each assumption comes with an allowance, which the reader adds to the bound, and every conditions
+section gives how much of its bound the allowances make up, rounded up. Section 27's figures are
+far coarser than any of them: the gate itself allows one processor's worth, five processor-seconds,
+in any five seconds.
 
 | Assumption | Its bound | Why it holds on a reference host | What the reader checks | Allowance in each stretch between two readings |
 | --- | --- | --- | --- | --- |
 | Idle time is counted as it passes | Linux counts it exactly on a kernel that stops the clock tick on an idle processor; macOS brings an idle processor's count up to date when it is read | Distribution kernels for x86-64 and ARM64 are built for it, and those machines have the one-shot timers it needs | On Linux, `CONFIG_NO_HZ_COMMON` in the kernel's configuration and no `nohz=` that turns it off; a kernel that fails either is not read | Rounding to a hundredth of a second: 0.02 s on Linux (idle and waiting counts), a hundredth of a second and one 10 ms quantum per processor on macOS (0.24 s on twelve processors) |
 | A running thread's charged time trails by little | At most one clock tick on Linux (1 ms at 1000 Hz), one 10 ms scheduling quantum on macOS | The clock tick, or the quantum's timer, brings the running thread's time up to date, and a quiet host holds interrupts off for microseconds | On Linux, the clock rate from the kernel's configuration, and no processor that stops the tick while a thread runs (`nohz_full`) | For each of the run's processes, its running threads times one tick or one quantum, and on Linux a further 0.02 s for rounding |
-| An idle count read without a lock is right at least once in three | A count taken just as a processor goes idle or wakes can drop that processor's current idle stretch (Linux) or count it twice (macOS) | It needs a wake-up to land within the few hundred nanoseconds between two reads of one processor's fields, three times over, on a quiet host | Every count is taken three times; the largest is kept where it starts a stretch and the smallest where it ends one | None |
-| A process identifier and start name one process | Linux gives the start in hundredths of a second, macOS to the microsecond | Both hand identifiers out in turn, Linux up to its `pid_max`, macOS up to 99,999, so one returns only after every other has been used, far longer than a hundredth of a second | Nothing | None |
+| An idle count read without a lock is right at least once in three | A count taken just as a processor goes idle or wakes can drop that processor's current idle stretch (Linux) or count it twice (macOS) | It needs a wake-up to land within the few hundred nanoseconds between two reads of one processor's fields, three times over, on a quiet host | Nothing checks it: every count is taken three times, and the largest is kept where it starts a stretch and the smallest where it ends one | None |
+| A process identifier and start name one process | No identifier is given to a new process within a hundredth of a second on Linux, which gives the start to that; macOS gives it to the microsecond | Both hand identifiers out in turn, Linux up to its `pid_max`, macOS up to 99,999, so one returns only after every other has been used, far longer than a hundredth of a second | Nothing | None |
 
 ## The two configurations
 
