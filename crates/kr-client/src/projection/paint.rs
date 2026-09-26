@@ -1881,6 +1881,198 @@ mod fixtures {
         }
     }
 
+    /// Screens whose runs reach every branch of a run's placement: clusters the window's edges cut
+    /// on both sides, a run whose text disagrees with its cells, a mark with no base of its own,
+    /// control characters inside a run's text, and a styled run inside a link.
+    fn placement_screens() -> Vec<(&'static str, Screen, Window)> {
+        let edges = serde_json::json!({
+            "window": {"top_row": 0, "left_column": 2, "rows": 3, "columns": 8},
+            "rows": [
+                {"row": 0, "soft_wrapped": false, "runs": [
+                    {"column": 0, "cells": 1, "text": "a"},
+                    {"column": 1, "cells": 6, "text": "\u{4e2d}bc\u{6587}"},
+                    {"column": 7, "cells": 5, "text": "de\u{4e2d}f"}]},
+                {"row": 1, "soft_wrapped": true, "runs": [
+                    {"column": 2, "cells": 5, "text": "abc"},
+                    {"column": 7, "cells": 2, "text": "\u{301}xy"}]},
+                {"row": 2, "soft_wrapped": false, "runs": [
+                    {"column": 0, "cells": 12, "text": "outside the window"}]}
+            ],
+            "cursor": {"column": 4, "row": 1, "visible": true, "style": 2, "pending_wrap": false}
+        });
+        let styled = serde_json::json!({
+            "window": {"top_row": 5, "left_column": 0, "rows": 2, "columns": 12},
+            "rows": [
+                {"row": 5, "soft_wrapped": false, "runs": [
+                    {"column": 0, "cells": 4, "text": "a\u{7}b\u{9b}cd"},
+                    {"column": 4, "cells": 5, "text": "e\u{301}f\u{1f600}g"},
+                    {"column": 9, "cells": 3, "text": "hij"}]},
+                {"row": 6, "soft_wrapped": false, "runs": [
+                    {"column": 1, "cells": 4, "text": "link"},
+                    {"column": 6, "cells": 4, "text": "\u{1f468}\u{200d}\u{1f4bb}"}]}
+            ],
+            "cursor": {"column": 11, "row": 1, "visible": false, "style": 5,
+                       "pending_wrap": true}
+        });
+        let (edges_screen, edges_window) = screen_of(&edges);
+        let (mut styled_screen, styled_window) = screen_of(&styled);
+        if let Some(row) = styled_screen.rows.get_mut(&(ProjectedBuffer::Primary, 5)) {
+            row.runs[1].rendition = CellRendition {
+                foreground: CellColour::Indexed(9),
+                background: CellColour::Direct(Rgb {
+                    red: 0x10,
+                    green: 0x20,
+                    blue: 0x30,
+                }),
+                underline_colour: CellColour::Indexed(200),
+                underline: CellUnderline::Curly,
+                blink: CellBlink::Slow,
+                vertical_align: CellVerticalAlign::Superscript,
+                bold: true,
+                faint: false,
+                italic: true,
+                reverse: true,
+                invisible: false,
+                strikethrough: true,
+                overline: true,
+            };
+        }
+        if let Some(row) = styled_screen.rows.get_mut(&(ProjectedBuffer::Primary, 6)) {
+            row.runs[0].hyperlink = Nullable::some("https://example.com/a".to_owned());
+            row.runs[1].hyperlink = Nullable::some("https://example.com/a".to_owned());
+        }
+        vec![
+            ("edges", edges_screen, edges_window),
+            ("styled", styled_screen, styled_window),
+        ]
+    }
+
+    /// Every frame the painter writes, byte for byte.
+    ///
+    /// Each corpus case and each placement screen is painted as an installed snapshot and as an
+    /// update, with every keyboard and with and without its state, and each frame is held to the
+    /// SHA-256 of the bytes it has always written. A frame is what the CLI's terminal receives, so
+    /// a change to how a run is placed, a control is filtered or a piece is addressed that alters a
+    /// single byte fails here rather than on somebody's screen.
+    #[test]
+    fn every_frame_is_the_bytes_the_painter_writes() {
+        use sha2::{Digest as _, Sha256};
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("fixtures")
+            .join("terminal")
+            .join("projection.json");
+        let text = std::fs::read_to_string(&path).expect("the projection fixtures");
+        let document: serde_json::Value = serde_json::from_str(&text).expect("the fixtures parse");
+        let mut screens: Vec<(String, Screen, Window)> = document["cases"]
+            .as_array()
+            .expect("cases")
+            .iter()
+            .map(|case| {
+                let (screen, window) = screen_of(case);
+                (
+                    case["id"].as_str().expect("an identifier").to_owned(),
+                    screen,
+                    window,
+                )
+            })
+            .collect();
+        screens.extend(
+            placement_screens()
+                .into_iter()
+                .map(|(name, screen, window)| (name.to_owned(), screen, window)),
+        );
+        let mut frames: Vec<String> = Vec::new();
+        for (name, screen, window) in &screens {
+            let visible = screen.visible_rows();
+            let painted = [
+                ("install", install(screen, *window, Keyboard::EVERYTHING)),
+                (
+                    "install-nothing",
+                    install(screen, *window, Keyboard::NOTHING),
+                ),
+                (
+                    "update",
+                    update(screen, *window, &visible, true, Keyboard::EVERYTHING),
+                ),
+                (
+                    "update-rows",
+                    update(screen, *window, &visible, false, Keyboard::NOTHING),
+                ),
+            ];
+            for (pass, frame) in painted {
+                let digest = Sha256::digest(&frame.bytes);
+                let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+                frames.push(format!("{name} {pass} {hex}"));
+            }
+        }
+        let expected: Vec<String> = FRAMES.iter().map(|line| (*line).to_owned()).collect();
+        assert_eq!(
+            frames,
+            expected,
+            "the painter's frames, one line each:\n{}",
+            frames.join("\n")
+        );
+
+        // The placement screen reaches every branch it is there for: two runs whose text
+        // disagrees with their cells, a cluster cut at each edge of the window and a mark with no
+        // base, and cells on both sides of the window.
+        let (_, edges, window) = placement_screens()
+            .into_iter()
+            .find(|(name, _, _)| *name == "edges")
+            .expect("the placement screen");
+        let comparison = install(&edges, window, Keyboard::EVERYTHING).comparison;
+        assert_eq!(comparison.runs_replaced, 2, "runs replaced");
+        assert_eq!(comparison.clusters_replaced, 3, "clusters replaced");
+        assert_eq!(comparison.cells_clipped, 8, "cells clipped");
+    }
+
+    /// The SHA-256 of each frame [`every_frame_is_the_bytes_the_painter_writes`] paints.
+    const FRAMES: &[&str] = &[
+        "emoji_then_ascii install f2de8a108314cc6c12a04f0cc04567683439001d5e7816dc5c77adb749eff907",
+        "emoji_then_ascii install-nothing e96e7f8739b6f0c36d9525b79829ecf67eb68694ccf52b16f8dc28d457ecf22e",
+        "emoji_then_ascii update 85bc95ef7a5031b34a8bc815a80f8c8595011e87efe4fb2207c83f8fb488b0a9",
+        "emoji_then_ascii update-rows 1668007387cc6d0a491d34e403107584bcd18563ed57b7653acd1b54603027c5",
+        "right_margin_splits_a_wide_cluster install 8520efa740775e48f6794a229270aeb96f51f8e332000a1531d346bf9026e9dc",
+        "right_margin_splits_a_wide_cluster install-nothing c9a6a41729faccd12e946a8a9e7bffd6987fe063d90a4ae658ea557f5520c579",
+        "right_margin_splits_a_wide_cluster update f02db9d13504e59dd95b417a09868940fe19d8886583f9bbedb821fd503ff3b1",
+        "right_margin_splits_a_wide_cluster update-rows fde3a3d620b81a3be02e2fd0e9d2cc8d922a5ccbc1d2089a156fea556a482599",
+        "left_margin_splits_a_wide_cluster install bc313677463edc464d6e0a6cde209a420fbac932b8df8372783a884c23421ad4",
+        "left_margin_splits_a_wide_cluster install-nothing 419fbe27dcc282e192a2c3bf42e889e42f7320aa7c24c03aec800213a0b354cf",
+        "left_margin_splits_a_wide_cluster update 8a171c0b9744c223c3010b9dbd2425f30465cd8dbf7dfc0c7becda368965e55c",
+        "left_margin_splits_a_wide_cluster update-rows b3151db334dd9cb266bd3a3b29710c602d1e1b8cc4228c28b7aee6885bce8f7a",
+        "the_last_column_and_a_delayed_wrap install 7728c8630db2c51848196ca738268a9584085ec77a16ac10586ea2d28dbb80f0",
+        "the_last_column_and_a_delayed_wrap install-nothing 01ecf8fd3f7fecaf562e6841df073a6af5b3bb0ad9907708bb90f2ae711d63a2",
+        "the_last_column_and_a_delayed_wrap update 74c99a9b23bf952a5675dd002f173050d59fcf4826d24c57cbe52972d83f19f4",
+        "the_last_column_and_a_delayed_wrap update-rows 43c6e0089c66d32aaca9dffed3d581a25e857bf2b2bf0a52bd42e60d0f30ed75",
+        "the_bottom_row_scrolls_without_scrolling_the_destination install 359be8653c538543eb1bb6eae3a873c0dd652bc67ca5f6175229a7496aae27bd",
+        "the_bottom_row_scrolls_without_scrolling_the_destination install-nothing cd9b24b2b9c975521535319babadff9c6651356d30137000bf7ccdd36b0d07e8",
+        "the_bottom_row_scrolls_without_scrolling_the_destination update b52c293176f84948d23556a9255668ea984fd911d36513585a602c46d1d3bae9",
+        "the_bottom_row_scrolls_without_scrolling_the_destination update-rows c1205bd420028864e84bfe9ca677a36ae089cf28287dba2c6ae7a01a164fb099",
+        "a_width_disagreement_is_rejected install 4cf587e0ecce961d23903030b979e0afcdf5ecfe663121539524bd715511337a",
+        "a_width_disagreement_is_rejected install-nothing 1a62caf8fd3ae213d9c55a57a81fb1782beb5714a6640bf7fbccd8e242c54ff2",
+        "a_width_disagreement_is_rejected update 93a8b76814cd5d2c99539c0ce6dc88dae62685b251c78941ae03b3710180f8b8",
+        "a_width_disagreement_is_rejected update-rows c090b85f4a149b16084598f6d947fd4e1139cdc95e8de981d4adbb1905798903",
+        "a_cursor_outside_the_window_is_hidden install f0856040bf06a080ff5c5e032999d576614e0bd94baea9e8b496b71f3967a7a9",
+        "a_cursor_outside_the_window_is_hidden install-nothing 265941860f308db411361b2efdde77282cf3c48b8bd8ae347fd6c686c5b12a8e",
+        "a_cursor_outside_the_window_is_hidden update da6945461a98cb8554c58d6033a463d312b07dc852283c1cd7e66e25508864a4",
+        "a_cursor_outside_the_window_is_hidden update-rows 8c30ade96697fdcdfbec252c2aa79ad9beb5ca6fde6804f6f4c5cc8c25a92d50",
+        "a_row_clears_what_was_on_the_line install e3e5f0293df1f4970145e868c15c25f0a1e489d7c87564a0998a8240a22d88a8",
+        "a_row_clears_what_was_on_the_line install-nothing b0f654b268d094e1701b7162d34603819cc45fa1d0f0986e770d9011e6dd0435",
+        "a_row_clears_what_was_on_the_line update 32259689f49de720049a0a2b0c2c9c356f5e1548136c426ac49172100bb905bb",
+        "a_row_clears_what_was_on_the_line update-rows cb6170cbd151c8b91d87e187b400fdf0d68e437a794b372cd57bef8011e74c10",
+        "edges install cdaddf95bd3752cf8be7129f9e2b2dcc3b01326fc659484d92ea8e3b7d770d11",
+        "edges install-nothing e58e8464d05d2fd50f5aeb6474b048d407dbf2fa1893fa9f4b5c7cda4c424a78",
+        "edges update 84479a9e5209613cdffb6b8bddab2ad6c76b701251add1aa0541fd978dc92fe2",
+        "edges update-rows efd00f8c0b73b0530237a475a3410549d4ca056d5aef7efef7c0a8dbef60f615",
+        "styled install 82c7d2c3402bd28754ead1e1ed02b0b057520e738c68db0dd366bbd9c2700477",
+        "styled install-nothing 79d38c752fc87516cd2bc346e046785a76d2e95ef24f80fb3b82e9864e3b3a75",
+        "styled update f132e2a6a7ccc65f9aaf81ce9ba7c602964ddf4ad52a19350201d428f350929a",
+        "styled update-rows b81cbe6fe14730d6751af60ce9f5ec81eb50d07171d7e2978ff9936405596140",
+    ];
+
     /// A screen with a scroll region of its own, and origin mode on.
     fn screen_with_a_region() -> (Screen, Window) {
         let case = serde_json::json!({
