@@ -621,10 +621,17 @@ impl Drop for EndsWhatItStarted<'_> {
         if let Ok(store) =
             kr_crypto::store::PlatformStore::open(kr_ipc::verify::CONTROLLER_SECRET_SERVICE)
         {
-            let scope = self.host.temp.environment_id().to_string();
-            for purpose in kr_protocol::pairing::KeyPurpose::ALL {
-                if let Ok(name) = kr_crypto::store::SecretName::device_key(&scope, purpose) {
-                    let _ = kr_crypto::store::SecretStore::delete(&store, &name);
+            // The daemon's own keys, and the keys it holds the network with, which it keeps
+            // under the environment's identity followed by `/network-device`.
+            let environment_id = self.host.temp.environment_id();
+            for scope in [
+                environment_id.to_string(),
+                format!("{environment_id}/network-device"),
+            ] {
+                for purpose in kr_protocol::pairing::KeyPurpose::ALL {
+                    if let Ok(name) = kr_crypto::store::SecretName::device_key(&scope, purpose) {
+                        let _ = kr_crypto::store::SecretStore::delete(&store, &name);
+                    }
                 }
             }
         }
@@ -811,6 +818,7 @@ fn three_first_invocations_at_once_leave_one_daemon_that_serves_every_caller() {
     let running: Vec<std::process::Child> = (0..3)
         .map(|_| host.new_session().spawn().expect("kr new starts"))
         .collect();
+    let log = host.environment().state_dir().join("controller.log");
     let mut sessions = Vec::new();
     for (index, child) in running.into_iter().enumerate() {
         let what = format!("kr new {index}");
@@ -818,8 +826,9 @@ fn three_first_invocations_at_once_leave_one_daemon_that_serves_every_caller() {
         let created = document(&output, &what);
         assert!(
             output.status.success(),
-            "{what} created its session: {created}; it said {}",
-            String::from_utf8_lossy(&output.stderr)
+            "{what} created its session: {created}; it said {}; the daemons wrote: {}",
+            String::from_utf8_lossy(&output.stderr),
+            std::fs::read_to_string(&log).unwrap_or_default()
         );
         assert_eq!(created["state"], "live", "{what}: {created}");
         sessions.push(
