@@ -126,10 +126,28 @@ pub fn personal_owner_grant() -> ProposedGrant {
 
 /// Checks a proposal against the rules for its kind.
 ///
+/// A proposal of either kind names no current approval or question. Section 10 lets an invitation
+/// name exact current decisions only when they are previewed to its issuer, and a pairing
+/// invitation shows its issuer the rights it proposes and no preview of any named resource. So a
+/// named resource never enters a grant through pairing; sharing a session, which previews each
+/// one, is how a grant comes to name one.
+///
 /// # Errors
 ///
 /// Returns [`PairingError::GrantNotPermitted`] naming the rule it broke.
 pub fn validate_proposal(proposal: &ProposedGrant, kind: GrantKind, now_ms: u64) -> Result<()> {
+    if !proposal.history.named_approvals.is_empty() {
+        return Err(PairingError::GrantNotPermitted {
+            reason: "a pairing invitation names no current approval, because its issuer is shown \
+                     no preview of one",
+        });
+    }
+    if !proposal.history.named_questions.is_empty() {
+        return Err(PairingError::GrantNotPermitted {
+            reason: "a pairing invitation names no current question, because its issuer is shown \
+                     no preview of one",
+        });
+    }
     match (kind, proposal.expiry) {
         (GrantKind::PersonalOwner, GrantExpiry::Never) => Ok(()),
         (GrantKind::PersonalOwner, GrantExpiry::At { .. }) => {
