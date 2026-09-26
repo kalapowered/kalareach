@@ -34,6 +34,7 @@ pub mod remote;
 pub mod setup;
 pub mod state;
 pub mod target;
+pub mod terminal;
 pub mod transfers;
 pub mod verify;
 
@@ -58,7 +59,7 @@ pub use state::AppState;
 pub fn run() {
     use tauri::Manager as _;
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         // The page holds no permission for the pasteboard: native code reads an invitation there
         // itself, so its text never reaches the page.
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -66,7 +67,9 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(companion_platform::init())
         .manage(AppState::new())
-        .invoke_handler(commands::handlers())
+        .invoke_handler(commands::handlers());
+    // The raw terminal views, and the rule that ends a page's views when it loads again.
+    terminal::install(builder, terminal::TerminalViews::local())
         .setup(|app| {
             open_main_window(app.handle())?;
             app.manage(account::AccountSlot::new(account_builder(

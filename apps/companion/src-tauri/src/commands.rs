@@ -54,6 +54,11 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("attachment_configure", Some(Method::AttachmentConfigure)),
     ("attachment_viewport", Some(Method::AttachmentViewport)),
     ("terminal_resize", Some(Method::TerminalResize)),
+    // The raw terminal view. Its attachment is made on the session's own worker, from native
+    // code: the page names a session and a size, never a method.
+    ("terminal_view_open", None),
+    ("terminal_view_resize", None),
+    ("terminal_view_close", None),
     // Input.
     ("input_acquire", Some(Method::InputAcquire)),
     ("input_release", Some(Method::InputRelease)),
@@ -151,6 +156,19 @@ pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
             Method::OwnerConfirmationComplete,
         ],
     ),
+    // A view attaches, subscribes, reports its size and detaches on the session's worker. The
+    // page supplies a session and a grid; what reaches the worker is built here.
+    (
+        "terminal_view_open",
+        &[
+            Method::SessionAttach,
+            Method::EventsSubscribe,
+            Method::AttachmentViewport,
+            Method::SessionDetach,
+        ],
+    ),
+    ("terminal_view_resize", &[Method::AttachmentViewport]),
+    ("terminal_view_close", &[Method::SessionDetach]),
 ];
 
 /// The command handlers, in the form Tauri registers.
@@ -172,6 +190,9 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         attachment_configure,
         attachment_viewport,
         terminal_resize,
+        terminal_view_open,
+        terminal_view_resize,
+        terminal_view_close,
         input_acquire,
         input_release,
         input_interrupt,
@@ -1188,6 +1209,62 @@ pub fn connection_state(state: State<'_, AppState>) -> crate::connection::Connec
     state.connection_state()
 }
 
+/// Opens a raw terminal view of one session, `columns` by `rows` cells, and returns its handle.
+///
+/// The view's link, its attachment and its screen are held in native code. The page is sent each
+/// state on `on_state`, the channel it passed, and on nothing else, and the handle comes back
+/// before anything is asked of the host.
+#[tauri::command]
+pub async fn terminal_view_open<R: tauri::Runtime>(
+    webview: tauri::Webview<R>,
+    views: State<'_, crate::terminal::TerminalViews>,
+    session_id: String,
+    columns: u64,
+    rows: u64,
+    on_state: tauri::ipc::Channel<crate::terminal::TerminalViewState>,
+) -> Result<String> {
+    let session_id: kr_protocol::ids::SessionId = session_id
+        .parse()
+        .map_err(|_| CommandError::invalid("that is not a session identifier"))?;
+    let dimensions = view_size(columns, rows)?;
+    let publish: crate::terminal::Publish = std::sync::Arc::new(move |state| {
+        // A page that has gone takes nothing; its load ends the view.
+        let _ = on_state.send(state);
+    });
+    Ok(views.open(webview.label(), session_id, dimensions, publish))
+}
+
+/// Tells an open view that the page's grid is now `columns` by `rows` cells.
+#[tauri::command]
+pub fn terminal_view_resize(
+    views: State<'_, crate::terminal::TerminalViews>,
+    view: String,
+    columns: u64,
+    rows: u64,
+) -> Result<()> {
+    views.resize(&view, view_size(columns, rows)?);
+    Ok(())
+}
+
+/// Closes a view: it detaches, closes its link and publishes nothing more.
+#[tauri::command]
+pub async fn terminal_view_close(
+    views: State<'_, crate::terminal::TerminalViews>,
+    view: String,
+) -> Result<()> {
+    views.close(&view).await;
+    Ok(())
+}
+
+/// A view's grid, held to the protocol's bounds on a terminal's size.
+fn view_size(columns: u64, rows: u64) -> Result<kr_protocol::session::Dimensions> {
+    let dimensions = kr_protocol::session::Dimensions::new(columns, rows);
+    dimensions.validate().map_err(|error| {
+        CommandError::invalid(format!("that is not a terminal's size: {error}"))
+    })?;
+    Ok(dimensions)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1407,6 +1484,12 @@ mod tests {
                 "account_sign_out",
                 "account_status",
                 "account_usage",
+                // The raw terminal view's three. The view attaches on the session's own worker,
+                // which the control daemon does not proxy for this computer, so the page names a
+                // session and a size and native code makes every call.
+                "terminal_view_close",
+                "terminal_view_open",
+                "terminal_view_resize",
             ])
         );
     }
