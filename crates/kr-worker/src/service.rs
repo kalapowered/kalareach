@@ -5215,11 +5215,11 @@ impl WorkerService {
                 // would let bytes already handed to the writer reach the application after the
                 // attachment that sent them had gone.
                 self.runtime.flush_locked(session);
-                // Whatever the result, the attachment is no longer the session's: an error is either
-                // an attachment the session did not have, or a succession the kernel refused, which
-                // puts the size back and never the attachment. So this connection and the fence
-                // stop holding it before the result is looked at, or a failed succession would
-                // leave both naming an attachment the session no longer has.
+                // Whatever the result, the attachment is no longer the session's: the session either
+                // never had it or removed it before the geometry succession that can fail, and
+                // nothing puts a removed attachment back. So this connection and the fence stop
+                // holding it before the result is looked at, or a failed succession would leave
+                // both naming an attachment the session no longer has.
                 state.remove_attachment(attachment_id);
                 self.forget_granted_attachment(attachment_id);
                 let result = outcome?;
