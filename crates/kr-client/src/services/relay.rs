@@ -21,16 +21,19 @@
 //!
 //! A lease request that reached the service may have reserved bytes, issued a lease and installed
 //! it on a relay, whatever came back. When this client cannot tell, it reports `OUTCOME_UNKNOWN`:
-//! for a success status whose body it cannot read, and for a 502 or 504 with no envelope of the
-//! service's, which is a gateway in front of it saying the service's answer never reached it.
-//! Nothing asks again by itself. A caller finds out before it asks for anything else, by sending
-//! the same request again: the same signer, payer, pair, direction and cumulative ceiling. A pair
-//! that already holds a lease on a live reservation is answered with that lease, holding no more
-//! bytes than the ceiling names, although its deadline can move later. When the first request
-//! issued nothing, or the reservation it issued from has since ended, the answer is a new lease;
-//! and either answer can be a refusal. The caller then uses the lease it is given or ends it with a
-//! revocation. A revocation whose answer went missing is simply asked again, because a repeated
-//! revocation finishes whatever the first did not and answers with the settlement as it stands.
+//! for a success status whose body it cannot read, for a 502 or 504 with no envelope of the
+//! service's, which is a gateway in front of it saying the service's answer never reached it, and
+//! for the service's own `INTERNAL`, which it can answer after it acted on the request. Nothing asks
+//! again by itself. A caller finds out before it asks for anything else, by sending the same
+//! request again: the same signer, payer, pair, direction and cumulative ceiling. A pair that
+//! already holds a lease on a live reservation is answered with that lease, holding no more bytes
+//! than the ceiling names, although its deadline can move later. When the first request issued
+//! nothing, or the reservation it issued from has since ended, the answer is a new lease; and
+//! either answer can be a refusal. The caller then uses the lease it is given or ends it with a
+//! revocation. A revocation whose answer went missing, or that the service failed while it
+//! handled, is simply asked again, because a repeated revocation finishes whatever the first did
+//! not and answers with the settlement as it stands. A revocation the relay confirmed whose charge
+//! the service could not settle yet answers with no settlement, and asking again learns the charge.
 //!
 //! # One body, two representations
 //!
@@ -602,8 +605,9 @@ pub struct RelayLeaseEnding {
     pub revision: U64,
     /// What the relay answered, or null when it could not be reached.
     pub relay: Nullable<RelayLeaseAck>,
-    /// What the reservation was charged, and on what evidence.
-    pub settlement: RelaySettlement,
+    /// What the reservation was charged, and on what evidence, or null when the relay confirmed the
+    /// revocation and the charge is not known yet. Revoking again answers with it once it is.
+    pub settlement: Nullable<RelaySettlement>,
     /// What is left of the shared grace, or null when the principal is not in grace.
     pub grace: Nullable<RelayGraceRemainder>,
 }
@@ -692,7 +696,7 @@ impl ManagedRelayLeaseService {
         let url = format!("{}{path}", self.origin.as_str());
         let answer = self.http.post_json(&url, &request, &[]).await?;
 
-        data_of(&answer)
+        data_of(&answer, method)
     }
 }
 
@@ -762,11 +766,17 @@ impl RelayLeaseService for ManagedRelayLeaseService {
 /// are the ones every route of this service uses; the mapping is to the protocol's own, so a caller
 /// reacts to one vocabulary.
 ///
+/// One refusal says nothing about whether the request ran: `INTERNAL` is the service failing while
+/// it handled the request of `method`, which it can do after it acted on it. For a request that is
+/// not safe to send again ([`repeat_is_safe`]) that is an unknown outcome, as an answer a gateway
+/// lost is, and nothing sends it again by itself. For a revocation it is the transient failure
+/// [`classify`] names.
+///
 /// A body that is not this service's envelope is not a refusal at all, and it is not this caller's
 /// mistake either: it is a proxy's error page, a truncated answer, or something that is not this
 /// service. [`unreadable`] is what those become, classified by the status that carried them, and a
 /// text that names one member twice anywhere is one of them ([`super::json::read`]).
-fn data_of(answer: &ServiceHttpAnswer) -> Result<serde_json::Value> {
+fn data_of(answer: &ServiceHttpAnswer, method: &str) -> Result<serde_json::Value> {
     #[derive(Deserialize)]
     struct Envelope {
         ok: bool,
@@ -802,11 +812,22 @@ fn data_of(answer: &ServiceHttpAnswer) -> Result<serde_json::Value> {
         return Err(unreadable(answer.status, "its refusal names no error"));
     };
 
-    let (code, action) = classify(&refusal.code, answer.status);
-    let error = crate::error::refusal(
-        code,
-        Shown::service(&ServiceMessage::from_refusal(refusal.message)),
-    );
+    let message = Shown::service(&ServiceMessage::from_refusal(refusal.message));
+    let (code, action, message) = if refusal.code == "INTERNAL" && !repeat_is_safe(method) {
+        (
+            ErrorCode::OutcomeUnknown,
+            UserAction::CheckTheOutcome,
+            crate::shown!(
+                "the service failed while it handled this request, so whether it carried the \
+                 request out is unknown: {}",
+                message
+            ),
+        )
+    } else {
+        let (code, action) = classify(&refusal.code, answer.status);
+        (code, action, message)
+    };
+    let error = crate::error::refusal(code, message);
 
     // Always the service's own variant, with or without a delay. What a person is told about a
     // refusal turns on who refused and why, and the service's own code says more than the protocol
@@ -849,6 +870,17 @@ fn classify(code: &str, status: u16) -> (ErrorCode, UserAction) {
         _ if status >= 500 => (ErrorCode::UpstreamUnavailable, UserAction::Wait),
         _ => (ErrorCode::InvalidArgument, UserAction::Update),
     }
+}
+
+/// Whether a request of `method` may be sent again as it was after the service failed while it
+/// handled it.
+///
+/// A revocation may: a repeated revocation finishes whatever the first did not and answers with the
+/// settlement as it stands. A lease request may not: the service may have reserved bytes and
+/// installed a lease before it failed, so what became of it is unknown, and a caller sends it again
+/// only to find that out, never as a retry the caller did not decide on.
+fn repeat_is_safe(method: &str) -> bool {
+    method == RELAY_LEASE_REVOKE_METHOD
 }
 
 /// An answer this client could not read, classified by the status that carried it.
@@ -982,10 +1014,13 @@ mod tests {
             }
         });
 
-        let data = data_of(&ServiceHttpAnswer {
-            status: 200,
-            body: serde_json::to_vec(&answer).expect("an envelope"),
-        })
+        let data = data_of(
+            &ServiceHttpAnswer {
+                status: 200,
+                body: serde_json::to_vec(&answer).expect("an envelope"),
+            },
+            RELAY_LEASE_ISSUE_METHOD,
+        )
         .expect("the service's envelope");
         let answer: TaggedAnswer = serde_json::from_value(data).expect("an issued lease");
         match RelayLeaseAnswer::from(answer) {
@@ -1082,10 +1117,13 @@ mod tests {
     fn an_answer_this_client_cannot_read_is_reported_without_quoting_it() {
         // The body that could not be read is the one carrying the marker, so an error that quoted
         // any of what came back would carry it.
-        let error = data_of(&ServiceHttpAnswer {
-            status: 200,
-            body: NEVER_RENDERED.as_bytes().to_vec(),
-        })
+        let error = data_of(
+            &ServiceHttpAnswer {
+                status: 200,
+                body: NEVER_RENDERED.as_bytes().to_vec(),
+            },
+            RELAY_LEASE_ISSUE_METHOD,
+        )
         .expect_err("that is not this service's envelope");
         for rendering in [
             error.to_string(),
@@ -1101,13 +1139,16 @@ mod tests {
     fn a_refusal_carries_the_services_own_message_and_nothing_else_of_the_answer() {
         // The one thing of an answer that does reach a caller, because it is written to be shown
         // to a person. Everything else of the same answer does not.
-        let error = data_of(&ServiceHttpAnswer {
-            status: 402,
-            body: format!(
-                r#"{{"ok":false,"error":{{"code":"QUOTA_EXHAUSTED","message":"Your relay allowance is spent.","detail":"{NEVER_RENDERED}"}}}}"#
-            )
-            .into_bytes(),
-        })
+        let error = data_of(
+            &ServiceHttpAnswer {
+                status: 402,
+                body: format!(
+                    r#"{{"ok":false,"error":{{"code":"QUOTA_EXHAUSTED","message":"Your relay allowance is spent.","detail":"{NEVER_RENDERED}"}}}}"#
+                )
+                .into_bytes(),
+            },
+            RELAY_LEASE_ISSUE_METHOD,
+        )
         .expect_err("a refusal");
 
         assert!(error.to_string().contains("Your relay allowance is spent."));

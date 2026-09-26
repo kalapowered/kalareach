@@ -867,13 +867,17 @@ operations without a second effect: a delivery by its envelope identifier, a set
 by its identity, a manifest by its generation, an upload part by its number. So are a revocation,
 the identity and usage reads, the voice terms and closing a voice call.
 
-A caller of `services::relay` finds out what became of a lease request whose answer went missing, a
-success it cannot read included, before it asks for anything else, by sending the same request
-again, with the same signer, payer, pair, direction and cumulative ceiling: a pair that already
-holds a lease on a live reservation is answered with that lease and no more bytes held, a first
-request that issued nothing is answered with a new lease, and either can be refused. The caller then
-uses the lease it is given or ends it. A revocation whose answer went missing is asked again as it
-was.
+A caller of `services::relay` finds out what became of a lease request whose outcome is unknown
+before it asks for anything else. Three answers leave it unknown: one that went missing, a success
+the client cannot read, and the service's own `INTERNAL`, which the service can answer after it
+reserved bytes and installed a lease. The caller sends the same request again, with the same signer,
+payer, pair, direction and cumulative ceiling: a pair that already holds a lease on a live
+reservation is answered with that lease and no more bytes held, a first request that issued nothing
+is answered with a new lease, and either can be refused. The caller then uses the lease it is given
+or ends it. A revocation whose answer went missing, or that the service failed while it handled, is
+asked again as it was, because a repeated revocation finishes whatever the first did not. Its answer
+names the settlement as it stands, or none when the relay confirmed the revocation and the charge is
+not known yet; asking again learns the charge.
 
 A mailbox is addressed by the identifier of the recipient's stored-envelope public key, and every
 paired peer of that recipient knows that key, because it is what they seal to. So possession of the
