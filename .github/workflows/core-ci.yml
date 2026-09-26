@@ -573,6 +573,13 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-controller --lib registry
 
+      # One daemon holds an environment at a time. Here the lock is an open of its file with no
+      # sharing, so a second daemon's open meets a sharing violation, which is the environment held;
+      # a refused access is a failure that names the lock file.
+      - name: Hold the environment's singleton lock
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-controller --lib singleton
+
       # A Windows worker must be independent of the daemon's kill-on-close job, so the start asks to
       # break away from that job only when the daemon's own job would kill it on close. This checks
       # that decision for the four job contexts the product can be started in.
