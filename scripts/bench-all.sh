@@ -19,19 +19,27 @@
 # run names it as not run here, with that reason.
 #
 # Every measurement writes its figures under KR_TEST_ARTIFACTS_DIR as Markdown sections headed by
-# the identifier they measure (`## KR-PERF-007 ...`). For each identifier this script adds a section
-# of its own to bench-all.md there: the host, the conditions at the edges of each step that
-# measured it, the outcome, and whether its figures are reference figures. A directory that
-# already holds records is appended to, and only what this run added is read. When
+# the identifier they measure (`## KR-PERF-007 ...`), each with a verdict. For each identifier this
+# script adds a section of its own to bench-all.md there: the host, the conditions at the edges of
+# each step that measured it, the outcome, and whether its figures are reference figures. A
+# directory that already holds records is appended to, and only what this run added is read; a
+# directory another run is writing to at the same time mixes the two runs' records. When
 # KR_TEST_ARTIFACTS_DIR is not set, the run makes a directory of its own and says where it is.
 #
-# The conditions read at each step's edges are the load average, the share of the step the
-# hypervisor took from this machine (where the platform accounts for it), and, before the step, how
-# much of the machine other work was using over ten seconds. A figure is a reference figure only
-# when the host has the reference host's processors and memory, no step lost more than one part in
-# a hundred of its time to a hypervisor, and less than one processor's worth of other work was
-# running as each step began. The load average is recorded rather than judged: its one-minute
-# average still carries the step before, whereas the ten-second reading says what is running now.
+# A step's outcome is its exit status and the verdicts its records give: a measurement can record a
+# missed target without failing, where it does not assert the target on a host short of the
+# reference host, and that still counts as a missed target here.
+#
+# The conditions read at each step's edges are the load average, how much of the machine other work
+# was using over the ten seconds before the step began and the ten seconds after it ended, and the
+# share of the step the hypervisor took from this machine (where the platform accounts for it). A
+# figure is a reference figure only when the host has the reference host's processors and memory,
+# less than one processor's worth of other work was running at either edge of every step, no step
+# lost more than one part in a hundred of its time to a hypervisor, and no measurement's own record
+# names a shortfall. What runs between a step's edges is not read, because the measurement's own
+# work cannot be told apart from anything else's there; the host's whole use over the step is kept
+# beside the figure instead. The load average is recorded rather than judged: its one-minute average
+# still carries the step before, whereas the ten-second readings say what is running now.
 #
 # Usage:
 #   scripts/bench-all.sh [--reference-host] [--only <step>[,<step>...]]
@@ -42,8 +50,8 @@
 #   --only            runs only the named steps.
 #
 # Exit status: 0 when every measurement that ran met its target and recorded its figures; 1 when a
-# target was missed, a measurement failed or recorded no figure, or, with --reference-host, the host
-# did not meet a condition; 2 for a usage error.
+# target was missed, a measurement failed or recorded no figure, the run could not keep its
+# evidence, or, with --reference-host, the host did not meet a condition; 2 for a usage error.
 set -uo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -91,15 +99,19 @@ quiet_processors=1.0
 # What the host is.
 os_name="$(uname -s)"
 arch="$(uname -m)"
+# `processors` is what the measurements can run on, which is what the reference host is held to;
+# `host_processors` is what the host's own counters cover, which is what other work is read over.
 case "$os_name" in
   Darwin)
     processors="$(sysctl -n hw.logicalcpu)"
+    host_processors="$processors"
     memory_mib="$(($(sysctl -n hw.memsize) / 1048576))"
     processor_name="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo 'not reported here')"
     os_release="macOS $(sw_vers -productVersion 2>/dev/null || uname -r)"
     ;;
   *)
     processors="$(nproc)"
+    host_processors="$(grep -c '^cpu[0-9]' /proc/stat 2>/dev/null || echo "$processors")"
     memory_mib="$(awk '/^MemTotal:/ { printf "%d\n", $2 / 1024 }' /proc/meminfo)"
     processor_name="$(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo 2>/dev/null | head -1)"
     processor_name="${processor_name:-not reported here}"
@@ -127,21 +139,26 @@ cpu_ticks() {
   }' /proc/stat
 }
 
+# How many processors' worth of work the host ran between two cpu_ticks readings.
+host_use() {
+  awk -v a="$1" -v b="$2" -v n="$host_processors" 'BEGIN {
+    split(a, x, " "); split(b, y, " "); t = y[2] - x[2]
+    if (t <= 0) { print "unread"; exit }
+    printf "%.2f\n", (y[1] - x[1]) / t * n
+  }'
+}
+
 # How many processors' worth of work the host ran over the next ten seconds.
 other_work() {
   local before after
   if before="$(cpu_ticks)"; then
     sleep 10
     after="$(cpu_ticks)" || { echo unread; return; }
-    awk -v a="$before" -v b="$after" -v n="$processors" 'BEGIN {
-      split(a, x, " "); split(b, y, " "); t = y[2] - x[2]
-      if (t <= 0) { print "unread"; exit }
-      printf "%.2f\n", (y[1] - x[1]) / t * n
-    }'
+    host_use "$before" "$after"
   elif command -v iostat > /dev/null 2>&1; then
     # The second report covers the interval, and its third column is the idle share.
     iostat -n 0 -c 2 -w 10 2>/dev/null | tail -1 |
-      awk -v n="$processors" '$3 ~ /^[0-9.]+$/ { printf "%.2f\n", (100 - $3) / 100 * n; found = 1 }
+      awk -v n="$host_processors" '$3 ~ /^[0-9.]+$/ { printf "%.2f\n", (100 - $3) / 100 * n; found = 1 }
         END { if (!found) print "unread" }'
   else
     echo unread
@@ -283,44 +300,99 @@ settle() {
   echo "$reading"
 }
 
-# Runs one step and records its conditions, its exit status and whether each identifier it measures
-# recorded a figure. `$2` names each such identifier with the record file its figures land in.
+# Evidence this run could not keep, which fails the run.
+lost() {
+  echo "bench-all: this run could not keep its evidence at $1" >&2
+  printf '%s\n' "$1" >> "$work/lost"
+}
+
+# A reference-host condition a measurement's own record says it did not meet.
+add_shortfall() {
+  printf '%s\n' "$2" >> "$work/$1.shortfalls"
+}
+
+# What the sections of identifier `$3` that file `$1` gained beyond byte `$2` say against the target
+# and the reference host: one "missed <heading>: <verdict>" line for each verdict that says the
+# target was not met, and one "short <heading>: <condition>" line for each condition the
+# measurement found missing. The whole of the gained text is read.
+verdicts() {
+  tail -c +"$(($2 + 1))" "$1" | awk -v id="$3" '
+    /^## / { heading = substr($0, 4); inside = (heading == id || index(heading, id " ") == 1); next }
+    !inside { next }
+    { line = $0; sub(/^ +/, "", line) }
+    line ~ /^verdict / {
+      verdict = line; sub(/^verdict +/, "", verdict)
+      if (verdict ~ /not met|below the target|outside the target|not valid/) print "missed " heading ": " verdict
+    }
+    line ~ /^condition missing / { sub(/^condition missing +/, "", line); print "short " heading ": " line }
+    line ~ /^reference host +short: / { sub(/^reference host +short: +/, "", line); print "short " heading ": " line }'
+}
+
+# Runs one step and records its conditions, its exit status, whether each identifier it measures
+# recorded a figure, and what those figures' own verdicts say. `$2` names each such identifier with
+# the record file its figures land in.
 run_step() {
-  local step="$1" expected="$2" status load_in load_out other ticks_in ticks_out pair identifier
-  local file
+  local step="$1" expected="$2" status logged load_in load_out other_in other_out ticks_in
+  local ticks_out pair identifier file name gained kind finding
   shift 2
   echo
   echo "== $(date '+%T') step $step: $*"
-  other="$(settle)"
+  other_in="$(settle)"
   load_in="$(load_average)"
   ticks_in="$(cpu_ticks || true)"
-  echo "  other work entering: $other processors; load average entering: $load_in"
+  echo "  other work entering: $other_in processors; load average entering: $load_in"
   "$@" 2>&1 | tee "$evidence/$step.log"
-  status=${PIPESTATUS[0]}
+  # Both statuses in one statement: the next command replaces them.
+  status=${PIPESTATUS[0]} logged=${PIPESTATUS[1]}
   load_out="$(load_average)"
   ticks_out="$(cpu_ticks || true)"
+  other_out="$(other_work)"
   echo "$step" >> "$work/ran"
   put "$step" status "$status"
   put "$step" load_in "${load_in:-unread}"
   put "$step" load_out "${load_out:-unread}"
-  put "$step" other "$other"
+  put "$step" other_in "$other_in"
+  put "$step" other_out "$other_out"
   if [ -n "$ticks_in" ] && [ -n "$ticks_out" ]; then
     put "$step" stolen "$(stolen_share "$ticks_in" "$ticks_out")"
+    put "$step" used "$(host_use "$ticks_in" "$ticks_out") processors' worth, the measurement's own work included"
   else
     put "$step" stolen "not accounted on this platform"
+    put "$step" used "not read on this platform"
   fi
-  echo "  exit $status; load average leaving: $load_out; stolen share: $(get "$step" stolen)"
+  if [ "$logged" -ne 0 ]; then
+    lost "$evidence/$step.log"
+  fi
+  echo "  exit $status; other work leaving: $other_out processors; load average leaving:" \
+    "$load_out; stolen share: $(get "$step" stolen)"
   for pair in $expected; do
     identifier="${pair%%:*}"
-    file="$evidence/${pair#*:}"
-    if ! { [ -f "$file" ] && tail -c +"$(($(started_at "${pair#*:}") + 1))" "$file" |
-      grep -qE "^## $identifier( |\$)"; }; then
-      add_problem "$step" "$identifier" "$identifier recorded no figure in ${pair#*:}"
+    name="${pair#*:}"
+    file="$evidence/$name"
+    # Counted rather than stopped at the first match, so the whole of the gained text is read.
+    gained=0
+    if [ -f "$file" ]; then
+      gained="$(tail -c +"$(($(started_at "$name") + 1))" "$file" |
+        grep -cE "^## $identifier( |\$)" || true)"
     fi
+    if [ "${gained:-0}" -eq 0 ]; then
+      add_problem "$step" "$identifier" "$identifier recorded no figure in $name"
+      continue
+    fi
+    verdicts "$file" "$(started_at "$name")" "$identifier" > "$work/findings"
+    while read -r kind finding; do
+      case "$kind" in
+        missed) add_problem "$step" "$identifier" "$identifier's record says the target was missed: $finding" ;;
+        short) add_shortfall "$step" "$finding" ;;
+      esac
+    done < "$work/findings"
   done
 }
 
-# Appends one section to this run's own record.
+# Appends one section to this run's own record, or says the run could not keep it.
+#
+# A redirection that fails is caught with `||`: bash does not apply `!` to a compound command whose
+# redirection failed.
 section() {
   local heading="$1" line
   shift
@@ -330,7 +402,7 @@ section() {
       printf '  %s\n' "$line"
     done
     printf '\n'
-  } >> "$record"
+  } >> "$record" || lost "$record"
 }
 
 outcome_of() {
@@ -350,7 +422,8 @@ descriptions_refusal() {
     echo "$processors processors, below the four the description budget runs on"
     return
   fi
-  if [ "$os_name" = Darwin ] && ! pmset -g ps 2>/dev/null | grep -q "'AC Power'"; then
+  if [ "$os_name" = Darwin ] &&
+    [ "$(pmset -g ps 2>/dev/null | grep -c "'AC Power'" || true)" = 0 ]; then
     echo "the host is not on mains power, and descriptions pause on battery"
     return
   fi
@@ -412,7 +485,12 @@ if selected companion; then
       printf '## %s\n\n' "KR-PERF-008 the companion's semantic display"
       printf '%s\n' "$figures" | sed 's/^/  /'
       printf '  outcome           %s\n\n' "$(outcome_of companion)"
-    } >> "$record"
+    } >> "$record" || lost "$record"
+    # Each figure line ends with its own verdict, "(met)" or "(missed)".
+    printf '%s\n' "$figures" | grep -v '(met)$' > "$work/findings" || true
+    while read -r finding; do
+      add_problem companion KR-PERF-008 "KR-PERF-008's record says the target was missed: $finding"
+    done < "$work/findings"
   else
     add_problem companion KR-PERF-008 "KR-PERF-008 recorded no figure"
   fi
@@ -438,7 +516,12 @@ if selected descriptions; then
         printf '## KR-PERF-009 local session descriptions\n\n'
         printf '%s\n' "$figures" | sed 's/^/  /'
         printf '  outcome           %s\n\n' "$(outcome_of descriptions)"
-      } >> "$record"
+      } >> "$record" || lost "$record"
+      # The benchmark names each qualification target it did not meet on a line of its own.
+      printf '%s\n' "$figures" | grep 'qualification_target_not_met' > "$work/findings" || true
+      while read -r finding; do
+        add_problem descriptions KR-PERF-009 "KR-PERF-009's record says the target was missed: $finding"
+      done < "$work/findings"
     else
       add_problem descriptions KR-PERF-009 "KR-PERF-009 recorded no figure"
     fi
@@ -461,16 +544,24 @@ identifiers_of() {
   esac
 }
 
-# Every condition of the reference host a step did not meet.
+# Every condition of the reference host a step did not meet, the ones its own records name among
+# them.
 step_shortfalls() {
-  local other stolen shortfalls="$host_shortfalls"
-  other="$(get "$1" other)"
-  stolen="$(get "$1" stolen)"
-  if [ "$other" = unread ]; then
-    shortfalls="${shortfalls:+$shortfalls; }how busy the host was could not be read"
-  elif ! below "$other" "$quiet_processors"; then
-    shortfalls="${shortfalls:+$shortfalls; }$other processors' worth of other work as the step began, not under $quiet_processors"
+  local other edge stolen finding shortfalls="$host_shortfalls"
+  for edge in in out; do
+    other="$(get "$1" "other_$edge")"
+    if [ "$other" = unread ]; then
+      shortfalls="${shortfalls:+$shortfalls; }how busy the host was could not be read"
+    elif ! below "$other" "$quiet_processors"; then
+      shortfalls="${shortfalls:+$shortfalls; }$other processors' worth of other work as the step $([ "$edge" = in ] && echo began || echo ended), not under $quiet_processors"
+    fi
+  done
+  if [ -f "$work/$1.shortfalls" ]; then
+    while read -r finding; do
+      shortfalls="${shortfalls:+$shortfalls; }the record $finding"
+    done < "$work/$1.shortfalls"
   fi
+  stolen="$(get "$1" stolen)"
   case "$stolen" in
     unread) shortfalls="${shortfalls:+$shortfalls; }the hypervisor's share could not be read" ;;
     not*) ;;
@@ -520,7 +611,7 @@ for identifier in $measured; do
       unread | not*) ;;
       *) stolen="$(percent "$stolen")" ;;
     esac
-    lines+=("step $step  exit $(get "$step" status); load average (1, 5 and 15 minutes) $(get "$step" load_in) entering, $(get "$step" load_out) leaving; other work $(get "$step" other) processors entering; stolen share $stolen")
+    lines+=("step $step  exit $(get "$step" status); load average (1, 5 and 15 minutes) $(get "$step" load_in) entering, $(get "$step" load_out) leaving; other work $(get "$step" other_in) processors entering, $(get "$step" other_out) leaving; the host's use over the step $(get "$step" used); stolen share $stolen")
     problems="$(problems_of "$step" "$identifier")"
     if [ "$(get "$step" status)" != 0 ] || [ -n "$problems" ]; then
       outcome="not met: $step exit $(get "$step" status)${problems:+; $problems}"
@@ -560,6 +651,11 @@ done
 echo
 if [ "$reference" -eq 1 ] && [ "$short" -ne 0 ]; then
   failed=1
+fi
+if [ -s "$work/lost" ]; then
+  failed=1
+  reasons="$reasons
+  this run could not keep its evidence at: $(sort -u "$work/lost" | paste -sd ' ' -)"
 fi
 if [ "$failed" -ne 0 ]; then
   echo "bench-all: not every figure stands:$reasons"
