@@ -865,6 +865,9 @@ impl Debugs {
                     keyword @ ("struct" | "enum" | "union" | "trait" | "type" | "fn" | "const"
                     | "static" | "mod"),
                 ) => format!("{keyword} Debug"),
+                Some("mut") if ident(tokens.get(at.wrapping_sub(2))) == Some("static") => {
+                    "static mut Debug".to_owned()
+                }
                 _ if punct(tokens.get(at - 1), '!')
                     && ident(tokens.get(at.wrapping_sub(2))) == Some("macro_rules") =>
                 {
@@ -4955,6 +4958,13 @@ fn each_name_is_placed_where_the_compiler_places_it() {
             "a function of the crate's own named Debug",
             "",
             "#[allow(non_snake_case)]\npub fn Debug() {}\n",
+            2,
+            "only the standard library's Debug may carry the name Debug",
+        ),
+        (
+            "a mutable static of the crate's own named Debug",
+            "",
+            "#[allow(non_upper_case_globals)]\npub static mut Debug: u64 = 0;\n",
             2,
             "only the standard library's Debug may carry the name Debug",
         ),
