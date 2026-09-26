@@ -594,10 +594,23 @@ impl CatalogueModule {
                 Err(failure.into_answer())
             }
         };
-        // The package's native bridge follows what the change left its installation wanting,
-        // under the same lock and after the change's commit. What it does is its own journal's and
-        // never changes the answer the change recorded.
-        if let Some(plugin_id) = plugin_named(method, &mutation.params) {
+        // Each native bridge the change can move follows what its installation now wants, under
+        // the same lock and after the change's commit: the package a plugin mutation names, and
+        // every installed package after a change to a repository's generation, which can add or
+        // withdraw the signed build records a recipe's version is read from. What a bridge does is
+        // its own journal's and never changes the answer the change recorded.
+        let subjects = match plugin_named(method, &mutation.params) {
+            Some(plugin_id) => vec![plugin_id],
+            None if matches!(
+                method,
+                Method::CatalogueSync | Method::CataloguePin | Method::CatalogueRemove
+            ) =>
+            {
+                bridge_subjects(&catalogue, &self.bridges, self.environment_id)
+            }
+            None => Vec::new(),
+        };
+        for plugin_id in subjects {
             let bridges = Arc::clone(&self.bridges);
             let wanted = wanted_bridge(&catalogue, self.environment_id, &plugin_id);
             let followed = tokio::task::spawn_blocking(move || {
@@ -1089,17 +1102,24 @@ fn wanted_bridge(
     let Some(recipe) = manifest.native_bridge.as_ref().cloned() else {
         return Ok(WantedBridge::Nothing);
     };
+    // Which version an executable is comes from the signed builds the current generation of the
+    // installation's origin names for this host's platform, by the executable's digest. With none,
+    // the recipe's version requirement refuses the recipe rather than guessing.
+    let qualified = catalogue
+        .builds(&installation, &kr_plugin_catalogue::this_host())?
+        .into_iter()
+        .map(|build| native_bridge::QualifiedExecutable {
+            digest: Digest256::from_bytes(*build.executable_digest.as_bytes()),
+            version: build.version.to_string(),
+        })
+        .collect();
     let target = native_bridge::BridgeTarget {
         plugin_id: plugin_id.clone(),
         package_digest: installation.package_digest,
         package_dir: store.package_dir(installation.package_digest),
         recipe,
         match_rules: manifest.match_rules.clone(),
-        // A catalogue qualification result names a capability, the subject it was qualified
-        // against and its profile, and no executable's digest, so no signed record here says which
-        // version an executable is. The recipe's version requirement then refuses the recipe
-        // rather than guessing.
-        qualified: Vec::new(),
+        qualified,
     };
     Ok(WantedBridge::Release(Box::new(target)))
 }

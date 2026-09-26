@@ -2449,6 +2449,12 @@ async fn a_confirmation_that_expires_while_the_change_waits_for_the_database_cha
 // KR-REQ-11.42: a release's native bridge recipe, applied by the catalogue's own methods
 // ---------------------------------------------------------------------------------------------
 
+/// The catalogue's own builder of signed generations, for a release signed again with the build
+/// records a test needs. This suite uses a few of its helpers.
+#[allow(dead_code)]
+#[path = "../../kr-plugin-catalogue/tests/support/mod.rs"]
+mod generations;
+
 /// The catalogue's plugin methods and a release that carries a native bridge recipe: the Claude
 /// Code package 0.3.0 from the plugins repository's signed development generation, copied whole
 /// into `tests/fixtures/bridge-generation/`, whose recipe installs three registration files and
@@ -2456,6 +2462,8 @@ async fn a_confirmation_that_expires_while_the_change_waits_for_the_database_cha
 mod native_bridges {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+
+    use super::generations;
 
     use kr_controller::catalogue::native_bridge::{
         ApplicationDirectory, BridgeHost, BridgeSurface, QualifiedExecutable,
@@ -2953,9 +2961,9 @@ mod native_bridges {
         }
     }
 
-    /// With no signed record establishing the executable's version, which is what the catalogue's
-    /// signed records give today, a confirmed installation commits and its recipe places nothing,
-    /// and says why. On Windows the reason is the platform's, which is checked first.
+    /// With no signed record establishing the executable's version, as in the committed
+    /// generation, which names no builds, a confirmed installation commits and its recipe places
+    /// nothing, and says why. On Windows the reason is the platform's, which is checked first.
     #[tokio::test]
     async fn a_release_without_signed_version_evidence_places_nothing() {
         let site = Site {
@@ -2984,5 +2992,139 @@ mod native_bridges {
                 .any(|note| note.contains("no signed qualification record")),
             "{reports:?}"
         );
+    }
+
+    /// The platform a build of the stand-in executable runs on: this host's, or one release
+    /// 0.3.0 also lists.
+    fn stand_in_on(
+        os: kr_plugin_sdk::matching::OperatingSystem,
+        architecture: kr_plugin_sdk::matching::Architecture,
+    ) -> kr_plugin_sdk::catalogue::QualifiedBuild {
+        kr_plugin_sdk::catalogue::QualifiedBuild {
+            application: kr_plugin_sdk::text::Label::new("claude-code").expect("a label"),
+            distribution: kr_plugin_sdk::text::Label::new("npm @anthropic-ai/claude-code")
+                .expect("a label"),
+            version: kr_plugin_sdk::version::PackageVersion::parse("2.1.278").expect("a version"),
+            os,
+            architecture,
+            executable_digest: kr_plugin_sdk::digest::PayloadDigest::of(EXECUTABLE),
+        }
+    }
+
+    /// Names the stand-in executable at 2.1.278, built for this host.
+    fn built_here(entry: &mut kr_plugin_sdk::catalogue::IndexEntry) {
+        let here = kr_plugin_catalogue::this_host();
+        entry.builds = vec![stand_in_on(
+            here.os.expect("a named platform"),
+            here.architecture.expect("a named platform"),
+        )];
+    }
+
+    /// Names the stand-in executable at 2.1.278, built only for a platform other than this host's.
+    fn built_elsewhere(entry: &mut kr_plugin_sdk::catalogue::IndexEntry) {
+        use kr_plugin_sdk::matching::{Architecture, OperatingSystem};
+        let here = kr_plugin_catalogue::this_host();
+        entry.builds = vec![if here.os == Some(OperatingSystem::MacOs) {
+            stand_in_on(OperatingSystem::Linux, Architecture::X86_64)
+        } else {
+            stand_in_on(OperatingSystem::MacOs, Architecture::Aarch64)
+        }];
+    }
+
+    /// The bridge generation's release 0.3.0 signed again as generation `number` of a repository
+    /// of this test's own, its entry edited by `edit`, and put where the host reads its
+    /// repository from.
+    async fn signed_again(
+        host: &Host,
+        home: &Path,
+        keys: Option<generations::KeySet>,
+        number: u64,
+        edit: Option<fn(&mut kr_plugin_sdk::catalogue::IndexEntry)>,
+    ) -> generations::KeySet {
+        let package = home.join("claude-code-0.3.0");
+        if !package.exists() {
+            copy_tree(
+                &generation().join("targets/packages/kalareach/claude-code/0.3.0"),
+                &package,
+            );
+        }
+        let built = generations::Generation::build(
+            &home.join(format!("generation-{number}")),
+            generations::GenerationSpec {
+                generation: number,
+                package: Some(package),
+                keys,
+                edit_entry: edit,
+                ..generations::GenerationSpec::default()
+            },
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&host.working);
+        copy_tree(&built.directory(), &host.working);
+        built.keys()
+    }
+
+    /// Synchronises the repository this test enrolled.
+    async fn sync(host: &Host) {
+        let _: wire::CatalogueSyncResult = ok(host
+            .module
+            .write_frame_admitted(
+                &mutation(
+                    Method::CatalogueSync,
+                    host.environment_id,
+                    &wire::CatalogueSyncParams {
+                        environment_id: host.environment_id,
+                        catalogue_id: "development".to_owned(),
+                    },
+                ),
+                Method::CatalogueSync,
+                Some(host.confirmations()),
+            )
+            .await);
+    }
+
+    /// The recipe's version is read from the signed builds the installed release's current entry
+    /// names: with none for this host, and with one only for another platform, the recipe places
+    /// nothing; a synchronisation that adds the build for this host applies it, with no change to
+    /// the plugin, and the facts then name the release.
+    #[tokio::test]
+    async fn the_recipe_applies_once_a_synchronised_record_names_this_hosts_build() {
+        let site = Site {
+            signed_records: Vec::new(),
+            ..Site::new()
+        };
+        let host = host(&site);
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let keys = signed_again(&host, home.path(), None, 1, None).await;
+        let digest = synchronised(&host).await;
+        let before = site.tree();
+
+        let _: wire::PluginInstallResult = ok(install(&host, &digest, true).await);
+        assert_eq!(site.tree(), before, "no record: nothing was placed");
+
+        signed_again(
+            &host,
+            home.path(),
+            Some(keys.clone()),
+            2,
+            Some(built_elsewhere),
+        )
+        .await;
+        sync(&host).await;
+        assert_eq!(
+            site.tree(),
+            before,
+            "a record for another platform places nothing"
+        );
+        assert!(bridge_facts(&host, &digest).is_none());
+
+        signed_again(&host, home.path(), Some(keys), 3, Some(built_here)).await;
+        sync(&host).await;
+        assert_eq!(
+            site.tree(),
+            applied(&before, &generation()),
+            "the synchronised record applies the recipe"
+        );
+        assert!(bridge_facts(&host, &digest).is_some());
     }
 }

@@ -73,7 +73,11 @@ exacl.workspace = true
 [dev-dependencies]
 # This crate's own tests, with the pause above compiled in.
 kr-controller = { path = ".", features = ["testing"] }
+# The keys and expiry a catalogue suite test signs a generation of its own with, through the
+# catalogue's own generation builder.
+aws-lc-rs.workspace = true
 iroh-relay = { workspace = true, features = ["server", "test-utils"] }
+jiff.workspace = true
 kr-cbor.workspace = true
 kr-client = { workspace = true, features = ["terminal"] }
 kr-changeset.workspace = true
