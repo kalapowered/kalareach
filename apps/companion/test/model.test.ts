@@ -45,7 +45,7 @@ import {
   unresolved
 } from '../src/model/receipts'
 import { emptyControlState, evaluate, isRendered, visibilityOf } from '../src/model/controls'
-import { stretchesOf, styleOf } from '../src/terminal/cells'
+import { leftBlankOnPhone, stretchesOf, styleOf } from '../src/terminal/cells'
 import { drawableText, frameOf, leftBlank, paint, REPLACEMENT, sgr } from '../src/terminal/frame'
 import { CELL_TABLE, cellsOf } from '../src/terminal/widths'
 import {
@@ -501,6 +501,8 @@ describe('the raw terminal', () => {
     }
     expect(stretchesOf(line).map((stretch) => stretch.text)).toEqual(['  ', ' ', 'bcd', 'g  '])
     expect(stretchesOf(line).map((stretch) => stretch.column)).toEqual([0, 2, 3, 6])
+    // The two drawn as blank cells are counted; the one cut and the one filled are not.
+    expect(leftBlankOnPhone({ ...terminalScreen('8a7b6c50-22bb-4c3d-8e4f-000000000101', { columns: 9, rows: 1 }), lines: [line] })).toBe(2)
   })
 
   it("measures text in the cells the desktop's renderer gives it", () => {
@@ -594,16 +596,23 @@ describe('the raw terminal', () => {
 
   it('names what a screen warns of, in the words and the order both views show', () => {
     const whole = terminalScreen('8a7b6c50-22bb-4c3d-8e4f-000000000101', { columns: 80, rows: 8 })
-    expect(warningsOf({ ...whole, replaced: 0 })).toEqual([])
+    expect(warningsOf({ ...whole, replaced: 0 }, 0)).toEqual([])
+    // What the view's own renderer left blank is counted with what native code did.
+    expect(warningsOf({ ...whole, replaced: 0 }, 1)).toEqual([
+      { id: 'substituted-count', words: '1 left blank' }
+    ])
     expect(
-      warningsOf({
-        ...whole,
-        degraded: true,
-        replaced: 2,
-        lines: whole.lines.map((line, index) => (index === 4 ? { ...line, truncated: true } : line))
-      })
+      warningsOf(
+        {
+          ...whole,
+          degraded: true,
+          replaced: 2,
+          lines: whole.lines.map((line, index) => (index === 4 ? { ...line, truncated: true } : line))
+        },
+        1
+      )
     ).toEqual([
-      { id: 'substituted-count', words: '2 left blank' },
+      { id: 'substituted-count', words: '3 left blank' },
       { id: 'rows-truncated', words: 'Rows cut short' },
       { id: 'screen-degraded', words: 'Shortened by the session' }
     ])

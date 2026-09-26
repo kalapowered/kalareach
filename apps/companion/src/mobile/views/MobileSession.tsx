@@ -37,7 +37,7 @@ import {
 } from '../../model/receipts'
 import { renderMarkdown } from '../../markdown/render'
 import type { TerminalGrid, TerminalScreen } from '../../host/port'
-import { stretchesOf, styleOf } from '../../terminal/cells'
+import { leftBlankOnPhone, stretchesOf, styleOf } from '../../terminal/cells'
 import {
   ATTACHING,
   clipping,
@@ -460,7 +460,7 @@ export function MobileSession({
               )}
               {frame === null
                 ? null
-                : warningsOf(frame).map((warning) => (
+                : warningsOf(frame, leftBlankOnPhone(frame)).map((warning) => (
                     <Badge key={warning.id} tone="warning" data-testid={warning.id}>
                       {warning.words}
                     </Badge>

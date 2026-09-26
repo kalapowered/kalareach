@@ -12,7 +12,7 @@ import type { CSSProperties } from 'react'
 
 import type { CellRendition, PaletteState } from '@kalareach/protocol'
 
-import type { TerminalLine, TerminalPiece } from '../host/port'
+import type { TerminalLine, TerminalPiece, TerminalScreen } from '../host/port'
 
 type Colour = CellRendition['foreground']
 
@@ -127,6 +127,8 @@ export interface Stretch {
   readonly column: number
   readonly text: string
   readonly piece: TerminalPiece | null
+  /** Whether it is a piece whose text the phone drew as blank cells. */
+  readonly leftBlank: boolean
 }
 
 /**
@@ -143,11 +145,26 @@ export function stretchesOf(line: TerminalLine): Stretch[] {
   const pieces = [...line.pieces].sort((one, other) => one.column - other.column)
   for (const piece of pieces) {
     if (piece.column < at) continue
-    if (piece.column > at) stretches.push({ column: at, text: ' '.repeat(piece.column - at), piece: null })
+    if (piece.column > at) {
+      stretches.push({ column: at, text: ' '.repeat(piece.column - at), piece: null, leftBlank: false })
+    }
     const cells = Number.isFinite(piece.cells) ? Math.max(0, Math.trunc(piece.cells)) : 0
-    const text = /^[\x20-\x7e]*$/.test(piece.text) ? piece.text.slice(0, cells).padEnd(cells) : ' '.repeat(cells)
-    stretches.push({ column: piece.column, text, piece })
+    const plain = /^[\x20-\x7e]*$/.test(piece.text)
+    stretches.push({
+      column: piece.column,
+      text: plain ? piece.text.slice(0, cells).padEnd(cells) : ' '.repeat(cells),
+      piece,
+      leftBlank: !plain
+    })
     at = piece.column + cells
   }
   return stretches
+}
+
+/** How many pieces of `screen` the phone draws as blank cells. */
+export function leftBlankOnPhone(screen: TerminalScreen): number {
+  return screen.lines.reduce(
+    (total, line) => total + stretchesOf(line).filter((stretch) => stretch.leftBlank).length,
+    0
+  )
 }

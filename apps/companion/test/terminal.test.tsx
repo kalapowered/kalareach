@@ -319,6 +319,23 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     opened.mockRestore()
   })
 
+  it('counts each piece it draws as blank cells with the ones native code left blank', async () => {
+    const { port, controls } = fakeHost()
+    open(port)
+    await screen.findByTestId('palette-provenance')
+    expect(screen.getByTestId('substituted-count').textContent).toBe('1 left blank')
+    const whole = terminalScreen(SESSION_MAIN, { columns: 80, rows: 8 })
+    act(() => {
+      controls.terminalViews[0]?.show({
+        ...whole,
+        lines: whole.lines.map((line, index) =>
+          index === 6 ? { ...line, pieces: [{ ...piece(0, '\u{4e2d}'), cells: 1 }] } : line
+        )
+      })
+    })
+    expect(screen.getByTestId('substituted-count').textContent).toBe('2 left blank')
+  })
+
   it('leaves out a piece that starts inside the one before it, and keeps that one whole', async () => {
     const opened = vi.spyOn(Terminal.prototype, 'open')
     const { port, controls } = fakeHost()

@@ -122,14 +122,14 @@ export interface ScreenWarning {
 }
 
 /**
- * What a screen warns of, in the order both views show it: cells native code could not place and
- * left blank, lines the session cut short, and a screen the session shortened.
+ * What a screen warns of, in the order both views show it: what was left blank, which is what
+ * native code could not place and the pieces the view's own renderer drew as blank cells
+ * (`leftBlankHere`); lines the session cut short; and a screen the session shortened.
  */
-export function warningsOf(screen: TerminalScreen): readonly ScreenWarning[] {
+export function warningsOf(screen: TerminalScreen, leftBlankHere: number): readonly ScreenWarning[] {
   const warnings: ScreenWarning[] = []
-  if (screen.replaced > 0) {
-    warnings.push({ id: 'substituted-count', words: `${screen.replaced} left blank` })
-  }
+  const blank = screen.replaced + leftBlankHere
+  if (blank > 0) warnings.push({ id: 'substituted-count', words: `${blank} left blank` })
   if (screen.lines.some((line) => line.truncated)) {
     warnings.push({ id: 'rows-truncated', words: 'Rows cut short' })
   }

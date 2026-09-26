@@ -23,7 +23,7 @@ import '@xterm/xterm/css/xterm.css'
 import { Badge, Button, Segmented } from '../components/ui'
 import { useApp } from '../app/state'
 import type { TerminalGrid } from '../host/port'
-import { backgroundOf, paint, themeOf } from './frame'
+import { backgroundOf, leftBlank, paint, themeOf } from './frame'
 import {
   ATTACHING,
   clipping,
@@ -205,7 +205,7 @@ export function RawTerminal({
             <Badge tone="neutral" data-testid="terminal-size">
               {`${frame.dimensions.columns}×${frame.dimensions.rows}`}
             </Badge>
-            {warningsOf(frame).map((warning) => (
+            {warningsOf(frame, leftBlank(frame)).map((warning) => (
               <Badge key={warning.id} tone="warning" data-testid={warning.id}>
                 {warning.words}
               </Badge>

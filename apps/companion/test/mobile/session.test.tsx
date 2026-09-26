@@ -248,6 +248,20 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     expect(screen.getByTestId('substituted-count').textContent).toBe('3 left blank')
     expect(screen.getByTestId('rows-truncated').textContent).toBe('Rows cut short')
     expect(screen.getByTestId('screen-degraded').textContent).toBe('Shortened by the session')
+
+    // A piece the phone draws as blank cells is counted with the ones native code left blank.
+    const first = whole.lines[0]?.pieces[0]
+    if (first === undefined) throw new Error('the scripted screen has a piece')
+    act(() => {
+      controls.terminalViews[0]?.show({
+        ...whole,
+        replaced: 3,
+        lines: whole.lines.map((line, index) =>
+          index === 6 ? { ...line, pieces: [{ ...first, column: 0, cells: 2, text: '\u{4e2d}' }] } : line
+        )
+      })
+    })
+    expect(screen.getByTestId('substituted-count').textContent).toBe('4 left blank')
   })
 
   it('keeps the last frame while it waits, busy at once and saying so only after a moment', async () => {
