@@ -301,6 +301,12 @@ pub struct Instance {
     pub application_instance_id: ApplicationInstanceId,
     /// The process, where this host launched one.
     pub process: Option<ManagedProcess>,
+    /// The process an adoption found running this instance, where one did.
+    ///
+    /// It places the questions that process and the ones it starts ask, and does nothing else: it
+    /// is no managed process, so it holds no credential, authenticates no connection and admits no
+    /// bridge. Detection never creates a gateway after the fact.
+    pub observed: Option<ProcessStartIdentity>,
     /// The revision that advances when the upstream owner or selected thread changes.
     pub binding_revision: AgentBindingRevision,
     /// The generation of the source frames this instance is producing.
@@ -1009,13 +1015,14 @@ impl Broker {
     }
 
     /// Records an application instance the host detected rather than started, with the profile it
-    /// was observed running, as one operation.
+    /// was observed running and the process it was found running as, as one operation.
     ///
     /// Section 12: manual launches remain valid and trigger the same detection and capability
     /// process, and detection never creates a gateway after the fact, so the instance has no
-    /// process record and the mode is the one observed. An identifier another path holds is
-    /// refused, and the profile is written before either is kept, so a refused or failed adoption
-    /// leaves nothing behind.
+    /// process record and the mode is the one observed. The process it was found running as places
+    /// the questions it asks and nothing more ([`Instance::observed`]). An identifier another path
+    /// holds is refused, and the profile is written before either is kept, so a refused or failed
+    /// adoption leaves nothing behind.
     ///
     /// # Errors
     ///
@@ -1026,6 +1033,7 @@ impl Broker {
         &self,
         profile: LaunchProfile,
         application_instance_id: ApplicationInstanceId,
+        process: ProcessStartIdentity,
         saved_conversation: Option<String>,
     ) -> Result<()> {
         let semantic = self.resumed_semantics(application_instance_id)?;
@@ -1046,6 +1054,9 @@ impl Broker {
             None,
             semantic,
         );
+        if let Some(instance) = state.instances.get_mut(&application_instance_id) {
+            instance.observed = Some(process);
+        }
         Ok(())
     }
 
@@ -4087,6 +4098,7 @@ impl BrokerState {
             Instance {
                 application_instance_id,
                 process,
+                observed: None,
                 binding_revision: AgentBindingRevision::new(1),
                 source_generation: SourceGeneration::new(1),
                 thread_id: None,

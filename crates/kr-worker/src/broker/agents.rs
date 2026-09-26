@@ -1,9 +1,10 @@
 //! What the broker tells the question ledger about the agent a process belongs to.
 //!
-//! The broker launched the agent and knows its process by its start identity, so a contact helper
-//! that agent starts is found by the kernel's parent chain, link by link, or on Windows by the job
-//! the agent was started in, and its questions belong to the agent's application instance: they
-//! end when that instance ends.
+//! The broker launched the agent, or an adoption found it running, and knows its process by its
+//! start identity, so a contact helper that agent starts is found by the kernel's parent chain,
+//! link by link, or on Windows by the job the agent was started in, and its questions belong to
+//! the agent's application instance: they end when that instance ends. An adopted agent's process
+//! places its questions and nothing else; it admits no bridge.
 //!
 //! Either proves which application a helper serves and nothing about which thread a request came
 //! from. One helper can serve several threads, one after another or at once, and a request
@@ -28,18 +29,22 @@ use crate::questions::binding::{
 
 impl AgentBindings for Broker {
     fn binding_of(&self, process: &ProcessStartIdentity) -> AgentPlacement {
-        // The launched processes are read under the lock and the placement happens after it is
-        // released: it reads the process table or the agents' jobs, and nothing that holds the
-        // broker waits on that. An instance that ends between the two is found ended by the next sweep.
+        // The launched and adopted processes are read under the lock and the placement happens
+        // after it is released: it reads the process table or the agents' jobs, and nothing that
+        // holds the broker waits on that. An instance that ends between the two is found ended by
+        // the next sweep.
         let launched: Vec<(ApplicationInstanceId, ProcessStartIdentity)> = {
             let state = self.state();
             state
                 .instances
                 .values()
                 .filter_map(|instance| {
-                    instance.process.as_ref().map(|launched| {
-                        (instance.application_instance_id, launched.process.clone())
-                    })
+                    instance
+                        .process
+                        .as_ref()
+                        .map(|launched| launched.process.clone())
+                        .or_else(|| instance.observed.clone())
+                        .map(|process| (instance.application_instance_id, process))
                 })
                 .collect()
         };

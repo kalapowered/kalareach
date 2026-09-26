@@ -835,11 +835,21 @@ fn kr_req_11_13_an_instance_is_bound_once_an_admitted_package_recognises_it() {
     let gemini = worker.package(&fixture::Shape::gemini_cli(&[]));
     worker
         .broker
-        .adopt_instance(profile(1, "/usr/local/bin/claude"), instance(1), None)
+        .adopt_instance(
+            profile(1, "/usr/local/bin/claude"),
+            instance(1),
+            ProcessStartIdentity::new(1_101, ProcessStartSource::MacosProcBsdInfo, 900),
+            None,
+        )
         .expect("a program found running");
     worker
         .broker
-        .adopt_instance(profile(2, "/usr/local/bin/vim"), instance(2), None)
+        .adopt_instance(
+            profile(2, "/usr/local/bin/vim"),
+            instance(2),
+            ProcessStartIdentity::new(1_102, ProcessStartSource::MacosProcBsdInfo, 900),
+            None,
+        )
         .expect("another program found running");
     let bound_to = |number: u8| {
         worker

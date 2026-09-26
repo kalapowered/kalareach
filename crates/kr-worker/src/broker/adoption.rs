@@ -12,8 +12,9 @@
 //! exact rule beats an inferred one, and two that both recognise it exactly adopt nothing. A package
 //! with no connector table is adopted and bound the same way. An adopted instance gets no
 //! registration, no endpoint and no credential, so none of its bridges is admitted, and its
-//! announcement says so. It is watched by its identity and ended when it exits. A bind the broker
-//! refuses leaves nothing adopted, and the next look tries again.
+//! announcement says so; the process it was found running as places the questions it asks, and
+//! nothing more. It is watched by its identity and ended when it exits. A bind the broker refuses
+//! leaves nothing adopted, and the next look tries again.
 //!
 //! A program takes the terminal when the root shell starts a command, and the session knows when
 //! that is likely: the input it accepts, the output it produces, and an invocation the shell's
@@ -403,7 +404,7 @@ impl Adoptions {
             }
             if self
                 .broker
-                .adopt_instance(profile, application_instance_id, None)
+                .adopt_instance(profile, application_instance_id, process.clone(), None)
                 .is_err()
             {
                 return Vec::new();

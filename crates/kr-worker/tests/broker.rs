@@ -2549,6 +2549,7 @@ fn kr_req_12_02_an_instance_one_path_holds_cannot_be_taken_by_another() {
         .adopt_instance(
             profile(IntegrationMode::NativeTerminal, [4; 32], "1.0.0"),
             instance(2),
+            process_identity(44, 903),
             None,
         )
         .expect_err("an adoption cannot take an identifier a launch reserved");
@@ -2581,7 +2582,7 @@ fn kr_req_12_02_an_instance_one_path_holds_cannot_be_taken_by_another() {
         ..profile(IntegrationMode::NativeTerminal, [4; 32], "1.0.0")
     };
     broker
-        .adopt_instance(observed, instance(3), None)
+        .adopt_instance(observed, instance(3), process_identity(45, 904), None)
         .expect("the detected process is adopted");
     let later = broker
         .prepare_launch(

@@ -10,7 +10,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-12.07 | a program the root shell ran that the integration did not launch is adopted as a native terminal instance with no process record, with the bypass its line was answered with, its bridges refused, and ended when it exits; a program the integration launched is not adopted; a view that installs the session's list and applies the announcements after it holds each instance once; the watch finds a program the root shell starts from a typed line within two seconds of it running, at once or after four silent seconds, and its end within two seconds of its exit, and looks when the integration asks about an invocation or reports a command starting |
+//! | KR-REQ-12.07 | a program the root shell ran that the integration did not launch is adopted as a native terminal instance with no process record, its process placing the questions it asks and admitting no bridge, with the bypass its line was answered with, its bridges refused, and ended when it exits; a program the integration launched is not adopted; a view that installs the session's list and applies the announcements after it holds each instance once; the watch finds a program the root shell starts from a typed line within two seconds of it running, at once or after four silent seconds, and its end within two seconds of its exit, and looks when the integration asks about an invocation or reports a command starting |
 //! | KR-REQ-11.13 | an adopted program is bound in the same step to the admitted package that recognises it, for the program found running, and the binding ends with it; a program two packages recognise exactly is adopted by neither, and an exact rule is selected over an inferred one; a package with no connector table adopts and binds what it recognises |
 //! | KR-PERF-003 | a session nothing is happening in reads its terminal's foreground on no more than one interval in four, less often the longer it stays quiet, before and after its own traffic, and after an adopted program has ended |
 
@@ -290,6 +290,47 @@ fn kr_req_12_07_a_program_the_integration_did_not_launch_is_adopted_without_a_la
         Some(profile.binary.resolved_path.clone())
     );
 
+    // KR-REQ-12.07: its process places the questions it asks, and admits nothing: a channel that
+    // says the program started it speaks for no instance.
+    use kr_worker::questions::binding::{AgentBinding, AgentBindings as _, AgentPlacement};
+    assert_eq!(
+        setup.broker.binding_of(&started.process),
+        AgentPlacement::Bound(AgentBinding {
+            application_instance_id: instance,
+            revision: None,
+        }),
+        "a question the adopted program asks is placed under its instance"
+    );
+    let process = started.process.clone();
+    let connector = setup
+        .sources
+        .for_command(fixture::COMMAND)
+        .expect("the admitted connector");
+    let refused = setup
+        .broker
+        .open_bridge_channel(
+            instance,
+            &kr_worker::broker::bridge::BridgeProcess {
+                identity: kr_protocol::identity::ProcessStartIdentity::new(
+                    u64::from(std::process::id()),
+                    kr_protocol::identity::ProcessStartSource::MacosProcBsdInfo,
+                    1,
+                ),
+                starter: Some(started.process.clone()),
+                started: None,
+            },
+            &connector,
+            Some(fixture::QUALIFIED_VERSION),
+        )
+        .expect_err("an adopted program's process admits no bridge");
+    assert!(
+        matches!(
+            refused,
+            kr_worker::broker::BrokerError::PermissionDenied { .. }
+        ),
+        "{refused}"
+    );
+
     assert!(
         setup.adoptions.look(&foreground).is_empty(),
         "a program is adopted once"
@@ -308,6 +349,11 @@ fn kr_req_12_07_a_program_the_integration_did_not_launch_is_adopted_without_a_la
     assert!(
         setup.broker.live_bindings().is_empty(),
         "and its binding with it"
+    );
+    assert_eq!(
+        setup.broker.binding_of(&process),
+        AgentPlacement::Unbound,
+        "and nothing is placed under an instance that has ended"
     );
 }
 
