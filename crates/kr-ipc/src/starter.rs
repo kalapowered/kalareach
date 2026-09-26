@@ -427,14 +427,13 @@ mod windows {
         WaitNamedPipeW,
     };
     use windows_sys::Win32::System::Threading::{
-        CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED,
-        CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateProcessW, DETACHED_PROCESS,
-        DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
-        GetCurrentThread, GetProcessTimes, InitializeProcThreadAttributeList,
-        LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess, OpenProcessToken, OpenThreadToken,
-        PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, PROCESS_NAME_WIN32,
-        PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW, ResumeThread,
-        STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
+        CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED,
+        CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateProcessW, DeleteProcThreadAttributeList,
+        EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetCurrentThread, GetProcessTimes,
+        InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess,
+        OpenProcessToken, OpenThreadToken, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION,
+        PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+        ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
         UpdateProcThreadAttribute, WaitForSingleObject,
     };
 
@@ -1146,9 +1145,13 @@ mod windows {
                 flags.unwrap_or(0)
             )));
         }
+        // The child gets a console of its own that shows no window. Every console program it runs
+        // shares that console: without one, each would be given a console of its own, whose
+        // window would appear on the desktop of the person signed in, and whose creation fails
+        // now and then when several are created at once.
         let mut creation = CREATE_SUSPENDED
             | CREATE_NEW_PROCESS_GROUP
-            | DETACHED_PROCESS
+            | CREATE_NO_WINDOW
             | CREATE_UNICODE_ENVIRONMENT;
         if plan == JobPlan::BreakAway {
             creation |= CREATE_BREAKAWAY_FROM_JOB;
@@ -2972,6 +2975,36 @@ mod tests {
             (shell, line)
         }
 
+        /// The variable that has the helper below say whether it has a console.
+        const CONSOLE: &str = "KR_STARTER_TEST_CONSOLE";
+
+        /// What a started process is given to run when the case asks about its console: this test
+        /// executable, as the helper below.
+        fn console_command() -> (std::path::PathBuf, String) {
+            let executable = std::env::current_exe().expect("this test executable");
+            let line = format!(
+                "\"{}\" starter::tests::windows::a_child_that_says_whether_it_has_a_console --exact \
+                 --ignored --nocapture --test-threads=1",
+                executable.display()
+            );
+            (executable, line)
+        }
+
+        /// Says on its standard output whether this process has a console, which only a process
+        /// with one can open for writing.
+        #[test]
+        #[ignore = "a helper process the console test below has a starter start"]
+        fn a_child_that_says_whether_it_has_a_console() {
+            if std::env::var_os(CONSOLE).is_none() {
+                return;
+            }
+            let console = std::fs::OpenOptions::new()
+                .write(true)
+                .open("CONOUT$")
+                .is_ok();
+            println!("console {console}");
+        }
+
         /// Acts as a starter, once its parent has put it in the jobs a case needs.
         #[test]
         #[ignore = "a helper process of the job tests below, which start it themselves"]
@@ -2995,7 +3028,11 @@ mod tests {
                 open_log(std::path::Path::new(&path), LogAccess::Append)
                     .expect("the output file this case names")
             });
-            let (shell, line) = if written.is_some() {
+            let mut environment = vec![("KR_STARTER_TEST_MARK".to_owned(), "set".to_owned())];
+            let (shell, line) = if role == "console" {
+                environment.push((CONSOLE.to_owned(), "1".to_owned()));
+                console_command()
+            } else if written.is_some() {
                 writing_command()
             } else {
                 (shell, line)
@@ -3004,7 +3041,7 @@ mod tests {
                 application: &shell,
                 command_line: &line,
                 directory: &directory,
-                environment: &[("KR_STARTER_TEST_MARK".to_owned(), "set".to_owned())],
+                environment: &environment,
                 session,
                 output: written.as_ref().map(|file| file.as_handle()),
             });
@@ -3178,6 +3215,29 @@ mod tests {
                 written.contains("to its output") && written.contains("to its error"),
                 "both streams reach the file: {written:?}"
             );
+        }
+
+        /// A child the starter creates has a console of its own, which shows no window: a console
+        /// program it runs shares it rather than being given one, whose window would appear on
+        /// the desktop of the person signed in.
+        #[test]
+        fn a_child_has_a_console_of_its_own() {
+            let directory = Scratch::create();
+            let log = directory.0.join("controller.log");
+            let (reported, _jobs) = starter_writing_to("console", &[0], Some(&log));
+            assert!(
+                reported.starts_with("result started "),
+                "started: {reported:?}"
+            );
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let said = loop {
+                let written = std::fs::read_to_string(&log).unwrap_or_default();
+                if written.contains("console ") || Instant::now() > deadline {
+                    break written;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            };
+            assert!(said.contains("console true"), "the child said: {said:?}");
         }
 
         /// The daemon log is taken only as a regular file whose list grants no account this host
