@@ -280,6 +280,39 @@ async fn kr_req_12_18_a_channel_the_worker_ends_ends_its_session() {
     );
 }
 
+/// A launch ends every process it started when it goes, the channel the application started
+/// included, while the case that made it still holds the channel's input and the worker's end of
+/// its connection, as a case that stops early does: nothing is left for the channel to notice on
+/// its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_launch_that_goes_ends_the_channel_it_started() {
+    use kr_ipc::identity::{ProcessState, process_start_identity, process_state};
+
+    let placed = Placed::new();
+    let mut launch = Launch::channel(&placed, installed(&placed, &[BridgeSurface::Channel]));
+    let admitted = launch.accept().await.expect("the channel is admitted");
+    let channel = admitted.process.identity.clone();
+    let application =
+        process_start_identity(launch.application.id()).expect("the application is running");
+    let input = launch.requests.take();
+
+    drop(launch);
+    assert_eq!(
+        process_state(&application),
+        ProcessState::Ended,
+        "the application ended with its launch"
+    );
+    let deadline = std::time::Instant::now() + LIVENESS;
+    while process_state(&channel) != ProcessState::Ended {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the channel the application started is still running: {channel:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    drop((input, admitted));
+}
+
 /// KR-REQ-05.09, KR-REQ-11.43: a channel the installation did not register is refused before
 /// Claude Code's handshake is answered, and the forwarder exits with a failure rather than serving
 /// a channel nothing stands behind.
