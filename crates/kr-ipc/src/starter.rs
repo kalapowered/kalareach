@@ -262,26 +262,37 @@ pub enum Withdrawal {
     Taken,
 }
 
+/// What the taken marker holds when the command that left the claim withdrew it. A starter's
+/// marker holds nothing.
+const WITHDRAWN: &[u8] = b"withdrawn";
+
 /// Withdraws the claim for `request`, as the command that left it does once it stops waiting for
 /// the start, or once the run meant to take it failed.
 ///
-/// The command takes the claim itself, by creating its taken marker as a starter would. Only one
-/// creation of the marker succeeds, so either the command withdraws the claim and no starter can
-/// take it afterwards, or a starter took it first and the command learns so.
+/// The command takes the claim itself, by creating its taken marker as a starter would, with
+/// [`WITHDRAWN`] in it. Only one creation of the marker succeeds, so either the command withdraws
+/// the claim and no starter can take it afterwards, or a starter took it first and the command
+/// learns so. What the marker holds tells a withdrawal apart from a starter's taking, so a claim
+/// this command withdrew before, including by a creation that published the marker and then failed
+/// to flush its directory, is found withdrawn again rather than taken.
 ///
 /// # Errors
 ///
-/// Returns an error when the marker can be neither created nor found to exist.
+/// Returns an error when the marker can be neither created nor read.
 pub fn withdraw_claim(environment: &EnvironmentPaths, request: Uuid) -> Result<Withdrawal> {
     let marker = environment
         .start_claims_dir()
         .join(format!("{request}.{TAKEN}"));
-    match crate::paths::create_new_owner_only_file(&marker, &[]) {
-        Ok(()) => Ok(Withdrawal::Withdrawn),
-        Err(IpcError::Io { source, .. }) if source.kind() == std::io::ErrorKind::AlreadyExists => {
-            Ok(Withdrawal::Taken)
-        }
-        Err(error) => Err(error),
+    let failed = match crate::paths::create_new_owner_only_file(&marker, WITHDRAWN) {
+        Ok(()) => return Ok(Withdrawal::Withdrawn),
+        Err(error) => error,
+    };
+    // The marker may be there, whether another creation came first or this one published it and
+    // then failed: what it holds says whose it is.
+    match crate::paths::read_owner_only_file(&marker, MAX_RECORD_LEN) {
+        Ok(Some(held)) if held == WITHDRAWN => Ok(Withdrawal::Withdrawn),
+        Ok(Some(_)) => Ok(Withdrawal::Taken),
+        Ok(None) | Err(_) => Err(failed),
     }
 }
 
@@ -2379,6 +2390,12 @@ mod tests {
                 .expect("the directory is read")
                 .is_none(),
             "no starter takes a withdrawn claim"
+        );
+        // A second withdrawal finds the command's own marker, as one does after a first whose
+        // creation published the marker and then failed: withdrawn, not taken by a starter.
+        assert_eq!(
+            withdraw_claim(&environment, unwanted.request).expect("the marker is read"),
+            Withdrawal::Withdrawn
         );
 
         let live = claim(10_000);
