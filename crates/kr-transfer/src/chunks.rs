@@ -17,6 +17,11 @@
 //! What travels is the same [`kr_protocol::envelope::ControlFrame`] union both transports carry, so
 //! a chunk is an ordinary mutation with an ordinary action window and an ordinary response. That is
 //! what keeps `upload.chunk` inside the host's admission path instead of beside it.
+//!
+//! The endpoint's address is kr-ipc's, beside the environment's other local endpoints
+//! ([`EnvironmentPaths::attachment_chunk_endpoint`]), and a client's lane is kr-client's
+//! (`kr_client::chunks`), so a client needs nothing of this crate. [`ChunkChannel`] is the
+//! controller's own suite's client of the same endpoint.
 
 use kr_ipc::endpoint::Connection;
 use kr_ipc::framed::{FrameReader, FrameWriter, split};
@@ -38,32 +43,19 @@ use kr_protocol::transfer::{
 
 use crate::error::{Result, TransferError};
 
-/// The role suffix the attachment-chunk endpoint is named with.
+/// Returns the environment's attachment-chunk endpoint, as kr-ipc names it.
 ///
-/// The control endpoint is `c`, the rendezvous `r` and a worker `w<display>`; `t` is this one. A
-/// Unix socket address is short on macOS, which is why the name is one letter.
-const ROLE: &str = "t";
-
-/// Returns the environment's attachment-chunk endpoint.
+/// The host binds the address this returns and a client connects to kr-ipc's name directly; the
+/// two are one name. It serves the controller's transfer module and its suite, which name the
+/// endpoint through this crate; remove it when they name it through kr-ipc.
 ///
 /// # Errors
 ///
 /// Returns [`TransferError::Ipc`] when the address does not fit the platform's socket address.
 pub fn chunk_endpoint(paths: &EnvironmentPaths) -> Result<Endpoint> {
-    #[cfg(unix)]
-    {
-        Endpoint::from_path(paths.runtime_dir().join(format!("{ROLE}.sock")))
-            .map_err(TransferError::from)
-    }
-    #[cfg(windows)]
-    {
-        Endpoint::from_name(format!(
-            "kalareach-{}-{}-{ROLE}",
-            kr_ipc::paths::current_uid(),
-            kr_ipc::paths::short_prefix(paths.environment_id())
-        ))
+    paths
+        .attachment_chunk_endpoint()
         .map_err(TransferError::from)
-    }
 }
 
 /// A client's connection to the attachment-chunk endpoint.
@@ -262,7 +254,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_chunk_endpoint_sits_beside_the_control_endpoint() {
+    fn the_host_binds_the_address_a_client_connects_to() {
         let root = tempfile::tempdir().expect("a temporary directory");
         let paths =
             kr_ipc::paths::HostPaths::new(root.path().join("run"), root.path().join("state"))
@@ -270,16 +262,12 @@ mod tests {
                 .environment(kr_protocol::ids::EnvironmentId::new(
                     kr_protocol::scalars::Uuid::from_bytes([2; 16]),
                 ));
-        let chunks = chunk_endpoint(&paths).expect("an addressable endpoint");
-        let control = paths
-            .controller_endpoint()
-            .expect("an addressable endpoint");
-        assert_ne!(chunks, control);
-        #[cfg(unix)]
-        {
-            assert_eq!(chunks.as_path().parent(), control.as_path().parent());
-            assert!(chunks.as_text().ends_with("/t.sock"));
-        }
+        assert_eq!(
+            chunk_endpoint(&paths).expect("an addressable endpoint"),
+            paths
+                .attachment_chunk_endpoint()
+                .expect("an addressable endpoint")
+        );
     }
 
     #[test]

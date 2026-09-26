@@ -335,6 +335,21 @@ impl EnvironmentPaths {
         self.endpoint("r")
     }
 
+    /// Returns the controller's attachment-chunk endpoint.
+    ///
+    /// A 1 MiB chunk does not fit a control frame, so a local client sends a transfer's chunks
+    /// here and the controller frames this connection at the attachment bound. It is the local form
+    /// of the protocol's attachment-chunk stream: everything else about the connection is the
+    /// control endpoint's. The role is one letter because a Unix socket address is short on macOS.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcError::SocketPathTooLong`] when the path does not fit the platform's socket
+    /// address.
+    pub fn attachment_chunk_endpoint(&self) -> Result<Endpoint> {
+        self.endpoint("t")
+    }
+
     /// Returns one worker's private endpoint.
     ///
     /// Display numbers are never reused within an environment, so the name identifies one worker
@@ -2929,9 +2944,29 @@ mod tests {
         environment.create().expect("directories");
         environment.controller_endpoint().expect("fits");
         environment.rendezvous_endpoint().expect("fits");
+        environment.attachment_chunk_endpoint().expect("fits");
         environment
             .worker_endpoint(DisplayNumber::new(999_999))
             .expect("fits");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_attachment_chunk_endpoint_is_its_own_beside_the_control_endpoint() {
+        let root = temporary_root("chunks");
+        let paths = HostPaths::new(root.join("run"), root.join("state")).expect("roots");
+        let environment = paths.environment(EnvironmentId::new(Uuid::from_bytes([2; 16])));
+        let chunks = environment.attachment_chunk_endpoint().expect("fits");
+        let control = environment.controller_endpoint().expect("fits");
+        assert_ne!(chunks, control);
+        assert_ne!(chunks, environment.rendezvous_endpoint().expect("fits"));
+        #[cfg(unix)]
+        {
+            assert_eq!(chunks.as_path().parent(), control.as_path().parent());
+            assert!(chunks.as_text().ends_with("/t.sock"));
+        }
+        #[cfg(windows)]
+        assert!(chunks.as_text().ends_with("-t"));
         std::fs::remove_dir_all(&root).ok();
     }
 
