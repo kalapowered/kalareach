@@ -14,7 +14,7 @@ use crate::error::{CliError, Result};
 use crate::terminal::ControllingTerminal;
 
 /// What the palette this session starts with cost to establish.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Chosen {
     /// The palette the create request carries.
     pub palette: PaletteRequest,
@@ -24,6 +24,17 @@ pub struct Chosen {
     /// is the first input the attachment that follows forwards, so a person who started typing
     /// before the prompt appeared gets what they typed.
     pub typed: Vec<u8>,
+}
+
+impl std::fmt::Debug for Chosen {
+    /// The palette, and how many bytes were typed while it was chosen. Never those bytes.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Chosen")
+            .field("palette", &self.palette)
+            .field("typed", &self.typed.len())
+            .finish()
+    }
 }
 
 /// What `--palette` was given.

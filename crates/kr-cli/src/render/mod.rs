@@ -33,7 +33,7 @@ use kr_protocol::projection::ProjectionEvent;
 pub use kr_client::projection::{decode, is_projection_event};
 
 /// What applying one event means for the terminal.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Drawn {
     /// The bytes to write, which may be none.
     pub bytes: Vec<u8>,
@@ -41,6 +41,17 @@ pub struct Drawn {
     pub resubscribe: bool,
     /// Whether this event completed a screen, which is then the one this terminal holds.
     pub installed: bool,
+}
+
+impl std::fmt::Debug for Drawn {
+    /// How many bytes were drawn. Never the bytes, which are what a terminal shows.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Drawn")
+            .field("bytes", &self.bytes.len())
+            .field("resubscribe", &self.resubscribe)
+            .finish()
+    }
 }
 
 /// One projected session, as this terminal is showing it.
