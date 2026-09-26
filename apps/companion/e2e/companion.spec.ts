@@ -1009,11 +1009,12 @@ test.describe("the phone's room for its terminal", () => {
   /**
    * How far the focus ring around `locator`'s element runs outside what a person sees of it, on its
    * most hidden side: outside the screen, or outside any box around it that clips what it holds.
-   * Zero when the whole ring is in view.
+   * Zero when the whole ring is in view, and endless when the element draws no ring at all.
    */
   async function ringHidden(locator: Locator): Promise<number> {
     return locator.evaluate((element) => {
       const style = getComputedStyle(element)
+      if (style.outlineStyle === 'none' || !(parseFloat(style.outlineWidth) > 0)) return Infinity
       const ring = Math.max(0, parseFloat(style.outlineWidth) + parseFloat(style.outlineOffset))
       const box = element.getBoundingClientRect()
       const seen = { top: 0, right: window.innerWidth, bottom: window.innerHeight, left: 0 }
