@@ -478,6 +478,45 @@ pub struct PluginSummary {
     /// after the read began, and null there while a worker has not reported, and in every other
     /// answer, which asks no worker.
     pub live_bindings: Nullable<U64>,
+    /// Whether the admissions in force let new bindings use it, and why not where they do not:
+    /// read in `plugin.list` at the revision the answer renders, and null there when they could
+    /// not be computed at it, and in every other answer, which reads none.
+    pub admission: Nullable<PluginAdmission>,
+}
+
+/// Whether the admissions in force let new bindings use an installation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PluginAdmission {
+    /// New bindings may use it.
+    Admitted,
+    /// The admissions leave it out, so no new binding uses it. A binding made before keeps or
+    /// ends as its release's state says.
+    LeftOut {
+        /// Why, as a kind a program can act on.
+        reason: PluginLeftOutReason,
+        /// Why, for a person, naming the package and its hash.
+        detail: String,
+    },
+}
+
+/// Why the admissions in force leave an installation out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginLeftOutReason {
+    /// It is disabled here.
+    Disabled,
+    /// Its repository revoked its exact package hash.
+    Revoked,
+    /// Its manifest does not support this host's operating system or architecture.
+    Unsupported,
+    /// Its package is not whole in this host's store.
+    Incomplete,
+    /// Its package is past one of the package limits in force.
+    PastALimit,
+    /// What a worker would be handed about it cannot be made: a path or the record past its
+    /// bound, or a native bridge applied for it that cannot be read.
+    Unrecordable,
 }
 
 /// Parameters of `plugin.list`.

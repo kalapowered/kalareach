@@ -325,7 +325,10 @@ closes within about 30 seconds of its last request finishing, with no other chan
 
 `plugin.list` counts each installation's live bindings, and every release a worker still holds that
 no installation describes, from reports every worker makes after the read began. While a worker
-has not answered, a count is null rather than a guess. `plugin.remove` answers with the bindings
+has not answered, a count is null rather than a guess. It also says whether the admissions in force
+let new bindings use each installation and, where they do not, why: disabled, revoked, not for this
+host, not whole in the store, past a package limit, or a record the host cannot hand to a worker,
+each by kind and in words that name the package. `plugin.remove` answers with the bindings
 its own refresh found, which are the ones the workers are told to end, and with null when a worker
 did not answer or the admissions moved before the removal committed.
 

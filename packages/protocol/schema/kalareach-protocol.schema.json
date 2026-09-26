@@ -21111,6 +21111,49 @@
       ],
       "type": "object"
     },
+    "PluginAdmission": {
+      "description": "Whether the admissions in force let new bindings use an installation.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "New bindings may use it.",
+          "properties": {
+            "state": {
+              "const": "admitted",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The admissions leave it out, so no new binding uses it. A binding made before keeps or\nends as its release's state says.",
+          "properties": {
+            "detail": {
+              "description": "Why, for a person, naming the package and its hash.",
+              "type": "string"
+            },
+            "reason": {
+              "$ref": "#/$defs/PluginLeftOutReason",
+              "description": "Why, as a kind a program can act on."
+            },
+            "state": {
+              "const": "left_out",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "reason",
+            "detail"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "PluginAdmissions": {
       "additionalProperties": false,
       "description": "One part of a snapshot of admissions.",
@@ -21727,6 +21770,41 @@
         }
       ]
     },
+    "PluginLeftOutReason": {
+      "description": "Why the admissions in force leave an installation out.",
+      "oneOf": [
+        {
+          "const": "disabled",
+          "description": "It is disabled here.",
+          "type": "string"
+        },
+        {
+          "const": "revoked",
+          "description": "Its repository revoked its exact package hash.",
+          "type": "string"
+        },
+        {
+          "const": "unsupported",
+          "description": "Its manifest does not support this host's operating system or architecture.",
+          "type": "string"
+        },
+        {
+          "const": "incomplete",
+          "description": "Its package is not whole in this host's store.",
+          "type": "string"
+        },
+        {
+          "const": "past_a_limit",
+          "description": "Its package is past one of the package limits in force.",
+          "type": "string"
+        },
+        {
+          "const": "unrecordable",
+          "description": "What a worker would be handed about it cannot be made: a path or the record past its\nbound, or a native bridge applied for it that cannot be read.",
+          "type": "string"
+        }
+      ]
+    },
     "PluginListParams": {
       "additionalProperties": false,
       "description": "Parameters of `plugin.list`.",
@@ -21860,6 +21938,17 @@
       "additionalProperties": false,
       "description": "One installed plugin as `plugin.list` reports it.",
       "properties": {
+        "admission": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PluginAdmission"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Whether the admissions in force let new bindings use it, and why not where they do not:\nread in `plugin.list` at the revision the answer renders, and null there when they could\nnot be computed at it, and in every other answer, which reads none."
+        },
         "catalogue_id": {
           "description": "The repository it came from.",
           "type": "string"
@@ -21913,7 +22002,8 @@
         "enabled",
         "pinned",
         "revoked",
-        "live_bindings"
+        "live_bindings",
+        "admission"
       ],
       "type": "object"
     },

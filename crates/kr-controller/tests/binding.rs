@@ -48,6 +48,12 @@ use kr_protocol::worker::ReservationId;
 
 mod teardown;
 
+/// The catalogue's own builder of signed generations, for a release whose manifest names another
+/// platform. This suite uses one of its helpers.
+#[allow(dead_code)]
+#[path = "../../kr-plugin-catalogue/tests/support/mod.rs"]
+mod generations;
+
 /// How long a test waits for something the daemon does on its own: a round after a worker is
 /// recorded, the pass a change asks for, a closure. Generous, because a loaded machine is slow and
 /// none of these is timed by the product itself.
@@ -179,14 +185,26 @@ struct Hosted {
 
 impl Hosted {
     async fn start() -> Self {
-        let built = worker_beside_this_test();
+        Self::start_from(&fixture(), true).await
+    }
+
+    /// A daemon whose repository publishes what `source` holds, with the example package installed
+    /// and enabled from it. Where `workers` is false there is no worker program, for a test that
+    /// starts no session.
+    async fn start_from(source: &Path, workers: bool) -> Self {
         let tree = teardown::Tree::create();
-        // On the internal disk, and started once here, where nothing is timed.
         let worker = tree.root().join("kr-worker");
-        kr_ipc::testing::place_and_start_once(&built, &worker, &["--version"]);
+        if workers {
+            // On the internal disk, and started once here, where nothing is timed.
+            kr_ipc::testing::place_and_start_once(
+                &worker_beside_this_test(),
+                &worker,
+                &["--version"],
+            );
+        }
         let repository = tempfile::tempdir().expect("a directory on the internal disk");
         let published = repository.path().join("development");
-        copy_tree(&fixture(), &published);
+        copy_tree(source, &published);
         let example = install_the_example(&tree, &published).await;
         let environment = tree.environment();
         let mut hosted = Self {
@@ -399,9 +417,8 @@ impl Hosted {
         removed.affected_bindings
     }
 
-    /// The example package's live bindings as `plugin.list` counts them now: known only when every
-    /// worker answered its refresh at the revision the answer renders.
-    async fn counted(&self) -> Nullable<U64> {
+    /// The example package as `plugin.list` reports it now.
+    async fn summary(&self) -> wire::PluginSummary {
         let listed: wire::PluginListResult = self
             .client()
             .await
@@ -418,10 +435,31 @@ impl Hosted {
             .expect("decodes");
         listed
             .plugins
-            .iter()
+            .into_iter()
             .find(|summary| summary.plugin_id == plugin())
             .expect("the example package is installed")
-            .live_bindings
+    }
+
+    /// The example package's live bindings as `plugin.list` counts them now: known only when every
+    /// worker answered its refresh at the revision the answer renders.
+    async fn counted(&self) -> Nullable<U64> {
+        self.summary().await.live_bindings
+    }
+
+    /// The directory of the example package's copy in the catalogue's store.
+    fn package_copy(&self) -> PathBuf {
+        self.tree
+            .environment()
+            .state_dir()
+            .join("catalogue/repositories")
+            .join(&self.example.origin.enrolment_key)
+            .join("packages")
+            .join(
+                kr_plugin_sdk::digest::PayloadDigest::from_bytes(
+                    *self.example.package_digest.as_bytes(),
+                )
+                .to_string(),
+            )
     }
 
     /// Asks `plugin.list` until it counts `wanted` live bindings, or until the patience runs out,
@@ -993,7 +1031,7 @@ async fn a_lowered_package_limit_moves_the_admissions_to_a_new_revision() {
         after
             .left_out
             .iter()
-            .any(|(plugin_id, why)| *plugin_id == plugin() && why.contains("package_bytes")),
+            .any(|left| left.plugin_id == plugin() && left.detail.contains("package_bytes")),
         "{:?}",
         after.left_out
     );
@@ -1081,7 +1119,7 @@ async fn a_package_limit_whose_revision_cannot_be_raised_stays_out_of_force_unti
         after
             .left_out
             .iter()
-            .any(|(plugin_id, why)| *plugin_id == plugin() && why.contains("package_bytes")),
+            .any(|left| left.plugin_id == plugin() && left.detail.contains("package_bytes")),
         "{:?}",
         after.left_out
     );
@@ -1288,4 +1326,100 @@ async fn the_cadence_asks_a_worker_reporting_a_binding_due_to_end_again_until_it
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(hosted.pending().await.is_empty());
+}
+
+/// Why `plugin.list` says the admissions leave the example package out, where it says they do.
+fn left_out(summary: &wire::PluginSummary) -> (wire::PluginLeftOutReason, String) {
+    match &summary.admission.0 {
+        Some(wire::PluginAdmission::LeftOut { reason, detail }) => (*reason, detail.clone()),
+        other => panic!("the admissions leave it out, not {other:?}"),
+    }
+}
+
+/// `plugin.list` says whether the admissions in force let new bindings use each installation,
+/// and why not where they do not, by kind and in words that name the package: admitted, then
+/// disabled, then past a package limit the owner set, and, once a file of the store's copy is
+/// gone, not whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn plugin_list_says_why_the_admissions_leave_an_installation_out() {
+    use kr_protocol::hostinfo::configuration::{Change, ConfiguredEnrolmentBudgets};
+    let admitted = Nullable::some(wire::PluginAdmission::Admitted);
+    let mut hosted = Hosted::start_from(&fixture(), false).await;
+    assert_eq!(hosted.summary().await.admission, admitted);
+
+    hosted.change(Method::PluginDisable).await;
+    let (reason, detail) = left_out(&hosted.summary().await);
+    assert_eq!(reason, wire::PluginLeftOutReason::Disabled);
+    assert!(
+        detail.contains(plugin().as_str()) && detail.contains("disabled"),
+        "{detail}"
+    );
+    hosted.change(Method::PluginEnable).await;
+    assert_eq!(hosted.summary().await.admission, admitted);
+
+    hosted
+        .controller()
+        .apply_configuration(&Change::Enrolment(ConfiguredEnrolmentBudgets {
+            package_bytes: Nullable::some(1),
+            ..ConfiguredEnrolmentBudgets::default()
+        }))
+        .await
+        .expect("the owner's limit");
+    let (reason, detail) = left_out(&hosted.summary().await);
+    assert_eq!(reason, wire::PluginLeftOutReason::PastALimit);
+    assert!(
+        detail.contains(plugin().as_str()) && detail.contains("package_bytes"),
+        "{detail}"
+    );
+    hosted
+        .controller()
+        .apply_configuration(&Change::Enrolment(ConfiguredEnrolmentBudgets::default()))
+        .await
+        .expect("the limit lifted");
+    assert_eq!(hosted.summary().await.admission, admitted);
+
+    // The store's copy is read when the admissions are next computed, which a daemon that starts
+    // again does.
+    std::fs::remove_file(hosted.package_copy().join("README.md")).expect("a file of the copy");
+    hosted.restart().await;
+    let (reason, detail) = left_out(&hosted.summary().await);
+    assert_eq!(reason, wire::PluginLeftOutReason::Incomplete);
+    assert!(
+        detail.contains(plugin().as_str()) && detail.contains("README.md"),
+        "{detail}"
+    );
+}
+
+/// An installation whose own manifest names only another platform is listed as one this host
+/// does not support.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn plugin_list_names_an_installation_this_host_does_not_support() {
+    use kr_plugin_sdk::matching::{Architecture, OperatingSystem, PlatformSupport};
+    let home = tempfile::tempdir().expect("a directory on the internal disk");
+    let elsewhere = if kr_plugin_catalogue::this_host().os == Some(OperatingSystem::MacOs) {
+        PlatformSupport {
+            os: OperatingSystem::Linux,
+            architectures: vec![Architecture::X86_64],
+        }
+    } else {
+        PlatformSupport {
+            os: OperatingSystem::MacOs,
+            architectures: vec![Architecture::Aarch64],
+        }
+    };
+    let generation = generations::Generation::build(
+        home.path(),
+        generations::GenerationSpec {
+            platforms: Some(vec![elsewhere]),
+            ..generations::GenerationSpec::default()
+        },
+    )
+    .await;
+    let hosted = Hosted::start_from(&generation.directory(), false).await;
+    let (reason, detail) = left_out(&hosted.summary().await);
+    assert_eq!(reason, wire::PluginLeftOutReason::Unsupported);
+    assert!(
+        detail.contains(plugin().as_str()) && detail.contains("operating system"),
+        "{detail}"
+    );
 }

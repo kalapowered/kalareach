@@ -24,9 +24,10 @@ use kr_ipc::paths::HostPaths;
 use kr_protocol::catalogue::{
     CatalogueListParams, CatalogueListResult, CataloguePinParams, CataloguePinResult,
     CatalogueRemoveParams, CatalogueRemoveResult, CatalogueSummary, CatalogueSyncParams,
-    CatalogueSyncResult, PluginEnableParams, PluginEnableResult, PluginInstallParams,
-    PluginInstallResult, PluginListParams, PluginListResult, PluginPinParams, PluginPinResult,
-    PluginRemoveParams, PluginRemoveResult, PluginSummary,
+    CatalogueSyncResult, PluginAdmission, PluginEnableParams, PluginEnableResult,
+    PluginInstallParams, PluginInstallResult, PluginLeftOutReason, PluginListParams,
+    PluginListResult, PluginPinParams, PluginPinResult, PluginRemoveParams, PluginRemoveResult,
+    PluginSummary,
 };
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{PluginId, RepositoryGeneration};
@@ -369,6 +370,20 @@ fn line(plugin: &PluginSummary) -> String {
     if plugin.revoked {
         states.push("revoked by its repository");
     }
+    if let Some(PluginAdmission::LeftOut { reason, .. }) = &plugin.admission.0 {
+        match reason {
+            // What the states above already say.
+            PluginLeftOutReason::Disabled | PluginLeftOutReason::Revoked => {}
+            PluginLeftOutReason::Unsupported => states.push("not admitted: not for this host"),
+            PluginLeftOutReason::Incomplete => {
+                states.push("not admitted: not whole in this host's store");
+            }
+            PluginLeftOutReason::PastALimit => states.push("not admitted: past a package limit"),
+            PluginLeftOutReason::Unrecordable => {
+                states.push("not admitted: cannot be handed to a session");
+            }
+        }
+    }
     format!(
         "{} {} from {} ({})",
         plugin.plugin_id,
@@ -397,4 +412,45 @@ fn repo_line(catalogue: &CatalogueSummary) -> String {
         catalogue.entries.get(),
         catalogue.metadata_url
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn summary(admission: Nullable<PluginAdmission>) -> PluginSummary {
+        PluginSummary {
+            plugin_id: PluginId::new("kalareach/example-declarative").expect("a package"),
+            catalogue_id: "development".to_owned(),
+            version: "0.1.0".to_owned(),
+            package_digest: "00".repeat(32),
+            environment_id: kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid()),
+            enabled: true,
+            pinned: false,
+            revoked: false,
+            live_bindings: Nullable::null(),
+            admission,
+        }
+    }
+
+    /// A package the host leaves out says so beside its other states, and one it admits, or whose
+    /// admission the answer does not say, says nothing more.
+    #[test]
+    fn a_line_says_why_the_host_leaves_a_package_out() {
+        let past = summary(Nullable::some(PluginAdmission::LeftOut {
+            reason: PluginLeftOutReason::PastALimit,
+            detail: "past package_bytes".to_owned(),
+        }));
+        assert_eq!(
+            line(&past),
+            "kalareach/example-declarative 0.1.0 from development (enabled, not admitted: past a \
+             package limit)"
+        );
+        for admission in [Nullable::some(PluginAdmission::Admitted), Nullable::null()] {
+            assert_eq!(
+                line(&summary(admission)),
+                "kalareach/example-declarative 0.1.0 from development (enabled)"
+            );
+        }
+    }
 }

@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use kr_protocol::admission::{LiveRelease, PluginAdmissions};
+use kr_protocol::catalogue::PluginLeftOutReason;
 use kr_protocol::ids::SessionId;
 
 use crate::catalogue::admissions::Snapshot;
@@ -78,7 +79,10 @@ impl Controller {
                 snapshot
                     .left_out
                     .iter()
-                    .map(|(_, why)| format!("{why}, so no new binding uses it")),
+                    // A disabled installation is its owner's decision, and nothing anybody needs
+                    // telling.
+                    .filter(|left| left.reason != PluginLeftOutReason::Disabled)
+                    .map(|left| format!("{}, so no new binding uses it", left.detail)),
             );
         }
         for (session_id, refusal) in self.plugin_bridge.refusals() {
@@ -270,6 +274,7 @@ impl Controller {
                 revision: 0,
                 live: self.plugin_bridge.live(),
                 counts: None,
+                admissions: None,
             };
         };
         let asked: Vec<SessionId> = self
@@ -286,6 +291,7 @@ impl Controller {
             revision,
             live: self.plugin_bridge.live(),
             counts: self.plugin_bridge.counts_since(mark, revision),
+            admissions: None,
         }
     }
 
@@ -477,7 +483,8 @@ impl Controller {
         request: &kr_protocol::envelope::Request,
     ) -> kr_protocol::envelope::ControlFrame {
         if request.method.method() == Some(kr_protocol::method::Method::PluginList) {
-            let view = self.refreshed_view().await;
+            let mut view = self.refreshed_view().await;
+            view.admissions = self.current_snapshot(tokio::time::Instant::now()).await;
             return self
                 .catalogue
                 .read_frame(ingress, request, Some(&view))

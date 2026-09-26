@@ -18,6 +18,7 @@ use kr_protocol::admission::{
     AdmissionRevocation, AdmittedBridge, AdmittedBuild, AdmittedComponent, AdmittedPackage,
     FrameId, LiveRelease, PluginAdmissions, ReleaseOrigin, ReleaseState, RevocationPolicy,
 };
+use kr_protocol::catalogue::{PluginAdmission, PluginLeftOutReason};
 use kr_protocol::envelope::ControlFrame;
 use kr_protocol::ids::{EnvironmentId, PluginId, PublisherId};
 use kr_protocol::limits::{
@@ -43,12 +44,45 @@ pub struct Snapshot {
     pub packages: Vec<AdmittedPackage>,
     /// The state of every admitted release and of every release reported live.
     pub releases: Vec<ReleaseState>,
-    /// Every installation left out of `packages` for a reason other than being disabled, with
-    /// why: what the doctor names.
-    pub left_out: Vec<(PluginId, String)>,
+    /// Every installation left out of `packages`, with why: what `plugin.list` says, and, for
+    /// every reason but being disabled, what the doctor names.
+    pub left_out: Vec<LeftOut>,
+}
+
+/// One installation the admissions leave out, and why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeftOut {
+    /// The package.
+    pub plugin_id: PluginId,
+    /// Why, by kind.
+    pub reason: PluginLeftOutReason,
+    /// Why, for a person, naming the package and its hash.
+    pub detail: String,
 }
 
 impl Snapshot {
+    /// Returns whether these admissions let new bindings use the installation of `plugin_id` at
+    /// `package_digest`, and why not where they do not; `None` for one they do not name.
+    #[must_use]
+    pub fn admission_of(
+        &self,
+        plugin_id: &PluginId,
+        package_digest: PayloadDigest,
+    ) -> Option<PluginAdmission> {
+        if self.packages.iter().any(|package| {
+            package.plugin_id == *plugin_id && package.package_digest == digest(package_digest)
+        }) {
+            return Some(PluginAdmission::Admitted);
+        }
+        self.left_out
+            .iter()
+            .find(|left| left.plugin_id == *plugin_id)
+            .map(|left| PluginAdmission::LeftOut {
+                reason: left.reason,
+                detail: left.detail.clone(),
+            })
+    }
+
     /// Returns every release whose state the snapshot carries.
     #[must_use]
     pub fn covered(&self) -> BTreeSet<ReleaseKey> {
@@ -264,18 +298,33 @@ pub fn wire(
     admissions: &Admissions,
     bridge: &dyn Fn(&PluginId, PayloadDigest) -> BridgeLookup,
 ) -> Snapshot {
-    let mut left_out: Vec<(PluginId, String)> = admissions
+    let mut left_out: Vec<LeftOut> = admissions
         .not_admitted
         .iter()
-        // A disabled installation is its owner's decision, and nothing anybody needs telling.
-        .filter(|refused| !matches!(refused.reason, NotAdmittedReason::Disabled))
-        .map(|refused| (refused.plugin_id.clone(), refused.detail()))
+        .map(|refused| LeftOut {
+            plugin_id: refused.plugin_id.clone(),
+            reason: match refused.reason {
+                NotAdmittedReason::Disabled => PluginLeftOutReason::Disabled,
+                NotAdmittedReason::Revoked(_) => PluginLeftOutReason::Revoked,
+                NotAdmittedReason::Unsupported { .. } => PluginLeftOutReason::Unsupported,
+                NotAdmittedReason::Incomplete(_) => PluginLeftOutReason::Incomplete,
+                NotAdmittedReason::PastALimit(_) => PluginLeftOutReason::PastALimit,
+            },
+            detail: refused.detail(),
+        })
         .collect();
     let mut packages = Vec::new();
     for package in &admissions.packages {
         match admitted(package, bridge(&package.plugin_id, package.package_digest)) {
             Ok(record) => packages.push(record),
-            Err(why) => left_out.push((package.plugin_id.clone(), why)),
+            Err(why) => left_out.push(LeftOut {
+                plugin_id: package.plugin_id.clone(),
+                reason: PluginLeftOutReason::Unrecordable,
+                detail: format!(
+                    "{} at {} cannot be handed to a worker: {why}",
+                    package.plugin_id, package.package_digest
+                ),
+            }),
         }
     }
     let releases = admissions.releases.iter().map(state).collect();

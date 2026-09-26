@@ -2110,6 +2110,7 @@ async fn counts_read_at_an_earlier_revision_are_not_shown() {
             revision,
             live: std::collections::BTreeMap::new(),
             counts: Some(std::collections::BTreeMap::new()),
+            admissions: None,
         };
         let host = &host;
         async move {

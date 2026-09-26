@@ -44,7 +44,8 @@ pub fn key_of(release: &LiveRelease) -> ReleaseKey {
     )
 }
 
-/// What the workers reported, as `plugin.list` counts it.
+/// What `plugin.list` reads beside the catalogue's records: what the workers reported, as it
+/// counts it, and the admissions in force.
 #[derive(Clone, Debug, Default)]
 pub struct LiveView {
     /// The admission revision the counts were read at; counts read at another revision than the
@@ -54,6 +55,9 @@ pub struct LiveView {
     pub live: BTreeMap<ReleaseKey, (LiveRelease, bool)>,
     /// The counts from reports every worker made after the read began, where every worker did.
     pub counts: Option<BTreeMap<ReleaseKey, (LiveRelease, u64, bool)>>,
+    /// The admissions in force, where they could be computed; an answer that renders another
+    /// revision than theirs says nothing about any installation's admission.
+    pub admissions: Option<super::admissions::Snapshot>,
 }
 
 /// Where a member stands.

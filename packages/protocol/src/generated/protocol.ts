@@ -1288,6 +1288,25 @@ export type PluginInvalidationTrigger =
   | 'desktop_generation_changed'
   | 'profile_changed'
 /**
+ * Whether the admissions in force let new bindings use an installation.
+ */
+export type PluginAdmission =
+  | {
+      state: 'admitted'
+    }
+  | {
+      /**
+       * Why, for a person, naming the package and its hash.
+       */
+      detail: string
+      /**
+       * Why, as a kind a program can act on.
+       */
+      reason:
+        'disabled' | 'revoked' | 'unsupported' | 'incomplete' | 'past_a_limit' | 'unrecordable'
+      state: 'left_out'
+    }
+/**
  * One directory the owner authorised for repository work.
  */
 export type ProjectLocationId = string
@@ -16444,6 +16463,12 @@ export interface PluginEvidenceSubject {
  */
 export interface PluginSummary {
   /**
+   * Whether the admissions in force let new bindings use it, and why not where they do not:
+   * read in `plugin.list` at the revision the answer renders, and null there when they could
+   * not be computed at it, and in every other answer, which reads none.
+   */
+  admission: PluginAdmission | null
+  /**
    * The repository it came from.
    */
   catalogue_id: string
@@ -16505,6 +16530,12 @@ export interface PluginEnableResult {
  * The installation as it now stands.
  */
 export interface PluginSummary1 {
+  /**
+   * Whether the admissions in force let new bindings use it, and why not where they do not:
+   * read in `plugin.list` at the revision the answer renders, and null there when they could
+   * not be computed at it, and in every other answer, which reads none.
+   */
+  admission: PluginAdmission | null
   /**
    * The repository it came from.
    */
@@ -16616,6 +16647,12 @@ export interface PluginGrantResult {
  */
 export interface PluginSummary2 {
   /**
+   * Whether the admissions in force let new bindings use it, and why not where they do not:
+   * read in `plugin.list` at the revision the answer renders, and null there when they could
+   * not be computed at it, and in every other answer, which reads none.
+   */
+  admission: PluginAdmission | null
+  /**
    * The repository it came from.
    */
   catalogue_id: string
@@ -16712,6 +16749,12 @@ export interface PluginInstallResult {
  * The installation as it now stands.
  */
 export interface PluginSummary3 {
+  /**
+   * Whether the admissions in force let new bindings use it, and why not where they do not:
+   * read in `plugin.list` at the revision the answer renders, and null there when they could
+   * not be computed at it, and in every other answer, which reads none.
+   */
+  admission: PluginAdmission | null
   /**
    * The repository it came from.
    */
@@ -16813,6 +16856,12 @@ export interface LiveReleaseSummary {
  */
 export interface PluginSummary4 {
   /**
+   * Whether the admissions in force let new bindings use it, and why not where they do not:
+   * read in `plugin.list` at the revision the answer renders, and null there when they could
+   * not be computed at it, and in every other answer, which reads none.
+   */
+  admission: PluginAdmission | null
+  /**
    * The repository it came from.
    */
   catalogue_id: string
@@ -16878,6 +16927,12 @@ export interface PluginPinResult {
  * One installed plugin as `plugin.list` reports it.
  */
 export interface PluginSummary5 {
+  /**
+   * Whether the admissions in force let new bindings use it, and why not where they do not:
+   * read in `plugin.list` at the revision the answer renders, and null there when they could
+   * not be computed at it, and in every other answer, which reads none.
+   */
+  admission: PluginAdmission | null
   /**
    * The repository it came from.
    */

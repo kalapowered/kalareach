@@ -1058,7 +1058,7 @@ too, and so is any action a worker could not show did not run before the revocat
 
 | Command | What it does |
 | --- | --- |
-| `kr plugin list` | Lists the plugins installed in the environment |
+| `kr plugin list` | Lists the plugins installed in the environment, and why the host leaves any of them out of new sessions |
 | `kr plugin install <repository> <plugin> <version> --digest <hash> [--grant <capability>]...` | Installs a package from an enrolled repository, at exactly the hash named |
 | `kr plugin remove <plugin>` | Removes an installed plugin and closes its live bindings |
 | `kr plugin pin <plugin> [--digest <hash>]` | Holds it at one exact hash, or releases the pin when no hash is given |

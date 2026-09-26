@@ -751,12 +751,22 @@ impl CatalogueModule {
                     .admission_revision()
                     .map_err(ProtocolError::from)?;
                 let counts = view.counts.as_ref().filter(|_| view.revision == current);
+                let admissions = view
+                    .admissions
+                    .as_ref()
+                    .filter(|admissions| admissions.revision == current);
                 let mut plugins = Vec::with_capacity(views.len());
                 for installation in &views {
                     let mut summary = plugin_summary(installation)?;
                     let key = installed_key(&installation.installation);
                     summary.live_bindings = Nullable::from(counts.map(|counts| {
                         U64::new(counts.get(&key).map_or(0, |(_, count, _)| *count))
+                    }));
+                    summary.admission = Nullable::from(admissions.and_then(|admissions| {
+                        admissions.admission_of(
+                            &installation.installation.plugin_id,
+                            installation.installation.package_digest,
+                        )
                     }));
                     plugins.push(summary);
                 }
@@ -1811,6 +1821,8 @@ fn plugin_summary(view: &InstallationView) -> Answer<wire::PluginSummary> {
         revoked: view.revoked,
         // The workers' own records are what counts bindings, and this answer asks none of them.
         live_bindings: Nullable::null(),
+        // The admissions are computed for `plugin.list` alone, beside its refresh.
+        admission: Nullable::null(),
     })
 }
 
