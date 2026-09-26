@@ -407,6 +407,26 @@ pub(crate) fn home_directory() -> Option<PathBuf> {
         .filter(|path| !path.as_os_str().is_empty())
 }
 
+/// Another group this process's user belongs to than the one a file written in `directory` is
+/// given, when there is one.
+///
+/// A new file takes its directory's group on macOS and this process's on Linux, so a test finds out
+/// which by writing one.
+#[cfg(all(test, unix))]
+pub(crate) fn another_group(directory: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let probe = directory.join(".group-probe");
+    std::fs::write(&probe, b"").expect("a probe");
+    let given = std::fs::metadata(&probe).expect("the probe").gid();
+    std::fs::remove_file(&probe).expect("the probe goes");
+    rustix::process::getgroups()
+        .expect("this process's groups")
+        .into_iter()
+        .map(rustix::process::Gid::as_raw)
+        .find(|group| *group != given)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,6 +459,53 @@ mod tests {
             .map(|entry| entry.expect("an entry").file_name())
             .collect();
         assert_eq!(names, ["settings.json"], "no copy is left beside it");
+    }
+
+    /// KR-REQ-11.50: on macOS and Linux a document whose group is not the one a replacement written
+    /// beside it would get is not replaced: the copy that would take its place is refused, and so
+    /// is the document, before anything is written. The document keeps its bytes and its group.
+    #[cfg(unix)]
+    #[test]
+    fn a_document_of_another_group_is_not_replaced() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let directory = tempfile::tempdir().expect("a directory");
+        let Some(group) = another_group(directory.path()) else {
+            println!(
+                "this user belongs to one group only, so the group case runs as a decision here"
+            );
+            return;
+        };
+        let document = directory.path().join("settings.json");
+        std::fs::write(&document, b"first").expect("writes");
+        std::os::unix::fs::chown(&document, None, Some(group))
+            .expect("the document is given another group of this user's");
+        let group_of = |path: &Path| std::fs::metadata(path).expect("reads").gid();
+        match write_atomically(&document, b"second", PRIVATE) {
+            Ok(()) => panic!(
+                "replaced, and its group is now {} rather than {group}",
+                group_of(&document)
+            ),
+            Err(refused) => assert!(
+                matches!(refused, ControllerError::PermissionDenied { ref detail }
+                    if detail.contains(&format!("group {group}"))),
+                "{refused:?}"
+            ),
+        }
+        assert_eq!(std::fs::read(&document).expect("reads it"), b"first");
+        assert_eq!(group_of(&document), group);
+        let names: Vec<_> = std::fs::read_dir(directory.path())
+            .expect("lists the directory")
+            .map(|entry| entry.expect("an entry").file_name())
+            .collect();
+        assert_eq!(names, ["settings.json"], "no copy is left beside it");
+        let refused = guard_access_controls(&document, "do it by hand")
+            .expect_err("refused before anything is written");
+        assert!(
+            matches!(refused, ControllerError::PermissionDenied { ref detail }
+                if detail.contains(&format!("group {group}")) && detail.ends_with("do it by hand")),
+            "{refused:?}"
+        );
     }
 
     /// The Linux probe's answers, including the one that is not an answer.

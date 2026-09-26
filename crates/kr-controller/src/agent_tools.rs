@@ -3634,6 +3634,46 @@ mod tests {
         );
     }
 
+    /// KR-REQ-11.50: on macOS and Linux a configuration document whose group is not the one its
+    /// replacement would get is refused before anything is written, naming both, and keeps its
+    /// bytes and its group. The control is every other installation here: the person's own
+    /// document is replaced as before.
+    #[cfg(unix)]
+    #[test]
+    fn a_configuration_of_another_group_is_refused_before_anything_is_written() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let tree = Tree::create();
+        let Some(group) = crate::catalogue::files::another_group(&tree.home()) else {
+            println!(
+                "this user belongs to one group only, so the group case runs as a decision here"
+            );
+            return;
+        };
+        let document = tree.home().join(".claude.json");
+        std::fs::write(&document, "{\"theme\": \"dark\"}\n").expect("writes");
+        std::os::unix::fs::chown(&document, None, Some(group))
+            .expect("the document is given another group of this user's");
+        let group_of = |path: &Path| std::fs::metadata(path).expect("reads").gid();
+        let before = files_under(&tree.root);
+        match tree
+            .installer()
+            .install(&params(AgentTarget::ClaudeCode, InstallScope::User))
+        {
+            Ok(_) => panic!(
+                "installed, and the document's group is now {} rather than {group}",
+                group_of(&document)
+            ),
+            Err(refused) => assert!(
+                matches!(refused, ControllerError::PermissionDenied { ref detail }
+                    if detail.contains(&format!("group {group}"))),
+                "{refused:?}"
+            ),
+        }
+        assert_eq!(files_under(&tree.root), before, "nothing is written");
+        assert_eq!(group_of(&document), group);
+    }
+
     /// Where each agent's skills and configuration live under a user's home, name by name.
     fn user_layout(agent: AgentTarget) -> (&'static [&'static str], &'static [&'static str]) {
         match agent {
