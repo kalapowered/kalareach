@@ -1186,8 +1186,7 @@ fn compact(profile: &cap_std::fs::Dir, text: &str) -> Result<()> {
         .map_err(ProjectError::staging)?;
     file.sync_data().map_err(ProjectError::staging)?;
     drop(file);
-    profile
-        .rename(&beside, profile, TEMPORARY_MANIFEST_FILE)
+    kr_flush::retry_while_held(|| profile.rename(&beside, profile, TEMPORARY_MANIFEST_FILE))
         .map_err(ProjectError::staging)?;
     durable(profile)
 }

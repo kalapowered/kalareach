@@ -753,7 +753,7 @@ impl Journal {
             let mut file = std::fs::File::create(&partial)?;
             file.write_all(&bytes)?;
             file.sync_all()?;
-            std::fs::rename(&partial, &self.path)?;
+            kr_flush::retry_while_held(|| std::fs::rename(&partial, &self.path))?;
             flush_directory(&self.directory, NameKind::File)
         })();
         written.map_err(|source| {

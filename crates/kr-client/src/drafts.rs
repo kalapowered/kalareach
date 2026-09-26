@@ -1058,7 +1058,7 @@ impl DraftStore {
         write_whole(&temporary, bytes).map_err(|source| storage(stored(&temporary), source))?;
         // A rename within one directory replaces the name in one step, so a reader sees the old
         // contents or the new ones and never a file half written.
-        if let Err(source) = std::fs::rename(&temporary, path) {
+        if let Err(source) = kr_flush::retry_while_held(|| std::fs::rename(&temporary, path)) {
             let _ = std::fs::remove_file(&temporary);
             return Err(storage(stored(path), source).into());
         }
