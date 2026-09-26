@@ -620,11 +620,13 @@ impl WorkerTerminal {
         client
             .request(
                 Method::EventsSubscribe,
+                // From the start of what the session retains, so what the shell wrote before this
+                // terminal attached, its prompt among it, arrives too.
                 &kr_protocol::recovery::EventsSubscribeParams {
                     session_id,
                     attachment_id,
                     streams,
-                    from_cursor: Nullable::null(),
+                    from_cursor: Nullable::some(kr_protocol::scalars::U64::new(0)),
                 },
             )
             .await
@@ -727,9 +729,10 @@ impl WorkerTerminal {
                     self.text()
                 ),
                 Err(_) => panic!(
-                    "{what}: waited {:?} for {pattern:?}: {}",
+                    "{what}: waited {:?} for {pattern:?}; the session wrote {} bytes: {:?}",
                     started.elapsed(),
-                    self.text()
+                    self.seen.len(),
+                    self.seen
                 ),
             }
         }
@@ -878,6 +881,9 @@ async fn the_first_owner_is_not_confirmed_in_a_real_workers_session_without_its_
     let session_id = host.session().await;
     let environment = host.tree.environment();
     let mut terminal = WorkerTerminal::attach(&environment, session_id).await;
+    terminal
+        .shown("PS ", "the session's shell prompts, as it retains")
+        .await;
     let kr_path = kr();
     let roots = format!(
         "$env:KR_RUNTIME_DIR = '{}'; $env:KR_STATE_DIR = '{}'",
