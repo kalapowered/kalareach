@@ -39,7 +39,9 @@ pub(crate) fn create_directory_durably(path: &Path) -> Result<bool> {
 /// across; an access-control list is not, and reapplying one needs the platform's own calls. An
 /// agent's configuration can hold a credential, and somebody who restricted it beyond the mode bits
 /// meant it, so a document carrying one is refused before anything is written rather than quietly
-/// weakened. `instead` says what to do about a refusal, in the caller's own words.
+/// weakened. So is one whose owner or group is not the one the replacement would get: on macOS and
+/// Linux a document of root's, or of another group, in a directory this user may write would
+/// become this user's. `instead` says what to do about a refusal, in the caller's own words.
 pub(crate) fn guard_access_controls(path: &Path, instead: &str) -> Result<()> {
     if !path.exists() {
         return Ok(());
@@ -72,7 +74,77 @@ pub(crate) fn guard_access_controls(path: &Path, instead: &str) -> Result<()> {
             ),
         });
     }
+    // The replacement belongs to this process's user and to the group the directory gives it, and
+    // the rename hands both to the document. The write compares the copy it made; this is the same
+    // comparison, made before anything is installed.
+    #[cfg(unix)]
+    if let Some(refusal) = owners_refusal(
+        path,
+        Owners::of(&std::fs::metadata(path).map_err(storage)?),
+        Owners::of_new_file_in(parent)?,
+    ) {
+        return Err(ControllerError::PermissionDenied {
+            detail: format!("{refusal}; {instead}"),
+        });
+    }
     Ok(())
+}
+
+/// Who a file belongs to.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Owners {
+    user: u32,
+    group: u32,
+}
+
+#[cfg(unix)]
+impl Owners {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+        Self {
+            user: metadata.uid(),
+            group: metadata.gid(),
+        }
+    }
+
+    /// Who a file this process creates in `directory` belongs to.
+    ///
+    /// The user this process acts as, and a group by the platform's rule: on Linux the group this
+    /// process acts as, unless the directory passes its own on (its set-group-identifier bit), and
+    /// elsewhere, macOS among them, the directory's.
+    fn of_new_file_in(directory: &Path) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let directory = std::fs::metadata(directory).map_err(storage)?;
+        let passes_its_group_on = directory.mode() & 0o2000 != 0;
+        let group = if cfg!(target_os = "linux") && !passes_its_group_on {
+            rustix::process::getegid().as_raw()
+        } else {
+            directory.gid()
+        };
+        Ok(Self {
+            user: rustix::process::geteuid().as_raw(),
+            group,
+        })
+    }
+}
+
+/// Why replacing `path`, which `document` owns, with a file `replacement` owns would change who can
+/// read or change it, or nothing when it would not.
+#[cfg(unix)]
+fn owners_refusal(path: &Path, document: Owners, replacement: Owners) -> Option<String> {
+    (document != replacement).then(|| {
+        format!(
+            "{} belongs to user {} and group {}, and a replacement written here would belong to \
+             user {} and group {}, so replacing it would change who can read or change it",
+            display(path),
+            document.user,
+            document.group,
+            replacement.user,
+            replacement.group
+        )
+    })
 }
 
 /// Returns true when the file carries access controls its mode bits do not describe.
@@ -223,35 +295,57 @@ const NOT_CARRIED: &str =
 const NOT_CARRIED: &str = "has an owner or an access-control list that a new file in its directory \
      would not be given, and changing it here would change who can read it";
 
-/// What a copy that would change who can read the document it replaces is given.
-#[cfg(not(windows))]
-const COPY_DIFFERS: &str = "is given an access-control list by the directory itself";
-
-/// What a copy that would change who can read the document it replaces is given.
-#[cfg(windows)]
-const COPY_DIFFERS: &str =
-    "is given another owner or access-control list than the file it would replace";
-
-/// Returns true when the copy about to take `document`'s place would change who can read it.
+/// Why the copy about to take `document`'s place would change who can read it, or nothing when it
+/// would not.
 ///
 /// On macOS and Linux the copy was created with the document's mode bits, so what it can differ in
-/// is an access-control list its directory gave it.
+/// is an access-control list its directory gave it, and who it belongs to: this process's user, and
+/// the group the directory gave it.
 #[cfg(not(windows))]
-fn copy_changes_access(_copy: &std::fs::File, temporary: &Path, _document: &Path) -> Result<bool> {
-    extended_access_controls(temporary)
+fn copy_refusal(copy: &std::fs::File, temporary: &Path, document: &Path) -> Result<Option<String>> {
+    let parent = document.parent().unwrap_or_else(|| Path::new("."));
+    if extended_access_controls(temporary)? {
+        return Ok(Some(format!(
+            "a new file in {} is given an access-control list by the directory itself, so \
+             replacing {} here would change who can read it",
+            display(parent),
+            display(document)
+        )));
+    }
+    #[cfg(unix)]
+    let refusal = owners_refusal(
+        document,
+        Owners::of(&std::fs::metadata(document).map_err(storage)?),
+        Owners::of(&copy.metadata().map_err(storage)?),
+    );
+    #[cfg(not(unix))]
+    let refusal = {
+        let _ = copy;
+        None
+    };
+    Ok(refusal)
 }
 
-/// Returns true when the copy about to take `document`'s place would change who can read it.
+/// Why the copy about to take `document`'s place would change who can read it, or nothing when it
+/// would not.
 ///
 /// On Windows the copy's owner and lists, read through the handle that created it, are compared
 /// with the document's, read again now, whole.
 #[cfg(windows)]
-fn copy_changes_access(copy: &std::fs::File, temporary: &Path, document: &Path) -> Result<bool> {
+fn copy_refusal(copy: &std::fs::File, temporary: &Path, document: &Path) -> Result<Option<String>> {
+    let parent = document.parent().unwrap_or_else(|| Path::new("."));
     let copy = kr_ipc::paths::FileAccess::read(copy)
         .map_err(|refusal| refused_read(temporary, refusal))?;
-    let document = kr_ipc::paths::FileAccess::of(document)
+    let read = kr_ipc::paths::FileAccess::of(document)
         .map_err(|refusal| refused_read(document, refusal))?;
-    Ok(copy != document)
+    Ok((copy != read).then(|| {
+        format!(
+            "a new file in {} is given another owner or access-control list than the file it \
+             would replace, so replacing {} here would change who can read it",
+            display(parent),
+            display(document)
+        )
+    }))
 }
 
 /// Makes a directory's own entries durable.
@@ -340,26 +434,18 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8], default_mode: u32) -> 
     options.read(true);
     let mut file = options.open(&temporary).map_err(storage)?;
     // The copy that is about to take an existing file's place, before anything is written into it.
-    // A directory can give what is created in it access its own files do not have, and the rename
-    // below would hand that to the document being replaced. A check that cannot be made refuses as
-    // one that fails does, and neither leaves the copy behind.
-    let changes = if path.exists() {
-        copy_changes_access(&file, &temporary, path)
-    } else {
-        Ok(false)
+    // A directory can give what is created in it access, an owner or a group its own files do not
+    // have, and the rename below would hand that to the document being replaced. A check that
+    // cannot be made refuses as one that fails does, and neither leaves the copy behind.
+    let refused = match path.exists().then(|| copy_refusal(&file, &temporary, path)) {
+        None | Some(Ok(None)) => None,
+        Some(Ok(Some(detail))) => Some(ControllerError::PermissionDenied { detail }),
+        Some(Err(error)) => Some(error),
     };
-    if !matches!(changes, Ok(false)) {
+    if let Some(refused) = refused {
         drop(file);
         let _ = std::fs::remove_file(&temporary);
-        changes?;
-        return Err(ControllerError::PermissionDenied {
-            detail: format!(
-                "a new file in {} {COPY_DIFFERS}, so replacing {} here would change who can read \
-                 it",
-                display(parent),
-                display(path)
-            ),
-        });
+        return Err(refused);
     }
     file.write_all(bytes).map_err(storage)?;
     // The bytes reach the disk before the rename that publishes them, and the directory entry
@@ -506,6 +592,75 @@ mod tests {
                 if detail.contains(&format!("group {group}")) && detail.ends_with("do it by hand")),
             "{refused:?}"
         );
+    }
+
+    /// KR-REQ-11.50: the decision the guard and the copy check make on macOS and Linux, with the
+    /// owners given, since a test cannot make another user's file: a document of another user, or
+    /// of another group, is refused, naming the document and both owners, and the person's own is
+    /// not. Where this user belongs to one group only, this is the group case too.
+    #[cfg(unix)]
+    #[test]
+    fn a_document_another_user_or_group_owns_is_refused_naming_both() {
+        let path = Path::new("/home/someone/.claude.json");
+        let own = Owners {
+            user: 501,
+            group: 20,
+        };
+        for (document, named) in [
+            (Owners { user: 0, group: 20 }, "user 0 and group 20"),
+            (
+                Owners {
+                    user: 501,
+                    group: 80,
+                },
+                "user 501 and group 80",
+            ),
+        ] {
+            let refusal = owners_refusal(path, document, own).expect("refused");
+            assert!(
+                refusal.contains("/home/someone/.claude.json")
+                    && refusal.contains(named)
+                    && refusal.contains("would belong to user 501 and group 20"),
+                "{refusal}"
+            );
+        }
+        assert_eq!(owners_refusal(path, own, own), None, "the person's own");
+    }
+
+    /// The owners a replacement is taken to get are the ones a file made in its directory gets:
+    /// in a directory that passes its group on to what is made in it, and in one that does not.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_file_gets_the_owners_the_guard_expects() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let made = |directory: &Path| {
+            let probe = directory.join("probe");
+            std::fs::write(&probe, b"").expect("a probe");
+            let owners = Owners::of(&std::fs::metadata(&probe).expect("the probe"));
+            std::fs::remove_file(&probe).expect("the probe goes");
+            owners
+        };
+        let directory = tempfile::tempdir().expect("a directory");
+        assert_eq!(
+            Owners::of_new_file_in(directory.path()).expect("reads"),
+            made(directory.path())
+        );
+        let Some(group) = another_group(directory.path()) else {
+            println!("this user belongs to one group only, so no directory passes another on here");
+            return;
+        };
+        let passing = directory.path().join("passing");
+        std::fs::create_dir(&passing).expect("a directory");
+        std::os::unix::fs::chown(&passing, None, Some(group))
+            .expect("another group of this user's");
+        std::fs::set_permissions(&passing, std::fs::Permissions::from_mode(0o2700))
+            .expect("the directory passes its group on");
+        assert_eq!(
+            Owners::of_new_file_in(&passing).expect("reads"),
+            made(&passing)
+        );
+        assert_eq!(made(&passing).group, group);
     }
 
     /// The Linux probe's answers, including the one that is not an answer.
