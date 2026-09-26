@@ -38,14 +38,17 @@ pub type Locate = Arc<dyn Fn() -> Result<EnvironmentPaths, String> + Send + Sync
 /// Where one view's states go: the page's channel for it.
 pub type Publish = Arc<dyn Fn(TerminalViewState) + Send + Sync>;
 
-/// One open view, as the registry holds it.
+/// One view whose task is running, as the registry holds it.
+///
+/// A view is held until its task has ended, whether or not it has been told to close, so every
+/// close can wait for the same end.
 struct Held {
     /// The label of the web view whose page opened it.
     page: String,
     /// How the page's commands reach the view's task.
     commands: tokio::sync::mpsc::UnboundedSender<view::Command>,
-    /// The view's task, once it has been started.
-    task: Option<tauri::async_runtime::JoinHandle<()>>,
+    /// Becomes true once the view's task has ended.
+    ended: tokio::sync::watch::Receiver<bool>,
 }
 
 /// The raw terminal views this application holds open.
@@ -95,27 +98,26 @@ impl TerminalViews {
     ) -> String {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (ending, ended) = tokio::sync::watch::channel(false);
         // Held before the task starts, so a close that arrives at once finds it.
         self.lock().insert(
             id,
             Held {
                 page: page.to_owned(),
                 commands,
-                task: None,
+                ended,
             },
         );
         let held = Arc::clone(&self.held);
         let locate = Arc::clone(&self.locate);
-        let task = tauri::async_runtime::spawn(async move {
+        tauri::async_runtime::spawn(async move {
             view::run(&locate, session_id, dimensions, receiver, &publish).await;
-            // A view that has ended is not held: its page is told, and nothing more reaches it.
+            // Not held once it has ended, and only then is every close waiting for it told.
             held.lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&id);
+            let _ = ending.send(true);
         });
-        if let Some(entry) = self.lock().get_mut(&id) {
-            entry.task = Some(task);
-        }
         id.to_string()
     }
 
@@ -130,18 +132,22 @@ impl TerminalViews {
     }
 
     /// Closes a view and returns once its task has ended: it detaches, closes its link and publishes
-    /// nothing more. Closing a view that has already ended, or was never open, does nothing.
+    /// nothing more. Every close waits for that end, however many arrive and whatever asked the view
+    /// to close first. Closing a view that has already ended, or was never open, does nothing.
     pub async fn close(&self, view: &str) {
         let Ok(id) = view.parse::<u64>() else {
             return;
         };
-        let Some(entry) = self.lock().remove(&id) else {
-            return;
+        let mut ended = {
+            let held = self.lock();
+            let Some(entry) = held.get(&id) else {
+                return;
+            };
+            let _ = entry.commands.send(view::Command::Close);
+            entry.ended.clone()
         };
-        let _ = entry.commands.send(view::Command::Close);
-        if let Some(task) = entry.task {
-            let _ = task.await;
-        }
+        // A task that ends drops its side, which also ends the wait.
+        let _ = ended.wait_for(|ended| *ended).await;
     }
 
     /// What a page loading tells the views: when the page `page` starts loading again, every view it
@@ -151,20 +157,14 @@ impl TerminalViews {
         if event != tauri::webview::PageLoadEvent::Started {
             return;
         }
-        let mut held = self.lock();
-        let leaving: Vec<u64> = held
-            .iter()
-            .filter(|(_, entry)| entry.page == page)
-            .map(|(id, _)| *id)
-            .collect();
-        for id in leaving {
-            if let Some(entry) = held.remove(&id) {
-                let _ = entry.commands.send(view::Command::Close);
-            }
+        // Each is told to close and ends on its own; it stays held until then, so a close that
+        // follows still waits for it.
+        for entry in self.lock().values().filter(|entry| entry.page == page) {
+            let _ = entry.commands.send(view::Command::Close);
         }
     }
 
-    /// How many views are open.
+    /// How many views have not yet ended.
     #[must_use]
     pub fn held(&self) -> usize {
         self.lock().len()

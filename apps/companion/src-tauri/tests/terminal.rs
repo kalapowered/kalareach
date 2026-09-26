@@ -972,6 +972,82 @@ async fn a_close_during_a_pending_open_leaves_nothing() {
     }
 }
 
+/// Every close returns only once the view has ended: two closes at once, or a close after the page
+/// has loaded again, each wait for the view's task, so nothing it publishes or holds outlives the
+/// call that closed it.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_close_returns_only_once_the_view_has_ended() {
+    use std::sync::Condvar;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    for after_a_page_load in [false, true] {
+        let mut worker = ScriptedWorker::start(Challenge::Answered);
+        let views = Arc::new(companion_tauri::terminal::TerminalViews::at(worker.paths()));
+        // The view's first state is held inside its publication until the test opens the gate.
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let published = Arc::new(AtomicUsize::new(0));
+        let publish: companion_tauri::terminal::Publish = {
+            let gate = Arc::clone(&gate);
+            let published = Arc::clone(&published);
+            Arc::new(move |_state| {
+                published.fetch_add(1, Ordering::SeqCst);
+                let (open, opened) = &*gate;
+                let mut open = open.lock().expect("the gate");
+                while !*open {
+                    open = opened.wait(open).expect("the gate");
+                }
+            })
+        };
+        let view = views.open("main", worker.session_id, Dimensions::new(10, 2), publish);
+        let mut link = worker.link().await;
+        link.attach().await;
+        tokio::time::timeout(WATCHDOG, async {
+            while published.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the view is publishing its first state");
+        if after_a_page_load {
+            views.page_load("main", tauri::webview::PageLoadEvent::Started);
+        }
+        let closing = |views: &Arc<companion_tauri::terminal::TerminalViews>| {
+            let views = Arc::clone(views);
+            let view = view.clone();
+            tokio::spawn(async move { views.close(&view).await })
+        };
+        let first = closing(&views);
+        let second = closing(&views);
+        tokio::time::sleep(QUIET).await;
+        assert!(
+            !first.is_finished() && !second.is_finished(),
+            "page load first: {after_a_page_load}: no close returns while the view is still running"
+        );
+        {
+            let (open, opened) = &*gate;
+            *open.lock().expect("the gate") = true;
+            opened.notify_all();
+        }
+        tokio::time::timeout(WATCHDOG, first)
+            .await
+            .expect("the first close returns")
+            .expect("the first close");
+        tokio::time::timeout(WATCHDOG, second)
+            .await
+            .expect("the second close returns")
+            .expect("the second close");
+        assert_eq!(views.held(), 0);
+        let sent = link.closed().await;
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].method, Method::SessionDetach.to_string());
+        assert_eq!(
+            published.load(Ordering::SeqCst),
+            1,
+            "nothing is published after a close"
+        );
+    }
+}
+
 /// A page that starts loading again closes the views it opened, and only those; a finished load
 /// closes nothing.
 #[tokio::test(flavor = "multi_thread")]
