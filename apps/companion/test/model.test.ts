@@ -483,6 +483,61 @@ describe('the raw terminal', () => {
     expect(stretchesOf(line).map((stretch) => stretch.column)).toEqual([0, 2, 3, 5, 6])
   })
 
+  it('draws a piece on a phone in exactly its cells, and one a phone cannot measure as blank cells', () => {
+    const at = (column: number, cells: number, text: string) => ({
+      column,
+      cells,
+      text,
+      rendition: PLAIN,
+      hyperlink: null
+    })
+    const line = {
+      row: '1',
+      soft_wrapped: false,
+      truncated: false,
+      // Native code sends a phone only plain ASCII; these did not come from it.
+      pieces: [at(0, 2, '\u{4e2d}'), at(2, 1, 'a\u{1b}'), at(3, 3, 'bcdef'), at(6, 3, 'g')]
+    }
+    expect(stretchesOf(line).map((stretch) => stretch.text)).toEqual(['  ', ' ', 'bcd', 'g  '])
+    expect(stretchesOf(line).map((stretch) => stretch.column)).toEqual([0, 2, 3, 6])
+  })
+
+  it('draws an underline on a phone in its own style and colour', () => {
+    const palette = terminalScreen('8a7b6c50-22bb-4c3d-8e4f-000000000101', { columns: 80, rows: 8 })
+      .palette
+    expect(styleOf({ ...PLAIN, underline: 'single' }, palette)).toMatchObject({
+      textDecorationLine: 'underline',
+      textDecorationStyle: 'solid'
+    })
+    expect(styleOf({ ...PLAIN, underline: 'double' }, palette).textDecorationStyle).toBe('double')
+    expect(styleOf({ ...PLAIN, underline: 'curly' }, palette).textDecorationStyle).toBe('wavy')
+    expect(styleOf({ ...PLAIN, underline: 'dotted' }, palette).textDecorationStyle).toBe('dotted')
+    expect(styleOf({ ...PLAIN, underline: 'dashed' }, palette).textDecorationStyle).toBe('dashed')
+    expect(
+      styleOf({ ...PLAIN, underline: 'curly', underline_colour: { indexed: 1 } }, palette)
+        .textDecorationColor
+    ).toBe('#a2352e')
+    expect(styleOf({ ...PLAIN, underline: 'single' }, palette).textDecorationColor).toBeUndefined()
+  })
+
+  it('keeps the background of faint and invisible text on a phone', () => {
+    const palette = terminalScreen('8a7b6c50-22bb-4c3d-8e4f-000000000101', { columns: 80, rows: 8 })
+      .palette
+    const faint = styleOf({ ...PLAIN, faint: true, background: { indexed: 196 } }, palette)
+    expect(faint.opacity).toBeUndefined()
+    expect(faint.color).toBe('rgba(220, 220, 218, 0.5)')
+    expect(faint.backgroundColor).toBe('#ff0000')
+    const invisible = styleOf(
+      { ...PLAIN, invisible: true, underline: 'single', background: { indexed: 196 } },
+      palette
+    )
+    expect(invisible.visibility).toBeUndefined()
+    expect(invisible.color).toBe('transparent')
+    expect(invisible.backgroundColor).toBe('#ff0000')
+    // The underline stays, in the colour the text would have had, as the desktop draws it.
+    expect(invisible.textDecorationColor).toBe('#dcdcda')
+  })
+
   it('names what a screen warns of, in the words and the order both views show', () => {
     const whole = terminalScreen('8a7b6c50-22bb-4c3d-8e4f-000000000101', { columns: 80, rows: 8 })
     expect(warningsOf({ ...whole, replaced: 0 })).toEqual([])

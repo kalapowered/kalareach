@@ -2,9 +2,10 @@
  * Drawing a view's screen as text on a phone.
  *
  * A phone has no terminal renderer and no parser: each piece of a line becomes a text node with a
- * style, at its column, and the cells no piece covers are spaces. Every piece a phone is sent is
- * plain ASCII or blank, a cell per character, so in a monospaced font the columns line up without
- * anything being measured.
+ * style, at its column, and the cells no piece covers are spaces. Native code sends a phone only
+ * pieces of printable ASCII, a cell per character, so in a monospaced font the columns line up
+ * without anything being measured. A piece that is anything else did not come from native code, and
+ * a phone cannot say how wide it would draw, so it is drawn as blank cells.
  */
 
 import type { CSSProperties } from 'react'
@@ -12,7 +13,6 @@ import type { CSSProperties } from 'react'
 import type { CellRendition, PaletteState } from '@kalareach/protocol'
 
 import type { TerminalLine, TerminalPiece } from '../host/port'
-import { drawableText } from './frame'
 
 type Colour = CellRendition['foreground']
 
@@ -61,32 +61,61 @@ function indexed(index: number, palette: PaletteState): string {
 }
 
 /** A cell colour as CSS, with `fallback` for the default. */
-function css(colour: Colour, palette: PaletteState, fallback: string): string {
+function css<Fallback>(colour: Colour, palette: PaletteState, fallback: Fallback): string | Fallback {
   if (typeof colour !== 'object') return fallback
   if ('indexed' in colour) return indexed(Math.min(255, Math.max(0, colour.indexed)), palette)
   return hex(colour.direct.red, colour.direct.green, colour.direct.blue)
 }
 
-/** How one piece is drawn: its colours, with reverse video swapping them, and its attributes. */
+/** A colour from `hex` at half strength, which is how faint text is drawn. */
+function halfStrength(colour: string): string {
+  const part = (at: number) => parseInt(colour.slice(at, at + 2), 16)
+  return `rgba(${part(1)}, ${part(3)}, ${part(5)}, 0.5)`
+}
+
+/** The line each underline style is drawn with. */
+const UNDERLINE_STYLE: Readonly<
+  Record<Exclude<CellRendition['underline'], 'none'>, CSSProperties['textDecorationStyle']>
+> = {
+  single: 'solid',
+  double: 'double',
+  curly: 'wavy',
+  dotted: 'dotted',
+  dashed: 'dashed'
+}
+
+/**
+ * How one piece is drawn: its colours, with reverse video swapping them, and its attributes.
+ *
+ * Faint text is drawn at half strength and invisible text in no colour, each over the piece's own
+ * background, as the desktop's renderer draws them; an invisible piece keeps its underline. CSS
+ * draws every line of one element in one style and colour, so a strikethrough or an overline on an
+ * underlined piece takes the underline's.
+ */
 export function styleOf(rendition: CellRendition, palette: PaletteState): CSSProperties {
   const foreground = hex(palette.foreground.red, palette.foreground.green, palette.foreground.blue)
   const background = hex(palette.background.red, palette.background.green, palette.background.blue)
   let colour = css(rendition.foreground, palette, foreground)
   let fill = css(rendition.background, palette, background)
   if (rendition.reverse) [colour, fill] = [fill, colour]
+  const underlined = rendition.underline !== 'none'
   const lines = [
-    rendition.underline === 'none' ? null : 'underline',
+    underlined ? 'underline' : null,
     rendition.strikethrough ? 'line-through' : null,
     rendition.overline ? 'overline' : null
   ].filter((line) => line !== null)
+  const underlineColour = underlined
+    ? css(rendition.underline_colour, palette, rendition.invisible ? colour : undefined)
+    : undefined
   return {
-    color: colour,
+    color: rendition.invisible ? 'transparent' : rendition.faint ? halfStrength(colour) : colour,
     backgroundColor: fill === background ? undefined : fill,
     fontWeight: rendition.bold ? 700 : undefined,
     fontStyle: rendition.italic ? 'italic' : undefined,
-    opacity: rendition.faint ? 0.6 : undefined,
-    visibility: rendition.invisible ? 'hidden' : undefined,
-    textDecorationLine: lines.length > 0 ? lines.join(' ') : undefined
+    textDecorationLine: lines.length > 0 ? lines.join(' ') : undefined,
+    textDecorationStyle:
+      rendition.underline === 'none' ? undefined : UNDERLINE_STYLE[rendition.underline],
+    textDecorationColor: underlineColour
   }
 }
 
@@ -101,6 +130,9 @@ export interface Stretch {
  * A line as the stretches a phone draws, left to right: each piece at its column, and spaces for
  * the cells before it that no piece covers. A piece that would start inside the one before it is
  * left out, so no column ever moves.
+ *
+ * Each piece is drawn in exactly its cells: printable ASCII cut or filled with spaces to its cell
+ * count, and anything else as blank cells.
  */
 export function stretchesOf(line: TerminalLine): Stretch[] {
   const stretches: Stretch[] = []
@@ -109,8 +141,10 @@ export function stretchesOf(line: TerminalLine): Stretch[] {
   for (const piece of pieces) {
     if (piece.column < at) continue
     if (piece.column > at) stretches.push({ column: at, text: ' '.repeat(piece.column - at), piece: null })
-    stretches.push({ column: piece.column, text: drawableText(piece.text), piece })
-    at = piece.column + Math.max(0, piece.cells)
+    const cells = Number.isFinite(piece.cells) ? Math.max(0, Math.trunc(piece.cells)) : 0
+    const text = /^[\x20-\x7e]*$/.test(piece.text) ? piece.text.slice(0, cells).padEnd(cells) : ' '.repeat(cells)
+    stretches.push({ column: piece.column, text, piece })
+    at = piece.column + cells
   }
   return stretches
 }
