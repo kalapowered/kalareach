@@ -35,7 +35,7 @@ use kr_plugin_sdk::version::PackageVersion;
 use kr_protocol::error::ProtocolError;
 use kr_protocol::ids::{EnvironmentId, RepositoryGeneration};
 use kr_protocol::receipt::ReceiptState;
-use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension as _, TransactionBehavior, params};
 
 use crate::authority::{Failure, Permit};
 use crate::ceiling::{InstallationGrant, capability_from_str};
@@ -169,13 +169,32 @@ pub struct Db {
 impl Db {
     /// Opens the catalogue's database under `root`, creating it where there is none.
     ///
+    /// The database and the files SQLite keeps beside it are the catalogue's own, like the
+    /// directory they are in, so none of them is opened through a link: a link at one of their
+    /// names is refused before anything is read or written, and the open itself follows no link,
+    /// so one put there afterwards fails it too. The directories above the catalogue's own are the
+    /// host's, which is why the database is named through the canonical path of the catalogue's
+    /// directory: a link the host keeps higher up is resolved first, and is no refusal.
+    ///
     /// # Errors
     ///
-    /// Returns [`CatalogueError::StorageUnavailable`] when it cannot be opened or its tables
-    /// cannot be created.
+    /// Returns [`CatalogueError::StorageUnavailable`] when the database or a file beside it is a
+    /// link or not a file, or when it cannot be opened or its tables cannot be created.
     pub(crate) fn open(root: &Path) -> CatalogueResult<Self> {
-        let path = root.join(DATABASE_FILE);
-        let connection = Connection::open(&path).map_err(|source| failed(&path, &source))?;
+        let path = canonical(root)?.join(DATABASE_FILE);
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let mut name = path.clone().into_os_string();
+            name.push(suffix);
+            check_own_file(Path::new(&name))?;
+        }
+        let connection = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(|source| failed(&path, &source))?;
         let db = Self { connection, path };
         db.connection
             .busy_timeout(BUSY_TIMEOUT)
@@ -1428,6 +1447,38 @@ fn failed(path: &Path, source: &rusqlite::Error) -> CatalogueError {
     CatalogueError::StorageUnavailable {
         detail: format!("{}: {source}", path.display()),
     }
+}
+
+/// Returns the canonical path of the catalogue's own directory, every link above it resolved.
+///
+/// On Windows the path is the one the host named: SQLite resolves nothing there, and a canonical
+/// Windows path is a verbatim one, which is not how the database has ever been named.
+fn canonical(root: &Path) -> CatalogueResult<PathBuf> {
+    #[cfg(unix)]
+    {
+        std::fs::canonicalize(root).map_err(|source| CatalogueError::storage(root, &source))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(root.to_path_buf())
+    }
+}
+
+/// Refuses a file of the catalogue's own that is a link, or that is there and is not a file.
+fn check_own_file(path: &Path) -> CatalogueResult<()> {
+    let what = match std::fs::symlink_metadata(path) {
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => return Err(CatalogueError::storage(path, &source)),
+        Ok(metadata) if metadata.file_type().is_symlink() => "a link",
+        Ok(metadata) if !metadata.is_file() => "not a file",
+        Ok(_) => return Ok(()),
+    };
+    Err(CatalogueError::StorageUnavailable {
+        detail: format!(
+            "{} is {what}, and the catalogue keeps its records only in files of its own",
+            path.display()
+        ),
+    })
 }
 
 fn unreadable(detail: impl core::fmt::Display) -> CatalogueError {

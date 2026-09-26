@@ -6553,6 +6553,73 @@ fn a_catalogue_directory_that_is_a_link_is_refused_however_it_is_spelt() {
     assert_eq!(tree_of(&elsewhere), before);
 }
 
+/// The catalogue's database, and each file SQLite keeps beside it, is refused while it is a link
+/// to a file elsewhere: the open stops before anything is read or written through the link, and
+/// the files elsewhere, one of them a database SQLite would happily open, are left exactly as they
+/// were. The directories above the catalogue's own are the host's, so a catalogue reached through
+/// a link higher up still opens.
+#[cfg(unix)]
+#[test]
+fn the_database_or_a_file_beside_it_that_is_a_link_is_refused_and_left_alone() {
+    let names = [
+        "catalogue.sqlite3",
+        "catalogue.sqlite3-wal",
+        "catalogue.sqlite3-shm",
+        "catalogue.sqlite3-journal",
+    ];
+    let mut followed = Vec::new();
+    for name in names {
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let root = home.path().join("catalogue");
+        let mut catalogue = Catalogue::open(&root, local()).expect("a catalogue of its own");
+        catalogue
+            .set_disable_policy(DisablePolicy::DisableAtOnce)
+            .expect("a record written");
+        drop(catalogue);
+
+        let elsewhere = home.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).expect("a directory");
+        let target = elsewhere.join("outside");
+        if name == "catalogue.sqlite3" {
+            // A database of its own, which SQLite would open and write through the link.
+            std::fs::rename(root.join(name), &target).expect("moved elsewhere");
+        } else {
+            std::fs::write(&target, b"not the catalogue's").expect("writable");
+        }
+        std::os::unix::fs::symlink(&target, root.join(name)).expect("a file link");
+        let before = tree_of(&elsewhere);
+
+        match Catalogue::open(&root, local()) {
+            Err(CatalogueError::StorageUnavailable { detail }) if detail.contains("is a link") => {}
+            Ok(_) => followed.push(format!("{name}: opened through the link")),
+            Err(other) => followed.push(format!("{name}: refused for another reason: {other:?}")),
+        }
+        if tree_of(&elsewhere) != before {
+            followed.push(format!("{name}: the file elsewhere changed"));
+        }
+    }
+    assert!(followed.is_empty(), "{followed:#?}");
+
+    // A link above the catalogue's own directory is the host's to make.
+    let home = tempfile::tempdir().expect("a temporary directory");
+    std::fs::create_dir(home.path().join("real")).expect("a directory");
+    std::os::unix::fs::symlink(home.path().join("real"), home.path().join("alias"))
+        .expect("a directory link");
+    let catalogue = Catalogue::open(&home.path().join("alias").join("catalogue"), local())
+        .expect("a catalogue whose parent is reached through a link");
+    assert_eq!(
+        catalogue.disable_policy().expect("readable"),
+        DisablePolicy::WarnOnly
+    );
+    assert!(
+        home.path()
+            .join("real")
+            .join("catalogue")
+            .join("catalogue.sqlite3")
+            .is_file()
+    );
+}
+
 /// Reads the local repository, and the first time it fetches a location whose path contains `at`,
 /// runs one step of the test's own first: after the operation fetching it took the store, and
 /// before it writes anything the fetch leads to.
