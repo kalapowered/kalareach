@@ -4646,6 +4646,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kr-perf"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "kr-plugin-catalogue"
 version = "0.1.0"
 dependencies = [
