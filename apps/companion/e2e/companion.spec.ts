@@ -858,6 +858,37 @@ test.describe("moving a raw view's window", () => {
     await expect(surface).toContainText('$ cargo test -p kr-client')
   })
 
+  // A zoom step during a drag begins the drag again from where the pointer is: the part of a row it
+  // had not sent is dropped, and the release sends nothing for it.
+  test('a zoom step during a drag drops the part it had not sent', async ({ page }) => {
+    await openSession(page)
+    await page.getByRole('tab', { name: 'Terminal' }).click()
+    const surface = page.getByTestId('terminal-surface')
+    await expect(surface).toContainText('$ cargo test -p kr-client')
+    await page.getByRole('tab', { name: 'View' }).click()
+    const grid = page.getByTestId('terminal-grid')
+    const rowHeight = await grid.evaluate(
+      (element) => element.getBoundingClientRect().height / Number(element.getAttribute('data-rows'))
+    )
+    const box = await surface.boundingBox()
+    if (box === null) throw new Error('the terminal is not laid out')
+    const x = box.x + box.width / 2
+    const y = box.y + 40
+    await page.mouse.move(x, y)
+    await page.mouse.down()
+    // A row and a half down: one row goes, and half a row is drawn.
+    await page.mouse.move(x, y + rowHeight * 1.5, { steps: 6 })
+    await expect.poll(async () => moves(page)).toBe(1)
+    await page.keyboard.down('Control')
+    await page.mouse.wheel(0, -100)
+    await page.keyboard.up('Control')
+    await expect(page.getByTestId('zoom-out')).toBeEnabled()
+    await page.mouse.up()
+    // Without the zoom step the half row would have rounded to a second row.
+    await page.waitForTimeout(100)
+    expect(await moves(page)).toBe(1)
+  })
+
   for (const theme of ['light', 'dark'] as const) {
     test(`the desktop view moves across the session and into its history, ${theme}, at 320 px`, async ({
       page

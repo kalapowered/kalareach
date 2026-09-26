@@ -576,8 +576,16 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
       expect(gridShift()).toEqual({ x: 0, y: 32 })
       expect(screen.getByTestId('terminal-surface')).toHaveAttribute('aria-busy', 'true')
       expect(position()).not.toBe(WAITING)
+      // A state that arrives before the wait is long enough to say does not start it again.
       act(() => {
-        vi.advanceTimersByTime(SLOW_MS)
+        vi.advanceTimersByTime(SLOW_MS - 100)
+      })
+      act(() => {
+        controls.terminalViews[0]?.show(undefined, 0)
+      })
+      expect(position()).not.toBe(WAITING)
+      act(() => {
+        vi.advanceTimersByTime(100)
       })
       expect(position()).toBe(WAITING)
       // A screen that settles nothing, such as a repaint of the old place, leaves the move waiting.
@@ -671,6 +679,100 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     expect(gridShift()).toEqual({ x: 0, y: 12 * 16 })
   })
 
+  it('takes no move once the view has ended, so nothing is left shifted or busy', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    open(port)
+    await screen.findByTestId('palette-provenance')
+    await person.click(screen.getByRole('tab', { name: 'View' }))
+    act(() => {
+      controls.terminalViews[0]?.end('This session has closed.')
+    })
+    wheel({ deltaY: -48 })
+    pointer('pointerdown', 100, 100)
+    pointer('pointermove', 100, 140)
+    pointer('pointerup', 100, 140)
+    await person.click(screen.getByRole('tab', { name: 'Control' }))
+    await settle()
+    expect(controls.terminalViews[0]?.moves).toEqual([])
+    expect(gridShift()).toEqual({ x: 0, y: 0 })
+    expect(screen.getByTestId('terminal-surface')).toHaveAttribute('aria-busy', 'false')
+  })
+
+  it('ends a drag without sending its part when a second pointer comes down', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    controls.holdTerminalMoves()
+    open(port)
+    await screen.findByTestId('palette-provenance')
+    await person.click(screen.getByRole('tab', { name: 'View' }))
+    pointer('pointerdown', 100, 100)
+    pointer('pointermove', 100, 108)
+    expect(gridShift()).toEqual({ x: 0, y: 8 })
+    pointer('pointerdown', 200, 100, 2)
+    expect(gridShift()).toEqual({ x: 0, y: 0 })
+    pointer('pointerup', 100, 140)
+    expect(controls.terminalViews[0]?.moves).toEqual([])
+  })
+
+  it('settles only the moves a frame holds, and replays the rest over it', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    controls.holdTerminalMoves()
+    open(port)
+    await screen.findByTestId('palette-provenance')
+    await person.click(screen.getByRole('tab', { name: 'View' }))
+    // A frame of a session wider than the view, at column 5 of 0 to 10.
+    const wide = (column: number, right: number, settled: number) => {
+      act(() => {
+        controls.terminalViews[0]?.show(
+          {
+            window: { rows: 8, columns: 70, column, line: 0, above: 0 },
+            room: { up: 0, down: 0, left: column, right }
+          },
+          settled
+        )
+      })
+    }
+    wide(5, 5, 0)
+    wheel({ deltaX: 40 })
+    wheel({ deltaX: -80 })
+    wheel({ deltaX: 40 })
+    expect(controls.terminalViews[0]?.moves).toEqual([
+      { number: 1, across: 5, down: 0 },
+      { number: 2, across: -10, down: 0 },
+      { number: 3, across: 5, down: 0 }
+    ])
+    expect(gridShift()).toEqual({ x: 0, y: 0 })
+    // The first is settled with a frame the host held at column 7, the last it can now reach: the
+    // other two are replayed over it in order, each held to its room, and end at column 5.
+    wide(7, 0, 1)
+    expect(gridShift()).toEqual({ x: 16, y: 0 })
+  })
+
+  it('offers labelled controls that move the window a page at a time, only in view mode and within its room', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    controls.holdTerminalMoves()
+    open(port)
+    await screen.findByTestId('palette-provenance')
+    const up = screen.getByRole('button', { name: 'Move the window up' })
+    expect(up).toBeDisabled()
+    await person.click(screen.getByRole('tab', { name: 'View' }))
+    // Twelve rows of history above a window of eight: a page up is eight rows.
+    expect(up).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Move the window down' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Move the window left' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Move the window right' })).toBeDisabled()
+    await person.click(up)
+    expect(controls.terminalViews[0]?.moves).toEqual([{ number: 1, across: 0, down: -8 }])
+    // The rest of the history is four rows: the next page goes four, and then there is no more.
+    await person.click(up)
+    expect(controls.terminalViews[0]?.moves.at(-1)).toEqual({ number: 2, across: 0, down: -4 })
+    expect(up).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Move the window down' })).toBeEnabled()
+  })
+
   it('moves nothing with a drag in control mode', async () => {
     const { port, controls } = fakeHost()
     open(port)
@@ -693,8 +795,8 @@ function wheel(init: WheelEventInit): WheelEvent {
   return event
 }
 
-/** Sends the primary pointer's `type` over the terminal at `x`, `y`. */
-function pointer(type: string, x: number, y: number): void {
+/** Sends pointer `id`'s `type` over the terminal at `x`, `y`: the primary one unless told. */
+function pointer(type: string, x: number, y: number, id = 1): void {
   act(() => {
     screen
       .getByTestId('terminal-surface')
@@ -702,9 +804,9 @@ function pointer(type: string, x: number, y: number): void {
         new PointerEvent(type, {
           bubbles: true,
           cancelable: true,
-          pointerId: 1,
+          pointerId: id,
           pointerType: 'mouse',
-          isPrimary: true,
+          isPrimary: id === 1,
           button: 0,
           buttons: type === 'pointerup' ? 0 : 1,
           clientX: x,

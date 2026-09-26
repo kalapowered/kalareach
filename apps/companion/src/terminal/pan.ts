@@ -196,6 +196,44 @@ export function releaseDrag(drag: Drag, at: Point, cell: CellSize, room: Termina
   )
 }
 
+/**
+ * What a drag, and a wheel's part of a cell, belong to: the view they were made in (its session and
+ * opening, its mode, and whether it lasts), as one key, and the cell they are measured in.
+ */
+export interface DragGeneration {
+  readonly view: string
+  readonly cell: CellSize
+}
+
+/** A drag in progress: its pointer, the drag, what it belongs to, and the pointer's last point. */
+export interface HeldDrag {
+  readonly pointer: number
+  readonly drag: Drag
+  readonly generation: DragGeneration
+  readonly last: Point
+}
+
+/** Whether two generations are the same view and the same cell. */
+export function sameGeneration(one: DragGeneration, other: DragGeneration): boolean {
+  return (
+    one.view === other.view &&
+    one.cell.width === other.cell.width &&
+    one.cell.height === other.cell.height
+  )
+}
+
+/**
+ * The drag `held` once what it belongs to is `now`. The same view and cell: the drag goes on. The
+ * same view with another cell (a zoom step): it begins again from the pointer's last point, its
+ * part not sent dropped and its moves sent kept. Any other view (the view ended or opened again,
+ * the session changed, or control mode was taken): it is over, and sends nothing more.
+ */
+export function followGeneration(held: HeldDrag, now: DragGeneration): HeldDrag | null {
+  if (held.generation.view !== now.view) return null
+  if (sameGeneration(held.generation, now)) return held
+  return { pointer: held.pointer, drag: beginDrag(held.last), generation: now, last: held.last }
+}
+
 /** The part of a wheel's movement not yet a whole cell, in pixels. */
 export interface WheelRest {
   readonly across: number
@@ -207,7 +245,8 @@ export const WHEEL_AT_REST: WheelRest = { across: 0, down: 0 }
 
 /**
  * One turn of the wheel: `pixels` more of the window's movement, in cells of `cell`, held to
- * `room`. The part short of a whole cell is carried to the next turn; what a limit refused is not.
+ * `room`. The part short of a whole cell is carried to the next turn, unless it points past a limit
+ * the window has reached, so a turn the other way moves at once; what a limit refused is dropped.
  */
 export function wheelTurn(
   rest: WheelRest,
@@ -220,11 +259,23 @@ export function wheelTurn(
   const wholeAcross = cell.width > 0 ? whole(across / cell.width) : 0
   const wholeDown = cell.height > 0 ? whole(down / cell.height) : 0
   const send = within({ across: wholeAcross, down: wholeDown }, room)
+  const kept = (part: number, refused: boolean, before: number, after: number): number =>
+    refused || (part > 0 && after <= 0) || (part < 0 && before <= 0) ? 0 : part
   return {
     send,
     rest: {
-      across: send.across === wholeAcross ? across - wholeAcross * cell.width : 0,
-      down: send.down === wholeDown ? down - wholeDown * cell.height : 0
+      across: kept(
+        across - wholeAcross * cell.width,
+        send.across !== wholeAcross,
+        room.left + send.across,
+        room.right - send.across
+      ),
+      down: kept(
+        down - wholeDown * cell.height,
+        send.down !== wholeDown,
+        room.up + send.down,
+        room.down - send.down
+      )
     }
   }
 }

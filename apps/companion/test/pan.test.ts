@@ -11,6 +11,7 @@ import type { TerminalMove, TerminalRoom, TerminalScreen } from '../src/host/por
 import {
   beginDrag,
   dragTo,
+  followGeneration,
   releaseDrag,
   replay,
   resisted,
@@ -18,7 +19,8 @@ import {
   STILL,
   WHEEL_AT_REST,
   wheelTurn,
-  within
+  within,
+  type HeldDrag
 } from '../src/terminal/pan'
 
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
@@ -117,6 +119,51 @@ describe('a wheel', () => {
     const turned = wheelTurn(WHEEL_AT_REST, { across: 0, down: 16 * 9 }, cell, room)
     expect(turned.send).toEqual({ across: 0, down: 5 })
     expect(turned.rest).toEqual({ across: 0, down: 0 })
+  })
+
+  it('keeps no part of a cell that points past a limit, so a turn back moves at once', () => {
+    const atTheRight: TerminalRoom = { up: 0, down: 0, left: 5, right: 0 }
+    const pushed = wheelTurn(WHEEL_AT_REST, { across: 4, down: 0 }, cell, atTheRight)
+    expect(pushed.send).toEqual(STILL)
+    expect(pushed.rest).toEqual({ across: 0, down: 0 })
+    expect(wheelTurn(pushed.rest, { across: -8, down: 0 }, cell, atTheRight).send).toEqual({
+      across: -1,
+      down: 0
+    })
+    // A turn that reaches the limit keeps nothing past it either.
+    const reaching = wheelTurn(WHEEL_AT_REST, { across: 12, down: 0 }, cell, { ...atTheRight, right: 1 })
+    expect(reaching.send).toEqual({ across: 1, down: 0 })
+    expect(reaching.rest).toEqual({ across: 0, down: 0 })
+  })
+})
+
+describe('what a drag belongs to', () => {
+  const cell = { width: 8, height: 16 }
+  const held: HeldDrag = {
+    pointer: 1,
+    drag: { origin: { x: 100, y: 100 }, sent: { across: 0, down: -1 } },
+    generation: { view: 'session:1:view', cell },
+    last: { x: 100, y: 124 }
+  }
+
+  it('goes on while its view, its mode and its cell stay as they were', () => {
+    expect(followGeneration(held, { view: 'session:1:view', cell: { ...cell } })).toBe(held)
+  })
+
+  it('begins again from the last point, keeping what it sent, when the cell changes', () => {
+    const larger = { width: 9, height: 18 }
+    expect(followGeneration(held, { view: 'session:1:view', cell: larger })).toEqual({
+      pointer: 1,
+      drag: { origin: { x: 100, y: 124 }, sent: STILL },
+      generation: { view: 'session:1:view', cell: larger },
+      last: { x: 100, y: 124 }
+    })
+  })
+
+  it('ends when its view ends, opens again, changes session or leaves view mode', () => {
+    for (const view of ['session:1:ended', 'session:2:view', 'other:1:view', 'session:1:control']) {
+      expect(followGeneration(held, { view, cell })).toBeNull()
+    }
   })
 })
 

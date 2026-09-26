@@ -507,6 +507,59 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     }
   })
 
+  it('sends nothing for a drag whose view has changed under it: control taken, or the view ended', async () => {
+    const restore = measured()
+    try {
+      const { port, controls } = fakeHost()
+      controls.holdTerminalMoves()
+      const person = await onTerminal(port)
+      await waitFor(() => {
+        expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
+      })
+      await person.click(screen.getByRole('button', { name: 'Look around' }))
+      // A row and a half down; control is taken with the finger still down, and then it lifts.
+      finger('pointerdown', 1, 100, 100)
+      finger('pointermove', 1, 100, 124)
+      await person.click(screen.getByRole('button', { name: 'Take control' }))
+      // The part not sent is gone, and the return is drawn over the row sent: the live screen.
+      expect(gridShift()).toEqual({ x: 0, y: 0 })
+      finger('pointerup', 1, 100, 124)
+      expect(controls.terminalViews[0]?.moves).toEqual([
+        { number: 1, across: 0, down: -1 },
+        { number: 2, live: true }
+      ])
+
+      // The same with the view ending under the finger.
+      await person.click(screen.getByRole('button', { name: 'Look around' }))
+      finger('pointerdown', 1, 100, 100)
+      finger('pointermove', 1, 100, 108)
+      act(() => {
+        controls.terminalViews[0]?.end('This session has closed.')
+      })
+      finger('pointermove', 1, 100, 140)
+      finger('pointerup', 1, 100, 140)
+      expect(controls.terminalViews[0]?.moves).toHaveLength(2)
+      expect(gridShift()).toEqual({ x: 0, y: 0 })
+    } finally {
+      restore()
+    }
+  })
+
+  it('offers labelled controls in view mode that move the window a page at a time', async () => {
+    const { port, controls } = fakeHost()
+    controls.holdTerminalMoves()
+    const person = await onTerminal(port)
+    await waitFor(() => {
+      expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
+    })
+    expect(screen.queryByRole('button', { name: 'Move the window up' })).toBeNull()
+    await person.click(screen.getByRole('button', { name: 'Look around' }))
+    const up = screen.getByRole('button', { name: 'Move the window up' })
+    expect(screen.getByRole('button', { name: 'Move the window down' })).toBeDisabled()
+    await person.click(up)
+    expect(controls.terminalViews[0]?.moves).toEqual([{ number: 1, across: 0, down: -8 }])
+  })
+
   it('gives a one-finger drag to the program in control mode and moves nothing', async () => {
     const restore = measured()
     try {

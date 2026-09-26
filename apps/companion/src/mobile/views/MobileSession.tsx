@@ -54,9 +54,12 @@ import {
 import {
   beginDrag,
   dragTo,
+  followGeneration,
   releaseDrag,
+  sameGeneration,
   type Cells,
-  type Drag,
+  type DragGeneration,
+  type HeldDrag,
   type Point
 } from '../../terminal/pan'
 import { FALLBACK_GRID, useTerminalView } from '../../terminal/view'
@@ -218,7 +221,9 @@ export function MobileSession({
     slow,
     resize,
     again,
+    openingKey,
     shift,
+    room,
     moving,
     movingSlow,
     roomNow,
@@ -439,6 +444,7 @@ export function MobileSession({
               screen={frame}
               busy={terminal === null || terminalWaiting || moving}
               ended={terminal?.state === 'ended'}
+              openingKey={openingKey}
               shift={shift}
               roomNow={roomNow}
               onPan={pan}
@@ -473,6 +479,26 @@ export function MobileSession({
                 {mode === 'control' ? 'Look around' : 'Take control'}
               </Button>
               <span>{`Zoom ${Math.round((ZOOM_STEPS[zoom] ?? 1) * 100)}%`}</span>
+              {mode === 'view' ? (
+                <span className="row" role="group" aria-label="Move the window">
+                  {PAGE_MOVES.map((move) => (
+                    <Button
+                      key={move.name}
+                      aria-label={`Move the window ${move.name}`}
+                      disabled={room === null || room[move.limit] === 0}
+                      onClick={() => {
+                        if (frame === null) return
+                        pan({
+                          across: move.across * frame.window.columns,
+                          down: move.down * frame.window.rows
+                        })
+                      }}
+                    >
+                      {move.label}
+                    </Button>
+                  ))}
+                </span>
+              ) : null}
               {terminal === null ? (
                 <span data-testid="terminal-presentation" data-presentation="attaching">
                   {ATTACHING}
@@ -634,11 +660,20 @@ function cellOf(probe: HTMLSpanElement | null): { width: number; height: number 
 /** The screen where it rests. */
 const AT_REST: Point = { x: 0, y: 0 }
 
+/** The four buttons that move the window a page each way, and the room each one needs. */
+const PAGE_MOVES = [
+  { name: 'up', label: 'Up', across: 0, down: -1, limit: 'up' },
+  { name: 'down', label: 'Down', across: 0, down: 1, limit: 'down' },
+  { name: 'left', label: 'Left', across: -1, down: 0, limit: 'left' },
+  { name: 'right', label: 'Right', across: 1, down: 0, limit: 'right' }
+] as const
+
 /** The session's screen, as cells drawn as text, zoomed by the pinch and moved by a drag in view mode. */
 function RawTerminal({
   screen,
   busy,
   ended,
+  openingKey,
   shift,
   roomNow,
   onPan,
@@ -652,6 +687,8 @@ function RawTerminal({
   readonly screen: TerminalScreen | null
   readonly busy: boolean
   readonly ended: boolean
+  /** Which opening of which session the screen is, which a drag belongs to. */
+  readonly openingKey: string
   /** Where the screen is drawn from its own place: moved by the moves not yet settled. */
   readonly shift: Cells
   readonly roomNow: () => TerminalRoom | null
@@ -665,12 +702,10 @@ function RawTerminal({
 }): ReactNode {
   const pointers = useRef(new Map<number, { x: number; y: number }>())
   // The one-finger drag in progress in view mode, and the part of it not sent, as drawn.
-  const dragging = useRef<{
-    readonly pointer: number
-    readonly drag: Drag
-    readonly cell: { width: number; height: number }
-  } | null>(null)
-  const [dragged, setDragged] = useState<Point | null>(null)
+  const dragging = useRef<HeldDrag | null>(null)
+  const [dragged, setDragged] = useState<{ readonly generation: DragGeneration; readonly at: Point } | null>(
+    null
+  )
   // One cell in pixels, measured once laid out at each zoom and screen, for drawing the shift.
   const [cell, setCell] = useState<{ width: number; height: number } | null>(null)
   useLayoutEffect(() => {
@@ -679,24 +714,20 @@ function RawTerminal({
       current?.width === measured?.width && current?.height === measured?.height ? current : measured
     )
   }, [probeRef, zoom, screen])
-  // Only view mode drags, and only while the view lasts: otherwise no drag is drawn, and the next
-  // event of one in progress ends it.
+  // A drag belongs to the view as it was when it began: this opening, in view mode, while it lasts,
+  // and this cell. When any of those changes its part not sent is no longer drawn, and its next
+  // event ends it without sending anything.
   const draggable = mode === 'view' && !ended
-  const drawnDrag = draggable && dragged !== null ? dragged : AT_REST
+  const generation: DragGeneration = {
+    view: `${openingKey}:${mode}:${ended ? 'ended' : 'open'}`,
+    cell: cell ?? { width: 0, height: 0 }
+  }
+  const drawnDrag = dragged !== null && sameGeneration(dragged.generation, generation) ? dragged.at : AT_REST
 
-  /**
-   * Ends the drag in progress. A finger lifted sends only the cells rounding adds; any other end
-   * drops the part not sent at once. The moves already sent wait for their screen either way.
-   */
-  const endDrag = (released: Point | null) => {
-    const current = dragging.current
+  /** Ends the drag in progress, sending nothing: its part not sent is dropped. */
+  const dropDrag = () => {
     dragging.current = null
     setDragged(null)
-    if (current === null || released === null) return
-    const room = roomNow()
-    if (room === null) return
-    const rounding = releaseDrag(current.drag, released, current.cell, room)
-    if (rounding.across !== 0 || rounding.down !== 0) onPan(rounding)
   }
   // Where the gesture began. A drag is the displacement from that origin, not a sum of each move's
   // step: adding steps makes the distance depend on how many events the device sent.
@@ -758,17 +789,11 @@ function RawTerminal({
         pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
         rebase()
         // One finger in view mode drags the window; a second one ends the drag and pinches.
-        if (pointers.current.size === 1 && draggable) {
-          const cell = cellOf(probeRef.current)
-          if (cell !== null) {
-            dragging.current = {
-              pointer: event.pointerId,
-              drag: beginDrag({ x: event.clientX, y: event.clientY }),
-              cell
-            }
-          }
+        if (pointers.current.size === 1 && draggable && cell !== null) {
+          const at = { x: event.clientX, y: event.clientY }
+          dragging.current = { pointer: event.pointerId, drag: beginDrag(at), generation, last: at }
         } else if (dragging.current !== null) {
-          endDrag(null)
+          dropDrag()
         }
       }}
       onPointerMove={(event) => {
@@ -776,28 +801,22 @@ function RawTerminal({
         pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
         const current = dragging.current
         if (current === null || current.pointer !== event.pointerId) return
-        if (!draggable) {
-          dragging.current = null
-          return
-        }
-        const at = { x: event.clientX, y: event.clientY }
-        // A pinch's zoom changes the cell: the drag goes on from here, keeping what it sent.
-        const now = cellOf(probeRef.current)
-        if (now !== null && (now.width !== current.cell.width || now.height !== current.cell.height)) {
-          dragging.current = { pointer: current.pointer, drag: beginDrag(at), cell: now }
-          setDragged(null)
+        const held = followGeneration(current, generation)
+        if (held === null) {
+          dropDrag()
           return
         }
         const room = roomNow()
         if (room === null) return
+        const at = { x: event.clientX, y: event.clientY }
         const element = event.currentTarget
-        const step = dragTo(current.drag, at, current.cell, room, {
+        const step = dragTo(held.drag, at, held.generation.cell, room, {
           width: element.clientWidth,
           height: element.clientHeight
         })
         if (step.send.across !== 0 || step.send.down !== 0) onPan(step.send)
-        dragging.current = { ...current, drag: step.drag }
-        setDragged(step.offset)
+        dragging.current = { ...held, drag: step.drag, last: at }
+        setDragged({ generation: held.generation, at: step.offset })
       }}
       onPointerUp={(event) => {
         const outcome = routeGesture(mode, gestureFrom(event))
@@ -806,8 +825,16 @@ function RawTerminal({
         // again from the fingers still down. Keeping the old one makes the next gesture jump by
         // whatever the lifted finger had travelled.
         rebase()
-        if (dragging.current?.pointer === event.pointerId) {
-          endDrag({ x: event.clientX, y: event.clientY })
+        const current = dragging.current
+        if (current?.pointer === event.pointerId) {
+          // A lifted finger sends only the cells rounding adds, and only for the view the drag
+          // began in.
+          const held = followGeneration(current, generation)
+          dropDrag()
+          const room = roomNow()
+          if (held === null || room === null) return
+          const rounding = releaseDrag(held.drag, { x: event.clientX, y: event.clientY }, held.generation.cell, room)
+          if (rounding.across !== 0 || rounding.down !== 0) onPan(rounding)
           return
         }
         if (outcome.kind === 'zoom') onZoom(outcome.steps)
@@ -817,12 +844,12 @@ function RawTerminal({
       onPointerCancel={(event) => {
         pointers.current.delete(event.pointerId)
         rebase()
-        if (dragging.current?.pointer === event.pointerId) endDrag(null)
+        if (dragging.current?.pointer === event.pointerId) dropDrag()
       }}
       onLostPointerCapture={(event) => {
         pointers.current.delete(event.pointerId)
         rebase()
-        if (dragging.current?.pointer === event.pointerId) endDrag(null)
+        if (dragging.current?.pointer === event.pointerId) dropDrag()
       }}
     >
       <pre

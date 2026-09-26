@@ -43,8 +43,15 @@ export interface TerminalViewing {
   readonly resize: (grid: TerminalGrid) => void
   /** Opens the view again after it has ended. */
   readonly again: () => void
+  /**
+   * Which opening of which session this is. A drag or a wheel's part belongs to one, and ends
+   * with it.
+   */
+  readonly openingKey: string
   /** Where the frame is drawn from its own place: moved by the moves not yet settled. */
   readonly shift: Cells
+  /** How far the window can still move each way once those moves are applied, or null with none. */
+  readonly room: TerminalRoom | null
   /** Whether moves wait for the screen that settles them. */
   readonly moving: boolean
   /** Whether moves have waited long enough, without a break, to say so. */
@@ -75,6 +82,8 @@ interface Opening {
   pending: TerminalMove[]
   /** When its moves began to wait without a break, while any wait. */
   since: number | null
+  /** Whether native code has said the view ended: nothing settles a move made after that. */
+  ended: boolean
 }
 
 /** No moves waiting. */
@@ -152,7 +161,8 @@ export function useTerminalView(
       attempt,
       number: 0,
       pending: [],
-      since: null
+      since: null,
+      ended: false
     }
     opening.current = open
     port
@@ -165,7 +175,9 @@ export function useTerminalView(
           frameNow.current = next.screen
           setFramed({ sessionId, screen: next.screen })
         }
-        // What native code has settled goes, with the frame that holds it; an end settles all.
+        // What native code has settled goes, with the frame that holds it; an end settles all, and
+        // the view takes no move after it.
+        if (next.state === 'ended') open.ended = true
         const settled = next.state === 'ended' ? Infinity : Number(next.settled)
         const left = open.pending.filter((move) => move.number > settled)
         if (left.length !== open.pending.length) keepMoves(open, left)
@@ -232,7 +244,7 @@ export function useTerminalView(
     (cells: Cells): Cells => {
       const open = opening.current
       const shown = frameNow.current
-      if (open?.view == null || shown === null) return STILL
+      if (open?.view == null || open.ended || shown === null) return STILL
       const asked = within(cells, roomLeft(shown, open.pending))
       if (asked.across === 0 && asked.down === 0) return STILL
       send(open, open.view, (number) => ({ number, across: asked.across, down: asked.down }))
@@ -244,12 +256,12 @@ export function useTerminalView(
   const roomNow = useCallback((): TerminalRoom | null => {
     const open = opening.current
     const shown = frameNow.current
-    return open === null || shown === null ? null : roomLeft(shown, open.pending)
+    return open === null || open.ended || shown === null ? null : roomLeft(shown, open.pending)
   }, [])
 
   const live = useCallback(() => {
     const open = opening.current
-    if (open?.view == null) return
+    if (open?.view == null || open.ended) return
     send(open, open.view, (number) => ({ number, live: true }))
   }, [send])
 
@@ -316,7 +328,9 @@ export function useTerminalView(
     slow: waitingOnAFrame && slowStamp === stamp,
     resize,
     again,
+    openingKey: `${sessionId}:${attempt}`,
     shift: frame === null ? STILL : replay(frame, pending),
+    room: frame === null || state?.state === 'ended' ? null : roomLeft(frame, pending),
     moving,
     movingSlow: moving && movingSince !== null && movingSlowSince === movingSince,
     roomNow,

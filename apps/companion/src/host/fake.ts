@@ -1948,6 +1948,7 @@ function fakeTerminalView(
   const grids: TerminalGrid[] = [grid]
   const moves: TerminalMove[] = []
   let closed = false
+  let ended = false
   // Where the window is, and the newest move that put it there.
   let place: TerminalPlace = HOME
   let applied = 0
@@ -1994,6 +1995,7 @@ function fakeTerminalView(
       publish({ state: 'waiting', attachment, settled: settled ?? applied })
     },
     end(reason) {
+      ended = true
       publish({ state: 'ended', reason })
     },
     publish,
@@ -2001,13 +2003,16 @@ function fakeTerminalView(
     handle: {
       resize: (next) => {
         grids.push(next)
+        // The host holds the window inside what a window of the new size can reach.
+        place = held(sessionId, next, place)
         return Promise.resolve()
       },
       // Native code applies a move, has the host draw the window there, and says the move is
-      // settled with that screen. A view whose moves are held records them and waits for the test.
+      // settled with that screen. A view whose moves are held records them and waits for the test;
+      // a view that has ended, or a move not numbered after the last, takes nothing.
       move: (next) => {
         moves.push(next)
-        if (!holdingMoves && !closed) {
+        if (!holdingMoves && !closed && !ended && next.number > applied) {
           place = moved(sessionId, grids.at(-1) ?? grid, place, next)
           applied = next.number
           setTimeout(() => {
@@ -2084,6 +2089,19 @@ function roomOf(session: FakeScreen, grid: TerminalGrid, place: TerminalPlace): 
     down: session.rows - rows - top,
     left: place.column,
     right: session.columns - columns - place.column
+  }
+}
+
+/** `place`, held inside what a window of `grid` can reach on the session's screen. */
+function held(sessionId: string, grid: TerminalGrid, place: TerminalPlace): TerminalPlace {
+  const session = fakeScreenOf(sessionId)
+  const rows = Math.min(grid.rows, session.rows)
+  const columns = Math.min(grid.columns, session.columns)
+  const top = Math.min(place.above > 0 ? -place.above : place.line, session.rows - rows)
+  return {
+    column: Math.min(place.column, session.columns - columns),
+    line: top < 0 ? 0 : top,
+    above: top < 0 ? -top : 0
   }
 }
 
