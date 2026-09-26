@@ -135,6 +135,46 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     opened.mockRestore()
   })
 
+  it('keeps each piece inside its cells when the renderer measures its text wider', async () => {
+    const opened = vi.spyOn(Terminal.prototype, 'open')
+    const { port, controls } = fakeHost()
+    controls.holdTerminalViews()
+    open(port)
+    await waitFor(() => {
+      expect(controls.terminalViews).toHaveLength(1)
+    })
+    const measured: TerminalScreen = {
+      ...terminalScreen(SESSION_MAIN, { columns: 6, rows: 2 }),
+      window: { columns: 6, rows: 2 },
+      lines: [
+        // A letter and a mark native code measures as one cell, which this renderer gives a cell of
+        // its own, then a blank cell and a letter.
+        {
+          row: '1',
+          soft_wrapped: false,
+          truncated: false,
+          pieces: [{ ...piece(0, 'a\u{1ab0}'), cells: 1 }, piece(2, 'b')]
+        },
+        // A wide character in a piece of one cell, from a state that did not come from native code.
+        {
+          row: '2',
+          soft_wrapped: false,
+          truncated: false,
+          pieces: [{ ...piece(0, '\u{4e2d}'), cells: 1 }, piece(2, 'c')]
+        }
+      ],
+      cursor: null
+    }
+    act(() => {
+      controls.terminalViews[0]?.attach()
+      controls.terminalViews[0]?.show(measured)
+    })
+    // Nothing is drawn past a piece's cells: the blank cell after each stays blank, and what the
+    // renderer could not fit is left out.
+    expect((await drawn(renderer(opened))).slice(0, 2)).toEqual(['a b', '  c'])
+    opened.mockRestore()
+  })
+
   it('keeps the last frame while it waits, busy at once and saying so only after a moment', async () => {
     const opened = vi.spyOn(Terminal.prototype, 'open')
     const { port, controls } = fakeHost()

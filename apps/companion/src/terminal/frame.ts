@@ -54,7 +54,7 @@ export function drawableText(text: string): string {
   return drawn
 }
 
-/** At most `cells` of `text`'s grapheme clusters: a piece never draws past its cells. */
+/** At most `cells` of `text`'s grapheme clusters, the most a piece of that many cells can hold. */
 function withinCells(text: string, cells: number): string {
   const segments = [...new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(text)]
   if (segments.length <= cells) return text
@@ -62,6 +62,11 @@ function withinCells(text: string, cells: number): string {
     .slice(0, Math.max(0, cells))
     .map((each) => each.segment)
     .join('')
+}
+
+/** Whether every scalar of `text` is printable ASCII, which every renderer draws a cell each. */
+function printableAscii(text: string): boolean {
+  return /^[\x20-\x7e]*$/.test(text)
 }
 
 /** A number the renderer is given, held to a byte whatever a malformed state carried. */
@@ -145,14 +150,30 @@ function steadyCursor(style: number): number {
  *
  * One write, so a screen still waiting in the renderer can never be drawn over this one: the reset
  * clears whatever an earlier write left, in the order the writes were made.
+ *
+ * A piece never shows past its cells. The renderer measures text by its own width rules, which can
+ * give a cluster more cells than the pinned width model native code placed it by: a mark the model
+ * joins to its letter can take a cell of its own. So after a piece that is not printable ASCII,
+ * everything from the end of its cells to the end of the line is erased, in this same write and
+ * before anything is shown. The pieces after it on the line are drawn after the erase, left to
+ * right, so they draw their own cells again, and a cell no piece covers stays blank. What the
+ * renderer drew wider than the piece's cells is cut at its edge, and a wide glyph cut there is
+ * erased whole.
  */
 export function frameOf(screen: TerminalScreen): string {
   let out = FULL_RESET + NORMAL_BUFFER + AUTOWRAP_OFF + CURSOR_HIDDEN
+  const columns = count(screen.window.columns)
   screen.lines.forEach((line, index) => {
-    for (const piece of line.pieces) {
-      const text = withinCells(drawableText(piece.text), count(piece.cells))
+    const pieces = [...line.pieces].sort((one, other) => count(one.column) - count(other.column))
+    for (const piece of pieces) {
+      const column = count(piece.column)
+      const cells = count(piece.cells)
+      const text = withinCells(drawableText(piece.text), cells)
       if (text.length === 0) continue
-      out += `${ESC}[${index + 1};${count(piece.column) + 1}H${sgr(piece.rendition)}${text}`
+      out += `${ESC}[${index + 1};${column + 1}H${sgr(piece.rendition)}${text}`
+      if (!printableAscii(text) && column + cells < columns) {
+        out += `${ESC}[${index + 1};${column + cells + 1}H${ESC}[0m${ESC}[K`
+      }
     }
   })
   out += `${ESC}[0m`
