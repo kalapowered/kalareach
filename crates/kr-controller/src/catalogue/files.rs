@@ -411,16 +411,29 @@ pub(crate) fn home_directory() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
-    /// A document is replaced whole and nothing is left beside it, on every platform: a copy made
-    /// in the document's own directory keeps who can read it, so the check at the replacement
-    /// lets it take the document's place.
+    /// A document is replaced whole and nothing is left beside it. Where this host reads access
+    /// controls, a copy made in the document's own directory keeps who can read it, so the check
+    /// at the replacement lets it take the document's place; anywhere else every replacement is
+    /// refused, and the document keeps its bytes.
     #[test]
     fn a_document_is_replaced_whole_and_nothing_is_left_beside_it() {
         let directory = tempfile::tempdir().expect("a directory");
         let document = directory.path().join("settings.json");
         write_atomically(&document, b"first", PRIVATE).expect("creates it");
-        write_atomically(&document, b"second", PRIVATE).expect("replaces it");
-        assert_eq!(std::fs::read(&document).expect("reads it"), b"second");
+        let replaced = write_atomically(&document, b"second", PRIVATE);
+        // A compile-time value rather than a conditional test, so both answers are checked on
+        // every platform this crate builds for.
+        if cfg!(any(target_os = "macos", target_os = "linux", windows)) {
+            replaced.expect("replaces it");
+            assert_eq!(std::fs::read(&document).expect("reads it"), b"second");
+        } else {
+            let refused = replaced.expect_err("refuses to replace it");
+            assert!(
+                matches!(refused, ControllerError::PermissionDenied { .. }),
+                "{refused:?}"
+            );
+            assert_eq!(std::fs::read(&document).expect("reads it"), b"first");
+        }
         let names: Vec<_> = std::fs::read_dir(directory.path())
             .expect("lists the directory")
             .map(|entry| entry.expect("an entry").file_name())
