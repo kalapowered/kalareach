@@ -455,7 +455,8 @@ fn setup_adds_one_marked_entry_per_shell_and_removal_deletes_only_that() {
                 &target,
                 &package.startup_entry(),
                 package.kind() == ShellKind::Zsh,
-            );
+            )
+            .expect("the path is text");
             assert_eq!(
                 startup::install(&target.path, &body).expect("installs"),
                 Change::Added
@@ -523,13 +524,14 @@ fn a_known_auto_wrapper_gets_its_documented_session_local_bypass() {
         reason: "a test",
         shared: false,
     };
-    let with = startup::entry(&target, Path::new("/opt/kr/entry"), true);
+    let with = startup::entry(&target, Path::new("/opt/kr/entry"), true).expect("the path is text");
     assert!(with.contains(startup::NSH_BYPASS_VARIABLE));
     assert!(
         with.contains("KR_SHELL_BRIDGE"),
         "the bypass is set only where the worker exported the bridge, which is a KR shell"
     );
-    let without = startup::entry(&target, Path::new("/opt/kr/entry"), false);
+    let without =
+        startup::entry(&target, Path::new("/opt/kr/entry"), false).expect("the path is text");
     assert!(!without.contains(startup::NSH_BYPASS_VARIABLE));
     // And nothing else of that tool's configuration is touched: the entry names one variable.
     assert_eq!(with.matches("NSH_").count(), 1);
