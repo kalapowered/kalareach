@@ -44,12 +44,14 @@ pub struct Drawn {
 }
 
 impl std::fmt::Debug for Drawn {
-    /// How many bytes were drawn. Never the bytes, which are what a terminal shows.
+    /// How many bytes were drawn, and the two flags. Never the bytes, which are what a terminal
+    /// shows.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Drawn")
             .field("bytes", &self.bytes.len())
             .field("resubscribe", &self.resubscribe)
+            .field("installed", &self.installed)
             .finish()
     }
 }
@@ -449,6 +451,25 @@ pub const fn discards_the_screen(refusal: Refusal) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What an event drew is said by its length and its two flags, never by the bytes, which are
+    /// what a terminal shows.
+    #[test]
+    fn a_drawn_event_says_how_much_it_drew_and_not_what() {
+        let drawn = Drawn {
+            bytes: b"kr-marker-7c1e".to_vec(),
+            resubscribe: false,
+            installed: true,
+        };
+        assert_eq!(
+            format!("{drawn:?}"),
+            "Drawn { bytes: 14, resubscribe: false, installed: true }"
+        );
+        assert_eq!(
+            format!("{drawn:#?}"),
+            "Drawn {\n    bytes: 14,\n    resubscribe: false,\n    installed: true,\n}"
+        );
+    }
 
     /// One named loss, and the one field of a comparison that holds it.
     type Loss = (&'static str, fn(&mut Comparison));
