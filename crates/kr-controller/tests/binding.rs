@@ -1077,12 +1077,16 @@ async fn a_lowered_package_limit_comes_into_force_with_its_revision_in_one_step(
         .expect("computed");
     let in_force = catalogue.budgets_in_force();
 
-    // A read that holds the catalogue until the test lets it go.
+    // A read that holds the catalogue until the test lets it go: the first one to reach it, which
+    // may be the cadence's own. Every later read, the rounds the acceptance asks for among them,
+    // goes through.
     let (held, holding) = std::sync::mpsc::channel::<()>();
     let (release, released) = std::sync::mpsc::channel::<()>();
     let (held, released) = (Mutex::new(held), Mutex::new(released));
+    let first = std::sync::atomic::AtomicBool::new(true);
     catalogue.at_testing_point(move |point| {
-        if point == TestingPoint::Records {
+        if point == TestingPoint::Records && first.swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
             let _ = held.lock().expect("the channel").send(());
             let _ = released.lock().expect("the channel").recv_timeout(PATIENCE);
         }
