@@ -16,21 +16,23 @@ A reference host has:
 * its operating system and architecture recorded beside every figure taken on it;
 * nothing else running while a figure is taken.
 
-`scripts/bench-all.sh` checks the last condition at both edges of every measurement. For ten seconds
-before each one and ten seconds after it, it reads how much of the machine was in use, in
-processors' worth; one processor's worth or more at either edge makes the host busy. Over each
-measurement it reads the share of the machine's time a hypervisor took, where the platform keeps
-that count (the `steal` counter in Linux's `/proc/stat`), and a measurement that lost more than 1%
-of its time falls short. It records the load average at both edges as well. It does not decide
-anything by the load average, because a one-minute average still carries the measurement before,
-while the ten-second readings say what is running now. The four processors, the 8 GiB and the 1%
-are the figures that `crates/kr-transport/tests/support/conditions.rs` holds, and every
-measurement's record reads its host against them, so a record can name a shortfall of its own.
+`scripts/bench-all.sh` checks the last condition for the whole of every measurement. Before each one
+it reads how much of the machine was in use over ten seconds, in processors' worth. Through each
+one, every five seconds from its start to its end, it reads the processor time of every process
+outside the run: the run is the script and everything descended from it, the workers a
+measurement's daemon starts included, since they are the daemon's children while it runs. One
+processor's worth or more as the measurement begins, or in any five seconds of it, makes the host
+busy. Over each measurement it also reads the share of the machine's time a hypervisor took, where
+the platform keeps that count (the `steal` counter in Linux's `/proc/stat`), and a measurement that
+lost more than 1% of its time falls short. It records the load average at both edges as well, and
+decides nothing by it, because a one-minute average still carries the measurement before. The four
+processors, the 8 GiB and the 1% are the figures that
+`crates/kr-transport/tests/support/conditions.rs` holds, and every measurement's record reads its
+host against them, so a record can name a shortfall of its own.
 
 A reading can show that a host fell short. It cannot show that the host met the definition in full.
-Between a measurement's edges nothing tells the measurement's own work from anybody else's, so a
-job that starts after one edge and ends before the other goes unseen; the host's whole use over the
-measurement is kept beside the figure for that reason. A zero stolen share means the hypervisor
+A process that starts and ends between two readings is counted through the parent that collects it,
+and not at all if no such parent is still running. A zero stolen share means the hypervisor
 reported no loss, and a platform that keeps no such count leaves the condition unverified. And
 memory as the operating system reports it is a little less than the memory installed, so a machine
 with exactly 8 GiB installed reads as short of the reference host.
@@ -65,14 +67,14 @@ Every measurement runs in a release build, one at a time.
 | --- | --- | --- | --- |
 | KR-PERF-001 | p95 below 5 ms, p99 below 15 ms | `crates/kr-worker/benches/input_latency.rs` (`added_input_forwarding_latency`), and again in the stress run | 1,000 single-byte writes on the session's own local socket, each timed to the byte arriving back after the application echoed it. That includes the application's read and echo and the host's whole output path, which section 27 leaves out, so the figure is an upper bound on the added latency |
 | KR-PERF-002 | recogniser deadline at most 25 ms | `input_latency.rs` (`paste_prefix_recogniser_deadline`) | Every proper prefix of both paste delimiters and a lone Escape, each alone and timed to the byte reaching the application, and a delimiter split across two writes, recognised once. The deadline the host is built with is checked against section 27's directly |
-| KR-PERF-003 | below 500 MiB and 1% of one core | `crates/kr-worker/tests/performance.rs` (`idle_resources_for_twenty_sessions_and_thirty_two_views`) | The idle configuration's daemon, workers and root shells: processor time over five minutes and resident memory at the end. The stress run reports the same readings under stress, which section 27 sets no bound on, and the whole host's memory with the plugin host serving |
+| KR-PERF-003 | below 500 MiB and 1% of one core | `crates/kr-worker/tests/performance.rs` (`idle_resources_for_twenty_sessions_and_thirty_two_views`) | The idle configuration's daemon, workers and root shells: processor time over five minutes and resident memory at the end. The stress run reports the same readings under stress, which section 27 sets no bound on, and the whole product's memory with the plugin host serving |
 | KR-PERF-004 | a usable 120x40 screen within 500 ms | `performance.rs` (`attach_to_a_usable_screen`) | Five attachments of each presentation, from the connection to a screen a person could look at |
 | KR-PERF-005 | under 25 ms p95 above the path's round trip | `crates/kr-transport/tests/perf.rs` | Remote input over a real connection while a bulk transfer runs, less the path's own round trip. The target is asserted where the host meets the reference host's conditions, and elsewhere recorded with the shortfall named |
 | KR-PERF-006 | usable state within two seconds | `crates/kr-transport/tests/perf.rs` and `crates/kr-client/tests/session.rs` | The transport's share is timed: reconnecting, the handshake, a stream and a 120x40 snapshot. The client's share is asserted inside the budget: the subscription through the client library and a painted 120x40 screen, plainly and after one refused read |
 | KR-PERF-007 | drain 5 MiB/s without unbounded queues; slow observers resynchronise | `crates/kr-term/tests/perf.rs`, and the stress run | The engine's sustained rate on a plain and a scrolling stream, with every bound checked. In the stress run, the observer that stops reading is told to resynchronise and receives output again once it resubscribes, and no other view goes an interval without output |
 | KR-PERF-008 | one batch per animation frame; input stays responsive | `apps/companion/test/performance.test.tsx` | Events folded into frames, a keystroke's cost against the size of the history while output streams, what a keystroke touches in the document, and how many nodes are drawn for a long history |
 | KR-PERF-009 | 4 GiB, four threads and 30 seconds per description | `scripts/bench-descriptions.sh` | The selected profile against real weights at 1, 5, 20 and 50 sessions, with the resource pause beside it |
-| KR-PERF-010 | first audio and delegation latency recorded | a paired phone, and the voice service's own record of each call | Measured on a phone with a connected media path to the voice provider, not on a host. The voice service records what starting each call took, which the web repository's voice tests check |
+| KR-PERF-010 | first audio and delegation latency recorded | a paired phone, and the voice service's own record of each call | Taken on a phone with a connected media path to the voice provider, not on a host. The phone apps take first audio where they add the remote audio track (iOS's `didAdd` receiver, Android's `onAddTrack`), which shows that a track exists, not that its audio has played. The voice service records, for each call, the time from creating it to releasing its answer and to its sideband being ready, which the web repository's voice tests check. Neither is a measurement of delegation latency |
 
 The stress run reads processor time per process and adds it up by kind: the workers, the shells and
 their programs, and the measurement's own process, which is the daemon and also every reading view's
@@ -125,10 +127,11 @@ A measurement's own section starts with its host: the build, the operating syste
 the processor, the processors and the memory against the reference host's, the load average entering
 and leaving, the stolen share, and which of those fall short. For each identifier the run measured,
 `bench-all.md` adds a conditions section. It gives each step that measured the identifier, with its
-exit status, the load average and the other work at both edges, the host's whole use over the step
-and the stolen share over it, then the outcome, and whether the figures are reference figures.
-Figures are reference figures only when the run was asked for them, the host met every condition it
-read, and no record of the step names a shortfall.
+exit status, the load average at both edges, the machine's use as the step began, the other work
+through the step (its busiest five seconds and its average) and the stolen share over it, then the
+outcome, and whether the figures are reference figures. Figures are reference figures only when the
+run was asked for them, the host met every condition it read, every reading could be taken, and no
+record of the step names a shortfall.
 
 ## Where release figures come from
 
