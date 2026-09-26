@@ -1044,7 +1044,8 @@ carries an owner device's signed confirmation of exactly that root, so `kr plugi
 with `OWNER_CONFIRMATION_REQUIRED` and sends nothing: add the repository from an owner device.
 
 The second is an installation that may do more than the one it replaces or, with none to replace,
-more than its repository permits by itself, and every release that installs a native bridge.
+more than its repository permits by itself, and every release that installs a native bridge or
+declares a command integration.
 `kr plugin install` asks without a confirmation, which is all an installation inside what is
 already permitted needs. When the host answers that this one needs the owner, `kr` exits with
 `OWNER_CONFIRMATION_REQUIRED` and says to confirm and install it from an owner device. It leaves no

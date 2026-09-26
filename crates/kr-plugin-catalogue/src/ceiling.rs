@@ -52,7 +52,8 @@ pub enum GrantRequirement {
     RepositoryGrant,
     /// An explicit installation grant is needed.
     InstallationGrant,
-    /// An installation grant the owner confirms, because the code runs outside the sandbox.
+    /// An installation grant the owner confirms on every release, because what the release installs
+    /// or adds runs under the application's own permissions, outside the sandbox.
     ConfirmedInstallationGrant,
 }
 
@@ -76,8 +77,9 @@ impl GrantRequirement {
             Self::RepositoryGrant => "an explicit package or repository grant",
             Self::InstallationGrant => "an explicit installation grant",
             Self::ConfirmedInstallationGrant => {
-                "an installation grant the owner confirms, because the files run under the \
-                 application's own permissions and outside the component sandbox"
+                "an installation grant the owner confirms on every release, because what the \
+                 release installs or adds runs under the application's own permissions and outside \
+                 the component sandbox"
             }
         }
     }
@@ -158,8 +160,9 @@ pub fn requirement_for(
     ceiling: &CapabilityCeiling,
 ) -> GrantRequirement {
     // A native bridge installs files that run under the application's own permissions, outside
-    // the component sandbox. No repository ceiling reaches it, whatever the enrolment says.
-    if capability == PluginCapability::NativeBridgeInstall {
+    // the component sandbox, and a command integration changes how the application runs. No
+    // repository ceiling reaches either, whatever the enrolment says.
+    if capability.confirmed_on_every_release() {
         return GrantRequirement::ConfirmedInstallationGrant;
     }
     if capability.requires_installation_grant() {
@@ -275,14 +278,30 @@ mod tests {
     }
 
     #[test]
-    fn a_native_bridge_always_needs_the_owners_confirmation() {
-        // Even a repository the owner widened all the way cannot reach a native bridge.
+    fn a_native_bridge_and_a_command_integration_always_need_the_owners_confirmation() {
+        // Even a repository the owner widened all the way cannot reach either.
         let wide = CapabilityCeiling::with(PluginCapability::ALL.iter().copied());
-        assert_eq!(
-            requirement_for(PluginCapability::NativeBridgeInstall, &wide),
-            GrantRequirement::ConfirmedInstallationGrant
-        );
-        assert!(requirement_for(PluginCapability::NativeBridgeInstall, &wide).needs_confirmation());
+        for capability in [
+            PluginCapability::NativeBridgeInstall,
+            PluginCapability::CommandIntegrationLaunch,
+        ] {
+            assert_eq!(
+                requirement_for(capability, &wide),
+                GrantRequirement::ConfirmedInstallationGrant,
+                "{capability}"
+            );
+            assert!(
+                requirement_for(capability, &wide).needs_confirmation(),
+                "{capability}"
+            );
+        }
+        for capability in PluginCapability::ALL {
+            assert_eq!(
+                requirement_for(*capability, &wide).needs_confirmation(),
+                capability.confirmed_on_every_release(),
+                "{capability}"
+            );
+        }
     }
 
     #[test]

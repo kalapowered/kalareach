@@ -2508,12 +2508,18 @@ fn check_installation(
             ),
         });
     }
-    if proposed.contains(&PluginCapability::NativeBridgeInstall) {
+    // What a native bridge installs and what a command integration adds are in the release itself,
+    // so a grant held from an earlier release says nothing about this one.
+    if let Some(capability) = proposed
+        .iter()
+        .copied()
+        .find(|capability| capability.confirmed_on_every_release())
+    {
         return Err(CatalogueError::OwnerConfirmationRequired {
             detail: format!(
-                "{} {} installs a native bridge, which runs under the application's own \
-                 permissions and outside the component sandbox; every release of one is the \
-                 owner's decision, confirmed for this exact package and grant",
+                "{} {} asks for {capability}, which changes what runs under the application's own \
+                 permissions and outside the component sandbox; every release that asks for it is \
+                 the owner's decision, confirmed for this exact package and grant",
                 entry.plugin_id, entry.version
             ),
         });
