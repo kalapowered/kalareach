@@ -30,6 +30,12 @@
   /* The terminal's type before zoom, which the room kept for the terminal is counted in. */
   --terminal-size: 0.8125rem;
   --terminal-leading: 1.35;
+  /*
+   * The field's type, which the room kept for the field under the terminal is counted in. Anything
+   * smaller than 1rem makes iOS zoom the page when the field takes focus.
+   */
+  --field-size: 1rem;
+  --field-leading: 1.45;
 }
 
 .m-shell {
@@ -352,11 +358,31 @@
 
 /* ---- The session surfaces -------------------------------------------------------------------- */
 
+/*
+ * One column, as wide as the session and never wider: a row whose content cannot shrink runs past
+ * it on its own rather than widen the column, which would carry the composer's controls past the
+ * screen's edge.
+ */
 .m-session {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: auto minmax(0, 1fr) auto;
   block-size: 100%;
   gap: var(--gap-3);
+}
+
+/*
+ * The switch between the conversation and the terminal: with text too large for its two choices to
+ * sit side by side, each takes a line of its own, as wide as the switch, rather than run past the
+ * screen's edge. At other sizes nothing changes.
+ */
+.m-session .segmented {
+  flex-wrap: wrap;
+}
+
+.m-session .segmented button {
+  flex: 1 1 auto;
+  justify-content: center;
 }
 
 .m-pane {
@@ -369,13 +395,14 @@
  * While the terminal shows, it is the content and the composer is its bar. The terminal never has
  * less than four rows at its type's own size, whatever the keyboard covers: four lines, the grid's
  * padding, the surface's border and a pixel over, so rounding never takes the fourth. The composer
- * takes what it needs of the rest, and the terminal all that is left.
+ * takes what it needs of the rest, never less than the field's line, and the terminal all that is
+ * left. Where the screen cannot hold both, the page scrolls rather than cut either.
  */
 .m-session[data-pane='terminal'] {
   --terminal-floor: calc(
     4 * var(--terminal-size) * var(--terminal-leading) + 2 * var(--gap-2) + 3px
   );
-  grid-template-rows: auto minmax(var(--terminal-floor), 1fr) minmax(0, auto);
+  grid-template-rows: auto minmax(var(--terminal-floor), 1fr) auto;
 }
 
 /* The terminal fills its pane, under the words of a view that has ended. */
@@ -507,13 +534,20 @@
 /*
  * Under the terminal the composer scrolls when it holds more than the room it has, and it scrolls
  * from its bottom: the field and the terminal keys stay in view above the keyboard, and the bar
- * above them is what goes out of view first.
+ * above them is what goes out of view first. Its room is never less than the field's line: one line
+ * of the field's type inside its padding and border, and the platform's target at least, as the
+ * field is. The padding that lifts it over a keyboard is added to that room.
  */
 .m-session[data-pane='terminal'] > .m-composer {
   display: flex;
   flex-direction: column-reverse;
   overflow-y: auto;
   overscroll-behavior-y: contain;
+  box-sizing: content-box;
+  min-block-size: max(
+    var(--target),
+    calc(var(--field-size) * var(--field-leading) + 2 * var(--gap-2) + 2px)
+  );
 }
 
 /* While the terminal shows, the field is one line with Send beside it. */
@@ -533,8 +567,8 @@
   background: var(--raised);
   color: var(--text);
   font: inherit;
-  font-size: 1rem; /* Anything smaller makes iOS zoom the page when the field takes focus. */
-  line-height: 1.45;
+  font-size: var(--field-size);
+  line-height: var(--field-leading);
   resize: none;
 }
 
@@ -545,7 +579,8 @@
 
 /*
  * One line of the field's own text, never less than the platform's target: larger text grows it.
- * It takes the width Send leaves, so the two share a line at any text size.
+ * It takes the width Send leaves, so the two share a line: the field gives up width before Send
+ * does. The room kept for the composer under the terminal is counted from these sizes.
  */
 .m-composer-line textarea {
   flex: 1 1 0;
@@ -553,6 +588,14 @@
   min-inline-size: 0;
   min-block-size: var(--target);
   padding-block: var(--gap-2);
+}
+
+/*
+ * The field sits against the edges of the composer under the terminal, which scrolls and so cuts
+ * whatever is drawn outside it. Its focus ring is drawn inside its edge instead.
+ */
+.m-composer-line textarea:focus-visible {
+  outline-offset: -2px;
 }
 
 .m-composer-actions {
