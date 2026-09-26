@@ -179,23 +179,43 @@ impl RecipientAuthority for GrantedRecipients {
         // intersected the way a paired device's request is. An organisation grant answers to the
         // lease of the member its recipient device is bound to, on both clocks; a message carries
         // no account of its own that could name another.
-        let effective = policy
-            .intersect(
-                grant,
-                &AccessRequest {
-                    method: Method::SessionRead,
-                    ingress: ActorIngress::PairedDevice,
-                    environment_id: self.environment_id,
-                    session_id: None,
-                    claims_geometry: false,
-                    own_subject: None,
-                    now_ms,
-                    continuous_now,
-                },
+        let effective = match policy.intersect(
+            grant,
+            &AccessRequest {
+                method: Method::SessionRead,
+                ingress: ActorIngress::PairedDevice,
+                environment_id: self.environment_id,
+                session_id: None,
+                claims_geometry: false,
+                own_subject: None,
                 now_ms,
-            )
-            .ok()?;
+                continuous_now,
+            },
+            now_ms,
+        ) {
+            Ok(effective) => effective,
+            Err(refusal) => {
+                // A lapse the clock decided, a lease or the offline bound run out in UTC, is owed
+                // the record of the floor it was found at, as every such lapse is: the host's next
+                // decision or its record task writes it, and until then no clock wound back before
+                // a restart can revive the bound.
+                if refusal.is_clock_decided() {
+                    policy.utc_floor().owe(now_ms);
+                }
+                return None;
+            }
+        };
         drop(policy);
+        // The offline bound the intersection loaded is held to its continuous end as well, as a
+        // device's request is: a wall clock wound back does not hold it open. The time it has spent
+        // is written down by the host's record task at every mark.
+        if effective.offline.as_ref().is_some_and(|offline| {
+            offline
+                .snapshot()
+                .ended_on_the_continuous_clock(continuous_now)
+        }) {
+            return None;
+        }
         if !effective.rights.contains(&ActionRight::SessionView) {
             return None;
         }
@@ -357,6 +377,71 @@ mod tests {
                 afresh.scope_for(&rule(Some(13))).is_some(),
                 runs_out.is_none(),
                 "and a host with no anchor for it answers as the record says"
+            );
+        }
+    }
+
+    /// A message under a personal grant whose offline bound has run out admits nothing: in UTC, and
+    /// then the floor it was found at is owed its record, so a clock wound back before a restart
+    /// cannot revive the bound; and on the continuous clock, whatever UTC says. The control: inside
+    /// the bound it admits, and nothing is owed.
+    #[test]
+    fn a_lapsed_offline_bound_admits_nothing_and_its_utc_lapse_is_owed_its_record() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        for lapsed in [None, Some("in UTC"), Some("on the continuous clock")] {
+            let sharing = Arc::new(SharingService::in_memory(host()).expect("a store"));
+            issued(
+                &sharing,
+                grant(14, SessionSelector::Any, &[ActionRight::SessionView]),
+                true,
+            );
+            let policy = personal();
+            let wall = Arc::new(AtomicU64::new(NOW));
+            let continuous = kr_transport::clock::ManualClock::new();
+            let recipients = GrantedRecipients::at(
+                Arc::clone(&sharing),
+                Arc::clone(&policy),
+                environment(),
+                Arc::new(continuous.clone()),
+                {
+                    let wall = Arc::clone(&wall);
+                    move || wall.load(Ordering::SeqCst)
+                },
+            );
+            {
+                // A bound of a minute, synchronised now, published as a daemon publishes it, with
+                // its continuous end a minute out.
+                let mut held = policy.lock().expect("not poisoned");
+                held.set_offline_validity(Some(kr_protocol::sharing::OfflineValidityPolicy {
+                    maximum_offline_ms: kr_protocol::scalars::DurationMs::new(60_000),
+                    last_synchronised_at_ms: Nullable::some(
+                        kr_protocol::scalars::TimestampMs::new(NOW),
+                    ),
+                }));
+                held.offline_cell().publish(
+                    crate::grants::policy::BoundIdentity::Offline {
+                        synchronised_at_ms: Some(NOW),
+                    },
+                    kr_transport::clock::ContinuousClock::now(&continuous)
+                        .checked_add(std::time::Duration::from_secs(60)),
+                    Some(NOW + 60_001),
+                    false,
+                    false,
+                );
+            }
+            match lapsed {
+                Some("in UTC") => wall.store(NOW + 60_001, Ordering::SeqCst),
+                Some(_) => continuous.advance(std::time::Duration::from_secs(61)),
+                None => {}
+            }
+            let scope = recipients.scope_for(&rule(Some(14)));
+            assert_eq!(scope.is_some(), lapsed.is_none(), "lapsed {lapsed:?}");
+            let owed = policy.lock().expect("not poisoned").utc_floor().is_owed();
+            assert_eq!(
+                owed,
+                lapsed == Some("in UTC"),
+                "only a lapse found in UTC is owed the floor's record"
             );
         }
     }
