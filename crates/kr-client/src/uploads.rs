@@ -1127,18 +1127,39 @@ mod tests {
     fn a_step_names_itself_and_nothing_it_sends() {
         let mut upload = Upload::new(subject(), Box::new(Held::new(b"hello".to_vec())));
         let begin = upload.next().expect("a step");
-        assert_eq!(format!("{begin:?}"), "Begin(..)");
         let answer = begun(&upload, 1, &ChunkBitmap::empty(1));
         upload.accept(answer).expect("the reservation folds in");
         let chunk = upload.next().expect("a step");
-        assert_eq!(format!("{chunk:?}"), "Chunk(..)");
-        assert_eq!(format!("{chunk:#?}"), "Chunk(..)");
 
         let mut empty = Upload::new(subject(), Box::new(Held::new(Vec::new())));
         let answer = begun(&empty, 0, &ChunkBitmap::empty(0));
         empty.accept(answer).expect("the reservation folds in");
         let finish = empty.next().expect("a step");
-        assert_eq!(format!("{finish:?}"), "Finish(..)");
+
+        let done = Step::Done(Box::new(AttachmentHandle {
+            environment_id: subject().environment_id,
+            transfer_id: transfer_id(),
+            session_id: Nullable::null(),
+            byte_len: U64::new(5),
+            content_digest: Digest256::from_bytes(kr_cbor::sha256(b"hello")),
+            declared_media_type: "image/png".into(),
+            original_file_name: "diagram.png".into(),
+            preview: Nullable::null(),
+            presented_as_image: false,
+            published_at_ms: kr_protocol::scalars::TimestampMs::new(2),
+            expires_at_ms: kr_protocol::scalars::TimestampMs::new(3),
+            submitted: false,
+        }));
+
+        for (step, name) in [
+            (begin, "Begin"),
+            (chunk, "Chunk"),
+            (finish, "Finish"),
+            (done, "Done"),
+        ] {
+            assert_eq!(format!("{step:?}"), format!("{name}(..)"));
+            assert_eq!(format!("{step:#?}"), format!("{name}(..)"));
+        }
     }
 
     #[test]
