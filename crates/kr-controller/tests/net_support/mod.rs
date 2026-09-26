@@ -158,6 +158,12 @@ impl Host {
 
     /// Restarts this daemon as [`Self::restart`] does, with its network built from `settings`.
     pub async fn restart_with(self, settings: NetworkSettings) -> Self {
+        self.shut_down().await.start(settings).await
+    }
+
+    /// Stops this daemon the way a restart of the host does, and keeps what the next one starts
+    /// from: every durable record, and nothing held in memory.
+    pub async fn shut_down(self) -> Stopped {
         let Self {
             temp,
             controller,
@@ -165,6 +171,7 @@ impl Host {
             clients,
             owner,
             room,
+            settings,
             ..
         } = self;
         clients.abort();
@@ -182,9 +189,12 @@ impl Host {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         drop(controller);
-        let mut host = Self::start_on(temp, room, settings).await;
-        host.owner = owner;
-        host
+        Stopped {
+            temp,
+            room,
+            owner,
+            settings,
+        }
     }
 
     /// Starts a daemon on the network over an environment tree that may already hold records,
@@ -333,6 +343,39 @@ impl Host {
         self.network.shutdown().await;
         drop(self.controller);
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A daemon a suite shut down, and what the next one on its environment tree starts from.
+pub struct Stopped {
+    temp: kr_ipc::testing::TempHost,
+    room: room::TestRoom,
+    owner: Option<DeviceRecord>,
+    settings: NetworkSettings,
+}
+
+impl Stopped {
+    /// Returns the environment tree the stopped daemon owned.
+    #[must_use]
+    pub const fn tree(&self) -> &kr_ipc::testing::TempHost {
+        &self.temp
+    }
+
+    /// Returns the network settings the stopped daemon was started with.
+    #[must_use]
+    pub const fn settings(&self) -> &NetworkSettings {
+        &self.settings
+    }
+
+    /// Starts a daemon on the stopped one's environment tree, with its network built from
+    /// `settings` and the stopped one's owner.
+    pub async fn start(self, settings: NetworkSettings) -> Host {
+        let Self {
+            temp, room, owner, ..
+        } = self;
+        let mut host = Host::start_on(temp, room, settings).await;
+        host.owner = owner;
+        host
     }
 }
 

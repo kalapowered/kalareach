@@ -997,3 +997,51 @@ async fn a_confirmation_whose_identifier_is_spent_meanwhile_spends_no_confirmati
     connection.close(0u32.into(), b"paired");
     host.stop().await;
 }
+
+/// A restart while something the stopped daemon's reference count does not see still holds its
+/// environment, as the daemon's own tasks can for a moment, meets the environment held and takes
+/// it over once the holder lets go.
+///
+/// The holder is this test's own, and it lets go the first time the restart waits. A start takes
+/// the environment's lock before it waits for anything, so that is after the restart's first
+/// attempt met the environment held, and nothing here depends on timing. The control, a restart
+/// with nothing held, is the restart every other suite makes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_takes_the_environment_over_once_its_holder_lets_go() {
+    use kr_controller::singleton::SingletonLock;
+
+    let stopped = Host::start_unowned().await.shut_down().await;
+    let environment = stopped.tree().environment();
+    let environment_id = stopped.tree().environment_id();
+    // The stopped daemon's own tasks can still hold the environment for a moment, which is the
+    // case under test, so this hold waits for them as a restart does.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let lock = loop {
+        match SingletonLock::acquire(&environment.singleton_lock(), environment_id) {
+            Ok(lock) => break lock,
+            Err(ControllerError::AlreadyRunning { .. }) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Err(error) => panic!("this test holds the environment: {error}"),
+        }
+    };
+    let mut holder = Some(lock);
+
+    let settings = stopped.settings().clone();
+    let mut restart = std::pin::pin!(stopped.start(settings));
+    let host = std::future::poll_fn(|context| {
+        let polled = restart.as_mut().poll(context);
+        if polled.is_pending() {
+            holder = None;
+        }
+        polled
+    })
+    .await;
+    assert!(
+        holder.is_none(),
+        "the restart waited while the environment was held"
+    );
+
+    let host = host.restart().await;
+    host.stop().await;
+}
