@@ -2261,18 +2261,6 @@ fn removal_mount() {
 #[cfg(target_os = "macos")]
 #[test]
 fn a_removal_stops_before_a_disk_image_attached_inside_the_tree() {
-    /// Detaches the image however the test ends, so no volume outlives it.
-    struct Attached(std::path::PathBuf);
-
-    impl Drop for Attached {
-        fn drop(&mut self) {
-            let _ = std::process::Command::new("/usr/bin/hdiutil")
-                .args(["detach", "-force", "-quiet"])
-                .arg(&self.0)
-                .status();
-        }
-    }
-
     let root = tempfile::tempdir().expect("a directory");
     let graft = root.path().join("tree/graft");
     std::fs::create_dir_all(&graft).expect("the tree");
@@ -2311,7 +2299,11 @@ fn a_removal_stops_before_a_disk_image_attached_inside_the_tree() {
         attached.is_ok_and(|status| status.success()),
         "this host would not attach a disk image inside the tree, so this check cannot run here"
     );
-    let _attached = Attached(graft.clone());
+    let attached = Attached {
+        image: image.clone(),
+        mount_point: graft.clone(),
+        detached: false,
+    };
     std::fs::write(graft.join("kept"), b"elsewhere\n").expect("a file on the image");
 
     let authority =
@@ -2340,6 +2332,166 @@ fn a_removal_stops_before_a_disk_image_attached_inside_the_tree() {
         b"elsewhere\n",
         "nothing on the attached volume was reached"
     );
+    if let Err(report) = attached.detach() {
+        panic!("{report}");
+    }
+}
+
+/// A disk image a test attached at a mount point, which the test detaches with [`Self::detach`]
+/// before it ends.
+///
+/// Dropped without that, as when the test fails first, it still detaches the image, and a detach
+/// that fails then is reported rather than passed over: an image left attached keeps its helper
+/// serving it, and that helper holds the volume the image lives on.
+#[cfg(target_os = "macos")]
+struct Attached {
+    image: std::path::PathBuf,
+    mount_point: std::path::PathBuf,
+    detached: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl Attached {
+    /// Detaches the image.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`detach_image`] reports when the image does not come off.
+    fn detach(mut self) -> Result<(), String> {
+        self.detached = true;
+        detach_image(&self.image, &self.mount_point)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Attached {
+    fn drop(&mut self) {
+        if self.detached {
+            return;
+        }
+        if let Err(report) = detach_image(&self.image, &self.mount_point) {
+            // A second panic while the first unwinds would abort the whole test binary, so a test
+            // that has already failed says it here instead.
+            if std::thread::panicking() {
+                eprintln!("{report}");
+            } else {
+                panic!("{report}");
+            }
+        }
+    }
+}
+
+/// Detaches the disk image `image` from `mount_point`.
+///
+/// # Errors
+///
+/// Returns why it did not come off: what `hdiutil` said, the image and the mount point, and every
+/// process `hdiutil info` still shows serving the image.
+#[cfg(target_os = "macos")]
+fn detach_image(image: &std::path::Path, mount_point: &std::path::Path) -> Result<(), String> {
+    let said = match std::process::Command::new("/usr/bin/hdiutil")
+        .args(["detach", "-force"])
+        .arg(mount_point)
+        .output()
+    {
+        Ok(output) if output.status.success() => return Ok(()),
+        Ok(output) => format!(
+            "hdiutil ended with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(error) => format!("hdiutil could not be run: {error}"),
+    };
+    Err(format!(
+        "the disk image {} did not detach from {} ({said}); {}",
+        image.display(),
+        mount_point.display(),
+        serving(image)
+    ))
+}
+
+/// Says which processes `hdiutil info` shows serving `image`, by number and name.
+#[cfg(target_os = "macos")]
+fn serving(image: &std::path::Path) -> String {
+    // The listing names an image by its resolved path: the temporary directory is reached
+    // through a link.
+    let resolved = std::fs::canonicalize(image).unwrap_or_else(|_| image.to_path_buf());
+    let listed = match std::process::Command::new("/usr/bin/hdiutil")
+        .arg("info")
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
+        Ok(output) => return format!("hdiutil info ended with {}", output.status),
+        Err(error) => return format!("hdiutil info could not be run: {error}"),
+    };
+    let mut current = None;
+    let mut processes = Vec::new();
+    for line in listed.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        match key.trim() {
+            "image-path" => current = Some(std::path::PathBuf::from(value.trim())),
+            "process ID" if current.as_deref() == Some(resolved.as_path()) => {
+                let pid = value.trim();
+                let name = std::process::Command::new("/bin/ps")
+                    .args(["-o", "comm=", "-p", pid])
+                    .output()
+                    .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+                    .unwrap_or_default();
+                processes.push(format!("{pid} ({name})"));
+            }
+            _ => {}
+        }
+    }
+    if processes.is_empty() {
+        "hdiutil info shows no process serving it".to_owned()
+    } else {
+        format!(
+            "hdiutil info shows it still served by process {}",
+            processes.join(", ")
+        )
+    }
+}
+
+/// A detach that fails is reported, naming the image and the mount point, rather than passed over
+/// without a word. The detach here is of a mount point with nothing attached, which fails as any
+/// failed detach does.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_disk_image_that_does_not_detach_is_reported_by_name() {
+    let root = tempfile::tempdir().expect("a directory");
+    let nothing = root.path().join("nothing-attached");
+    std::fs::create_dir(&nothing).expect("a mount point");
+    let image = root.path().join("never-attached.dmg");
+    let report = detach_image(&image, &nothing)
+        .expect_err("a mount point with nothing attached does not detach");
+    assert!(
+        report.contains(&image.display().to_string())
+            && report.contains(&nothing.display().to_string()),
+        "the report names the image and the mount point: {report}"
+    );
+    assert!(
+        report.contains("hdiutil info shows"),
+        "and says what hdiutil info shows serving the image: {report}"
+    );
+}
+
+/// The same failure, met by a guard the test did not detach, fails the test with the report.
+#[cfg(target_os = "macos")]
+#[test]
+#[should_panic(expected = "did not detach")]
+fn a_guard_dropped_before_its_image_detaches_fails_with_the_report() {
+    let root = tempfile::tempdir().expect("a directory");
+    let nothing = root.path().join("nothing-attached");
+    std::fs::create_dir(&nothing).expect("a mount point");
+    drop(Attached {
+        image: root.path().join("never-attached.dmg"),
+        mount_point: nothing,
+        detached: false,
+    });
 }
 
 /// A directory made to stage in is made only where nothing was, and it is this account's alone.
